@@ -125,6 +125,7 @@ interface CliOptions extends OptionValues {
   browserChromeProfile?: string;
   browserChromePath?: string;
   browserCookiePath?: string;
+  browserAttachRunning?: boolean;
   chatgptUrl?: string;
   browserUrl?: string;
   browserTimeout?: string;
@@ -254,11 +255,11 @@ program
   .addOption(new Option("--message <text>", "Alias for --prompt.").hideHelp())
   .option(
     "--followup <sessionId|responseId>",
-    "Continue an OpenAI/Azure Responses API run from a stored response id (resp_...) or from a stored oracle session id.",
+    "Continue an existing run. API mode accepts a stored response id (resp_...) or oracle session id; browser mode accepts a stored browser session id only.",
   )
   .option(
     "--followup-model <model>",
-    "When following up a multi-model session, choose which model response to continue from.",
+    "API only: when following up a multi-model session, choose which model response to continue from.",
   )
   .option(
     "-f, --file <paths...>",
@@ -462,6 +463,12 @@ program
   )
   .addOption(
     new Option(
+      "--browser-attach-running",
+      "Attach to a running local browser session instead of launching Chrome (defaults to 127.0.0.1:9222; combine with --remote-chrome to hint a different host:port).",
+    ),
+  )
+  .addOption(
+    new Option(
       "--chatgpt-url <url>",
       `Override the ChatGPT web URL (e.g., workspace/folder like https://chatgpt.com/g/.../project; default ${CHATGPT_URL}).`,
     ),
@@ -609,7 +616,7 @@ program
   .addOption(
     new Option(
       "--remote-chrome <host:port>",
-      "Connect to remote Chrome DevTools Protocol (e.g., 192.168.1.10:9222 or [2001:db8::1]:9222 for IPv6).",
+      "Connect to remote Chrome DevTools Protocol, or when combined with --browser-attach-running use this host:port as the local attach hint.",
     ),
   )
   .addOption(
@@ -934,6 +941,7 @@ function buildRunOptions(
     model: options.model,
     models: overrides.models ?? options.models,
     previousResponseId: overrides.previousResponseId ?? options.previousResponseId,
+    followupSessionId: overrides.followupSessionId ?? options.followupSessionId,
     effectiveModelId: overrides.effectiveModelId ?? options.effectiveModelId ?? options.model,
     file: overrides.file ?? options.file ?? [],
     maxFileSizeBytes: overrides.maxFileSizeBytes ?? options.maxFileSizeBytes,
@@ -1003,8 +1011,11 @@ function assertFollowupSupported({
   baseUrl?: string;
   azureEndpoint?: string;
 }): void {
+  if (engine === "browser") {
+    return;
+  }
   if (engine !== "api") {
-    throw new Error("--followup requires --engine api.");
+    throw new Error("--followup requires --engine api or --engine browser.");
   }
   if (model.startsWith("gemini") || model.startsWith("claude")) {
     throw new Error(
@@ -1016,6 +1027,33 @@ function assertFollowupSupported({
       "--followup is only supported for the default OpenAI Responses API or Azure OpenAI Responses. Custom --base-url providers are not supported.",
     );
   }
+}
+
+async function resolveBrowserFollowupSessionId(reference: string): Promise<string> {
+  const trimmed = reference.trim();
+  if (!trimmed) {
+    throw new Error("--followup requires a session id.");
+  }
+  if (/^resp_/i.test(trimmed)) {
+    throw new Error("Browser follow-up requires an oracle session id, not a response id.");
+  }
+  const meta = await sessionStore.readSession(trimmed);
+  if (!meta) {
+    throw new Error(`No stored oracle session found for ${trimmed}.`);
+  }
+  if ((meta.mode ?? meta.options?.mode) !== "browser") {
+    throw new Error(`Session ${trimmed} is not a browser session.`);
+  }
+  if (!meta.browser?.runtime) {
+    throw new Error(
+      `Session ${trimmed} is missing browser runtime metadata and cannot be continued. Re-run the parent browser session with a current Oracle build.`,
+    );
+  }
+  const model = String(meta.model ?? meta.options?.model ?? "").toLowerCase();
+  if (model.startsWith("gemini")) {
+    throw new Error("Browser follow-up currently supports ChatGPT/GPT browser sessions only.");
+  }
+  return meta.id;
 }
 
 function levenshteinDistance(a: string, b: string): number {
@@ -1083,7 +1121,7 @@ async function resolveFollowupReference(
   if (trimmed.length === 0) {
     throw new Error("--followup requires a session id or response id.");
   }
-  if (trimmed.startsWith("resp_")) {
+  if (/^resp_/i.test(trimmed)) {
     return { responseId: trimmed };
   }
 
@@ -1163,6 +1201,7 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
     model: (stored.model as ModelName) ?? DEFAULT_MODEL,
     models: stored.models as ModelName[] | undefined,
     previousResponseId: stored.previousResponseId,
+    followupSessionId: stored.followupSessionId,
     effectiveModelId: stored.effectiveModelId ?? stored.model,
     file: stored.file ?? [],
     maxFileSizeBytes: stored.maxFileSizeBytes,
@@ -1524,6 +1563,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       if (normalizedMultiModels.length > 0) {
         throw new Error("--followup cannot be combined with --models.");
       }
+      if (engine === "browser") {
+        throw new Error("Browser follow-up is not available with --dry-run/preview.");
+      }
       const followup = await resolveFollowupReference(options.followup, options.followupModel);
       resolvedOptions.previousResponseId = followup.responseId;
       resolvedOptions.followupSessionId = followup.sessionId;
@@ -1592,10 +1634,20 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     if (normalizedMultiModels.length > 0) {
       throw new Error("--followup cannot be combined with --models.");
     }
-    const followup = await resolveFollowupReference(options.followup, options.followupModel);
-    resolvedOptions.previousResponseId = followup.responseId;
-    resolvedOptions.followupSessionId = followup.sessionId;
-    resolvedOptions.followupModel = options.followupModel;
+    if (engine === "browser") {
+      if (options.followupModel) {
+        throw new Error("--followup-model is only supported for API follow-ups.");
+      }
+      resolvedOptions.followupSessionId = await resolveBrowserFollowupSessionId(options.followup);
+      if (resolvedModel.startsWith("gemini")) {
+        throw new Error("Browser follow-up currently supports ChatGPT/GPT browser sessions only.");
+      }
+    } else {
+      const followup = await resolveFollowupReference(options.followup, options.followupModel);
+      resolvedOptions.previousResponseId = followup.responseId;
+      resolvedOptions.followupSessionId = followup.sessionId;
+      resolvedOptions.followupModel = options.followupModel;
+    }
   }
 
   const duplicateBlocked = await shouldBlockDuplicatePrompt({
@@ -2091,6 +2143,10 @@ function printDebugHelp(cliName: string): void {
     ["--browser-chrome-profile <name>", "Reuse cookies from a specific Chrome profile."],
     ["--browser-chrome-path <path>", "Point to a custom Chrome/Chromium binary."],
     ["--browser-cookie-path <path>", "Use a specific Chrome/Chromium cookie store file."],
+    [
+      "--browser-attach-running",
+      "Attach to your current Chrome session through its local remote debugging toggle.",
+    ],
     ["--browser-url <url>", "Alias for --chatgpt-url."],
     ["--browser-timeout <ms|s|m>", "Cap total wait time for the assistant response."],
     ["--browser-input-timeout <ms|s|m>", "Cap how long we wait for the composer textarea."],

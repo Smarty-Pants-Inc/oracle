@@ -1,7 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
-import type { BrowserSessionConfig } from "../../src/sessionStore.js";
-import { runBrowserSessionExecution } from "../../src/browser/sessionRunner.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import type { BrowserSessionConfig, SessionMetadata } from "../../src/sessionStore.js";
+import {
+  runBrowserSessionExecution,
+  continueBrowserSessionExecution,
+} from "../../src/browser/sessionRunner.js";
 
 const baseRunOptions: RunOracleOptions = {
   prompt: "Hello world",
@@ -65,6 +69,73 @@ describe("runBrowserSessionExecution", () => {
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
     );
     expect(log).toHaveBeenCalled();
+  });
+
+  test("persists attach-mode runtime metadata from the browser runner", async () => {
+    const log = vi.fn();
+    const persistRuntimeHint = vi.fn();
+    const executeBrowser = vi.fn(async (options) => {
+      await options.runtimeHintCb?.({
+        browserTransport: "cdp" as const,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
+        chromeTargetId: "target-2",
+        tabUrl: "https://chatgpt.com/c/attached",
+      });
+      return {
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 100,
+        answerTokens: 2,
+        answerChars: 2,
+        browserTransport: "cdp" as const,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
+        chromeTargetId: "target-2",
+        tabUrl: "https://chatgpt.com/c/attached",
+      };
+    });
+
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { attachRunning: true },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 10,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+        persistRuntimeHint,
+      },
+    );
+
+    expect(persistRuntimeHint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        browserTransport: "cdp",
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
+        chromeTargetId: "target-2",
+        tabUrl: "https://chatgpt.com/c/attached",
+      }),
+    );
+    expect(result.runtime).toMatchObject({
+      browserTransport: "cdp",
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
+      chromeTargetId: "target-2",
+      tabUrl: "https://chatgpt.com/c/attached",
+    });
   });
 
   test("suppresses automation noise when not verbose", async () => {
@@ -378,5 +449,182 @@ describe("runBrowserSessionExecution", () => {
     );
     expect(result.answerText).toBe("gemini response");
     expect(executeBrowser).toHaveBeenCalled();
+  });
+});
+
+describe("continueBrowserSessionExecution", () => {
+  test("continues a stored browser session with inline prompt text", async () => {
+    const log = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: {},
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    const continueBrowser = vi.fn(async () => ({
+      answerText: "continued",
+      answerMarkdown: "continued",
+      tookMs: 321,
+      answerTokens: 9,
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+    }));
+    const persistRuntimeHint = vi.fn();
+
+    const result = await continueBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "never",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        continueBrowser,
+        persistRuntimeHint,
+      },
+    );
+
+    expect(continueBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ chromePort: 9222 }),
+      baseConfig,
+      expect.any(Function),
+      expect.objectContaining({ prompt: "prompt", attachments: [] }),
+      expect.any(Object),
+    );
+    expect(persistRuntimeHint).toHaveBeenCalled();
+    expect(result).toMatchObject({
+      usage: { inputTokens: 42, outputTokens: 9, totalTokens: 51 },
+      elapsedMs: 321,
+      answerText: "continued",
+    });
+  });
+
+  test("passes follow-up attachments and fallback submission through", async () => {
+    const log = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: {},
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    const continueBrowser = vi.fn(async () => ({
+      answerText: "continued",
+      answerMarkdown: "continued",
+      tookMs: 321,
+      answerTokens: 9,
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+    }));
+
+    await continueBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: true },
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [{ path: "/repo/context.zip", displayPath: "context.zip", sizeBytes: 4 }],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "always",
+          attachmentMode: "upload",
+          fallback: {
+            composerText: "fallback prompt",
+            attachments: [
+              { path: "/repo/fallback.zip", displayPath: "fallback.zip", sizeBytes: 4 },
+            ],
+            bundled: null,
+          },
+        }),
+        continueBrowser,
+      },
+    );
+
+    expect(continueBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ chromePort: 9222 }),
+      baseConfig,
+      expect.any(Function),
+      {
+        prompt: "prompt",
+        attachments: [expect.objectContaining({ displayPath: "context.zip" })],
+        fallbackSubmission: {
+          prompt: "fallback prompt",
+          attachments: [expect.objectContaining({ displayPath: "fallback.zip" })],
+        },
+      },
+      expect.any(Object),
+    );
+  });
+
+  test("wraps generic followup failures as BrowserAutomationError", async () => {
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: {},
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+
+    await expect(
+      continueBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: baseConfig,
+          cwd: "/repo",
+          log: vi.fn(),
+          parentSession,
+        },
+        {
+          assemblePrompt: async () => ({
+            markdown: "prompt",
+            composerText: "prompt",
+            estimatedInputTokens: 42,
+            attachments: [],
+            inlineFileCount: 0,
+            tokenEstimateIncludesInlineFiles: false,
+            attachmentsPolicy: "never",
+            attachmentMode: "inline",
+            fallback: null,
+          }),
+          continueBrowser: async () => {
+            throw new Error("chrome disappeared");
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      message: "chrome disappeared",
+      details: { stage: "continue-browser" },
+    } satisfies Partial<BrowserAutomationError>);
   });
 });
