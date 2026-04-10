@@ -21,7 +21,7 @@ async function readSessionLogTail(sessionId: string, maxBytes: number): Promise<
   }
 }
 import { performSessionRun } from "../../cli/sessionRunner.js";
-import { CHATGPT_URL } from "../../browser/constants.js";
+import { CHATGPT_URL, isTemporaryChatUrl, normalizeChatgptUrl } from "../../browserMode.js";
 import { consultInputSchema } from "../types.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveNotificationSettings } from "../../cli/notifier.js";
@@ -57,6 +57,12 @@ const consultInputShape = {
     .optional()
     .describe(
       'Browser-only: explicit ChatGPT UI label to select (overrides model mapping). Example: "GPT-5.2 Thinking".',
+    ),
+  browserModelStrategy: z
+    .enum(["select", "current", "ignore"])
+    .optional()
+    .describe(
+      'Browser-only: model picker strategy. "select" switches to the requested model, "current" keeps the active model, and "ignore" skips the picker.',
     ),
   browserAttachments: z
     .enum(["auto", "never", "always"])
@@ -164,6 +170,7 @@ export function buildConsultBrowserConfig({
   runModel,
   inputModel,
   browserModelLabel,
+  browserModelStrategy,
   browserThinkingTime,
   browserKeepBrowser,
 }: {
@@ -172,25 +179,43 @@ export function buildConsultBrowserConfig({
   runModel: string;
   inputModel?: string;
   browserModelLabel?: string;
+  browserModelStrategy?: BrowserSessionConfig["modelStrategy"];
   browserThinkingTime?: "light" | "standard" | "extended" | "heavy";
   browserKeepBrowser?: boolean;
 }): BrowserSessionConfig {
   const configuredBrowser = userConfig.browser ?? {};
   const envProfileDir = (env.ORACLE_BROWSER_PROFILE_DIR ?? "").trim();
   const hasProfileDir = envProfileDir.length > 0;
-  const preferredLabel = (browserModelLabel ?? inputModel)?.trim();
+  const explicitBrowserLabel = browserModelLabel?.trim();
+  const requestedInputModel = inputModel?.trim();
   const isChatGptModel = runModel.startsWith("gpt-") && !runModel.includes("codex");
-  const desiredModelLabel = isChatGptModel
-    ? mapModelToBrowserLabel(runModel)
-    : resolveBrowserModelLabel(preferredLabel, runModel);
+  const desiredModelLabel = explicitBrowserLabel
+    ? resolveBrowserModelLabel(explicitBrowserLabel, runModel)
+    : isChatGptModel
+      ? mapModelToBrowserLabel(runModel)
+      : resolveBrowserModelLabel(requestedInputModel, runModel);
   const configuredUrl = configuredBrowser.chatgptUrl ?? configuredBrowser.url ?? CHATGPT_URL;
+  const normalizedUrl = normalizeChatgptUrl(configuredUrl, CHATGPT_URL);
   const manualLogin = hasProfileDir ? true : (configuredBrowser.manualLogin ?? false);
+  const manualLoginCookieSync = configuredBrowser.manualLoginCookieSync ?? false;
+  const modelStrategy = browserModelStrategy ?? configuredBrowser.modelStrategy;
+
+  if (
+    modelStrategy === "select" &&
+    isTemporaryChatUrl(normalizedUrl) &&
+    /\bpro\b/i.test(desiredModelLabel ?? "")
+  ) {
+    throw new Error(
+      "Temporary Chat mode does not expose Pro models in the ChatGPT model picker. " +
+        'Remove "temporary-chat=true" from --chatgpt-url (or omit --chatgpt-url), or use a non-Pro model (e.g. --model gpt-5.2).',
+    );
+  }
 
   return {
     ...configuredBrowser,
-    url: configuredUrl,
-    chatgptUrl: configuredUrl,
-    cookieSync: !manualLogin,
+    url: normalizedUrl,
+    chatgptUrl: normalizedUrl,
+    cookieSync: !manualLogin || manualLoginCookieSync,
     headless: configuredBrowser.headless ?? false,
     hideWindow: configuredBrowser.hideWindow ?? false,
     keepBrowser: browserKeepBrowser ?? configuredBrowser.keepBrowser ?? false,
@@ -198,6 +223,8 @@ export function buildConsultBrowserConfig({
     manualLoginProfileDir: manualLogin
       ? ((envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null)
       : null,
+    manualLoginCookieSync,
+    modelStrategy,
     thinkingTime: browserThinkingTime ?? configuredBrowser.thinkingTime,
     desiredModel: desiredModelLabel || mapModelToBrowserLabel(runModel),
   };
@@ -224,6 +251,7 @@ export function registerConsultTool(server: McpServer): void {
         engine,
         search,
         browserModelLabel,
+        browserModelStrategy,
         browserAttachments,
         browserBundleFiles,
         browserThinkingTime,
@@ -282,6 +310,7 @@ export function registerConsultTool(server: McpServer): void {
           runModel: runOptions.model,
           inputModel: model,
           browserModelLabel,
+          browserModelStrategy,
           browserThinkingTime,
           browserKeepBrowser,
         });

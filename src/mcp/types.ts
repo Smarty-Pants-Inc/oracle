@@ -7,6 +7,7 @@ export const consultInputSchema = z.object({
   models: z.array(z.string()).optional(),
   engine: z.enum(["api", "browser"]).optional(),
   browserModelLabel: z.string().optional(),
+  browserModelStrategy: z.enum(["select", "current", "ignore"]).optional(),
   browserAttachments: z.enum(["auto", "never", "always"]).optional(),
   browserBundleFiles: z.boolean().optional(),
   browserThinkingTime: z.enum(["light", "standard", "extended", "heavy"]).optional(),

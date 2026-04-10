@@ -526,16 +526,28 @@ async function verifyPromptCommitted(
     };
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
     const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
+    const homePageMatchedCommit =
+      matchesPrompt &&
+      !info?.inConversation &&
+      Boolean(info?.composerCleared) &&
+      ((info?.stopVisible ?? false) || Boolean(info?.assistantVisible));
     const baselineUnknown =
       typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
-    if (matchesPrompt && (baselineUnknown || info?.hasNewTurn)) {
+    if (matchesPrompt && (baselineUnknown || info?.hasNewTurn || homePageMatchedCommit)) {
       return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
     }
     const fallbackCommit =
       info?.composerCleared &&
       Boolean(info?.hasNewTurn) &&
       ((info?.stopVisible ?? false) || info?.assistantVisible || info?.inConversation);
-    if (fallbackCommit) {
+    const homePageCommit =
+      info?.composerCleared &&
+      (info?.stopVisible ?? false) &&
+      !info?.inConversation &&
+      !info?.assistantVisible &&
+      (info?.turnsCount ?? 0) === 0 &&
+      ((typeof info?.baseline === "number" && info.baseline === 0) || baselineLiteral === 0);
+    if (fallbackCommit || homePageCommit) {
       return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
     }
     await delay(100);

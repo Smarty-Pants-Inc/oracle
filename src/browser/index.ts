@@ -15,6 +15,8 @@ import {
   launchChrome,
   registerTerminationHooks,
   hideChromeWindow,
+  captureFrontmostProcess,
+  startChromeFocusGuard,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -191,6 +193,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     logger(`Created temporary Chrome profile at ${userDataDir}`);
   }
 
+  const shouldHideChromeWindow = !config.headless && config.hideWindow;
+  const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
+
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
@@ -244,6 +249,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let removeDialogHandler: (() => void) | null = null;
   let appliedCookies = 0;
   let preserveBrowserOnError = false;
+  let stopChromeFocusGuard: (() => void) | null = null;
+  if (shouldHideChromeWindow) {
+    await hideChromeWindow(chrome, logger, frontmostTarget);
+    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
+  }
 
   try {
     try {
@@ -276,10 +286,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
     const { Network, Page, Runtime, Input, DOM } = client;
-
-    if (!config.headless && config.hideWindow) {
-      await hideChromeWindow(chrome, logger);
-    }
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -1036,6 +1042,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
     }
     removeDialogHandler?.();
+    if (shouldHideChromeWindow) {
+      await hideChromeWindow(chrome, logger).catch(() => undefined);
+    }
+    stopChromeFocusGuard?.();
     removeTerminationHooks?.();
     const keepBrowserOpen = effectiveKeepBrowser || preserveBrowserOnError;
     if (!keepBrowserOpen) {
@@ -1241,7 +1251,7 @@ async function _assertNavigatedToHttp(
   });
 }
 
-async function maybeReuseRunningChrome(
+export async function maybeReuseRunningChrome(
   userDataDir: string,
   logger: BrowserLogger,
   options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},

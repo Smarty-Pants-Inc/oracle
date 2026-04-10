@@ -72,4 +72,68 @@ describe("promptComposer", () => {
       promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
     ).resolves.toBe(1);
   });
+
+  test("treats a cleared home-page composer plus stop button as committed for a fresh chat", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        // Baseline read (turn count)
+        .mockResolvedValueOnce({ result: { value: 0 } })
+        // First poll shows the home-page send state before /c/ navigation lands.
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 0,
+              userMatched: false,
+              prefixMatched: false,
+              lastMatched: false,
+              hasNewTurn: false,
+              stopVisible: true,
+              assistantVisible: false,
+              composerCleared: true,
+              inConversation: false,
+            },
+          },
+        }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
+    ).resolves.toBe(0);
+  });
+
+  test("treats a matched prompt plus active generation on the home page as committed", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        // Baseline read (turn count)
+        .mockResolvedValueOnce({ result: { value: 4 } })
+        // First poll shows the prompt echoed in home-page fallback UI while generation is active.
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              baseline: 4,
+              turnsCount: 4,
+              userMatched: true,
+              prefixMatched: true,
+              lastMatched: false,
+              hasNewTurn: false,
+              stopVisible: true,
+              assistantVisible: true,
+              composerCleared: true,
+              inConversation: false,
+            },
+          },
+        }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
+    ).resolves.toBe(4);
+  });
 });

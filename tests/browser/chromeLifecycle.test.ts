@@ -1,3 +1,4 @@
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const cdpNewMock = vi.fn();
@@ -249,5 +250,151 @@ describe("connectWithNewTab", () => {
     expect(logger).toHaveBeenCalledWith(
       "Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
     );
+  });
+});
+
+describe("startChromeFocusGuard", () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    Object.defineProperty(process, "platform", { value: "darwin" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+    vi.restoreAllMocks();
+  });
+
+  test("updates the restore target using the specific frontmost process and expires cleanly", async () => {
+    const frontmostProcesses = [
+      "Google Chrome\n4242\n",
+      "Google Chrome\n4242\n",
+      "Messages\n9001\n",
+      "Google Chrome\n4242\n",
+      "Google Chrome\n4242\n",
+    ];
+    const execFileMock = vi.fn(
+      (
+        _file: string,
+        args: string[],
+        callback: (error: Error | null, stdout?: string, stderr?: string) => void,
+      ) => {
+        const script = args[1] ?? args[0] ?? "";
+        if (script.includes("first application process whose frontmost is true")) {
+          callback(null, frontmostProcesses.shift() ?? "Messages\n9001\n", "");
+          return;
+        }
+        callback(null, "", "");
+      },
+    );
+    Reflect.set(
+      execFileMock as object,
+      promisify.custom,
+      (_file: string, args: string[]) =>
+        new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          execFileMock(_file, args, (error, stdout = "", stderr = "") => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve({ stdout, stderr });
+          });
+        }),
+    );
+
+    vi.doMock("node:child_process", () => ({
+      execFile: execFileMock,
+    }));
+
+    const { startChromeFocusGuard } = await import("../../src/browser/chromeLifecycle.js");
+    const logger = vi.fn();
+    const stop = startChromeFocusGuard(
+      { pid: 4242 } as unknown as import("chrome-launcher").LaunchedChrome,
+      logger,
+      { name: "Zed", pid: 7001 },
+      100,
+      350,
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(100);
+    const callsBeforeExpiry = execFileMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(500);
+    stop();
+
+    const restoreScripts = execFileMock.mock.calls
+      .map(([, args]) => args[1] ?? args[0] ?? "")
+      .filter((script) => script.includes("set frontmost of"));
+
+    expect(
+      restoreScripts.some((script) =>
+        script.includes("set frontmost of (first application process whose unix id is 7001)"),
+      ),
+    ).toBe(true);
+    expect(
+      restoreScripts.some((script) =>
+        script.includes("set frontmost of (first application process whose unix id is 9001)"),
+      ),
+    ).toBe(true);
+    expect(execFileMock.mock.calls.length).toBe(callsBeforeExpiry);
+  });
+
+  test("does not restore another app when hiding a background chrome process", async () => {
+    const frontmostProcesses = ["Messages\n9001\n"];
+    const execFileMock = vi.fn(
+      (
+        _file: string,
+        args: string[],
+        callback: (error: Error | null, stdout?: string, stderr?: string) => void,
+      ) => {
+        const script = args[1] ?? args[0] ?? "";
+        if (script.includes("first application process whose frontmost is true")) {
+          callback(null, frontmostProcesses.shift() ?? "Messages\n9001\n", "");
+          return;
+        }
+        callback(null, "", "");
+      },
+    );
+    Reflect.set(
+      execFileMock as object,
+      promisify.custom,
+      (_file: string, args: string[]) =>
+        new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          execFileMock(_file, args, (error, stdout = "", stderr = "") => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve({ stdout, stderr });
+          });
+        }),
+    );
+
+    vi.doMock("node:child_process", () => ({
+      execFile: execFileMock,
+    }));
+
+    const { hideChromeWindow } = await import("../../src/browser/chromeLifecycle.js");
+    const logger = vi.fn();
+
+    await hideChromeWindow(
+      { pid: 4242 } as unknown as import("chrome-launcher").LaunchedChrome,
+      logger,
+      { name: "Zed", pid: 7001 },
+    );
+
+    const restoreScripts = execFileMock.mock.calls
+      .map(([, args]) => args[1] ?? args[0] ?? "")
+      .filter(
+        (script) =>
+          script.includes("set frontmost of") ||
+          script.includes('tell application "Zed" to activate'),
+      );
+
+    expect(restoreScripts).toEqual([]);
   });
 });

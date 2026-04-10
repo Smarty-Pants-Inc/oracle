@@ -7,6 +7,18 @@ import {
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 
+type ModelVersion = "5-4" | "5-2" | "5-1" | "5-0";
+
+interface ModelTargetTraits {
+  normalizedTarget: string;
+  normalizedTokens: string[];
+  targetWords: string[];
+  desiredVersion: ModelVersion | null;
+  wantsPro: boolean;
+  wantsInstant: boolean;
+  wantsThinking: boolean;
+}
+
 export async function ensureModelSelection(
   Runtime: ChromeClient["Runtime"],
   desiredModel: string,
@@ -22,7 +34,6 @@ export async function ensureModelSelection(
   const result = outcome.result?.value as
     | { status: "already-selected"; label?: string | null }
     | { status: "switched"; label?: string | null }
-    | { status: "switched-best-effort"; label?: string | null }
     | {
         status: "option-not-found";
         hint?: { temporaryChat?: boolean; availableOptions?: string[] };
@@ -32,8 +43,7 @@ export async function ensureModelSelection(
 
   switch (result?.status) {
     case "already-selected":
-    case "switched":
-    case "switched-best-effort": {
+    case "switched": {
       const label = result.label ?? desiredModel;
       logger(`Model picker: ${label}`);
       return;
@@ -67,9 +77,11 @@ function buildModelSelectionExpression(
   strategy: BrowserModelStrategy,
 ): string {
   const matchers = buildModelMatchersLiteral(targetModel);
+  const traits = buildModelTargetTraits(targetModel, matchers.labelTokens);
   const labelLiteral = JSON.stringify(matchers.labelTokens);
   const idLiteral = JSON.stringify(matchers.testIdTokens);
   const primaryLabelLiteral = JSON.stringify(targetModel);
+  const traitsLiteral = JSON.stringify(traits);
   const strategyLiteral = JSON.stringify(strategy);
   const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
   const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
@@ -80,6 +92,7 @@ function buildModelSelectionExpression(
     const LABEL_TOKENS = ${labelLiteral};
     const TEST_IDS = ${idLiteral};
     const PRIMARY_LABEL = ${primaryLabelLiteral};
+    const TARGET_TRAITS = ${traitsLiteral};
     const MODEL_STRATEGY = ${strategyLiteral};
     const INITIAL_WAIT_MS = 150;
     const REOPEN_INTERVAL_MS = 400;
@@ -94,37 +107,94 @@ function buildModelSelectionExpression(
         .replace(/\\s+/g, ' ')
         .trim();
     };
-    // Normalize every candidate token to keep fuzzy matching deterministic.
-    const normalizedTarget = normalizeText(PRIMARY_LABEL);
-    const normalizedTokens = Array.from(new Set([normalizedTarget, ...LABEL_TOKENS]))
-      .map((token) => normalizeText(token))
-      .filter(Boolean);
-    const targetWords = normalizedTarget.split(' ').filter(Boolean);
-    const desiredVersion = normalizedTarget.includes('5 4')
-      ? '5-4'
-      : normalizedTarget.includes('5 2')
-        ? '5-2'
-        : normalizedTarget.includes('5 1')
-          ? '5-1'
-          : normalizedTarget.includes('5 0')
-            ? '5-0'
-            : null;
-    const wantsPro = normalizedTarget.includes(' pro') || normalizedTarget.endsWith(' pro') || normalizedTokens.includes('pro');
-    const wantsInstant = normalizedTarget.includes('instant');
-    const wantsThinking = normalizedTarget.includes('thinking');
+    const tokenize = (value) => normalizeText(value).split(' ').filter(Boolean);
+    const hasWord = (value, word) => tokenize(value).includes(word);
+    const normalizedTarget = TARGET_TRAITS.normalizedTarget;
+    const normalizedTokens = TARGET_TRAITS.normalizedTokens;
+    const targetWords = TARGET_TRAITS.targetWords;
+    const desiredVersion = TARGET_TRAITS.desiredVersion;
+    const wantsPro = TARGET_TRAITS.wantsPro;
+    const wantsInstant = TARGET_TRAITS.wantsInstant;
+    const wantsThinking = TARGET_TRAITS.wantsThinking;
+
+    const detectCandidateVersion = (normalizedText, normalizedTestId) => {
+      const combined = [normalizedText, normalizedTestId].filter(Boolean).join(' ');
+      const has52 =
+        combined.includes('5 2') ||
+        combined.includes('5-2') ||
+        combined.includes('5.2') ||
+        combined.includes('gpt52');
+      const has54 =
+        combined.includes('5 4') ||
+        combined.includes('5-4') ||
+        combined.includes('5.4') ||
+        combined.includes('gpt54');
+      const has51 =
+        combined.includes('5 1') ||
+        combined.includes('5-1') ||
+        combined.includes('5.1') ||
+        combined.includes('gpt51');
+      const has50 =
+        combined.includes('5 0') ||
+        combined.includes('5-0') ||
+        combined.includes('5.0') ||
+        combined.includes('gpt50');
+      return has54 ? '5-4' : has52 ? '5-2' : has51 ? '5-1' : has50 ? '5-0' : null;
+    };
+    const hasVariant = (normalizedText, normalizedTestId, variant) =>
+      hasWord(normalizedText, variant) || (normalizedTestId ?? '').toLowerCase().includes(variant);
+    const optionMatchesTarget = (label, testid) => {
+      const normalizedLabel = normalizeText(label);
+      const normalizedTestId = (testid ?? '').toLowerCase();
+      if (!normalizedLabel && !normalizedTestId) {
+        return false;
+      }
+      const candidateVersion = detectCandidateVersion(normalizedLabel, normalizedTestId);
+      if (desiredVersion && candidateVersion && candidateVersion !== desiredVersion) {
+        return false;
+      }
+      const hasPro = hasVariant(normalizedLabel, normalizedTestId, 'pro');
+      const hasThinking = hasVariant(normalizedLabel, normalizedTestId, 'thinking');
+      const hasInstant = hasVariant(normalizedLabel, normalizedTestId, 'instant');
+      if (wantsPro && !hasPro) return false;
+      if (wantsThinking && !hasThinking) return false;
+      if (wantsInstant && !hasInstant) return false;
+      if (!wantsPro && hasPro) return false;
+      if (!wantsThinking && hasThinking) return false;
+      if (!wantsInstant && hasInstant) return false;
+      if (!normalizedLabel) {
+        return Boolean(candidateVersion && candidateVersion === desiredVersion);
+      }
+      if (candidateVersion && candidateVersion === desiredVersion) {
+        return true;
+      }
+      if (normalizedLabel === normalizedTarget) {
+        return true;
+      }
+      if (normalizedTarget && (normalizedLabel.startsWith(normalizedTarget) || normalizedLabel.includes(normalizedTarget))) {
+        return true;
+      }
+      if (targetWords.length > 1 && targetWords.every((word) => normalizedLabel.includes(word))) {
+        return true;
+      }
+      if (normalizedTokens.some((token) => token && normalizedLabel.includes(token))) {
+        return true;
+      }
+      // ChatGPT sometimes abbreviates picker rows to the variant name only (e.g. "Pro", "Thinking").
+      if (desiredVersion && !candidateVersion) {
+        if (wantsPro && normalizedLabel === 'pro') return true;
+        if (wantsThinking && normalizedLabel === 'thinking') return true;
+        if (wantsInstant && normalizedLabel === 'instant') return true;
+      }
+      return Boolean(!desiredVersion && candidateVersion === null && normalizedLabel === normalizedTarget);
+    };
 
     const button = document.querySelector(BUTTON_SELECTOR);
     if (!button) {
       return { status: 'button-missing' };
     }
 
-    const closeMenu = () => {
-      try {
-        if (dispatchClickSequence(button)) {
-          lastPointerClick = performance.now();
-          return;
-        }
-      } catch {}
+    const dispatchEscape = () => {
       try {
         document.dispatchEvent(
           new KeyboardEvent('keydown', {
@@ -137,39 +207,54 @@ function buildModelSelectionExpression(
         );
       } catch {}
     };
-
-    const getButtonLabel = () => (button.textContent ?? '').trim();
-    if (MODEL_STRATEGY === 'current') {
-      return { status: 'already-selected', label: getButtonLabel() };
-    }
-    const buttonMatchesTarget = () => {
-      const normalizedLabel = normalizeText(getButtonLabel());
-      if (!normalizedLabel) return false;
-      if (desiredVersion) {
-        if (desiredVersion === '5-4' && !normalizedLabel.includes('5 4')) return false;
-        if (desiredVersion === '5-2' && !normalizedLabel.includes('5 2')) return false;
-        if (desiredVersion === '5-1' && !normalizedLabel.includes('5 1')) return false;
-        if (desiredVersion === '5-0' && !normalizedLabel.includes('5 0')) return false;
-      }
-      if (wantsPro && !normalizedLabel.includes(' pro')) return false;
-      if (wantsInstant && !normalizedLabel.includes('instant')) return false;
-      if (wantsThinking && !normalizedLabel.includes('thinking')) return false;
-      // Also reject if button has variants we DON'T want
-      if (!wantsPro && normalizedLabel.includes(' pro')) return false;
-      if (!wantsInstant && normalizedLabel.includes('instant')) return false;
-      if (!wantsThinking && normalizedLabel.includes('thinking')) return false;
-      return true;
-    };
-
-    if (buttonMatchesTarget()) {
-      return { status: 'already-selected', label: getButtonLabel() };
-    }
-
     let lastPointerClick = 0;
     const pointerClick = () => {
+      dispatchEscape();
       if (dispatchClickSequence(button)) {
         lastPointerClick = performance.now();
       }
+    };
+
+    const closeMenu = () => {
+      try {
+        if (dispatchClickSequence(button)) {
+          lastPointerClick = performance.now();
+          return;
+        }
+      } catch {}
+      dispatchEscape();
+    };
+
+    const getButtonLabelCandidates = () => {
+      const values = [
+        button.textContent ?? '',
+        button.getAttribute('aria-label') ?? '',
+        button.getAttribute('title') ?? '',
+        button.getAttribute('data-model') ?? '',
+        button.getAttribute('data-value') ?? '',
+      ]
+        .map((value) => value.trim())
+        .filter(Boolean);
+      return Array.from(new Set(values));
+    };
+    const getButtonLabel = () => getButtonLabelCandidates()[0] ?? '';
+    const buttonCandidateMatchesTarget = (candidate, testId) => {
+      if (!optionMatchesTarget(candidate, testId)) {
+        return false;
+      }
+      if (!desiredVersion) {
+        return true;
+      }
+      const candidateVersion = detectCandidateVersion(normalizeText(candidate), (testId ?? '').toLowerCase());
+      // A bare button label like "Pro" is ambiguous across versions; defer to selected menu option checks.
+      if (!candidateVersion) {
+        return false;
+      }
+      return candidateVersion === desiredVersion;
+    };
+    const buttonMatchesTarget = () => {
+      const testId = button.getAttribute('data-testid') ?? '';
+      return getButtonLabelCandidates().some((candidate) => buttonCandidateMatchesTarget(candidate, testId));
     };
 
     const getOptionLabel = (node) => node?.textContent?.trim() ?? '';
@@ -194,6 +279,92 @@ function buildModelSelectionExpression(
       }
       return false;
     };
+    const isVisibleMenuRoot = (root) => {
+      if (!(root instanceof HTMLElement)) {
+        return false;
+      }
+      const rect = root.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+      const style = window.getComputedStyle(root);
+      return style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const rootDistanceFromButton = (root) => {
+      if (!(root instanceof HTMLElement)) {
+        return Number.POSITIVE_INFINITY;
+      }
+      const buttonRect = button.getBoundingClientRect();
+      const rootRect = root.getBoundingClientRect();
+      const buttonCenterX = buttonRect.left + buttonRect.width / 2;
+      const buttonCenterY = buttonRect.top + buttonRect.height / 2;
+      const rootCenterX = rootRect.left + rootRect.width / 2;
+      const rootCenterY = rootRect.top + rootRect.height / 2;
+      return Math.hypot(rootCenterX - buttonCenterX, rootCenterY - buttonCenterY);
+    };
+    const getAssociatedMenuRoots = () => {
+      const menuRoots = Array.from(document.querySelectorAll(${menuContainerLiteral})).filter((root) =>
+        isVisibleMenuRoot(root),
+      );
+      const controlledId = button.getAttribute('aria-controls') ?? '';
+      const buttonId = button.id ?? '';
+      const associatedVisibleRoots = menuRoots.filter((root) => {
+        const rootId = root.id ?? '';
+        const labelledBy = (root.getAttribute('aria-labelledby') ?? '').split(/\\s+/).filter(Boolean);
+        if (controlledId && rootId === controlledId) {
+          return true;
+        }
+        if (buttonId && labelledBy.includes(buttonId)) {
+          return true;
+        }
+        return false;
+      });
+      if (associatedVisibleRoots.length > 0) {
+        return associatedVisibleRoots;
+      }
+      const nearestVisibleRoot = menuRoots
+        .slice()
+        .sort((left, right) => rootDistanceFromButton(left) - rootDistanceFromButton(right))[0];
+      return nearestVisibleRoot ? [nearestVisibleRoot] : [];
+    };
+    const collectOptionNodes = () => {
+      const menuRoots = getAssociatedMenuRoots();
+      const scoped = menuRoots.flatMap((root) => Array.from(root.querySelectorAll(${menuItemLiteral})));
+      const fallback = Array.from(document.querySelectorAll(${menuItemLiteral}));
+      const source = scoped.length > 0 ? scoped : fallback;
+      return Array.from(new Set(source.filter((node) => node instanceof HTMLElement)));
+    };
+    const findSelectedOption = () => {
+      let selected = null;
+      for (const option of collectOptionNodes()) {
+        if (!optionIsSelected(option)) {
+          continue;
+        }
+        const label = getOptionLabel(option);
+        const testid = option.getAttribute('data-testid') ?? '';
+        if (optionMatchesTarget(label, testid)) {
+          return { node: option, label, testid };
+        }
+        if (!selected) {
+          selected = { node: option, label, testid };
+        }
+      }
+      return selected;
+    };
+    const resolveCurrentSelectionLabel = () => {
+      const selected = findSelectedOption();
+      if (selected?.label) {
+        return selected.label;
+      }
+      return getButtonLabel();
+    };
+    const selectionMatchesTarget = () => {
+      const selected = findSelectedOption();
+      if (selected) {
+        return optionMatchesTarget(selected.label, selected.testid);
+      }
+      return buttonMatchesTarget();
+    };
 
     const scoreOption = (normalizedText, testid) => {
       // Assign a score to every node so we can pick the most likely match without brittle equality checks.
@@ -202,34 +373,15 @@ function buildModelSelectionExpression(
       }
       let score = 0;
       const normalizedTestId = (testid ?? '').toLowerCase();
+      if (optionMatchesTarget(normalizedText, normalizedTestId)) {
+        score += 600;
+        if (normalizedText === 'pro' || normalizedText === 'thinking' || normalizedText === 'instant') {
+          score += 400;
+        }
+      }
       if (normalizedTestId) {
         if (desiredVersion) {
-          // data-testid strings have been observed with both dotted and dashed versions (e.g. gpt-5.2-pro vs gpt-5-2-pro).
-          const has52 =
-            normalizedTestId.includes('5-2') ||
-            normalizedTestId.includes('5.2') ||
-            normalizedTestId.includes('gpt-5-2') ||
-            normalizedTestId.includes('gpt-5.2') ||
-            normalizedTestId.includes('gpt52');
-          const has54 =
-            normalizedTestId.includes('5-4') ||
-            normalizedTestId.includes('5.4') ||
-            normalizedTestId.includes('gpt-5-4') ||
-            normalizedTestId.includes('gpt-5.4') ||
-            normalizedTestId.includes('gpt54');
-          const has51 =
-            normalizedTestId.includes('5-1') ||
-            normalizedTestId.includes('5.1') ||
-            normalizedTestId.includes('gpt-5-1') ||
-            normalizedTestId.includes('gpt-5.1') ||
-            normalizedTestId.includes('gpt51');
-          const has50 =
-            normalizedTestId.includes('5-0') ||
-            normalizedTestId.includes('5.0') ||
-            normalizedTestId.includes('gpt-5-0') ||
-            normalizedTestId.includes('gpt-5.0') ||
-            normalizedTestId.includes('gpt50');
-          const candidateVersion = has54 ? '5-4' : has52 ? '5-2' : has51 ? '5-1' : has50 ? '5-0' : null;
+          const candidateVersion = detectCandidateVersion('', normalizedTestId);
           // If a candidate advertises a different version, ignore it entirely.
           if (candidateVersion && candidateVersion !== desiredVersion) {
             return 0;
@@ -283,26 +435,26 @@ function buildModelSelectionExpression(
       }
       // If the caller didn't explicitly ask for Pro, prefer non-Pro options when both exist.
       if (wantsPro) {
-        if (!normalizedText.includes(' pro')) {
+        if (!hasVariant(normalizedText, normalizedTestId, 'pro')) {
           score -= 80;
         }
-      } else if (normalizedText.includes(' pro')) {
+      } else if (hasVariant(normalizedText, normalizedTestId, 'pro')) {
         score -= 40;
       }
       // Similarly for Thinking variant
       if (wantsThinking) {
-        if (!normalizedText.includes('thinking') && !normalizedTestId.includes('thinking')) {
+        if (!hasVariant(normalizedText, normalizedTestId, 'thinking')) {
           score -= 80;
         }
-      } else if (normalizedText.includes('thinking') || normalizedTestId.includes('thinking')) {
+      } else if (hasVariant(normalizedText, normalizedTestId, 'thinking')) {
         score -= 40;
       }
       // Similarly for Instant variant
       if (wantsInstant) {
-        if (!normalizedText.includes('instant') && !normalizedTestId.includes('instant')) {
+        if (!hasVariant(normalizedText, normalizedTestId, 'instant')) {
           score -= 80;
         }
-      } else if (normalizedText.includes('instant') || normalizedTestId.includes('instant')) {
+      } else if (hasVariant(normalizedText, normalizedTestId, 'instant')) {
         score -= 40;
       }
       return Math.max(score, 0);
@@ -311,24 +463,38 @@ function buildModelSelectionExpression(
     const findBestOption = () => {
       // Walk through every menu item and keep whichever earns the highest score.
       let bestMatch = null;
-      const menus = Array.from(document.querySelectorAll(${menuContainerLiteral}));
-      for (const menu of menus) {
-        const buttons = Array.from(menu.querySelectorAll(${menuItemLiteral}));
-        for (const option of buttons) {
-          const text = option.textContent ?? '';
-          const normalizedText = normalizeText(text);
-          const testid = option.getAttribute('data-testid') ?? '';
-          const score = scoreOption(normalizedText, testid);
-          if (score <= 0) {
-            continue;
-          }
-          const label = getOptionLabel(option);
-          if (!bestMatch || score > bestMatch.score) {
-            bestMatch = { node: option, label, score, testid, normalizedText };
-          }
+      for (const option of collectOptionNodes()) {
+        const text = option.textContent ?? '';
+        const normalizedText = normalizeText(text);
+        const testid = option.getAttribute('data-testid') ?? '';
+        const score = scoreOption(normalizedText, testid);
+        if (score <= 0) {
+          continue;
+        }
+        const label = getOptionLabel(option);
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = { node: option, label, score, testid, normalizedText };
         }
       }
       return bestMatch;
+    };
+    const clickedExactVersionedOption = (match) => {
+      const normalizedTestId = (match?.testid ?? '').toLowerCase();
+      if (!desiredVersion || !normalizedTestId.startsWith('model-switcher-')) {
+        return false;
+      }
+      const candidateVersion = detectCandidateVersion('', normalizedTestId);
+      if (!candidateVersion || candidateVersion !== desiredVersion) {
+        return false;
+      }
+      if (wantsPro && !normalizedTestId.includes('pro')) return false;
+      if (wantsThinking && !normalizedTestId.includes('thinking')) return false;
+      if (wantsInstant && !normalizedTestId.includes('instant')) return false;
+      return true;
+    };
+    const usesGenericModelButton = () => {
+      const normalizedButtonLabel = normalizeText(getButtonLabel());
+      return normalizedButtonLabel === 'chatgpt';
     };
 
     return new Promise((resolve) => {
@@ -345,7 +511,7 @@ function buildModelSelectionExpression(
         return body.includes('temporary chat');
       };
       const collectAvailableOptions = () => {
-        const menuRoots = Array.from(document.querySelectorAll(${menuContainerLiteral}));
+        const menuRoots = getAssociatedMenuRoots();
         const nodes = menuRoots.length > 0
           ? menuRoots.flatMap((root) => Array.from(root.querySelectorAll(${menuItemLiteral})))
           : Array.from(document.querySelectorAll(${menuItemLiteral}));
@@ -355,29 +521,86 @@ function buildModelSelectionExpression(
           .filter((label, index, arr) => arr.indexOf(label) === index);
         return labels.slice(0, 12);
       };
+      const collectMenuLabels = () => collectAvailableOptions().map((label) => normalizeText(label));
+      const looksLikeThinkingTimeMenu = () => {
+        const labels = collectMenuLabels();
+        return labels.includes('standard') && labels.includes('extended');
+      };
+      const pickThinkingTimeFallback = () => {
+        const optionNodes = collectOptionNodes();
+        const fallback =
+          optionNodes.find((node) => normalizeText(getOptionLabel(node)) === 'standard') ??
+          optionNodes.find((node) => normalizeText(getOptionLabel(node)).includes('standard'));
+        if (!fallback) {
+          return null;
+        }
+        dispatchClickSequence(fallback);
+        return true;
+      };
       const ensureMenuOpen = () => {
-        const menuOpen = document.querySelector('[role="menu"], [data-radix-collection-root]');
+        const menuOpen = getAssociatedMenuRoots().length > 0;
         if (!menuOpen && performance.now() - lastPointerClick > REOPEN_INTERVAL_MS) {
           pointerClick();
         }
       };
 
-      // Open once and wait a tick before first scan.
-      pointerClick();
       const openDelay = () => new Promise((r) => setTimeout(r, INITIAL_WAIT_MS));
       let initialized = false;
+      let lastClickedSignature = '';
+      let repeatedTargetClicks = 0;
+      if (MODEL_STRATEGY === 'current') {
+        const label = getButtonLabel();
+        if (label) {
+          resolve({ status: 'already-selected', label });
+          return;
+        }
+      } else if (buttonMatchesTarget()) {
+        resolve({ status: 'already-selected', label: getButtonLabel() || PRIMARY_LABEL });
+        return;
+      }
+      if (getAssociatedMenuRoots().length === 0) {
+        // Open once only when the model menu is not already visible.
+        pointerClick();
+      }
       const attempt = async () => {
         if (!initialized) {
           initialized = true;
           await openDelay();
         }
         ensureMenuOpen();
+        if (MODEL_STRATEGY === 'current') {
+          const label = resolveCurrentSelectionLabel();
+          if (label) {
+            closeMenu();
+            resolve({ status: 'already-selected', label });
+            return;
+          }
+          if (performance.now() - start > MAX_WAIT_MS) {
+            closeMenu();
+            resolve({ status: 'already-selected', label: getButtonLabel() });
+            return;
+          }
+          setTimeout(attempt, REOPEN_INTERVAL_MS / 2);
+          return;
+        }
+        if (selectionMatchesTarget()) {
+          closeMenu();
+          resolve({ status: 'already-selected', label: resolveCurrentSelectionLabel() });
+          return;
+        }
         const match = findBestOption();
         if (match) {
           if (optionIsSelected(match.node)) {
             closeMenu();
-            resolve({ status: 'already-selected', label: getButtonLabel() || match.label });
+            resolve({ status: 'already-selected', label: resolveCurrentSelectionLabel() || match.label });
             return;
+          }
+          const signature = ((match.testid ?? '').toLowerCase()) + '|' + normalizeText(match.label);
+          if (signature && signature === lastClickedSignature) {
+            repeatedTargetClicks += 1;
+          } else {
+            lastClickedSignature = signature;
+            repeatedTargetClicks = 1;
           }
           dispatchClickSequence(match.node);
           // Submenus (e.g. "Legacy models") need a second pass to pick the actual model option.
@@ -389,9 +612,36 @@ function buildModelSelectionExpression(
           }
           // Wait for the top bar label to reflect the requested model; otherwise keep scanning.
           setTimeout(() => {
+            if (selectionMatchesTarget()) {
+              closeMenu();
+              resolve({ status: 'switched', label: resolveCurrentSelectionLabel() || match.label });
+              return;
+            }
             if (buttonMatchesTarget()) {
               closeMenu();
-              resolve({ status: 'switched', label: getButtonLabel() || match.label });
+              resolve({ status: 'switched', label: resolveCurrentSelectionLabel() || match.label });
+              return;
+            }
+            if ((wantsPro || wantsThinking) && looksLikeThinkingTimeMenu()) {
+              if (pickThinkingTimeFallback()) {
+                setTimeout(attempt, Math.max(120, INITIAL_WAIT_MS));
+                return;
+              }
+            }
+            if (
+              clickedExactVersionedOption(match) &&
+              usesGenericModelButton() &&
+              getAssociatedMenuRoots().length === 0
+            ) {
+              resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });
+              return;
+            }
+            if (repeatedTargetClicks >= 2) {
+              closeMenu();
+              resolve({
+                status: 'option-not-found',
+                hint: { temporaryChat: detectTemporaryChat(), availableOptions: collectAvailableOptions() },
+              });
               return;
             }
             attempt();
@@ -414,6 +664,152 @@ function buildModelSelectionExpression(
 
 export function buildModelMatchersLiteralForTest(targetModel: string) {
   return buildModelMatchersLiteral(targetModel);
+}
+
+export function modelCandidateMatchesTargetForTest(
+  targetModel: string,
+  label: string,
+  testId = "",
+): boolean {
+  return candidateMatchesTarget(buildModelTargetTraits(targetModel), label, testId);
+}
+
+function normalizeModelText(value: string | null | undefined): string {
+  if (!value) {
+    return "";
+  }
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectModelVersion(text: string, testId = ""): ModelVersion | null {
+  const normalizedText = normalizeModelText(text);
+  const normalizedTestId = testId.toLowerCase();
+  const combined = [normalizedText, normalizedTestId].filter(Boolean).join(" ");
+  if (
+    combined.includes("5 4") ||
+    combined.includes("5-4") ||
+    combined.includes("5.4") ||
+    combined.includes("gpt54")
+  ) {
+    return "5-4";
+  }
+  if (
+    combined.includes("5 2") ||
+    combined.includes("5-2") ||
+    combined.includes("5.2") ||
+    combined.includes("gpt52")
+  ) {
+    return "5-2";
+  }
+  if (
+    combined.includes("5 1") ||
+    combined.includes("5-1") ||
+    combined.includes("5.1") ||
+    combined.includes("gpt51")
+  ) {
+    return "5-1";
+  }
+  if (
+    combined.includes("5 0") ||
+    combined.includes("5-0") ||
+    combined.includes("5.0") ||
+    combined.includes("gpt50")
+  ) {
+    return "5-0";
+  }
+  return null;
+}
+
+function hasVariantWord(text: string, testId: string, variant: "pro" | "thinking" | "instant") {
+  const normalizedText = normalizeModelText(text);
+  return normalizedText.split(" ").includes(variant) || testId.toLowerCase().includes(variant);
+}
+
+function buildModelTargetTraits(targetModel: string, labelTokens?: string[]): ModelTargetTraits {
+  const normalizedTarget = normalizeModelText(targetModel);
+  const normalizedTokens = Array.from(
+    new Set([
+      normalizedTarget,
+      ...(labelTokens ?? buildModelMatchersLiteral(targetModel).labelTokens),
+    ]),
+  )
+    .map((token) => normalizeModelText(token))
+    .filter(Boolean);
+  return {
+    normalizedTarget,
+    normalizedTokens,
+    targetWords: normalizedTarget.split(" ").filter(Boolean),
+    desiredVersion: detectModelVersion(normalizedTarget),
+    wantsPro:
+      normalizedTarget.split(" ").includes("pro") ||
+      normalizedTokens.some((token) => token === "pro"),
+    wantsInstant: normalizedTarget.split(" ").includes("instant"),
+    wantsThinking: normalizedTarget.split(" ").includes("thinking"),
+  };
+}
+
+function candidateMatchesTarget(
+  traits: ModelTargetTraits,
+  label: string | null | undefined,
+  testId = "",
+): boolean {
+  const normalizedLabel = normalizeModelText(label);
+  const normalizedTestId = testId.toLowerCase();
+  if (!normalizedLabel && !normalizedTestId) {
+    return false;
+  }
+  const candidateVersion = detectModelVersion(normalizedLabel, normalizedTestId);
+  if (traits.desiredVersion && candidateVersion && candidateVersion !== traits.desiredVersion) {
+    return false;
+  }
+  const hasPro = hasVariantWord(normalizedLabel, normalizedTestId, "pro");
+  const hasThinking = hasVariantWord(normalizedLabel, normalizedTestId, "thinking");
+  const hasInstant = hasVariantWord(normalizedLabel, normalizedTestId, "instant");
+  if (traits.wantsPro && !hasPro) return false;
+  if (traits.wantsThinking && !hasThinking) return false;
+  if (traits.wantsInstant && !hasInstant) return false;
+  if (!traits.wantsPro && hasPro) return false;
+  if (!traits.wantsThinking && hasThinking) return false;
+  if (!traits.wantsInstant && hasInstant) return false;
+  if (!normalizedLabel) {
+    return Boolean(candidateVersion && candidateVersion === traits.desiredVersion);
+  }
+  if (candidateVersion && candidateVersion === traits.desiredVersion) {
+    return true;
+  }
+  if (normalizedLabel === traits.normalizedTarget) {
+    return true;
+  }
+  if (
+    traits.normalizedTarget &&
+    (normalizedLabel.startsWith(traits.normalizedTarget) ||
+      normalizedLabel.includes(traits.normalizedTarget))
+  ) {
+    return true;
+  }
+  if (
+    traits.targetWords.length > 1 &&
+    traits.targetWords.every((word) => normalizedLabel.includes(word))
+  ) {
+    return true;
+  }
+  if (traits.normalizedTokens.some((token) => token && normalizedLabel.includes(token))) {
+    return true;
+  }
+  if (traits.desiredVersion && !candidateVersion) {
+    if (traits.wantsPro && normalizedLabel === "pro") return true;
+    if (traits.wantsThinking && normalizedLabel === "thinking") return true;
+    if (traits.wantsInstant && normalizedLabel === "instant") return true;
+  }
+  return Boolean(
+    !traits.desiredVersion &&
+    candidateVersion === null &&
+    normalizedLabel === traits.normalizedTarget,
+  );
 }
 
 function buildModelMatchersLiteral(targetModel: string): {

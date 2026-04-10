@@ -17,6 +17,16 @@ describe("browser automation expressions", () => {
     expect(expression).toContain(JSON.stringify(ASSISTANT_ROLE_SELECTOR));
   });
 
+  test("assistant extractor aggregates top-level content roots instead of stopping at the first block", () => {
+    const expression = buildAssistantExtractorForTest("capture");
+    expect(expression).toContain("const CONTENT_SELECTOR");
+    expect(expression).toContain("const topLevelRoots = uniqueRoots.filter");
+    expect(expression).toContain("aggregatedRoots.map((payload) => payload.text).join('\\n\\n')");
+    expect(expression).toContain(
+      "const candidateScore = candidate.text.length + candidate.rank * 32",
+    );
+  });
+
   test("conversation debug expression references conversation selector", () => {
     const expression = buildConversationDebugExpressionForTest();
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
@@ -43,6 +53,8 @@ describe("browser automation expressions", () => {
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
     expect(expression).toContain(ASSISTANT_ROLE_SELECTOR);
     expect(expression).toContain("isAssistantTurn");
+    expect(expression).toContain("isAssistantButton");
     expect(expression).toContain("copy-turn-action-button");
+    expect(expression).toContain("return null;");
   });
 });

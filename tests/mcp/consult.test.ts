@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { SessionModelRun } from "../../src/sessionStore.js";
+import { consultInputSchema } from "../../src/mcp/types.ts";
 import {
   buildConsultBrowserConfig,
   summarizeModelRunsForConsult,
@@ -93,5 +94,88 @@ describe("summarizeModelRunsForConsult", () => {
       desiredModel: "Claude Sonnet",
       cookieSync: false,
     });
+  });
+
+  test("respects manual-login cookie sync when configured", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {
+        browser: {
+          manualLogin: true,
+          manualLoginCookieSync: true,
+          manualLoginProfileDir: "/tmp/oracle-profile",
+        },
+      },
+      env: {},
+      runModel: "gpt-5.4-pro",
+      inputModel: "gpt-5.4-pro",
+    });
+
+    expect(config).toMatchObject({
+      manualLogin: true,
+      manualLoginCookieSync: true,
+      manualLoginProfileDir: "/tmp/oracle-profile",
+      cookieSync: true,
+    });
+  });
+
+  test("keeps canonical GPT browser targets when the input model is an alias", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.4-pro",
+      inputModel: "gpt-5-pro",
+    });
+
+    expect(config.desiredModel).toBe("GPT-5.4 Pro");
+  });
+
+  test("prefers an explicit GPT browser label override when provided", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.4-pro",
+      inputModel: "gpt-5.4-pro",
+      browserModelLabel: "Pro",
+    });
+
+    expect(config.desiredModel).toBe("Pro");
+  });
+
+  test("passes through an explicit browser model strategy", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.4",
+      inputModel: "gpt-5.4",
+      browserModelStrategy: "current",
+    });
+
+    expect(config.modelStrategy).toBe("current");
+  });
+
+  test("accepts browser model strategy through the public consult schema", () => {
+    const parsed = consultInputSchema.parse({
+      prompt: "hi",
+      engine: "browser",
+      browserModelStrategy: "ignore",
+    });
+
+    expect(parsed.browserModelStrategy).toBe("ignore");
+  });
+
+  test("rejects select-mode Pro targeting in Temporary Chat", () => {
+    expect(() =>
+      buildConsultBrowserConfig({
+        userConfig: {
+          browser: {
+            chatgptUrl: "https://chatgpt.com/?temporary-chat=true",
+          },
+        },
+        env: {},
+        runModel: "gpt-5.4-pro",
+        inputModel: "gpt-5.4-pro",
+        browserModelStrategy: "select",
+      }),
+    ).toThrow(/Temporary Chat mode does not expose Pro models/);
   });
 });

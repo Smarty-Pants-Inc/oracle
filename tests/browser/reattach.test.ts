@@ -122,7 +122,7 @@ describe("resumeBrowserSession", () => {
       }
       return { result: { value: null } };
     });
-    const connect = vi.fn(
+    const connectMock = vi.fn(
       async () =>
         ({
           Runtime: { enable: vi.fn(), evaluate },
@@ -130,7 +130,8 @@ describe("resumeBrowserSession", () => {
           Input: {},
           close: vi.fn(async () => {}),
         }) satisfies FakeClient,
-    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    );
+    const connect = connectMock as unknown as (options?: unknown) => Promise<ChromeClient>;
     const waitForAssistantResponse = vi.fn(async () => ({
       text: "attached",
       html: "",
@@ -154,6 +155,70 @@ describe("resumeBrowserSession", () => {
     expect(result.answerMarkdown).toBe("attached-md");
     expect(listTargets).toHaveBeenCalled();
     expect(connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: "ws://127.0.0.1:9222/devtools/browser/abc",
+        local: true,
+      }),
+    );
+  });
+
+  test("falls back to the default devtools target when websocket metadata has no matched tab", async () => {
+    const runtime = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const listTargets = vi.fn(async () => [] satisfies FakeTarget[]) as unknown as () => Promise<
+      FakeTarget[]
+    >;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        return { result: { value: runtime.tabUrl } };
+      }
+      if (expression === "1+1") {
+        return { result: { value: 2 } };
+      }
+      return { result: { value: null } };
+    });
+    const connectMock = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          Input: {},
+          close: vi.fn(async () => {}),
+        }) satisfies FakeClient,
+    );
+    const connect = connectMock as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "attached",
+      html: "",
+      meta: { messageId: "m1", turnId: "conversation-turn-1" },
+    }));
+    const captureAssistantMarkdown = vi.fn(async () => "attached-md");
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { attachRunning: true, timeoutMs: 2_000 },
+      logger,
+      {
+        listTargets,
+        connect,
+        waitForAssistantResponse,
+        captureAssistantMarkdown,
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("attached-md");
+    expect(connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        host: "127.0.0.1",
+        port: 9222,
+      }),
+    );
+    expect(connect).not.toHaveBeenCalledWith(
       expect.objectContaining({
         target: "ws://127.0.0.1:9222/devtools/browser/abc",
         local: true,
@@ -321,6 +386,323 @@ describe("resumeBrowserSession", () => {
     expect(result.answerMarkdown).toBe("supervisor markdown");
     expect(result.runtime?.conversationId).toBe("abc");
   });
+
+  test("guards an existing hidden chrome follow-up before reconnecting and sending", async () => {
+    vi.resetModules();
+    const frontmostTarget = { name: "Zed", pid: 77 };
+    const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
+    const hideChromeWindow = vi.fn(async () => {});
+    const startChromeFocusGuard = vi.fn(() => vi.fn());
+    vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
+        "../../src/browser/chromeLifecycle.js",
+      );
+      return {
+        ...original,
+        captureFrontmostProcess,
+        hideChromeWindow,
+        startChromeFocusGuard,
+      };
+    });
+
+    const { continueBrowserSession: guardedContinueBrowserSession } =
+      await import("../../src/browser/reattach.js");
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/abc",
+      conversationId: "abc",
+    };
+    const listTargets = vi.fn(
+      async () =>
+        [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
+    ) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        return { result: { value: runtime.tabUrl } };
+      }
+      if (expression === "1+1") {
+        return { result: { value: 2 } };
+      }
+      return { result: { value: null } };
+    });
+    const connectMock = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          Input: {},
+          close: vi.fn(async () => {}),
+        }) satisfies FakeClient,
+    );
+    const connect = connectMock as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const ensurePromptReady = vi.fn(async () => {});
+    const clearPromptComposer = vi.fn(async () => {});
+    const submitPrompt = vi.fn(async () => 3);
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "supervisor response",
+      html: "",
+      meta: { messageId: "m2", turnId: "conversation-turn-2" },
+    }));
+    const captureAssistantMarkdown = vi.fn(async () => "supervisor markdown");
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await guardedContinueBrowserSession(
+      runtime,
+      { hideWindow: true, timeoutMs: 2_000, inputTimeoutMs: 1_000, modelStrategy: "ignore" },
+      logger,
+      { prompt: "Follow up on the implementation." },
+      {
+        listTargets,
+        connect,
+        ensurePromptReady,
+        clearPromptComposer,
+        submitPrompt,
+        waitForAssistantResponse,
+        captureAssistantMarkdown,
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("supervisor markdown");
+    expect(captureFrontmostProcess).toHaveBeenCalledWith(logger);
+    expect(hideChromeWindow).toHaveBeenCalledTimes(2);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(1, { pid: 4242 }, logger, frontmostTarget);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, { pid: 4242 }, logger);
+    expect(startChromeFocusGuard).toHaveBeenCalledWith({ pid: 4242 }, logger, frontmostTarget);
+    expect(hideChromeWindow.mock.invocationCallOrder[0]).toBeLessThan(
+      connectMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  test("recovers a follow-up answer after a transient thinking scaffold", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "target-1",
+        tabUrl: "https://chatgpt.com/c/abc",
+        conversationId: "abc",
+      };
+      const listTargets = vi.fn(
+        async () =>
+          [
+            { targetId: "target-1", type: "page", url: runtime.tabUrl },
+            { targetId: "target-2", type: "page", url: "about:blank" },
+          ] satisfies FakeTarget[],
+      ) as unknown as () => Promise<FakeTarget[]>;
+      let snapshotCalls = 0;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "location.href") {
+          return { result: { value: runtime.tabUrl } };
+        }
+        if (expression === "1+1") {
+          return { result: { value: 2 } };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          snapshotCalls += 1;
+          if (snapshotCalls < 3) {
+            return {
+              result: {
+                value: {
+                  text: "Thinking",
+                  html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+                  messageId: "m-thinking",
+                  turnId: "conversation-turn-2",
+                },
+              },
+            };
+          }
+          return {
+            result: {
+              value: {
+                text: "ORACLE-E2E-20260401-A",
+                html: "<p>ORACLE-E2E-20260401-A</p>",
+                messageId: "m-final",
+                turnId: "conversation-turn-2",
+              },
+            },
+          };
+        }
+        return { result: { value: null } };
+      });
+      const connect = vi.fn(
+        async () =>
+          ({
+            Runtime: { enable: vi.fn(), evaluate },
+            DOM: { enable: vi.fn() },
+            Input: {},
+            close: vi.fn(async () => {}),
+          }) satisfies FakeClient,
+      ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+      const ensurePromptReady = vi.fn(async () => {});
+      const clearPromptComposer = vi.fn(async () => {});
+      const submitPrompt = vi.fn(async () => 3);
+      const waitForAssistantResponse = vi.fn(async () => ({
+        text: "Thinking",
+        html: "",
+        meta: { messageId: "m-thinking", turnId: "conversation-turn-2" },
+      }));
+      const captureAssistantMarkdown = vi
+        .fn()
+        .mockResolvedValueOnce("Thinking")
+        .mockResolvedValueOnce("ORACLE-E2E-20260401-A");
+      const logger = vi.fn() as BrowserLogger;
+
+      const promise = continueBrowserSession(
+        runtime,
+        { timeoutMs: 2_000, inputTimeoutMs: 1_000 },
+        logger,
+        { prompt: "Follow up on the implementation." },
+        {
+          listTargets,
+          connect,
+          ensurePromptReady,
+          clearPromptComposer,
+          submitPrompt,
+          waitForAssistantResponse,
+          captureAssistantMarkdown,
+        },
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await promise;
+
+      expect(result.answerText).toBe("ORACLE-E2E-20260401-A");
+      expect(result.answerMarkdown).toBe("ORACLE-E2E-20260401-A");
+      expect(captureAssistantMarkdown).toHaveBeenCalledTimes(2);
+      expect(logger).toHaveBeenCalledWith(
+        "Recovered follow-up assistant response after transient thinking scaffold",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("refreshes a partial follow-up answer when later snapshot expands to the full control payload", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "target-1",
+        tabUrl: "https://chatgpt.com/c/abc",
+        conversationId: "abc",
+      };
+      const listTargets = vi.fn(
+        async () =>
+          [
+            { targetId: "target-1", type: "page", url: runtime.tabUrl },
+            { targetId: "target-2", type: "page", url: "about:blank" },
+          ] satisfies FakeTarget[],
+      ) as unknown as () => Promise<FakeTarget[]>;
+      const partialAnswer =
+        "I’m sending a minimal orchestrator round-trip now: a simple 2+2 task with an explicit return, and I’ll only confirm success once the result comes back here.";
+      const fullAnswer = `${partialAnswer}
+
+Starting the minimal loop test now. I am not treating it as proven until the orchestrator returns a result from the delegated task.
+
+\`\`\`oracle_control
+{"op":"handoff","message":"Run a minimal orchestrator round-trip test.","message_for_user":"Starting a minimal orchestrator round-trip test now.","workflow_version":0,"status":"in_progress"}
+\`\`\``;
+      let snapshotCalls = 0;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "location.href") {
+          return { result: { value: runtime.tabUrl } };
+        }
+        if (expression === "1+1") {
+          return { result: { value: 2 } };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          snapshotCalls += 1;
+          return {
+            result: {
+              value:
+                snapshotCalls < 3
+                  ? {
+                      text: partialAnswer,
+                      html: `<p>${partialAnswer}</p>`,
+                      messageId: "m-partial",
+                      turnId: "conversation-turn-2",
+                    }
+                  : {
+                      text: fullAnswer,
+                      html: "<div>expanded</div>",
+                      messageId: "m-final",
+                      turnId: "conversation-turn-2",
+                    },
+            },
+          };
+        }
+        if (expression.includes("document.querySelectorAll(")) {
+          return { result: { value: 3 } };
+        }
+        return { result: { value: null } };
+      });
+      const connect = vi.fn(
+        async () =>
+          ({
+            Runtime: { enable: vi.fn(), evaluate },
+            DOM: { enable: vi.fn() },
+            Input: {},
+            close: vi.fn(async () => {}),
+          }) satisfies FakeClient,
+      ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+      const ensurePromptReady = vi.fn(async () => {});
+      const clearPromptComposer = vi.fn(async () => {});
+      const submitPrompt = vi.fn(async () => 3);
+      const waitForAssistantResponse = vi.fn(async () => ({
+        text: partialAnswer,
+        html: `<p>${partialAnswer}</p>`,
+        meta: { messageId: "m-partial", turnId: "conversation-turn-2" },
+      }));
+      const captureAssistantMarkdown = vi
+        .fn()
+        .mockResolvedValueOnce(partialAnswer)
+        .mockResolvedValueOnce(fullAnswer);
+      const logger = vi.fn() as BrowserLogger;
+
+      const promise = continueBrowserSession(
+        runtime,
+        { timeoutMs: 3_000, inputTimeoutMs: 1_000 },
+        logger,
+        { prompt: "Follow up on the implementation." },
+        {
+          listTargets,
+          connect,
+          ensurePromptReady,
+          clearPromptComposer,
+          submitPrompt,
+          waitForAssistantResponse,
+          captureAssistantMarkdown,
+        },
+      );
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await promise;
+
+      expect(result.answerText).toBe(fullAnswer);
+      expect(result.answerMarkdown).toBe(fullAnswer);
+      expect(captureAssistantMarkdown).toHaveBeenCalledTimes(2);
+      expect(captureAssistantMarkdown).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        { messageId: "m-partial", turnId: "conversation-turn-2" },
+        logger,
+        2,
+      );
+      expect(captureAssistantMarkdown).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        { messageId: "m-final", turnId: "conversation-turn-2" },
+        logger,
+        2,
+      );
+      expect(logger).toHaveBeenCalledWith("Recovered expanded assistant response during reattach");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
 
   test("applies model selection and thinking time before follow-up submission", async () => {
     const runtime = {

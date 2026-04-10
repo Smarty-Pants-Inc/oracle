@@ -70,4 +70,84 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("key: 'Escape'");
     expect(expression).toContain("closeMenu();");
   });
+
+  it("inspects the selected picker option instead of trusting the top bar label", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const findSelectedOption = () =>");
+    expect(expression).toContain("const resolveCurrentSelectionLabel = () =>");
+    expect(expression).toContain("selectionMatchesTarget()");
+  });
+
+  it("uses button metadata and caps repeated target clicks to avoid picker thrash", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const getButtonLabelCandidates = () =>");
+    expect(expression).toContain("button.getAttribute('aria-label')");
+    expect(expression).toContain("let repeatedTargetClicks = 0;");
+    expect(expression).toContain("repeatedTargetClicks >= 2");
+  });
+
+  it("returns early when the button already matches the requested model", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("} else if (buttonMatchesTarget()) {");
+    expect(expression).toContain(
+      "resolve({ status: 'already-selected', label: getButtonLabel() || PRIMARY_LABEL });",
+    );
+  });
+
+  it("does not blindly click the picker when the menu is already visible", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("if (getAssociatedMenuRoots().length === 0) {");
+    expect(expression).toContain("// Open once only when the model menu is not already visible.");
+  });
+
+  it("requires explicit version evidence before trusting top-bar shorthand labels", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const buttonCandidateMatchesTarget = (candidate, testId) =>");
+    expect(expression).toContain("if (!desiredVersion) {");
+    expect(expression).toContain("if (!candidateVersion) {");
+    expect(expression).toContain("return candidateVersion === desiredVersion;");
+  });
+
+  it("keeps versioned button matching strict enough to reject bare shorthand labels", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("if (!candidateVersion) {");
+    expect(expression).not.toContain("buttonReflectsClickedMatch");
+  });
+
+  it("falls back to visible menu roots before scanning page-wide buttons", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const isVisibleMenuRoot = (root) => {");
+    expect(expression).toContain("const rootDistanceFromButton = (root) => {");
+    expect(expression).toContain("const menuRoots = Array.from(document.querySelectorAll(");
+    expect(expression).toContain("isVisibleMenuRoot(root)");
+    expect(expression).toContain(
+      ".sort((left, right) => rootDistanceFromButton(left) - rootDistanceFromButton(right))[0];",
+    );
+    expect(expression).toContain("return nearestVisibleRoot ? [nearestVisibleRoot] : [];");
+  });
+
+  it("handles the follow-up thinking-time chooser after selecting Pro/Thinking", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const looksLikeThinkingTimeMenu = () =>");
+    expect(expression).toContain("const pickThinkingTimeFallback = () =>");
+    expect(expression).toContain(
+      "if ((wantsPro || wantsThinking) && looksLikeThinkingTimeMenu()) {",
+    );
+    expect(expression).toContain("setTimeout(attempt, Math.max(120, INITIAL_WAIT_MS));");
+    expect(expression).not.toContain(
+      "resolve({ status: 'switched', label: match.label || fallbackThinkingTime })",
+    );
+  });
+
+  it("accepts an exact versioned picker hit when ChatGPT keeps the top button generic", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const clickedExactVersionedOption = (match) =>");
+    expect(expression).toContain("const usesGenericModelButton = () =>");
+    expect(expression).toContain("return normalizedButtonLabel === 'chatgpt';");
+    expect(expression).toContain("clickedExactVersionedOption(match) &&");
+    expect(expression).toContain("usesGenericModelButton() &&");
+    expect(expression).toContain(
+      "resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });",
+    );
+  });
 });

@@ -9,6 +9,7 @@ import {
   ensurePromptReady,
   ensureNotBlocked,
   ensureLoggedIn,
+  buildAssistantSnapshotExpressionForTest,
 } from "../../src/browser/pageActions.js";
 import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
@@ -245,7 +246,12 @@ describe("waitForAssistantResponse", () => {
     vi.useFakeTimers();
     try {
       let snapshotCalls = 0;
-      const payload = { text: "Answer", html: "<p>Answer</p>", messageId: "mid", turnId: "tid" };
+      const payload = {
+        text: "Answer payload long enough to skip the watchdog",
+        html: "<p>Answer payload long enough to skip the watchdog</p>",
+        messageId: "mid",
+        turnId: "tid",
+      };
       const evaluate = vi
         .fn()
         .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
@@ -268,7 +274,7 @@ describe("waitForAssistantResponse", () => {
       const promise = waitForAssistantResponse(runtime, 30_000, logger);
       await vi.advanceTimersByTimeAsync(2_000);
       const result = await promise;
-      expect(result.text).toBe("Answer");
+      expect(result.text).toBe("Answer payload long enough to skip the watchdog");
 
       const callsAtReturn = evaluate.mock.calls.length;
       await vi.advanceTimersByTimeAsync(5_000);
@@ -329,6 +335,331 @@ describe("waitForAssistantResponse", () => {
     const result = await waitForAssistantResponse(runtime, 200, logger);
     expect(result.text).toBe("Recovered");
     expect(evaluate).toHaveBeenCalled();
+  });
+
+  test("keeps the watchdog alive when the observer only sees placeholder text", async () => {
+    const placeholder = {
+      text: "ChatGPT said:",
+      html: "<p>ChatGPT said:</p>",
+      messageId: "mid",
+      turnId: "tid",
+    };
+    const evaluate = vi
+      .fn()
+      .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+        const expression = String(params?.expression ?? "");
+        if (params?.awaitPromise && expression.includes("MutationObserver")) {
+          return { result: { type: "object", value: placeholder } };
+        }
+        if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+          return {
+            result: {
+              value: {
+                success: true,
+                markdown: "BROKER-SMOKE-OK",
+              },
+            },
+          };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          return { result: { value: placeholder } };
+        }
+        if (expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)) {
+          return { result: { value: false } };
+        }
+        if (expression.includes("hasAssistantFinishedActions")) {
+          return { result: { value: true } };
+        }
+        return { result: { value: null } };
+      });
+    const runtime = {
+      evaluate,
+      terminateExecution: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await waitForAssistantResponse(runtime, 1_500, logger);
+
+    expect(result.text).toBe("BROKER-SMOKE-OK");
+    expect(
+      evaluate.mock.calls.some(([params]) =>
+        String((params as { expression?: string }).expression ?? "").includes(
+          "const BUTTON_SELECTOR",
+        ),
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  test("does not treat a user-turn copy button as assistant completion", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const placeholder = {
+        text: "ChatGPT said:",
+        html: "<p>ChatGPT said:</p>",
+        messageId: "mid",
+        turnId: "tid",
+      };
+      const answer = {
+        text: "BROKER-THINKING-OK",
+        html: "<p>BROKER-THINKING-OK</p>",
+        messageId: "mid-answer",
+        turnId: "tid-answer",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: placeholder } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            throw new Error("copy fallback should not be used for user-turn buttons");
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 4 ? placeholder : answer,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await promise;
+
+      expect(result.text).toBe("BROKER-THINKING-OK");
+      expect(
+        evaluate.mock.calls.some(([params]) =>
+          String((params as { expression?: string }).expression ?? "").includes(
+            "const BUTTON_SELECTOR",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not copy a stale earlier assistant turn when the current turn has no copy button yet", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const placeholder = {
+        text: "ChatGPT said:",
+        html: "<p>ChatGPT said:</p>",
+        messageId: "mid-current",
+        turnId: "tid-current",
+        turnIndex: 3,
+      };
+      const answer = {
+        text: "BROKER-FRESH-OK after enough stable cycles",
+        html: "<p>BROKER-FRESH-OK after enough stable cycles</p>",
+        messageId: "mid-answer",
+        turnId: "tid-answer",
+        turnIndex: 3,
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: placeholder } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            return {
+              result: {
+                value: {
+                  success: false,
+                  status: "missing-button",
+                },
+              },
+            };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 4 ? placeholder : answer,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: true } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger, 3);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await promise;
+
+      expect(result.text).toBe("BROKER-FRESH-OK after enough stable cycles");
+      expect(
+        evaluate.mock.calls.some(([params]) =>
+          String((params as { expression?: string }).expression ?? "").includes(
+            "const MIN_TURN_INDEX = 3",
+          ),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  test("snapshot extractor invokes the markdown fallback instead of returning the function object", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(3);
+    expect(expression).toContain("const fallback = (() => {");
+    expect(expression).toContain("return fallback() ?? extracted;");
+  });
+
+  test("waits for the watchdog when the observer returns an incomplete short answer before completion markers appear", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const earlyCapture = {
+        text: "Thinking",
+        html: "<p>Thinking</p>",
+        messageId: "mid-thinking",
+        turnId: "tid-thinking",
+      };
+      const answer = {
+        text: "ORACLE-WATCHDOG-FINAL-20260401",
+        html: "<p>ORACLE-WATCHDOG-FINAL-20260401</p>",
+        messageId: "mid-answer",
+        turnId: "tid-answer",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: earlyCapture } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            throw new Error("copy fallback should not run for incomplete early captures");
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 18 ? null : answer,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 20_000, logger);
+      await vi.advanceTimersByTimeAsync(12_000);
+      const result = await promise;
+
+      expect(result.text).toBe("ORACLE-WATCHDOG-FINAL-20260401");
+      expect(snapshotCalls).toBeGreaterThanOrEqual(18);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("ignores thinking-summary-only turns until the real assistant text appears", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const thinkingSummary = {
+        text: "ChatGPT said:\nThought for a couple of seconds",
+        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        messageId: "mid-thinking",
+        turnId: "tid-thinking",
+      };
+      const answer = {
+        text: "ORACLE-THINKING-FINAL",
+        html: "<p>ORACLE-THINKING-FINAL</p>",
+        messageId: "mid-answer",
+        turnId: "tid-answer",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: thinkingSummary } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            throw new Error("copy fallback should not be used for thinking summaries");
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 4 ? thinkingSummary : answer,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await promise;
+
+      expect(result.text).toBe("ORACLE-THINKING-FINAL");
+      expect(
+        evaluate.mock.calls.some(([params]) =>
+          String((params as { expression?: string }).expression ?? "").includes(
+            "const BUTTON_SELECTOR",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
