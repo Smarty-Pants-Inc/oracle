@@ -1,9 +1,10 @@
 import { normalizeChatgptUrl, CHATGPT_URL } from "../browserMode.js";
 import type { UserConfig } from "../config.js";
 import type { ThinkingTimeLevel } from "../oracle.js";
-import type { BrowserModelStrategy } from "../browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy } from "../browser/types.js";
 
 export interface BrowserDefaultsOptions {
+  browserLauncher?: BrowserLauncher;
   chatgptUrl?: string;
   browserUrl?: string;
   browserChromeProfile?: string;
@@ -53,6 +54,9 @@ export function applyBrowserDefaultsFromConfig(
 
   if (isUnset("browserChromeProfile") && browser.chromeProfile !== undefined) {
     options.browserChromeProfile = browser.chromeProfile ?? undefined;
+  }
+  if (isUnset("browserLauncher") && browser.launcher !== undefined) {
+    options.browserLauncher = browser.launcher;
   }
   if (isUnset("browserChromePath") && browser.chromePath !== undefined) {
     options.browserChromePath = browser.chromePath ?? undefined;

@@ -126,17 +126,35 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("return nearestVisibleRoot ? [nearestVisibleRoot] : [];");
   });
 
-  it("handles the follow-up thinking-time chooser after selecting Pro/Thinking", () => {
+  it("rejects Pro/Thinking/Instant rows when targeting the base model", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4");
+    expect(expression).toContain(
+      "const hasProVariant = hasVariant(normalizedText, normalizedTestId, 'pro');",
+    );
+    expect(expression).toContain(
+      "const hasThinkingVariant = hasVariant(normalizedText, normalizedTestId, 'thinking');",
+    );
+    expect(expression).toContain(
+      "const hasInstantVariant = hasVariant(normalizedText, normalizedTestId, 'instant');",
+    );
+    expect(expression).toContain("(!wantsPro && hasProVariant)");
+    expect(expression).toContain("(!wantsThinking && hasThinkingVariant)");
+    expect(expression).toContain("(!wantsInstant && hasInstantVariant)");
+  });
+
+  it("treats the follow-up thinking-time chooser as a successful model switch without mutating the level", () => {
     const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
     expect(expression).toContain("const looksLikeThinkingTimeMenu = () =>");
-    expect(expression).toContain("const pickThinkingTimeFallback = () =>");
+    expect(expression).toContain("const dismissThinkingTimeMenu = () =>");
+    expect(expression).toContain("dispatchEscape();");
+    expect(expression).toContain("lastPointerClick = 0;");
     expect(expression).toContain(
       "if ((wantsPro || wantsThinking) && looksLikeThinkingTimeMenu()) {",
     );
-    expect(expression).toContain("setTimeout(attempt, Math.max(120, INITIAL_WAIT_MS));");
-    expect(expression).not.toContain(
-      "resolve({ status: 'switched', label: match.label || fallbackThinkingTime })",
+    expect(expression).toContain(
+      "resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });",
     );
+    expect(expression).not.toContain("normalizeText(getOptionLabel(node)) === 'standard'");
   });
 
   it("accepts an exact versioned picker hit when ChatGPT keeps the top button generic", () => {
@@ -144,8 +162,22 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("const clickedExactVersionedOption = (match) =>");
     expect(expression).toContain("const usesGenericModelButton = () =>");
     expect(expression).toContain("return normalizedButtonLabel === 'chatgpt';");
-    expect(expression).toContain("clickedExactVersionedOption(match) &&");
+    expect(expression).toContain("clickedExactVersionedOption(match)");
     expect(expression).toContain("usesGenericModelButton() &&");
+    expect(expression).toContain(
+      "resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });",
+    );
+  });
+
+  it("accepts shorthand variant rows when ChatGPT keeps the top button generic", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
+    expect(expression).toContain("const clickedVariantShortcutOption = (match) =>");
+    expect(expression).toContain("if (normalizedLabel === 'pro') {");
+    expect(expression).toContain("if (normalizedLabel === 'thinking') {");
+    expect(expression).toContain("if (normalizedLabel === 'instant') {");
+    expect(expression).toContain(
+      "(clickedExactVersionedOption(match) || clickedVariantShortcutOption(match)) &&",
+    );
     expect(expression).toContain(
       "resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });",
     );

@@ -1,6 +1,9 @@
 import type { ChromeClient } from "./types.js";
 import { delay } from "./utils.js";
-import { openConversationFromSidebarWithRetry } from "./reattachHelpers.js";
+import {
+  conversationHrefMatchesConfiguredScope,
+  openConversationFromSidebarWithRetry,
+} from "./reattachHelpers.js";
 import {
   normalizeSupervisorThread,
   type SupervisorThreadInfo,
@@ -27,16 +30,47 @@ export async function readCurrentSupervisorThread(
     returnByValue: true,
   });
   const normalized = normalizeSupervisorThread(
-    (response.result?.value ?? {}) as Record<string, unknown>,
+    (response?.result?.value ?? {}) as Record<string, unknown>,
   );
   return normalized ?? { title: "Untitled chat", isActive: true };
 }
 
+function normalizeProjectUrl(projectUrl?: string): string | undefined {
+  const trimmed = projectUrl?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+export function supervisorThreadMatchesProjectScope(
+  thread: SupervisorThreadInfo,
+  projectUrl?: string,
+): boolean {
+  const normalizedProjectUrl = normalizeProjectUrl(projectUrl);
+  if (!normalizedProjectUrl) {
+    return true;
+  }
+  const threadUrl = normalizeProjectUrl(thread.url);
+  if (thread.conversationId) {
+    return !threadUrl || conversationHrefMatchesConfiguredScope(threadUrl, normalizedProjectUrl);
+  }
+  return threadUrl === normalizedProjectUrl;
+}
+
 export async function listSupervisorThreads(
   Runtime: ChromeClient["Runtime"],
-  options?: { limit?: number },
+  options?: { limit?: number; projectUrl?: string },
 ): Promise<SupervisorThreadInfo[]> {
   const limit = Math.min(200, Math.max(1, options?.limit ?? 50));
+  const projectUrl = options?.projectUrl;
   const response = await Runtime.evaluate({
     expression: `(() => {
       const limit = ${limit};
@@ -110,16 +144,40 @@ export async function listSupervisorThreads(
   const rawThreads = Array.isArray(response.result?.value) ? response.result.value : [];
   return rawThreads
     .map((raw) => normalizeSupervisorThread((raw ?? {}) as Record<string, unknown>))
+    .filter((value): value is SupervisorThreadInfo => value !== null)
     .filter(
-      (value): value is SupervisorThreadInfo =>
-        Boolean(value) && Boolean(value?.conversationId?.trim()),
+      (value) =>
+        Boolean(value.conversationId?.trim()) &&
+        supervisorThreadMatchesProjectScope(value, projectUrl),
     )
     .slice(0, limit);
+}
+
+async function readConfirmedSupervisorThread(
+  Runtime: ChromeClient["Runtime"],
+  conversationId: string,
+  options?: { projectUrl?: string },
+): Promise<SupervisorThreadInfo> {
+  const current = await readCurrentSupervisorThread(Runtime);
+  if (
+    current.conversationId === conversationId &&
+    supervisorThreadMatchesProjectScope(current, options?.projectUrl)
+  ) {
+    return current;
+  }
+  const activeSidebarThread = (
+    await listSupervisorThreads(Runtime, {
+      limit: 50,
+      projectUrl: options?.projectUrl,
+    })
+  ).find((thread) => thread.isActive && thread.conversationId === conversationId);
+  return activeSidebarThread ?? current;
 }
 
 export async function attachSupervisorThread(
   Runtime: ChromeClient["Runtime"],
   conversationId: string,
+  options?: { projectUrl?: string },
 ): Promise<SupervisorThreadInfo> {
   const normalizedId = conversationId.trim();
   if (!normalizedId) {
@@ -127,7 +185,10 @@ export async function attachSupervisorThread(
   }
 
   const current = await readCurrentSupervisorThread(Runtime);
-  if (current.conversationId === normalizedId) {
+  if (
+    current.conversationId === normalizedId &&
+    supervisorThreadMatchesProjectScope(current, options?.projectUrl)
+  ) {
     return current;
   }
 
@@ -144,8 +205,11 @@ export async function attachSupervisorThread(
   let lastSeen = current;
   while (Date.now() - start < ATTACH_CONFIRM_TIMEOUT_MS) {
     await delay(ATTACH_CONFIRM_POLL_MS);
-    lastSeen = await readCurrentSupervisorThread(Runtime);
-    if (lastSeen.conversationId === normalizedId) {
+    lastSeen = await readConfirmedSupervisorThread(Runtime, normalizedId, options);
+    if (
+      lastSeen.conversationId === normalizedId &&
+      supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl)
+    ) {
       return lastSeen;
     }
   }
@@ -159,7 +223,9 @@ export async function attachSupervisorThread(
 
 export async function newSupervisorThread(
   Runtime: ChromeClient["Runtime"],
+  options?: { projectUrl?: string },
 ): Promise<SupervisorThreadInfo> {
+  const projectUrl = options?.projectUrl?.trim() || undefined;
   const start = await readCurrentSupervisorThread(Runtime);
   const isFreshChat = (thread: SupervisorThreadInfo): boolean => {
     if (!thread.url || thread.url.includes("/c/") || thread.conversationId) {
@@ -167,9 +233,21 @@ export async function newSupervisorThread(
     }
     try {
       const parsed = new URL(thread.url);
-      return parsed.pathname === "/" || parsed.pathname === "";
+      const pathname = parsed.pathname.replace(/\/+$/, "");
+      if (pathname === "" || pathname === "/") {
+        return !projectUrl;
+      }
+      if (projectUrl) {
+        return normalizeProjectUrl(parsed.toString()) === normalizeProjectUrl(projectUrl);
+      }
+      return /^\/g\/[^/]+\/project$/i.test(pathname);
     } catch {
-      return thread.url === "https://chatgpt.com" || thread.url === "https://chatgpt.com/";
+      return (
+        (!projectUrl &&
+          (thread.url === "https://chatgpt.com" || thread.url === "https://chatgpt.com/")) ||
+        (projectUrl !== undefined &&
+          normalizeProjectUrl(thread.url) === normalizeProjectUrl(projectUrl))
+      );
     }
   };
   if (isFreshChat(start)) {
@@ -198,7 +276,7 @@ export async function newSupervisorThread(
         return true;
       }
       try {
-        window.location.href = '/';
+        window.location.href = ${JSON.stringify(projectUrl ?? "/")};
         return true;
       } catch {
         return false;
@@ -210,8 +288,11 @@ export async function newSupervisorThread(
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await delay(250);
     const current = await readCurrentSupervisorThread(Runtime);
-    if (current.url !== start.url || current.conversationId !== start.conversationId) {
+    if (isFreshChat(current)) {
       return current;
+    }
+    if (current.url !== start.url || current.conversationId !== start.conversationId) {
+      continue;
     }
   }
 
@@ -219,9 +300,14 @@ export async function newSupervisorThread(
   if (isFreshChat(current)) {
     return current;
   }
-  throw new Error("New Oracle thread did not become active.");
+  throw new Error(
+    `New Oracle thread did not become active in the configured project scope (current: ${
+      current.url || current.conversationId || "unknown"
+    }).`,
+  );
 }
 
 export const __test__ = {
   normalizeSupervisorThread,
+  supervisorThreadMatchesProjectScope,
 };

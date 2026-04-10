@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { delay } from "./utils.js";
@@ -51,6 +51,74 @@ export async function writeDevToolsActivePort(userDataDir: string, port: number)
 }
 
 export async function readChromePid(userDataDir: string): Promise<number | null> {
+  const singletonPid = await readChromePidFromSingletonLock(userDataDir);
+  if (singletonPid && isProcessAlive(singletonPid)) {
+    return singletonPid;
+  }
+  const filePid = await readChromePidFromFile(userDataDir);
+  if (filePid && isProcessAlive(filePid)) {
+    return filePid;
+  }
+  return filePid ?? singletonPid ?? null;
+}
+
+export async function writeChromePid(userDataDir: string, pid: number): Promise<void> {
+  if (!Number.isFinite(pid) || pid <= 0) return;
+  const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
+  try {
+    await mkdir(path.dirname(pidPath), { recursive: true });
+    await writeFile(pidPath, `${Math.trunc(pid)}\n`, "utf8");
+  } catch {
+    // best effort
+  }
+}
+
+export async function chromePidMatchesUserDataDir(
+  pid: number,
+  userDataDir: string,
+): Promise<boolean> {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  if (process.platform === "win32") {
+    return isProcessAlive(pid);
+  }
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", `${Math.trunc(pid)}`, "-o", "command="], {
+      maxBuffer: 1024 * 1024,
+    });
+    const command = String(stdout ?? "").trim();
+    if (!command) {
+      return false;
+    }
+    const lower = command.toLowerCase();
+    const escapedUserDataDir = userDataDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const userDataDirPattern = new RegExp(
+      String.raw`(?:^|\s)--user-data-dir(?:=|\s+)(["']?)${escapedUserDataDir}\1(?=\s|$)`,
+    );
+    return (
+      (lower.includes("chrome") || lower.includes("chromium")) && userDataDirPattern.test(command)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveChromePidForUserDataDir(
+  userDataDir: string,
+  cachedPid?: number | null,
+): Promise<number | null> {
+  const livePid = await readChromePid(userDataDir);
+  if (livePid && (await chromePidMatchesUserDataDir(livePid, userDataDir))) {
+    return livePid;
+  }
+  if (cachedPid && (await chromePidMatchesUserDataDir(cachedPid, userDataDir))) {
+    return cachedPid;
+  }
+  return null;
+}
+
+async function readChromePidFromFile(userDataDir: string): Promise<number | null> {
   const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
   try {
     const raw = (await readFile(pidPath, "utf8")).trim();
@@ -64,14 +132,20 @@ export async function readChromePid(userDataDir: string): Promise<number | null>
   }
 }
 
-export async function writeChromePid(userDataDir: string, pid: number): Promise<void> {
-  if (!Number.isFinite(pid) || pid <= 0) return;
-  const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
+async function readChromePidFromSingletonLock(userDataDir: string): Promise<number | null> {
+  if (process.platform === "win32") {
+    return null;
+  }
   try {
-    await mkdir(path.dirname(pidPath), { recursive: true });
-    await writeFile(pidPath, `${Math.trunc(pid)}\n`, "utf8");
+    const target = await readlink(path.join(userDataDir, "SingletonLock"));
+    const match = path.basename(target).match(/(?:^Mac-)?(\d+)$/);
+    const pid = Number.parseInt(match?.[1] ?? "", 10);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      return null;
+    }
+    return pid;
   } catch {
-    // best effort
+    return null;
   }
 }
 
@@ -105,6 +179,7 @@ interface ProfileRunLockRecord {
   lockId: string;
   createdAt: string;
   sessionId?: string;
+  processStartMarker?: string;
 }
 
 function parseProfileRunLock(payload: string | null): ProfileRunLockRecord | null {
@@ -117,6 +192,32 @@ function parseProfileRunLock(payload: string | null): ProfileRunLockRecord | nul
   } catch {
     return null;
   }
+}
+
+async function readProcessStartMarker(pid: number): Promise<string | null> {
+  if (!Number.isFinite(pid) || pid <= 0 || process.platform === "win32") {
+    return null;
+  }
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", `${Math.trunc(pid)}`, "-o", "lstart="], {
+      maxBuffer: 1024 * 1024,
+    });
+    const marker = String(stdout ?? "").trim();
+    return marker || null;
+  } catch {
+    return null;
+  }
+}
+
+async function profileRunLockMatchesLiveProcess(lock: ProfileRunLockRecord): Promise<boolean> {
+  if (!isProcessAlive(lock.pid)) {
+    return false;
+  }
+  const expectedMarker = lock.processStartMarker?.trim();
+  if (!expectedMarker) {
+    return true;
+  }
+  return (await readProcessStartMarker(lock.pid)) === expectedMarker;
 }
 
 export async function acquireProfileRunLock(
@@ -148,6 +249,7 @@ export async function acquireProfileRunLock(
         lockId,
         createdAt: new Date().toISOString(),
         sessionId: options.sessionId,
+        processStartMarker: (await readProcessStartMarker(process.pid)) ?? undefined,
       };
       await mkdir(path.dirname(lockPath), { recursive: true });
       await writeFile(lockPath, JSON.stringify(payload), { encoding: "utf8", flag: "wx" });
@@ -173,7 +275,7 @@ export async function acquireProfileRunLock(
           continue;
         }
       }
-      if (!existing || !isProcessAlive(existing.pid)) {
+      if (!existing || !(await profileRunLockMatchesLiveProcess(existing))) {
         await rm(lockPath, { force: true }).catch(() => undefined);
         continue;
       }

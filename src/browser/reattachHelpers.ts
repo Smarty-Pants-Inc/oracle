@@ -5,10 +5,173 @@ import { readAssistantSnapshot } from "./pageActions.js";
 
 export type TargetInfoLite = {
   targetId?: string;
+  id?: string;
   type?: string;
   url?: string;
   [key: string]: unknown;
 };
+
+function getTargetId(target: TargetInfoLite | undefined): string | undefined {
+  const targetId = target?.targetId;
+  if (typeof targetId === "string" && targetId.length > 0) {
+    return targetId;
+  }
+  const legacyId = target?.id;
+  return typeof legacyId === "string" && legacyId.length > 0 ? legacyId : undefined;
+}
+
+function isPageTarget(target: TargetInfoLite | undefined): boolean {
+  return target?.type === "page";
+}
+
+export function isAttachableChatTarget(target: TargetInfoLite | undefined): boolean {
+  if (!target) {
+    return false;
+  }
+  if (isPageTarget(target)) {
+    return true;
+  }
+  const url = target.url || "";
+  if (isProjectConversationTargetUrl(url)) {
+    return false;
+  }
+  return Boolean(extractConversationIdFromUrl(url) || isConversationShellTargetUrl(url));
+}
+
+function isChatLikeTargetUrl(url: string | undefined): boolean {
+  if (!url || url === "about:blank") {
+    return false;
+  }
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return host === "chatgpt.com" || host === "chat.openai.com";
+  } catch {
+    return false;
+  }
+}
+
+function isConversationShellTargetUrl(url: string | undefined): boolean {
+  if (!isChatLikeTargetUrl(url) || extractConversationIdFromUrl(url || "")) {
+    return false;
+  }
+  try {
+    const parsed = new URL(url ?? "");
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return pathname === "" || pathname === "/" || /^\/g\/[^/]+\/project$/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function projectConversationShellUrl(url: string | undefined): string | null {
+  if (!isChatLikeTargetUrl(url)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url ?? "");
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const match = pathname.match(/^(\/g\/[^/]+\/project)\/c\/[^/]+$/i);
+    if (!match) {
+      return null;
+    }
+    return `${parsed.origin}${match[1]}`;
+  } catch {
+    return null;
+  }
+}
+
+function isProjectConversationTargetUrl(url: string | undefined): boolean {
+  if (!isChatLikeTargetUrl(url)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(url ?? "");
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return /^\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i.test(pathname);
+  } catch {
+    return /^https:\/\/chatgpt\.com\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+\/?$/i.test(url ?? "");
+  }
+}
+
+function urlsLooselyMatchRuntimeTab(candidateUrl: string | undefined, runtimeUrl: string): boolean {
+  if (!candidateUrl || !runtimeUrl) {
+    return false;
+  }
+  try {
+    const candidate = new URL(candidateUrl);
+    const runtime = new URL(runtimeUrl);
+    if (candidate.origin !== runtime.origin) {
+      return false;
+    }
+    const candidateHref = candidate.toString();
+    const runtimeHref = runtime.toString();
+    if (candidateHref === runtimeHref) {
+      return true;
+    }
+    const candidatePath = candidate.pathname.replace(/\/+$/, "");
+    const runtimePath = runtime.pathname.replace(/\/+$/, "");
+    if (!candidatePath || candidatePath === "/") {
+      return false;
+    }
+    return (
+      runtimeHref.startsWith(candidateHref) ||
+      candidateHref.startsWith(runtimeHref) ||
+      runtimePath.startsWith(candidatePath) ||
+      candidatePath.startsWith(runtimePath)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function projectConversationScopeKey(url: string | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const match = pathname.match(/^\/g\/([^/]+?)(?:-oracle)?(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i);
+    return match?.[1]?.toLowerCase() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function urlsShareProjectConversationScope(
+  candidateUrl: string | undefined,
+  runtimeUrl: string | undefined,
+): boolean {
+  const candidateKey = projectConversationScopeKey(candidateUrl);
+  const runtimeKey = projectConversationScopeKey(runtimeUrl);
+  return Boolean(candidateKey && runtimeKey && candidateKey === runtimeKey);
+}
+
+function pickUniqueConversationShellTarget(targets: TargetInfoLite[]): TargetInfoLite | undefined {
+  const shells = targets.filter(
+    (target) => isAttachableChatTarget(target) && isConversationShellTargetUrl(target.url),
+  );
+  return shells.length === 1 ? shells[0] : undefined;
+}
+
+function pickSafeFallbackTarget(targets: TargetInfoLite[]): TargetInfoLite | undefined {
+  const attachableTargets = targets.filter(isAttachableChatTarget);
+  if (attachableTargets.length === 1) {
+    return attachableTargets[0];
+  }
+  const conversationTargets = attachableTargets.filter((target) =>
+    Boolean(extractConversationIdFromUrl(target.url || "")),
+  );
+  if (conversationTargets.length === 1) {
+    return conversationTargets[0];
+  }
+  const chatTargets = attachableTargets.filter((target) => isChatLikeTargetUrl(target.url));
+  if (chatTargets.length === 1) {
+    return chatTargets[0];
+  }
+  return undefined;
+}
 
 export type AssistantPayload = {
   text: string;
@@ -18,24 +181,126 @@ export type AssistantPayload = {
 
 type PromptEchoMatcher = { isEcho: (text: string) => boolean };
 
+export function runtimeRequiresSpecificTarget(runtime: {
+  chromeTargetId?: string;
+  tabUrl?: string;
+  conversationId?: string;
+}): boolean {
+  return Boolean(runtime.chromeTargetId || runtime.tabUrl || getRuntimeConversationId(runtime));
+}
+
+export function runtimeHasReusableIdentity(runtime: {
+  chromeTargetId?: string;
+  tabUrl?: string;
+  conversationId?: string;
+}): boolean {
+  return runtimeRequiresSpecificTarget(runtime);
+}
+
+export function getRuntimeConversationId(runtime: {
+  tabUrl?: string;
+  conversationId?: string;
+}): string | undefined {
+  const explicitConversationId = runtime.conversationId?.trim();
+  if (explicitConversationId) {
+    return explicitConversationId;
+  }
+  return extractConversationIdFromUrl(runtime.tabUrl || "");
+}
+
 export function pickTarget(
   targets: TargetInfoLite[],
-  runtime: { chromeTargetId?: string; tabUrl?: string },
+  runtime: { chromeTargetId?: string; tabUrl?: string; conversationId?: string },
+  options?: { requireMatch?: boolean },
 ): TargetInfoLite | undefined {
   if (!Array.isArray(targets) || targets.length === 0) {
     return undefined;
   }
+  const attachableTargets = targets.filter(isAttachableChatTarget);
+  const runtimeConversationId = getRuntimeConversationId(runtime);
+  if (runtimeConversationId) {
+    const projectConversationTarget = targets.find((target) => {
+      if (!isProjectConversationTargetUrl(target.url)) {
+        return false;
+      }
+      return extractConversationIdFromUrl(target.url || "") === runtimeConversationId;
+    });
+    if (projectConversationTarget) {
+      const preferredProjectShellUrl = projectConversationShellUrl(projectConversationTarget.url);
+      if (preferredProjectShellUrl) {
+        const projectShellTarget = attachableTargets.find((target) => {
+          if (!isPageTarget(target)) {
+            return false;
+          }
+          const candidateUrl = target.url?.replace(/\/+$/, "");
+          return candidateUrl === preferredProjectShellUrl;
+        });
+        if (projectShellTarget) {
+          return projectShellTarget;
+        }
+      }
+    }
+  }
   if (runtime.chromeTargetId) {
-    const byId = targets.find((t) => t.targetId === runtime.chromeTargetId);
-    if (byId) return byId;
+    const byId = attachableTargets.find((t) => getTargetId(t) === runtime.chromeTargetId);
+    if (
+      byId &&
+      (!runtime.tabUrl ||
+        byId.url === runtime.tabUrl ||
+        byId.url?.startsWith(runtime.tabUrl) ||
+        runtime.tabUrl.startsWith(byId.url || "") ||
+        urlsShareProjectConversationScope(byId.url, runtime.tabUrl) ||
+        (runtimeConversationId &&
+          extractConversationIdFromUrl(byId.url || "") === runtimeConversationId))
+    ) {
+      return byId;
+    }
+  }
+  if (runtimeConversationId) {
+    const byConversation = attachableTargets.find(
+      (t) => extractConversationIdFromUrl(t.url || "") === runtimeConversationId,
+    );
+    if (byConversation) {
+      if (!isPageTarget(byConversation)) {
+        const preferredProjectShellUrl = projectConversationShellUrl(byConversation.url);
+        if (preferredProjectShellUrl) {
+          const projectShellTarget = attachableTargets.find((target) => {
+            if (!isPageTarget(target)) {
+              return false;
+            }
+            const candidateUrl = target.url?.replace(/\/+$/, "");
+            return candidateUrl === preferredProjectShellUrl;
+          });
+          if (projectShellTarget) {
+            return projectShellTarget;
+          }
+        }
+      }
+      return byConversation;
+    }
   }
   if (runtime.tabUrl) {
-    const byUrl =
-      targets.find((t) => t.url?.startsWith(runtime.tabUrl as string)) ||
-      targets.find((t) => (runtime.tabUrl as string).startsWith(t.url || ""));
+    const byUrl = attachableTargets.find((t) =>
+      urlsLooselyMatchRuntimeTab(t.url, runtime.tabUrl as string),
+    );
     if (byUrl) return byUrl;
+    const matchingProjectTargets = attachableTargets.filter((target) =>
+      urlsShareProjectConversationScope(target.url, runtime.tabUrl),
+    );
+    if (matchingProjectTargets.length === 1) {
+      return matchingProjectTargets[0];
+    }
   }
-  return targets.find((t) => t.type === "page") ?? targets[0];
+  if (runtimeConversationId) {
+    const shellTarget = pickUniqueConversationShellTarget(attachableTargets);
+    if (shellTarget) {
+      return shellTarget;
+    }
+  }
+  if (options?.requireMatch || runtimeRequiresSpecificTarget(runtime)) {
+    return undefined;
+  }
+  return pickSafeFallbackTarget(targets);
 }
 
 export function extractConversationIdFromUrl(url: string): string | undefined {
@@ -44,28 +309,90 @@ export function extractConversationIdFromUrl(url: string): string | undefined {
   return match?.[1];
 }
 
+function normalizeProjectBaseUrl(baseUrl: string): string | null {
+  try {
+    const parsed = new URL(baseUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    if (/^\/g\/[^/]+\/project$/i.test(pathname)) {
+      return `${parsed.origin}${pathname}`;
+    }
+  } catch {
+    const trimmed = baseUrl.replace(/\/+$/, "");
+    if (/^https:\/\/chatgpt\.com\/g\/[^/]+\/project$/i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+function escapeRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function conversationHrefMatchesConfiguredScope(href: string, baseUrl: string): boolean {
+  const projectBaseUrl = normalizeProjectBaseUrl(baseUrl);
+  if (!projectBaseUrl) {
+    return true;
+  }
+  try {
+    const base = new URL(projectBaseUrl);
+    const target = new URL(href);
+    if (target.origin !== base.origin) {
+      return false;
+    }
+    const normalizedBasePath = base.pathname.replace(/\/+$/, "");
+    const normalizedTargetPath = target.pathname.replace(/\/+$/, "");
+    if (
+      normalizedTargetPath === normalizedBasePath ||
+      normalizedTargetPath.startsWith(`${normalizedBasePath}/`)
+    ) {
+      return true;
+    }
+    const projectMatch = normalizedBasePath.match(/^\/g\/([^/]+)\/project$/i);
+    if (!projectMatch?.[1]) {
+      return false;
+    }
+    const projectIdPattern = escapeRegex(projectMatch[1]);
+    return new RegExp(`^/g/${projectIdPattern}(?:-oracle)?/c/[a-zA-Z0-9-]+$`, "i").test(
+      normalizedTargetPath,
+    );
+  } catch {
+    const trimmedHref = href.replace(/\/+$/, "");
+    return trimmedHref === projectBaseUrl || trimmedHref.startsWith(`${projectBaseUrl}/`);
+  }
+}
+
 export function buildConversationUrl(
   runtime: { tabUrl?: string; conversationId?: string },
   baseUrl: string,
 ): string | null {
+  const conversationId =
+    runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? "");
+  const canonicalConversationUrl = (() => {
+    if (!conversationId) {
+      return null;
+    }
+    try {
+      const base = new URL(baseUrl);
+      const pathRoot = base.pathname.replace(/\/$/, "");
+      const prefix = pathRoot === "/" ? "" : pathRoot;
+      return `${base.origin}${prefix}/c/${conversationId}`;
+    } catch {
+      return null;
+    }
+  })();
   if (runtime.tabUrl) {
     if (runtime.tabUrl.includes("/c/")) {
-      return runtime.tabUrl;
+      return conversationHrefMatchesConfiguredScope(runtime.tabUrl, baseUrl)
+        ? runtime.tabUrl
+        : canonicalConversationUrl;
     }
     return null;
   }
-  const conversationId = runtime.conversationId;
   if (!conversationId) {
     return null;
   }
-  try {
-    const base = new URL(baseUrl);
-    const pathRoot = base.pathname.replace(/\/$/, "");
-    const prefix = pathRoot === "/" ? "" : pathRoot;
-    return `${base.origin}${prefix}/c/${conversationId}`;
-  } catch {
-    return null;
-  }
+  return canonicalConversationUrl;
 }
 
 export async function withTimeout<T>(task: Promise<T>, ms: number, label: string): Promise<T> {
@@ -80,14 +407,25 @@ export async function withTimeout<T>(task: Promise<T>, ms: number, label: string
   });
 }
 
+async function evaluateWithTimeout(
+  Runtime: ChromeClient["Runtime"],
+  expression: string,
+  timeoutMs: number,
+  label: string,
+): Promise<{ result?: { value?: unknown } }> {
+  return await withTimeout(Runtime.evaluate({ expression, returnByValue: true }), timeoutMs, label);
+}
+
 export async function openConversationFromSidebar(
   Runtime: ChromeClient["Runtime"],
   options: { conversationId?: string; preferProjects?: boolean; promptPreview?: string },
   attempt = 0,
 ): Promise<boolean> {
-  const response = await Runtime.evaluate({
-    expression: `(() => {
+  const response = await evaluateWithTimeout(
+    Runtime,
+    `(() => {
       const conversationId = ${JSON.stringify(options.conversationId ?? null)};
+      const allowLooseFallback = !conversationId;
       const preferProjects = ${JSON.stringify(Boolean(options.preferProjects))};
       const promptPreview = ${JSON.stringify(options.promptPreview ?? null)};
       const attemptIndex = ${Math.max(0, attempt)};
@@ -147,28 +485,43 @@ export async function openConversationFromSidebar(
         const index = Math.min(attemptIndex, pool.length - 1);
         return pool[index] ?? null;
       };
+      const pickByPreference = (navItems, mainItems) =>
+        preferProjects ? pick(navItems) || pick(mainItems) : pick(mainItems) || pick(navItems);
+      const pickByAttemptPreference = (navItems, mainItems) =>
+        preferProjects
+          ? pickWithAttempt(navItems) || pickWithAttempt(mainItems)
+          : pickWithAttempt(mainItems) || pickWithAttempt(navItems);
       let target = null;
       if (conversationId) {
         const byId = (item) =>
           (item.href && item.href.includes('/c/' + conversationId)) ||
           (item.conversationId && item.conversationId === conversationId);
-        target = pick(mainCandidates.filter(byId)) || pick(navCandidates.filter(byId));
+        target = pickByPreference(navCandidates.filter(byId), mainCandidates.filter(byId));
       }
-      if (!target && promptNeedles.length > 0) {
+      if (!target && allowLooseFallback && promptNeedles.length > 0) {
         const byPrompt = (item) => promptNeedles.some((needle) => item.text && item.text.toLowerCase().includes(needle));
         const sortBySpecificity = (items) =>
           items
             .filter(byPrompt)
             .sort((a, b) => (a.text?.length ?? 0) - (b.text?.length ?? 0));
-        target = pickWithAttempt(sortBySpecificity(mainCandidates)) || pickWithAttempt(sortBySpecificity(navCandidates));
+        target = pickByAttemptPreference(
+          sortBySpecificity(navCandidates),
+          sortBySpecificity(mainCandidates),
+        );
       }
-      if (!target) {
+      if (!target && allowLooseFallback) {
         const byHref = (item) => item.href && item.href.includes('/c/');
-        target = pickWithAttempt(mainCandidates.filter(byHref)) || pickWithAttempt(navCandidates.filter(byHref));
+        target = pickByAttemptPreference(
+          navCandidates.filter(byHref),
+          mainCandidates.filter(byHref),
+        );
       }
-      if (!target) {
+      if (!target && allowLooseFallback) {
         const byTestId = (item) => /conversation|history/i.test(item.testId || '');
-        target = pickWithAttempt(mainCandidates.filter(byTestId)) || pickWithAttempt(navCandidates.filter(byTestId));
+        target = pickByAttemptPreference(
+          navCandidates.filter(byTestId),
+          mainCandidates.filter(byTestId),
+        );
       }
       if (target) {
         target.clickable.scrollIntoView({ block: 'center' });
@@ -193,9 +546,11 @@ export async function openConversationFromSidebar(
       }
       return { ok: false, count: candidates.length };
     })()`,
-    returnByValue: true,
-  });
-  return Boolean(response.result?.value?.ok);
+    5_000,
+    "Timed out while reopening the ChatGPT conversation from the sidebar",
+  );
+  const value = response.result?.value as { ok?: boolean } | undefined;
+  return Boolean(value?.ok);
 }
 
 export async function openConversationFromSidebarWithRetry(
@@ -209,7 +564,10 @@ export async function openConversationFromSidebarWithRetry(
     // Retry because project list can hydrate after initial navigation.
     const opened = await openConversationFromSidebar(Runtime, options, attempt);
     if (opened) {
-      if (options.promptPreview) {
+      // A known conversation id is enough to reopen the existing thread.
+      // The current follow-up prompt has not been submitted yet, so waiting
+      // for its preview here would deadlock the reopen path.
+      if (options.promptPreview && !options.conversationId) {
         const matched = await waitForPromptPreview(Runtime, options.promptPreview, 10_000);
         if (matched) {
           return true;
@@ -263,7 +621,13 @@ export async function waitForPromptPreview(
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const { result } = await Runtime.evaluate({ expression, returnByValue: true });
+      const remainingMs = timeoutMs - (Date.now() - start);
+      const { result } = await evaluateWithTimeout(
+        Runtime,
+        expression,
+        Math.min(5_000, Math.max(1_000, remainingMs)),
+        "Timed out while checking the follow-up prompt preview",
+      );
       if (result?.value === true) {
         return true;
       }
@@ -282,7 +646,12 @@ export async function waitForLocationChange(
   const start = Date.now();
   let lastHref = "";
   while (Date.now() - start < timeoutMs) {
-    const { result } = await Runtime.evaluate({ expression: "location.href", returnByValue: true });
+    const remainingMs = timeoutMs - (Date.now() - start);
+    const { result } = await withTimeout(
+      Runtime.evaluate({ expression: "location.href", returnByValue: true }),
+      Math.min(5_000, Math.max(1_000, remainingMs)),
+      "Timed out waiting for location change",
+    );
     const href = typeof result?.value === "string" ? result.value : "";
     if (lastHref && href !== lastHref) {
       return;
@@ -292,6 +661,32 @@ export async function waitForLocationChange(
   }
 }
 
+export async function waitForConversationLocation(
+  Runtime: ChromeClient["Runtime"],
+  conversationId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const expectedId = conversationId.trim();
+  if (!expectedId) {
+    return false;
+  }
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const remainingMs = timeoutMs - (Date.now() - start);
+    const { result } = await withTimeout(
+      Runtime.evaluate({ expression: "location.href", returnByValue: true }),
+      Math.min(5_000, Math.max(1_000, remainingMs)),
+      "Timed out waiting for the expected conversation URL",
+    );
+    const href = typeof result?.value === "string" ? result.value : "";
+    if (extractConversationIdFromUrl(href) === expectedId) {
+      return true;
+    }
+    await delay(200);
+  }
+  return false;
+}
+
 export async function readConversationTurnIndex(
   Runtime: ChromeClient["Runtime"],
   logger?: BrowserLogger,
@@ -299,7 +694,12 @@ export async function readConversationTurnIndex(
   const selectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   try {
     const { result } = await Runtime.evaluate({
-      expression: `document.querySelectorAll(${selectorLiteral}).length`,
+      expression: `(() => {
+        const selector = ${selectorLiteral};
+        return Array.from(document.querySelectorAll(selector)).filter(
+          (node) => !(node.parentElement && node.parentElement.closest(selector)),
+        ).length;
+      })()`,
       returnByValue: true,
     });
     const raw = typeof result?.value === "number" ? result.value : Number(result?.value);

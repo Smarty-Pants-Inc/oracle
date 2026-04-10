@@ -11,6 +11,18 @@ type ThinkingTimeOutcome =
   | { status: "menu-not-found" }
   | { status: "option-not-found" };
 
+async function evaluateWithTimeout(
+  Runtime: ChromeClient["Runtime"],
+  params: Parameters<ChromeClient["Runtime"]["evaluate"]>[0],
+  timeoutMs: number,
+  message: string,
+) {
+  return await Promise.race([
+    Runtime.evaluate(params),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
+  ]);
+}
+
 /**
  * Selects a specific thinking time level in ChatGPT's composer pill menu.
  * @param level - The thinking time intensity: 'light', 'standard', 'extended', or 'heavy'
@@ -97,11 +109,16 @@ async function evaluateThinkingTimeSelection(
   Runtime: ChromeClient["Runtime"],
   level: ThinkingTimeLevel,
 ): Promise<ThinkingTimeOutcome | undefined> {
-  const outcome = await Runtime.evaluate({
-    expression: buildThinkingTimeExpression(level),
-    awaitPromise: true,
-    returnByValue: true,
-  });
+  const outcome = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: buildThinkingTimeExpression(level),
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    20_000,
+    `Timed out while selecting the ${level} thinking-time option`,
+  );
 
   return outcome.result?.value as ThinkingTimeOutcome | undefined;
 }
@@ -117,115 +134,178 @@ function buildThinkingTimeExpression(level: ThinkingTimeLevel): string {
     const MENU_CONTAINER_SELECTOR = ${menuContainerLiteral};
     const MENU_ITEM_SELECTOR = ${menuItemLiteral};
     const TARGET_LEVEL = ${targetLevelLiteral};
-
     const CHIP_SELECTORS = [
       '[data-testid="composer-footer-actions"] button[aria-haspopup="menu"]',
       'button.__composer-pill[aria-haspopup="menu"]',
       '.__composer-pill-composite button[aria-haspopup="menu"]',
     ];
+    const LEVEL_KEYWORDS = ['light', 'standard', 'extended', 'heavy'];
 
     const INITIAL_WAIT_MS = 150;
     const MAX_WAIT_MS = 10000;
+    const MENU_OPEN_TIMEOUT_MS = 1500;
 
     const normalize = (value) => (value || '')
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, ' ')
       .replace(/\\s+/g, ' ')
       .trim();
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const dispatchEscape = () => {
+      try {
+        document.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Escape',
+            code: 'Escape',
+            keyCode: 27,
+            which: 27,
+            bubbles: true,
+          }),
+        );
+      } catch {}
+    };
 
-    const findThinkingChip = () => {
-      for (const selector of CHIP_SELECTORS) {
-        const buttons = document.querySelectorAll(selector);
-        for (const btn of buttons) {
-          // Skip toggle buttons (no haspopup) - only click dropdown triggers to avoid disabling Pro mode
-          if (btn.getAttribute?.('aria-haspopup') !== 'menu') continue;
-          const aria = normalize(btn.getAttribute?.('aria-label') ?? '');
-          const text = normalize(btn.textContent ?? '');
-          if (aria.includes('thinking') || text.includes('thinking')) {
-            return btn;
-          }
-
-          // In some cases the pill is labeled "Pro".
-          if (aria.includes('pro') || text.includes('pro')) {
-            return btn;
-          }
+    const findThinkingMenu = () => {
+      const menus = document.querySelectorAll(MENU_CONTAINER_SELECTOR + ', [role="group"]');
+      for (const menu of menus) {
+        const label = menu.querySelector?.('.__menu-label, [class*="menu-label"]');
+        if (normalize(label?.textContent ?? '').includes('thinking time')) {
+          return menu;
+        }
+        const text = normalize(menu.textContent ?? '');
+        if (text.includes('standard') && text.includes('extended')) {
+          return menu;
         }
       }
       return null;
     };
 
-    const chip = findThinkingChip();
-    if (!chip) {
-      return { status: 'chip-not-found' };
+    const buttonMetadata = (btn) =>
+      normalize(
+        [
+          btn.getAttribute?.('aria-label') ?? '',
+          btn.getAttribute?.('title') ?? '',
+          btn.getAttribute?.('data-testid') ?? '',
+          btn.textContent ?? '',
+        ].join(' '),
+      );
+    const looksLikeModelChip = (metadata) =>
+      metadata.includes('model-switcher') ||
+      metadata.includes('current model') ||
+      metadata.includes('chatgpt') ||
+      metadata.includes('gpt') ||
+      metadata === 'pro' ||
+      metadata === 'instant' ||
+      /\\b5 [0-9]\\b/.test(metadata);
+    const collectThinkingChipCandidates = () => {
+      const seen = new Set();
+      const candidates = [];
+      for (const selector of CHIP_SELECTORS) {
+        const buttons = document.querySelectorAll(selector);
+        for (const btn of buttons) {
+          if (!(btn instanceof HTMLElement)) continue;
+          if (btn.getAttribute?.('aria-haspopup') !== 'menu') continue;
+          const metadata = buttonMetadata(btn);
+          if (!metadata) continue;
+          let score = 0;
+          if (metadata.includes('thinking time')) score += 200;
+          if (LEVEL_KEYWORDS.some((keyword) => metadata.includes(keyword))) score += 120;
+          if (metadata.includes('thinking')) score += 60;
+          if (looksLikeModelChip(metadata) && !metadata.includes('thinking time')) {
+            score -= 80;
+          }
+          if (score <= 0) continue;
+          const rect = btn.getBoundingClientRect();
+          const key = [
+            btn.getAttribute?.('data-testid') ?? '',
+            metadata,
+            String(Math.round(rect.left)),
+            String(Math.round(rect.top)),
+          ].join('|');
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({ node: btn, score, rect });
+        }
+      }
+      return candidates
+        .sort((left, right) => right.score - left.score || right.rect.left - left.rect.left)
+        .map((candidate) => candidate.node);
+    };
+    const waitForThinkingMenu = async (timeoutMs = MENU_OPEN_TIMEOUT_MS) => {
+      const start = performance.now();
+      while (performance.now() - start <= timeoutMs) {
+        const menu = findThinkingMenu();
+        if (menu) {
+          return menu;
+        }
+        await wait(100);
+      }
+      return null;
+    };
+    const ensureThinkingMenu = async () => {
+      const existingMenu = findThinkingMenu();
+      if (existingMenu) {
+        return { status: 'ready', menu: existingMenu };
+      }
+      const candidates = collectThinkingChipCandidates();
+      if (candidates.length === 0) {
+        return { status: 'chip-not-found' };
+      }
+      for (const candidate of candidates) {
+        dispatchClickSequence(candidate);
+        await wait(INITIAL_WAIT_MS);
+        const menu = await waitForThinkingMenu();
+        if (menu) {
+          return { status: 'ready', menu };
+        }
+        dispatchEscape();
+        await wait(120);
+      }
+      return { status: 'menu-not-found' };
+    };
+    const findTargetOption = (menu) => {
+      const items = menu.querySelectorAll(MENU_ITEM_SELECTOR);
+      for (const item of items) {
+        const text = normalize(item.textContent ?? '');
+        if (text.includes(TARGET_LEVEL)) {
+          return item;
+        }
+      }
+      return null;
+    };
+    const optionIsSelected = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const ariaChecked = node.getAttribute('aria-checked');
+      const dataState = (node.getAttribute('data-state') || '').toLowerCase();
+      if (ariaChecked === 'true') return true;
+      if (dataState === 'checked' || dataState === 'selected' || dataState === 'on') return true;
+      return false;
+    };
+
+    const menuState = await ensureThinkingMenu();
+    if (menuState.status !== 'ready') {
+      return { status: menuState.status };
     }
 
-    dispatchClickSequence(chip);
-
-    return new Promise((resolve) => {
-      const start = performance.now();
-
-      const findMenu = () => {
-        const menus = document.querySelectorAll(MENU_CONTAINER_SELECTOR + ', [role="group"]');
-        for (const menu of menus) {
-          const label = menu.querySelector?.('.__menu-label, [class*="menu-label"]');
-          if (normalize(label?.textContent ?? '').includes('thinking time')) {
-            return menu;
-          }
-          const text = normalize(menu.textContent ?? '');
-          if (text.includes('standard') && text.includes('extended')) {
-            return menu;
-          }
-        }
-        return null;
-      };
-
-      const findTargetOption = (menu) => {
-        const items = menu.querySelectorAll(MENU_ITEM_SELECTOR);
-        for (const item of items) {
-          const text = normalize(item.textContent ?? '');
-          if (text.includes(TARGET_LEVEL)) {
-            return item;
-          }
-        }
-        return null;
-      };
-
-      const optionIsSelected = (node) => {
-        if (!(node instanceof HTMLElement)) return false;
-        const ariaChecked = node.getAttribute('aria-checked');
-        const dataState = (node.getAttribute('data-state') || '').toLowerCase();
-        if (ariaChecked === 'true') return true;
-        if (dataState === 'checked' || dataState === 'selected' || dataState === 'on') return true;
-        return false;
-      };
-
-      const attempt = () => {
-        const menu = findMenu();
-        if (!menu) {
-          if (performance.now() - start > MAX_WAIT_MS) {
-            resolve({ status: 'menu-not-found' });
-            return;
-          }
-          setTimeout(attempt, 100);
-          return;
-        }
-
-        const targetOption = findTargetOption(menu);
-        if (!targetOption) {
-          resolve({ status: 'option-not-found' });
-          return;
-        }
-
+    const start = performance.now();
+    while (performance.now() - start <= MAX_WAIT_MS) {
+      const menu = findThinkingMenu() ?? menuState.menu;
+      const targetOption = menu ? findTargetOption(menu) : null;
+      if (targetOption) {
         const alreadySelected =
           optionIsSelected(targetOption) ||
           optionIsSelected(targetOption.querySelector?.('[aria-checked="true"], [data-state="checked"], [data-state="selected"]'));
         const label = targetOption.textContent?.trim?.() || null;
         dispatchClickSequence(targetOption);
-        resolve({ status: alreadySelected ? 'already-selected' : 'switched', label });
-      };
-
-      setTimeout(attempt, INITIAL_WAIT_MS);
-    });
+        return { status: alreadySelected ? 'already-selected' : 'switched', label };
+      }
+      if (!findThinkingMenu()) {
+        dispatchEscape();
+        return { status: 'menu-not-found' };
+      }
+      await wait(100);
+    }
+    return { status: 'option-not-found' };
   })()`;
 }
 

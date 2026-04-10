@@ -117,6 +117,7 @@ interface CliOptions extends OptionValues {
   sessionId?: string;
   engine?: EngineMode;
   browser?: boolean;
+  browserLauncher?: "chrome" | "carbonyl";
   timeout?: number | "auto";
   background?: boolean;
   httpTimeout?: number;
@@ -208,6 +209,11 @@ const normalizedArgv = process.argv.map((arg, index) => {
 const rawCliArgs = normalizedArgv.slice(2);
 const userCliArgs = rawCliArgs[0] === CLI_ENTRYPOINT ? rawCliArgs.slice(1) : rawCliArgs;
 const isTty = process.stdout.isTTY;
+const exitIfNonInteractive = (): never | void => {
+  if (!process.stdout.isTTY) {
+    process.exit(process.exitCode ?? 0);
+  }
+};
 
 const program = new Command();
 let introPrinted = false;
@@ -445,6 +451,12 @@ program
   )
   .addOption(
     new Option(
+      "--browser-launcher <name>",
+      "Browser launcher: chrome (default) or carbonyl (experimental terminal browser with CDP).",
+    ).choices(["chrome", "carbonyl"]),
+  )
+  .addOption(
+    new Option(
       "--browser-chrome-profile <name>",
       "Chrome profile name/path for cookie reuse.",
     ).hideHelp(),
@@ -452,7 +464,7 @@ program
   .addOption(
     new Option(
       "--browser-chrome-path <path>",
-      "Explicit Chrome or Chromium executable path.",
+      "Explicit browser executable path (Chrome/Chromium by default, or Carbonyl when --browser-launcher carbonyl).",
     ).hideHelp(),
   )
   .addOption(
@@ -845,6 +857,7 @@ program
   .addOption(new Option("--clean", "Deprecated alias for --clear.").default(false).hideHelp())
   .action(async (sessionId, _options: StatusOptions, cmd: Command) => {
     await handleSessionCommand(sessionId, cmd);
+    exitIfNonInteractive();
   });
 
 program
@@ -1483,10 +1496,12 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   if (await handleStatusFlag(options, { attachSession, showStatus })) {
+    exitIfNonInteractive();
     return;
   }
 
   if (await handleSessionAlias(options, { attachSession })) {
+    exitIfNonInteractive();
     return;
   }
 

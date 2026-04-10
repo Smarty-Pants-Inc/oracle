@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import type { WriteStream } from "node:fs";
 import net from "node:net";
-import type { BrowserModelStrategy, CookieParam } from "./browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy, CookieParam } from "./browser/types.js";
 import type {
   TransportFailureReason,
   AzureOptions,
@@ -17,10 +17,12 @@ import { getOracleHomeDir } from "./oracleHome.js";
 export type SessionMode = "api" | "browser";
 
 export interface BrowserSessionConfig {
+  launcher?: BrowserLauncher;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
   attachRunning?: boolean;
+  supervisorChatgptUrl?: string | null;
   chatgptUrl?: string | null;
   url?: string;
   timeoutMs?: number;
@@ -53,9 +55,13 @@ export interface BrowserSessionConfig {
   debug?: boolean;
   allowCookieErrors?: boolean;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserWSEndpoint?: string | null;
+  remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
+  /** Optional broker-only scope used to partition supervisor throttle state. */
+  supervisorThrottleScope?: string | null;
   /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
   thinkingTime?: ThinkingTimeLevel;
 }
@@ -85,6 +91,7 @@ export interface SessionResponseMetadata {
   requestId?: string | null;
   status?: string;
   incompleteReason?: string | null;
+  assistantOutput?: string;
 }
 
 export interface SessionTransportMetadata {
@@ -244,6 +251,15 @@ function slugify(text: string | undefined, maxWords = MAX_SLUG_WORDS): string {
   return trimmed.length > 0 ? trimmed.join("-") : DEFAULT_SLUG;
 }
 
+export function sanitizeSessionSlugBase(candidate: string | null | undefined): string | undefined {
+  const parts =
+    candidate
+      ?.trim()
+      .toLowerCase()
+      .match(/[a-z0-9]+/g) ?? [];
+  return parts.length > 0 ? parts.join("-") : undefined;
+}
+
 function countSlugWords(slug: string): number {
   return slug.split("-").filter(Boolean).length;
 }
@@ -392,8 +408,9 @@ export async function initializeSession(
   baseSlugOverride?: string,
 ): Promise<SessionMetadata> {
   await ensureSessionStorage();
+  const sanitizedBaseSlugOverride = sanitizeSessionSlugBase(baseSlugOverride);
   const baseSlug =
-    baseSlugOverride || createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
+    sanitizedBaseSlugOverride ?? createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
   const sessionId = await ensureUniqueSessionId(baseSlug);
   const dir = sessionDir(sessionId);
   await ensureDir(dir);

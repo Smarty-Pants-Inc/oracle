@@ -19,17 +19,34 @@ interface ModelTargetTraits {
   wantsThinking: boolean;
 }
 
+async function evaluateWithTimeout(
+  Runtime: ChromeClient["Runtime"],
+  params: Parameters<ChromeClient["Runtime"]["evaluate"]>[0],
+  timeoutMs: number,
+  message: string,
+) {
+  return await Promise.race([
+    Runtime.evaluate(params),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
+  ]);
+}
+
 export async function ensureModelSelection(
   Runtime: ChromeClient["Runtime"],
   desiredModel: string,
   logger: BrowserLogger,
   strategy: BrowserModelStrategy = "select",
 ) {
-  const outcome = await Runtime.evaluate({
-    expression: buildModelSelectionExpression(desiredModel, strategy),
-    awaitPromise: true,
-    returnByValue: true,
-  });
+  const outcome = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: buildModelSelectionExpression(desiredModel, strategy),
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    30_000,
+    `Timed out while selecting the ChatGPT model (${desiredModel})`,
+  );
 
   const result = outcome.result?.value as
     | { status: "already-selected"; label?: string | null }
@@ -373,6 +390,19 @@ function buildModelSelectionExpression(
       }
       let score = 0;
       const normalizedTestId = (testid ?? '').toLowerCase();
+      const hasProVariant = hasVariant(normalizedText, normalizedTestId, 'pro');
+      const hasThinkingVariant = hasVariant(normalizedText, normalizedTestId, 'thinking');
+      const hasInstantVariant = hasVariant(normalizedText, normalizedTestId, 'instant');
+      if (
+        (wantsPro && !hasProVariant) ||
+        (!wantsPro && hasProVariant) ||
+        (wantsThinking && !hasThinkingVariant) ||
+        (!wantsThinking && hasThinkingVariant) ||
+        (wantsInstant && !hasInstantVariant) ||
+        (!wantsInstant && hasInstantVariant)
+      ) {
+        return 0;
+      }
       if (optionMatchesTarget(normalizedText, normalizedTestId)) {
         score += 600;
         if (normalizedText === 'pro' || normalizedText === 'thinking' || normalizedText === 'instant') {
@@ -492,6 +522,23 @@ function buildModelSelectionExpression(
       if (wantsInstant && !normalizedTestId.includes('instant')) return false;
       return true;
     };
+    const clickedVariantShortcutOption = (match) => {
+      const normalizedLabel = normalizeText(match?.label ?? '');
+      const normalizedTestId = (match?.testid ?? '').toLowerCase();
+      if (!normalizedLabel || detectCandidateVersion(normalizedLabel, normalizedTestId)) {
+        return false;
+      }
+      if (normalizedLabel === 'pro') {
+        return wantsPro && !wantsThinking && !wantsInstant;
+      }
+      if (normalizedLabel === 'thinking') {
+        return wantsThinking && !wantsPro && !wantsInstant;
+      }
+      if (normalizedLabel === 'instant') {
+        return wantsInstant && !wantsPro && !wantsThinking;
+      }
+      return false;
+    };
     const usesGenericModelButton = () => {
       const normalizedButtonLabel = normalizeText(getButtonLabel());
       return normalizedButtonLabel === 'chatgpt';
@@ -526,15 +573,11 @@ function buildModelSelectionExpression(
         const labels = collectMenuLabels();
         return labels.includes('standard') && labels.includes('extended');
       };
-      const pickThinkingTimeFallback = () => {
-        const optionNodes = collectOptionNodes();
-        const fallback =
-          optionNodes.find((node) => normalizeText(getOptionLabel(node)) === 'standard') ??
-          optionNodes.find((node) => normalizeText(getOptionLabel(node)).includes('standard'));
-        if (!fallback) {
-          return null;
-        }
-        dispatchClickSequence(fallback);
+      const dismissThinkingTimeMenu = () => {
+        // Selecting Pro/Thinking can hand off to the thinking-time chooser.
+        // Close that menu without mutating the current level.
+        dispatchEscape();
+        lastPointerClick = 0;
         return true;
       };
       const ensureMenuOpen = () => {
@@ -623,13 +666,13 @@ function buildModelSelectionExpression(
               return;
             }
             if ((wantsPro || wantsThinking) && looksLikeThinkingTimeMenu()) {
-              if (pickThinkingTimeFallback()) {
-                setTimeout(attempt, Math.max(120, INITIAL_WAIT_MS));
+              if (dismissThinkingTimeMenu()) {
+                resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });
                 return;
               }
             }
             if (
-              clickedExactVersionedOption(match) &&
+              (clickedExactVersionedOption(match) || clickedVariantShortcutOption(match)) &&
               usesGenericModelButton() &&
               getAssociatedMenuRoots().length === 0
             ) {

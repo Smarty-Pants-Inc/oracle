@@ -5,6 +5,7 @@ import {
   attachSupervisorThread,
   listSupervisorThreads,
   newSupervisorThread,
+  supervisorThreadMatchesProjectScope,
   type SupervisorThreadInfo,
 } from "../browser/supervisorThreads.js";
 import {
@@ -60,8 +61,6 @@ export interface SupervisorBrokerDeps {
 }
 
 const supervisorChromeLogger = Object.assign((_: string) => {}, { verbose: false });
-const SUPERVISOR_FOCUS_GUARD_MS = 15_000;
-
 interface ChromeFocusDeps {
   captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
@@ -84,6 +83,32 @@ const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
   connectSupervisorRuntime,
 };
 
+function configuredSupervisorProjectUrl(
+  meta: Awaited<ReturnType<typeof sessionStore.readSession>>,
+): string | undefined {
+  return (
+    meta?.browser?.config?.supervisorChatgptUrl ??
+    meta?.browser?.config?.chatgptUrl ??
+    meta?.browser?.config?.url ??
+    undefined
+  );
+}
+
+function filterSupervisorThreadsForBrokerProjectScope(
+  threads: SupervisorThreadInfo[],
+  projectUrl?: string,
+): SupervisorThreadInfo[] {
+  const normalizedProjectUrl = projectUrl?.trim();
+  if (!normalizedProjectUrl) {
+    return threads;
+  }
+  return threads.filter(
+    (thread) =>
+      Boolean(thread.url?.trim()) &&
+      supervisorThreadMatchesProjectScope(thread, normalizedProjectUrl),
+  );
+}
+
 async function withChromeFocusProtection<T>(
   chromePid: number | undefined,
   action: () => Promise<T>,
@@ -99,7 +124,6 @@ async function withChromeFocusProtection<T>(
     supervisorChromeLogger,
     frontmostProcess,
     250,
-    SUPERVISOR_FOCUS_GUARD_MS,
   );
   try {
     await deps
@@ -117,6 +141,7 @@ async function withSupervisorRuntime<T>(
   action: (args: {
     Runtime: Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"]["Runtime"];
     sessionId: string;
+    targetId?: string;
   }) => Promise<T>,
   runtimeDeps: SupervisorRuntimeDeps = supervisorRuntimeDeps,
   focusDeps: ChromeFocusDeps = chromeFocusDeps,
@@ -130,6 +155,7 @@ async function withSupervisorRuntime<T>(
         return await action({
           Runtime: connection.client.Runtime,
           sessionId: context.sessionId,
+          targetId: connection.targetId,
         });
       } finally {
         await connection.close();
@@ -142,22 +168,102 @@ async function withSupervisorRuntime<T>(
 async function syncSupervisorRuntimeSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
+  targetId?: string,
 ): Promise<void> {
   const meta = await sessionStore.readSession(sessionId);
   const runtime = meta?.browser?.runtime;
   if (!runtime) {
     throw new Error(`Supervisor runtime session ${sessionId} is missing browser metadata.`);
   }
+  if (!supervisorThreadMatchesProjectScope(thread, configuredSupervisorProjectUrl(meta))) {
+    throw new Error(
+      `Refusing to persist Oracle supervisor thread ${thread.conversationId} outside the configured project scope.`,
+    );
+  }
   await sessionStore.updateSession(sessionId, {
     browser: {
       config: meta.browser?.config,
       runtime: {
         ...runtime,
+        chromeTargetId: targetId ?? runtime.chromeTargetId,
         tabUrl: thread.url ?? runtime.tabUrl,
         conversationId: thread.conversationId,
       },
     },
   });
+}
+
+function supervisorThreadSessionSlug(thread: SupervisorThreadInfo): string {
+  const source = thread.conversationId?.trim() || thread.title.trim() || "chatgpt";
+  const normalized = source
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `oracle-thread-${normalized || "chatgpt"}`;
+}
+
+async function createSupervisorThreadSession(
+  sessionId: string,
+  thread: SupervisorThreadInfo,
+  targetId?: string,
+): Promise<string> {
+  const meta = await sessionStore.readSession(sessionId);
+  const runtime = meta?.browser?.runtime;
+  if (!meta || !runtime) {
+    throw new Error(`Supervisor runtime session ${sessionId} is missing browser metadata.`);
+  }
+  if (!supervisorThreadMatchesProjectScope(thread, configuredSupervisorProjectUrl(meta))) {
+    throw new Error(
+      "Refusing to create an Oracle supervisor thread session outside the configured project scope.",
+    );
+  }
+
+  const browser = {
+    config: meta.browser?.config,
+    runtime: {
+      ...runtime,
+      chromeTargetId: targetId ?? runtime.chromeTargetId,
+      tabUrl: thread.url ?? runtime.tabUrl,
+      conversationId: thread.conversationId,
+    },
+  };
+
+  const model = meta.options.model ?? meta.options.effectiveModelId ?? meta.model ?? "gpt-5.4-pro";
+  const created = await sessionStore.createSession(
+    {
+      prompt: `Supervisor thread: ${thread.title}`,
+      model,
+      models: meta.options.models,
+      mode: "browser",
+      browserConfig: browser.config,
+      followupSessionId: sessionId,
+      effectiveModelId: meta.options.effectiveModelId ?? model,
+      search: meta.options.search,
+      silent: true,
+      waitPreference: true,
+    },
+    meta.cwd ?? process.cwd(),
+    meta.notifications,
+    supervisorThreadSessionSlug(thread),
+  );
+
+  await sessionStore.updateSession(created.id, {
+    status: "completed",
+    browser,
+    promptPreview: `Supervisor thread: ${thread.title}`,
+    mode: "browser",
+    completedAt: new Date().toISOString(),
+  });
+  return created.id;
+}
+
+async function createAndSyncSupervisorThreadSession(
+  sessionId: string,
+  thread: SupervisorThreadInfo,
+  targetId?: string,
+): Promise<string> {
+  await syncSupervisorRuntimeSession(sessionId, thread, targetId);
+  return await createSupervisorThreadSession(sessionId, thread, targetId);
 }
 
 function normalizeOperation(request: SupervisorBrokerRequest): SupervisorBrokerOperation {
@@ -183,24 +289,38 @@ export async function runSupervisorBrokerRequest(
       case "list_threads":
         return (
           deps.listThreads ??
-          (async (incoming: SupervisorBrokerRequest) => ({
-            ok: true as const,
-            threads: await withSupervisorRuntime(incoming, ({ Runtime }) =>
-              listSupervisorThreads(Runtime),
-            ),
-          }))
+          (async (incoming: SupervisorBrokerRequest) =>
+            withSupervisorRuntime(incoming, async ({ Runtime, sessionId }) => {
+              const meta = await sessionStore.readSession(sessionId);
+              return {
+                ok: true as const,
+                threads: filterSupervisorThreadsForBrokerProjectScope(
+                  await listSupervisorThreads(Runtime, {
+                    projectUrl: configuredSupervisorProjectUrl(meta),
+                  }),
+                  configuredSupervisorProjectUrl(meta),
+                ),
+              };
+            }))
         )(request);
       case "new_thread":
         return (
           deps.newThread ??
           (async (incoming: SupervisorBrokerRequest) =>
-            withSupervisorRuntime(incoming, async ({ Runtime, sessionId }) => {
-              const thread = await newSupervisorThread(Runtime);
-              await syncSupervisorRuntimeSession(sessionId, thread);
+            withSupervisorRuntime(incoming, async ({ Runtime, sessionId, targetId }) => {
+              const meta = await sessionStore.readSession(sessionId);
+              const thread = await newSupervisorThread(Runtime, {
+                projectUrl: configuredSupervisorProjectUrl(meta),
+              });
+              const threadSessionId = await createAndSyncSupervisorThreadSession(
+                sessionId,
+                thread,
+                targetId,
+              );
               return {
                 ok: true as const,
                 thread,
-                sessionId,
+                sessionId: threadSessionId,
               };
             }))
         )(request);
@@ -215,13 +335,20 @@ export async function runSupervisorBrokerRequest(
         return (
           deps.attachThread ??
           (async (incoming: SupervisorBrokerRequest) =>
-            withSupervisorRuntime(incoming, async ({ Runtime, sessionId }) => {
-              const thread = await attachSupervisorThread(Runtime, conversationId);
-              await syncSupervisorRuntimeSession(sessionId, thread);
+            withSupervisorRuntime(incoming, async ({ Runtime, sessionId, targetId }) => {
+              const meta = await sessionStore.readSession(sessionId);
+              const thread = await attachSupervisorThread(Runtime, conversationId, {
+                projectUrl: configuredSupervisorProjectUrl(meta),
+              });
+              const threadSessionId = await createAndSyncSupervisorThreadSession(
+                sessionId,
+                thread,
+                targetId,
+              );
               return {
                 ok: true as const,
                 thread,
-                sessionId,
+                sessionId: threadSessionId,
               };
             }))
         )(request);
@@ -263,4 +390,9 @@ export async function startSupervisorBroker(): Promise<void> {
 export const __test__ = {
   withChromeFocusProtection,
   withSupervisorRuntime,
+  syncSupervisorRuntimeSession,
+  createSupervisorThreadSession,
+  createAndSyncSupervisorThreadSession,
+  filterSupervisorThreadsForBrokerProjectScope,
+  supervisorThreadSessionSlug,
 };

@@ -14,6 +14,7 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserLogger } from "./types.js";
 import { estimateTokenCount } from "./utils.js";
 import { continueBrowserSession, type ReattachDeps } from "./reattach.js";
+import { extractConversationIdFromUrl } from "./reattachHelpers.js";
 
 export interface BrowserExecutionResult {
   usage: {
@@ -43,6 +44,36 @@ export interface BrowserSessionRunnerDeps extends ReattachDeps {
 
 interface ContinueBrowserSessionArgs extends RunBrowserSessionArgs {
   parentSession: SessionMetadata;
+}
+
+function ensureRuntimeInErrorDetails(
+  error: BrowserAutomationError,
+  runtime: BrowserRuntimeMetadata,
+): BrowserAutomationError {
+  const details = typeof error.details === "object" && error.details ? { ...error.details } : {};
+  if ("runtime" in details && details.runtime) {
+    return error;
+  }
+  return new BrowserAutomationError(error.message, { ...details, runtime }, error);
+}
+
+function mergeBrowserRuntimeMetadata(
+  runtime: BrowserRuntimeMetadata,
+  updates?: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  if (!updates) {
+    return runtime;
+  }
+  const tabUrl = updates.tabUrl ?? runtime.tabUrl;
+  return {
+    ...runtime,
+    ...updates,
+    tabUrl,
+    conversationId:
+      updates.conversationId ??
+      (tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined) ??
+      runtime.conversationId,
+  };
 }
 
 export async function runBrowserSessionExecution(
@@ -183,6 +214,7 @@ export async function runBrowserSessionExecution(
       userDataDir: browserResult.userDataDir,
       chromeTargetId: browserResult.chromeTargetId,
       tabUrl: browserResult.tabUrl,
+      conversationId: browserResult.conversationId,
       controllerPid: browserResult.controllerPid ?? process.pid,
     },
     answerText,
@@ -252,6 +284,16 @@ export async function continueBrowserSessionExecution(
   logger.verbose = Boolean(runOptions.verbose);
   logger.sessionLog = runOptions.verbose ? log : () => {};
   const startedAt = Date.now();
+  const parentAssistantOutput = String(parentSession.response?.assistantOutput ?? "").trim();
+  const followupDeps =
+    !deps.baselineAssistant && parentAssistantOutput
+      ? {
+          ...deps,
+          baselineAssistant: {
+            text: parentAssistantOutput,
+          },
+        }
+      : deps;
   let result;
   try {
     result = await continueBrowser(
@@ -268,17 +310,18 @@ export async function continueBrowserSessionExecution(
             }
           : undefined,
       },
-      deps,
+      followupDeps,
     );
   } catch (error) {
     if (error instanceof BrowserAutomationError) {
-      throw error;
+      throw ensureRuntimeInErrorDetails(error, runtime);
     }
     const message = error instanceof Error ? error.message : "Browser follow-up automation failed.";
-    throw new BrowserAutomationError(message, { stage: "continue-browser" }, error);
+    throw new BrowserAutomationError(message, { stage: "continue-browser", runtime }, error);
   }
+  const mergedRuntime = mergeBrowserRuntimeMetadata(runtime, result.runtime);
   if (result.runtime) {
-    await deps.persistRuntimeHint?.(result.runtime);
+    await deps.persistRuntimeHint?.(mergedRuntime);
   }
   const outputTokens =
     result.answerTokens ?? estimateTokenCount(result.answerMarkdown || result.answerText || "");
@@ -318,7 +361,7 @@ export async function continueBrowserSessionExecution(
   return {
     usage,
     elapsedMs,
-    runtime: result.runtime ?? runtime,
+    runtime: mergedRuntime,
     answerText: result.answerMarkdown || result.answerText || "",
   };
 }

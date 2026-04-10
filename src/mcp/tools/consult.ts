@@ -276,6 +276,7 @@ export function registerConsultTool(server: McpServer): void {
       const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
       const browserGuard = ensureBrowserAvailable(resolvedEngine, {
         remoteHost: resolvedRemote.host,
+        launcher: userConfig.browser?.launcher ?? null,
       });
       if (resolvedEngine === "browser" && browserGuard) {
         return {

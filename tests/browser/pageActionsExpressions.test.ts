@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildAssistantExtractorForTest,
+  buildAssistantSnapshotExpressionForTest,
   buildConversationDebugExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
@@ -48,6 +49,21 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("const __minTurn");
   });
 
+  test("assistant snapshot expression does not return raw placeholder turns when fallback is empty", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(2);
+    expect(expression).toContain(
+      "const extractedCandidate = extracted && extracted.text && !isPlaceholder(extracted) ? extracted : null;",
+    );
+    expect(expression).toContain("return fallback() ?? null;");
+    expect(expression).not.toContain("return fallback() ?? extracted;");
+  });
+
+  test("assistant snapshot expression treats progress-only project-view status text as transient", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(2);
+    expect(expression).toContain("if (progressOnly) return true;");
+    expect(expression).toContain("starting|finalizing answer");
+  });
+
   test("copy expression scopes to assistant turn buttons", () => {
     const expression = buildCopyExpressionForTest({});
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
@@ -56,5 +72,11 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("isAssistantButton");
     expect(expression).toContain("copy-turn-action-button");
     expect(expression).toContain("return null;");
+  });
+
+  test("assistant response expressions filter nested conversation turn wrappers", () => {
+    expect(buildAssistantSnapshotExpressionForTest(2)).toContain("parentElement?.closest");
+    expect(buildMarkdownFallbackExtractorForTest("2")).toContain("parentElement?.closest");
+    expect(buildCopyExpressionForTest({})).toContain("parentElement?.closest");
   });
 });

@@ -6,10 +6,12 @@ import os from "node:os";
 import path from "node:path";
 
 export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
+  launcher: "chrome",
   chromeProfile: null,
   chromePath: null,
   chromeCookiePath: null,
   attachRunning: false,
+  supervisorChatgptUrl: null,
   url: CHATGPT_URL,
   chatgptUrl: CHATGPT_URL,
   timeoutMs: 1_200_000,
@@ -73,16 +75,21 @@ export function resolveBrowserConfig(
     );
   }
   const isWindows = process.platform === "win32";
-  const manualLogin =
-    config?.manualLogin ?? (isWindows ? true : DEFAULT_BROWSER_CONFIG.manualLogin);
+  const attachRunning = config?.attachRunning ?? DEFAULT_BROWSER_CONFIG.attachRunning;
   const cookieSyncDefault = isWindows ? false : DEFAULT_BROWSER_CONFIG.cookieSync;
+  const explicitProfileDir =
+    config?.manualLoginProfileDir ?? process.env.ORACLE_BROWSER_PROFILE_DIR ?? null;
   const resolvedProfileDir =
-    config?.manualLoginProfileDir ??
-    process.env.ORACLE_BROWSER_PROFILE_DIR ??
-    path.join(os.homedir(), ".oracle", "browser-profile");
+    explicitProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
+  const launcher = config?.launcher ?? DEFAULT_BROWSER_CONFIG.launcher;
+  const isCarbonyl = launcher === "carbonyl";
+  const manualLogin = isCarbonyl
+    ? false
+    : (config?.manualLogin ?? (isWindows ? true : DEFAULT_BROWSER_CONFIG.manualLogin));
   return {
     ...DEFAULT_BROWSER_CONFIG,
     ...config,
+    launcher,
     url: normalizedUrl,
     chatgptUrl: normalizedUrl,
     timeoutMs: config?.timeoutMs ?? DEFAULT_BROWSER_CONFIG.timeoutMs,
@@ -105,15 +112,17 @@ export function resolveBrowserConfig(
     cookieSyncWaitMs: config?.cookieSyncWaitMs ?? DEFAULT_BROWSER_CONFIG.cookieSyncWaitMs,
     inlineCookies: config?.inlineCookies ?? DEFAULT_BROWSER_CONFIG.inlineCookies,
     inlineCookiesSource: config?.inlineCookiesSource ?? DEFAULT_BROWSER_CONFIG.inlineCookiesSource,
-    headless: config?.headless ?? DEFAULT_BROWSER_CONFIG.headless,
+    headless: isCarbonyl ? false : (config?.headless ?? DEFAULT_BROWSER_CONFIG.headless),
     keepBrowser: config?.keepBrowser ?? DEFAULT_BROWSER_CONFIG.keepBrowser,
-    hideWindow: config?.hideWindow ?? DEFAULT_BROWSER_CONFIG.hideWindow,
+    hideWindow: isCarbonyl ? false : (config?.hideWindow ?? DEFAULT_BROWSER_CONFIG.hideWindow),
     desiredModel,
     modelStrategy,
     chromeProfile: config?.chromeProfile ?? DEFAULT_BROWSER_CONFIG.chromeProfile,
     chromePath: config?.chromePath ?? DEFAULT_BROWSER_CONFIG.chromePath,
     chromeCookiePath: config?.chromeCookiePath ?? DEFAULT_BROWSER_CONFIG.chromeCookiePath,
-    attachRunning: config?.attachRunning ?? DEFAULT_BROWSER_CONFIG.attachRunning,
+    attachRunning,
+    supervisorChatgptUrl:
+      config?.supervisorChatgptUrl ?? DEFAULT_BROWSER_CONFIG.supervisorChatgptUrl,
     debug: config?.debug ?? DEFAULT_BROWSER_CONFIG.debug,
     allowCookieErrors:
       config?.allowCookieErrors ?? envAllowCookieErrors ?? DEFAULT_BROWSER_CONFIG.allowCookieErrors,
@@ -123,7 +132,11 @@ export function resolveBrowserConfig(
       config?.remoteChromeProfileRoot ?? DEFAULT_BROWSER_CONFIG.remoteChromeProfileRoot,
     thinkingTime: config?.thinkingTime,
     manualLogin,
-    manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
+    manualLoginProfileDir: isCarbonyl
+      ? null
+      : manualLogin || explicitProfileDir
+        ? resolvedProfileDir
+        : null,
     manualLoginCookieSync:
       config?.manualLoginCookieSync ?? DEFAULT_BROWSER_CONFIG.manualLoginCookieSync,
   };

@@ -26,6 +26,31 @@ describe("buildBrowserConfig", () => {
     expect(config.desiredModel).toBe("Thinking 5.4");
   });
 
+  test("passes through the selected browser launcher", async () => {
+    const config = await buildBrowserConfig({
+      model: "gpt-5.4-pro",
+      browserLauncher: "carbonyl",
+    });
+    expect(config.launcher).toBe("carbonyl");
+  });
+
+  test("forces Carbonyl away from manual-login Chrome reuse flags", async () => {
+    const config = await buildBrowserConfig({
+      model: "gpt-5.4-pro",
+      browserLauncher: "carbonyl",
+      browserHeadless: true,
+      browserHideWindow: true,
+      browserManualLogin: true,
+      browserManualLoginProfileDir: "/tmp/oracle-profile",
+    });
+
+    expect(config.launcher).toBe("carbonyl");
+    expect(config.headless).toBe(false);
+    expect(config.hideWindow).toBe(false);
+    expect(config.manualLogin).toBe(false);
+    expect(config.manualLoginProfileDir).toBeNull();
+  });
+
   test("sets model strategy when provided", async () => {
     const config = await buildBrowserConfig({
       model: "gpt-5.2-pro",

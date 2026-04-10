@@ -27,11 +27,13 @@ import {
   navigateToPromptReadyWithFallback,
   ensureNotBlocked,
   ensureLoggedIn,
+  ensureBackendApiReachable,
   ensurePromptReady,
   installJavaScriptDialogAutoDismissal,
   ensureModelSelection,
   clearPromptComposer,
   waitForAssistantResponse,
+  isAssistantRateLimitError,
   captureAssistantMarkdown,
   clearComposerAttachments,
   uploadAttachmentFile,
@@ -52,6 +54,7 @@ import type { ProfileRunLock } from "./profileState.js";
 import {
   cleanupStaleProfileState,
   acquireProfileRunLock,
+  isProcessAlive,
   readChromePid,
   readDevToolsPort,
   shouldCleanupManualLoginProfileState,
@@ -78,6 +81,27 @@ function shouldPreserveBrowserOnError(error: unknown, headless: boolean): boolea
 
 export function shouldPreserveBrowserOnErrorForTest(error: unknown, headless: boolean): boolean {
   return shouldPreserveBrowserOnError(error, headless);
+}
+
+function attachBrowserRuntimeIfMissing(error: Error, runtime: Record<string, unknown>): Error {
+  if (!(error instanceof BrowserAutomationError)) {
+    return error;
+  }
+  const details = ((error.details as Record<string, unknown> | undefined) ?? {}) as Record<
+    string,
+    unknown
+  >;
+  if (details.runtime) {
+    return error;
+  }
+  return new BrowserAutomationError(
+    error.message,
+    {
+      ...details,
+      runtime,
+    },
+    (error as Error & { cause?: unknown }).cause,
+  );
 }
 
 function listIgnoredRemoteChromeFlags(config: {
@@ -115,6 +139,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const runtimeHintCb = options.runtimeHintCb;
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
+  let chromeBrowserWSEndpoint: string | undefined;
   const emitRuntimeHint = async (): Promise<void> => {
     if (!runtimeHintCb || !chrome?.port) {
       return;
@@ -124,6 +149,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePid: chrome.pid,
       chromePort: chrome.port,
       chromeHost,
+      chromeBrowserWSEndpoint,
       chromeTargetId: lastTargetId,
       tabUrl: lastUrl,
       conversationId,
@@ -146,8 +172,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     );
   }
 
+  let attachRunningChromePid: number | undefined;
   if (config.attachRunning) {
     const attached = await resolveAttachRunningConnection(config, logger);
+    attachRunningChromePid = attached.chromePid ?? undefined;
     config = {
       ...config,
       remoteChrome: { host: attached.host, port: attached.port },
@@ -175,10 +203,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Note: --remote-chrome ignores local Chrome flags (${ignoredFlags.join(", ")}).`);
     }
 
-    return runRemoteBrowserMode(promptText, attachments, config, logger, options);
+    const result = await runRemoteBrowserMode(promptText, attachments, config, logger, options);
+    if (attachRunningChromePid && !result.chromePid) {
+      return {
+        ...result,
+        chromePid: attachRunningChromePid,
+      };
+    }
+    return result;
   }
 
-  const manualLogin = Boolean(config.manualLogin);
+  const manualLogin = Boolean(config.manualLogin) && config.launcher !== "carbonyl";
   const manualProfileDir = config.manualLoginProfileDir
     ? path.resolve(config.manualLoginProfileDir)
     : path.join(os.homedir(), ".oracle", "browser-profile");
@@ -193,13 +228,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     logger(`Created temporary Chrome profile at ${userDataDir}`);
   }
 
-  const shouldHideChromeWindow = !config.headless && config.hideWindow;
+  const shouldHideChromeWindow =
+    config.launcher !== "carbonyl" && !config.headless && config.hideWindow;
   const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
 
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
         waitForPortMs: config.reuseChromeWaitMs,
+        failOnLiveChromeWithoutDevtools: true,
       })
     : null;
   const chrome =
@@ -251,20 +288,25 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let preserveBrowserOnError = false;
   let stopChromeFocusGuard: (() => void) | null = null;
   if (shouldHideChromeWindow) {
-    await hideChromeWindow(chrome, logger, frontmostTarget);
     stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
+    await hideChromeWindow(chrome, logger, frontmostTarget);
   }
 
   try {
     try {
       const strictTabIsolation = Boolean(manualLogin && reusedChrome);
+      const requireHiddenTarget = Boolean(shouldHideChromeWindow);
       const connection = await connectWithNewTab(chrome.port, logger, undefined, chromeHost, {
-        fallbackToDefault: !strictTabIsolation,
+        fallbackToDefault: !strictTabIsolation && !requireHiddenTarget,
+        preferDefaultTarget: config.launcher === "carbonyl",
+        hiddenTarget: requireHiddenTarget,
+        closeTargetOnDispose: !effectiveKeepBrowser,
         retries: strictTabIsolation ? 3 : 0,
         retryDelayMs: 500,
       });
       client = connection.client;
       isolatedTargetId = connection.targetId ?? null;
+      chromeBrowserWSEndpoint = connection.browserWSEndpoint ?? undefined;
     } catch (error) {
       const hint = describeDevtoolsFirewallHint(chromeHost, chrome.port);
       if (hint) {
@@ -297,7 +339,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await Network.clearBrowserCookies();
     }
 
-    const manualLoginCookieSync = manualLogin && Boolean(config.manualLoginCookieSync);
+    const manualLoginCookieSync =
+      manualLogin && Boolean(config.manualLoginCookieSync) && !reusedChrome;
     const cookieSyncEnabled = config.cookieSync && (!manualLogin || manualLoginCookieSync);
     if (cookieSyncEnabled) {
       if (manualLoginCookieSync) {
@@ -335,9 +378,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       );
     } else {
       logger(
-        manualLogin
-          ? "Skipping Chrome cookie sync (--browser-manual-login enabled); reuse the opened profile after signing in."
-          : "Skipping Chrome cookie sync (--browser-no-cookie-sync)",
+        manualLogin && reusedChrome
+          ? "Manual login mode: reusing a running persistent Chrome profile; skipping cookie sync."
+          : manualLogin
+            ? "Skipping Chrome cookie sync (--browser-manual-login enabled); reuse the opened profile after signing in."
+            : "Skipping Chrome cookie sync (--browser-no-cookie-sync)",
       );
     }
 
@@ -534,6 +579,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
       const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+      await ensureBackendApiReachable(Runtime, logger);
+      await clearPromptComposer(Runtime, logger);
       let attachmentWaitTimedOut = false;
       let inputOnlyAttachments = false;
       if (submissionAttachments.length > 0) {
@@ -733,6 +780,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               chromePid: chrome.pid,
               chromePort: chrome.port,
               chromeHost,
+              chromeBrowserWSEndpoint,
               userDataDir,
               chromeTargetId: lastTargetId,
               tabUrl: lastUrl,
@@ -766,6 +814,26 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         ),
       );
     } catch (error) {
+      if (isAssistantRateLimitError(error)) {
+        await updateConversationHint("assistant-rate-limit", 15_000).catch(() => false);
+        await captureRuntimeSnapshot().catch(() => undefined);
+        const runtime = {
+          chromePid: chrome.pid,
+          chromePort: chrome.port,
+          chromeHost,
+          chromeBrowserWSEndpoint,
+          userDataDir,
+          chromeTargetId: lastTargetId,
+          tabUrl: lastUrl,
+          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+          controllerPid: process.pid,
+        };
+        throw new BrowserAutomationError(
+          "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
+          { stage: "assistant-rate-limit", runtime },
+          error,
+        );
+      }
       if (isAssistantResponseTimeoutError(error)) {
         const rechecked = await attemptAssistantRecheck().catch(() => null);
         if (rechecked) {
@@ -777,6 +845,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             chromePid: chrome.pid,
             chromePort: chrome.port,
             chromeHost,
+            chromeBrowserWSEndpoint,
             userDataDir,
             chromeTargetId: lastTargetId,
             tabUrl: lastUrl,
@@ -962,27 +1031,34 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePid: chrome.pid,
       chromePort: chrome.port,
       chromeHost,
+      chromeBrowserWSEndpoint,
       userDataDir,
       chromeTargetId: lastTargetId,
       tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       controllerPid: process.pid,
     };
   } catch (error) {
-    const normalizedError = error instanceof Error ? error : new Error(String(error));
+    const runtime = {
+      chromePid: chrome.pid,
+      chromePort: chrome.port,
+      chromeHost,
+      chromeBrowserWSEndpoint,
+      userDataDir,
+      chromeTargetId: lastTargetId,
+      tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      controllerPid: process.pid,
+    };
+    const normalizedError = attachBrowserRuntimeIfMissing(
+      error instanceof Error ? error : new Error(String(error)),
+      runtime,
+    );
     stopThinkingMonitor?.();
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
     if (shouldPreserveBrowserOnError(normalizedError, config.headless)) {
       preserveBrowserOnError = true;
-      const runtime = {
-        chromePid: chrome.pid,
-        chromePort: chrome.port,
-        chromeHost,
-        userDataDir,
-        chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
-        controllerPid: process.pid,
-      };
       const reuseProfileHint =
         `oracle --engine browser --browser-manual-login ` +
         `--browser-manual-login-profile-dir ${JSON.stringify(userDataDir)}`;
@@ -1019,6 +1095,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           chromePid: chrome.pid,
           chromePort: chrome.port,
           chromeHost,
+          chromeBrowserWSEndpoint,
           userDataDir,
           chromeTargetId: lastTargetId,
           tabUrl: lastUrl,
@@ -1038,7 +1115,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     // Close the isolated tab once the response has been fully captured to prevent
     // tab accumulation across repeated runs. Keep the tab open on incomplete runs
     // so reattach can recover the response.
-    if (runStatus === "complete" && isolatedTargetId && chrome?.port) {
+    if (runStatus === "complete" && isolatedTargetId && chrome?.port && !effectiveKeepBrowser) {
       await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
     }
     removeDialogHandler?.();
@@ -1254,22 +1331,67 @@ async function _assertNavigatedToHttp(
 export async function maybeReuseRunningChrome(
   userDataDir: string,
   logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
+  options: {
+    waitForPortMs?: number;
+    probe?: typeof verifyDevToolsReachable;
+    failOnLiveChromeWithoutDevtools?: boolean;
+  } = {},
 ): Promise<LaunchedChrome | null> {
   const waitForPortMs = Math.max(0, options.waitForPortMs ?? 0);
   let port = await readDevToolsPort(userDataDir);
+  let pid = await readChromePid(userDataDir);
+  const hasLiveChromePid = () => Boolean(pid && isProcessAlive(pid));
   if (!port && waitForPortMs > 0) {
     const deadline = Date.now() + waitForPortMs;
-    logger(`Waiting up to ${formatElapsed(waitForPortMs)} for shared Chrome to appear...`);
+    logger(
+      hasLiveChromePid()
+        ? `Chrome pid ${pid} is already alive for ${userDataDir}; waiting up to ${formatElapsed(waitForPortMs)} for DevTools to appear...`
+        : `Waiting up to ${formatElapsed(waitForPortMs)} for shared Chrome to appear...`,
+    );
     while (!port && Date.now() < deadline) {
       await delay(250);
       port = await readDevToolsPort(userDataDir);
+      pid = await readChromePid(userDataDir);
     }
   }
   if (!port) return null;
 
-  const probe = await (options.probe ?? verifyDevToolsReachable)({ port });
+  const probeDevTools = options.probe ?? verifyDevToolsReachable;
+  let probe = await probeDevTools({ port });
+  if (!probe.ok && waitForPortMs > 0 && hasLiveChromePid()) {
+    const deadline = Date.now() + waitForPortMs;
+    logger(
+      `DevToolsActivePort found for ${userDataDir} but unreachable (${probe.error}); Chrome pid ${pid} is still alive, waiting for DevTools to recover...`,
+    );
+    while (Date.now() < deadline) {
+      await delay(500);
+      port = await readDevToolsPort(userDataDir);
+      pid = await readChromePid(userDataDir);
+      if (!port) {
+        continue;
+      }
+      probe = await probeDevTools({ port });
+      if (probe.ok) {
+        break;
+      }
+      if (!hasLiveChromePid()) {
+        break;
+      }
+    }
+  }
   if (!probe.ok) {
+    if (options.failOnLiveChromeWithoutDevtools && hasLiveChromePid()) {
+      throw new BrowserAutomationError(
+        `A Chrome process is already using the shared Oracle profile (${userDataDir}), but DevTools is still unreachable after waiting ${formatElapsed(waitForPortMs)}. Refusing to launch a second Chrome instance for that profile.`,
+        {
+          stage: "manual-login-devtools-unreachable",
+          userDataDir,
+          chromePid: pid ?? null,
+          waitForPortMs,
+          probeError: probe.error,
+        },
+      );
+    }
     logger(
       `DevToolsActivePort found for ${userDataDir} but unreachable (${probe.error}); launching new Chrome.`,
     );
@@ -1278,7 +1400,6 @@ export async function maybeReuseRunningChrome(
     return null;
   }
 
-  const pid = await readChromePid(userDataDir);
   logger(
     `Found running Chrome for ${userDataDir}; reusing (DevTools port ${port}${pid ? `, pid ${pid}` : ""})`,
   );
@@ -1320,6 +1441,7 @@ async function runRemoteBrowserMode(
         chromeProfileRoot,
         chromeTargetId: remoteTargetId ?? undefined,
         tabUrl: lastUrl,
+        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
         controllerPid: process.pid,
       });
     } catch (error) {
@@ -1337,10 +1459,12 @@ async function runRemoteBrowserMode(
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
   const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
+  const preserveRemoteTarget = Boolean(config.keepBrowser);
 
   try {
     connection = await connectToRemoteChrome(host, port, logger, config.url, browserWSEndpoint, {
       approvalWaitMs: config.attachRunning && browserWSEndpoint ? 20_000 : undefined,
+      closeTargetOnDispose: !preserveRemoteTarget,
     });
     client = connection.client;
     remoteTargetId = connection.targetId ?? null;
@@ -1425,6 +1549,8 @@ async function runRemoteBrowserMode(
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
       const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+      await ensureBackendApiReachable(Runtime, logger);
+      await clearPromptComposer(Runtime, logger);
       if (submissionAttachments.length > 0) {
         if (!DOM) {
           throw new Error("Chrome DOM domain unavailable while uploading attachments.");
@@ -1598,6 +1724,32 @@ async function runRemoteBrowserMode(
         baselineTurns ?? undefined,
       );
     } catch (error) {
+      if (isAssistantRateLimitError(error)) {
+        try {
+          const conversationUrl = await readConversationUrl(Runtime);
+          if (conversationUrl) {
+            lastUrl = conversationUrl;
+          }
+        } catch {
+          // ignore
+        }
+        await emitRuntimeHint();
+        const runtime = {
+          chromePort: port,
+          chromeHost: host,
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chromeProfileRoot,
+          chromeTargetId: remoteTargetId ?? undefined,
+          tabUrl: lastUrl,
+          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+          controllerPid: process.pid,
+        };
+        throw new BrowserAutomationError(
+          "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
+          { stage: "assistant-rate-limit", runtime },
+          error,
+        );
+      }
       if (isAssistantResponseTimeoutError(error)) {
         const rechecked = await attemptAssistantRecheck().catch(() => null);
         if (rechecked) {
@@ -1769,10 +1921,24 @@ async function runRemoteBrowserMode(
       userDataDir: undefined,
       chromeTargetId: remoteTargetId ?? undefined,
       tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       controllerPid: process.pid,
     };
   } catch (error) {
-    const normalizedError = error instanceof Error ? error : new Error(String(error));
+    const runtime = {
+      chromeHost: host,
+      chromePort: port,
+      chromeBrowserWSEndpoint: browserWSEndpoint,
+      chromeProfileRoot,
+      chromeTargetId: remoteTargetId ?? undefined,
+      tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      controllerPid: process.pid,
+    };
+    const normalizedError = attachBrowserRuntimeIfMissing(
+      error instanceof Error ? error : new Error(String(error)),
+      runtime,
+    );
     stopThinkingMonitor?.();
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
@@ -1787,15 +1953,7 @@ async function runRemoteBrowserMode(
 
     throw new BrowserAutomationError("Remote Chrome connection lost before Oracle finished.", {
       stage: "connection-lost",
-      runtime: {
-        chromeHost: host,
-        chromePort: port,
-        chromeBrowserWSEndpoint: browserWSEndpoint,
-        chromeProfileRoot,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
-        controllerPid: process.pid,
-      },
+      runtime,
     });
   } finally {
     try {
@@ -1818,6 +1976,8 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   listIgnoredRemoteChromeFlags,
+  shouldReloadAfterAssistantError,
+  isAssistantResponseTimeoutError,
 };
 export { syncCookies } from "./cookies.js";
 export {
@@ -1835,7 +1995,11 @@ export {
 export async function maybeReuseRunningChromeForTest(
   userDataDir: string,
   logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
+  options: {
+    waitForPortMs?: number;
+    probe?: typeof verifyDevToolsReachable;
+    failOnLiveChromeWithoutDevtools?: boolean;
+  } = {},
 ): Promise<LaunchedChrome | null> {
   return maybeReuseRunningChrome(userDataDir, logger, options);
 }
@@ -1891,7 +2055,18 @@ async function waitForAssistantResponseWithReload(
   }
 }
 
+function isAssistantEmptyResponseError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message.toLowerCase().includes("assistant-response-empty-turn");
+}
+
 function shouldReloadAfterAssistantError(error: unknown): boolean {
+  if (isAssistantEmptyResponseError(error)) {
+    return false;
+  }
+  if (isAssistantRateLimitError(error)) {
+    return false;
+  }
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   return (
@@ -1903,6 +2078,12 @@ function shouldReloadAfterAssistantError(error: unknown): boolean {
 }
 
 function isAssistantResponseTimeoutError(error: unknown): boolean {
+  if (isAssistantEmptyResponseError(error)) {
+    return false;
+  }
+  if (isAssistantRateLimitError(error)) {
+    return false;
+  }
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   if (!message) return false;

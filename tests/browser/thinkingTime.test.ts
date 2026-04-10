@@ -23,4 +23,23 @@ describe("browser thinking-time selection expression", () => {
       expect(expression).toContain(`"${level}"`);
     }
   });
+
+  it("reuses an existing thinking-time menu before clicking any composer chip", () => {
+    const expression = buildThinkingTimeExpressionForTest("extended");
+    expect(expression).toContain("const findThinkingMenu = () => {");
+    expect(expression).toContain("const ensureThinkingMenu = async () => {");
+    expect(expression).toContain("const existingMenu = findThinkingMenu();");
+    expect(expression).toContain("return { status: 'ready', menu: existingMenu };");
+  });
+
+  it("ranks thinking-time chip candidates without falling back to the Pro model chip", () => {
+    const expression = buildThinkingTimeExpressionForTest("extended");
+    expect(expression).toContain("const collectThinkingChipCandidates = () => {");
+    expect(expression).toContain("const looksLikeModelChip = (metadata) =>");
+    expect(expression).toContain("metadata === 'pro'");
+    expect(expression).toContain(
+      ".sort((left, right) => right.score - left.score || right.rect.left - left.rect.left)",
+    );
+    expect(expression).not.toContain("aria.includes('pro') || text.includes('pro')");
+  });
 });

@@ -1,5 +1,9 @@
-import { describe, expect, test } from "vitest";
-import { alignPromptEchoPair, buildPromptEchoMatcher } from "../../src/browser/reattachHelpers.ts";
+import { describe, expect, test, vi } from "vitest";
+import {
+  alignPromptEchoPair,
+  buildPromptEchoMatcher,
+  readConversationTurnIndex,
+} from "../../src/browser/reattachHelpers.ts";
 
 describe("alignPromptEchoPair", () => {
   test("aligns answer text when text is a prompt echo", () => {
@@ -25,5 +29,18 @@ describe("alignPromptEchoPair", () => {
     expect(matcher).not.toBeNull();
     const result = alignPromptEchoPair("Echo prompt", "Echo prompt", matcher);
     expect(result.isEcho).toBe(true);
+  });
+
+  test("counts only top-level conversation turns for follow-up baselines", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      expect(expression).toContain("node.parentElement && node.parentElement.closest(selector)");
+      return { result: { value: 5 } };
+    });
+
+    const turnIndex = await readConversationTurnIndex({
+      evaluate,
+    } as never);
+
+    expect(turnIndex).toBe(4);
   });
 });

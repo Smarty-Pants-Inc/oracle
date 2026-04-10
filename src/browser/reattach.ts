@@ -18,6 +18,8 @@ import {
   uploadAttachmentFile,
   waitForAttachmentCompletion,
   waitForUserTurnAttachments,
+  isAssistantEmptyResponseError,
+  isAssistantRateLimitError,
 } from "./pageActions.js";
 import type { BrowserAttachment, BrowserLogger, ChromeClient } from "./types.js";
 import {
@@ -36,17 +38,28 @@ import { resolveBrowserConfig } from "./config.js";
 import { syncCookies } from "./cookies.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { cleanupStaleProfileState } from "./profileState.js";
+import {
+  chromePidMatchesUserDataDir,
+  cleanupStaleProfileState,
+  readChromePid,
+  resolveChromePidForUserDataDir,
+} from "./profileState.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
   pickTarget,
+  isAttachableChatTarget,
+  getRuntimeConversationId,
+  runtimeHasReusableIdentity,
+  runtimeRequiresSpecificTarget,
   extractConversationIdFromUrl,
   buildConversationUrl,
+  conversationHrefMatchesConfiguredScope,
   withTimeout,
   openConversationFromSidebar,
   openConversationFromSidebarWithRetry,
   waitForLocationChange,
+  waitForConversationLocation,
   readConversationTurnIndex,
   buildPromptEchoMatcher,
   recoverPromptEcho,
@@ -74,6 +87,13 @@ export interface ReattachDeps {
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
   promptPreview?: string;
+  baselineTurns?: number | null;
+  baselineAssistant?: {
+    text: string;
+    messageId?: string | null;
+    turnId?: string | null;
+  } | null;
+  forceConversationReload?: boolean;
 }
 
 export interface ReattachResult {
@@ -91,11 +111,23 @@ export interface ContinueBrowserSessionOptions {
 }
 
 async function readCurrentHref(Runtime: ChromeClient["Runtime"]): Promise<string> {
-  const { result } = await Runtime.evaluate({
-    expression: "location.href",
-    returnByValue: true,
-  });
+  const { result } = await withTimeout(
+    Runtime.evaluate({
+      expression: "location.href",
+      returnByValue: true,
+    }),
+    5_000,
+    "Timed out reading location.href",
+  );
   return typeof result?.value === "string" ? result.value : "";
+}
+
+async function conversationLocationMatchesConfiguredScope(
+  Runtime: ChromeClient["Runtime"],
+  baseUrl: string,
+): Promise<boolean> {
+  const href = await readCurrentHref(Runtime);
+  return conversationHrefMatchesConfiguredScope(href, baseUrl);
 }
 
 function mergeRuntimeMetadata(
@@ -125,6 +157,57 @@ function mergeRuntimeMetadata(
     userDataDir: updates.userDataDir ?? runtime.userDataDir,
     controllerPid: updates.controllerPid ?? runtime.controllerPid,
   };
+}
+
+function isAssistantRateLimitAutomationError(error: unknown): error is BrowserAutomationError {
+  if (!(error instanceof BrowserAutomationError)) {
+    return false;
+  }
+  return (error.details as { stage?: string } | undefined)?.stage === "assistant-rate-limit";
+}
+
+function isAssistantRateLimitFailure(error: unknown): boolean {
+  return isAssistantRateLimitError(error) || isAssistantRateLimitAutomationError(error);
+}
+
+function isSessionIdentityError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("Unable to locate the existing Oracle browser tab") ||
+    message.includes("ChatGPT did not reopen the expected conversation") ||
+    message.includes("Reusable Oracle runtime is missing a conversation identity") ||
+    message.includes("missing conversation identity metadata")
+  );
+}
+
+function isRecoverableSessionDiscoveryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("Unable to locate the existing Oracle browser tab") ||
+    message.includes("ChatGPT did not reopen the expected conversation")
+  );
+}
+
+function withTimeoutBudget(
+  config: BrowserSessionConfig | undefined,
+  timeoutMs: number,
+): BrowserSessionConfig {
+  const budgetMs = Math.max(0, timeoutMs);
+  const configuredTimeoutMs = Math.max(0, config?.timeoutMs ?? 0);
+  return {
+    ...(config ?? {}),
+    timeoutMs: configuredTimeoutMs > 0 ? Math.min(configuredTimeoutMs, budgetMs) : budgetMs,
+  };
+}
+
+function withAssistantRecheckBudget(
+  config: BrowserSessionConfig | undefined,
+): BrowserSessionConfig | undefined {
+  const budgetMs = Math.max(0, config?.assistantRecheckTimeoutMs ?? 0);
+  if (budgetMs <= 0) {
+    return config;
+  }
+  return withTimeoutBudget(config, budgetMs);
 }
 
 async function closeClient(client: ChromeClient | null | undefined): Promise<void> {
@@ -170,8 +253,9 @@ async function connectReopenedChrome(
   chromeHost: string,
   logger: BrowserLogger,
   strictTabIsolation: boolean,
+  hiddenTarget: boolean,
 ): Promise<{ client: ChromeClient; isolatedTargetId: string | null }> {
-  if (!strictTabIsolation) {
+  if (!strictTabIsolation && !hiddenTarget) {
     return {
       client: await connectToChrome(chrome.port, logger, chromeHost),
       isolatedTargetId: null,
@@ -179,7 +263,8 @@ async function connectReopenedChrome(
   }
   const connection = await connectWithNewTab(chrome.port, logger, undefined, chromeHost, {
     fallbackToDefault: false,
-    retries: 3,
+    hiddenTarget,
+    retries: strictTabIsolation || hiddenTarget ? 3 : 0,
     retryDelayMs: 500,
   });
   return {
@@ -254,12 +339,104 @@ interface ExistingRuntimeConnection {
   target?: TargetInfoLite;
 }
 
+async function readConnectedTargetInfo(
+  client: ChromeClient,
+  fallback: TargetInfoLite,
+  options?: { requireVerification?: boolean },
+): Promise<TargetInfoLite> {
+  try {
+    const info = await client.Target?.getTargetInfo?.({});
+    if (info?.targetInfo) {
+      return {
+        targetId: info.targetInfo.targetId ?? fallback.targetId,
+        type: info.targetInfo.type ?? fallback.type,
+        url: info.targetInfo.url ?? fallback.url,
+      };
+    }
+    if (options?.requireVerification) {
+      throw new Error("Target.getTargetInfo returned no target metadata");
+    }
+  } catch {
+    if (options?.requireVerification) {
+      throw new Error("Target.getTargetInfo failed while verifying the cached target");
+    }
+  }
+  return fallback;
+}
+
+async function refreshOwnedManualLoginRuntime(
+  runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
+  logger: BrowserLogger,
+): Promise<BrowserRuntimeMetadata> {
+  const resolved = resolveBrowserConfig(config);
+  if (
+    !resolved.manualLogin ||
+    resolved.attachRunning ||
+    resolved.launcher === "carbonyl" ||
+    !resolved.keepBrowser
+  ) {
+    return runtime;
+  }
+  const configuredProfileDir = resolved.manualLoginProfileDir?.trim();
+  const runtimeProfileDir = runtime.userDataDir?.trim();
+  const expectedProfileDir = configuredProfileDir || runtimeProfileDir;
+  if (!expectedProfileDir) {
+    return runtime;
+  }
+  const normalizedProfileDir = path.resolve(expectedProfileDir);
+  if (runtimeProfileDir && path.resolve(runtimeProfileDir) !== normalizedProfileDir) {
+    throw new Error(
+      "Refusing to attach: cached Oracle runtime profile does not match the owned hidden browser profile.",
+    );
+  }
+  if (!runtimeHasReusableIdentity(runtime)) {
+    throw new Error(
+      "Refusing to attach: cached Oracle hidden browser runtime is missing conversation identity metadata. Run another Oracle browser turn before reusing this session.",
+    );
+  }
+  const devtoolsInfo = await readDevToolsActivePortInfo(normalizedProfileDir, {
+    host: runtime.chromeHost ?? "127.0.0.1",
+  });
+  const discoveredChromePid = await readChromePid(normalizedProfileDir);
+  if (
+    discoveredChromePid &&
+    !(await chromePidMatchesUserDataDir(discoveredChromePid, normalizedProfileDir))
+  ) {
+    throw new Error(
+      "Refusing to attach: the process holding the Oracle hidden browser profile is not an Oracle-owned Chrome instance.",
+    );
+  }
+  const chromePid = await resolveChromePidForUserDataDir(normalizedProfileDir, runtime.chromePid);
+  if (!devtoolsInfo) {
+    logger(
+      `[reattach] hidden Oracle profile ${normalizedProfileDir} has no DevToolsActivePort; relaunching a fresh hidden browser instead of attaching elsewhere.`,
+    );
+    return {
+      ...runtime,
+      chromePid: chromePid ?? runtime.chromePid,
+      chromePort: undefined,
+      chromeBrowserWSEndpoint: undefined,
+      userDataDir: normalizedProfileDir,
+    };
+  }
+  return {
+    ...runtime,
+    chromePid: chromePid ?? runtime.chromePid,
+    chromeHost: runtime.chromeHost ?? "127.0.0.1",
+    chromePort: devtoolsInfo.port,
+    chromeBrowserWSEndpoint: devtoolsInfo.browserWSEndpoint,
+    userDataDir: normalizedProfileDir,
+  };
+}
+
 async function connectToExistingRuntime(
   runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
   logger: BrowserLogger,
   deps: ReattachDeps,
 ): Promise<ExistingRuntimeConnection> {
-  const liveRuntime = runtime;
+  const liveRuntime = await refreshOwnedManualLoginRuntime(runtime, config, logger);
   const host = liveRuntime.chromeHost ?? "127.0.0.1";
   const port =
     liveRuntime.chromePort ?? inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
@@ -273,8 +450,108 @@ async function connectToExistingRuntime(
         port: resolvedPort,
         browserWSEndpoint,
       })) as TargetInfoLite[]);
-  const targetList = (await listTargets()) as TargetInfoLite[];
-  const target = pickTarget(targetList, liveRuntime);
+  let cachedTargetList: TargetInfoLite[] | null = null;
+  if (browserWSEndpoint && liveRuntime.chromeTargetId) {
+    cachedTargetList = (await listTargets().catch(
+      () => [] as TargetInfoLite[],
+    )) as TargetInfoLite[];
+  }
+  if (browserWSEndpoint && liveRuntime.chromeTargetId && !deps.connect) {
+    const cachedListedTarget = cachedTargetList?.find((candidate) => {
+      const candidateTargetId = candidate.targetId ?? candidate.id;
+      return candidateTargetId === liveRuntime.chromeTargetId;
+    });
+    if (!cachedListedTarget) {
+      logger(
+        `[reattach] cached target ${liveRuntime.chromeTargetId} is no longer listed; retrying via target discovery.`,
+      );
+    } else {
+      try {
+        const connection = await connectToRemoteChromeTarget(host, resolvedPort, logger, {
+          browserWSEndpoint,
+          targetId: liveRuntime.chromeTargetId,
+          closeTargetOnDispose: false,
+        });
+        try {
+          const target = await readConnectedTargetInfo(
+            connection.client,
+            {
+              targetId: liveRuntime.chromeTargetId,
+              url: liveRuntime.tabUrl,
+            },
+            { requireVerification: true },
+          );
+          if (
+            !pickTarget([target], liveRuntime, {
+              requireMatch: true,
+            })
+          ) {
+            throw new Error("cached target no longer matches the reusable runtime");
+          }
+          return {
+            client: connection.client,
+            close: connection.close,
+            host,
+            port: resolvedPort,
+            liveRuntime,
+            target,
+          };
+        } catch (error) {
+          await connection.close().catch(() => undefined);
+          throw error;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger(
+          `[reattach] direct websocket attach to cached target ${liveRuntime.chromeTargetId} failed (${message}); retrying via target discovery.`,
+        );
+      }
+    }
+  }
+  const requireExactTarget = Boolean(
+    browserWSEndpoint || runtimeRequiresSpecificTarget(liveRuntime),
+  );
+  let targetList = (cachedTargetList ?? (await listTargets())) as TargetInfoLite[];
+  let target = pickTarget(targetList, liveRuntime, {
+    requireMatch: requireExactTarget,
+  });
+  if (!target && requireExactTarget) {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await delay(500);
+      targetList = ((await listTargets().catch(() => [])) as TargetInfoLite[]) ?? [];
+      target = pickTarget(targetList, liveRuntime, {
+        requireMatch: true,
+      });
+      if (target) {
+        logger(
+          `[reattach] recovered reusable target after retry ${attempt} (${target.type ?? "unknown"} ${target.url ?? ""})`,
+        );
+        break;
+      }
+    }
+  }
+  if (!target && browserWSEndpoint) {
+    const portTargetList = (await listRemoteChromeTargets({
+      host,
+      port: resolvedPort,
+    }).catch(() => [])) as TargetInfoLite[];
+    target = pickTarget(portTargetList, liveRuntime, {
+      requireMatch: true,
+    });
+    if (target) {
+      logger(
+        `[reattach] recovered reusable target from host:port discovery (${target.type ?? "unknown"} ${target.url ?? ""})`,
+      );
+      targetList = portTargetList;
+    }
+  }
+  if (!target) {
+    throw new Error(
+      requireExactTarget
+        ? "Unable to locate the existing Oracle browser tab for the reusable runtime. Run another Oracle browser turn or reopen the Oracle conversation before continuing."
+        : "Unable to safely locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before continuing.",
+    );
+  }
   const useBrowserSocketTarget = Boolean(browserWSEndpoint && target?.targetId);
   if (useBrowserSocketTarget && !deps.connect) {
     const connection = await connectToRemoteChromeTarget(host, resolvedPort, logger, {
@@ -282,13 +559,14 @@ async function connectToExistingRuntime(
       targetId: target?.targetId,
       closeTargetOnDispose: false,
     });
+    const connectedTarget = await readConnectedTargetInfo(connection.client, target ?? {});
     return {
       client: connection.client,
       close: connection.close,
       host,
       port: resolvedPort,
       liveRuntime,
-      target,
+      target: connectedTarget,
     };
   }
   const client = (await (deps.connect ?? ((options?: unknown) => CDP(options as CDP.Options)))(
@@ -318,21 +596,78 @@ async function ensureConversationOpenForRuntime(
   Runtime: ChromeClient["Runtime"],
   runtime: BrowserRuntimeMetadata,
   promptPreview?: string,
+  baseUrl = CHATGPT_URL,
 ): Promise<void> {
+  const expectedConversationId = getRuntimeConversationId(runtime);
   const href = await readCurrentHref(Runtime);
-  if (isFreshChatHomeUrl(href) && !runtime.conversationId) {
+  const inferredProjectBaseUrl =
+    !runtime.tabUrl || runtime.tabUrl.trim().length === 0 ? projectBaseUrlFromHref(href) : null;
+  const conversationUrl = buildConversationUrl(runtime, inferredProjectBaseUrl ?? baseUrl);
+  const projectBaseUrl = normalizeProjectBaseUrl(baseUrl);
+  if (isFreshChatHomeUrl(href) && !expectedConversationId) {
     return;
+  }
+  if (!expectedConversationId) {
+    throw new Error(
+      "Reusable Oracle runtime is missing a conversation identity; refusing to continue on an arbitrary existing chat.",
+    );
   }
   if (href.includes("/c/")) {
     const currentId = extractConversationIdFromUrl(href);
-    if (!runtime.conversationId || (currentId && currentId === runtime.conversationId)) {
+    if (
+      currentId &&
+      currentId === expectedConversationId &&
+      conversationHrefMatchesConfiguredScope(href, baseUrl)
+    ) {
+      return;
+    }
+    if (
+      currentId &&
+      currentId !== expectedConversationId &&
+      conversationUrl &&
+      conversationUrl.includes("/c/")
+    ) {
+      await withTimeout(
+        Runtime.evaluate({
+          expression: `window.location.href = ${JSON.stringify(conversationUrl)}`,
+        }),
+        5_000,
+        "Timed out reopening the stored ChatGPT conversation",
+      ).catch(() => undefined);
+      const matched = await waitForConversationLocation(Runtime, expectedConversationId, 15_000);
+      if (matched && (await conversationLocationMatchesConfiguredScope(Runtime, baseUrl))) {
+        return;
+      }
+    }
+  }
+  if (projectBaseUrl) {
+    if (href.replace(/\/+$/, "") !== projectBaseUrl) {
+      await withTimeout(
+        Runtime.evaluate({
+          expression: `window.location.href = ${JSON.stringify(projectBaseUrl)}`,
+        }),
+        5_000,
+        "Timed out reopening the configured ChatGPT project shell",
+      ).catch(() => undefined);
+      await waitForExactLocation(Runtime, projectBaseUrl, 15_000).catch(() => undefined);
+    }
+  } else if (conversationUrl) {
+    await withTimeout(
+      Runtime.evaluate({
+        expression: `window.location.href = ${JSON.stringify(conversationUrl)}`,
+      }),
+      5_000,
+      "Timed out reopening the stored ChatGPT conversation",
+    ).catch(() => undefined);
+    const matched = await waitForConversationLocation(Runtime, expectedConversationId, 15_000);
+    if (matched && (await conversationLocationMatchesConfiguredScope(Runtime, baseUrl))) {
       return;
     }
   }
   const opened = await openConversationFromSidebarWithRetry(
     Runtime,
     {
-      conversationId: runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+      conversationId: expectedConversationId,
       preferProjects: true,
       promptPreview,
     },
@@ -341,7 +676,61 @@ async function ensureConversationOpenForRuntime(
   if (!opened) {
     throw new Error("Unable to locate prior ChatGPT conversation in sidebar.");
   }
+  if (expectedConversationId) {
+    const sidebarHref = await readCurrentHref(Runtime).catch(() => "");
+    const sidebarConversationId = extractConversationIdFromUrl(sidebarHref);
+    if (
+      conversationUrl &&
+      conversationUrl.includes("/c/") &&
+      sidebarConversationId &&
+      sidebarConversationId !== expectedConversationId
+    ) {
+      await withTimeout(
+        Runtime.evaluate({
+          expression: `window.location.href = ${JSON.stringify(conversationUrl)}`,
+        }),
+        5_000,
+        "Timed out forcing the stored ChatGPT conversation URL",
+      ).catch(() => undefined);
+    }
+    let matched = await waitForConversationLocation(Runtime, expectedConversationId, 15_000);
+    if (!matched && conversationUrl && conversationUrl.includes("/c/")) {
+      await withTimeout(
+        Runtime.evaluate({
+          expression: `window.location.href = ${JSON.stringify(conversationUrl)}`,
+        }),
+        5_000,
+        "Timed out forcing the stored ChatGPT conversation URL",
+      ).catch(() => undefined);
+      matched = await waitForConversationLocation(Runtime, expectedConversationId, 15_000);
+    }
+    if (!matched) {
+      throw new Error(
+        "ChatGPT did not reopen the expected conversation before Oracle continued the session.",
+      );
+    }
+    if (!(await conversationLocationMatchesConfiguredScope(Runtime, baseUrl))) {
+      throw new Error(
+        "ChatGPT reopened the expected conversation outside the configured project scope.",
+      );
+    }
+    return;
+  }
   await waitForLocationChange(Runtime, 15_000);
+}
+
+function projectBaseUrlFromHref(href: string): string | null {
+  if (!href) {
+    return null;
+  }
+  try {
+    const parsed = new URL(href);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const projectPath = pathname.match(/^(\/g\/[^/]+\/project)(?:\/c\/[a-zA-Z0-9-]+)?$/i)?.[1];
+    return projectPath ? `${parsed.origin}${projectPath}` : null;
+  } catch {
+    return null;
+  }
 }
 
 function isFreshChatHomeUrl(url: string): boolean {
@@ -350,10 +739,48 @@ function isFreshChatHomeUrl(url: string): boolean {
   }
   try {
     const parsed = new URL(url);
-    return parsed.pathname === "/" || parsed.pathname === "";
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return pathname === "" || pathname === "/" || /^\/g\/[^/]+\/project$/i.test(pathname);
   } catch {
-    return url === "https://chatgpt.com" || url === "https://chatgpt.com/";
+    return (
+      url === "https://chatgpt.com" ||
+      url === "https://chatgpt.com/" ||
+      /^https:\/\/chatgpt\.com\/g\/[^/]+\/project\/?$/i.test(url)
+    );
   }
+}
+
+function normalizeProjectBaseUrl(baseUrl: string): string | null {
+  try {
+    const parsed = new URL(baseUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    if (/^\/g\/[^/]+\/project$/i.test(pathname)) {
+      return `${parsed.origin}${pathname}`;
+    }
+  } catch {
+    const trimmed = baseUrl.replace(/\/+$/, "");
+    if (/^https:\/\/chatgpt\.com\/g\/[^/]+\/project$/i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+async function waitForExactLocation(
+  Runtime: ChromeClient["Runtime"],
+  expectedUrl: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const expected = expectedUrl.replace(/\/+$/, "");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const href = (await readCurrentHref(Runtime)).replace(/\/+$/, "");
+    if (href === expected) {
+      return true;
+    }
+    await delay(200);
+  }
+  return false;
 }
 
 async function captureConversationResponse(
@@ -362,17 +789,47 @@ async function captureConversationResponse(
   deps: ReattachDeps,
   timeoutMs: number,
   promptPreview?: string,
+  baselineTurns?: number | null,
 ): Promise<ReattachResult> {
   const startedAt = Date.now();
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
-  const minTurnIndex = await readConversationTurnIndex(Runtime, logger);
+  const minTurnIndex =
+    typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
+      ? Math.floor(baselineTurns)
+      : await readConversationTurnIndex(Runtime, logger);
   const promptEcho = buildPromptEchoMatcher(promptPreview);
-  const answer = await withTimeout(
+  let answer = await withTimeout(
     waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
     timeoutMs + 5_000,
     "Reattach response timed out",
   );
+  if (isStaleBaselineAssistant(answer, deps.baselineAssistant)) {
+    logger("Detected stale assistant response; waiting for new response...");
+    const remainingMs = Math.max(1_000, timeoutMs - (Date.now() - startedAt));
+    const refreshed = await recoverFreshAssistantAfterStaleBaseline({
+      Runtime,
+      logger,
+      matcher: promptEcho,
+      minTurnIndex,
+      timeoutMs: remainingMs,
+      baselineAssistant: deps.baselineAssistant,
+    });
+    if (refreshed) {
+      answer = refreshed;
+    } else {
+      throw new BrowserAutomationError(
+        "Captured the previous assistant turn again while waiting for a follow-up response.",
+        {
+          stage: "assistant-stale-replay",
+          promptSubmitted: true,
+          submittedPrompt: promptPreview,
+          baselineTurns,
+          baselineAssistant: deps.baselineAssistant,
+        },
+      );
+    }
+  }
   const recovered = await recoverPromptEcho(
     Runtime,
     answer,
@@ -393,8 +850,10 @@ async function captureConversationResponse(
     promptEcho,
     logger,
   );
-  let answerText = aligned.answerMarkdown || aligned.answerText;
-  let answerMarkdown = aligned.answerMarkdown || aligned.answerText;
+  let { answerText, answerMarkdown } = collapseReattachAnswer(
+    aligned.answerText,
+    aligned.answerMarkdown,
+  );
   if (isTransientReattachAnswer(answerText)) {
     const refreshed = await recoverTransientReattachAnswer({
       Runtime,
@@ -425,12 +884,177 @@ async function captureConversationResponse(
       answerMarkdown = refreshed.answerMarkdown;
     }
   }
+  const shortRecovered = await recoverShortReattachAnswer({
+    Runtime,
+    captureMarkdown,
+    logger,
+    matcher: promptEcho,
+    minTurnIndex,
+    timeoutMs,
+    currentText: answerText,
+    currentMarkdown: answerMarkdown,
+    currentMeta: recovered.meta,
+  });
+  if (shortRecovered) {
+    answerText = shortRecovered.answerText;
+    answerMarkdown = shortRecovered.answerMarkdown;
+  }
   return {
     answerText,
     answerMarkdown,
     answerTokens: estimateTokenCount(answerText),
     tookMs: Date.now() - startedAt,
   };
+}
+
+function isStaleBaselineAssistant(
+  candidate:
+    | {
+        text: string;
+        meta: { turnId?: string | null; messageId?: string | null };
+      }
+    | null
+    | undefined,
+  baseline:
+    | {
+        text: string;
+        messageId?: string | null;
+        turnId?: string | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  const candidateText = String(candidate?.text ?? "").trim();
+  const baselineText = String(baseline?.text ?? "").trim();
+  if (!candidateText || !baselineText) {
+    return false;
+  }
+  const candidateMessageId = candidate?.meta?.messageId?.trim() || null;
+  const candidateTurnId = candidate?.meta?.turnId?.trim() || null;
+  const baselineMessageId = baseline?.messageId?.trim() || null;
+  const baselineTurnId = baseline?.turnId?.trim() || null;
+  if (candidateMessageId && baselineMessageId && candidateMessageId === baselineMessageId) {
+    return true;
+  }
+  if (candidateTurnId && baselineTurnId && candidateTurnId === baselineTurnId) {
+    return true;
+  }
+  if (candidateText !== baselineText) {
+    return false;
+  }
+  return (
+    !candidateMessageId ||
+    !baselineMessageId ||
+    candidateMessageId === baselineMessageId ||
+    !candidateTurnId ||
+    !baselineTurnId ||
+    candidateTurnId === baselineTurnId
+  );
+}
+
+async function recoverFreshAssistantAfterStaleBaseline({
+  Runtime,
+  logger: _logger,
+  matcher,
+  minTurnIndex,
+  timeoutMs,
+  baselineAssistant,
+}: {
+  Runtime: ChromeClient["Runtime"];
+  logger: BrowserLogger;
+  matcher: ReturnType<typeof buildPromptEchoMatcher>;
+  minTurnIndex: number | null;
+  timeoutMs: number;
+  baselineAssistant:
+    | {
+        text: string;
+        messageId?: string | null;
+        turnId?: string | null;
+      }
+    | null
+    | undefined;
+}): Promise<{
+  text: string;
+  html?: string;
+  meta: { turnId?: string | null; messageId?: string | null };
+} | null> {
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
+  while (Date.now() < deadline) {
+    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex ?? undefined).catch(
+      () => null,
+    );
+    const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
+    if (!text || isTransientReattachAnswer(text) || matcher?.isEcho(text)) {
+      await delay(350);
+      continue;
+    }
+    const candidate = {
+      text,
+      html: snapshot?.html ?? undefined,
+      meta: {
+        turnId: snapshot?.turnId ?? undefined,
+        messageId: snapshot?.messageId ?? undefined,
+      },
+    };
+    if (isStaleBaselineAssistant(candidate, baselineAssistant)) {
+      await delay(350);
+      continue;
+    }
+    return candidate;
+  }
+  return null;
+}
+
+async function retryResumeAfterAssistantShell(
+  runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
+  logger: BrowserLogger,
+  deps: ReattachDeps,
+): Promise<ReattachResult | null> {
+  const delayMs = Math.max(0, config?.assistantRecheckDelayMs ?? 0);
+  const timeoutMs = Math.max(0, config?.assistantRecheckTimeoutMs ?? 0);
+  if (!delayMs || !timeoutMs) {
+    return null;
+  }
+  const deadline = Date.now() + timeoutMs;
+  const retryConfig: BrowserSessionConfig = {
+    ...(config ?? {}),
+    assistantRecheckDelayMs: 0,
+    assistantRecheckTimeoutMs: 0,
+  };
+  while (Date.now() < deadline) {
+    const waitMs = Math.min(delayMs, Math.max(0, deadline - Date.now()));
+    if (waitMs <= 0) {
+      break;
+    }
+    logger(
+      `[browser] Assistant is still showing a thinking shell; waiting ${Math.max(1, Math.round(waitMs / 1000))}s before rechecking conversation.`,
+    );
+    await delay(waitMs);
+    const remainingMs = Math.max(0, deadline - Date.now());
+    if (remainingMs <= 0) {
+      break;
+    }
+    try {
+      return await resumeBrowserSession(
+        runtime,
+        withTimeoutBudget(retryConfig, remainingMs),
+        logger,
+        {
+          ...deps,
+          forceConversationReload: true,
+        },
+      );
+    } catch (error) {
+      if (isAssistantRateLimitFailure(error)) {
+        throw error;
+      }
+      if (!isAssistantEmptyResponseError(error)) {
+        throw error;
+      }
+    }
+  }
+  return null;
 }
 
 function isTransientReattachAnswer(text: string): boolean {
@@ -446,6 +1070,14 @@ function isTransientReattachAnswer(text: string): boolean {
     return true;
   }
   if (withoutPrefix === "thinking") {
+    return true;
+  }
+  if (
+    /^(?:starting|finalizing answer)(?:\.{3}|…)?$/.test(withoutPrefix) ||
+    /^(?:analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\.{3}|…)?$/.test(
+      withoutPrefix,
+    )
+  ) {
     return true;
   }
   return /^thought for\b.+?(?:seconds?|minutes?|hours?|secs?|mins?|hrs?|ms|s|m|h)(?:\s+thinking)?$/.test(
@@ -474,6 +1106,76 @@ function shouldPromoteExpandedReattachAnswer(nextText: string, currentText: stri
     return true;
   }
   return next.length >= current.length + Math.max(24, Math.floor(current.length * 0.15));
+}
+
+function pickPreferredReattachBody(answerText: string, answerMarkdown: string): string {
+  const text = String(answerText || "").trim();
+  const markdown = String(answerMarkdown || "").trim();
+  if (!markdown) {
+    return text;
+  }
+  if (!text) {
+    return markdown;
+  }
+  if (text === markdown) {
+    return markdown;
+  }
+  if (isTransientReattachAnswer(markdown) && !isTransientReattachAnswer(text)) {
+    return text;
+  }
+  const normalizedText = text.toLowerCase().replace(/\s+/g, " ").trim();
+  const normalizedMarkdown = markdown.toLowerCase().replace(/\s+/g, " ").trim();
+  if (
+    normalizedMarkdown &&
+    normalizedText.length > normalizedMarkdown.length &&
+    normalizedText.includes(normalizedMarkdown)
+  ) {
+    return text;
+  }
+  const lengthDelta = text.length - markdown.length;
+  if (lengthDelta >= Math.max(12, Math.floor(markdown.length * 0.75))) {
+    return text;
+  }
+  return markdown;
+}
+
+function collapseReattachAnswer(
+  answerText: string,
+  answerMarkdown: string,
+): {
+  answerText: string;
+  answerMarkdown: string;
+} {
+  const text = String(answerText || "").trim();
+  const markdown = String(answerMarkdown || "").trim();
+  const preferred = pickPreferredReattachBody(text, markdown);
+  let preferredMarkdown = markdown;
+  if (!preferredMarkdown) {
+    preferredMarkdown = preferred;
+  } else if (isTransientReattachAnswer(preferredMarkdown) && !isTransientReattachAnswer(text)) {
+    preferredMarkdown = preferred;
+  } else {
+    const normalizedText = text.toLowerCase().replace(/\s+/g, " ").trim();
+    const normalizedMarkdown = preferredMarkdown.toLowerCase().replace(/\s+/g, " ").trim();
+    const markdownLooksStructured =
+      /[`*_>#()[\]|-]/.test(preferredMarkdown) || preferredMarkdown.includes("\n");
+    if (
+      normalizedMarkdown &&
+      normalizedText.length > normalizedMarkdown.length &&
+      normalizedText.includes(normalizedMarkdown)
+    ) {
+      const materiallyShorter =
+        text.length - preferredMarkdown.length >=
+        Math.max(12, Math.floor(preferredMarkdown.length * 0.75));
+      if (!markdownLooksStructured || materiallyShorter) {
+        preferredMarkdown = preferred;
+      }
+    }
+  }
+  return {
+    answerText: preferred,
+    answerMarkdown: preferredMarkdown,
+  };
 }
 
 async function recoverTransientReattachAnswer({
@@ -518,7 +1220,7 @@ async function recoverTransientReattachAnswer({
     } else if (text === bestSnapshot.text) {
       stableCount += 1;
     }
-    if (stableCount >= 2) {
+    if (stableCount >= 1) {
       break;
     }
     await delay(350);
@@ -537,10 +1239,8 @@ async function recoverTransientReattachAnswer({
       minTurnIndex ?? undefined,
     ).catch(() => null)) ?? bestSnapshot.text;
   logger("Recovered follow-up assistant response after transient thinking scaffold");
-  return {
-    answerText: bestSnapshot.text,
-    answerMarkdown: markdown,
-  };
+  const aligned = alignPromptEchoMarkdown(bestSnapshot.text, markdown, matcher, logger);
+  return collapseReattachAnswer(aligned.answerText, aligned.answerMarkdown);
 }
 
 async function recoverExpandedReattachAnswer({
@@ -564,16 +1264,19 @@ async function recoverExpandedReattachAnswer({
   currentMarkdown: string;
   currentMeta: { turnId?: string | null; messageId?: string | null };
 }): Promise<{ answerText: string; answerMarkdown: string } | null> {
-  const deadline = Date.now() + Math.min(timeoutMs, 8_000);
+  const trimmedCurrentText = currentText.trim();
+  if (trimmedCurrentText.length < 16) {
+    return null;
+  }
+  const deadline = Date.now() + Math.min(timeoutMs, 15_000);
   let bestSnapshot = {
-    text: currentText.trim(),
+    text: trimmedCurrentText,
     meta: {
       turnId: currentMeta.turnId ?? undefined,
       messageId: currentMeta.messageId ?? undefined,
     },
   };
   let improved = false;
-  let stableCount = 0;
   let emptyPolls = 0;
   while (Date.now() < deadline) {
     const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex ?? undefined).catch(
@@ -582,7 +1285,7 @@ async function recoverExpandedReattachAnswer({
     const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
     if (!text || isTransientReattachAnswer(text) || matcher?.isEcho(text)) {
       emptyPolls += 1;
-      if (emptyPolls >= 3) {
+      if (emptyPolls >= 20 && improved) {
         break;
       }
       await delay(350);
@@ -598,11 +1301,6 @@ async function recoverExpandedReattachAnswer({
         },
       };
       improved = true;
-      stableCount = 0;
-    } else if (text === bestSnapshot.text) {
-      stableCount += 1;
-    }
-    if (stableCount >= (improved ? 2 : 3)) {
       break;
     }
     await delay(350);
@@ -624,10 +1322,101 @@ async function recoverExpandedReattachAnswer({
     bestSnapshot.text;
   const aligned = alignPromptEchoMarkdown(bestSnapshot.text, markdown, matcher, logger);
   logger("Recovered expanded assistant response during reattach");
-  return {
-    answerText: aligned.answerMarkdown || aligned.answerText,
-    answerMarkdown: aligned.answerMarkdown || aligned.answerText,
+  return collapseReattachAnswer(aligned.answerText, aligned.answerMarkdown);
+}
+
+async function recoverShortReattachAnswer({
+  Runtime,
+  captureMarkdown,
+  logger,
+  matcher,
+  minTurnIndex,
+  timeoutMs,
+  currentText,
+  currentMarkdown,
+  currentMeta,
+}: {
+  Runtime: ChromeClient["Runtime"];
+  captureMarkdown: typeof captureAssistantMarkdown;
+  logger: BrowserLogger;
+  matcher: ReturnType<typeof buildPromptEchoMatcher>;
+  minTurnIndex: number | null;
+  timeoutMs: number;
+  currentText: string;
+  currentMarkdown: string;
+  currentMeta: { turnId?: string | null; messageId?: string | null };
+}): Promise<{ answerText: string; answerMarkdown: string } | null> {
+  const minAnswerChars = 16;
+  const currentLength = String(currentText || "").trim().length;
+  if (currentLength === 0 || currentLength >= minAnswerChars) {
+    return null;
+  }
+  const currentMarkdownLength = String(currentMarkdown || "").trim().length;
+  const suspiciouslyShort = currentLength <= 1 && currentMarkdownLength <= 1;
+  const deadline = Date.now() + Math.min(timeoutMs, suspiciouslyShort ? 12_000 : 2_000);
+  let bestSnapshot = {
+    text: currentText.trim(),
+    meta: {
+      turnId: currentMeta.turnId ?? undefined,
+      messageId: currentMeta.messageId ?? undefined,
+    },
   };
+  let stableCycles = 0;
+  let noImprovementCycles = 0;
+  while (Date.now() < deadline) {
+    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex ?? undefined).catch(
+      () => null,
+    );
+    const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
+    if (!text || isTransientReattachAnswer(text) || matcher?.isEcho(text)) {
+      stableCycles += 1;
+      noImprovementCycles += 1;
+      if (!suspiciouslyShort && noImprovementCycles >= 3) {
+        break;
+      }
+      await delay(400);
+      continue;
+    }
+    if (text.length > bestSnapshot.text.length) {
+      bestSnapshot = {
+        text,
+        meta: {
+          turnId: snapshot?.turnId ?? undefined,
+          messageId: snapshot?.messageId ?? undefined,
+        },
+      };
+      stableCycles = 0;
+      noImprovementCycles = 0;
+    } else {
+      stableCycles += 1;
+      noImprovementCycles += 1;
+    }
+    if (stableCycles >= 2 && bestSnapshot.text.length >= minAnswerChars) {
+      break;
+    }
+    if (!suspiciouslyShort && noImprovementCycles >= 2) {
+      break;
+    }
+    await delay(400);
+  }
+  if (bestSnapshot.text.length <= currentLength) {
+    return null;
+  }
+  const markdown =
+    (await captureMarkdown(
+      Runtime,
+      {
+        messageId: bestSnapshot.meta.messageId ?? undefined,
+        turnId: bestSnapshot.meta.turnId ?? undefined,
+      },
+      logger,
+      minTurnIndex ?? undefined,
+    ).catch(() => null)) ??
+    currentMarkdown ??
+    bestSnapshot.text;
+  const aligned = alignPromptEchoMarkdown(bestSnapshot.text, markdown, matcher, logger);
+  logger("Recovered short follow-up assistant response from latest DOM snapshot");
+  return collapseReattachAnswer(aligned.answerText, aligned.answerMarkdown);
 }
 
 async function applyConversationSettings(
@@ -683,7 +1472,15 @@ async function submitFollowupPrompt(
   options: ContinueBrowserSessionOptions,
   config: BrowserSessionConfig | undefined,
   deps: ReattachDeps,
-): Promise<string> {
+): Promise<{
+  promptPreview: string;
+  baselineTurns: number | null;
+  baselineAssistant: {
+    text: string;
+    messageId?: string | null;
+    turnId?: string | null;
+  } | null;
+}> {
   const ensurePromptReadyForFollowup = deps.ensurePromptReady ?? ensurePromptReady;
   const clearComposer = deps.clearPromptComposer ?? clearPromptComposer;
   const submit = deps.submitPrompt ?? submitPrompt;
@@ -691,8 +1488,24 @@ async function submitFollowupPrompt(
   const uploadAttachment = deps.uploadAttachmentFile ?? uploadAttachmentFile;
   const waitForAttachments = deps.waitForAttachmentCompletion ?? waitForAttachmentCompletion;
   const waitForSentAttachments = deps.waitForUserTurnAttachments ?? waitForUserTurnAttachments;
-  const submitOnce = async (prompt: string, attachments: BrowserAttachment[] = []) => {
+  const submitOnce = async (
+    prompt: string,
+    attachments: BrowserAttachment[] = [],
+  ): Promise<{
+    baselineTurns: number | null;
+    baselineAssistant: {
+      text: string;
+      messageId?: string | null;
+      turnId?: string | null;
+    } | null;
+  }> => {
     let promptSubmitted = false;
+    let baselineTurns: number | null = null;
+    let baselineAssistant: {
+      text: string;
+      messageId?: string | null;
+      turnId?: string | null;
+    } | null = null;
     try {
       await ensurePromptReadyForFollowup(Runtime, config?.inputTimeoutMs ?? 60_000, logger);
       await clearComposer(Runtime, logger);
@@ -737,7 +1550,27 @@ async function submitFollowupPrompt(
           }
         }
       }
-      const baselineTurns = await readConversationTurnIndex(Runtime, logger);
+      const baselineTurnIndex = await readConversationTurnIndex(Runtime, logger);
+      baselineTurns =
+        typeof baselineTurnIndex === "number" && Number.isFinite(baselineTurnIndex)
+          ? baselineTurnIndex + 1
+          : null;
+      const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+      const baselineText =
+        typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
+      baselineAssistant = baselineText
+        ? {
+            text: baselineText,
+            messageId: baselineSnapshot?.messageId ?? undefined,
+            turnId: baselineSnapshot?.turnId ?? undefined,
+          }
+        : deps.baselineAssistant
+          ? {
+              text: deps.baselineAssistant.text,
+              messageId: deps.baselineAssistant.messageId ?? undefined,
+              turnId: deps.baselineAssistant.turnId ?? undefined,
+            }
+          : null;
       await submit(
         {
           runtime: Runtime,
@@ -750,31 +1583,61 @@ async function submitFollowupPrompt(
       );
       promptSubmitted = true;
       if (attachmentNames.length === 0) {
-        return;
+        return { baselineTurns, baselineAssistant };
       }
       if (attachmentWaitTimedOut) {
         logger("Attachment confirmation timed out; skipping user-turn attachment verification.");
-        return;
+        return { baselineTurns, baselineAssistant };
       }
       if (inputOnlyAttachments) {
         logger(
           "Attachment UI did not render before send; skipping user-turn attachment verification.",
         );
-        return;
+        return { baselineTurns, baselineAssistant };
       }
       const verified = await waitForSentAttachments(Runtime, attachmentNames, 20_000, logger);
       if (!verified) {
         throw new Error("Sent user message did not expose attachment UI after upload.");
       }
       logger("Verified attachments present on sent user message");
+      return { baselineTurns, baselineAssistant };
     } catch (error) {
-      if (promptSubmitted) {
+      const postSubmitDetails =
+        error instanceof BrowserAutomationError
+          ? (error.details as
+              | {
+                  promptSubmitted?: boolean;
+                  submittedPrompt?: string;
+                  baselineTurns?: number | null;
+                  baselineAssistant?: {
+                    text: string;
+                    messageId?: string | null;
+                    turnId?: string | null;
+                  } | null;
+                  code?: string;
+                }
+              | undefined)
+          : undefined;
+      const errorPromptSubmitted = postSubmitDetails?.promptSubmitted === true;
+      if (postSubmitDetails?.submittedPrompt) {
+        prompt = postSubmitDetails.submittedPrompt;
+      }
+      if (typeof postSubmitDetails?.baselineTurns === "number") {
+        baselineTurns = postSubmitDetails.baselineTurns;
+      }
+      if ("baselineAssistant" in (postSubmitDetails ?? {})) {
+        baselineAssistant = postSubmitDetails?.baselineAssistant ?? baselineAssistant;
+      }
+      if (promptSubmitted || errorPromptSubmitted) {
         throw new BrowserAutomationError(
           error instanceof Error ? error.message : "Follow-up verification failed after send.",
           {
             stage: "followup-post-submit",
             promptSubmitted: true,
             submittedPrompt: prompt,
+            baselineTurns,
+            baselineAssistant,
+            code: postSubmitDetails?.code,
           },
           error,
         );
@@ -783,16 +1646,27 @@ async function submitFollowupPrompt(
     }
   };
   try {
-    await submitOnce(options.prompt, options.attachments ?? []);
-    return options.prompt;
+    const submission = await submitOnce(options.prompt, options.attachments ?? []);
+    return {
+      promptPreview: options.prompt,
+      baselineTurns: submission.baselineTurns,
+      baselineAssistant: submission.baselineAssistant,
+    };
   } catch (error) {
     const isPromptTooLarge =
       error instanceof BrowserAutomationError &&
       (error.details as { code?: string } | undefined)?.code === "prompt-too-large";
     if (options.fallbackSubmission && isPromptTooLarge) {
       logger("[browser] Inline prompt too large; retrying with file uploads.");
-      await submitOnce(options.fallbackSubmission.prompt, options.fallbackSubmission.attachments);
-      return options.fallbackSubmission.prompt;
+      const submission = await submitOnce(
+        options.fallbackSubmission.prompt,
+        options.fallbackSubmission.attachments,
+      );
+      return {
+        promptPreview: options.fallbackSubmission.prompt,
+        baselineTurns: submission.baselineTurns,
+        baselineAssistant: submission.baselineAssistant,
+      };
     }
     throw error;
   }
@@ -804,6 +1678,7 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
+  const reattachBaseUrl = resolveBrowserConfig(config ?? {}).url;
   const recoverSession =
     deps.recoverSession ??
     (async (runtimeMeta, configMeta) =>
@@ -815,12 +1690,20 @@ export async function resumeBrowserSession(
   }
 
   let closeConnection: (() => Promise<void>) | undefined;
+  let targetId: string | undefined;
   try {
     return await withHiddenExistingChrome(runtime, config, logger, async (liveRuntime) => {
-      const connection = await connectToExistingRuntime(liveRuntime, logger, deps);
+      const connection = await connectToExistingRuntime(liveRuntime, config, logger, deps);
       closeConnection = connection.close;
       const { client, host, port, target } = connection;
-      const { Runtime, DOM } = client;
+      targetId = target?.targetId;
+      if (target && !isAttachableChatTarget(target)) {
+        logger(
+          `[browser] Cached Oracle target type=${target.type}; reopening the conversation in a dedicated page target before recovering the session.`,
+        );
+        return recoverSession(liveRuntime, config);
+      }
+      const { Runtime, DOM, Page } = client;
       if (Runtime?.enable) {
         await Runtime.enable();
       }
@@ -835,13 +1718,30 @@ export async function resumeBrowserSession(
         pingTimeoutMs,
         "Reattach target did not respond",
       );
-      await ensureConversationOpenForRuntime(Runtime, liveRuntime, deps.promptPreview);
+      await ensureConversationOpenForRuntime(
+        Runtime,
+        liveRuntime,
+        deps.promptPreview,
+        reattachBaseUrl,
+      );
+      if (deps.forceConversationReload && Page && typeof Page.navigate === "function") {
+        const conversationUrl = await readCurrentHref(Runtime);
+        const reloadUrl =
+          (conversationUrl && conversationUrl.includes("/c/") ? conversationUrl : null) ??
+          buildConversationUrl(liveRuntime, reattachBaseUrl);
+        if (reloadUrl) {
+          logger(`[browser] Rechecking assistant response at ${reloadUrl}`);
+          await Page.navigate({ url: reloadUrl });
+          await delay(1000);
+        }
+      }
       const result = await captureConversationResponse(
         Runtime,
         logger,
         deps,
         timeoutMs,
         deps.promptPreview,
+        deps.baselineTurns,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -857,13 +1757,38 @@ export async function resumeBrowserSession(
       };
     });
   } catch (error) {
+    if (closeConnection) {
+      await closeConnection().catch(() => undefined);
+    }
+    if (isAssistantRateLimitFailure(error)) {
+      if (isAssistantRateLimitAutomationError(error)) {
+        throw error;
+      }
+      throw new BrowserAutomationError(
+        "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
+        {
+          stage: "assistant-rate-limit",
+          runtime: mergeRuntimeMetadata(runtime, {
+            chromeTargetId: targetId,
+          }),
+        },
+        error,
+      );
+    }
+    if (isAssistantEmptyResponseError(error)) {
+      const rechecked = await retryResumeAfterAssistantShell(runtime, config, logger, deps);
+      if (rechecked) {
+        return rechecked;
+      }
+      throw error;
+    }
+    if (isSessionIdentityError(error)) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
     );
-    if (closeConnection) {
-      await closeConnection().catch(() => undefined);
-    }
     return recoverSession(runtime, config);
   }
 }
@@ -883,11 +1808,13 @@ async function resumeBrowserSessionViaNewChrome(
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
-  const shouldHideChromeWindow = !resolved.headless && resolved.hideWindow;
+  const shouldHideChromeWindow =
+    resolved.launcher !== "carbonyl" && !resolved.headless && resolved.hideWindow;
   const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
         waitForPortMs: resolved.reuseChromeWaitMs,
+        failOnLiveChromeWithoutDevtools: true,
       })
     : null;
   const chrome = reusedChrome ?? (await launchChrome(resolved, userDataDir, logger));
@@ -895,8 +1822,8 @@ async function resumeBrowserSessionViaNewChrome(
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
   if (shouldHideChromeWindow) {
-    await hideChromeWindow(chrome, logger, frontmostTarget);
     stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
+    await hideChromeWindow(chrome, logger, frontmostTarget);
   }
   try {
     const { client, isolatedTargetId } = await connectReopenedChrome(
@@ -904,6 +1831,7 @@ async function resumeBrowserSessionViaNewChrome(
       chromeHost,
       logger,
       strictTabIsolation,
+      shouldHideChromeWindow,
     );
     const { Network, Page, Runtime, DOM } = client;
 
@@ -935,31 +1863,14 @@ async function resumeBrowserSessionViaNewChrome(
     await ensurePromptReadyForFollowup(Runtime, resolved.inputTimeoutMs, logger);
 
     const conversationUrl = buildConversationUrl(runtime, resolved.url);
-    if (conversationUrl) {
-      logger(`Reopening conversation at ${conversationUrl}`);
-      await navigateToChatGPT(Page, Runtime, conversationUrl, logger);
-      await ensureNotBlocked(Runtime, resolved.headless, logger);
-      await ensurePromptReadyForFollowup(Runtime, resolved.inputTimeoutMs, logger);
-    } else {
-      const opened = await openConversationFromSidebarWithRetry(
-        Runtime,
-        {
-          conversationId:
-            runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? ""),
-          preferProjects:
-            resolved.url !== CHATGPT_URL ||
-            Boolean(
-              runtime.tabUrl &&
-              (/\/g\//.test(runtime.tabUrl) || runtime.tabUrl.includes("/project")),
-            ),
-          promptPreview: deps.promptPreview,
-        },
-        15_000,
+    if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
+      logger(
+        conversationUrl
+          ? `Reopening conversation at ${conversationUrl}`
+          : "Reopening stored Oracle conversation.",
       );
-      if (!opened) {
-        throw new Error("Unable to locate prior ChatGPT conversation in sidebar.");
-      }
-      await waitForLocationChange(Runtime, 15_000);
+      await ensureConversationOpenForRuntime(Runtime, runtime, deps.promptPreview, resolved.url);
+      await ensureNotBlocked(Runtime, resolved.headless, logger);
     }
 
     const result = await captureConversationResponse(
@@ -968,6 +1879,7 @@ async function resumeBrowserSessionViaNewChrome(
       deps,
       resolved.timeoutMs ?? 120_000,
       deps.promptPreview,
+      deps.baselineTurns,
     );
     const href = await readCurrentHref(Runtime);
     await closeClient(client);
@@ -1021,6 +1933,7 @@ export async function continueBrowserSession(
   if (!prompt) {
     throw new Error("Prompt text is required to continue a browser session.");
   }
+  const reattachBaseUrl = resolveBrowserConfig(config ?? {}).url;
 
   const recoverSession =
     deps.recoverSession ??
@@ -1036,12 +1949,48 @@ export async function continueBrowserSession(
   let targetId: string | undefined;
   let promptSubmitted = false;
   let submittedPromptPreview = prompt;
+  let submittedBaselineTurns: number | null = deps.baselineTurns ?? null;
+  let submittedBaselineAssistant = deps.baselineAssistant ?? null;
   try {
     return await withHiddenExistingChrome(runtime, config, logger, async (liveRuntime) => {
-      const connection = await connectToExistingRuntime(liveRuntime, logger, deps);
+      const browserWSEndpoint = liveRuntime.chromeBrowserWSEndpoint ?? undefined;
+      if (browserWSEndpoint) {
+        const host = liveRuntime.chromeHost ?? "127.0.0.1";
+        const port =
+          liveRuntime.chromePort ??
+          inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
+        const resolvedPort = port ?? 9222;
+        const preflightTargets = await (
+          deps.listTargets ??
+          (async () =>
+            (await listRemoteChromeTargets({
+              host,
+              port: resolvedPort,
+              browserWSEndpoint,
+            })) as TargetInfoLite[])
+        )().catch(() => [] as TargetInfoLite[]);
+        const cachedTarget = liveRuntime.chromeTargetId
+          ? preflightTargets.find((candidate) => candidate.targetId === liveRuntime.chromeTargetId)
+          : undefined;
+        if (cachedTarget && !isAttachableChatTarget(cachedTarget)) {
+          logger(
+            `[browser] Cached Oracle target type=${cachedTarget.type}; reopening the conversation in a dedicated page target before sending the follow-up.`,
+          );
+          return recoverSession(liveRuntime, config);
+        }
+      }
+      const connection = await connectToExistingRuntime(liveRuntime, config, logger, deps);
       closeConnection = connection.close;
       const { client, host, port, target } = connection;
       targetId = target?.targetId;
+      if (target && !isAttachableChatTarget(target)) {
+        logger(
+          `[browser] Existing Oracle target type=${target.type}; reopening the conversation in a dedicated page target before sending the follow-up.`,
+        );
+        await connection.close().catch(() => undefined);
+        closeConnection = undefined;
+        return recoverSession(liveRuntime, config);
+      }
       const { Runtime, DOM, Input } = client;
       if (Runtime?.enable) {
         await Runtime.enable();
@@ -1057,9 +2006,14 @@ export async function continueBrowserSession(
         pingTimeoutMs,
         "Follow-up target did not respond",
       );
-      await ensureConversationOpenForRuntime(Runtime, liveRuntime, deps.promptPreview);
+      await ensureConversationOpenForRuntime(
+        Runtime,
+        liveRuntime,
+        deps.promptPreview,
+        reattachBaseUrl,
+      );
       await applyConversationSettings(Runtime, logger, config, deps);
-      submittedPromptPreview = await submitFollowupPrompt(
+      const submission = await submitFollowupPrompt(
         Runtime,
         DOM,
         Input,
@@ -1068,13 +2022,20 @@ export async function continueBrowserSession(
         config,
         deps,
       );
+      submittedPromptPreview = submission.promptPreview;
+      submittedBaselineTurns = submission.baselineTurns;
+      submittedBaselineAssistant = submission.baselineAssistant;
       promptSubmitted = true;
       const result = await captureConversationResponse(
         Runtime,
         logger,
-        deps,
+        {
+          ...deps,
+          baselineAssistant: submittedBaselineAssistant,
+        },
         timeoutMs,
         submittedPromptPreview,
+        submission.baselineTurns,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -1094,29 +2055,85 @@ export async function continueBrowserSession(
     if (closeConnection) {
       await closeConnection().catch(() => undefined);
     }
+    if (isAssistantRateLimitError(error)) {
+      throw new BrowserAutomationError(
+        "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
+        {
+          stage: "assistant-rate-limit",
+          runtime: mergeRuntimeMetadata(runtime, {
+            chromeTargetId: targetId,
+          }),
+        },
+        error,
+      );
+    }
     const postSubmitDetails =
       error instanceof BrowserAutomationError
-        ? (error.details as { promptSubmitted?: boolean; submittedPrompt?: string } | undefined)
+        ? (error.details as
+            | {
+                promptSubmitted?: boolean;
+                submittedPrompt?: string;
+                baselineTurns?: number | null;
+                baselineAssistant?: {
+                  text: string;
+                  messageId?: string | null;
+                  turnId?: string | null;
+                } | null;
+              }
+            | undefined)
         : undefined;
     const errorPromptSubmitted = postSubmitDetails?.promptSubmitted === true;
     if (postSubmitDetails?.submittedPrompt) {
       submittedPromptPreview = postSubmitDetails.submittedPrompt;
     }
+    if (typeof postSubmitDetails?.baselineTurns === "number") {
+      submittedBaselineTurns = postSubmitDetails.baselineTurns;
+    }
+    if ("baselineAssistant" in (postSubmitDetails ?? {})) {
+      submittedBaselineAssistant = postSubmitDetails?.baselineAssistant ?? null;
+    }
+    const assistantRecheckConfigured =
+      Math.max(0, config?.assistantRecheckDelayMs ?? 0) > 0 &&
+      Math.max(0, config?.assistantRecheckTimeoutMs ?? 0) > 0;
+    if (
+      isAssistantEmptyResponseError(error) &&
+      (!(promptSubmitted || errorPromptSubmitted) || !assistantRecheckConfigured)
+    ) {
+      throw error;
+    }
+    if (isSessionIdentityError(error)) {
+      if (isRecoverableSessionDiscoveryError(error) && runtimeHasReusableIdentity(runtime)) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger(
+          `Existing Chrome follow-up could not safely reuse the prior target (${message}); reopening browser to continue the session.`,
+        );
+        return recoverSession(runtime, config);
+      }
+      throw error;
+    }
     if (promptSubmitted || errorPromptSubmitted) {
       const { recoverSession: _recoverSession, ...resumeDeps } = deps;
       logger(
-        `Existing Chrome follow-up lost DevTools after sending the prompt (${message}); reopening browser to resume without resending.`,
+        isAssistantEmptyResponseError(error)
+          ? "[browser] Existing Chrome follow-up is still on a thinking shell; reattaching without resending."
+          : `Existing Chrome follow-up lost DevTools after sending the prompt (${message}); reopening browser to resume without resending.`,
       );
       const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+      const resumeConfig =
+        isAssistantEmptyResponseError(error) && assistantRecheckConfigured
+          ? withAssistantRecheckBudget(config)
+          : config;
       return resumeBrowserSession(
         mergeRuntimeMetadata(liveRuntime, {
           chromeTargetId: targetId,
         }),
-        config,
+        resumeConfig,
         logger,
         {
           ...resumeDeps,
           promptPreview: submittedPromptPreview,
+          baselineTurns: submittedBaselineTurns,
+          baselineAssistant: submittedBaselineAssistant,
         },
       );
     }
@@ -1142,11 +2159,13 @@ async function continueBrowserSessionViaNewChrome(
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
-  const shouldHideChromeWindow = !resolved.headless && resolved.hideWindow;
+  const shouldHideChromeWindow =
+    resolved.launcher !== "carbonyl" && !resolved.headless && resolved.hideWindow;
   const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
         waitForPortMs: resolved.reuseChromeWaitMs,
+        failOnLiveChromeWithoutDevtools: true,
       })
     : null;
   const chrome = reusedChrome ?? (await launchChrome(resolved, userDataDir, logger));
@@ -1154,8 +2173,8 @@ async function continueBrowserSessionViaNewChrome(
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
   if (shouldHideChromeWindow) {
-    await hideChromeWindow(chrome, logger, frontmostTarget);
     stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
+    await hideChromeWindow(chrome, logger, frontmostTarget);
   }
   try {
     const { client, isolatedTargetId } = await connectReopenedChrome(
@@ -1163,6 +2182,7 @@ async function continueBrowserSessionViaNewChrome(
       chromeHost,
       logger,
       strictTabIsolation,
+      shouldHideChromeWindow,
     );
     const { Network, Page, Runtime, DOM, Input } = client;
 
@@ -1194,19 +2214,27 @@ async function continueBrowserSessionViaNewChrome(
     await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
 
     const conversationUrl = buildConversationUrl(runtime, resolved.url);
-    if (conversationUrl) {
-      logger(`Reopening conversation at ${conversationUrl}`);
-      await navigateToChatGPT(Page, Runtime, conversationUrl, logger);
+    if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
+      logger(
+        conversationUrl
+          ? `Reopening conversation at ${conversationUrl}`
+          : "Reopening stored Oracle conversation.",
+      );
+      await ensureConversationOpenForRuntime(Runtime, runtime, deps.promptPreview, resolved.url);
       await ensureNotBlocked(Runtime, resolved.headless, logger);
       await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
-    } else {
-      await ensureConversationOpenForRuntime(Runtime, runtime, deps.promptPreview);
     }
 
     await applyConversationSettings(Runtime, logger, resolved, deps);
     let submittedPrompt: string;
+    let submittedBaselineTurns: number | null = null;
+    let submittedBaselineAssistant: {
+      text: string;
+      messageId?: string | null;
+      turnId?: string | null;
+    } | null = null;
     try {
-      submittedPrompt = await submitFollowupPrompt(
+      const submission = await submitFollowupPrompt(
         Runtime,
         DOM,
         Input,
@@ -1215,10 +2243,24 @@ async function continueBrowserSessionViaNewChrome(
         resolved,
         deps,
       );
+      submittedPrompt = submission.promptPreview;
+      submittedBaselineTurns = submission.baselineTurns;
+      submittedBaselineAssistant = submission.baselineAssistant;
     } catch (error) {
       const postSubmitDetails =
         error instanceof BrowserAutomationError
-          ? (error.details as { promptSubmitted?: boolean; submittedPrompt?: string } | undefined)
+          ? (error.details as
+              | {
+                  promptSubmitted?: boolean;
+                  submittedPrompt?: string;
+                  baselineTurns?: number | null;
+                  baselineAssistant?: {
+                    text: string;
+                    messageId?: string | null;
+                    turnId?: string | null;
+                  } | null;
+                }
+              | undefined)
           : undefined;
       const promptWasSubmitted = postSubmitDetails?.promptSubmitted === true;
       if (!promptWasSubmitted) {
@@ -1229,11 +2271,14 @@ async function continueBrowserSessionViaNewChrome(
         `[browser] Follow-up submission completed but verification failed (${message}); continuing to observe the response without resending.`,
       );
       submittedPrompt = postSubmitDetails?.submittedPrompt ?? options.prompt;
+      submittedBaselineTurns = postSubmitDetails?.baselineTurns ?? null;
+      submittedBaselineAssistant = postSubmitDetails?.baselineAssistant ?? null;
     }
     const launchedRuntime = mergeRuntimeMetadata(runtime, {
       chromePid: chrome.pid,
       chromeHost,
       chromePort: chrome.port,
+      chromeTargetId: isolatedTargetId ?? undefined,
       tabUrl: conversationUrl || runtime.tabUrl,
       userDataDir,
       controllerPid: process.pid,
@@ -1244,21 +2289,55 @@ async function continueBrowserSessionViaNewChrome(
       result = await captureConversationResponse(
         Runtime,
         logger,
-        deps,
+        {
+          ...deps,
+          baselineAssistant: submittedBaselineAssistant,
+        },
         resolved.timeoutMs ?? 120_000,
         submittedPrompt,
+        submittedBaselineTurns,
       );
     } catch (error) {
+      const assistantRecheckConfigured =
+        Math.max(0, resolved.assistantRecheckDelayMs ?? 0) > 0 &&
+        Math.max(0, resolved.assistantRecheckTimeoutMs ?? 0) > 0;
+      if (isAssistantEmptyResponseError(error) && !assistantRecheckConfigured) {
+        if (!resolved.keepBrowser && !reusedChrome) {
+          await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
+        }
+        throw error;
+      }
+      if (isAssistantRateLimitError(error)) {
+        if (!resolved.keepBrowser && !reusedChrome) {
+          await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
+        }
+        throw new BrowserAutomationError(
+          "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
+          {
+            stage: "assistant-rate-limit",
+            runtime: launchedRuntime,
+          },
+          error,
+        );
+      }
       const message = error instanceof Error ? error.message : String(error);
       resumedAfterObservationFailure = true;
       await closeClient(client);
       logger(
-        `[browser] Follow-up observation failed after send (${message}); reattaching without resending.`,
+        isAssistantEmptyResponseError(error)
+          ? "[browser] Follow-up is still on a thinking shell; reattaching without resending."
+          : `[browser] Follow-up observation failed after send (${message}); reattaching without resending.`,
       );
+      const resumeConfig =
+        isAssistantEmptyResponseError(error) && assistantRecheckConfigured
+          ? withAssistantRecheckBudget(resolved)
+          : resolved;
       try {
-        result = await resumeBrowserSession(launchedRuntime, resolved, logger, {
+        result = await resumeBrowserSession(launchedRuntime, resumeConfig, logger, {
           ...deps,
           promptPreview: submittedPrompt,
+          baselineTurns: submittedBaselineTurns,
+          baselineAssistant: submittedBaselineAssistant,
         });
       } finally {
         if (!resolved.keepBrowser && !reusedChrome) {
@@ -1304,6 +2383,8 @@ export const __test__ = {
   pickTarget,
   extractConversationIdFromUrl,
   buildConversationUrl,
+  conversationHrefMatchesConfiguredScope,
   mergeRuntimeMetadata,
   openConversationFromSidebar,
+  isTransientReattachAnswer,
 };

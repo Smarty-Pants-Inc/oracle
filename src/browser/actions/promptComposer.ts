@@ -201,7 +201,20 @@ export async function submitPrompt(
     );
   }
 
-  const clicked = await attemptSendButton(runtime, logger, deps?.attachmentNames);
+  if (observedLength > 0) {
+    await nudgePromptComposerState(runtime);
+    await delay(250);
+  }
+
+  let clicked = await attemptSendButton(runtime, logger, deps?.attachmentNames);
+  if (!clicked && observedLength > 0) {
+    await nudgePromptComposerState(runtime);
+    await delay(250);
+    clicked = await attemptSendButton(runtime, logger, deps?.attachmentNames);
+    if (clicked) {
+      logger("Clicked send button after composer state nudge");
+    }
+  }
   if (!clicked) {
     await input.dispatchKeyEvent({
       type: "keyDown",
@@ -220,13 +233,41 @@ export async function submitPrompt(
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-  return await verifyPromptCommitted(
-    runtime,
-    prompt,
-    commitTimeoutMs,
-    logger,
-    deps.baselineTurns ?? undefined,
-  );
+  try {
+    return await verifyPromptCommitted(
+      runtime,
+      prompt,
+      commitTimeoutMs,
+      logger,
+      deps.baselineTurns ?? undefined,
+    );
+  } catch (error) {
+    if (error instanceof BrowserAutomationError) {
+      throw new BrowserAutomationError(
+        error.message,
+        {
+          ...(typeof error.details === "object" && error.details ? error.details : {}),
+          stage: "submit-prompt",
+          promptSubmitted: true,
+          submittedPrompt: prompt,
+          baselineTurns: deps.baselineTurns ?? null,
+        },
+        error,
+      );
+    }
+    throw new BrowserAutomationError(
+      error instanceof Error
+        ? error.message
+        : "Prompt commit verification failed after sending the prompt.",
+      {
+        stage: "submit-prompt",
+        promptSubmitted: true,
+        submittedPrompt: prompt,
+        baselineTurns: deps.baselineTurns ?? null,
+      },
+      error,
+    );
+  }
 }
 
 export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logger: BrowserLogger) {
@@ -306,6 +347,50 @@ async function waitForDomReady(
   logger?.(`Page did not reach ready/composer state within ${timeoutMs}ms; continuing cautiously.`);
 }
 
+async function nudgePromptComposerState(Runtime: ChromeClient["Runtime"]): Promise<void> {
+  const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
+  const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
+  const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
+  await Runtime.evaluate({
+    expression: `(() => {
+      const editor = document.querySelector(${primarySelectorLiteral});
+      const fallback = document.querySelector(${fallbackSelectorLiteral});
+      const inputSelectors = ${inputSelectorsLiteral};
+      const isVisible = (node) => {
+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const inputs = inputSelectors
+        .map((selector) => document.querySelector(selector))
+        .filter((node) => Boolean(node));
+      const visibleInputs = inputs.filter((node) => isVisible(node));
+      const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+      const nodes = Array.from(new Set([editor, fallback, ...activeInputs].filter(Boolean)));
+      for (const node of nodes) {
+        const text =
+          node instanceof HTMLTextAreaElement ? (node.value ?? "") : ((node.innerText ?? "") as string);
+        if (!String(text).trim()) continue;
+        if (typeof node.focus === "function") {
+          node.focus();
+        }
+        if (node instanceof HTMLTextAreaElement) {
+          node.dispatchEvent(
+            new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }),
+          );
+          node.dispatchEvent(new Event("change", { bubbles: true }));
+          continue;
+        }
+        node.dispatchEvent(
+          new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }),
+        );
+      }
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+}
+
 function buildAttachmentReadyExpression(attachmentNames: string[]): string {
   const namesLiteral = JSON.stringify(attachmentNames.map((name) => name.toLowerCase()));
   return `(() => {
@@ -315,6 +400,7 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
       document.querySelector('form') ||
       document.body ||
       document;
+    const roots = Array.from(new Set([composer, document.body, document].filter(Boolean)));
     const match = (node, name) => (node?.textContent || '').toLowerCase().includes(name);
 
     // Restrict to attachment affordances; never scan generic div/span nodes (prompt text can contain the file name).
@@ -326,11 +412,16 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
       'button[aria-label="Remove file"]',
     ];
 
+    const attachmentNodes = roots.flatMap((root) =>
+      Array.from(root.querySelectorAll(attachmentSelectors.join(','))),
+    );
+    const fileInputs = roots.flatMap((root) => Array.from(root.querySelectorAll('input[type="file"]')));
+
     const chipsReady = names.every((name) =>
-      Array.from(composer.querySelectorAll(attachmentSelectors.join(','))).some((node) => match(node, name)),
+      attachmentNodes.some((node) => match(node, name)),
     );
     const inputsReady = names.every((name) =>
-      Array.from(composer.querySelectorAll('input[type="file"]')).some((el) =>
+      fileInputs.some((el) =>
         Array.from((el instanceof HTMLInputElement ? el.files : []) || []).some((file) =>
           file?.name?.toLowerCase?.().includes(name),
         ),
@@ -422,7 +513,12 @@ async function verifyPromptCommitted(
   if (baseline === null) {
     try {
       const { result } = await Runtime.evaluate({
-        expression: `document.querySelectorAll(${turnSelectorLiteral}).length`,
+        expression: `(() => {
+          const selector = ${turnSelectorLiteral};
+          return Array.from(document.querySelectorAll(selector)).filter(
+            (node) => !(node.parentElement && node.parentElement.closest(selector)),
+          ).length;
+        })()`,
         returnByValue: true,
       });
       const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
@@ -445,13 +541,31 @@ async function verifyPromptCommitted(
 	      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
 	      text = text.replace(/\`\`\`/g, ' ');
 	      text = text.replace(/\`([^\`]*)\`/g, '$1');
-	      return text.replace(/\\s+/g, ' ').trim();
+	      text = text.replace(/\\s+/g, ' ').trim();
+	      return text.replace(/^you said\\s*:?\\s*/, '');
+	    };
+	    const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
+	    const turnNodes = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
+	      (node) => !(node.parentElement && node.parentElement.closest(CONVERSATION_SELECTOR)),
+	    );
+	    const resolveTurnRole = (node) => {
+	      if (!node || typeof node.getAttribute !== 'function') return '';
+	      const ownRole = node.getAttribute('data-message-author-role') || node.getAttribute('data-turn');
+	      if (ownRole) return ownRole.toLowerCase();
+	      const nestedRoleNode =
+	        typeof node.querySelector === 'function'
+	          ? node.querySelector('[data-message-author-role], [data-turn]')
+	          : null;
+	      const nestedRole =
+	        nestedRoleNode?.getAttribute?.('data-message-author-role') ||
+	        nestedRoleNode?.getAttribute?.('data-turn') ||
+	        '';
+	      return String(nestedRole || '').toLowerCase();
 	    };
 	    const normalizedPrompt = normalize(${encodedPrompt});
-	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
-	    const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
-	    const articles = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
-	    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
+	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 60);
+	    const normalizedTurns = turnNodes.map((node) => normalize(node?.innerText));
+	    const turnRoles = turnNodes.map((node) => resolveTurnRole(node));
 	    const readValue = (node) => {
 	      if (!node) return '';
 	      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
@@ -467,18 +581,35 @@ async function verifyPromptCommitted(
 	      .filter((node) => Boolean(node));
 	    const visibleInputs = inputs.filter((node) => isVisible(node));
 	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+		    const baseline = ${baselineLiteral};
+		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
+	    const postBaselineTurnTexts =
+	      baseline < 0 ? normalizedTurns : normalizedTurns.slice(Math.max(0, baseline));
+	    const postBaselineTurnRoles =
+	      baseline < 0 ? turnRoles : turnRoles.slice(Math.max(0, baseline));
+	    const postBaselineUserTurns = postBaselineTurnTexts.filter(
+	      (_text, index) => postBaselineTurnRoles[index] === 'user',
+	    );
+	    const searchableTurns =
+	      postBaselineUserTurns.length > 0
+	        ? postBaselineUserTurns
+	        : (postBaselineTurnTexts.length > 0 ? postBaselineTurnTexts : normalizedTurns);
 	    const userMatched =
-	      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
+	      normalizedPrompt.length > 0 &&
+	      searchableTurns.some((text) => text.includes(normalizedPrompt));
 	    const prefixMatched =
 	      normalizedPromptPrefix.length > 30 &&
-	      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
-		    const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
+	      searchableTurns.some((text) => text.includes(normalizedPromptPrefix));
+		    const lastTurn =
+		      (postBaselineUserTurns.length > 0
+		        ? postBaselineUserTurns[postBaselineUserTurns.length - 1]
+		        : postBaselineTurnTexts.length > 0
+		          ? postBaselineTurnTexts[postBaselineTurnTexts.length - 1]
+		          : normalizedTurns[normalizedTurns.length - 1]) ?? '';
 		    const lastMatched =
 		      normalizedPrompt.length > 0 &&
 		      (lastTurn.includes(normalizedPrompt) ||
 		        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
-		    const baseline = ${baselineLiteral};
-		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
 		    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
 		    const assistantVisible = Boolean(
 		      document.querySelector(${assistantSelectorLiteral}) ||
@@ -539,7 +670,8 @@ async function verifyPromptCommitted(
     const fallbackCommit =
       info?.composerCleared &&
       Boolean(info?.hasNewTurn) &&
-      ((info?.stopVisible ?? false) || info?.assistantVisible || info?.inConversation);
+      Boolean(info?.stopVisible) &&
+      !info?.inConversation;
     const homePageCommit =
       info?.composerCleared &&
       (info?.stopVisible ?? false) &&

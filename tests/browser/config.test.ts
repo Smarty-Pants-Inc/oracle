@@ -5,6 +5,7 @@ import { CHATGPT_URL } from "../../src/browser/constants.js";
 describe("resolveBrowserConfig", () => {
   test("returns defaults when config missing", () => {
     const resolved = resolveBrowserConfig(undefined);
+    expect(resolved.launcher).toBe("chrome");
     expect(resolved.url).toBe(CHATGPT_URL);
     const isWindows = process.platform === "win32";
     expect(resolved.cookieSync).toBe(!isWindows);
@@ -43,5 +44,44 @@ describe("resolveBrowserConfig", () => {
         desiredModel: "GPT-5.2 Pro",
       }),
     ).toThrow(/Temporary Chat/i);
+  });
+
+  test("preserves manualLoginProfileDir as an attach-running hint", () => {
+    const resolved = resolveBrowserConfig({
+      attachRunning: true,
+      manualLogin: false,
+      manualLoginProfileDir: "/tmp/oracle-profile",
+    });
+
+    expect(resolved.attachRunning).toBe(true);
+    expect(resolved.manualLogin).toBe(false);
+    expect(resolved.manualLoginProfileDir).toBe("/tmp/oracle-profile");
+  });
+
+  test("forces Carbonyl into its own non-hidden non-manual-login runtime", () => {
+    const resolved = resolveBrowserConfig({
+      launcher: "carbonyl",
+      headless: true,
+      hideWindow: true,
+      manualLogin: true,
+      manualLoginProfileDir: "/tmp/oracle-profile",
+    });
+
+    expect(resolved.launcher).toBe("carbonyl");
+    expect(resolved.headless).toBe(false);
+    expect(resolved.hideWindow).toBe(false);
+    expect(resolved.manualLogin).toBe(false);
+    expect(resolved.manualLoginProfileDir).toBeNull();
+  });
+
+  test("does not invent a profile hint for plain attach-running discovery", () => {
+    const resolved = resolveBrowserConfig({
+      attachRunning: true,
+      manualLogin: false,
+    });
+
+    expect(resolved.attachRunning).toBe(true);
+    expect(resolved.manualLogin).toBe(false);
+    expect(resolved.manualLoginProfileDir).toBeNull();
   });
 });

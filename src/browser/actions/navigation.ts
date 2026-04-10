@@ -72,12 +72,26 @@ export interface PromptReadyNavigationDeps {
   ensurePromptReady?: typeof ensurePromptReady;
 }
 
+async function evaluateWithTimeout(
+  Runtime: ChromeClient["Runtime"],
+  params: Parameters<ChromeClient["Runtime"]["evaluate"]>[0],
+  timeoutMs: number,
+  message: string,
+) {
+  return await Promise.race([
+    Runtime.evaluate(params),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
+  ]);
+}
+
 async function dismissBlockingUi(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
 ): Promise<boolean> {
-  const outcome = await Runtime.evaluate({
-    expression: `(() => {
+  const outcome = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: `(() => {
       const isVisible = (el) => {
         if (!(el instanceof HTMLElement)) return false;
         const rect = el.getBoundingClientRect();
@@ -124,14 +138,59 @@ async function dismissBlockingUi(
       }
       return { dismissed: false };
     })()`,
-    returnByValue: true,
-  }).catch(() => null);
+      returnByValue: true,
+    },
+    5_000,
+    "Timed out while dismissing blocking UI",
+  ).catch(() => null);
   const value = outcome?.result?.value as { dismissed?: boolean; action?: string } | undefined;
   if (value?.dismissed) {
     logger(`[nav] dismissed blocking UI (${value.action ?? "unknown"})`);
     return true;
   }
   return false;
+}
+
+function isPromptReadyTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /prompt textarea did not appear before timeout|timed out waiting for the prompt textarea/i.test(
+    message,
+  );
+}
+
+async function navigateAndEnsurePromptReady(
+  Page: ChromeClient["Page"],
+  Runtime: ChromeClient["Runtime"],
+  options: {
+    url: string;
+    timeoutMs: number;
+    headless: boolean;
+    logger: BrowserLogger;
+  },
+  deps: Required<
+    Pick<PromptReadyNavigationDeps, "navigateToChatGPT" | "ensureNotBlocked" | "ensurePromptReady">
+  >,
+): Promise<void> {
+  const { url, timeoutMs, headless, logger } = options;
+  const retryTimeoutMs = Math.max(timeoutMs, 45_000);
+  const runAttempt = async (attemptTimeoutMs: number) => {
+    await deps.navigateToChatGPT(Page, Runtime, url, logger);
+    await deps.ensureNotBlocked(Runtime, headless, logger);
+    await dismissBlockingUi(Runtime, logger).catch(() => false);
+    await deps.ensurePromptReady(Runtime, attemptTimeoutMs, logger);
+  };
+
+  try {
+    await runAttempt(timeoutMs);
+  } catch (error) {
+    if (!isPromptReadyTimeout(error)) {
+      throw error;
+    }
+    logger(
+      `[nav] prompt missing on ${url}; retrying the same page once with ${Math.round(retryTimeoutMs / 1000)}s timeout.`,
+    );
+    await runAttempt(retryTimeoutMs);
+  }
 }
 
 export async function navigateToPromptReadyWithFallback(
@@ -145,11 +204,22 @@ export async function navigateToPromptReadyWithFallback(
   const ensureBlocked = deps.ensureNotBlocked ?? ensureNotBlocked;
   const ensureReady = deps.ensurePromptReady ?? ensurePromptReady;
 
-  await navigate(Page, Runtime, url, logger);
-  await ensureBlocked(Runtime, headless, logger);
-  await dismissBlockingUi(Runtime, logger).catch(() => false);
   try {
-    await ensureReady(Runtime, timeoutMs, logger);
+    await navigateAndEnsurePromptReady(
+      Page,
+      Runtime,
+      {
+        url,
+        timeoutMs,
+        headless,
+        logger,
+      },
+      {
+        navigateToChatGPT: navigate,
+        ensureNotBlocked: ensureBlocked,
+        ensurePromptReady: ensureReady,
+      },
+    );
     return { usedFallback: false };
   } catch (error) {
     if (!fallbackUrl || fallbackUrl === url) {
@@ -159,10 +229,21 @@ export async function navigateToPromptReadyWithFallback(
     logger(
       `Prompt not ready after ${Math.round(timeoutMs / 1000)}s on ${url}; retrying ${fallbackUrl} with ${Math.round(fallbackTimeout / 1000)}s timeout.`,
     );
-    await navigate(Page, Runtime, fallbackUrl, logger);
-    await ensureBlocked(Runtime, headless, logger);
-    await dismissBlockingUi(Runtime, logger).catch(() => false);
-    await ensureReady(Runtime, fallbackTimeout, logger);
+    await navigateAndEnsurePromptReady(
+      Page,
+      Runtime,
+      {
+        url: fallbackUrl,
+        timeoutMs: fallbackTimeout,
+        headless,
+        logger,
+      },
+      {
+        navigateToChatGPT: navigate,
+        ensureNotBlocked: ensureBlocked,
+        ensurePromptReady: ensureReady,
+      },
+    );
     return { usedFallback: true };
   }
 }
@@ -182,6 +263,26 @@ export async function ensureNotBlocked(
 }
 
 const LOGIN_CHECK_TIMEOUT_MS = 5_000;
+const BACKEND_API_PROBE_ENDPOINTS = [
+  "/backend-api/me",
+  "/backend-api/models?iim=false&is_gizmo=false",
+] as const;
+const CLOUDFLARE_BACKEND_MARKERS = [
+  "enable javascript and cookies to continue",
+  "window._cf_chl_opt",
+  "/cdn-cgi/challenge-platform/",
+] as const;
+
+type BackendApiProbeResult = {
+  ok: boolean;
+  challenged?: boolean;
+  url?: string | null;
+  status?: number;
+  contentType?: string | null;
+  challengeMarkers?: string[];
+  bodySnippet?: string | null;
+  error?: string | null;
+};
 
 export async function ensureLoggedIn(
   Runtime: ChromeClient["Runtime"],
@@ -197,6 +298,7 @@ export async function ensureLoggedIn(
   });
   const probe = normalizeLoginProbe(outcome.result?.value);
   if (probe.ok) {
+    await ensureBackendApiReachable(Runtime, logger, { timeoutMs: LOGIN_CHECK_TIMEOUT_MS });
     logger(
       `Login check passed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)})`,
     );
@@ -239,6 +341,48 @@ export async function ensureLoggedIn(
       : "ChatGPT login appears missing; open chatgpt.com in Chrome to refresh the session or provide inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON).";
 
   throw new Error(`ChatGPT session not detected.${domLabel} ${cookieHint}`);
+}
+
+export async function ensureBackendApiReachable(
+  Runtime: ChromeClient["Runtime"],
+  logger: BrowserLogger,
+  options: { timeoutMs?: number; endpoints?: readonly string[] } = {},
+): Promise<void> {
+  const probe = await probeBackendApiHealth(Runtime, options);
+  if (!probe.challenged) {
+    return;
+  }
+  logger(
+    `ChatGPT backend API probe hit a Cloudflare challenge (url=${probe.url ?? "unknown"}, status=${probe.status ?? 0})`,
+  );
+  throw new BrowserAutomationError(
+    "ChatGPT backend API requests are being challenged by Cloudflare in this browser runtime, so Oracle cannot submit prompts or capture replies.",
+    {
+      stage: "cloudflare-backend-challenge",
+      url: probe.url ?? null,
+      status: probe.status ?? 0,
+      contentType: probe.contentType ?? null,
+      challengeMarkers: probe.challengeMarkers ?? [],
+      bodySnippet: probe.bodySnippet ?? null,
+    },
+  );
+}
+
+async function probeBackendApiHealth(
+  Runtime: ChromeClient["Runtime"],
+  options: { timeoutMs?: number; endpoints?: readonly string[] } = {},
+): Promise<BackendApiProbeResult> {
+  const timeoutMs = Math.max(1000, options.timeoutMs ?? LOGIN_CHECK_TIMEOUT_MS);
+  const endpoints =
+    options.endpoints && options.endpoints.length > 0
+      ? [...options.endpoints]
+      : [...BACKEND_API_PROBE_ENDPOINTS];
+  const outcome = await Runtime.evaluate({
+    expression: buildBackendApiProbeExpression(timeoutMs, endpoints),
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  return normalizeBackendApiProbe(outcome.result?.value);
 }
 
 async function attemptWelcomeBackLogin(
@@ -354,24 +498,45 @@ export async function ensurePromptReady(
 
 async function waitForDocumentReady(Runtime: ChromeClient["Runtime"], timeoutMs: number) {
   const start = Date.now();
+  let lastError: Error | null = null;
   while (Date.now() - start < timeoutMs) {
-    const { result } = await Runtime.evaluate({
-      expression: `document.readyState`,
-      returnByValue: true,
-    });
-    if (result?.value === "complete" || result?.value === "interactive") {
-      return;
+    const remainingMs = timeoutMs - (Date.now() - start);
+    if (remainingMs <= 0) {
+      break;
+    }
+    try {
+      const { result } = await evaluateWithTimeout(
+        Runtime,
+        {
+          expression: `document.readyState`,
+          returnByValue: true,
+        },
+        Math.min(5_000, remainingMs),
+        "Timed out reading document.readyState",
+      );
+      if (result?.value === "complete" || result?.value === "interactive") {
+        return;
+      }
+      lastError = null;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
     }
     await delay(100);
   }
-  throw new Error("Page did not reach ready state in time");
+  const reason = lastError ? `: ${lastError.message}` : "";
+  throw new Error(`Page did not reach ready state in time${reason}`);
 }
 
 async function currentUrl(Runtime: ChromeClient["Runtime"]): Promise<string | null> {
-  const { result } = await Runtime.evaluate({
-    expression: 'typeof location === "object" && location.href ? location.href : null',
-    returnByValue: true,
-  });
+  const { result } = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: 'typeof location === "object" && location.href ? location.href : null',
+      returnByValue: true,
+    },
+    5_000,
+    "Timed out reading current location",
+  );
   return typeof result?.value === "string" ? result.value : null;
 }
 
@@ -393,8 +558,11 @@ async function waitForPrompt(
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    const remainingMs = deadline - Date.now();
+    const { result } = await evaluateWithTimeout(
+      Runtime,
+      {
+        expression: `(() => {
         const selectors = ${JSON.stringify(INPUT_SELECTORS)};
         for (const selector of selectors) {
           const node = document.querySelector(selector);
@@ -404,8 +572,11 @@ async function waitForPrompt(
         }
         return false;
       })()`,
-      returnByValue: true,
-    });
+        returnByValue: true,
+      },
+      Math.min(5_000, Math.max(1_000, remainingMs)),
+      "Timed out waiting for the prompt textarea",
+    );
     if (result?.value) {
       return true;
     }
@@ -415,20 +586,30 @@ async function waitForPrompt(
 }
 
 async function isCloudflareInterstitial(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
-  const { result: titleResult } = await Runtime.evaluate({
-    expression: "document.title",
-    returnByValue: true,
-  });
+  const { result: titleResult } = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: "document.title",
+      returnByValue: true,
+    },
+    5_000,
+    "Timed out reading document.title",
+  );
   const title = typeof titleResult.value === "string" ? titleResult.value : "";
   const challengeTitle = CLOUDFLARE_TITLE.toLowerCase();
   if (title.toLowerCase().includes(challengeTitle)) {
     return true;
   }
 
-  const { result } = await Runtime.evaluate({
-    expression: `Boolean(document.querySelector('${CLOUDFLARE_SCRIPT_SELECTOR}'))`,
-    returnByValue: true,
-  });
+  const { result } = await evaluateWithTimeout(
+    Runtime,
+    {
+      expression: `Boolean(document.querySelector('${CLOUDFLARE_SCRIPT_SELECTOR}'))`,
+      returnByValue: true,
+    },
+    5_000,
+    "Timed out checking for Cloudflare interstitial markers",
+  );
   return Boolean(result.value);
 }
 
@@ -442,6 +623,65 @@ type LoginProbeResult = {
   domLoginCta?: boolean;
   onAuthPage?: boolean;
 };
+
+function buildBackendApiProbeExpression(timeoutMs: number, endpoints: readonly string[]): string {
+  return `(async () => {
+    const endpoints = ${JSON.stringify(endpoints)};
+    const markers = ${JSON.stringify(Array.from(CLOUDFLARE_BACKEND_MARKERS))};
+    const classify = (text) => {
+      const normalized = String(text || '').toLowerCase();
+      return markers.filter((marker) => normalized.includes(String(marker).toLowerCase()));
+    };
+
+    for (const url of endpoints) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ${timeoutMs});
+        try {
+          const response = await fetch(url, {
+            cache: 'no-store',
+            credentials: 'include',
+            signal: controller.signal,
+          });
+          const contentType = response.headers?.get?.('content-type') || null;
+          const shouldReadBody =
+            !response.ok || (typeof contentType === 'string' && contentType.toLowerCase().includes('text/html'));
+          let bodyText = '';
+          if (shouldReadBody) {
+            try {
+              bodyText = await response.text();
+            } catch {
+              bodyText = '';
+            }
+          }
+          const matchedMarkers = classify(bodyText);
+          if (matchedMarkers.length > 0) {
+            return {
+              ok: false,
+              challenged: true,
+              url,
+              status: response.status || 0,
+              contentType,
+              challengeMarkers: matchedMarkers,
+              bodySnippet: String(bodyText || '').slice(0, 600),
+            };
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          challenged: false,
+          url,
+          error: error ? String(error) : 'unknown',
+        };
+      }
+    }
+
+    return { ok: true, challenged: false };
+  })()`;
+}
 
 function buildLoginProbeExpression(timeoutMs: number): string {
   return `(async () => {
@@ -551,5 +791,33 @@ function normalizeLoginProbe(raw: unknown): LoginProbeResult {
     pageUrl: typeof value.pageUrl === "string" ? value.pageUrl : null,
     domLoginCta: Boolean(value.domLoginCta),
     onAuthPage: Boolean(value.onAuthPage),
+  };
+}
+
+function normalizeBackendApiProbe(raw: unknown): BackendApiProbeResult {
+  if (!raw || typeof raw !== "object") {
+    return { ok: false, challenged: false };
+  }
+  const value = raw as Record<string, unknown>;
+  const statusRaw = value.status;
+  const status =
+    typeof statusRaw === "number"
+      ? statusRaw
+      : typeof statusRaw === "string" && !Number.isNaN(Number(statusRaw))
+        ? Number(statusRaw)
+        : 0;
+  const challengeMarkersRaw = value.challengeMarkers;
+  const challengeMarkers = Array.isArray(challengeMarkersRaw)
+    ? challengeMarkersRaw.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return {
+    ok: Boolean(value.ok),
+    challenged: Boolean(value.challenged),
+    url: typeof value.url === "string" ? value.url : null,
+    status: Number.isFinite(status) ? (status as number) : 0,
+    contentType: typeof value.contentType === "string" ? value.contentType : null,
+    challengeMarkers,
+    bodySnippet: typeof value.bodySnippet === "string" ? value.bodySnippet : null,
+    error: typeof value.error === "string" ? value.error : null,
   };
 }

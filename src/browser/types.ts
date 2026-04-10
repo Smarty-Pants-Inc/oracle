@@ -6,6 +6,7 @@ import type { ThinkingTimeLevel } from "../oracle/types.js";
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
 export type CookieParam = Protocol.Network.CookieParam;
 export type BrowserModelStrategy = "select" | "current" | "ignore";
+export type BrowserLauncher = "chrome" | "carbonyl";
 
 export type BrowserLogger = ((message: string) => void) & {
   verbose?: boolean;
@@ -19,10 +20,12 @@ export interface BrowserAttachment {
 }
 
 export interface BrowserAutomationConfig {
+  launcher?: BrowserLauncher;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
   attachRunning?: boolean;
+  supervisorChatgptUrl?: string | null;
   url?: string;
   chatgptUrl?: string | null;
   timeoutMs?: number;
@@ -96,12 +99,14 @@ export interface BrowserRunResult {
   userDataDir?: string;
   chromeTargetId?: string;
   tabUrl?: string;
+  conversationId?: string;
   controllerPid?: number;
 }
 
 export type ResolvedBrowserConfig = Required<
   Omit<
     BrowserAutomationConfig,
+    | "launcher"
     | "chromeProfile"
     | "chromePath"
     | "chromeCookiePath"
@@ -113,6 +118,7 @@ export type ResolvedBrowserConfig = Required<
     | "modelStrategy"
   >
 > & {
+  launcher: BrowserLauncher;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;

@@ -3,6 +3,7 @@ export {
   navigateToPromptReadyWithFallback,
   ensureNotBlocked,
   ensureLoggedIn,
+  ensureBackendApiReachable,
   ensurePromptReady,
   installJavaScriptDialogAutoDismissal,
 } from "./actions/navigation.js";
@@ -16,6 +17,8 @@ export {
 } from "./actions/attachments.js";
 export {
   waitForAssistantResponse,
+  isAssistantEmptyResponseError,
+  isAssistantRateLimitError,
   readAssistantSnapshot,
   captureAssistantMarkdown,
   buildAssistantExtractorForTest,

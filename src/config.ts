@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import JSON5 from "json5";
 import { getOracleHomeDir } from "./oracleHome.js";
-import type { BrowserModelStrategy } from "./browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy } from "./browser/types.js";
 import type { ThinkingTimeLevel } from "./oracle/types.js";
 
 export type EnginePreference = "api" | "browser";
@@ -14,10 +14,12 @@ export interface NotifyConfig {
 }
 
 export interface BrowserConfigDefaults {
+  launcher?: BrowserLauncher;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
   attachRunning?: boolean;
+  supervisorChatgptUrl?: string | null;
   chatgptUrl?: string | null;
   url?: string;
   /** Delegate browser automation to a remote `oracle serve` instance (host:port). */

@@ -3,6 +3,7 @@ import type { EngineMode } from "../cli/engine.js";
 import type { UserConfig } from "../config.js";
 import { resolveRunOptionsFromConfig } from "../cli/runOptions.js";
 import { Launcher } from "chrome-launcher";
+import type { BrowserLauncher } from "../browser/types.js";
 
 export function mapConsultToRunOptions({
   prompt,
@@ -56,9 +57,12 @@ export function mapConsultToRunOptions({
 
 export function ensureBrowserAvailable(
   engine: EngineMode,
-  options?: { remoteHost?: string | null },
+  options?: { remoteHost?: string | null; launcher?: BrowserLauncher | null },
 ): string | null {
   if (engine !== "browser") {
+    return null;
+  }
+  if (options?.launcher === "carbonyl") {
     return null;
   }
   const remoteHost = options?.remoteHost?.trim() || process.env.ORACLE_REMOTE_HOST?.trim();

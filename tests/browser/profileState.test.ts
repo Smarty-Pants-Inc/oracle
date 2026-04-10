@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
 
 describe("profileState", () => {
@@ -145,6 +145,30 @@ describe("profileState", () => {
     }
   });
 
+  test("clears stale profile lock when the pid was reused with a different start marker", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
+    try {
+      const lockPath = path.join(dir, "oracle-automation.lock");
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: process.pid,
+          lockId: "stale-reused-pid-lock",
+          createdAt: new Date().toISOString(),
+          processStartMarker: "old-process-start",
+        }),
+      );
+      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      const written = JSON.parse(await readFile(lockPath, "utf8")) as { lockId?: string };
+      expect(lock).not.toBeNull();
+      expect(written.lockId).not.toBe("stale-reused-pid-lock");
+      await lock?.release();
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("deletes unreadable profile lock and continues", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
@@ -159,4 +183,72 @@ describe("profileState", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("falls back to SingletonLock when chrome.pid is stale", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
+    const stale = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    await once(stale, "exit");
+    const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      if (!stale.pid || !live.pid) {
+        throw new Error("Missing child pid");
+      }
+      await profileState.writeChromePid(dir, stale.pid);
+      await symlink(`Mac-${live.pid}`, path.join(dir, "SingletonLock"));
+      await expect(profileState.readChromePid(dir)).resolves.toBe(live.pid);
+    } finally {
+      live.kill("SIGTERM");
+      await once(live, "exit").catch(() => undefined);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("drops a stale cached chrome pid when it does not own the profile", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
+    const stale = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      if (!stale.pid) {
+        throw new Error("Missing child pid");
+      }
+      await profileState.writeChromePid(dir, stale.pid);
+      await expect(profileState.resolveChromePidForUserDataDir(dir, stale.pid)).resolves.toBeNull();
+    } finally {
+      stale.kill("SIGTERM");
+      await once(stale, "exit").catch(() => undefined);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "requires an exact --user-data-dir match for chrome ownership checks",
+    async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
+      const otherDir = `${dir}-copy`;
+      const binDir = await mkdtemp(path.join(os.tmpdir(), "oracle-fake-chrome-"));
+      const chromePath = path.join(binDir, "chrome");
+      await writeFile(chromePath, "#!/bin/sh\nsleep 30\n", "utf8");
+      await chmod(chromePath, 0o755);
+      const fakeChrome = spawn(chromePath, [`--user-data-dir=${dir}`], { stdio: "ignore" });
+      try {
+        if (!fakeChrome.pid) {
+          throw new Error("Missing fake chrome pid");
+        }
+        await expect(profileState.chromePidMatchesUserDataDir(fakeChrome.pid, dir)).resolves.toBe(
+          true,
+        );
+        await expect(
+          profileState.chromePidMatchesUserDataDir(fakeChrome.pid, otherDir),
+        ).resolves.toBe(false);
+      } finally {
+        fakeChrome.kill("SIGTERM");
+        await once(fakeChrome, "exit").catch(() => undefined);
+        await rm(binDir, { recursive: true, force: true });
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });

@@ -22,6 +22,8 @@ vi.mock("../../src/browser/reattachHelpers.js", async (importOriginal) => {
 });
 
 describe("supervisorThreads", () => {
+  const projectUrl = "https://chatgpt.com/g/team-space/project";
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -85,43 +87,95 @@ describe("supervisorThreads", () => {
     ]);
   });
 
+  test("filters listed threads to the configured project scope", async () => {
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            {
+              title: "In scope",
+              url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+              conversationId: "right-thread",
+            },
+            {
+              title: "Root chat",
+              url: "https://chatgpt.com/c/root-thread",
+              conversationId: "root-thread",
+            },
+            {
+              title: "Other project",
+              url: "https://chatgpt.com/g/other-space-oracle/c/other-thread",
+              conversationId: "other-thread",
+            },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    const threads = await listSupervisorThreads(runtime, {
+      projectUrl,
+    });
+
+    expect(threads).toEqual([
+      {
+        title: "In scope",
+        url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        conversationId: "right-thread",
+        isActive: false,
+      },
+    ]);
+  });
+
   test("attach_thread waits until the requested conversation is active", async () => {
     vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
-    const evaluate = vi
-      .fn()
-      .mockResolvedValueOnce({
-        result: {
-          value: {
-            url: "https://chatgpt.com/c/current-1",
-            conversationId: "current-1",
-            title: "Current",
-            isActive: true,
+    let currentReads = 0;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("const href = window.location.href || ''")) {
+        currentReads += 1;
+        if (currentReads < 3) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space/c/current-1",
+                conversationId: "current-1",
+                title: "Current",
+                isActive: true,
+              },
+            },
+          };
+        }
+        return {
+          result: {
+            value: {
+              url: "https://chatgpt.com/g/team-space/c/target-9",
+              conversationId: "target-9",
+              title: "Target",
+              isActive: true,
+            },
           },
-        },
-      })
-      .mockResolvedValueOnce({
-        result: {
-          value: {
-            url: "https://chatgpt.com/c/current-1",
-            conversationId: "current-1",
-            title: "Current",
-            isActive: true,
+        };
+      }
+      if (expression.includes("const limit =")) {
+        return {
+          result: {
+            value: [
+              {
+                title: "Current",
+                url: "https://chatgpt.com/g/team-space/c/current-1",
+                conversationId: "current-1",
+                isActive: true,
+              },
+            ],
           },
-        },
-      })
-      .mockResolvedValueOnce({
-        result: {
-          value: {
-            url: "https://chatgpt.com/c/target-9",
-            conversationId: "target-9",
-            title: "Target",
-            isActive: true,
-          },
-        },
-      });
+        };
+      }
+      return { result: { value: null } };
+    });
     const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
 
-    const thread = await attachSupervisorThread(runtime, "target-9");
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      projectUrl,
+    });
 
     expect(openConversationFromSidebarWithRetry).toHaveBeenCalledWith(
       runtime,
@@ -130,7 +184,59 @@ describe("supervisorThreads", () => {
     );
     expect(thread).toEqual({
       title: "Target",
-      url: "https://chatgpt.com/c/target-9",
+      url: "https://chatgpt.com/g/team-space/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+  });
+
+  test("attach_thread accepts an in-place sidebar activation when the URL stays on the prior thread", async () => {
+    vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space/c/current-1",
+                conversationId: "current-1",
+                title: "Current",
+                isActive: true,
+              },
+            },
+          };
+        }
+        if (expression.includes("const limit =")) {
+          return {
+            result: {
+              value: [
+                {
+                  title: "Current",
+                  url: "https://chatgpt.com/g/team-space/c/current-1",
+                  conversationId: "current-1",
+                  isActive: false,
+                },
+                {
+                  title: "Target",
+                  url: "https://chatgpt.com/g/team-space/c/target-9",
+                  conversationId: "target-9",
+                  isActive: true,
+                },
+              ],
+            },
+          };
+        }
+        return { result: { value: null } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      projectUrl,
+    });
+
+    expect(thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space/c/target-9",
       conversationId: "target-9",
       isActive: true,
     });
@@ -159,6 +265,99 @@ describe("supervisorThreads", () => {
       "Conversation target-9 did not become active after attach_thread",
     );
     dateNow.mockRestore();
+  });
+
+  test("project scope matcher accepts only the configured project root or its conversations", () => {
+    expect(
+      __test__.supervisorThreadMatchesProjectScope(
+        {
+          title: "Fresh",
+          url: projectUrl,
+          conversationId: undefined,
+          isActive: true,
+        },
+        projectUrl,
+      ),
+    ).toBe(true);
+    expect(
+      __test__.supervisorThreadMatchesProjectScope(
+        {
+          title: "Scoped conversation",
+          url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+          conversationId: "right-thread",
+          isActive: true,
+        },
+        projectUrl,
+      ),
+    ).toBe(true);
+    expect(
+      __test__.supervisorThreadMatchesProjectScope(
+        {
+          title: "Root chat",
+          url: "https://chatgpt.com/c/root-thread",
+          conversationId: "root-thread",
+          isActive: true,
+        },
+        projectUrl,
+      ),
+    ).toBe(false);
+    expect(
+      __test__.supervisorThreadMatchesProjectScope(
+        {
+          title: "Different project with shared prefix",
+          url: "https://chatgpt.com/g/team-space-other/c/root-thread",
+          conversationId: "root-thread",
+          isActive: true,
+        },
+        projectUrl,
+      ),
+    ).toBe(false);
+  });
+
+  test("project scope matcher accepts project-shell query and hash variants", () => {
+    expect(
+      __test__.supervisorThreadMatchesProjectScope(
+        {
+          title: "Fresh",
+          url: "https://chatgpt.com/g/team-space/project?model=gpt-5.4#top",
+          conversationId: undefined,
+          isActive: true,
+        },
+        projectUrl,
+      ),
+    ).toBe(true);
+  });
+
+  test("project-scoped listing keeps conversation rows that only expose a conversation id", async () => {
+    const runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            {
+              title: "Sidebar thread",
+              conversationId: "thread-from-sidebar",
+            },
+            {
+              title: "Other project",
+              url: "https://chatgpt.com/g/other-space-oracle/c/other-thread",
+              conversationId: "other-thread",
+            },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    const threads = await listSupervisorThreads(runtime, {
+      projectUrl,
+    });
+
+    expect(threads).toEqual([
+      {
+        title: "Sidebar thread",
+        conversationId: "thread-from-sidebar",
+        isActive: false,
+      },
+    ]);
   });
 
   test("new_thread returns immediately when already on a fresh chat", async () => {
@@ -221,15 +420,41 @@ describe("supervisorThreads", () => {
     });
   });
 
-  test("new_thread does not treat project pages as already-fresh chats", async () => {
+  test("new_thread treats a configured project root as a fresh chat", async () => {
+    const evaluate = vi.fn(async () => ({
+      result: {
+        value: {
+          url: "https://chatgpt.com/g/team-space/project",
+          conversationId: "",
+          title: "Workspace",
+          isActive: true,
+        },
+      },
+    }));
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const thread = await newSupervisorThread(runtime, {
+      projectUrl: "https://chatgpt.com/g/team-space/project",
+    });
+
+    expect(thread).toEqual({
+      title: "Workspace",
+      url: "https://chatgpt.com/g/team-space/project",
+      conversationId: undefined,
+      isActive: true,
+    });
+    expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("new_thread falls back to the configured project URL instead of the ChatGPT root", async () => {
     const evaluate = vi
       .fn()
       .mockResolvedValueOnce({
         result: {
           value: {
-            url: "https://chatgpt.com/g/team-space",
-            conversationId: "",
-            title: "Workspace",
+            url: "https://chatgpt.com/c/current-1",
+            conversationId: "current-1",
+            title: "Current",
             isActive: true,
           },
         },
@@ -238,23 +463,77 @@ describe("supervisorThreads", () => {
       .mockResolvedValue({
         result: {
           value: {
-            url: "https://chatgpt.com/",
+            url: "https://chatgpt.com/g/team-space/project",
             conversationId: "",
-            title: "ChatGPT",
+            title: "Workspace",
             isActive: true,
           },
         },
       });
     const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
 
-    const thread = await newSupervisorThread(runtime);
+    const thread = await newSupervisorThread(runtime, {
+      projectUrl: "https://chatgpt.com/g/team-space/project",
+    });
 
     expect(thread).toEqual({
-      title: "ChatGPT",
-      url: "https://chatgpt.com/",
+      title: "Workspace",
+      url: "https://chatgpt.com/g/team-space/project",
       conversationId: undefined,
       isActive: true,
     });
+    expect(evaluate.mock.calls[1]?.[0]?.expression).toContain(
+      'window.location.href = "https://chatgpt.com/g/team-space/project"',
+    );
     expect(evaluate).toHaveBeenCalledTimes(3);
+  });
+
+  test("new_thread keeps waiting when navigation changes to an out-of-scope destination first", async () => {
+    const evaluate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          value: {
+            url: "https://chatgpt.com/g/team-space/c/current-1",
+            conversationId: "current-1",
+            title: "Current",
+            isActive: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({ result: { value: true } })
+      .mockResolvedValueOnce({
+        result: {
+          value: {
+            url: "https://chatgpt.com/",
+            conversationId: "",
+            title: "Root chat",
+            isActive: true,
+          },
+        },
+      })
+      .mockResolvedValue({
+        result: {
+          value: {
+            url: "https://chatgpt.com/g/team-space/project",
+            conversationId: "",
+            title: "Workspace",
+            isActive: true,
+          },
+        },
+      });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const thread = await newSupervisorThread(runtime, {
+      projectUrl,
+    });
+
+    expect(thread).toEqual({
+      title: "Workspace",
+      url: "https://chatgpt.com/g/team-space/project",
+      conversationId: undefined,
+      isActive: true,
+    });
+    expect(evaluate).toHaveBeenCalledTimes(4);
   });
 });

@@ -36,10 +36,25 @@ describe("browser model selection arbitrary labels", () => {
     expect(modelCandidateMatchesTargetForTest("Thinking 5.4", "Thinking")).toBe(true);
   });
 
+  it("rejects shorthand variant labels for a base-model request", () => {
+    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Pro")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Thinking")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Instant")).toBe(false);
+  });
+
   it("accepts version-specific test ids even when the visible label is generic", () => {
     expect(modelCandidateMatchesTargetForTest("GPT-5.2", "ChatGPT", "model-switcher-gpt-5-2")).toBe(
       true,
     );
+  });
+
+  it("rejects version-matched test ids that still advertise the wrong variant", () => {
+    expect(
+      modelCandidateMatchesTargetForTest("GPT-5.2", "ChatGPT", "model-switcher-gpt-5-2-pro"),
+    ).toBe(false);
+    expect(
+      modelCandidateMatchesTargetForTest("GPT-5.2", "ChatGPT", "model-switcher-gpt-5-2-thinking"),
+    ).toBe(false);
   });
 
   it("rejects conflicting shorthand labels", () => {

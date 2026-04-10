@@ -16,6 +16,12 @@ const sessionStoreMock = vi.hoisted(() => ({
   readLog: vi.fn(),
   readModelLog: vi.fn(),
   readRequest: vi.fn(),
+  createLogWriter: vi.fn(() => ({
+    logLine: vi.fn(),
+    stream: { end: vi.fn() },
+  })),
+  updateSession: vi.fn(),
+  updateModelRun: vi.fn(),
   listSessions: vi.fn(),
   filterSessions: vi.fn(),
   getPaths: vi.fn(),
@@ -258,6 +264,61 @@ describe("attachSession rendering", () => {
 
     expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining("Answer:\nfrom-session-log"));
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("gpt-5.2-pro"));
+  });
+
+  test("renders the completed transcript immediately after a successful reattach", async () => {
+    vi.resetModules();
+    const runningMeta: SessionMetadata = {
+      id: "sess",
+      createdAt: new Date().toISOString(),
+      status: "running",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: { timeoutMs: 2_000 },
+        runtime: {
+          chromePort: 9222,
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
+          controllerPid: 999999,
+        },
+      },
+    };
+    const completedMeta: SessionMetadata = {
+      ...runningMeta,
+      status: "completed",
+      response: { status: "completed" },
+    };
+    const resumeBrowserSession = vi.fn(async () => ({
+      answerText: "reattach-ok",
+      answerMarkdown: "reattach-ok",
+    }));
+    vi.doMock("../../src/browser/reattach.ts", () => ({
+      resumeBrowserSession,
+    }));
+    const { attachSession: mockedAttachSession } = await import("../../src/cli/sessionDisplay.ts");
+    readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValueOnce(completedMeta);
+    sessionStoreMock.readSession
+      .mockResolvedValueOnce(runningMeta)
+      .mockResolvedValueOnce(completedMeta);
+    readSessionLogMock.mockResolvedValue("Answer:\nreattach-ok");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    sessionStoreMock.updateSession.mockResolvedValue(undefined);
+    const writeSpy = vi.spyOn(process.stdout, "write");
+
+    await mockedAttachSession("sess", { renderMarkdown: false });
+
+    expect(resumeBrowserSession).toHaveBeenCalledTimes(1);
+    expect(waitMock).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({
+        response: {
+          status: "completed",
+          assistantOutput: "reattach-ok",
+        },
+      }),
+    );
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining("Answer:\nreattach-ok"));
   });
 
   test("renders markdown when requested and rich tty", async () => {

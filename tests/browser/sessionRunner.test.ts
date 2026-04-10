@@ -461,6 +461,10 @@ describe("continueBrowserSessionExecution", () => {
       status: "completed",
       mode: "browser",
       options: {},
+      response: {
+        status: "completed",
+        assistantOutput: "PREVIOUS_ORACLE_RESULT",
+      },
       browser: {
         config: {},
         runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
@@ -505,7 +509,11 @@ describe("continueBrowserSessionExecution", () => {
       baseConfig,
       expect.any(Function),
       expect.objectContaining({ prompt: "prompt", attachments: [] }),
-      expect.any(Object),
+      expect.objectContaining({
+        baselineAssistant: {
+          text: "PREVIOUS_ORACLE_RESULT",
+        },
+      }),
     );
     expect(persistRuntimeHint).toHaveBeenCalled();
     expect(result).toMatchObject({
@@ -582,6 +590,80 @@ describe("continueBrowserSessionExecution", () => {
     );
   });
 
+  test("merges inherited browser runtime when a follow-up returns only partial runtime metadata", async () => {
+    const log = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: {},
+        runtime: {
+          browserTransport: "cdp",
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/original",
+          chromeTargetId: "target-parent",
+          tabUrl: "https://chatgpt.com/g/g-p-example/project/c/demo",
+          conversationId: "demo",
+          controllerPid: 111,
+        },
+      },
+    };
+    const continueBrowser = vi.fn(async () => ({
+      answerText: "continued",
+      answerMarkdown: "continued",
+      tookMs: 321,
+      answerTokens: 9,
+      runtime: {
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        tabUrl: "https://chatgpt.com/g/g-p-example/project/c/demo",
+      },
+    }));
+    const persistRuntimeHint = vi.fn();
+
+    const result = await continueBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "never",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        continueBrowser,
+        persistRuntimeHint,
+      },
+    );
+
+    expect(persistRuntimeHint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chromeTargetId: "target-parent",
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/original",
+        conversationId: "demo",
+      }),
+    );
+    expect(result.runtime).toMatchObject({
+      chromeTargetId: "target-parent",
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/original",
+      conversationId: "demo",
+    });
+  });
+
   test("wraps generic followup failures as BrowserAutomationError", async () => {
     const parentSession: SessionMetadata = {
       id: "parent",
@@ -624,7 +706,10 @@ describe("continueBrowserSessionExecution", () => {
     ).rejects.toMatchObject({
       name: "BrowserAutomationError",
       message: "chrome disappeared",
-      details: { stage: "continue-browser" },
+      details: {
+        stage: "continue-browser",
+        runtime: expect.objectContaining({ chromePort: 9222, tabUrl: "https://chatgpt.com/c/abc" }),
+      },
     } satisfies Partial<BrowserAutomationError>);
   });
 });

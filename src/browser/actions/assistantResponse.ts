@@ -16,6 +16,21 @@ import {
 import { buildClickDispatcher } from "./domEvents.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
+const ASSISTANT_EMPTY_RESPONSE_ERROR = "assistant-response-empty-turn";
+const ASSISTANT_RATE_LIMIT_ERROR = "assistant-response-rate-limited";
+const ASSISTANT_EMPTY_RESPONSE_MIN_GRACE_MS = 6_000;
+const ASSISTANT_EMPTY_RESPONSE_MAX_GRACE_MS = 12_000;
+const ASSISTANT_TERMINAL_ERROR_MAX_TEXT_LENGTH = 500;
+
+export function isAssistantEmptyResponseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.toLowerCase().includes(ASSISTANT_EMPTY_RESPONSE_ERROR);
+}
+
+export function isAssistantRateLimitError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.toLowerCase().includes(ASSISTANT_RATE_LIMIT_ERROR);
+}
 
 function isAnswerNowPlaceholderText(normalized: string): boolean {
   const text = normalized.trim();
@@ -39,20 +54,12 @@ function isThinkingSummaryPlaceholder(candidate: {
   html?: string | null;
 }): boolean {
   const normalized = cleanAssistantText(candidate.text ?? "").toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  const withoutPrefix = normalized.replace(/^chatgpt said:\s*/, "").trim();
-  const hasSummaryOnlyText =
-    withoutPrefix === "thinking" ||
-    /^thought for\b/.test(withoutPrefix) ||
-    /^thought for\b[\s\S]*\nthinking$/.test(withoutPrefix);
-  if (!hasSummaryOnlyText) {
+  if (!isThinkingSummaryOnlyText(normalized)) {
     return false;
   }
   const html = String(candidate.html ?? "").toLowerCase();
   if (!html) {
-    return false;
+    return true;
   }
   return (
     html.includes("result-thinking") ||
@@ -61,26 +68,76 @@ function isThinkingSummaryPlaceholder(candidate: {
   );
 }
 
+function isProgressStatusPlaceholder(candidate: {
+  text?: string | null;
+  html?: string | null;
+}): boolean {
+  const normalized = cleanAssistantText(candidate.text ?? "").toLowerCase();
+  return isAssistantProgressStatusOnlyText(normalized);
+}
+
 function isAssistantPlaceholderCandidate(candidate: {
   text?: string | null;
   html?: string | null;
 }): boolean {
   const normalized = cleanAssistantText(candidate.text ?? "").toLowerCase();
-  return isAnswerNowPlaceholderText(normalized) || isThinkingSummaryPlaceholder(candidate);
+  return (
+    isAnswerNowPlaceholderText(normalized) ||
+    isThinkingSummaryPlaceholder(candidate) ||
+    isProgressStatusPlaceholder(candidate)
+  );
 }
 
-function shouldWaitForStableAssistantTurn(candidate: {
-  text?: string | null;
-  html?: string | null;
-}): boolean {
-  const cleaned = cleanAssistantText(candidate.text ?? "");
-  if (!cleaned) {
-    return true;
+function isThinkingSummaryOnlyText(normalized: string): boolean {
+  if (!normalized) {
+    return false;
   }
-  if (isAssistantPlaceholderCandidate(candidate)) {
-    return true;
+  const withoutPrefix = normalized.replace(/^chatgpt said:\s*/, "").trim();
+  return (
+    withoutPrefix === "thinking" ||
+    /^thought for\b[^\n]*$/.test(withoutPrefix) ||
+    /^thought for\b[^\n]*\nthinking$/.test(withoutPrefix)
+  );
+}
+
+function isAssistantProgressStatusOnlyText(normalized: string): boolean {
+  if (!normalized) {
+    return false;
   }
-  return cleaned.length < 16;
+  const withoutPrefix = normalized.replace(/^chatgpt said:\s*/, "").trim();
+  return (
+    /^(?:starting|finalizing answer)(?:\.{3}|…)?$/.test(withoutPrefix) ||
+    /^(?:analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\.{3}|…)?$/.test(
+      withoutPrefix,
+    )
+  );
+}
+
+function getAssistantStabilityThresholds(
+  currentLength: number,
+  completionVisible: boolean,
+): {
+  completionStableTarget: number;
+  requiredStableCycles: number;
+  minStableMs: number;
+} {
+  const shortAnswer = currentLength > 0 && currentLength < 16;
+  const mediumAnswer = currentLength >= 16 && currentLength < 40;
+  const longAnswer = currentLength >= 40 && currentLength < 500;
+  if (completionVisible) {
+    return {
+      completionStableTarget: shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 6 : 8,
+      requiredStableCycles: shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 8 : 10,
+      minStableMs: shortAnswer ? 8000 : mediumAnswer ? 1200 : longAnswer ? 2000 : 3000,
+    };
+  }
+  return {
+    completionStableTarget: Number.POSITIVE_INFINITY,
+    // Completion affordances can lag behind the first visible prose. Without them,
+    // require a much longer quiet window before accepting the turn as final.
+    requiredStableCycles: shortAnswer ? 12 : mediumAnswer ? 16 : longAnswer ? 20 : 24,
+    minStableMs: shortAnswer ? 8000 : mediumAnswer ? 6000 : longAnswer ? 8000 : 10000,
+  };
 }
 
 export async function waitForAssistantResponse(
@@ -121,9 +178,7 @@ export async function waitForAssistantResponse(
     pollerAbort.signal,
   ).then(
     (value) => ({ kind: "poll" as const, value }),
-    (error) => {
-      throw { source: "poll" as const, error };
-    },
+    (error) => ({ kind: "poll_error" as const, error }),
   );
 
   let evaluation: Awaited<ReturnType<ChromeClient["Runtime"]["evaluate"]>> | null = null;
@@ -137,11 +192,20 @@ export async function waitForAssistantResponse(
     if (remainingMs <= 0) {
       return null;
     }
-    const settled = await Promise.race([
-      pollerPromise.catch(() => null),
-      delay(remainingMs).then(() => null),
-    ]);
-    return settled && settled.kind === "poll" ? settled.value : null;
+    const settled = await Promise.race([pollerPromise, delay(remainingMs).then(() => null)]);
+    if (settled && settled.kind === "poll") {
+      return settled.value;
+    }
+    if (settled && settled.kind === "poll_error") {
+      const { error } = settled;
+      if (error instanceof Error && error.message === ASSISTANT_POLL_TIMEOUT_ERROR) {
+        return null;
+      }
+      evaluationPromise.catch(() => undefined);
+      await terminateRuntimeExecution(Runtime);
+      throw error ?? new Error("Failed to capture assistant response");
+    }
+    return null;
   };
 
   try {
@@ -149,14 +213,27 @@ export async function waitForAssistantResponse(
       const winner = await Promise.race([raceReadyEvaluation, pollerPromise]);
       if (winner.kind === "poll") {
         if (!winner.value) {
-          throw { source: "poll" as const, error: new Error(ASSISTANT_POLL_TIMEOUT_ERROR) };
+          evaluation = await evaluationPromise;
+        } else {
+          logger("Captured assistant response via snapshot watchdog");
+          evaluationPromise.catch(() => undefined);
+          await terminateRuntimeExecution(Runtime);
+          return winner.value;
         }
-        logger("Captured assistant response via snapshot watchdog");
-        evaluationPromise.catch(() => undefined);
-        await terminateRuntimeExecution(Runtime);
-        return winner.value;
+      } else if (winner.kind === "poll_error") {
+        if (
+          winner.error instanceof Error &&
+          winner.error.message === ASSISTANT_POLL_TIMEOUT_ERROR
+        ) {
+          evaluation = await evaluationPromise;
+        } else {
+          evaluationPromise.catch(() => undefined);
+          await terminateRuntimeExecution(Runtime);
+          throw winner.error ?? new Error("Failed to capture assistant response");
+        }
+      } else {
+        evaluation = winner.value;
       }
-      evaluation = winner.value;
     } catch (wrappedError) {
       if (
         wrappedError &&
@@ -165,15 +242,7 @@ export async function waitForAssistantResponse(
         "error" in wrappedError
       ) {
         const { source, error } = wrappedError as { source: string; error: unknown };
-        if (
-          source === "poll" &&
-          error instanceof Error &&
-          error.message === ASSISTANT_POLL_TIMEOUT_ERROR
-        ) {
-          evaluation = await evaluationPromise;
-        } else if (source === "poll") {
-          throw error;
-        } else if (source === "evaluation") {
+        if (source === "evaluation") {
           const recovered = await recoverAssistantResponse(
             Runtime,
             timeoutMs,
@@ -239,18 +308,11 @@ export async function waitForAssistantResponse(
         isStopButtonVisible(Runtime),
         isCompletionVisible(Runtime, minTurnIndex),
       ]);
-      if (
-        stopVisible ||
-        (!completionVisible &&
-          shouldWaitForStableAssistantTurn({
-            text: candidate.text,
-            html: candidate.html,
-          }))
-      ) {
+      if (stopVisible || !completionVisible) {
         logger(
           stopVisible
             ? "Assistant still generating; waiting for completion"
-            : "Assistant response not yet marked complete; waiting for a stable final turn",
+            : "Assistant response is missing completion markers; waiting for a stable final turn",
         );
         const completed = await awaitPollerResult(remainingMs);
         if (completed) {
@@ -495,9 +557,14 @@ async function pollAssistantCompletion(
   meta: { turnId?: string | null; messageId?: string | null };
 } | null> {
   const watchdogDeadline = Date.now() + timeoutMs;
+  const emptyResponseGraceMs = Math.min(
+    ASSISTANT_EMPTY_RESPONSE_MAX_GRACE_MS,
+    Math.max(ASSISTANT_EMPTY_RESPONSE_MIN_GRACE_MS, Math.floor(timeoutMs * 0.1)),
+  );
   let previousLength = 0;
   let stableCycles = 0;
   let lastChangeAt = Date.now();
+  let emptyAssistantSince: number | null = null;
   while (Date.now() < watchdogDeadline) {
     // Check abort signal to stop polling when another path won the race
     if (abortSignal?.aborted) {
@@ -509,6 +576,11 @@ async function pollAssistantCompletion(
       isStopButtonVisible(Runtime),
       isCompletionVisible(Runtime, minTurnIndex),
     ]);
+    const terminalError = await readAssistantTerminalError(Runtime);
+    if (terminalError) {
+      logger(`Assistant terminated with UI error: ${terminalError}`);
+      throw new Error(terminalError);
+    }
     if (!stopVisible && completionVisible && !normalized) {
       const copied = await captureAssistantCompletionViaCopy(
         Runtime,
@@ -520,6 +592,32 @@ async function pollAssistantCompletion(
         return copied;
       }
     }
+    if (!stopVisible && !normalized) {
+      const emptyAssistantTurn = await isIdleEmptyAssistantTurn(Runtime, minTurnIndex);
+      if (emptyAssistantTurn) {
+        const now = Date.now();
+        if (emptyAssistantSince === null) {
+          emptyAssistantSince = now;
+          logger("Assistant exposed an empty thinking shell; waiting for real answer text");
+        }
+        if (now - emptyAssistantSince >= emptyResponseGraceMs) {
+          const copied = await captureAssistantCompletionViaCopy(
+            Runtime,
+            snapshot,
+            logger,
+            minTurnIndex,
+          );
+          if (copied) {
+            return copied;
+          }
+          throw new Error(ASSISTANT_EMPTY_RESPONSE_ERROR);
+        }
+      } else {
+        emptyAssistantSince = null;
+      }
+    } else {
+      emptyAssistantSince = null;
+    }
     if (normalized) {
       const currentLength = normalized.text.length;
       if (currentLength > previousLength) {
@@ -529,21 +627,16 @@ async function pollAssistantCompletion(
       } else {
         stableCycles += 1;
       }
-      const shortAnswer = currentLength > 0 && currentLength < 16;
-      const mediumAnswer = currentLength >= 16 && currentLength < 40;
-      const longAnswer = currentLength >= 40 && currentLength < 500;
-      // Learned: short answers need a longer stability window or they truncate.
-      // Learned: long streaming responses (esp. thinking models) can pause mid-stream;
-      // use progressively longer windows to avoid truncation (#71).
-      const completionStableTarget = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 6 : 8;
-      const requiredStableCycles = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 8 : 10;
       const stableMs = Date.now() - lastChangeAt;
-      const minStableMs = shortAnswer ? 8000 : mediumAnswer ? 1200 : longAnswer ? 2000 : 3000;
+      const thresholds = getAssistantStabilityThresholds(currentLength, completionVisible);
       // Require stop button to disappear before treating completion as final.
       if (!stopVisible) {
-        const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
+        const stableEnough =
+          stableCycles >= thresholds.requiredStableCycles && stableMs >= thresholds.minStableMs;
         const completionEnough =
-          completionVisible && stableCycles >= completionStableTarget && stableMs >= minStableMs;
+          completionVisible &&
+          stableCycles >= thresholds.completionStableTarget &&
+          stableMs >= thresholds.minStableMs;
         if (completionEnough || stableEnough) {
           return normalized;
         }
@@ -566,6 +659,65 @@ async function isStopButtonVisible(Runtime: ChromeClient["Runtime"]): Promise<bo
     return Boolean(result?.value);
   } catch {
     return false;
+  }
+}
+
+async function readAssistantTerminalError(
+  Runtime: ChromeClient["Runtime"],
+): Promise<string | null> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `(() => {
+        const MAX_TEXT_LENGTH = ${ASSISTANT_TERMINAL_ERROR_MAX_TEXT_LENGTH};
+        const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        const matchesRateLimit = (text) => {
+          if (!text || text.length > MAX_TEXT_LENGTH) {
+            return false;
+          }
+          return (
+            (text.includes('too many requests') &&
+              text.includes('temporarily limited access to your conversations')) ||
+            (text.includes('too many requests') &&
+              text.includes('please wait a few minutes before trying again'))
+          );
+        };
+        const isVisible = (node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+          const style = window.getComputedStyle(node);
+          if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            Number.parseFloat(style.opacity || '1') === 0
+          ) {
+            return false;
+          }
+          const rects = node.getClientRects();
+          return rects.length > 0;
+        };
+        for (const candidate of Array.from(document.body?.querySelectorAll('*') || [])) {
+          if (!(candidate instanceof HTMLElement)) {
+            continue;
+          }
+          if (!isVisible(candidate)) {
+            continue;
+          }
+          if (candidate.closest('${CONVERSATION_TURN_SELECTOR}')) {
+            continue;
+          }
+          const text = normalize(candidate.innerText || candidate.textContent || '');
+          if (matchesRateLimit(text)) {
+            return '${ASSISTANT_RATE_LIMIT_ERROR}';
+          }
+        }
+        return null;
+      })()`,
+      returnByValue: true,
+    });
+    return typeof result?.value === "string" && result.value ? result.value : null;
+  } catch {
+    return null;
   }
 }
 
@@ -594,7 +746,10 @@ async function isCompletionVisible(
           if (testId.includes('assistant')) return true;
           return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
         };
-        const turns = Array.from(document.querySelectorAll('${CONVERSATION_TURN_SELECTOR}'));
+        const turns = Array.from(document.querySelectorAll('${CONVERSATION_TURN_SELECTOR}')).filter(
+          (node) =>
+            !(node instanceof HTMLElement && node.parentElement?.closest('${CONVERSATION_TURN_SELECTOR}')),
+        );
         const hasIndexedTurns = turns.length > 0;
         const resolveTurnIndex = (node) => {
           const turn = node?.closest?.('${CONVERSATION_TURN_SELECTOR}');
@@ -648,6 +803,89 @@ async function isCompletionVisible(
           return true;
         }
         return hasAssistantFinishedActions();
+      })()`,
+      returnByValue: true,
+    });
+    return Boolean(result?.value);
+  } catch {
+    return false;
+  }
+}
+
+async function isIdleEmptyAssistantTurn(
+  Runtime: ChromeClient["Runtime"],
+  minTurnIndex?: number,
+): Promise<boolean> {
+  const minTurnLiteral =
+    typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
+      ? Math.floor(minTurnIndex)
+      : -1;
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `(() => {
+        const MIN_TURN_INDEX = ${minTurnLiteral};
+        const turns = Array.from(document.querySelectorAll('${CONVERSATION_TURN_SELECTOR}')).filter(
+          (node) =>
+            !(node instanceof HTMLElement && node.parentElement?.closest('${CONVERSATION_TURN_SELECTOR}')),
+        );
+        const hasIndexedTurns = turns.length > 0;
+        const resolveTurnIndex = (node) => {
+          const turn = node?.closest?.('${CONVERSATION_TURN_SELECTOR}');
+          if (!turn) return null;
+          const idx = turns.indexOf(turn);
+          return idx >= 0 ? idx : null;
+        };
+        const isAfterMinTurn = (node) => {
+          if (MIN_TURN_INDEX < 0 || !hasIndexedTurns) return true;
+          const idx = resolveTurnIndex(node);
+          return idx !== null && idx >= MIN_TURN_INDEX;
+        };
+        const isAssistantTurn = (node) => {
+          if (!(node instanceof HTMLElement)) return false;
+          const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+          if (turnAttr === 'assistant') return true;
+          const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+          if (role === 'assistant') return true;
+          const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+          if (testId.includes('assistant')) return true;
+          return Boolean(node.querySelector('${ASSISTANT_ROLE_SELECTOR}') || node.querySelector('[data-testid*="assistant"]'));
+        };
+        let lastAssistantTurn = null;
+        for (let i = turns.length - 1; i >= 0; i -= 1) {
+          if (isAssistantTurn(turns[i])) {
+            lastAssistantTurn = turns[i];
+            break;
+          }
+        }
+        if (!lastAssistantTurn || !isAfterMinTurn(lastAssistantTurn)) {
+          return false;
+        }
+        const assistantRoot = lastAssistantTurn.querySelector('${ASSISTANT_ROLE_SELECTOR}') ?? lastAssistantTurn;
+        const assistantText = String(assistantRoot?.innerText || assistantRoot?.textContent || '').trim();
+        if (assistantText) {
+          return false;
+        }
+        const assistantHtml = String(assistantRoot?.outerHTML || lastAssistantTurn.innerHTML || '')
+          .toLowerCase()
+          .trim();
+        const htmlLooksEmpty =
+          assistantHtml.includes('result-thinking') ||
+          /<p\\b[^>]*>\\s*<\\/p>/.test(assistantHtml) ||
+          /data-message-model-slug="gpt-5-[^"]*thinking/.test(assistantHtml);
+        const turnText = String(lastAssistantTurn.innerText || lastAssistantTurn.textContent || '')
+          .toLowerCase()
+          .trim();
+        const stripped = turnText.startsWith('chatgpt said:')
+          ? turnText.slice('chatgpt said:'.length).trim()
+          : turnText;
+        const summaryOnly =
+          stripped === 'thinking' ||
+          /^thought for\\b[^\\n]*$/.test(stripped) ||
+          /^thought for\\b[^\\n]*\\nthinking$/.test(stripped);
+        if (!summaryOnly && !htmlLooksEmpty) {
+          return false;
+        }
+        return true;
       })()`,
       returnByValue: true,
     });
@@ -767,20 +1005,25 @@ function buildAssistantSnapshotExpression(minTurnIndex?: number): string {
         : normalized;
       const summaryOnly =
         stripped === 'thinking' ||
-        stripped.startsWith('thought for') ||
-        (stripped.startsWith('thought for') && stripped.endsWith('thinking'));
+        /^thought for\\b[^\\n]*$/.test(stripped) ||
+        /^thought for\\b[^\\n]*\\nthinking$/.test(stripped);
+      const progressOnly =
+        /^(?:starting|finalizing answer)(?:\\.\\.\\.|…)?$/.test(stripped) ||
+        /^(?:analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\\.\\.\\.|…)?$/.test(stripped);
+      if (progressOnly) return true;
       if (!summaryOnly) return false;
       return (
         html.includes('result-thinking') ||
         (html.includes('data-message-model-slug="gpt-5-') && html.includes('thinking'))
       );
     };
-    if (extracted && extracted.text && !isPlaceholder(extracted)) {
-      return extracted;
+    const extractedCandidate = extracted && extracted.text && !isPlaceholder(extracted) ? extracted : null;
+    if (extractedCandidate) {
+      return extractedCandidate;
     }
     // Fallback for ChatGPT project view: answers can live outside conversation turns.
     const fallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
-    return fallback() ?? extracted;
+    return fallback() ?? null;
   })()`;
 }
 
@@ -816,8 +1059,12 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
         : normalized;
       const summaryOnly =
         stripped === 'thinking' ||
-        stripped.startsWith('thought for') ||
-        (stripped.startsWith('thought for') && stripped.endsWith('thinking'));
+        /^thought for\\b[^\\n]*$/.test(stripped) ||
+        /^thought for\\b[^\\n]*\\nthinking$/.test(stripped);
+      const progressOnly =
+        /^(?:starting|finalizing answer)(?:\\.\\.\\.|…)?$/.test(stripped) ||
+        /^(?:analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\\.\\.\\.|…)?$/.test(stripped);
+      if (progressOnly) return true;
       if (!summaryOnly) return false;
       return (
         html.includes('result-thinking') ||
@@ -856,7 +1103,6 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
     const captureViaObserver = () =>
       new Promise((resolve, reject) => {
         const deadline = Date.now() + ${timeoutMs};
-        let stopInterval = null;
         let timeoutId = null;
         let cleanedUp = false;
         let observer = null;
@@ -865,10 +1111,6 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
         const cleanup = () => {
           if (cleanedUp) return;
           cleanedUp = true;
-          if (stopInterval) {
-            clearInterval(stopInterval);
-            stopInterval = null;
-          }
           if (timeoutId) {
             clearTimeout(timeoutId);
             timeoutId = null;
@@ -912,20 +1154,6 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
         observer = new MutationObserver(observerCallback);
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-        stopInterval = setInterval(() => {
-          if (cleanedUp) return;
-          const stop = document.querySelector(STOP_SELECTOR);
-          if (!stop) {
-            return;
-          }
-          const isStopButton =
-            stop.getAttribute('data-testid') === 'stop-button' || stop.getAttribute('aria-label')?.toLowerCase()?.includes('stop');
-          if (isStopButton) {
-            return;
-          }
-          dispatchClickSequence(stop);
-        }, 500);
-
         timeoutId = setTimeout(() => {
           cleanup();
           reject(new Error('Response timeout'));
@@ -934,7 +1162,24 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
 
     // Check if the last assistant turn has finished (scoped to avoid detecting old turns).
     const isLastAssistantTurnFinished = () => {
-      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
+        (node) => !(node instanceof HTMLElement && node.parentElement?.closest(CONVERSATION_SELECTOR)),
+      );
+      const hasIndexedTurns = turns.length > 0;
+      const resolveTurnIndex = (node) => {
+        if (!(node instanceof HTMLElement)) return null;
+        const turn = node.matches(CONVERSATION_SELECTOR)
+          ? node
+          : node.closest(CONVERSATION_SELECTOR);
+        if (!turn) return null;
+        const idx = turns.indexOf(turn);
+        return idx >= 0 ? idx : null;
+      };
+      const isAfterMinTurn = (node) => {
+        if (MIN_TURN_INDEX < 0 || !hasIndexedTurns) return true;
+        const idx = resolveTurnIndex(node);
+        return idx !== null && idx >= MIN_TURN_INDEX;
+      };
       let lastAssistantTurn = null;
       for (let i = turns.length - 1; i >= 0; i--) {
         if (isAssistantTurn(turns[i])) {
@@ -943,8 +1188,15 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
         }
       }
       if (!lastAssistantTurn) return false;
+      if (!isAfterMinTurn(lastAssistantTurn)) return false;
       // Check for action buttons in this specific turn
-      if (lastAssistantTurn.querySelector(FINISHED_SELECTOR)) return true;
+      if (
+        Array.from(lastAssistantTurn.querySelectorAll(FINISHED_SELECTOR)).some((node) =>
+          isAfterMinTurn(node),
+        )
+      ) {
+        return true;
+      }
       // Check for "Done" text in this turn's markdown
       const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
       return Array.from(markdowns).some((n) => (n.textContent || '').trim() === 'Done');
@@ -958,13 +1210,14 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
       const shortAnswer = initialLength > 0 && initialLength < 16;
       const mediumAnswer = initialLength >= 16 && initialLength < 40;
       const longAnswer = initialLength >= 40 && initialLength < 500;
-      const settleWindowMs = shortAnswer ? 12_000 : mediumAnswer ? 5_000 : longAnswer ? 8_000 : 10_000;
+      const settleWindowMs = shortAnswer ? 12_000 : mediumAnswer ? 8_000 : longAnswer ? 10_000 : 12_000;
       const settleIntervalMs = 400;
       const deadline = Date.now() + settleWindowMs;
       let latest = snapshot;
       let lastLength = snapshot?.text?.length ?? 0;
       let stableCycles = 0;
-      const stableTarget = shortAnswer ? 6 : mediumAnswer ? 3 : longAnswer ? 5 : 6;
+      const stableTarget = shortAnswer ? 12 : mediumAnswer ? 16 : longAnswer ? 20 : 24;
+      let lastChangeAt = Date.now();
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, settleIntervalMs));
         const refreshedRaw = extractFromTurns();
@@ -984,13 +1237,16 @@ function buildResponseObserverExpression(timeoutMs: number, minTurnIndex?: numbe
         if (nextLength > lastLength) {
           lastLength = nextLength;
           stableCycles = 0;
+          lastChangeAt = Date.now();
         } else {
           stableCycles += 1;
         }
         const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
         const finishedVisible = isLastAssistantTurnFinished();
+        const stableMs = Date.now() - lastChangeAt;
+        const minStableMs = shortAnswer ? 8000 : mediumAnswer ? 6000 : longAnswer ? 8000 : 10000;
 
-        if (finishedVisible || (!stopVisible && stableCycles >= stableTarget)) {
+        if (finishedVisible || (!stopVisible && stableCycles >= stableTarget && stableMs >= minStableMs)) {
           break;
         }
       }
@@ -1107,7 +1363,9 @@ function buildAssistantExtractor(functionName: string): string {
       }
     };
 
-    const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+    const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
+      (node) => !(node instanceof HTMLElement && node.parentElement?.closest(CONVERSATION_SELECTOR)),
+    );
     for (let index = turns.length - 1; index >= 0; index -= 1) {
       const turn = turns[index];
       if (!isAssistantTurn(turn)) {
@@ -1204,7 +1462,9 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     }
     if (!root) return null;
     const CONVERSATION_SELECTOR = '${CONVERSATION_TURN_SELECTOR}';
-    const turnNodes = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+    const turnNodes = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
+      (node) => !(node instanceof HTMLElement && node.parentElement?.closest(CONVERSATION_SELECTOR)),
+    );
     const hasTurns = turnNodes.length > 0;
     const resolveTurnIndex = (node) => {
       const turn = node?.closest?.(CONVERSATION_SELECTOR);
@@ -1320,7 +1580,9 @@ function buildCopyExpression(
       const hint = ${JSON.stringify(meta ?? {})};
       const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
       const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
-      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
+        (node) => !(node instanceof HTMLElement && node.parentElement?.closest(CONVERSATION_SELECTOR)),
+      );
       const hasIndexedTurns = turns.length > 0;
       const resolveTurnIndex = (node) => {
         const turn = node?.closest?.(CONVERSATION_SELECTOR);

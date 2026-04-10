@@ -77,6 +77,7 @@ export async function performSessionRun({
   browserDeps,
   muteStdout = false,
 }: SessionRunParams): Promise<void> {
+  let latestBrowserRuntime: BrowserRuntimeMetadata | undefined = sessionMeta.browser?.runtime;
   const writeInline = (chunk: string): boolean => {
     // Keep session logs intact while still echoing inline output to the user.
     write(chunk);
@@ -105,6 +106,7 @@ export async function performSessionRun({
       const runnerDeps = {
         ...browserDeps,
         persistRuntimeHint: async (runtime: BrowserRuntimeMetadata) => {
+          latestBrowserRuntime = runtime;
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
             browser: { config: browserConfig, runtime },
@@ -116,6 +118,7 @@ export async function performSessionRun({
         parentSessionId && parentSessionId !== sessionMeta.id
           ? await sessionStore.readSession(parentSessionId)
           : null;
+      let effectiveParentSession = parentSession;
       if (parentSessionId && parentSessionId !== sessionMeta.id) {
         if (!parentSession) {
           throw new Error(
@@ -124,6 +127,21 @@ export async function performSessionRun({
         }
         if ((parentSession.mode ?? parentSession.options?.mode) !== "browser") {
           throw new Error(`Session ${parentSessionId} is not a browser session.`);
+        }
+        const parentSessionStatus = String(parentSession.status ?? "").toLowerCase();
+        const parentResponseStatus = String(parentSession.response?.status ?? "").toLowerCase();
+        const parentIncompleteReason = parentSession.response?.incompleteReason?.trim() || null;
+        if (
+          parentSessionStatus !== "completed" ||
+          (parentResponseStatus && parentResponseStatus !== "completed") ||
+          parentIncompleteReason
+        ) {
+          const reason = parentIncompleteReason
+            ? `${parentSessionStatus || parentResponseStatus || "incomplete"} (${parentIncompleteReason})`
+            : parentSessionStatus || parentResponseStatus || "incomplete";
+          throw new Error(
+            `Browser follow-up parent session ${parentSessionId} is not reusable yet (${reason}).`,
+          );
         }
         const parentModel = String(
           parentSession.model ?? parentSession.options?.model ?? "",
@@ -134,13 +152,53 @@ export async function performSessionRun({
             "Browser follow-up currently supports ChatGPT/GPT browser sessions only.",
           );
         }
+        const effectiveRuntime =
+          parentSession.browser?.runtime || sessionMeta.browser?.runtime
+            ? {
+                ...(parentSession.browser?.runtime ?? {}),
+                ...(sessionMeta.browser?.runtime ?? {}),
+              }
+            : undefined;
+        const effectiveResponse = sessionMeta.response?.assistantOutput?.trim()
+          ? sessionMeta.response
+          : parentSession.response;
+        effectiveParentSession = {
+          ...parentSession,
+          response: effectiveResponse,
+          browser: {
+            config: sessionMeta.browser?.config ?? parentSession.browser?.config ?? browserConfig,
+            runtime: effectiveRuntime,
+          },
+        };
+        if (effectiveRuntime) {
+          latestBrowserRuntime = effectiveRuntime;
+          await sessionStore.updateSession(sessionMeta.id, {
+            status: "running",
+            browser: {
+              config: browserConfig,
+              runtime: effectiveRuntime,
+            },
+          });
+        }
       }
-      const result = parentSession
+      const result = effectiveParentSession
         ? await continueBrowserSessionExecution(
-            { runOptions, browserConfig, cwd, log, parentSession },
+            { runOptions, browserConfig, cwd, log, parentSession: effectiveParentSession },
             runnerDeps,
           )
         : await runBrowserSessionExecution({ runOptions, browserConfig, cwd, log }, runnerDeps);
+      latestBrowserRuntime = result.runtime ?? latestBrowserRuntime;
+      const attemptedOutputWrite = Boolean(runOptions.writeOutputPath);
+      const savedOutputPath = await writeAssistantOutput(
+        runOptions.writeOutputPath,
+        result.answerText ?? "",
+        log,
+      );
+      const nextOptions = finalizeSessionOutputOptions(
+        sessionMeta.options,
+        savedOutputPath,
+        attemptedOutputWrite,
+      );
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "completed",
@@ -157,11 +215,14 @@ export async function performSessionRun({
           config: browserConfig,
           runtime: result.runtime,
         },
-        response: undefined,
+        options: nextOptions,
+        response: {
+          status: "completed",
+          assistantOutput: result.answerText ?? "",
+        },
         transport: undefined,
         error: undefined,
       });
-      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
       await sendSessionNotification(
         {
           sessionId: sessionMeta.id,
@@ -417,11 +478,20 @@ export async function performSessionRun({
     if (result.mode !== "live") {
       throw new Error("Unexpected preview result while running a session.");
     }
+    const answerText = extractTextOutput(result.response);
+    const attemptedOutputWrite = Boolean(runOptions.writeOutputPath);
+    const savedOutputPath = await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
+    const nextOptions = finalizeSessionOutputOptions(
+      sessionMeta.options,
+      savedOutputPath,
+      attemptedOutputWrite,
+    );
     await sessionStore.updateSession(sessionMeta.id, {
       status: "completed",
       completedAt: new Date().toISOString(),
       usage: result.usage,
       elapsedMs: result.elapsedMs,
+      options: nextOptions,
       response: extractResponseMetadata(result.response),
       transport: undefined,
       error: undefined,
@@ -433,8 +503,6 @@ export async function performSessionRun({
         usage: result.usage,
       });
     }
-    const answerText = extractTextOutput(result.response);
-    await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
     await sendSessionNotification(
       {
         sessionId: sessionMeta.id,
@@ -459,12 +527,20 @@ export async function performSessionRun({
     const assistantTimeout =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "assistant-timeout";
+    const assistantRateLimit =
+      userError?.category === "browser-automation" &&
+      (userError.details as { stage?: string } | undefined)?.stage === "assistant-rate-limit";
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
+    const cloudflareBackendChallenge =
+      userError?.category === "browser-automation" &&
+      (userError.details as { stage?: string } | undefined)?.stage ===
+        "cloudflare-backend-challenge";
     if (connectionLost && mode === "browser") {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
+      latestBrowserRuntime = runtime ?? latestBrowserRuntime;
       log(dim("Chrome disconnected before completion; keeping session running for reattach."));
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -478,7 +554,7 @@ export async function performSessionRun({
         mode,
         browser: {
           config: browserConfig,
-          runtime: runtime ?? sessionMeta.browser?.runtime,
+          runtime: runtime ?? latestBrowserRuntime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
       });
@@ -487,6 +563,7 @@ export async function performSessionRun({
     if (assistantTimeout && mode === "browser") {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
+      latestBrowserRuntime = runtime ?? latestBrowserRuntime;
       log(dim("Assistant response timed out; keeping session running for reattach."));
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -500,13 +577,13 @@ export async function performSessionRun({
         mode,
         browser: {
           config: browserConfig,
-          runtime: runtime ?? sessionMeta.browser?.runtime,
+          runtime: runtime ?? latestBrowserRuntime,
         },
         response: { status: "running", incompleteReason: "assistant-timeout" },
       });
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       if (autoReattachIntervalMs > 0) {
-        const autoRuntime = runtime ?? sessionMeta.browser?.runtime;
+        const autoRuntime = runtime ?? latestBrowserRuntime;
         const success = await autoReattachUntilComplete({
           sessionMeta,
           runtime: autoRuntime ?? undefined,
@@ -523,6 +600,13 @@ export async function performSessionRun({
       log(dim(`Reattach later with: oracle session ${sessionMeta.id}`));
       return;
     }
+    if (assistantRateLimit && mode === "browser") {
+      log(
+        dim(
+          "ChatGPT temporarily rate-limited this browser profile; wait a few minutes before retrying.",
+        ),
+      );
+    }
     if (cloudflareChallenge && mode === "browser") {
       const details = userError.details as { reuseProfileHint?: string } | undefined;
       if (details?.reuseProfileHint) {
@@ -537,6 +621,13 @@ export async function performSessionRun({
           ),
         );
       }
+    }
+    if (cloudflareBackendChallenge && mode === "browser") {
+      log(
+        dim(
+          "Cloudflare is challenging ChatGPT backend API requests in this browser runtime; Oracle cannot submit prompts or capture replies here.",
+        ),
+      );
     }
     if (userError) {
       log(dim(`User error (${userError.category}): ${userError.message}`));
@@ -554,7 +645,8 @@ export async function performSessionRun({
     }
     const browserRuntime =
       mode === "browser"
-        ? (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime
+        ? ((userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime ??
+          latestBrowserRuntime)
         : undefined;
     await sessionStore.updateSession(sessionMeta.id, {
       status: "error",
@@ -646,6 +738,23 @@ async function writeAssistantOutput(
   }
 }
 
+function finalizeSessionOutputOptions(
+  options: SessionMetadata["options"],
+  savedOutputPath: string | undefined,
+  attemptedOutputWrite: boolean,
+): SessionMetadata["options"] {
+  if (!options && !savedOutputPath && !attemptedOutputWrite) {
+    return {};
+  }
+  const next = { ...(options ?? {}) };
+  if (savedOutputPath) {
+    next.writeOutputPath = savedOutputPath;
+  } else if (attemptedOutputWrite) {
+    delete next.writeOutputPath;
+  }
+  return next;
+}
+
 async function autoReattachUntilComplete({
   sessionMeta,
   runtime,
@@ -676,7 +785,7 @@ async function autoReattachUntilComplete({
     Math.max(0, browserConfig.autoReattachTimeoutMs ?? 0) ||
     Math.max(0, browserConfig.timeoutMs ?? 0) ||
     120_000;
-  const maxTotalMs = 2 * 60 * 60 * 1000; // 2h hard cap; avoid infinite polling by default.
+  const maxTotalMs = timeoutMs;
   const maxDeadline = Date.now() + maxTotalMs;
 
   if (delayMs > 0) {
@@ -691,6 +800,7 @@ async function autoReattachUntilComplete({
     }
   }) as BrowserLogger;
   logger.verbose = true;
+  let currentRuntime = runtime;
 
   let attempt = 0;
   for (;;) {
@@ -708,13 +818,25 @@ async function autoReattachUntilComplete({
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
-        timeoutMs,
+        timeoutMs: Math.min(timeoutMs, remainingBudgetMs),
       };
-      const result = await resumeBrowserSession(runtime, reattachConfig, logger, {
+      const result = await resumeBrowserSession(currentRuntime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
       });
+      currentRuntime = result.runtime ?? currentRuntime;
       const answerText = result.answerMarkdown || result.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
+      const attemptedOutputWrite = Boolean(runOptions.writeOutputPath);
+      const savedOutputPath = await writeAssistantOutput(
+        runOptions.writeOutputPath,
+        answerText,
+        log,
+      );
+      const nextOptions = finalizeSessionOutputOptions(
+        sessionMeta.options,
+        savedOutputPath,
+        attemptedOutputWrite,
+      );
       const logWriter = sessionStore.createLogWriter(sessionMeta.id);
       logWriter.logLine(`[auto-reattach] captured assistant response on attempt ${attempt}`);
       logWriter.logLine("Answer:");
@@ -743,13 +865,16 @@ async function autoReattachUntilComplete({
         },
         browser: {
           config: browserConfig,
-          runtime,
+          runtime: currentRuntime,
         },
-        response: { status: "completed" },
+        options: nextOptions,
+        response: {
+          status: "completed",
+          assistantOutput: answerText,
+        },
         error: undefined,
         transport: undefined,
       });
-      await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
       await sendSessionNotification(
         {
           sessionId: sessionMeta.id,
@@ -769,6 +894,13 @@ async function autoReattachUntilComplete({
       log(kleur.green("Auto-reattach succeeded; session marked completed."));
       return true;
     } catch (error) {
+      const userError = asOracleUserError(error);
+      if (
+        userError?.category === "browser-automation" &&
+        (userError.details as { stage?: string } | undefined)?.stage === "assistant-rate-limit"
+      ) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
     }

@@ -1,5 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
 import { __test__, runSupervisorBrokerRequest } from "../../src/cli/supervisorBroker.js";
+import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import { sessionStore } from "../../src/sessionStore.js";
 
 describe("runSupervisorBrokerRequest", () => {
   test("defaults to run_prompt operation for legacy requests", async () => {
@@ -268,6 +273,276 @@ describe("runSupervisorBrokerRequest", () => {
       "close",
       "stop",
       "hide",
+    ]);
+  });
+
+  test("syncSupervisorRuntimeSession persists the active chrome target for a broker thread", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-broker-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const meta = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(meta.id, {
+        browser: {
+          config: undefined,
+          runtime: {
+            chromePid: 1234,
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "stale-target",
+            tabUrl: "https://chatgpt.com/c/stale-thread",
+            conversationId: "stale-thread",
+          },
+        },
+      });
+
+      await __test__.syncSupervisorRuntimeSession(
+        meta.id,
+        {
+          title: "Fresh thread",
+          url: "https://chatgpt.com/c/fresh-thread",
+          conversationId: "fresh-thread",
+        },
+        "fresh-target",
+      );
+
+      const updated = await sessionStore.readSession(meta.id);
+      expect(updated?.browser?.runtime?.chromeTargetId).toBe("fresh-target");
+      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/fresh-thread");
+      expect(updated?.browser?.runtime?.conversationId).toBe("fresh-thread");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("createSupervisorThreadSession returns a fresh per-thread session id", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-thread-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const runtimeSession = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          search: true,
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(runtimeSession.id, {
+        status: "completed",
+        browser: {
+          config: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          runtime: {
+            chromePid: 1234,
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "stale-target",
+            tabUrl: "https://chatgpt.com/c/stale-thread",
+            conversationId: "stale-thread",
+          },
+        },
+      });
+
+      const threadSessionId = await __test__.createSupervisorThreadSession(
+        runtimeSession.id,
+        {
+          title: "Fresh thread",
+          url: "https://chatgpt.com/g/team-space-oracle/c/fresh-thread",
+          conversationId: "fresh-thread",
+        },
+        "fresh-target",
+      );
+
+      expect(threadSessionId).not.toBe(runtimeSession.id);
+
+      const updatedRuntime = await sessionStore.readSession(runtimeSession.id);
+      expect(updatedRuntime?.browser?.runtime?.chromeTargetId).toBe("stale-target");
+      expect(updatedRuntime?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/stale-thread");
+      expect(updatedRuntime?.browser?.runtime?.conversationId).toBe("stale-thread");
+
+      const threadSession = await sessionStore.readSession(threadSessionId);
+      expect(threadSession?.status).toBe("completed");
+      expect(threadSession?.options.followupSessionId).toBe(runtimeSession.id);
+      expect(threadSession?.browser?.runtime?.chromeTargetId).toBe("fresh-target");
+      expect(threadSession?.browser?.runtime?.tabUrl).toBe(
+        "https://chatgpt.com/g/team-space-oracle/c/fresh-thread",
+      );
+      expect(threadSession?.browser?.runtime?.conversationId).toBe("fresh-thread");
+      expect(threadSession?.promptPreview).toContain("Fresh thread");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("createAndSyncSupervisorThreadSession updates the parent runtime before returning the thread session", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-thread-sync-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const runtimeSession = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          search: true,
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(runtimeSession.id, {
+        status: "completed",
+        browser: {
+          config: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          runtime: {
+            chromePid: 1234,
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "stale-target",
+            tabUrl: "https://chatgpt.com/g/team-space-oracle/c/stale-thread",
+            conversationId: "stale-thread",
+          },
+        },
+      });
+
+      const threadSessionId = await __test__.createAndSyncSupervisorThreadSession(
+        runtimeSession.id,
+        {
+          title: "Fresh thread",
+          url: "https://chatgpt.com/g/team-space-oracle/c/fresh-thread",
+          conversationId: "fresh-thread",
+        },
+        "fresh-target",
+      );
+
+      expect(threadSessionId).not.toBe(runtimeSession.id);
+
+      const updatedRuntime = await sessionStore.readSession(runtimeSession.id);
+      expect(updatedRuntime?.browser?.runtime?.chromeTargetId).toBe("fresh-target");
+      expect(updatedRuntime?.browser?.runtime?.tabUrl).toBe(
+        "https://chatgpt.com/g/team-space-oracle/c/fresh-thread",
+      );
+      expect(updatedRuntime?.browser?.runtime?.conversationId).toBe("fresh-thread");
+
+      const threadSession = await sessionStore.readSession(threadSessionId);
+      expect(threadSession?.status).toBe("completed");
+      expect(threadSession?.options.followupSessionId).toBe(runtimeSession.id);
+      expect(threadSession?.browser?.runtime?.chromeTargetId).toBe("fresh-target");
+      expect(threadSession?.browser?.runtime?.tabUrl).toBe(
+        "https://chatgpt.com/g/team-space-oracle/c/fresh-thread",
+      );
+      expect(threadSession?.browser?.runtime?.conversationId).toBe("fresh-thread");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("createSupervisorThreadSession rejects threads outside the configured project scope", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-thread-scope-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const runtimeSession = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(runtimeSession.id, {
+        status: "completed",
+        browser: {
+          config: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          runtime: {
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            tabUrl: "https://chatgpt.com/g/team-space-oracle/c/stale-thread",
+            conversationId: "stale-thread",
+          },
+        },
+      });
+
+      await expect(
+        __test__.createSupervisorThreadSession(
+          runtimeSession.id,
+          {
+            title: "Root thread",
+            url: "https://chatgpt.com/c/root-thread",
+            conversationId: "root-thread",
+          },
+          "fresh-target",
+        ),
+      ).rejects.toThrow("outside the configured project scope");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("filterSupervisorThreadsForBrokerProjectScope drops in-scope guesses that lack a URL", () => {
+    expect(
+      __test__.filterSupervisorThreadsForBrokerProjectScope(
+        [
+          {
+            title: "Sidebar id only",
+            conversationId: "thread-from-sidebar",
+          },
+          {
+            title: "Scoped thread",
+            url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+            conversationId: "right-thread",
+          },
+          {
+            title: "Root chat",
+            url: "https://chatgpt.com/c/root-thread",
+            conversationId: "root-thread",
+          },
+        ],
+        "https://chatgpt.com/g/team-space/project",
+      ),
+    ).toEqual([
+      {
+        title: "Scoped thread",
+        url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        conversationId: "right-thread",
+      },
     ]);
   });
 });

@@ -51,6 +51,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
     const options: BrowserDefaultsOptions = {};
     const config: UserConfig = {
       browser: {
+        launcher: "carbonyl",
         chromePath: "/Applications/Comet.app/Contents/MacOS/Comet",
         chromeProfile: "Work",
         chromeCookiePath: "/tmp/cookies",
@@ -66,6 +67,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
 
     applyBrowserDefaultsFromConfig(options, config, (_key) => "default");
 
+    expect(options.browserLauncher).toBe("carbonyl");
     expect(options.browserChromePath).toBe("/Applications/Comet.app/Contents/MacOS/Comet");
     expect(options.browserChromeProfile).toBe("Work");
     expect(options.browserCookiePath).toBe("/tmp/cookies");

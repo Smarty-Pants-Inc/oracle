@@ -11,7 +11,7 @@ import {
   parseDuration,
 } from "../browserMode.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
-import type { BrowserModelStrategy } from "../browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy } from "../browser/types.js";
 import type { CookieParam } from "../browser/types.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 
@@ -40,6 +40,7 @@ const BROWSER_MODEL_LABELS: [ModelName, string][] = [
 ];
 
 export interface BrowserFlagOptions {
+  browserLauncher?: BrowserLauncher;
   browserChromeProfile?: string;
   browserChromePath?: string;
   browserCookiePath?: string;
@@ -108,6 +109,8 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
 export async function buildBrowserConfig(
   options: BrowserFlagOptions,
 ): Promise<BrowserSessionConfig> {
+  const launcher = options.browserLauncher;
+  const isCarbonyl = launcher === "carbonyl";
   const desiredModelOverride = options.browserModelLabel?.trim();
   const normalizedOverride = desiredModelOverride?.toLowerCase() ?? "";
   const baseModel = options.model.toLowerCase();
@@ -161,6 +164,7 @@ export async function buildBrowserConfig(
   }
 
   return {
+    launcher,
     chromeProfile: options.browserChromeProfile ?? DEFAULT_CHROME_PROFILE,
     chromePath: options.browserChromePath ?? null,
     chromeCookiePath: options.browserCookiePath ?? null,
@@ -201,11 +205,15 @@ export async function buildBrowserConfig(
     cookieNames,
     inlineCookies: inline?.cookies,
     inlineCookiesSource: inline?.source ?? null,
-    headless: options.browserHeadless ? true : undefined,
+    headless: isCarbonyl ? false : options.browserHeadless ? true : undefined,
     keepBrowser: options.browserKeepBrowser ? true : undefined,
-    manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
-    manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
-    hideWindow: options.browserHideWindow ? true : undefined,
+    manualLogin: isCarbonyl
+      ? false
+      : options.browserManualLogin === undefined
+        ? undefined
+        : options.browserManualLogin,
+    manualLoginProfileDir: isCarbonyl ? null : (options.browserManualLoginProfileDir ?? undefined),
+    hideWindow: isCarbonyl ? false : options.browserHideWindow ? true : undefined,
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,

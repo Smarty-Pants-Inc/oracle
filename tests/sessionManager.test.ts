@@ -59,6 +59,12 @@ describe("session identifiers", () => {
     const id = sessionModule.createSessionId("abcdefghijklm nopqrstuvwxyz shorty");
     expect(id).toBe("abcdefghij-nopqrstuvw-shorty");
   });
+
+  test("sanitizeSessionSlugBase strips traversal characters from a base slug override", () => {
+    expect(sessionModule.sanitizeSessionSlugBase("../Team Sync/../../prod-session")).toBe(
+      "team-sync-prod-session",
+    );
+  });
 });
 
 describe("session lifecycle", () => {
@@ -160,6 +166,23 @@ describe("session lifecycle", () => {
       first.id,
     );
     expect(restarted.id).toBe("alpha-beta-gamma-2");
+  });
+
+  test("initializeSession sanitizes traversal input in base slug overrides", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Escaped", model: "gpt-5.2-pro" },
+      "/tmp/cwd",
+      undefined,
+      "../Team Sync/../../prod-session",
+    );
+
+    expect(meta.id).toBe("team-sync-prod-session");
+    expect(path.dirname(path.join(sessionModule.getSessionsDir(), meta.id))).toBe(
+      sessionModule.getSessionsDir(),
+    );
+    await expect(
+      stat(path.join(sessionModule.getSessionsDir(), "team-sync-prod-session")),
+    ).resolves.toBeDefined();
   });
 
   test("marks stale running sessions as zombies after 60 minutes", async () => {

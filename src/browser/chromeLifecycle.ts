@@ -2,6 +2,7 @@ import { rm } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import net from "node:net";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import CDP from "chrome-remote-interface";
@@ -9,10 +10,35 @@ import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import { cleanupStaleProfileState } from "./profileState.js";
 import { delay } from "./utils.js";
+import { launchCarbonyl } from "./carbonylLifecycle.js";
 
 const execFileAsync = promisify(execFile);
-const CHROME_APP_NAMES = new Set(["Google Chrome", "Chromium"]);
-const DEFAULT_FOCUS_GUARD_WINDOW_MS = 3_000;
+const DEFAULT_FOCUS_GUARD_WINDOW_MS: number | null = null;
+const DEFAULT_CHROME_LAUNCH_TIMEOUT_MS = 30_000;
+const DEFAULT_CHROME_LAUNCH_POLL_MS = 250;
+const DEFAULT_CDP_CONNECT_TIMEOUT_MS = 15_000;
+
+async function withCdpConnectTimeout<T>(
+  task: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeoutId: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      task,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
 
 export interface FrontmostProcessTarget {
   name: string;
@@ -27,23 +53,49 @@ export async function launchChrome(
   const connectHost = resolveRemoteDebugHost();
   const debugBindAddress = connectHost && connectHost !== "127.0.0.1" ? "0.0.0.0" : connectHost;
   const debugPort = config.debugPort ?? parseDebugPortEnv();
-  const chromeFlags = buildChromeFlags(config.headless ?? false, debugBindAddress);
+  const backgroundLaunch = shouldUseMacOsBackgroundLaunch(config);
+  const chromeFlags = buildChromeFlags(config.headless ?? false, debugBindAddress, {
+    startWithoutWindow: backgroundLaunch,
+  });
+  if (config.launcher === "carbonyl") {
+    return launchCarbonyl(
+      {
+        chromePath: config.chromePath,
+        chromeFlags,
+        debugPort,
+        host: connectHost ?? "127.0.0.1",
+        // Keep Carbonyl aligned with the normal Chrome path: start on a blank page,
+        // then let Oracle seed cookies and navigate to ChatGPT explicitly.
+        url: "about:blank",
+        userDataDir,
+      },
+      logger,
+    );
+  }
   const usePatchedLauncher = Boolean(connectHost && connectHost !== "127.0.0.1");
-  const launcher = usePatchedLauncher
-    ? await launchWithCustomHost({
+  const launcher = backgroundLaunch
+    ? await launchBackgroundChromeOnMac({
         chromeFlags,
         chromePath: config.chromePath ?? undefined,
         userDataDir,
         host: connectHost ?? "127.0.0.1",
         requestedPort: debugPort ?? undefined,
       })
-    : await launch({
-        chromePath: config.chromePath ?? undefined,
-        chromeFlags,
-        userDataDir,
-        handleSIGINT: false,
-        port: debugPort ?? undefined,
-      });
+    : usePatchedLauncher
+      ? await launchWithCustomHost({
+          chromeFlags,
+          chromePath: config.chromePath ?? undefined,
+          userDataDir,
+          host: connectHost ?? "127.0.0.1",
+          requestedPort: debugPort ?? undefined,
+        })
+      : await launch({
+          chromePath: config.chromePath ?? undefined,
+          chromeFlags,
+          userDataDir,
+          handleSIGINT: false,
+          port: debugPort ?? undefined,
+        });
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
   logger(`Launched Chrome${pidLabel} on port ${launcher.port}${hostLabel}`);
@@ -142,7 +194,10 @@ export async function hideChromeWindow(
     logger("Unable to hide window: missing Chrome PID");
     return;
   }
-  const shouldRestore = restoreTarget ? await isProcessFrontmost(chrome.pid, logger) : false;
+  const normalizedRestoreTarget = normalizeRestorableTarget(restoreTarget);
+  const shouldRestore = normalizedRestoreTarget
+    ? await isProcessFrontmost(chrome.pid, logger)
+    : false;
   const script = `tell application "System Events"
     try
       set visible of (first process whose unix id is ${chrome.pid}) to false
@@ -151,8 +206,8 @@ export async function hideChromeWindow(
   try {
     await execFileAsync("osascript", ["-e", script]);
     logger("Chrome window hidden (Cmd-H)");
-    if (shouldRestore && restoreTarget) {
-      await restoreFrontmostApplication(restoreTarget, logger);
+    if (shouldRestore && normalizedRestoreTarget) {
+      await restoreFrontmostApplication(normalizedRestoreTarget, logger);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -204,7 +259,7 @@ export async function captureFrontmostApplication(logger: BrowserLogger): Promis
 
 async function isProcessFrontmost(pid: number, logger: BrowserLogger): Promise<boolean> {
   const frontmost = await captureFrontmostProcess(logger);
-  return frontmost?.pid === pid || isChromeProcess(frontmost?.name);
+  return matchesChromeProcess(frontmost, pid);
 }
 
 export function startChromeFocusGuard(
@@ -212,19 +267,22 @@ export function startChromeFocusGuard(
   logger: BrowserLogger,
   restoreTargetInput?: FrontmostProcessTarget | string | null,
   intervalMs = 250,
-  maxDurationMs = DEFAULT_FOCUS_GUARD_WINDOW_MS,
+  maxDurationMs: number | null = DEFAULT_FOCUS_GUARD_WINDOW_MS,
 ): () => void {
   if (process.platform !== "darwin" || !chrome.pid) {
     return () => {};
   }
-  if (maxDurationMs <= 0) {
+  if (typeof maxDurationMs === "number" && maxDurationMs <= 0) {
     return () => {};
   }
 
   let stopped = false;
   let inFlight = false;
   let restoreTarget = normalizeRestorableTarget(restoreTargetInput);
-  const deadline = Date.now() + maxDurationMs;
+  const deadline =
+    typeof maxDurationMs === "number" && Number.isFinite(maxDurationMs)
+      ? Date.now() + maxDurationMs
+      : null;
   const stop = () => {
     if (stopped) {
       return;
@@ -236,17 +294,17 @@ export function startChromeFocusGuard(
     if (stopped || inFlight) {
       return;
     }
-    if (Date.now() >= deadline) {
+    if (deadline !== null && Date.now() >= deadline) {
       stop();
       return;
     }
     inFlight = true;
     try {
       const frontmost = await captureFrontmostProcess(logger);
-      const targetIsFrontmost = frontmost?.pid === chrome.pid || isChromeProcess(frontmost?.name);
+      const targetIsFrontmost = matchesChromeProcess(frontmost, chrome.pid);
       if (!targetIsFrontmost) {
         const latestRestoreTarget = normalizeRestorableTarget(frontmost);
-        if (latestRestoreTarget) {
+        if (latestRestoreTarget && !isChromeProcessName(latestRestoreTarget.name)) {
           restoreTarget = latestRestoreTarget;
         }
       }
@@ -308,13 +366,13 @@ function normalizeRestorableTarget(
 ): FrontmostProcessTarget | null {
   if (typeof target === "string") {
     const name = target.trim();
-    if (!name) {
+    if (!name || isChromeProcessName(name)) {
       return null;
     }
     return { name, pid: null };
   }
   const name = target?.name?.trim();
-  if (!name) {
+  if (!name || isChromeProcessName(name)) {
     return null;
   }
   const pid = target?.pid;
@@ -324,9 +382,19 @@ function normalizeRestorableTarget(
   };
 }
 
-function isChromeProcess(name?: string | null): boolean {
-  const normalized = name?.trim();
-  return Boolean(normalized && CHROME_APP_NAMES.has(normalized));
+function matchesChromeProcess(
+  processTarget: FrontmostProcessTarget | null | undefined,
+  pid: number | null | undefined,
+): boolean {
+  if (!Number.isFinite(pid) || (pid ?? 0) <= 0) {
+    return false;
+  }
+  return processTarget?.pid === pid;
+}
+
+function isChromeProcessName(name?: string | null): boolean {
+  const normalized = name?.trim().toLowerCase();
+  return normalized === "google chrome" || normalized === "chromium";
 }
 
 export async function connectToChrome(
@@ -334,7 +402,12 @@ export async function connectToChrome(
   logger: BrowserLogger,
   host?: string,
 ): Promise<ChromeClient> {
-  const client = await CDP({ port, host });
+  const effectiveHost = host ?? "127.0.0.1";
+  const client = await withCdpConnectTimeout(
+    CDP({ port, host: effectiveHost }) as Promise<ChromeClient>,
+    DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+    `Timed out connecting to Chrome DevTools at ${effectiveHost}:${port}.`,
+  );
   logger("Connected to Chrome DevTools protocol");
   return client;
 }
@@ -347,13 +420,15 @@ export async function connectToRemoteChrome(
   browserWSEndpoint?: string,
   options?: {
     approvalWaitMs?: number;
+    closeTargetOnDispose?: boolean;
   },
 ): Promise<RemoteChromeConnection> {
+  const closeTargetOnDispose = options?.closeTargetOnDispose ?? true;
   if (browserWSEndpoint) {
     return await connectToRemoteChromeTarget(host, port, logger, {
       browserWSEndpoint,
       targetUrl: targetUrl ?? "about:blank",
-      closeTargetOnDispose: true,
+      closeTargetOnDispose,
       approvalWaitMs: options?.approvalWaitMs,
     });
   }
@@ -373,7 +448,9 @@ export async function connectToRemoteChrome(
         targetId: targetConnection.targetId,
         close: async () => {
           await targetConnection.client.close().catch(() => undefined);
-          await closeRemoteChromeTarget(host, port, targetConnection.targetId, logger);
+          if (closeTargetOnDispose) {
+            await closeRemoteChromeTarget(host, port, targetConnection.targetId, logger);
+          }
         },
       };
     }
@@ -418,6 +495,7 @@ export interface RemoteChromeConnection {
 export interface IsolatedTabConnection {
   client: ChromeClient;
   targetId?: string;
+  browserWSEndpoint?: string;
 }
 
 interface TargetConnectMessages {
@@ -429,8 +507,34 @@ interface TargetConnectMessages {
 
 export interface RemoteTargetInfo {
   targetId?: string;
+  id?: string;
   type?: string;
   url?: string;
+}
+
+interface BrowserVersionInfo {
+  webSocketDebuggerUrl?: string;
+}
+
+function normalizeRemoteTargetInfo(target: RemoteTargetInfo): RemoteTargetInfo {
+  return {
+    ...target,
+    targetId: target.targetId ?? target.id,
+  };
+}
+
+async function getBrowserWebSocketDebuggerUrl(
+  host: string,
+  port: number,
+): Promise<string | undefined> {
+  const response = await fetch(`http://${host}:${port}/json/version`);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const version = (await response.json()) as BrowserVersionInfo;
+  return typeof version.webSocketDebuggerUrl === "string"
+    ? version.webSocketDebuggerUrl
+    : undefined;
 }
 
 export async function listRemoteChromeTargets(options: {
@@ -440,16 +544,22 @@ export async function listRemoteChromeTargets(options: {
 }): Promise<RemoteTargetInfo[]> {
   if (!options.browserWSEndpoint) {
     const targets = await CDP.List({ host: options.host, port: options.port });
-    return targets as unknown as RemoteTargetInfo[];
+    return (targets as unknown as RemoteTargetInfo[]).map(normalizeRemoteTargetInfo);
   }
-  const browser = await CDP({ target: options.browserWSEndpoint, local: true });
+  const browser = await withCdpConnectTimeout(
+    CDP({ target: options.browserWSEndpoint, local: true }) as Promise<ChromeClient>,
+    DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+    `Timed out connecting to Chrome DevTools browser websocket at ${options.host}:${options.port} while listing targets.`,
+  );
   try {
     const result = await browser.Target.getTargets();
-    return (result.targetInfos ?? []).map((target) => ({
-      targetId: target.targetId,
-      type: target.type,
-      url: target.url,
-    }));
+    return (result.targetInfos ?? []).map((target) =>
+      normalizeRemoteTargetInfo({
+        targetId: target.targetId,
+        type: target.type,
+        url: target.url,
+      }),
+    );
   } finally {
     await browser.close().catch(() => undefined);
   }
@@ -465,10 +575,20 @@ export async function connectToRemoteChromeTarget(
     browserWSEndpoint?: string;
     closeTargetOnDispose?: boolean;
     approvalWaitMs?: number;
+    createTargetOptions?: {
+      background?: boolean;
+      hidden?: boolean;
+      focus?: boolean;
+    };
   },
 ): Promise<RemoteChromeConnection> {
   if (!options.browserWSEndpoint) {
-    const client = await CDP({ host, port, target: options.targetId });
+    const targetLabel = options.targetId ?? "default";
+    const client = await withCdpConnectTimeout(
+      CDP({ host, port, target: options.targetId }) as Promise<ChromeClient>,
+      DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+      `Timed out connecting to Chrome DevTools target ${targetLabel} at ${host}:${port}.`,
+    );
     return {
       client,
       targetId: options.targetId,
@@ -488,13 +608,37 @@ export async function connectToRemoteChromeTarget(
   let targetId = options.targetId;
   try {
     if (!targetId) {
-      const created = await browser.Target.createTarget({
-        url: options.targetUrl ?? "about:blank",
-      });
+      const created = await withCdpConnectTimeout(
+        browser.Target.createTarget({
+          url: options.targetUrl ?? "about:blank",
+          ...options.createTargetOptions,
+        }),
+        DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+        `Timed out creating a remote Chrome target at ${host}:${port}.`,
+      );
       targetId = created.targetId;
       logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
     }
-    const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
+    if (targetId && typeof browser.Target.getTargetInfo === "function") {
+      try {
+        const targetInfo = await withCdpConnectTimeout(
+          browser.Target.getTargetInfo({ targetId }),
+          DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+          `Timed out verifying remote Chrome target ${targetId} at ${host}:${port}.`,
+        );
+        if (!targetInfo?.targetInfo) {
+          throw new Error("missing target info");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Remote Chrome target ${targetId} is unavailable: ${message}`);
+      }
+    }
+    const attached = await withCdpConnectTimeout(
+      browser.Target.attachToTarget({ targetId, flatten: true }),
+      DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+      `Timed out attaching to remote Chrome target ${targetId ?? "unknown"} at ${host}:${port}.`,
+    );
     const client = createSessionBoundChromeClient(browser, attached.sessionId);
     return {
       client,
@@ -524,8 +668,14 @@ async function connectToBrowserWebSocket(
   approvalWaitMs?: number,
 ): Promise<ChromeClient> {
   const connectPromise = CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>;
+  const timeoutMs =
+    approvalWaitMs && approvalWaitMs > 0 ? approvalWaitMs : DEFAULT_CDP_CONNECT_TIMEOUT_MS;
   if (!approvalWaitMs || approvalWaitMs <= 0) {
-    return await connectPromise;
+    return await withCdpConnectTimeout(
+      connectPromise,
+      timeoutMs,
+      `Timed out connecting to Chrome DevTools browser websocket at ${host}:${port}.`,
+    );
   }
 
   logger(`Waiting for Chrome remote debugging approval for ${host}:${port}...`);
@@ -538,10 +688,10 @@ async function connectToBrowserWebSocket(
         timeoutId = setTimeout(() => {
           reject(
             new Error(
-              `Oracle waited ${formatApprovalWait(approvalWaitMs)} for Chrome remote debugging approval at ${host}:${port}. Allow the Chrome prompt or retry after toggling remote debugging.`,
+              `Oracle waited ${formatApprovalWait(timeoutMs)} for Chrome remote debugging approval at ${host}:${port}. Allow the Chrome prompt or retry after toggling remote debugging.`,
             ),
           );
-        }, approvalWaitMs);
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -650,15 +800,117 @@ function createSessionBoundChromeClient(browser: ChromeClient, sessionId: string
   } as ChromeClient;
 }
 
+function withConnectionClose(client: ChromeClient, close: () => Promise<void>): ChromeClient {
+  return Object.assign(client, {
+    close,
+  });
+}
+
 export async function connectWithNewTab(
   port: number,
   logger: BrowserLogger,
   initialUrl?: string,
   host?: string,
-  options?: { fallbackToDefault?: boolean; retries?: number; retryDelayMs?: number },
+  options?: {
+    fallbackToDefault?: boolean;
+    retries?: number;
+    retryDelayMs?: number;
+    preferDefaultTarget?: boolean;
+    hiddenTarget?: boolean;
+    closeTargetOnDispose?: boolean;
+  },
 ): Promise<IsolatedTabConnection> {
   const effectiveHost = host ?? "127.0.0.1";
   const url = initialUrl ?? "about:blank";
+  const closeTargetOnDispose = options?.closeTargetOnDispose ?? true;
+  if (options?.hiddenTarget) {
+    const failClosed = (message: string) =>
+      new Error(
+        `Failed to open hidden browser target (${message}); refusing to attach to a visible target.`,
+      );
+    try {
+      const browserWSEndpoint = await getBrowserWebSocketDebuggerUrl(effectiveHost, port);
+      if (!browserWSEndpoint) {
+        throw new Error("missing browser websocket endpoint");
+      }
+      logger("Opening hidden browser target via browser websocket endpoint.");
+      let connection: RemoteChromeConnection;
+      try {
+        connection = await connectToRemoteChromeTarget(effectiveHost, port, logger, {
+          browserWSEndpoint,
+          targetUrl: url,
+          closeTargetOnDispose,
+          createTargetOptions: {
+            background: true,
+            hidden: true,
+            focus: false,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.toLowerCase().includes("hidden target")) {
+          throw failClosed(message);
+        }
+        logger(
+          `Hidden browser target unsupported (${message}); retrying with a dedicated background target in the Oracle hidden browser.`,
+        );
+        try {
+          connection = await connectToRemoteChromeTarget(effectiveHost, port, logger, {
+            browserWSEndpoint,
+            targetUrl: url,
+            closeTargetOnDispose,
+            createTargetOptions: {
+              background: true,
+              focus: false,
+            },
+          });
+        } catch (fallbackError) {
+          const fallbackMessage =
+            fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          throw failClosed(`${message}; background target retry failed: ${fallbackMessage}`);
+        }
+      }
+      return {
+        client: withConnectionClose(connection.client, connection.close),
+        targetId: connection.targetId,
+        browserWSEndpoint: connection.browserWSEndpoint,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw failClosed(message);
+    }
+  }
+  if (options?.preferDefaultTarget) {
+    logger("Skipping isolated browser tab creation; attaching to the default target.");
+    try {
+      const browserWSEndpoint = await getBrowserWebSocketDebuggerUrl(effectiveHost, port);
+      if (browserWSEndpoint) {
+        const targets = await listRemoteChromeTargets({
+          host: effectiveHost,
+          port,
+          browserWSEndpoint,
+        });
+        const target =
+          targets.find((candidate) => candidate.type === "page") ??
+          targets.find((candidate) => candidate.targetId);
+        const connection = await connectToRemoteChromeTarget(effectiveHost, port, logger, {
+          browserWSEndpoint,
+          targetId: target?.targetId,
+          closeTargetOnDispose: false,
+        });
+        return {
+          client: withConnectionClose(connection.client, connection.close),
+          targetId: connection.targetId,
+          browserWSEndpoint: connection.browserWSEndpoint,
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Default-target browser websocket attach unavailable (${message}); using direct CDP.`);
+    }
+    const client = await connectToChrome(port, logger, effectiveHost);
+    return { client };
+  }
   const fallbackToDefault = options?.fallbackToDefault ?? true;
   const retries = Math.max(0, options?.retries ?? 0);
   const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 250);
@@ -677,7 +929,19 @@ export async function connectWithNewTab(
         `Failed to close unused browser tab ${targetId}: ${message}`,
     });
     if (targetConnection) {
-      return targetConnection;
+      const baseClose =
+        typeof targetConnection.client.close === "function"
+          ? targetConnection.client.close.bind(targetConnection.client)
+          : async () => undefined;
+      return {
+        client: withConnectionClose(targetConnection.client, async () => {
+          await baseClose().catch(() => undefined);
+          if (closeTargetOnDispose) {
+            await closeRemoteChromeTarget(effectiveHost, port, targetConnection.targetId, logger);
+          }
+        }),
+        targetId: targetConnection.targetId,
+      };
     }
     if (attempt >= retries) {
       break;
@@ -709,7 +973,13 @@ export async function closeTab(
   }
 }
 
-function buildChromeFlags(headless: boolean, debugBindAddress?: string | null): string[] {
+function buildChromeFlags(
+  headless: boolean,
+  debugBindAddress?: string | null,
+  options?: {
+    startWithoutWindow?: boolean;
+  },
+): string[] {
   const flags = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -741,6 +1011,10 @@ function buildChromeFlags(headless: boolean, debugBindAddress?: string | null): 
 
   if (headless) {
     flags.push("--headless=new");
+  }
+
+  if (options?.startWithoutWindow) {
+    flags.push("--no-startup-window");
   }
 
   return flags;
@@ -851,4 +1125,253 @@ async function launchWithCustomHost({
     host: host ?? undefined,
     remoteDebuggingPipes: launcher.remoteDebuggingPipes,
   } as unknown as LaunchedChrome & { host?: string };
+}
+
+function shouldUseMacOsBackgroundLaunch(config: ResolvedBrowserConfig): boolean {
+  return process.platform === "darwin" && !config.headless && config.hideWindow;
+}
+
+async function launchBackgroundChromeOnMac({
+  chromeFlags,
+  chromePath,
+  userDataDir,
+  host,
+  requestedPort,
+}: {
+  chromeFlags: string[];
+  chromePath?: string | null;
+  userDataDir: string;
+  host: string;
+  requestedPort?: number;
+}): Promise<LaunchedChrome & { host?: string }> {
+  const port = await reserveDevToolsPort(requestedPort);
+  const appTarget = resolveMacChromeApplication(chromePath);
+  const outPath = path.join(userDataDir, "chrome-out.log");
+  const errPath = path.join(userDataDir, "chrome-err.log");
+  const launchArgs = [
+    "-n",
+    "-g",
+    "-j",
+    "-a",
+    appTarget,
+    "--stdin",
+    os.devNull,
+    "--stdout",
+    outPath,
+    "--stderr",
+    errPath,
+    "--args",
+    ...Launcher.defaultFlags(),
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    ...chromeFlags,
+  ];
+  await execFileAsync("open", launchArgs);
+
+  const pid = await waitForBackgroundChromeLaunch({
+    host,
+    port,
+    userDataDir,
+  });
+
+  const kill = async () => {
+    if (pid) {
+      await terminateChromeProcess(pid);
+    }
+  };
+
+  return {
+    pid: pid ?? undefined,
+    port,
+    process: undefined as unknown as NonNullable<LaunchedChrome["process"]>,
+    kill,
+    host,
+    remoteDebuggingPipes: false,
+  } as unknown as LaunchedChrome & { host?: string };
+}
+
+function resolveMacChromeApplication(chromePath?: string | null): string {
+  const resolved = chromePath?.trim() || Launcher.getFirstInstallation();
+  if (!resolved) {
+    throw new Error("Chrome is not installed");
+  }
+  if (resolved.endsWith(".app")) {
+    return resolved;
+  }
+  const bundleMatch = resolved.match(/^(.*?\.app)(?:\/Contents\/MacOS\/.*)?$/);
+  if (bundleMatch?.[1]) {
+    return bundleMatch[1];
+  }
+  return resolved;
+}
+
+async function reserveDevToolsPort(preferred?: number): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", (error) => {
+      server.close(() => undefined);
+      reject(error);
+    });
+    server.listen(preferred ?? 0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Unable to allocate a Chrome DevTools port.")));
+        return;
+      }
+      const { port } = address;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+async function waitForBackgroundChromeLaunch({
+  host,
+  port,
+  userDataDir,
+  timeoutMs = DEFAULT_CHROME_LAUNCH_TIMEOUT_MS,
+}: {
+  host: string;
+  port: number;
+  userDataDir: string;
+  timeoutMs?: number;
+}): Promise<number | null> {
+  const startedAt = Date.now();
+  let detectedPid: number | null = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const [debugReady, pidByPort, pidByProfile] = await Promise.all([
+      isDebuggerReady(host, port),
+      findPidListeningOnPort(port),
+      findChromePidByUserDataDir(userDataDir),
+    ]);
+    detectedPid = pidByPort ?? pidByProfile ?? detectedPid;
+    if (debugReady) {
+      return detectedPid;
+    }
+    await delay(DEFAULT_CHROME_LAUNCH_POLL_MS);
+  }
+  throw new Error(`timed out waiting for hidden Chrome DevTools on ${host}:${port}`);
+}
+
+async function isDebuggerReady(host: string, port: number): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const client = net.createConnection({ host, port });
+    const finish = (ready: boolean) => {
+      client.removeAllListeners();
+      client.end();
+      client.destroy();
+      client.unref();
+      resolve(ready);
+    };
+    client.once("error", () => finish(false));
+    client.once("connect", () => finish(true));
+  });
+}
+
+async function findPidListeningOnPort(port: number): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+    return parsePidFromText(stdout);
+  } catch {
+    return null;
+  }
+}
+
+async function findChromePidByUserDataDir(userDataDir: string): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axww", "-o", "pid=,command="]);
+    for (const line of stdout.split(/\r?\n/)) {
+      const match = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (!match) {
+        continue;
+      }
+      const pid = Number.parseInt(match[1] ?? "", 10);
+      const command = match[2] ?? "";
+      if (!Number.isFinite(pid) || pid <= 0) {
+        continue;
+      }
+      if (
+        command.includes(`--user-data-dir=${userDataDir}`) &&
+        command.includes("--remote-debugging-port=")
+      ) {
+        return pid;
+      }
+    }
+  } catch {
+    // ignore process-list failures and fall back to the DevTools port probe
+  }
+  return null;
+}
+
+function parsePidFromText(stdout: string): number | null {
+  const match = stdout.trim().match(/^(\d+)/);
+  if (!match) {
+    return null;
+  }
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+async function terminateChromeProcess(pid: number): Promise<void> {
+  if (!(await isProcessRunning(pid))) {
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (!isNoSuchProcessError(error)) {
+      throw error;
+    }
+    return;
+  }
+  const exitedAfterTerm = await waitForProcessExit(pid, 2_000);
+  if (exitedAfterTerm) {
+    return;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (!isNoSuchProcessError(error)) {
+      throw error;
+    }
+  }
+  await waitForProcessExit(pid, 1_000);
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!(await isProcessRunning(pid))) {
+      return true;
+    }
+    await delay(100);
+  }
+  return !(await isProcessRunning(pid));
+}
+
+async function isProcessRunning(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isNoSuchProcessError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function isNoSuchProcessError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    ((error as NodeJS.ErrnoException).code === "ESRCH" ||
+      (error as NodeJS.ErrnoException).code === "ENOENT")
+  );
 }

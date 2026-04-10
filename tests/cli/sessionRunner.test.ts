@@ -198,6 +198,12 @@ describe("performSessionRun", () => {
       expect.stringContaining("Saved text\n"),
       "utf8",
     ]);
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      options: {
+        writeOutputPath: expectedPath,
+      },
+    });
     const logLines = log.mock.calls.map((c) => c[0]).join("\n");
     expect(logLines).toContain("Saved assistant output");
   });
@@ -759,6 +765,8 @@ describe("performSessionRun", () => {
       ...baseSessionMeta,
       id: "parent-browser",
       mode: "browser",
+      status: "completed",
+      response: { status: "completed" },
       browser: {
         config: { chromePath: null },
         runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
@@ -793,7 +801,153 @@ describe("performSessionRun", () => {
       }),
       expect.any(Object),
     );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        status: "running",
+        browser: {
+          config: { chromePath: null },
+          runtime: parentSession.browser?.runtime,
+        },
+      }),
+    );
     expect(vi.mocked(runBrowserSessionExecution)).not.toHaveBeenCalled();
+  });
+
+  test("prefers the child session runtime snapshot when continuing a stored browser thread session", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-parent",
+          tabUrl: "https://chatgpt.com/c/parent",
+          conversationId: "parent",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+      elapsedMs: 900,
+      runtime: {
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "target-child",
+        tabUrl: "https://chatgpt.com/c/child",
+        conversationId: "child",
+      },
+      answerText: "continued",
+    });
+
+    await performSessionRun({
+      sessionMeta: {
+        ...baseSessionMeta,
+        mode: "browser",
+        browser: {
+          config: { chromePath: null },
+          runtime: {
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "target-child",
+            tabUrl: "https://chatgpt.com/c/child",
+            conversationId: "child",
+          },
+        },
+        options: { followupSessionId: "parent-browser" },
+      },
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(continueBrowserSessionExecution)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSession: expect.objectContaining({
+          browser: expect.objectContaining({
+            runtime: expect.objectContaining({
+              chromeTargetId: "target-child",
+              tabUrl: "https://chatgpt.com/c/child",
+              conversationId: "child",
+            }),
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        status: "running",
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            chromeTargetId: "target-child",
+            tabUrl: "https://chatgpt.com/c/child",
+            conversationId: "child",
+          }),
+        }),
+      }),
+    );
+  });
+
+  test("preserves parent browser runtime when a followup fails before refreshing runtime metadata", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed" },
+      browser: {
+        config: { chromePath: null },
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Prompt textarea did not appear before timeout", {
+        stage: "continue-browser",
+      }),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          mode: "browser",
+          options: { followupSessionId: "parent-browser" },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Prompt textarea did not appear before timeout");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: {
+        config: { chromePath: null },
+        runtime: expect.objectContaining({
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/abc",
+        }),
+      },
+    });
   });
 
   test("fails fast when browser followup parent session is missing", async () => {
@@ -825,6 +979,8 @@ describe("performSessionRun", () => {
       ...baseSessionMeta,
       id: "parent-gemini",
       mode: "browser",
+      status: "completed",
+      response: { status: "completed" },
       model: "gemini-3-pro",
       browser: {
         config: { chromePath: null },
@@ -857,6 +1013,43 @@ describe("performSessionRun", () => {
     expect(vi.mocked(continueBrowserSessionExecution)).not.toHaveBeenCalled();
   });
 
+  test("fails fast when browser followup parent session is still running", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-running",
+      mode: "browser",
+      status: "running",
+      response: { status: "running", incompleteReason: "assistant-timeout" },
+      browser: {
+        config: { chromePath: null },
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          mode: "browser",
+          options: { followupSessionId: "parent-running" },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(
+      "Browser follow-up parent session parent-running is not reusable yet (running (assistant-timeout)).",
+    );
+
+    expect(vi.mocked(continueBrowserSessionExecution)).not.toHaveBeenCalled();
+    expect(vi.mocked(runBrowserSessionExecution)).not.toHaveBeenCalled();
+  });
+
   test("writes browser answers to disk when writeOutputPath provided", async () => {
     vi.mocked(runBrowserSessionExecution).mockResolvedValue({
       usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
@@ -884,6 +1077,12 @@ describe("performSessionRun", () => {
       expect.stringContaining("browser answer\n"),
       "utf8",
     ]);
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      options: {
+        writeOutputPath: expectedPath,
+      },
+    });
   });
 
   test("write-output failures warn but keep session successful", async () => {
@@ -918,14 +1117,19 @@ describe("performSessionRun", () => {
         version: cliVersion,
       }),
     ).resolves.not.toThrow();
-
+    const expectedFallbackPath = path.resolve(process.cwd(), "out.fallback.md");
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
-    expect(finalUpdate).toMatchObject({ status: "completed" });
+    expect(finalUpdate).toMatchObject({
+      status: "completed",
+      options: {
+        writeOutputPath: expectedFallbackPath,
+      },
+    });
     const logLines = log.mock.calls.map((c) => c[0]).join("\n");
     expect(logLines).toContain("write-output fallback");
     const calls = (fsPromises.writeFile as unknown as { mock: { calls: unknown[][] } }).mock.calls;
     expect(calls[0][0]).toBe(path.resolve("/tmp/out.md"));
-    expect(calls[1][0]).toMatch(/out\.fallback/);
+    expect(calls[1][0]).toBe(expectedFallbackPath);
   });
 
   test("refuses to write inside session storage path", async () => {
@@ -996,6 +1200,64 @@ describe("performSessionRun", () => {
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).not.toContain("Next steps (browser fallback)");
     expect(logLines).not.toContain("--engine api");
+  });
+
+  test("preserves inherited browser runtime when a follow-up fails before returning refreshed runtime", async () => {
+    const parentRuntime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-parent",
+      tabUrl: "https://chatgpt.com/g/g-p-example/project/c/demo",
+      conversationId: "demo",
+    };
+    sessionStoreMock.readSession.mockResolvedValue({
+      id: "parent-browser-session",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      model: "gpt-5.2-pro",
+      options: {},
+      response: { status: "completed" },
+      browser: {
+        config: { chromePath: null },
+        runtime: parentRuntime,
+      },
+    } satisfies SessionMetadata);
+    vi.mocked(continueBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Prompt textarea did not appear before timeout", {
+        stage: "continue-browser",
+      }),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          options: {
+            followupSessionId: "parent-browser-session",
+          },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Prompt textarea did not appear before timeout");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining(parentRuntime),
+      }),
+      error: expect.objectContaining({
+        category: "browser-automation",
+        details: expect.objectContaining({ stage: "continue-browser" }),
+      }),
+    });
   });
 
   test("keeps session running when browser connection is lost", async () => {
@@ -1128,6 +1390,100 @@ describe("performSessionRun", () => {
     );
   });
 
+  test("records runtime and guidance when browser response is rate-limited", async () => {
+    const automationError = new BrowserAutomationError(
+      "ChatGPT temporarily limited this browser profile after too many requests.",
+      {
+        stage: "assistant-rate-limit",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("temporarily limited");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: expect.objectContaining({
+        config: expect.any(Object),
+        runtime: expect.objectContaining({
+          chromePort: 9222,
+        }),
+      }),
+      error: expect.objectContaining({
+        category: "browser-automation",
+        details: expect.objectContaining({ stage: "assistant-rate-limit" }),
+      }),
+    });
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain(
+      "ChatGPT temporarily rate-limited this browser profile; wait a few minutes before retrying.",
+    );
+  });
+
+  test("records runtime and guidance when ChatGPT backend API is Cloudflare-challenged", async () => {
+    const automationError = new BrowserAutomationError(
+      "ChatGPT backend API requests are being challenged by Cloudflare in this browser runtime, so Oracle cannot submit prompts or capture replies.",
+      {
+        stage: "cloudflare-backend-challenge",
+        runtime: {
+          chromePort: 9339,
+          chromeHost: "127.0.0.1",
+          userDataDir: "/tmp/oracle-carbonyl-profile",
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("ChatGPT backend API requests are being challenged by Cloudflare");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining({
+          chromePort: 9339,
+          userDataDir: "/tmp/oracle-carbonyl-profile",
+        }),
+      }),
+      error: expect.objectContaining({
+        category: "browser-automation",
+        details: expect.objectContaining({ stage: "cloudflare-backend-challenge" }),
+      }),
+    });
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain(
+      "Cloudflare is challenging ChatGPT backend API requests in this browser runtime; Oracle cannot submit prompts or capture replies here.",
+    );
+  });
+
   test("auto-reattaches after assistant timeout when configured", async () => {
     const automationError = new BrowserAutomationError("assistant timed out", {
       stage: "assistant-timeout",
@@ -1159,12 +1515,95 @@ describe("performSessionRun", () => {
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
       status: "completed",
-      response: { status: "completed" },
+      response: {
+        status: "completed",
+        assistantOutput: "ok markdown",
+      },
     });
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
   });
 
-  test("auto-reattach stops after a hard cap when it cannot capture an answer", async () => {
+  test("auto-reattach persists refreshed runtime metadata from the recovered tab", async () => {
+    const automationError = new BrowserAutomationError("assistant timed out", {
+      stage: "assistant-timeout",
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
+    });
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+    vi.mocked(resumeBrowserSession).mockResolvedValue({
+      answerText: "ok text",
+      answerMarkdown: "ok markdown",
+      runtime: {
+        chromePort: 9333,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "fresh-target",
+        tabUrl: "https://chatgpt.com/c/fresh",
+      },
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 0,
+        autoReattachIntervalMs: 1000,
+        autoReattachTimeoutMs: 1000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "completed",
+      browser: {
+        config: expect.any(Object),
+        runtime: expect.objectContaining({
+          chromePort: 9333,
+          chromeTargetId: "fresh-target",
+          tabUrl: "https://chatgpt.com/c/fresh",
+        }),
+      },
+    });
+  });
+
+  test("auto-reattach rethrows assistant rate limits instead of hammering the profile", async () => {
+    const timeoutError = new BrowserAutomationError("assistant timed out", {
+      stage: "assistant-timeout",
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
+    });
+    const rateLimitError = new BrowserAutomationError("rate limited", {
+      stage: "assistant-rate-limit",
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
+    });
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(timeoutError);
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(rateLimitError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          chromePath: null,
+          autoReattachDelayMs: 0,
+          autoReattachIntervalMs: 1000,
+          autoReattachTimeoutMs: 1000,
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("rate limited");
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+  });
+
+  test("auto-reattach stops after the configured timeout when it cannot capture an answer", async () => {
     vi.useFakeTimers();
     try {
       const automationError = new BrowserAutomationError("assistant timed out", {
@@ -1194,10 +1633,10 @@ describe("performSessionRun", () => {
         version: cliVersion,
       });
 
-      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000 + 5_000);
+      await vi.advanceTimersByTimeAsync(2_000);
       await pending;
 
-      expect(vi.mocked(resumeBrowserSession).mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
       const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
       expect(finalUpdate).toMatchObject({
         status: "running",

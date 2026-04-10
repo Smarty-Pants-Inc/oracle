@@ -9,8 +9,10 @@ import {
   ensurePromptReady,
   ensureNotBlocked,
   ensureLoggedIn,
+  ensureBackendApiReachable,
   buildAssistantSnapshotExpressionForTest,
 } from "../../src/browser/pageActions.js";
+import { CONVERSATION_TURN_SELECTOR } from "../../src/browser/constants.js";
 import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
 import type { ChromeClient } from "../../src/browser/types.js";
@@ -89,11 +91,61 @@ describe("navigateToChatGPT", () => {
 });
 
 describe("navigateToPromptReadyWithFallback", () => {
+  test("retries the same page once before falling back", async () => {
+    const navigate = vi.fn().mockResolvedValue(undefined);
+    const ensureNotBlockedMock = vi.fn().mockResolvedValue(undefined);
+    const ensurePromptReadyMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Prompt textarea did not appear before timeout"))
+      .mockResolvedValueOnce(undefined);
+    const runtime = {} as unknown as ChromeClient["Runtime"];
+    const page = {} as unknown as ChromeClient["Page"];
+
+    await expect(
+      navigateToPromptReadyWithFallback(
+        page,
+        runtime,
+        {
+          url: "https://chatgpt.com/g/oracle/project",
+          fallbackUrl: "https://chatgpt.com/",
+          timeoutMs: 5_000,
+          headless: false,
+          logger,
+        },
+        {
+          navigateToChatGPT: navigate,
+          ensureNotBlocked: ensureNotBlockedMock,
+          ensurePromptReady: ensurePromptReadyMock,
+        },
+      ),
+    ).resolves.toEqual({ usedFallback: false });
+
+    expect(navigate).toHaveBeenNthCalledWith(
+      1,
+      page,
+      runtime,
+      "https://chatgpt.com/g/oracle/project",
+      logger,
+    );
+    expect(navigate).toHaveBeenNthCalledWith(
+      2,
+      page,
+      runtime,
+      "https://chatgpt.com/g/oracle/project",
+      logger,
+    );
+    expect(navigate).toHaveBeenCalledTimes(2);
+    expect(ensureNotBlockedMock).toHaveBeenCalledTimes(2);
+    expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(1, runtime, 5_000, logger);
+    expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(2, runtime, 45_000, logger);
+  });
+
   test("falls back to base URL when prompt is missing", async () => {
     const navigate = vi.fn().mockResolvedValue(undefined);
     const ensureNotBlockedMock = vi.fn().mockResolvedValue(undefined);
     const ensurePromptReadyMock = vi
       .fn()
+      .mockRejectedValueOnce(new Error("Prompt textarea did not appear before timeout"))
       .mockRejectedValueOnce(new Error("Prompt textarea did not appear before timeout"))
       .mockResolvedValueOnce(undefined);
     const runtime = {} as unknown as ChromeClient["Runtime"];
@@ -125,10 +177,18 @@ describe("navigateToPromptReadyWithFallback", () => {
       "https://chatgpt.com/g/missing/project",
       logger,
     );
-    expect(navigate).toHaveBeenNthCalledWith(2, page, runtime, "https://chatgpt.com/", logger);
-    expect(ensureNotBlockedMock).toHaveBeenCalledTimes(2);
+    expect(navigate).toHaveBeenNthCalledWith(
+      2,
+      page,
+      runtime,
+      "https://chatgpt.com/g/missing/project",
+      logger,
+    );
+    expect(navigate).toHaveBeenNthCalledWith(3, page, runtime, "https://chatgpt.com/", logger);
+    expect(ensureNotBlockedMock).toHaveBeenCalledTimes(3);
     expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(1, runtime, 5_000, logger);
-    expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(2, runtime, 120_000, logger);
+    expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(2, runtime, 45_000, logger);
+    expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(3, runtime, 120_000, logger);
   });
 });
 
@@ -188,9 +248,14 @@ describe("ensureNotBlocked", () => {
 describe("ensureLoggedIn", () => {
   test("logs success when session is present", async () => {
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: { value: { ok: true, status: 200, url: "/backend-api/me" } },
-      }),
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: { ok: true, status: 200, url: "/backend-api/me" } },
+        })
+        .mockResolvedValueOnce({
+          result: { value: { ok: true, challenged: false } },
+        }),
     } as unknown as ChromeClient["Runtime"];
     await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 2 })).resolves.toBeUndefined();
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("Login check passed"));
@@ -224,6 +289,76 @@ describe("ensureLoggedIn", () => {
     await expect(ensureLoggedIn(runtime, logger, { remoteSession: true })).rejects.toThrow(
       /remote Chrome session/i,
     );
+  });
+
+  test("throws structured backend challenge error when ChatGPT API is challenged", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: { ok: true, status: 200, url: "/backend-api/me" } },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              ok: false,
+              challenged: true,
+              url: "/backend-api/models?iim=false&is_gizmo=false",
+              status: 403,
+              challengeMarkers: ["window._cf_chl_opt"],
+              bodySnippet: "Enable JavaScript and cookies to continue",
+            },
+          },
+        }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 2 })).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: expect.objectContaining({
+        stage: "cloudflare-backend-challenge",
+        status: 403,
+        url: "/backend-api/models?iim=false&is_gizmo=false",
+      }),
+    });
+  });
+});
+
+describe("ensureBackendApiReachable", () => {
+  test("passes when backend probe is clean", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: { ok: true, challenged: false } },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    await expect(ensureBackendApiReachable(runtime, logger)).resolves.toBeUndefined();
+  });
+
+  test("throws descriptive error when backend probe is challenged", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            ok: false,
+            challenged: true,
+            url: "/backend-api/me",
+            status: 403,
+            challengeMarkers: ["Enable JavaScript and cookies to continue"],
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    try {
+      await ensureBackendApiReachable(runtime, logger);
+      throw new Error("expected ensureBackendApiReachable to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(BrowserAutomationError);
+      expect((error as BrowserAutomationError).details).toMatchObject({
+        stage: "cloudflare-backend-challenge",
+        status: 403,
+        url: "/backend-api/me",
+      });
+    }
   });
 });
 
@@ -267,6 +402,9 @@ describe("waitForAssistantResponse", () => {
             }
             return { result: { value: payload } };
           }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: true } };
+          }
           return { result: { value: false } };
         });
 
@@ -282,7 +420,7 @@ describe("waitForAssistantResponse", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 15_000);
 
   test("response observer watches character data mutations", async () => {
     let capturedExpression = "";
@@ -299,10 +437,14 @@ describe("waitForAssistantResponse", () => {
     expect(capturedExpression).toContain("characterData: true");
     expect(capturedExpression).toContain("copy-turn-action-button");
     expect(capturedExpression).toContain("isLastAssistantTurnFinished");
-    expect(capturedExpression).toContain("lastAssistantTurn.querySelector(FINISHED_SELECTOR)");
+    expect(capturedExpression).toContain("lastAssistantTurn.querySelectorAll(FINISHED_SELECTOR)");
     expect(capturedExpression).not.toContain("document.querySelector(FINISHED_SELECTOR)");
     expect(capturedExpression).toContain("lastAssistantTurn.querySelectorAll('.markdown')");
     expect(capturedExpression).not.toContain("document.querySelectorAll('.markdown')");
+    expect(capturedExpression).not.toContain("stopInterval = setInterval");
+    expect(capturedExpression).not.toContain("dispatchClickSequence(stop)");
+    expect(capturedExpression).toContain("const resolveTurnIndex = (node) => {");
+    expect(capturedExpression).toContain("if (!isAfterMinTurn(lastAssistantTurn)) return false;");
     expect(capturedExpression).toContain("data-message-author-role");
     expect(capturedExpression).toContain("role === 'assistant'");
   });
@@ -439,7 +581,7 @@ describe("waitForAssistantResponse", () => {
       } as unknown as ChromeClient["Runtime"];
 
       const promise = waitForAssistantResponse(runtime, 10_000, logger);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(12_000);
       const result = await promise;
 
       expect(result.text).toBe("BROKER-THINKING-OK");
@@ -453,7 +595,7 @@ describe("waitForAssistantResponse", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 15_000);
 
   test("does not copy a stale earlier assistant turn when the current turn has no copy button yet", async () => {
     vi.useFakeTimers();
@@ -501,7 +643,7 @@ describe("waitForAssistantResponse", () => {
           if (
             expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
           ) {
-            return { result: { value: false } };
+            return { result: { value: snapshotCalls < 4 } };
           }
           if (expression.includes("hasAssistantFinishedActions")) {
             return { result: { value: true } };
@@ -514,7 +656,7 @@ describe("waitForAssistantResponse", () => {
       } as unknown as ChromeClient["Runtime"];
 
       const promise = waitForAssistantResponse(runtime, 10_000, logger, 3);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(12_000);
       const result = await promise;
 
       expect(result.text).toBe("BROKER-FRESH-OK after enough stable cycles");
@@ -533,7 +675,10 @@ describe("waitForAssistantResponse", () => {
   test("snapshot extractor invokes the markdown fallback instead of returning the function object", () => {
     const expression = buildAssistantSnapshotExpressionForTest(3);
     expect(expression).toContain("const fallback = (() => {");
-    expect(expression).toContain("return fallback() ?? extracted;");
+    expect(expression).toContain(
+      "const extractedCandidate = extracted && extracted.text && !isPlaceholder(extracted) ? extracted : null;",
+    );
+    expect(expression).toContain("return fallback() ?? null;");
   });
 
   test("waits for the watchdog when the observer returns an incomplete short answer before completion markers appear", async () => {
@@ -596,6 +741,76 @@ describe("waitForAssistantResponse", () => {
     }
   });
 
+  test("waits for the watchdog when the observer returns a prose partial before the final control payload appears", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const partialAnswer =
+        "I’m sending a minimal orchestrator round-trip now: a simple 2+2 task with an explicit return, and I’ll only confirm success once the result comes back here.";
+      const fullAnswer = `${partialAnswer}
+
+Starting the minimal loop test now. I am not treating it as proven until the orchestrator returns a result from the delegated task.
+
+\`\`\`oracle_control
+{"schema_version":1,"op_id":"op-minimal-round-trip","idempotency_key":"idem-minimal-round-trip","op":"handoff","workflow_id":"oracle-routing","workflow_version":0,"message":"Run a minimal orchestrator round-trip test.","message_for_user":"Starting a minimal orchestrator round-trip test now.","status":"in_progress"}
+\`\`\``;
+      const earlyCapture = {
+        text: partialAnswer,
+        html: `<p>${partialAnswer}</p>`,
+        messageId: "mid-partial",
+        turnId: "tid-partial",
+      };
+      const finalCapture = {
+        text: fullAnswer,
+        html: "<div>expanded</div>",
+        messageId: "mid-final",
+        turnId: "tid-final",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: earlyCapture } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            throw new Error("copy fallback should not run before completion markers appear");
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 8 ? earlyCapture : finalCapture,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 25_000, logger);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await promise;
+
+      expect(result.text).toBe(fullAnswer);
+      expect(result.meta).toEqual({ messageId: "mid-final", turnId: "tid-final" });
+      expect(snapshotCalls).toBeGreaterThanOrEqual(8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("ignores thinking-summary-only turns until the real assistant text appears", async () => {
     vi.useFakeTimers();
     try {
@@ -646,7 +861,7 @@ describe("waitForAssistantResponse", () => {
       } as unknown as ChromeClient["Runtime"];
 
       const promise = waitForAssistantResponse(runtime, 10_000, logger);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(12_000);
       const result = await promise;
 
       expect(result.text).toBe("ORACLE-THINKING-FINAL");
@@ -660,6 +875,334 @@ describe("waitForAssistantResponse", () => {
     } finally {
       vi.useRealTimers();
     }
+  }, 15_000);
+
+  test("ignores finalizing-answer status turns until the real assistant text appears", async () => {
+    vi.useFakeTimers();
+    try {
+      let snapshotCalls = 0;
+      const finalizingStatus = {
+        text: "ChatGPT said:\nFinalizing answer",
+        html: "<div>Finalizing answer</div>",
+        messageId: "mid-finalizing",
+        turnId: "tid-finalizing",
+      };
+      const answer = {
+        text: "ORACLE-FINAL-ANSWER",
+        html: "<p>ORACLE-FINAL-ANSWER</p>",
+        messageId: "mid-final",
+        turnId: "tid-final",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: finalizingStatus } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            throw new Error("copy fallback should not be used for finalizing status");
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return {
+              result: {
+                value: snapshotCalls < 4 ? finalizingStatus : answer,
+              },
+            };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      await vi.advanceTimersByTimeAsync(12_000);
+      const result = await promise;
+
+      expect(result.text).toBe("ORACLE-FINAL-ANSWER");
+      expect(
+        evaluate.mock.calls.some(([params]) =>
+          String((params as { expression?: string }).expression ?? "").includes(
+            "const BUTTON_SELECTOR",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("fails fast when ChatGPT leaves an empty thinking shell and re-enables the composer", async () => {
+    vi.useFakeTimers();
+    try {
+      const thinkingSummary = {
+        text: "ChatGPT said:\nThought for a few seconds",
+        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        messageId: "mid-thinking",
+        turnId: "tid-thinking",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: thinkingSummary } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: thinkingSummary } };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("htmlLooksEmpty") && expression.includes("result-thinking")) {
+            return { result: { value: true } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      const rejection = expect(promise).rejects.toThrow("assistant-response-empty-turn");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await rejection;
+      expect(runtime.terminateExecution).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("fails fast when ChatGPT exposes copy actions on an empty thinking shell", async () => {
+    vi.useFakeTimers();
+    try {
+      const thinkingSummary = {
+        text: "ChatGPT said:\nThought for 5s",
+        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        messageId: "mid-thinking-copy",
+        turnId: "tid-thinking-copy",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: thinkingSummary } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: thinkingSummary } };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: true } };
+          }
+          if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+            return { result: { value: { success: false, status: "timeout" } } };
+          }
+          if (expression.includes("htmlLooksEmpty") && expression.includes("result-thinking")) {
+            return { result: { value: true } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      const rejection = expect(promise).rejects.toThrow("assistant-response-empty-turn");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await rejection;
+      expect(runtime.terminateExecution).toHaveBeenCalled();
+      expect(
+        evaluate.mock.calls.some(([params]) =>
+          String((params as { expression?: string }).expression ?? "").includes(
+            "const BUTTON_SELECTOR",
+          ),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("waits through an empty thinking shell when the real answer lands shortly after", async () => {
+    vi.useFakeTimers();
+    try {
+      const thinkingSummary = {
+        text: "ChatGPT said:\nThought for 5s",
+        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        messageId: "mid-thinking-recover",
+        turnId: "tid-thinking-recover",
+      };
+      const finalAnswer = {
+        text: "TOKEN_REPLY_98765",
+        html: "<div><p>TOKEN_REPLY_98765</p></div>",
+        messageId: "mid-final",
+        turnId: "tid-final",
+      };
+      let snapshotCalls = 0;
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: thinkingSummary } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            snapshotCalls += 1;
+            return { result: { value: snapshotCalls < 8 ? thinkingSummary : finalAnswer } };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: snapshotCalls >= 8 } };
+          }
+          if (expression.includes("htmlLooksEmpty") && expression.includes("result-thinking")) {
+            return { result: { value: snapshotCalls < 8 } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 20_000, logger);
+      const resolution = expect(promise).resolves.toEqual({
+        text: "TOKEN_REPLY_98765",
+        html: "<div><p>TOKEN_REPLY_98765</p></div>",
+        meta: { messageId: "mid-final", turnId: "tid-final" },
+      });
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      await resolution;
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("fails fast when ChatGPT shows a too-many-requests banner", async () => {
+    vi.useFakeTimers();
+    try {
+      const finalizingStatus = {
+        text: "ChatGPT said:\nFinalizing answer",
+        html: "<div>Finalizing answer</div>",
+        messageId: "mid-finalizing",
+        turnId: "tid-finalizing",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: finalizingStatus } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: finalizingStatus } };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          if (
+            expression.includes("temporarily limited access to your conversations") &&
+            expression.includes("too many requests")
+          ) {
+            return { result: { value: "assistant-response-rate-limited" } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 10_000, logger);
+      const rejection = expect(promise).rejects.toThrow("assistant-response-rate-limited");
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await rejection;
+      expect(runtime.terminateExecution).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("does not treat quoted rate-limit text inside the conversation as a terminal error", async () => {
+    const quotedRateLimitText =
+      'The UI showed: "Too many requests. You have temporarily limited access to your conversations. Please wait a few minutes before trying again."';
+    const payload = {
+      text: quotedRateLimitText,
+      html: `<p>${quotedRateLimitText}</p>`,
+      messageId: "mid",
+      turnId: "tid",
+    };
+    const evaluate = vi
+      .fn()
+      .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+        const expression = String(params?.expression ?? "");
+        if (params?.awaitPromise && expression.includes("MutationObserver")) {
+          return { result: { type: "object", value: payload } };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          return { result: { value: payload } };
+        }
+        if (expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)) {
+          return { result: { value: false } };
+        }
+        if (expression.includes("hasAssistantFinishedActions")) {
+          return { result: { value: true } };
+        }
+        if (
+          expression.includes("temporarily limited access to your conversations") &&
+          expression.includes("too many requests")
+        ) {
+          expect(expression).toContain("candidate.closest(");
+          expect(expression).toContain(CONVERSATION_TURN_SELECTOR);
+          expect(expression).not.toContain("document.body.innerText");
+          return { result: { value: null } };
+        }
+        return { result: { value: null } };
+      });
+    const runtime = {
+      evaluate,
+      terminateExecution: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await waitForAssistantResponse(runtime, 10_000, logger);
+
+    expect(result.text).toBe(quotedRateLimitText);
   });
 });
 

@@ -152,7 +152,6 @@ export async function attachSession(
       return;
     }
   }
-  const initialStatus = metadata.status;
   const wantsRender = Boolean(options?.renderMarkdown);
   const isVerbose = Boolean(process.env.ORACLE_VERBOSE_RENDER);
   const runtime = metadata.browser?.runtime;
@@ -227,7 +226,10 @@ export async function attachSession(
           config: metadata.browser?.config,
           runtime,
         },
-        response: { status: "completed" },
+        response: {
+          status: "completed",
+          assistantOutput: result.answerMarkdown || result.answerText,
+        },
         error: undefined,
         transport: undefined,
       });
@@ -274,7 +276,7 @@ export async function attachSession(
     }
   }
 
-  const shouldTrimIntro = initialStatus === "completed" || initialStatus === "error";
+  const shouldTrimIntro = metadata.status === "completed" || metadata.status === "error";
   if (options?.renderPrompt !== false) {
     const prompt = await readStoredPrompt(sessionId);
     if (prompt) {
