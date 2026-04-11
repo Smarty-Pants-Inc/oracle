@@ -7,6 +7,7 @@ import process from "node:process";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
+import { THINKING_MENU_TRIGGER_SELECTORS } from "../src/browser/constants.js";
 import type {
   SupervisorBrokerRequest,
   SupervisorBrokerResponse,
@@ -16,11 +17,6 @@ import type { ThinkingTimeLevel } from "../src/oracle/types.js";
 import { browserProofScript } from "./supervisor-proof.browser.js";
 
 const LEVELS = new Set<ThinkingTimeLevel>(["light", "standard", "extended", "heavy"]);
-const CHIP_SELECTORS = [
-  '[data-testid="composer-footer-actions"] button[aria-haspopup="menu"]',
-  'button.__composer-pill[aria-haspopup="menu"]',
-  '.__composer-pill-composite button[aria-haspopup="menu"]',
-];
 const USAGE =
   "Usage: pnpm exec tsx scripts/supervisor-proof.ts [--thinking-time <level>] [--prompt <text>]";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -129,6 +125,7 @@ async function runSupervisorBrokerOverWire(
 async function main() {
   const { thinkingTime, prompt } = parseArgs(process.argv.slice(2));
   const proofToken = `PROOF_${Date.now()}_${randomUUID().slice(0, 8)}`;
+  const expectsInlineProofToken = !prompt;
   const response = await runSupervisorBrokerOverWire({
     action: "run_prompt",
     prompt: prompt ?? `Reply with exactly ${proofToken} and nothing else.`,
@@ -185,7 +182,11 @@ async function main() {
             },
             {
               source: browserProofScript,
-              args: { chipSelectors: CHIP_SELECTORS, level: thinkingTime, token: proofToken },
+              args: {
+                chipSelectors: THINKING_MENU_TRIGGER_SELECTORS,
+                level: thinkingTime,
+                token: proofToken,
+              },
             },
           ),
           new Promise<never>((_, reject) =>
@@ -204,12 +205,15 @@ async function main() {
         const selectedItem = candidate.items.find(
           (item) => item.text.toLowerCase() === titleCase(thinkingTime).toLowerCase(),
         );
-        if (candidate.proofPresent && candidate.menuFound && isChecked(selectedItem)) {
+        const responseObserved = expectsInlineProofToken
+          ? candidate.proofPresent
+          : response.output.trim().length > 0;
+        if (responseObserved && candidate.menuFound && isChecked(selectedItem)) {
           state = candidate;
           break;
         }
         lastError = new Error(
-          `Proof not ready yet: ${JSON.stringify({ proofPresent: candidate.proofPresent, menuFound: candidate.menuFound, selectedItem, chipText: candidate.chipText })}`,
+          `Proof not ready yet: ${JSON.stringify({ responseObserved, proofPresent: candidate.proofPresent, menuFound: candidate.menuFound, selectedItem, chipText: candidate.chipText })}`,
         );
       } catch (error) {
         lastError = error;

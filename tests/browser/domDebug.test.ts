@@ -9,11 +9,29 @@ const makeRuntime = (value: unknown) =>
 
 describe("domDebug utilities", () => {
   test("logDomFailure captures snapshot when verbose", async () => {
-    const runtime = makeRuntime([{ role: "assistant", text: "Hello", testid: "assistant-1" }]);
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: [{ role: "assistant", text: "Hello", testid: "assistant-1" }] },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              title: "Oracle - Response Request",
+              url: "https://chatgpt.com/",
+              menuButtons: [{ text: "Thinking", aria: "", testid: "", className: "" }],
+              visibleMenus: [{ role: "menu", aria: "", text: "Thinking effort Light Standard" }],
+            },
+          },
+        }),
+    } as unknown as ChromeClient["Runtime"];
     const logger = Object.assign(vi.fn(), { verbose: true, sessionLog: vi.fn() });
     await logDomFailure(runtime, logger, "test-context");
-    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    expect(runtime.evaluate).toHaveBeenCalledTimes(2);
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("Browser automation failure"));
+    expect(logger).toHaveBeenCalledWith(expect.stringContaining("Conversation snapshot"));
+    expect(logger).toHaveBeenCalledWith(expect.stringContaining("UI snapshot"));
     expect(logger.sessionLog).toHaveBeenCalled();
   });
 

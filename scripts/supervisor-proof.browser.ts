@@ -1,10 +1,13 @@
+import { buildClickDispatcher } from "../src/browser/actions/domEvents.js";
+
 export const browserProofScript = String.raw`async ({ chipSelectors, level, token }) => {
+  ${buildClickDispatcher()}
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const normalize = (value) => (value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
-  const click = (element) => {
-    const rect = element.getBoundingClientRect();
-    const init = { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
-    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) element.dispatchEvent(new MouseEvent(type, init));
+  const isVisible = (node) => {
+    if (!(node instanceof HTMLElement)) return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   };
   const cloneStyled = (node) => {
     if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.textContent || "");
@@ -15,26 +18,40 @@ export const browserProofScript = String.raw`async ({ chipSelectors, level, toke
     node.childNodes.forEach((child) => clone.appendChild(cloneStyled(child)));
     return clone;
   };
+  const findMenu = () =>
+    Array.from(document.querySelectorAll('[role="menu"], [data-radix-collection-root], [role="group"]'))
+      .filter(isVisible)
+      .find((candidate) => {
+        const text = normalize(candidate.textContent);
+        return text.includes("thinking effort") || text.includes("thinking time") || (text.includes("thinking") && text.includes("standard") && text.includes("extended")) || (text.includes("light") && text.includes("standard") && text.includes("extended"));
+      }) || null;
   window.scrollTo(0, document.body.scrollHeight);
   await sleep(600);
-  let chip = null;
+  const candidates = [];
   for (const selector of chipSelectors) {
     for (const button of document.querySelectorAll(selector)) {
-      const aria = normalize(button.getAttribute("aria-label"));
-      const text = normalize(button.textContent);
-      if (aria.includes("thinking") || text.includes("thinking") || aria.includes("pro") || text.includes("pro")) { chip = button; break; }
+      if (!(button instanceof HTMLElement) || !isVisible(button)) continue;
+      const meta = normalize([button.getAttribute("aria-label"), button.textContent, button.className].filter(Boolean).join(" "));
+      let score = 0;
+      if (meta.includes("thinking")) score += 200;
+      if (meta === "pro" || meta.includes(" pro ")) score += 140;
+      if (meta.includes("composer-pill")) score += 80;
+      if (button.closest?.('[data-testid="composer-footer-actions"]')) score += 60;
+      if (button.closest?.('[class*="composer"]')) score += 40;
+      if (score > 0) candidates.push({ button, score });
     }
-    if (chip) break;
   }
+  candidates.sort((left, right) => right.score - left.score);
+  const chip = candidates[0]?.button ?? null;
   if (!chip) throw new Error("Unable to find the Pro/Thinking chip");
   chip.scrollIntoView({ block: "center", inline: "center" });
   await sleep(300);
-  click(chip);
-  await sleep(1000);
-  const menu = Array.from(document.querySelectorAll('[role="menu"], [data-radix-collection-root], [role="group"]')).find((candidate) => {
-    const text = normalize(candidate.textContent);
-    return text.includes("standard") && text.includes("extended");
-  });
+  let menu = findMenu();
+  for (let attempt = 0; !menu && attempt < 3; attempt += 1) {
+    dispatchClickSequence(chip);
+    await sleep(350);
+    menu = findMenu();
+  }
   const items = menu ? Array.from(menu.querySelectorAll('button, [role="menuitem"], [role="menuitemradio"], [data-testid*="model-switcher-"]')).map((item) => ({ text: (item.textContent || "").trim(), ariaChecked: item.getAttribute("aria-checked"), dataState: item.getAttribute("data-state"), role: item.getAttribute("role") })) : [];
   const wrapper = document.createElement("div");
   wrapper.style.cssText = "background:" + (getComputedStyle(document.body).backgroundColor || "#ffffff") + ";padding:24px;display:inline-flex;flex-direction:column;gap:16px;";

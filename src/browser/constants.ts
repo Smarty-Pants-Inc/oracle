@@ -58,6 +58,15 @@ export const GENERIC_FILE_INPUT_SELECTOR = FILE_INPUT_SELECTORS[3];
 export const MENU_CONTAINER_SELECTOR = '[role="menu"], [data-radix-collection-root]';
 export const MENU_ITEM_SELECTOR =
   'button, [role="menuitem"], [role="menuitemradio"], [data-testid*="model-switcher-"]';
+export const THINKING_MENU_TRIGGER_SELECTORS = [
+  '[data-testid="composer-footer-actions"] [aria-haspopup="menu"]',
+  'button.__composer-pill[aria-haspopup="menu"]',
+  '.__composer-pill[aria-haspopup="menu"]',
+  '.__composer-pill-composite [aria-haspopup="menu"]',
+  '[class*="composer-pill"][aria-haspopup="menu"]',
+] as const;
+export const THINKING_MENU_LABEL_TOKENS = ["thinking time", "thinking effort"] as const;
+export const THINKING_LEVEL_KEYWORDS = ["light", "standard", "extended", "heavy"] as const;
 export const UPLOAD_STATUS_SELECTORS = [
   '[data-testid*="upload"]',
   '[data-testid*="attachment"]',

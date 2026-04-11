@@ -6,11 +6,15 @@ describe("browser thinking-time selection expression", () => {
     const expression = buildThinkingTimeExpressionForTest();
     expect(expression).toContain("const MENU_CONTAINER_SELECTOR");
     expect(expression).toContain("const MENU_ITEM_SELECTOR");
+    expect(expression).toContain("const CHIP_SELECTORS");
+    expect(expression).toContain("const MENU_LABELS");
     expect(expression).toContain('role=\\"menu\\"');
     expect(expression).toContain("data-radix-collection-root");
     expect(expression).toContain('role=\\"menuitem\\"');
     expect(expression).toContain('role=\\"menuitemradio\\"');
     expect(expression).toContain("normalize");
+    expect(expression).toContain("thinking effort");
+    expect(expression).toContain('.__composer-pill[aria-haspopup=\\"menu\\"]');
     expect(expression).toContain("extended");
     expect(expression).toContain("standard");
   });
@@ -35,11 +39,12 @@ describe("browser thinking-time selection expression", () => {
   it("ranks thinking-time chip candidates without falling back to the Pro model chip", () => {
     const expression = buildThinkingTimeExpressionForTest("extended");
     expect(expression).toContain("const collectThinkingChipCandidates = () => {");
+    expect(expression).toContain("const queryCandidateTriggers = () => {");
+    expect(expression).toContain("const collectComposerRoots = () => {");
     expect(expression).toContain("const looksLikeModelChip = (metadata) =>");
     expect(expression).toContain("metadata === 'pro'");
-    expect(expression).toContain(
-      ".sort((left, right) => right.score - left.score || right.rect.left - left.rect.left)",
-    );
+    expect(expression).toContain("metadata.includes('switch model')");
+    expect(expression).toContain("right.rect.top - left.rect.top");
     expect(expression).not.toContain("aria.includes('pro') || text.includes('pro')");
   });
 });
