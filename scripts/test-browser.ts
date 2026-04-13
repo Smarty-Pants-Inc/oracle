@@ -76,10 +76,10 @@ async function fetchVersion(host: string, devtoolsPort: number): Promise<boolean
 }
 
 async function main() {
-  console.log(`[browser-test] launching Chrome on ${targetHost}:${port} (headful)…`);
+  console.log(`[browser-test] launching Chrome on ${targetHost}:${port} (background/headless)…`);
   const chrome = await launch({
     port,
-    chromeFlags: ["--remote-debugging-address=0.0.0.0"],
+    chromeFlags: ["--remote-debugging-address=0.0.0.0", "--headless=new", "--disable-gpu"],
   });
 
   let ok = await fetchVersion(targetHost, chrome.port);

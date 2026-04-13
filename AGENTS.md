@@ -14,7 +14,7 @@ The parent `smarty-code` repo tracks this fork as a gitlink/submodule; move the 
 
 - Before merging upstream, run `git status --short`.
 - If the repo is dirty, stop and decide whether the current Oracle changes need to be committed first.
-- From the parent `smarty-code` repo, run `./scripts/update-forks-oracle.sh` to fetch `origin` and `upstream`, merge `upstream/main`, run the carried checks, rebuild `dist`, and smoke-test the CLI.
+- From the parent `smarty-code` repo, run `./scripts/update-forks-oracle.sh` to fetch `origin` and `upstream`, merge `upstream/main`, run the carried checks, rebuild `dist`, smoke-test the CLI, and run hidden live Oracle browser E2E in the Oracle ChatGPT project scope.
 - Use `./scripts/update-forks-all.sh` from the parent repo when you want to sync both Oracle and Codex together. That helper only supports clean `main` branches; use the per-fork helper for custom branches or refs.
 - Do not push by default. Only pass `--push` when explicitly asked.
 
@@ -24,6 +24,7 @@ The parent `smarty-code` repo tracks this fork as a gitlink/submodule; move the 
 - `pnpm run check`
 - `pnpm run build`
 - `node dist/bin/oracle-cli.js --version`
+- Every upstream sync/update is incomplete until the hidden project-scoped live Oracle browser E2E passes. The canonical path is `./scripts/update-forks-oracle.sh`, which wires that live proof in automatically.
 
 ## Browser-Supervisor Changes
 
@@ -53,6 +54,7 @@ The parent `smarty-code` repo tracks this fork as a gitlink/submodule; move the 
 - When a flake is found, fix the generalized helper and add regression coverage for that variant. Do not only patch the one DOM shape that failed today.
 - Keep framework testing inside the Oracle ChatGPT project scope so live resilience testing does not pollute the user’s main workspace.
 - Keep the browser hidden/backgrounded on this machine. A visible Chrome launch is a regression unless the user is explicitly debugging it.
+- Normal non-test usage may still default to the user’s main/root ChatGPT workspace unless they ask for a project or an existing thread there.
 
 ## Runtime Notes
 
