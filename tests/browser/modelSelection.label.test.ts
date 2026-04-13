@@ -38,6 +38,7 @@ describe("browser model selection arbitrary labels", () => {
 
   it("matches descriptive shortcut rows for the generic Instant target", () => {
     expect(modelCandidateMatchesTargetForTest("Instant", "Instant for everyday chats")).toBe(true);
+    expect(modelCandidateMatchesTargetForTest("Instant", "InstantFor everyday chats")).toBe(true);
   });
 
   it("rejects shorthand variant labels for a base-model request", () => {

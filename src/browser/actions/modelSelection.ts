@@ -159,7 +159,9 @@ function buildModelSelectionExpression(
       return has54 ? '5-4' : has52 ? '5-2' : has51 ? '5-1' : has50 ? '5-0' : null;
     };
     const hasVariant = (normalizedText, normalizedTestId, variant) =>
-      hasWord(normalizedText, variant) || (normalizedTestId ?? '').toLowerCase().includes(variant);
+      hasWord(normalizedText, variant) ||
+      (normalizedText ?? '').startsWith(variant) ||
+      (normalizedTestId ?? '').toLowerCase().includes(variant);
     const optionMatchesTarget = (label, testid) => {
       const normalizedLabel = normalizeText(label);
       const normalizedTestId = (testid ?? '').toLowerCase();
@@ -769,7 +771,11 @@ function detectModelVersion(text: string, testId = ""): ModelVersion | null {
 
 function hasVariantWord(text: string, testId: string, variant: "pro" | "thinking" | "instant") {
   const normalizedText = normalizeModelText(text);
-  return normalizedText.split(" ").includes(variant) || testId.toLowerCase().includes(variant);
+  return (
+    normalizedText.split(" ").includes(variant) ||
+    normalizedText.startsWith(variant) ||
+    testId.toLowerCase().includes(variant)
+  );
 }
 
 function buildModelTargetTraits(targetModel: string, labelTokens?: string[]): ModelTargetTraits {

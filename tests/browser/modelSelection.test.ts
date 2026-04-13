@@ -191,6 +191,7 @@ describe("browser model selection matchers", () => {
 
   it("accepts descriptive variant rows when ChatGPT adds helper copy to the shortcut labels", () => {
     const expression = buildModelSelectionExpressionForTest("gpt-5.2");
+    expect(expression).toContain("(normalizedText ?? '').startsWith(variant)");
     expect(expression).toContain("normalizedLabel === 'pro' || normalizedLabel.startsWith('pro ')");
     expect(expression).toContain(
       "normalizedLabel === 'thinking' || normalizedLabel.startsWith('thinking ')",
