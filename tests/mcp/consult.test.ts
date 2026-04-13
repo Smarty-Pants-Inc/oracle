@@ -61,7 +61,7 @@ describe("summarizeModelRunsForConsult", () => {
       manualLogin: true,
       manualLoginProfileDir: "/tmp/oracle-profile",
       thinkingTime: "extended",
-      desiredModel: "GPT-5.2",
+      desiredModel: "Instant",
       cookieSync: false,
     });
   });

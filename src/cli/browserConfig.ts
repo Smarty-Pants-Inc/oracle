@@ -99,7 +99,7 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
     return normalized;
   }
 
-  // Legacy aliases: map to base GPT-5.2 (Auto)
+  // Legacy aliases: map to base GPT-5.2, which now targets the generic Instant picker row.
   if (normalized === "gpt-5.1") {
     return "gpt-5.2";
   }

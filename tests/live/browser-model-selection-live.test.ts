@@ -21,8 +21,8 @@ function normalizeLabel(label: string): string {
 const CASES = [
   {
     name: "auto",
-    desiredModel: "GPT-5.2",
-    expected: ["5.2"],
+    desiredModel: "Instant",
+    expected: ["instant"],
   },
   {
     name: "thinking",
