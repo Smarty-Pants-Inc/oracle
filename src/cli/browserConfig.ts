@@ -34,8 +34,8 @@ const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   ["gpt-5-pro", "GPT-5.4 Pro"],
   // Base models last (least specific)
   ["gpt-5.4", "Thinking 5.4"],
-  ["gpt-5.2", "GPT-5.2"], // Selects "Auto" in ChatGPT UI
-  ["gpt-5.1", "GPT-5.2"], // Legacy alias → Auto
+  ["gpt-5.2", "Instant"], // Current ChatGPT UI exposes the fast path as a generic Instant row
+  ["gpt-5.1", "Instant"], // Legacy alias → Instant
   ["gemini-3-pro", "Gemini 3 Pro"],
   ["gemini-3-pro-deep-think", "gemini-3-deep-think"],
 ];
