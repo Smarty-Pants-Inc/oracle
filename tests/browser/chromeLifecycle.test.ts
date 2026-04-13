@@ -79,7 +79,7 @@ describe("launchChrome", () => {
     expect(result.port).toBe(9444);
   });
 
-  test("uses a hidden macOS LaunchServices launch when hide-window mode is enabled", async () => {
+  test("uses a detached direct Chrome launch when hide-window mode is enabled", async () => {
     vi.resetModules();
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
@@ -90,10 +90,6 @@ describe("launchChrome", () => {
         args: string[],
         callback: (error: Error | null, stdout?: string, stderr?: string) => void,
       ) => {
-        if (file === "open") {
-          callback(null, "", "");
-          return;
-        }
         if (file === "lsof") {
           callback(null, "4242\n", "");
           return;
@@ -172,9 +168,14 @@ describe("launchChrome", () => {
       };
       return server;
     });
+    const spawnMock = vi.fn(() => ({
+      pid: 4242,
+      unref: vi.fn(),
+    }));
 
     vi.doMock("node:child_process", () => ({
       execFile: execFileMock,
+      spawn: spawnMock,
     }));
     vi.doMock("node:net", () => ({
       default: {
@@ -201,21 +202,18 @@ describe("launchChrome", () => {
       );
 
       expect(launchMock).not.toHaveBeenCalled();
-      expect(execFileMock).toHaveBeenCalledWith(
-        "open",
+      expect(spawnMock).toHaveBeenCalledWith(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         expect.arrayContaining([
-          "-n",
-          "-g",
-          "-j",
-          "-a",
-          "/Applications/Google Chrome.app",
-          "--args",
           "--default-flag",
           "--remote-debugging-port=9333",
           "--user-data-dir=/tmp/oracle-hidden-profile",
           "--no-startup-window",
         ]),
-        expect.any(Function),
+        expect.objectContaining({
+          detached: true,
+          stdio: ["ignore", expect.any(Number), expect.any(Number)],
+        }),
       );
       expect(createConnectionMock).toHaveBeenCalledWith({
         host: "127.0.0.1",
@@ -224,6 +222,153 @@ describe("launchChrome", () => {
       expect(result.pid).toBe(4242);
       expect(result.port).toBe(9333);
       expect(logger).toHaveBeenCalledWith("Launched Chrome (pid 4242) on port 9333");
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+      vi.resetModules();
+      vi.doUnmock("node:child_process");
+      vi.doUnmock("node:net");
+    }
+  });
+
+  test("forces a detached direct hidden Chrome launch even when hide-window was omitted", async () => {
+    vi.resetModules();
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+
+    const execFileMock = vi.fn(
+      (
+        file: string,
+        args: string[],
+        callback: (error: Error | null, stdout?: string, stderr?: string) => void,
+      ) => {
+        if (file === "lsof") {
+          callback(null, "5252\n", "");
+          return;
+        }
+        if (file === "ps") {
+          callback(
+            null,
+            "5252 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9444 --user-data-dir=/tmp/oracle-forced-hidden-profile\n",
+            "",
+          );
+          return;
+        }
+        callback(new Error(`unexpected execFile: ${file}`));
+      },
+    );
+    Reflect.set(
+      execFileMock as object,
+      promisify.custom,
+      (file: string, args: string[]) =>
+        new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          execFileMock(file, args, (error, stdout = "", stderr = "") => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve({ stdout, stderr });
+          });
+        }),
+    );
+
+    const createConnectionMock = vi.fn(() => {
+      const socket = {
+        once(event: string, listener: (...args: unknown[]) => void) {
+          if (event === "connect") {
+            queueMicrotask(() => listener());
+          }
+          return socket;
+        },
+        removeAllListeners() {
+          return socket;
+        },
+        end() {
+          return socket;
+        },
+        destroy() {
+          return socket;
+        },
+        unref() {
+          return socket;
+        },
+      };
+      return socket;
+    });
+    const createServerMock = vi.fn(() => {
+      const server = {
+        unref() {
+          return server;
+        },
+        once(_event: string, _listener: (...args: unknown[]) => void) {
+          return server;
+        },
+        listen(_port: number, _host: string, listener: () => void) {
+          queueMicrotask(listener);
+          return server;
+        },
+        address() {
+          return { port: 9444 };
+        },
+        close(callback?: (error?: Error) => void) {
+          callback?.();
+          return server;
+        },
+      };
+      return server;
+    });
+    const spawnMock = vi.fn(() => ({
+      pid: 5252,
+      unref: vi.fn(),
+    }));
+
+    vi.doMock("node:child_process", () => ({
+      execFile: execFileMock,
+      spawn: spawnMock,
+    }));
+    vi.doMock("node:net", () => ({
+      default: {
+        createConnection: createConnectionMock,
+        createServer: createServerMock,
+      },
+    }));
+
+    try {
+      const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+      const logger = vi.fn();
+
+      const result = await launchChrome(
+        {
+          launcher: "chrome",
+          chromePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          debugPort: 9444,
+          headless: false,
+          hideWindow: false,
+          url: "https://chatgpt.com/",
+        } as never,
+        "/tmp/oracle-forced-hidden-profile",
+        logger,
+      );
+
+      expect(launchMock).not.toHaveBeenCalled();
+      expect(spawnMock).toHaveBeenCalledWith(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        expect.arrayContaining([
+          "--default-flag",
+          "--remote-debugging-port=9444",
+          "--user-data-dir=/tmp/oracle-forced-hidden-profile",
+          "--no-startup-window",
+        ]),
+        expect.objectContaining({
+          detached: true,
+          stdio: ["ignore", expect.any(Number), expect.any(Number)],
+        }),
+      );
+      expect(createConnectionMock).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 9444,
+      });
+      expect(result.pid).toBe(5252);
+      expect(result.port).toBe(9444);
     } finally {
       Object.defineProperty(process, "platform", { value: originalPlatform });
       vi.resetModules();
@@ -1108,7 +1253,7 @@ describe("startChromeFocusGuard", () => {
     expect(restoreScripts).toEqual([]);
   });
 
-  test("does not treat a different Chrome pid as the Oracle browser", async () => {
+  test("does not treat a different Chrome pid as the managed hidden window", async () => {
     const frontmostProcesses = ["Google Chrome\n9999\n", "Google Chrome\n9999\n"];
     const execFileMock = vi.fn(
       (

@@ -55,8 +55,12 @@ describe("continueBrowserSession manual-login reuse", () => {
     const launchChrome = vi.fn(async () => {
       throw new Error("launchChrome should not be called");
     });
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
+    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop, restoreTarget) => {
+      await hideChromeWindow(chrome as never, loggerArg as never, restoreTarget as never);
+      stop?.();
+    });
     const frontmostTarget = { name: "Terminal", pid: 91 };
     const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
     const navigateToChatGPT = vi.fn(async () => {});
@@ -84,6 +88,7 @@ describe("continueBrowserSession manual-login reuse", () => {
         launchChrome,
         hideChromeWindow,
         startChromeFocusGuard,
+        finalizeChromeFocusProtection,
         captureFrontmostProcess,
       };
     });
@@ -147,7 +152,7 @@ describe("continueBrowserSession manual-login reuse", () => {
     expect(launchChrome).not.toHaveBeenCalled();
     expect(captureFrontmostProcess).toHaveBeenCalledWith(logger);
     expect(hideChromeWindow).toHaveBeenNthCalledWith(1, reusedChrome, logger, frontmostTarget);
-    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, reusedChrome, logger);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, reusedChrome, logger, frontmostTarget);
     expect(startChromeFocusGuard).toHaveBeenCalledWith(reusedChrome, logger, frontmostTarget);
     expect(hideChromeWindow.mock.invocationCallOrder[0]).toBeLessThan(
       connectWithNewTab.mock.invocationCallOrder[0],
@@ -284,8 +289,12 @@ describe("continueBrowserSession manual-login reuse", () => {
     const launchChrome = vi.fn(async () => {
       throw new Error("launchChrome should not be called");
     });
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
+    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop, restoreTarget) => {
+      await hideChromeWindow(chrome as never, loggerArg as never, restoreTarget as never);
+      stop?.();
+    });
     const frontmostTarget = { name: "Terminal", pid: 91 };
     const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
     const navigateToChatGPT = vi.fn(async () => {});
@@ -314,6 +323,7 @@ describe("continueBrowserSession manual-login reuse", () => {
         launchChrome,
         hideChromeWindow,
         startChromeFocusGuard,
+        finalizeChromeFocusProtection,
         captureFrontmostProcess,
       };
     });
@@ -379,7 +389,7 @@ describe("continueBrowserSession manual-login reuse", () => {
     expect(closeTab).toHaveBeenCalledWith(9333, "isolated-target-1", logger, "127.0.0.1");
     expect(captureFrontmostProcess).toHaveBeenCalledWith(logger);
     expect(hideChromeWindow).toHaveBeenNthCalledWith(1, reusedChrome, logger, frontmostTarget);
-    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, reusedChrome, logger);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, reusedChrome, logger, frontmostTarget);
     expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2_000, logger, 4);
     expect(captureAssistantMarkdown).toHaveBeenCalledWith(
       expect.anything(),
@@ -445,8 +455,12 @@ describe("continueBrowserSession manual-login reuse", () => {
     const launchChrome = vi.fn(async () => {
       throw new Error("launchChrome should not be called");
     });
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
+    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop, restoreTarget) => {
+      await hideChromeWindow(chrome as never, loggerArg as never, restoreTarget as never);
+      stop?.();
+    });
     const frontmostTarget = { name: "Terminal", pid: 91 };
     const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
     const navigateToChatGPT = vi.fn(async () => {});
@@ -481,6 +495,7 @@ describe("continueBrowserSession manual-login reuse", () => {
         launchChrome,
         hideChromeWindow,
         startChromeFocusGuard,
+        finalizeChromeFocusProtection,
         captureFrontmostProcess,
       };
     });
@@ -502,6 +517,19 @@ describe("continueBrowserSession manual-login reuse", () => {
         ensurePromptReady,
         clearPromptComposer,
         submitPrompt,
+      };
+    });
+    vi.doMock("../../src/browser/detect.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/detect.js")>(
+        "../../src/browser/detect.js",
+      );
+      return {
+        ...original,
+        readDevToolsActivePortInfo: vi.fn(async () => ({
+          port: 9333,
+          browserWSEndpoint: "ws://127.0.0.1:9333/devtools/browser/browser-1",
+          path: "/tmp/oracle-browser-profile/DevToolsActivePort",
+        })),
       };
     });
     vi.doMock("../../src/browser/reattachHelpers.js", async () => {
@@ -554,9 +582,9 @@ describe("continueBrowserSession manual-login reuse", () => {
     });
     expect(connect).toHaveBeenCalledTimes(1);
     expect(connect).toHaveBeenCalledWith({
-      host: "127.0.0.1",
-      port: 9333,
-      target: "isolated-target-1",
+      target: "ws://127.0.0.1:9333/devtools/browser/browser-1",
+      local: true,
+      targetId: "isolated-target-1",
     });
     expect(openConversationFromSidebarWithRetry).not.toHaveBeenCalled();
     expect(waitForAssistantResponse).toHaveBeenNthCalledWith(

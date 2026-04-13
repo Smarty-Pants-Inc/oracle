@@ -65,11 +65,21 @@ describe("continueBrowserSession via reopened Chrome", () => {
       close: vi.fn(async () => {}),
     } satisfies FakeClient & { Page: { navigate: (params: { url: string }) => Promise<void> } };
     const launchChrome = vi.fn(async () => launchedChrome);
-    const connectToChrome = vi.fn(async () => initialClient) as unknown as (
+    const connectWithNewTab = vi.fn(async () => ({
+      client: initialClient,
+      targetId: "target-1",
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/test",
+    })) as unknown as (
       port: number,
       logger: BrowserLogger,
+      initialUrl?: string,
       host?: string,
-    ) => Promise<ChromeClient>;
+      options?: unknown,
+    ) => Promise<{
+      client: ChromeClient;
+      targetId?: string;
+      browserWSEndpoint?: string;
+    }>;
     const hideChromeWindow = vi.fn(async () => {});
     const navigateToChatGPT = vi.fn(async (_page, _runtime, url: string) => {
       if (url === conversationUrl) {
@@ -93,7 +103,7 @@ describe("continueBrowserSession via reopened Chrome", () => {
       const original = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
         "../../src/browser/chromeLifecycle.js",
       );
-      return { ...original, launchChrome, connectToChrome, hideChromeWindow };
+      return { ...original, launchChrome, connectWithNewTab, hideChromeWindow };
     });
     vi.doMock("../../src/browser/pageActions.js", async () => {
       const original = await vi.importActual<typeof import("../../src/browser/pageActions.js")>(
@@ -175,11 +185,21 @@ describe("continueBrowserSession via reopened Chrome", () => {
       close: vi.fn(async () => {}),
     } satisfies FakeClient;
     const launchChrome = vi.fn(async () => launchedChrome);
-    const connectToChrome = vi.fn(async () => initialClient) as unknown as (
+    const connectWithNewTab = vi.fn(async () => ({
+      client: initialClient,
+      targetId: "target-1",
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/test",
+    })) as unknown as (
       port: number,
       logger: BrowserLogger,
+      initialUrl?: string,
       host?: string,
-    ) => Promise<ChromeClient>;
+      options?: unknown,
+    ) => Promise<{
+      client: ChromeClient;
+      targetId?: string;
+      browserWSEndpoint?: string;
+    }>;
     const hideChromeWindow = vi.fn(async () => {});
     const navigateToChatGPT = vi.fn(async () => {});
     const ensureNotBlocked = vi.fn(async () => {});
@@ -192,7 +212,7 @@ describe("continueBrowserSession via reopened Chrome", () => {
       const original = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
         "../../src/browser/chromeLifecycle.js",
       );
-      return { ...original, launchChrome, connectToChrome, hideChromeWindow };
+      return { ...original, launchChrome, connectWithNewTab, hideChromeWindow };
     });
     vi.doMock("../../src/browser/pageActions.js", async () => {
       const original = await vi.importActual<typeof import("../../src/browser/pageActions.js")>(
@@ -265,7 +285,7 @@ describe("continueBrowserSession via reopened Chrome", () => {
     expect(submitPrompt).toHaveBeenCalledTimes(1);
     expect(waitForAssistantResponse).toHaveBeenCalledTimes(2);
     expect(launchChrome).toHaveBeenCalledTimes(1);
-    expect(connectToChrome).toHaveBeenCalledTimes(1);
+    expect(connectWithNewTab).toHaveBeenCalledTimes(1);
     expect(resumeConnect).toHaveBeenCalledTimes(1);
     expect(launchedChrome.kill).toHaveBeenCalledTimes(1);
     expect(result.answerMarkdown).toBe("supervisor markdown");

@@ -50,6 +50,18 @@ describe("remote Chrome option warnings", () => {
       }),
     ).toContain("--browser-chrome-path");
   });
+
+  test("marks manual-login flags as ignored for classic remote-chrome", () => {
+    expect(
+      __test__.listIgnoredRemoteChromeFlags({
+        attachRunning: false,
+        manualLogin: true,
+        manualLoginProfileDir: "/tmp/oracle-profile",
+      }),
+    ).toEqual(
+      expect.arrayContaining(["--browser-manual-login", "--browser-manual-login-profile-dir"]),
+    );
+  });
 });
 
 describe("assistant retry policy", () => {
@@ -63,5 +75,51 @@ describe("assistant retry policy", () => {
     const error = new Error("assistant-response-watchdog-timeout");
     expect(__test__.shouldReloadAfterAssistantError(error)).toBe(true);
     expect(__test__.isAssistantResponseTimeoutError(error)).toBe(true);
+  });
+});
+
+describe("assistant DOM snapshot replacement", () => {
+  test("replaces missing markdown capture with a fresher DOM snapshot", () => {
+    expect(
+      __test__.shouldReplaceAssistantCaptureWithDomSnapshot({
+        promptText: "Summarize this diff",
+        currentMarkdown: "short copied text",
+        copiedMarkdown: null,
+        finalText: "short copied text with the real ending attached",
+      }),
+    ).toBe(true);
+  });
+
+  test("does not replace copied markdown for a small DOM mismatch", () => {
+    expect(
+      __test__.shouldReplaceAssistantCaptureWithDomSnapshot({
+        promptText: "Summarize this diff",
+        currentMarkdown: "fully copied assistant answer",
+        copiedMarkdown: "fully copied assistant answer",
+        finalText: "fully copied assistant answer plus footer",
+      }),
+    ).toBe(false);
+  });
+
+  test("replaces heavily truncated copied markdown with a larger DOM snapshot", () => {
+    expect(
+      __test__.shouldReplaceAssistantCaptureWithDomSnapshot({
+        promptText: "Summarize this diff",
+        currentMarkdown: "tiny copy",
+        copiedMarkdown: "tiny copy",
+        finalText: "tiny copy with a much larger DOM-only continuation that proves truncation",
+      }),
+    ).toBe(true);
+  });
+
+  test("does not replace with prompt echo text", () => {
+    expect(
+      __test__.shouldReplaceAssistantCaptureWithDomSnapshot({
+        promptText: "Summarize this diff",
+        currentMarkdown: "assistant answer",
+        copiedMarkdown: null,
+        finalText: "Summarize this diff",
+      }),
+    ).toBe(false);
   });
 });

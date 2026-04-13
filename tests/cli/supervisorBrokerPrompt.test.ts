@@ -247,20 +247,18 @@ describe("resolveSupervisorChatgptUrl", () => {
     expect(url).toBe(SUPERVISOR_PROJECT_URL);
   });
 
-  test("rejects an explicit supervisor override that is not project-scoped", async () => {
-    await expect(
-      __test__.resolveSupervisorChatgptUrl({
-        userConfig: {
-          browser: {
-            supervisorChatgptUrl: "https://chatgpt.com/",
-            chatgptUrl: SUPERVISOR_PROJECT_URL,
-          },
+  test("accepts an explicit supervisor root override", async () => {
+    const url = await __test__.resolveSupervisorChatgptUrl({
+      userConfig: {
+        browser: {
+          supervisorChatgptUrl: "https://chatgpt.com/",
+          chatgptUrl: SUPERVISOR_PROJECT_URL,
         },
-        env: {},
-      }),
-    ).rejects.toThrow(
-      "Supervisor browser requires ORACLE_SUPERVISOR_CHATGPT_URL/browser.supervisorChatgptUrl to be a dedicated /g/.../project URL.",
-    );
+      },
+      env: {},
+    });
+
+    expect(url).toBe("https://chatgpt.com/");
   });
 
   test("accepts a project-scoped browser url from config", async () => {
@@ -276,17 +274,26 @@ describe("resolveSupervisorChatgptUrl", () => {
     expect(url).toBe(SUPERVISOR_PROJECT_URL);
   });
 
-  test("fails closed instead of reusing a prior hidden session project implicitly", async () => {
-    await expect(
-      __test__.resolveSupervisorChatgptUrl({
-        userConfig: {
-          browser: {
-            chatgptUrl: "https://chatgpt.com/",
-          },
+  test("defaults supervisor runs to the ChatGPT root when a root browser url is configured", async () => {
+    const url = await __test__.resolveSupervisorChatgptUrl({
+      userConfig: {
+        browser: {
+          chatgptUrl: "https://chatgpt.com/",
         },
-        env: {},
-      }),
-    ).rejects.toThrow("Supervisor browser requires an explicit dedicated ChatGPT project URL");
+      },
+      env: {},
+    });
+
+    expect(url).toBe("https://chatgpt.com/");
+  });
+
+  test("defaults supervisor runs to the ChatGPT root when browser url is omitted", async () => {
+    const url = await __test__.resolveSupervisorChatgptUrl({
+      userConfig: {},
+      env: {},
+    });
+
+    expect(url).toBe("https://chatgpt.com/");
   });
 });
 

@@ -66,6 +66,40 @@ describe("summarizeModelRunsForConsult", () => {
     });
   });
 
+  test("applies the managed local Chrome defaults for bare consult browser runs on macOS", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.4-pro",
+      inputModel: "gpt-5.4-pro",
+    });
+
+    const expectsManagedChrome = process.platform === "darwin";
+    expect(config.manualLogin).toBe(expectsManagedChrome ? true : undefined);
+    expect(config.hideWindow).toBe(expectsManagedChrome ? true : undefined);
+    expect(config.keepBrowser).toBe(expectsManagedChrome ? true : undefined);
+  });
+
+  test("does not apply managed local Chrome defaults to remote Chrome consult runs", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {
+        browser: {
+          remoteChrome: {
+            host: "10.0.0.8",
+            port: 9222,
+          },
+        },
+      },
+      env: {},
+      runModel: "gpt-5.4-pro",
+      inputModel: "gpt-5.4-pro",
+    });
+
+    expect(config.manualLogin).toBeUndefined();
+    expect(config.hideWindow).toBeUndefined();
+    expect(config.keepBrowser).toBeUndefined();
+  });
+
   test("lets explicit consult inputs override config defaults", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {

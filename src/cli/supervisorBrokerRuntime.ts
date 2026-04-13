@@ -22,6 +22,7 @@ import {
   type TargetInfoLite,
 } from "../browser/reattachHelpers.js";
 import type { BrowserLogger, ChromeClient } from "../browser/types.js";
+import { normalizeChatgptUrl } from "../browser/utils.js";
 import { assertSupervisorRuntimeAttachLeaseAvailable } from "./supervisorBrokerPrompt.js";
 
 const noopLogger: BrowserLogger = Object.assign((_: string) => {}, { verbose: false });
@@ -96,30 +97,23 @@ function hasReusableRuntime(meta: SessionMetadata): meta is SessionMetadata & {
   return Boolean(runtime && (runtime.chromePort || runtime.chromeBrowserWSEndpoint));
 }
 
-function isProjectScopedChatgptUrl(raw: string | null | undefined): boolean {
-  const trimmed = raw?.trim();
-  if (!trimmed) {
-    return false;
-  }
-  try {
-    const parsed = new URL(trimmed);
-    const pathname = parsed.pathname.replace(/\/+$/, "");
-    return /^\/g\/[^/]+\/project$/i.test(pathname);
-  } catch {
-    return false;
-  }
-}
-
-function configuredSupervisorProjectUrl(meta: SessionMetadata): string | undefined {
+function configuredSupervisorScopeUrl(meta: SessionMetadata): string | undefined {
   const configuredProjectUrl =
     meta.browser?.config?.supervisorChatgptUrl?.trim() ??
     meta.browser?.config?.chatgptUrl?.trim() ??
     meta.browser?.config?.url?.trim();
-  return isProjectScopedChatgptUrl(configuredProjectUrl) ? configuredProjectUrl : undefined;
+  if (!configuredProjectUrl) {
+    return undefined;
+  }
+  try {
+    return normalizeChatgptUrl(configuredProjectUrl, "https://chatgpt.com/");
+  } catch {
+    return undefined;
+  }
 }
 
 function runtimeMatchesConfiguredProjectScope(meta: SessionMetadata): boolean {
-  const configuredProjectUrl = configuredSupervisorProjectUrl(meta);
+  const configuredProjectUrl = configuredSupervisorScopeUrl(meta);
   const tabUrl = meta.browser?.runtime?.tabUrl?.trim();
   return Boolean(
     configuredProjectUrl &&
@@ -153,7 +147,7 @@ function isOwnedSupervisorRuntime(meta: SessionMetadata): meta is SessionMetadat
     config.launcher !== "carbonyl" &&
     config.remoteChrome == null &&
     path.resolve(expectedProfileDir) == SUPERVISOR_BROWSER_PROFILE_DIR &&
-    Boolean(configuredSupervisorProjectUrl(meta))
+    Boolean(configuredSupervisorScopeUrl(meta))
   );
 }
 
@@ -189,7 +183,7 @@ async function refreshOwnedSupervisorRuntime(
     );
   }
   const config = meta.browser.config;
-  const configuredProjectUrl = configuredSupervisorProjectUrl(meta);
+  const configuredProjectUrl = configuredSupervisorScopeUrl(meta);
   const configuredProfileDir = config.manualLoginProfileDir?.trim();
   const runtimeProfileDir = runtime.userDataDir?.trim();
   const expectedProfileDir = configuredProfileDir || runtimeProfileDir;
@@ -211,12 +205,12 @@ async function refreshOwnedSupervisorRuntime(
   }
   if (!configuredProjectUrl) {
     throw new Error(
-      "Refusing to attach: owned Oracle hidden browser runtime is missing a dedicated project URL.",
+      "Refusing to attach: owned Oracle hidden browser runtime is missing a configured ChatGPT scope.",
     );
   }
   if (!runtimeMatchesConfiguredProjectScope(meta)) {
     throw new Error(
-      "Refusing to attach: cached Oracle hidden browser tab is outside the configured project scope.",
+      "Refusing to attach: cached Oracle hidden browser tab is outside the configured ChatGPT scope.",
     );
   }
   if (!runtimeHasReusableIdentity(runtime)) {

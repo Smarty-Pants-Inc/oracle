@@ -9,6 +9,7 @@ const {
   closeTab,
   killChrome,
   resolveBrowserConfig,
+  normalizeLocalChromeLaunchConfig,
   readDevToolsPort,
   writeDevToolsActivePort,
   writeChromePid,
@@ -21,6 +22,7 @@ const {
   closeTab: vi.fn(async () => undefined),
   killChrome: vi.fn(async () => undefined),
   resolveBrowserConfig: vi.fn((input: unknown) => input),
+  normalizeLocalChromeLaunchConfig: vi.fn((input: unknown) => input),
   readDevToolsPort: vi.fn(async () => null),
   writeDevToolsActivePort: vi.fn(async () => undefined),
   writeChromePid: vi.fn(async () => undefined),
@@ -79,6 +81,7 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => ({
 }));
 vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
+  normalizeLocalChromeLaunchConfig,
 }));
 vi.mock("../../src/browser/profileState.js", () => ({
   readDevToolsPort,
@@ -121,6 +124,7 @@ describe("gemini-web executor", () => {
     connectWithNewTab.mockReset();
     closeTab.mockClear();
     resolveBrowserConfig.mockClear();
+    normalizeLocalChromeLaunchConfig.mockClear();
     readDevToolsPort.mockReset();
     writeDevToolsActivePort.mockClear();
     writeChromePid.mockClear();
@@ -347,6 +351,12 @@ describe("gemini-web executor", () => {
   });
 
   it("uses DOM automation for gemini deep-think without keychain cookie reads", async () => {
+    launchChrome.mockResolvedValueOnce({
+      port: 9222,
+      pid: 12345,
+      host: "10.0.0.8",
+      kill: killChrome,
+    });
     const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
     const result = await exec({
@@ -359,7 +369,12 @@ describe("gemini-web executor", () => {
     expect(result.answerText).toBe("deep-think answer");
     expect(getCookies).not.toHaveBeenCalled();
     expect(launchChrome).toHaveBeenCalled();
-    expect(connectWithNewTab).toHaveBeenCalled();
+    expect(connectWithNewTab).toHaveBeenCalledWith(
+      9222,
+      expect.any(Function),
+      undefined,
+      "10.0.0.8",
+    );
     expect(closeTab).toHaveBeenCalled();
     expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
   });

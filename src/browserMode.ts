@@ -10,6 +10,9 @@ export {
   DEFAULT_MODEL_STRATEGY,
   DEFAULT_MODEL_TARGET,
   parseDuration,
+  isRootChatgptUrl,
+  isSupervisorScopedChatgptUrl,
   normalizeChatgptUrl,
+  normalizeProjectScopedChatgptUrl,
   isTemporaryChatUrl,
 } from "./browser/index.js";

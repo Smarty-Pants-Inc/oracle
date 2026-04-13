@@ -44,6 +44,39 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   manualLoginCookieSync: false,
 };
 
+export function shouldPreferManagedLocalChromeDefaults(config: {
+  launcher?: BrowserAutomationConfig["launcher"];
+  attachRunning?: boolean;
+  remoteChrome?: BrowserAutomationConfig["remoteChrome"];
+  headless?: BrowserAutomationConfig["headless"];
+}): boolean {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+  if (config.launcher === "carbonyl" || config.attachRunning || config.remoteChrome) {
+    return false;
+  }
+  return !(config.headless ?? DEFAULT_BROWSER_CONFIG.headless);
+}
+
+function allowVisibleChromeLaunchOverride(): boolean {
+  const raw = (process.env.ORACLE_ALLOW_VISIBLE_CHROME ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+export function normalizeLocalChromeLaunchConfig<T extends ResolvedBrowserConfig>(config: T): T {
+  if (allowVisibleChromeLaunchOverride() || !shouldPreferManagedLocalChromeDefaults(config)) {
+    return config;
+  }
+
+  const nextConfig = {
+    ...config,
+    hideWindow: true,
+    keepBrowser: config.keepBrowser || config.manualLogin,
+  };
+  return nextConfig as T;
+}
+
 export function resolveBrowserConfig(
   config: BrowserAutomationConfig | undefined,
 ): ResolvedBrowserConfig {

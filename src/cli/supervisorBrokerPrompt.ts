@@ -14,7 +14,7 @@ import { buildConsultBrowserConfig } from "../mcp/tools/consult.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type { BrowserModelStrategy } from "../browser/types.js";
 import { CHATGPT_URL } from "../browser/constants.js";
-import { isTemporaryChatUrl, normalizeChatgptUrl } from "../browser/utils.js";
+import { isSupervisorScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../browser/sessionRunner.js";
@@ -185,20 +185,6 @@ function parseSupervisorSessionTimestamp(meta: SessionMetadata): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function isProjectScopedChatgptUrl(raw: string | null | undefined): boolean {
-  const normalized = normalizeChatgptUrl(raw, CHATGPT_URL);
-  if (isTemporaryChatUrl(normalized)) {
-    return false;
-  }
-  try {
-    const parsed = new URL(normalized);
-    const pathname = parsed.pathname.replace(/\/+$/, "");
-    return /^\/g\/[^/]+\/project$/i.test(pathname);
-  } catch {
-    return false;
-  }
-}
-
 function resolveConfiguredSupervisorChatgptUrl(
   userConfig: UserConfig,
   env: Record<string, string | undefined>,
@@ -208,19 +194,19 @@ function resolveConfiguredSupervisorChatgptUrl(
     userConfig.browser?.supervisorChatgptUrl?.trim() ||
     null;
   if (explicitSupervisorUrl) {
-    if (!isProjectScopedChatgptUrl(explicitSupervisorUrl)) {
+    if (!isSupervisorScopedChatgptUrl(explicitSupervisorUrl)) {
       throw new Error(
-        "Supervisor browser requires ORACLE_SUPERVISOR_CHATGPT_URL/browser.supervisorChatgptUrl to be a dedicated /g/.../project URL.",
+        "Supervisor browser requires ORACLE_SUPERVISOR_CHATGPT_URL/browser.supervisorChatgptUrl to be the ChatGPT root or a /g/.../project URL.",
       );
     }
     return normalizeChatgptUrl(explicitSupervisorUrl, CHATGPT_URL);
   }
   const configuredBrowserUrl =
     userConfig.browser?.chatgptUrl?.trim() || userConfig.browser?.url?.trim() || null;
-  if (!configuredBrowserUrl || !isProjectScopedChatgptUrl(configuredBrowserUrl)) {
-    return null;
+  if (configuredBrowserUrl && isSupervisorScopedChatgptUrl(configuredBrowserUrl)) {
+    return normalizeChatgptUrl(configuredBrowserUrl, CHATGPT_URL);
   }
-  return normalizeChatgptUrl(configuredBrowserUrl, CHATGPT_URL);
+  return normalizeChatgptUrl(CHATGPT_URL, CHATGPT_URL);
 }
 
 function findRecentSupervisorProjectUrl(
@@ -240,7 +226,7 @@ function findRecentSupervisorProjectUrl(
       continue;
     }
     const candidateUrl = config.chatgptUrl ?? config.url ?? null;
-    if (isProjectScopedChatgptUrl(candidateUrl)) {
+    if (isSupervisorScopedChatgptUrl(candidateUrl)) {
       return normalizeChatgptUrl(candidateUrl, CHATGPT_URL);
     }
   }
@@ -258,9 +244,7 @@ async function resolveSupervisorChatgptUrl({
   if (configured) {
     return configured;
   }
-  throw new Error(
-    "Supervisor browser requires an explicit dedicated ChatGPT project URL. Set ORACLE_SUPERVISOR_CHATGPT_URL, browser.supervisorChatgptUrl, or browser.chatgptUrl/browser.url to a /g/.../project URL instead of relying on recovered session state.",
-  );
+  return normalizeChatgptUrl(CHATGPT_URL, CHATGPT_URL);
 }
 
 function normalizeSupervisorText(value: string | null | undefined): string | null {

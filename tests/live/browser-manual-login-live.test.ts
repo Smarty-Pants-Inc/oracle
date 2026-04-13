@@ -11,7 +11,7 @@ import {
   verifyDevToolsReachable,
 } from "../../src/browser/profileState.js";
 import { acquireLiveTestLock, releaseLiveTestLock } from "./liveLock.js";
-import { getCookies } from "@steipete/sweet-cookie";
+import { hasChatGptSession, requireChatgptLiveProjectUrls } from "./chatgptLive.js";
 
 const LIVE = process.env.ORACLE_LIVE_TEST === "1";
 const MANUAL = process.env.ORACLE_LIVE_TEST_MANUAL_LOGIN === "1";
@@ -61,23 +61,10 @@ async function waitForPageTarget(host: string, port: number, timeoutMs = 30_000)
     "preserves DevToolsActivePort when connection drops but Chrome stays running",
     async () => {
       const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-manual-login-"));
-      const { cookies } = await getCookies({
-        url: "https://chatgpt.com",
-        origins: ["https://chatgpt.com", "https://chat.openai.com", "https://atlas.openai.com"],
-        browsers: ["chrome"],
-        mode: "merge",
-        chromeProfile: "Default",
-        timeoutMs: 5_000,
-      });
-      const hasSession = cookies.some((cookie) =>
-        cookie.name.startsWith("__Secure-next-auth.session-token"),
-      );
-      if (!hasSession) {
-        console.warn(
-          "Skipping manual-login live test (missing __Secure-next-auth.session-token). Open chatgpt.com in Chrome and retry.",
-        );
+      if (!(await hasChatGptSession("manual-login live test"))) {
         return;
       }
+      const [projectUrl] = requireChatgptLiveProjectUrls();
 
       await acquireLiveTestLock("chatgpt-browser");
       try {
@@ -91,6 +78,7 @@ async function waitForPageTarget(host: string, port: number, timeoutMs = 30_000)
             manualLoginCookieSync: true,
             chromeProfile: "Default",
             keepBrowser: false,
+            url: projectUrl,
             timeoutMs: 180_000,
           },
         })
@@ -99,8 +87,8 @@ async function waitForPageTarget(host: string, port: number, timeoutMs = 30_000)
             runError = error instanceof Error ? error : new Error(String(error));
             return { status: "rejected" as const, error: runError };
           });
-
         const port = await waitForDevToolsPort(profileDir, 60_000, () => runError);
+
         const host = "127.0.0.1";
         const targetId = await waitForPageTarget(host, port, 60_000);
 

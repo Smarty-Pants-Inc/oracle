@@ -30,11 +30,12 @@ import {
   hideChromeWindow,
   captureFrontmostProcess,
   startChromeFocusGuard,
+  finalizeChromeFocusProtection,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
 } from "./chromeLifecycle.js";
 import { maybeReuseRunningChrome } from "./index.js";
-import { resolveBrowserConfig } from "./config.js";
+import { normalizeLocalChromeLaunchConfig, resolveBrowserConfig } from "./config.js";
 import { syncCookies } from "./cookies.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -227,7 +228,7 @@ async function withHiddenExistingChrome<T>(
   logger: BrowserLogger,
   action: (liveRuntime: BrowserRuntimeMetadata) => Promise<T>,
 ): Promise<T> {
-  const resolved = resolveBrowserConfig(config ?? {});
+  const resolved = normalizeLocalChromeLaunchConfig(resolveBrowserConfig(config ?? {}));
   const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
   if (process.platform !== "darwin" || resolved.headless || !resolved.hideWindow) {
     return action(liveRuntime);
@@ -243,8 +244,7 @@ async function withHiddenExistingChrome<T>(
     await hideChromeWindow(chrome, logger, frontmostTarget);
     return await action(liveRuntime);
   } finally {
-    stopChromeFocusGuard();
-    await hideChromeWindow(chrome, logger).catch(() => undefined);
+    await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
   }
 }
 
@@ -369,7 +369,7 @@ async function refreshOwnedManualLoginRuntime(
   config: BrowserSessionConfig | undefined,
   logger: BrowserLogger,
 ): Promise<BrowserRuntimeMetadata> {
-  const resolved = resolveBrowserConfig(config);
+  const resolved = normalizeLocalChromeLaunchConfig(resolveBrowserConfig(config));
   if (
     !resolved.manualLogin ||
     resolved.attachRunning ||
@@ -601,9 +601,10 @@ async function ensureConversationOpenForRuntime(
   const expectedConversationId = getRuntimeConversationId(runtime);
   const href = await readCurrentHref(Runtime);
   const inferredProjectBaseUrl =
-    !runtime.tabUrl || runtime.tabUrl.trim().length === 0 ? projectBaseUrlFromHref(href) : null;
+    projectBaseUrlFromHref(runtime.tabUrl ?? "") ??
+    (!runtime.tabUrl || runtime.tabUrl.trim().length === 0 ? projectBaseUrlFromHref(href) : null);
   const conversationUrl = buildConversationUrl(runtime, inferredProjectBaseUrl ?? baseUrl);
-  const projectBaseUrl = normalizeProjectBaseUrl(baseUrl);
+  const projectBaseUrl = normalizeProjectBaseUrl(baseUrl) ?? inferredProjectBaseUrl;
   if (isFreshChatHomeUrl(href) && !expectedConversationId) {
     return;
   }
@@ -1800,24 +1801,25 @@ async function resumeBrowserSessionViaNewChrome(
   deps: ReattachDeps,
 ): Promise<ReattachResult> {
   const resolved = resolveBrowserConfig(config ?? {});
+  const launchConfig = normalizeLocalChromeLaunchConfig(resolved);
   const ensurePromptReadyForFollowup = deps.ensurePromptReady ?? ensurePromptReady;
-  const manualLogin = Boolean(resolved.manualLogin);
+  const manualLogin = Boolean(launchConfig.manualLogin);
   const userDataDir = manualLogin
-    ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
+    ? (launchConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
     : await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
   const shouldHideChromeWindow =
-    resolved.launcher !== "carbonyl" && !resolved.headless && resolved.hideWindow;
+    launchConfig.launcher !== "carbonyl" && !launchConfig.headless && launchConfig.hideWindow;
   const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
-        waitForPortMs: resolved.reuseChromeWaitMs,
+        waitForPortMs: launchConfig.reuseChromeWaitMs,
         failOnLiveChromeWithoutDevtools: true,
       })
     : null;
-  const chrome = reusedChrome ?? (await launchChrome(resolved, userDataDir, logger));
+  const chrome = reusedChrome ?? (await launchChrome(launchConfig, userDataDir, logger));
   const chromeHost = (chrome as unknown as { host?: string }).host ?? "127.0.0.1";
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
@@ -1843,34 +1845,45 @@ async function resumeBrowserSessionViaNewChrome(
     }
 
     let appliedCookies = 0;
-    if (!manualLogin && resolved.cookieSync) {
-      appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
-        allowErrors: resolved.allowCookieErrors,
-        filterNames: resolved.cookieNames ?? undefined,
-        inlineCookies: resolved.inlineCookies ?? undefined,
-        cookiePath: resolved.chromeCookiePath ?? undefined,
-        waitMs: resolved.cookieSyncWaitMs ?? 0,
-      });
+    if (!manualLogin && launchConfig.cookieSync) {
+      appliedCookies = await syncCookies(
+        Network,
+        launchConfig.url,
+        launchConfig.chromeProfile,
+        logger,
+        {
+          allowErrors: launchConfig.allowCookieErrors,
+          filterNames: launchConfig.cookieNames ?? undefined,
+          inlineCookies: launchConfig.inlineCookies ?? undefined,
+          cookiePath: launchConfig.chromeCookiePath ?? undefined,
+          waitMs: launchConfig.cookieSyncWaitMs ?? 0,
+        },
+      );
     }
 
     await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
-    await ensureNotBlocked(Runtime, resolved.headless, logger);
+    await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     await ensureLoggedIn(Runtime, logger, { appliedCookies });
-    if (resolved.url !== CHATGPT_URL) {
-      await navigateToChatGPT(Page, Runtime, resolved.url, logger);
-      await ensureNotBlocked(Runtime, resolved.headless, logger);
+    if (launchConfig.url !== CHATGPT_URL) {
+      await navigateToChatGPT(Page, Runtime, launchConfig.url, logger);
+      await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
-    await ensurePromptReadyForFollowup(Runtime, resolved.inputTimeoutMs, logger);
+    await ensurePromptReadyForFollowup(Runtime, launchConfig.inputTimeoutMs, logger);
 
-    const conversationUrl = buildConversationUrl(runtime, resolved.url);
+    const conversationUrl = buildConversationUrl(runtime, launchConfig.url);
     if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
       logger(
         conversationUrl
           ? `Reopening conversation at ${conversationUrl}`
           : "Reopening stored Oracle conversation.",
       );
-      await ensureConversationOpenForRuntime(Runtime, runtime, deps.promptPreview, resolved.url);
-      await ensureNotBlocked(Runtime, resolved.headless, logger);
+      await ensureConversationOpenForRuntime(
+        Runtime,
+        runtime,
+        deps.promptPreview,
+        launchConfig.url,
+      );
+      await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
 
     const result = await captureConversationResponse(
@@ -1887,7 +1900,7 @@ async function resumeBrowserSessionViaNewChrome(
       await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
     }
 
-    if (!resolved.keepBrowser && !reusedChrome) {
+    if (!launchConfig.keepBrowser && !reusedChrome) {
       try {
         await chrome.kill();
       } catch {
@@ -1916,9 +1929,9 @@ async function resumeBrowserSessionViaNewChrome(
     };
   } finally {
     if (shouldHideChromeWindow) {
-      await hideChromeWindow(chrome, logger).catch(() => undefined);
+      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+      stopChromeFocusGuard = null;
     }
-    stopChromeFocusGuard?.();
   }
 }
 
@@ -2152,23 +2165,24 @@ async function continueBrowserSessionViaNewChrome(
   deps: ReattachDeps,
 ): Promise<ReattachResult> {
   const resolved = resolveBrowserConfig(config ?? {});
-  const manualLogin = Boolean(resolved.manualLogin);
+  const launchConfig = normalizeLocalChromeLaunchConfig(resolved);
+  const manualLogin = Boolean(launchConfig.manualLogin);
   const userDataDir = manualLogin
-    ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
+    ? (launchConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
     : await mkdtemp(path.join(os.tmpdir(), "oracle-followup-"));
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
   const shouldHideChromeWindow =
-    resolved.launcher !== "carbonyl" && !resolved.headless && resolved.hideWindow;
+    launchConfig.launcher !== "carbonyl" && !launchConfig.headless && launchConfig.hideWindow;
   const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
-        waitForPortMs: resolved.reuseChromeWaitMs,
+        waitForPortMs: launchConfig.reuseChromeWaitMs,
         failOnLiveChromeWithoutDevtools: true,
       })
     : null;
-  const chrome = reusedChrome ?? (await launchChrome(resolved, userDataDir, logger));
+  const chrome = reusedChrome ?? (await launchChrome(launchConfig, userDataDir, logger));
   const chromeHost = (chrome as unknown as { host?: string }).host ?? "127.0.0.1";
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
@@ -2194,38 +2208,49 @@ async function continueBrowserSessionViaNewChrome(
     }
 
     let appliedCookies = 0;
-    if (!manualLogin && resolved.cookieSync) {
-      appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
-        allowErrors: resolved.allowCookieErrors,
-        filterNames: resolved.cookieNames ?? undefined,
-        inlineCookies: resolved.inlineCookies ?? undefined,
-        cookiePath: resolved.chromeCookiePath ?? undefined,
-        waitMs: resolved.cookieSyncWaitMs ?? 0,
-      });
+    if (!manualLogin && launchConfig.cookieSync) {
+      appliedCookies = await syncCookies(
+        Network,
+        launchConfig.url,
+        launchConfig.chromeProfile,
+        logger,
+        {
+          allowErrors: launchConfig.allowCookieErrors,
+          filterNames: launchConfig.cookieNames ?? undefined,
+          inlineCookies: launchConfig.inlineCookies ?? undefined,
+          cookiePath: launchConfig.chromeCookiePath ?? undefined,
+          waitMs: launchConfig.cookieSyncWaitMs ?? 0,
+        },
+      );
     }
 
     await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
-    await ensureNotBlocked(Runtime, resolved.headless, logger);
+    await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     await ensureLoggedIn(Runtime, logger, { appliedCookies });
-    if (resolved.url !== CHATGPT_URL) {
-      await navigateToChatGPT(Page, Runtime, resolved.url, logger);
-      await ensureNotBlocked(Runtime, resolved.headless, logger);
+    if (launchConfig.url !== CHATGPT_URL) {
+      await navigateToChatGPT(Page, Runtime, launchConfig.url, logger);
+      await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
-    await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
+    await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
 
-    const conversationUrl = buildConversationUrl(runtime, resolved.url);
+    const conversationUrl = buildConversationUrl(runtime, launchConfig.url);
     if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
       logger(
         conversationUrl
           ? `Reopening conversation at ${conversationUrl}`
           : "Reopening stored Oracle conversation.",
       );
-      await ensureConversationOpenForRuntime(Runtime, runtime, deps.promptPreview, resolved.url);
-      await ensureNotBlocked(Runtime, resolved.headless, logger);
-      await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
+      await ensureConversationOpenForRuntime(
+        Runtime,
+        runtime,
+        deps.promptPreview,
+        launchConfig.url,
+      );
+      await ensureNotBlocked(Runtime, launchConfig.headless, logger);
+      await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
     }
 
-    await applyConversationSettings(Runtime, logger, resolved, deps);
+    await applyConversationSettings(Runtime, logger, launchConfig, deps);
     let submittedPrompt: string;
     let submittedBaselineTurns: number | null = null;
     let submittedBaselineAssistant: {
@@ -2302,13 +2327,13 @@ async function continueBrowserSessionViaNewChrome(
         Math.max(0, resolved.assistantRecheckDelayMs ?? 0) > 0 &&
         Math.max(0, resolved.assistantRecheckTimeoutMs ?? 0) > 0;
       if (isAssistantEmptyResponseError(error) && !assistantRecheckConfigured) {
-        if (!resolved.keepBrowser && !reusedChrome) {
+        if (!launchConfig.keepBrowser && !reusedChrome) {
           await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
         }
         throw error;
       }
       if (isAssistantRateLimitError(error)) {
-        if (!resolved.keepBrowser && !reusedChrome) {
+        if (!launchConfig.keepBrowser && !reusedChrome) {
           await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
         }
         throw new BrowserAutomationError(
@@ -2340,7 +2365,7 @@ async function continueBrowserSessionViaNewChrome(
           baselineAssistant: submittedBaselineAssistant,
         });
       } finally {
-        if (!resolved.keepBrowser && !reusedChrome) {
+        if (!launchConfig.keepBrowser && !reusedChrome) {
           await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
         }
       }
@@ -2357,7 +2382,7 @@ async function continueBrowserSessionViaNewChrome(
       await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
     }
 
-    if (!resolved.keepBrowser && !reusedChrome) {
+    if (!launchConfig.keepBrowser && !reusedChrome) {
       await cleanupReopenedChromeLaunch(chrome, userDataDir, manualLogin, logger);
     }
 
@@ -2372,9 +2397,9 @@ async function continueBrowserSessionViaNewChrome(
     };
   } finally {
     if (shouldHideChromeWindow) {
-      await hideChromeWindow(chrome, logger).catch(() => undefined);
+      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+      stopChromeFocusGuard = null;
     }
-    stopChromeFocusGuard?.();
   }
 }
 

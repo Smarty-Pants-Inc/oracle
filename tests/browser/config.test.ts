@@ -10,6 +10,8 @@ describe("resolveBrowserConfig", () => {
     const isWindows = process.platform === "win32";
     expect(resolved.cookieSync).toBe(!isWindows);
     expect(resolved.headless).toBe(false);
+    expect(resolved.keepBrowser).toBe(false);
+    expect(resolved.hideWindow).toBe(false);
     expect(resolved.manualLogin).toBe(isWindows);
     expect(resolved.profileLockTimeoutMs).toBe(300_000);
   });

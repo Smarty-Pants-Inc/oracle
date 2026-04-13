@@ -4,46 +4,47 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { runBrowserMode } from "../../src/browser/index.js";
 import { acquireLiveTestLock, releaseLiveTestLock } from "./liveLock.js";
-import { getCookies } from "@steipete/sweet-cookie";
+import { hasChatGptSession, requireChatgptLiveProjectUrls } from "./chatgptLive.js";
 
 const LIVE = process.env.ORACLE_LIVE_TEST === "1";
 const FAST = process.env.ORACLE_LIVE_TEST_FAST === "1";
 
-async function hasChatGptSession(): Promise<boolean> {
-  try {
-    const { cookies } = await getCookies({
-      url: "https://chatgpt.com",
-      origins: ["https://chatgpt.com", "https://chat.openai.com", "https://atlas.openai.com"],
-      browsers: ["chrome"],
-      mode: "merge",
-      chromeProfile: "Default",
-      timeoutMs: 5_000,
-    });
-    return cookies.some((cookie) => cookie.name.startsWith("__Secure-next-auth.session-token"));
-  } catch {
-    return false;
-  }
-}
-
 (LIVE && FAST ? describe : describe.skip)("ChatGPT browser fast live", () => {
   test(
-    "falls back when a project URL is missing",
+    "opens a configured project URL before sending",
     async () => {
-      if (!(await hasChatGptSession())) {
-        console.warn("Skipping fast live test (missing ChatGPT session cookie).");
+      if (!(await hasChatGptSession("fast live test"))) {
         return;
       }
+      const projectUrls = requireChatgptLiveProjectUrls();
       await acquireLiveTestLock("chatgpt-browser");
       try {
-        const promptToken = `fast fallback ${Date.now()}`;
-        const result = await runBrowserMode({
-          prompt: `${promptToken}\nReply with OK only.`,
-          config: {
-            url: "https://chatgpt.com/g/does-not-exist/project",
-            timeoutMs: 180_000,
-            inputTimeoutMs: 20_000,
-          },
-        });
+        let result: Awaited<ReturnType<typeof runBrowserMode>> | null = null;
+        let lastError = "";
+        for (const projectUrl of projectUrls) {
+          try {
+            result = await runBrowserMode({
+              prompt: `fast project smoke ${Date.now()}\nReply with OK only.`,
+              config: {
+                url: projectUrl,
+                timeoutMs: 180_000,
+                inputTimeoutMs: 20_000,
+              },
+            });
+            break;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            lastError = message;
+            if (message.includes("project URL missing")) {
+              console.warn(`Project URL unavailable (${projectUrl}); trying fallback.`);
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!result) {
+          throw new Error(`Live project smoke did not complete: ${lastError || "unknown error"}`);
+        }
         expect(result.answerText.toLowerCase()).toContain("ok");
       } finally {
         await releaseLiveTestLock("chatgpt-browser");
@@ -55,10 +56,10 @@ async function hasChatGptSession(): Promise<boolean> {
   test(
     "uploads attachments and sends the prompt (gpt-5.2)",
     async () => {
-      if (!(await hasChatGptSession())) {
-        console.warn("Skipping fast live test (missing ChatGPT session cookie).");
+      if (!(await hasChatGptSession("fast live attachment test"))) {
         return;
       }
+      const projectUrls = requireChatgptLiveProjectUrls();
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-fast-live-"));
       await acquireLiveTestLock("chatgpt-browser");
       try {
@@ -68,17 +69,38 @@ async function hasChatGptSession(): Promise<boolean> {
         await writeFile(fileB, `fast file b ${Date.now()}`);
         const [statA, statB] = await Promise.all([stat(fileA), stat(fileB)]);
         const promptToken = `fast upload ${Date.now()}`;
-        const result = await runBrowserMode({
-          prompt: `${promptToken}\nReply with OK only.`,
-          attachments: [
-            { path: fileA, displayPath: "oracle-fast-a.txt", sizeBytes: statA.size },
-            { path: fileB, displayPath: "oracle-fast-b.txt", sizeBytes: statB.size },
-          ],
-          config: {
-            timeoutMs: 240_000,
-            inputTimeoutMs: 60_000,
-          },
-        });
+        let result: Awaited<ReturnType<typeof runBrowserMode>> | null = null;
+        let lastError = "";
+        for (const projectUrl of projectUrls) {
+          try {
+            result = await runBrowserMode({
+              prompt: `${promptToken}\nReply with OK only.`,
+              attachments: [
+                { path: fileA, displayPath: "oracle-fast-a.txt", sizeBytes: statA.size },
+                { path: fileB, displayPath: "oracle-fast-b.txt", sizeBytes: statB.size },
+              ],
+              config: {
+                url: projectUrl,
+                timeoutMs: 240_000,
+                inputTimeoutMs: 60_000,
+              },
+            });
+            break;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            lastError = message;
+            if (message.includes("project URL missing")) {
+              console.warn(`Project URL unavailable (${projectUrl}); trying fallback.`);
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!result) {
+          throw new Error(
+            `Live attachment upload did not complete: ${lastError || "unknown error"}`,
+          );
+        }
         expect(result.answerText.toLowerCase()).toContain("ok");
       } finally {
         await releaseLiveTestLock("chatgpt-browser");

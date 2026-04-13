@@ -12,6 +12,7 @@ import {
   captureFrontmostProcess,
   hideChromeWindow,
   startChromeFocusGuard,
+  finalizeChromeFocusProtection,
 } from "../browser/chromeLifecycle.js";
 import { sessionStore } from "../sessionStore.js";
 import {
@@ -65,6 +66,7 @@ interface ChromeFocusDeps {
   captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
   startChromeFocusGuard: typeof startChromeFocusGuard;
+  finalizeChromeFocusProtection: typeof finalizeChromeFocusProtection;
 }
 
 interface SupervisorRuntimeDeps {
@@ -76,6 +78,7 @@ const chromeFocusDeps: ChromeFocusDeps = {
   captureFrontmostProcess,
   hideChromeWindow,
   startChromeFocusGuard,
+  finalizeChromeFocusProtection,
 };
 
 const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
@@ -131,8 +134,12 @@ async function withChromeFocusProtection<T>(
       .catch(() => undefined);
     return await action();
   } finally {
-    stopFocusGuard();
-    await deps.hideChromeWindow(chrome, supervisorChromeLogger).catch(() => undefined);
+    await deps.finalizeChromeFocusProtection(
+      chrome,
+      supervisorChromeLogger,
+      stopFocusGuard,
+      frontmostProcess,
+    );
   }
 }
 

@@ -124,6 +124,69 @@ export function normalizeChatgptUrl(raw: string | null | undefined, fallback: st
   return parsed.toString();
 }
 
+export function isProjectScopedChatgptUrl(
+  raw: string | null | undefined,
+  fallback = "https://chatgpt.com/",
+): boolean {
+  const normalized = normalizeChatgptUrl(raw, fallback);
+  if (isTemporaryChatUrl(normalized)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "chatgpt.com" && host !== "chat.openai.com") {
+      return false;
+    }
+    return /^\/g\/[^/]+\/project\/?$/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isRootChatgptUrl(
+  raw: string | null | undefined,
+  fallback = "https://chatgpt.com/",
+): boolean {
+  const normalized = normalizeChatgptUrl(raw, fallback);
+  if (isTemporaryChatUrl(normalized)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "chatgpt.com" && host !== "chat.openai.com") {
+      return false;
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return pathname === "" || pathname === "/";
+  } catch {
+    return false;
+  }
+}
+
+export function isSupervisorScopedChatgptUrl(
+  raw: string | null | undefined,
+  fallback = "https://chatgpt.com/",
+): boolean {
+  return isRootChatgptUrl(raw, fallback) || isProjectScopedChatgptUrl(raw, fallback);
+}
+
+export function normalizeProjectScopedChatgptUrl(
+  raw: string | null | undefined,
+  fallback: string,
+  errorMessage: string,
+): string {
+  const normalized = normalizeChatgptUrl(raw, fallback);
+  const parsed = new URL(normalized);
+  const host = parsed.hostname.toLowerCase();
+  const isChatGptHost = host === "chatgpt.com" || host === "chat.openai.com";
+  if (isChatGptHost && !isProjectScopedChatgptUrl(normalized, fallback)) {
+    throw new Error(errorMessage);
+  }
+  return normalized;
+}
+
 export function isTemporaryChatUrl(url: string): boolean {
   try {
     const parsed = new URL(url);

@@ -29,7 +29,12 @@ export function isAttachableChatTarget(target: TargetInfoLite | undefined): bool
     return false;
   }
   if (isPageTarget(target)) {
-    return true;
+    const url = target.url || "";
+    return (
+      isConversationShellTargetUrl(url) ||
+      isProjectConversationTargetUrl(url) ||
+      Boolean(extractConversationIdFromUrl(url))
+    );
   }
   const url = target.url || "";
   if (isProjectConversationTargetUrl(url)) {
@@ -332,7 +337,14 @@ function escapeRegex(literal: string): string {
 export function conversationHrefMatchesConfiguredScope(href: string, baseUrl: string): boolean {
   const projectBaseUrl = normalizeProjectBaseUrl(baseUrl);
   if (!projectBaseUrl) {
-    return true;
+    if (!isConversationShellTargetUrl(baseUrl)) {
+      return false;
+    }
+    return (
+      isConversationShellTargetUrl(href) ||
+      isProjectConversationTargetUrl(href) ||
+      Boolean(extractConversationIdFromUrl(href))
+    );
   }
   try {
     const base = new URL(projectBaseUrl);

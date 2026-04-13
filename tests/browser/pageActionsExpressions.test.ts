@@ -24,8 +24,28 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("const topLevelRoots = uniqueRoots.filter");
     expect(expression).toContain("aggregatedRoots.map((payload) => payload.text).join('\\n\\n')");
     expect(expression).toContain(
-      "const candidateScore = candidate.text.length + candidate.rank * 32",
+      "const candidateScore = candidate.rank * 10000 + candidate.text.length",
     );
+  });
+
+  test("assistant extractor preserves inline button-backed content while removing response actions", () => {
+    const expression = buildAssistantExtractorForTest("capture");
+    expect(expression).toContain('[aria-label="Response actions"]');
+    expect(expression).toContain('[data-testid*="good-response-turn-action-button"]');
+    expect(expression).not.toContain("'button',");
+    expect(expression).not.toContain("'[role=\"button\"]',");
+  });
+
+  test("assistant extractor prefers the last assistant message inside a grouped turn", () => {
+    const expression = buildAssistantExtractorForTest("capture");
+    expect(expression).toContain("const assistantMessages = Array.from(turn.querySelectorAll");
+    expect(expression).toContain("assistantMessages[assistantMessages.length - 1] ?? turn");
+  });
+
+  test("assistant extractor strongly prefers specific assistant roots over longer turn wrappers", () => {
+    const expression = buildAssistantExtractorForTest("capture");
+    expect(expression).toContain("current.rank * 10000 + current.text.length");
+    expect(expression).toContain("candidate.rank * 10000 + candidate.text.length");
   });
 
   test("conversation debug expression references conversation selector", () => {

@@ -1305,13 +1305,15 @@ function buildAssistantExtractor(functionName: string): string {
         return null;
       }
       const discardSelector = [
-        'button',
-        '[role="button"]',
         'nav',
         'aside',
         'form',
+        '[aria-label="Response actions"]',
+        '[role="group"][aria-label="Response actions"]',
         FINISHED_SELECTOR,
         '[data-testid*="copy-turn-action-button"]',
+        '[data-testid*="good-response-turn-action-button"]',
+        '[data-testid*="bad-response-turn-action-button"]',
         '[data-testid*="turn-action"]',
         '[data-testid*="message-actions"]',
       ]
@@ -1338,8 +1340,8 @@ function buildAssistantExtractor(functionName: string): string {
       if (!current) {
         return candidate;
       }
-      const currentScore = current.text.length + current.rank * 32;
-      const candidateScore = candidate.text.length + candidate.rank * 32;
+      const currentScore = current.rank * 10000 + current.text.length;
+      const candidateScore = candidate.rank * 10000 + candidate.text.length;
       if (candidateScore > currentScore) {
         return candidate;
       }
@@ -1371,7 +1373,11 @@ function buildAssistantExtractor(functionName: string): string {
       if (!isAssistantTurn(turn)) {
         continue;
       }
-      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) ?? turn;
+      const assistantMessages = Array.from(turn.querySelectorAll(ASSISTANT_SELECTOR)).filter(
+        (node) => node instanceof HTMLElement,
+      );
+      const messageRoot =
+        assistantMessages[assistantMessages.length - 1] ?? turn;
       expandCollapsibles(messageRoot);
       const candidateRoots = [];
       if (messageRoot.matches?.(CONTENT_SELECTOR)) {

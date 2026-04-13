@@ -101,7 +101,7 @@ describe("resumeBrowserSession", () => {
     expect(captureAssistantMarkdown).toHaveBeenCalled();
   });
 
-  test("navigates directly to the cached conversation url before sidebar recovery", async () => {
+  test("reopens the cached conversation from the project shell via sidebar recovery", async () => {
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
@@ -128,6 +128,15 @@ describe("resumeBrowserSession", () => {
       if (navigateMatch) {
         currentHref = JSON.parse(navigateMatch[1] ?? '""');
         return { result: { value: true } };
+      }
+      if (
+        expression.includes("const conversationId =") &&
+        expression.includes(JSON.stringify(runtime.conversationId))
+      ) {
+        currentHref = runtime.tabUrl;
+        return {
+          result: { value: { ok: true, href: runtime.tabUrl, count: 1, scope: "project" } },
+        };
       }
       if (expression.includes("document.querySelectorAll(")) {
         return { result: { value: 7 } };
@@ -160,6 +169,11 @@ describe("resumeBrowserSession", () => {
 
     expect(result.answerMarkdown).toBe("direct-nav-md");
     expect(currentHref).toBe(runtime.tabUrl);
+    expect(
+      evaluate.mock.calls.some((call) =>
+        String(call[0]?.expression ?? "").includes("const conversationId ="),
+      ),
+    ).toBe(true);
   });
 
   test("jumps straight to the stored oracle conversation when reattach starts on the wrong project thread", async () => {
@@ -1366,6 +1380,14 @@ describe("resumeBrowserSession", () => {
         return { result: { value: 2 } };
       }
       if (
+        expression.includes(
+          `window.location.href = ${JSON.stringify("https://chatgpt.com/g/g-p-example-oracle/project")}`,
+        )
+      ) {
+        currentHref = "https://chatgpt.com/g/g-p-example-oracle/project";
+        return { result: { value: true } };
+      }
+      if (
         expression.includes("const conversationId =") &&
         expression.includes(JSON.stringify(runtime.conversationId))
       ) {
@@ -1978,8 +2000,12 @@ describe("resumeBrowserSession", () => {
     vi.resetModules();
     const frontmostTarget = { name: "Zed", pid: 77 };
     const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
+    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop, restoreTarget) => {
+      await hideChromeWindow(chrome as never, loggerArg as never, restoreTarget as never);
+      stop?.();
+    });
     vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
       const original = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
         "../../src/browser/chromeLifecycle.js",
@@ -1989,6 +2015,7 @@ describe("resumeBrowserSession", () => {
         captureFrontmostProcess,
         hideChromeWindow,
         startChromeFocusGuard,
+        finalizeChromeFocusProtection,
       };
     });
 
@@ -2056,7 +2083,7 @@ describe("resumeBrowserSession", () => {
     expect(captureFrontmostProcess).toHaveBeenCalledWith(logger);
     expect(hideChromeWindow).toHaveBeenCalledTimes(2);
     expect(hideChromeWindow).toHaveBeenNthCalledWith(1, { pid: 4242 }, logger, frontmostTarget);
-    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, { pid: 4242 }, logger);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, { pid: 4242 }, logger, frontmostTarget);
     expect(startChromeFocusGuard).toHaveBeenCalledWith({ pid: 4242 }, logger, frontmostTarget);
     expect(hideChromeWindow.mock.invocationCallOrder[0]).toBeLessThan(
       connectMock.mock.invocationCallOrder[0],
@@ -3774,6 +3801,33 @@ describe("reattach helpers", () => {
     );
   });
 
+  test("root-scoped supervisor scope only accepts root chatgpt tabs and root conversations", () => {
+    expect(
+      conversationHrefMatchesConfiguredScope("https://chatgpt.com/", "https://chatgpt.com/"),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/c/root-thread",
+        "https://chatgpt.com/",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example/project",
+        "https://chatgpt.com/",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example-oracle/c/root-thread",
+        "https://chatgpt.com/",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope("https://example.com/docs", "https://chatgpt.com/"),
+    ).toBe(false);
+  });
+
   test("treats finalizing-answer status as transient during reattach", () => {
     expect(isTransientReattachAnswer("ChatGPT said:\nFinalizing answer")).toBe(true);
     expect(isTransientReattachAnswer("Finalizing answer")).toBe(true);
@@ -3918,6 +3972,15 @@ describe("reattach helpers", () => {
     ];
 
     expect(pickTarget(targets, { chromeTargetId: "t-2" })).toEqual(targets[1]);
+  });
+
+  test("pickTarget refuses non-chat page targets even when chromeTargetId points at them", () => {
+    const targets = [
+      { targetId: "t-docs", type: "page", url: "https://example.com/docs" },
+      { targetId: "t-chat", type: "page", url: "https://chatgpt.com/c/first" },
+    ];
+
+    expect(pickTarget(targets, { chromeTargetId: "t-docs" })).toBeUndefined();
   });
 
   test("pickTarget ignores a stale chromeTargetId when tabUrl points elsewhere", () => {

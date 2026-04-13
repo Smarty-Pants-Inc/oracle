@@ -10,6 +10,7 @@ import {
   normalizeChatgptUrl,
   parseDuration,
 } from "../browserMode.js";
+import { shouldPreferManagedLocalChromeDefaults } from "../browser/config.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type { BrowserLauncher, BrowserModelStrategy } from "../browser/types.js";
 import type { CookieParam } from "../browser/types.js";
@@ -138,6 +139,12 @@ export async function buildBrowserConfig(
     remoteChrome = parseRemoteChromeTarget(options.remoteChrome);
   }
   const attachRunning = options.browserAttachRunning === true;
+  const preferManagedLocalChrome = shouldPreferManagedLocalChromeDefaults({
+    launcher,
+    attachRunning,
+    remoteChrome,
+    headless: isCarbonyl ? false : options.browserHeadless,
+  });
   validateAttachRunningOptions(options, {
     attachRunning,
     hasInlineCookies: Boolean(inline?.cookies),
@@ -206,14 +213,20 @@ export async function buildBrowserConfig(
     inlineCookies: inline?.cookies,
     inlineCookiesSource: inline?.source ?? null,
     headless: isCarbonyl ? false : options.browserHeadless ? true : undefined,
-    keepBrowser: options.browserKeepBrowser ? true : undefined,
+    keepBrowser: isCarbonyl
+      ? false
+      : (options.browserKeepBrowser ?? (preferManagedLocalChrome ? true : undefined)),
     manualLogin: isCarbonyl
       ? false
       : options.browserManualLogin === undefined
-        ? undefined
+        ? preferManagedLocalChrome
+          ? true
+          : undefined
         : options.browserManualLogin,
     manualLoginProfileDir: isCarbonyl ? null : (options.browserManualLoginProfileDir ?? undefined),
-    hideWindow: isCarbonyl ? false : options.browserHideWindow ? true : undefined,
+    hideWindow: isCarbonyl
+      ? false
+      : (options.browserHideWindow ?? (preferManagedLocalChrome ? true : undefined)),
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,

@@ -3,7 +3,7 @@ import os from "node:os";
 import { mkdir } from "node:fs/promises";
 import type { BrowserRunOptions, BrowserLogger, ChromeClient } from "../browser/types.js";
 import { launchChrome, connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
-import { resolveBrowserConfig } from "../browser/config.js";
+import { normalizeLocalChromeLaunchConfig, resolveBrowserConfig } from "../browser/config.js";
 import {
   readDevToolsPort,
   writeDevToolsActivePort,
@@ -35,12 +35,14 @@ export async function openGeminiBrowserSession(
     browserConfig?.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   await mkdir(profileDir, { recursive: true });
 
-  const resolvedConfig = resolveBrowserConfig({
-    ...browserConfig,
-    manualLogin: true,
-    manualLoginProfileDir: profileDir,
-    keepBrowser: browserConfig?.keepBrowser ?? keepBrowserDefault,
-  });
+  const resolvedConfig = normalizeLocalChromeLaunchConfig(
+    resolveBrowserConfig({
+      ...browserConfig,
+      manualLogin: true,
+      manualLoginProfileDir: profileDir,
+      keepBrowser: browserConfig?.keepBrowser ?? keepBrowserDefault,
+    }),
+  );
   const keepBrowser = Boolean(resolvedConfig.keepBrowser);
 
   let port = await readDevToolsPort(profileDir);
@@ -69,7 +71,12 @@ export async function openGeminiBrowserSession(
     log?.(`[gemini-web] Reusing Chrome on port ${port} for ${purpose}.`);
   }
 
-  const connection = await connectWithNewTab(port, log ?? (() => {}), undefined);
+  const chromeHost =
+    (launchedChrome as { host?: string } | null)?.host ??
+    process.env.ORACLE_BROWSER_REMOTE_DEBUG_HOST?.trim() ??
+    process.env.WSL_HOST_IP?.trim() ??
+    "127.0.0.1";
+  const connection = await connectWithNewTab(port, log ?? (() => {}), undefined, chromeHost);
   const client = connection.client;
   const targetId = connection.targetId;
 

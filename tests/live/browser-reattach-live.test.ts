@@ -3,39 +3,10 @@ import fs from "node:fs/promises";
 import { runBrowserMode } from "../../src/browser/index.js";
 import { resumeBrowserSession } from "../../src/browser/reattach.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
-import { getCookies } from "@steipete/sweet-cookie";
 import { acquireLiveTestLock, releaseLiveTestLock } from "./liveLock.js";
+import { hasChatGptSession, requireChatgptLiveProjectUrls } from "./chatgptLive.js";
 
 const LIVE = process.env.ORACLE_LIVE_TEST === "1";
-const DEFAULT_PROJECT_URLS = [
-  "https://chatgpt.com/g/g-p-69505ed97e3081918a275477a647a682/project",
-  "https://chatgpt.com/g/g-p-691edc9fec088191b553a35093da1ea8-oracle/project",
-];
-const PROJECT_URLS = process.env.ORACLE_CHATGPT_PROJECT_URL
-  ? [process.env.ORACLE_CHATGPT_PROJECT_URL]
-  : DEFAULT_PROJECT_URLS;
-
-async function hasChatGptCookies(): Promise<boolean> {
-  const { cookies } = await getCookies({
-    url: "https://chatgpt.com",
-    origins: ["https://chatgpt.com", "https://chat.openai.com", "https://atlas.openai.com"],
-    browsers: ["chrome"],
-    mode: "merge",
-    chromeProfile: "Default",
-    timeoutMs: 5_000,
-  });
-  // Learned: reuse the same session cookie check as other live browser tests.
-  const hasSession = cookies.some((cookie) =>
-    cookie.name.startsWith("__Secure-next-auth.session-token"),
-  );
-  if (!hasSession) {
-    console.warn(
-      "Skipping ChatGPT browser live tests (missing __Secure-next-auth.session-token). Open chatgpt.com in Chrome and retry.",
-    );
-    return false;
-  }
-  return true;
-}
 
 function createLogger(): BrowserLogger {
   return (() => {}) as BrowserLogger;
@@ -45,15 +16,11 @@ function createLogger(): BrowserLogger {
   test(
     "reattaches from project list after closing Chrome (pro request)",
     async () => {
-      if (!(await hasChatGptCookies())) return;
+      if (!(await hasChatGptSession("ChatGPT browser live reattach"))) return;
+      const projectUrls = requireChatgptLiveProjectUrls();
       // Learned: reattach needs exclusive access to the profile to avoid target mismatch.
       await acquireLiveTestLock("chatgpt-browser");
       try {
-        if (!PROJECT_URLS.some((url) => url.includes("/g/"))) {
-          console.warn("Skipping live reattach test (project URL missing).");
-          return;
-        }
-
         // Learned: keep Pro here; it exercises long-running "thinking" + reattach timing.
         const promptToken = `live reattach pro ${Date.now()}`;
         const prompt = `${promptToken}\nRepeat the first line exactly. No other text.`;
@@ -72,7 +39,7 @@ function createLogger(): BrowserLogger {
         let result: Awaited<ReturnType<typeof runBrowserMode>> | null = null;
         let lastErrorMessage = "";
         let selectedProjectUrl: string | undefined;
-        for (const projectUrl of PROJECT_URLS) {
+        for (const projectUrl of projectUrls) {
           for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {
               // Learned: keepBrowser keeps the chrome instance alive so we can explicitly kill it and reattach.

@@ -1,13 +1,14 @@
-import { rm } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
+import { closeSync, openSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import net from "node:net";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
+import { normalizeLocalChromeLaunchConfig } from "./config.js";
 import { cleanupStaleProfileState } from "./profileState.js";
 import { delay } from "./utils.js";
 import { launchCarbonyl } from "./carbonylLifecycle.js";
@@ -50,17 +51,18 @@ export async function launchChrome(
   userDataDir: string,
   logger: BrowserLogger,
 ) {
+  const effectiveConfig = normalizeLocalChromeLaunchConfig(config);
   const connectHost = resolveRemoteDebugHost();
   const debugBindAddress = connectHost && connectHost !== "127.0.0.1" ? "0.0.0.0" : connectHost;
-  const debugPort = config.debugPort ?? parseDebugPortEnv();
-  const backgroundLaunch = shouldUseMacOsBackgroundLaunch(config);
-  const chromeFlags = buildChromeFlags(config.headless ?? false, debugBindAddress, {
+  const debugPort = effectiveConfig.debugPort ?? parseDebugPortEnv();
+  const backgroundLaunch = shouldUseMacOsBackgroundLaunch(effectiveConfig);
+  const chromeFlags = buildChromeFlags(effectiveConfig.headless ?? false, debugBindAddress, {
     startWithoutWindow: backgroundLaunch,
   });
-  if (config.launcher === "carbonyl") {
+  if (effectiveConfig.launcher === "carbonyl") {
     return launchCarbonyl(
       {
-        chromePath: config.chromePath,
+        chromePath: effectiveConfig.chromePath,
         chromeFlags,
         debugPort,
         host: connectHost ?? "127.0.0.1",
@@ -76,7 +78,7 @@ export async function launchChrome(
   const launcher = backgroundLaunch
     ? await launchBackgroundChromeOnMac({
         chromeFlags,
-        chromePath: config.chromePath ?? undefined,
+        chromePath: effectiveConfig.chromePath ?? undefined,
         userDataDir,
         host: connectHost ?? "127.0.0.1",
         requestedPort: debugPort ?? undefined,
@@ -84,13 +86,13 @@ export async function launchChrome(
     : usePatchedLauncher
       ? await launchWithCustomHost({
           chromeFlags,
-          chromePath: config.chromePath ?? undefined,
+          chromePath: effectiveConfig.chromePath ?? undefined,
           userDataDir,
           host: connectHost ?? "127.0.0.1",
           requestedPort: debugPort ?? undefined,
         })
       : await launch({
-          chromePath: config.chromePath ?? undefined,
+          chromePath: effectiveConfig.chromePath ?? undefined,
           chromeFlags,
           userDataDir,
           handleSIGINT: false,
@@ -253,10 +255,6 @@ export async function captureFrontmostProcess(
   }
 }
 
-export async function captureFrontmostApplication(logger: BrowserLogger): Promise<string | null> {
-  return (await captureFrontmostProcess(logger))?.name ?? null;
-}
-
 async function isProcessFrontmost(pid: number, logger: BrowserLogger): Promise<boolean> {
   const frontmost = await captureFrontmostProcess(logger);
   return matchesChromeProcess(frontmost, pid);
@@ -322,6 +320,19 @@ export function startChromeFocusGuard(
   timer.unref?.();
 
   return stop;
+}
+
+export async function finalizeChromeFocusProtection(
+  chrome: LaunchedChrome,
+  logger: BrowserLogger,
+  stopFocusGuard: (() => void) | null | undefined,
+  restoreTarget?: FrontmostProcessTarget | string | null,
+): Promise<void> {
+  try {
+    await hideChromeWindow(chrome, logger, restoreTarget).catch(() => undefined);
+  } finally {
+    stopFocusGuard?.();
+  }
 }
 
 async function restoreFrontmostApplication(
@@ -1145,33 +1156,36 @@ async function launchBackgroundChromeOnMac({
   requestedPort?: number;
 }): Promise<LaunchedChrome & { host?: string }> {
   const port = await reserveDevToolsPort(requestedPort);
-  const appTarget = resolveMacChromeApplication(chromePath);
+  const chromeBinary = resolveMacChromeExecutable(chromePath);
+  await mkdir(userDataDir, { recursive: true });
   const outPath = path.join(userDataDir, "chrome-out.log");
   const errPath = path.join(userDataDir, "chrome-err.log");
   const launchArgs = [
-    "-n",
-    "-g",
-    "-j",
-    "-a",
-    appTarget,
-    "--stdin",
-    os.devNull,
-    "--stdout",
-    outPath,
-    "--stderr",
-    errPath,
-    "--args",
     ...Launcher.defaultFlags(),
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${userDataDir}`,
     ...chromeFlags,
   ];
-  await execFileAsync("open", launchArgs);
+  const stdoutFd = openSync(outPath, "a");
+  const stderrFd = openSync(errPath, "a");
+  let launchedPid: number | null = null;
+  try {
+    const chrome = spawn(chromeBinary, launchArgs, {
+      detached: true,
+      stdio: ["ignore", stdoutFd, stderrFd],
+    });
+    chrome.unref();
+    launchedPid = typeof chrome.pid === "number" && chrome.pid > 0 ? chrome.pid : null;
+  } finally {
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+  }
 
   const pid = await waitForBackgroundChromeLaunch({
     host,
     port,
     userDataDir,
+    fallbackPid: launchedPid,
   });
 
   const kill = async () => {
@@ -1190,19 +1204,25 @@ async function launchBackgroundChromeOnMac({
   } as unknown as LaunchedChrome & { host?: string };
 }
 
-function resolveMacChromeApplication(chromePath?: string | null): string {
+function resolveMacChromeExecutable(chromePath?: string | null): string {
   const resolved = chromePath?.trim() || Launcher.getFirstInstallation();
   if (!resolved) {
     throw new Error("Chrome is not installed");
   }
-  if (resolved.endsWith(".app")) {
+  if (!resolved.endsWith(".app")) {
     return resolved;
   }
-  const bundleMatch = resolved.match(/^(.*?\.app)(?:\/Contents\/MacOS\/.*)?$/);
-  if (bundleMatch?.[1]) {
-    return bundleMatch[1];
+  const macOsDir = path.join(resolved, "Contents", "MacOS");
+  const bundleName = path.basename(resolved, ".app");
+  const entries = readdirSync(macOsDir, { withFileTypes: true }).filter((entry) => entry.isFile());
+  const executable =
+    entries.find((entry) => entry.name === bundleName) ??
+    entries.find((entry) => !entry.name.startsWith(".")) ??
+    null;
+  if (!executable) {
+    throw new Error(`Unable to locate a Chrome executable inside ${resolved}`);
   }
-  return resolved;
+  return path.join(macOsDir, executable.name);
 }
 
 async function reserveDevToolsPort(preferred?: number): Promise<number> {
@@ -1235,15 +1255,17 @@ async function waitForBackgroundChromeLaunch({
   host,
   port,
   userDataDir,
+  fallbackPid = null,
   timeoutMs = DEFAULT_CHROME_LAUNCH_TIMEOUT_MS,
 }: {
   host: string;
   port: number;
   userDataDir: string;
+  fallbackPid?: number | null;
   timeoutMs?: number;
 }): Promise<number | null> {
   const startedAt = Date.now();
-  let detectedPid: number | null = null;
+  let detectedPid: number | null = fallbackPid;
   while (Date.now() - startedAt < timeoutMs) {
     const [debugReady, pidByPort, pidByProfile] = await Promise.all([
       isDebuggerReady(host, port),

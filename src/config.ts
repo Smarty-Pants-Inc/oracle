@@ -26,6 +26,8 @@ export interface BrowserConfigDefaults {
   remoteHost?: string | null;
   /** Access token clients must provide to the remote `oracle serve` instance. */
   remoteToken?: string | null;
+  /** Connect directly to a remote Chrome DevTools host instead of local Chrome. */
+  remoteChrome?: { host: string; port: number } | null;
   /** Optional metadata for the SSH reverse-tunnel that makes remoteHost reachable. */
   remoteViaSshReverseTunnel?: RemoteViaSshReverseTunnelConfig | null;
   timeoutMs?: number;
@@ -45,6 +47,7 @@ export interface BrowserConfigDefaults {
   autoReattachIntervalMs?: number;
   /** Time budget for each auto-reattach attempt. */
   autoReattachTimeoutMs?: number;
+  cookieSync?: boolean;
   cookieSyncWaitMs?: number;
   headless?: boolean;
   hideWindow?: boolean;

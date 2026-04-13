@@ -167,13 +167,15 @@ describe("runSupervisorBrokerRequest", () => {
   test("focus protection is a no-op when no chrome pid is available", async () => {
     const action = vi.fn(async () => "ok");
     const captureFrontmostProcess = vi.fn(async () => "Zed");
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
+    const finalizeChromeFocusProtection = vi.fn(async () => {});
 
     const result = await __test__.withChromeFocusProtection(undefined, action, {
       captureFrontmostProcess,
       hideChromeWindow,
       startChromeFocusGuard,
+      finalizeChromeFocusProtection,
     } as never);
 
     expect(result).toBe("ok");
@@ -181,25 +183,32 @@ describe("runSupervisorBrokerRequest", () => {
     expect(captureFrontmostProcess).not.toHaveBeenCalled();
     expect(hideChromeWindow).not.toHaveBeenCalled();
     expect(startChromeFocusGuard).not.toHaveBeenCalled();
+    expect(finalizeChromeFocusProtection).not.toHaveBeenCalled();
   });
 
   test("focus protection hides chrome before and after the broker action", async () => {
     const action = vi.fn(async () => "ok");
     const captureFrontmostProcess = vi.fn(async () => "Zed");
-    const hideChromeWindow = vi.fn(async () => {});
+    const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const stopFocusGuard = vi.fn();
     const startChromeFocusGuard = vi.fn(() => stopFocusGuard);
+    const finalizeChromeFocusProtection = vi.fn(async () => {
+      await hideChromeWindow({ pid: 4242 } as never, vi.fn() as never, "Zed");
+      stopFocusGuard();
+    });
 
     const result = await __test__.withChromeFocusProtection(4242, action, {
       captureFrontmostProcess,
       hideChromeWindow,
       startChromeFocusGuard,
+      finalizeChromeFocusProtection,
     } as never);
 
     expect(result).toBe("ok");
     expect(action).toHaveBeenCalledTimes(1);
     expect(captureFrontmostProcess).toHaveBeenCalledTimes(1);
     expect(startChromeFocusGuard).toHaveBeenCalledTimes(1);
+    expect(finalizeChromeFocusProtection).toHaveBeenCalledTimes(1);
     expect(hideChromeWindow).toHaveBeenCalledTimes(2);
     expect(stopFocusGuard).toHaveBeenCalledTimes(1);
   });
@@ -244,6 +253,10 @@ describe("runSupervisorBrokerRequest", () => {
         callOrder.push("stop");
       };
     });
+    const finalizeChromeFocusProtection = vi.fn(async () => {
+      callOrder.push("hide");
+      callOrder.push("stop");
+    });
 
     const result = await __test__.withSupervisorRuntime(
       {
@@ -259,6 +272,7 @@ describe("runSupervisorBrokerRequest", () => {
         captureFrontmostProcess,
         hideChromeWindow,
         startChromeFocusGuard,
+        finalizeChromeFocusProtection,
       } as never,
     );
 
@@ -271,8 +285,8 @@ describe("runSupervisorBrokerRequest", () => {
       "connect",
       "action",
       "close",
-      "stop",
       "hide",
+      "stop",
     ]);
   });
 

@@ -215,6 +215,34 @@ const exitIfNonInteractive = (): never | void => {
   }
 };
 
+async function flushStandardStream(stream: NodeJS.WriteStream): Promise<void> {
+  if (stream.destroyed || typeof stream.write !== "function") {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    try {
+      if (stream.write("")) {
+        resolve();
+        return;
+      }
+      stream.once("drain", () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function exitAfterNonInteractiveCompletion(): Promise<never | void> {
+  if (process.stdout.isTTY) {
+    return;
+  }
+  await Promise.allSettled([
+    flushStandardStream(process.stdout),
+    flushStandardStream(process.stderr),
+  ]);
+  process.exit(process.exitCode ?? 0);
+}
+
 const program = new Command();
 let introPrinted = false;
 program.hook("preAction", () => {
@@ -587,6 +615,7 @@ program
       "Skip cookie copy; reuse a persistent automation profile and wait for manual ChatGPT login.",
     ).hideHelp(),
   )
+  .addOption(new Option("--no-browser-manual-login").hideHelp())
   .addOption(new Option("--browser-headless", "Launch Chrome in headless mode.").hideHelp())
   .addOption(
     new Option(
@@ -594,9 +623,11 @@ program
       "Hide the Chrome window after launch (macOS headful only).",
     ).hideHelp(),
   )
+  .addOption(new Option("--no-browser-hide-window").hideHelp())
   .addOption(
     new Option("--browser-keep-browser", "Keep Chrome running after completion.").hideHelp(),
   )
+  .addOption(new Option("--no-browser-keep-browser").hideHelp())
   .addOption(
     new Option(
       "--browser-model-strategy <mode>",
@@ -2266,13 +2297,19 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch((error: unknown) => {
-  if (error instanceof Error) {
-    if (!isErrorLogged(error)) {
-      console.error(chalk.red("✖"), error.message);
+void (async () => {
+  try {
+    await main();
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      if (!isErrorLogged(error)) {
+        console.error(chalk.red("✖"), error.message);
+      }
+    } else {
+      console.error(chalk.red("✖"), error);
     }
-  } else {
-    console.error(chalk.red("✖"), error);
+    process.exitCode = 1;
+  } finally {
+    await exitAfterNonInteractiveCompletion();
   }
-  process.exitCode = 1;
-});
+})();

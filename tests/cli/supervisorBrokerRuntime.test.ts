@@ -97,10 +97,10 @@ describe("supervisorBrokerRuntime", () => {
     expect(picked).toBeUndefined();
   });
 
-  test("ignores hidden runtimes that are not pinned to a dedicated project URL", () => {
+  test("accepts hidden runtimes pinned to the ChatGPT root", () => {
     const picked = __test__.pickReusableRuntimeCandidate([
       {
-        ...runtimeSession("hidden-root-chat", "running", "2026-03-31T10:05:00.000Z"),
+        ...runtimeSession("hidden-root-chat", "completed", "2026-03-31T10:05:00.000Z"),
         browser: {
           runtime: {
             chromePort: 9222,
@@ -120,7 +120,7 @@ describe("supervisorBrokerRuntime", () => {
       },
     ]);
 
-    expect(picked).toBeUndefined();
+    expect(picked?.id).toBe("hidden-root-chat");
   });
 
   test("prefers completed reusable runtimes over running sessions", () => {
@@ -581,7 +581,7 @@ describe("supervisorBrokerRuntime", () => {
       await import("../../src/cli/supervisorBrokerRuntime.js");
 
     await expect(resolveSupervisorRuntimeContext("owned-root-chat")).rejects.toThrow(
-      /outside the configured project scope/i,
+      /outside the configured chatgpt scope/i,
     );
   });
 

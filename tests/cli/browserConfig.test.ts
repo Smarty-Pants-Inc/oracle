@@ -4,6 +4,7 @@ import { buildBrowserConfig, resolveBrowserModelLabel } from "../../src/cli/brow
 describe("buildBrowserConfig", () => {
   test("uses defaults when optional flags omitted", async () => {
     const config = await buildBrowserConfig({ model: "gpt-5.4-pro" });
+    const expectsManagedChrome = process.platform === "darwin";
     expect(config).toMatchObject({
       chromeProfile: "Default",
       chromePath: null,
@@ -13,8 +14,9 @@ describe("buildBrowserConfig", () => {
       inputTimeoutMs: undefined,
       cookieSync: undefined,
       headless: undefined,
-      keepBrowser: undefined,
-      hideWindow: undefined,
+      keepBrowser: expectsManagedChrome ? true : undefined,
+      hideWindow: expectsManagedChrome ? true : undefined,
+      manualLogin: expectsManagedChrome ? true : undefined,
       desiredModel: "GPT-5.4 Pro",
       debug: undefined,
       allowCookieErrors: true,
@@ -94,6 +96,19 @@ describe("buildBrowserConfig", () => {
       debug: true,
       allowCookieErrors: true,
     });
+  });
+
+  test("preserves explicit false launcher booleans", async () => {
+    const config = await buildBrowserConfig({
+      model: "gpt-5.4-pro",
+      browserManualLogin: false,
+      browserHideWindow: false,
+      browserKeepBrowser: false,
+    });
+
+    expect(config.manualLogin).toBe(false);
+    expect(config.hideWindow).toBe(false);
+    expect(config.keepBrowser).toBe(false);
   });
 
   test("prefers explicit browser model label when provided", async () => {

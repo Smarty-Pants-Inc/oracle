@@ -22,6 +22,7 @@ async function readSessionLogTail(sessionId: string, maxBytes: number): Promise<
 }
 import { performSessionRun } from "../../cli/sessionRunner.js";
 import { CHATGPT_URL, isTemporaryChatUrl, normalizeChatgptUrl } from "../../browserMode.js";
+import { shouldPreferManagedLocalChromeDefaults } from "../../browser/config.js";
 import { consultInputSchema } from "../types.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveNotificationSettings } from "../../cli/notifier.js";
@@ -196,7 +197,15 @@ export function buildConsultBrowserConfig({
       : resolveBrowserModelLabel(requestedInputModel, runModel);
   const configuredUrl = configuredBrowser.chatgptUrl ?? configuredBrowser.url ?? CHATGPT_URL;
   const normalizedUrl = normalizeChatgptUrl(configuredUrl, CHATGPT_URL);
-  const manualLogin = hasProfileDir ? true : (configuredBrowser.manualLogin ?? false);
+  const preferManagedLocalChrome = shouldPreferManagedLocalChromeDefaults({
+    launcher: configuredBrowser.launcher,
+    attachRunning: configuredBrowser.attachRunning,
+    remoteChrome: configuredBrowser.remoteChrome,
+    headless: configuredBrowser.headless,
+  });
+  const manualLogin = hasProfileDir
+    ? true
+    : (configuredBrowser.manualLogin ?? (preferManagedLocalChrome ? true : undefined));
   const manualLoginCookieSync = configuredBrowser.manualLoginCookieSync ?? false;
   const modelStrategy = browserModelStrategy ?? configuredBrowser.modelStrategy;
 
@@ -215,14 +224,15 @@ export function buildConsultBrowserConfig({
     ...configuredBrowser,
     url: normalizedUrl,
     chatgptUrl: normalizedUrl,
-    cookieSync: !manualLogin || manualLoginCookieSync,
+    cookieSync: manualLogin === true ? manualLoginCookieSync : configuredBrowser.cookieSync,
     headless: configuredBrowser.headless ?? false,
-    hideWindow: configuredBrowser.hideWindow ?? false,
-    keepBrowser: browserKeepBrowser ?? configuredBrowser.keepBrowser ?? false,
+    hideWindow: configuredBrowser.hideWindow ?? (preferManagedLocalChrome ? true : undefined),
+    keepBrowser:
+      browserKeepBrowser ??
+      configuredBrowser.keepBrowser ??
+      (preferManagedLocalChrome ? true : undefined),
     manualLogin,
-    manualLoginProfileDir: manualLogin
-      ? ((envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null)
-      : null,
+    manualLoginProfileDir: (envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null,
     manualLoginCookieSync,
     modelStrategy,
     thinkingTime: browserThinkingTime ?? configuredBrowser.thinkingTime,
