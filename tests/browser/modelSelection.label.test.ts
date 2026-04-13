@@ -36,6 +36,10 @@ describe("browser model selection arbitrary labels", () => {
     expect(modelCandidateMatchesTargetForTest("Thinking 5.4", "Thinking")).toBe(true);
   });
 
+  it("matches descriptive shortcut rows for the generic Instant target", () => {
+    expect(modelCandidateMatchesTargetForTest("Instant", "Instant for everyday chats")).toBe(true);
+  });
+
   it("rejects shorthand variant labels for a base-model request", () => {
     expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Pro")).toBe(false);
     expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Thinking")).toBe(false);

@@ -528,13 +528,13 @@ function buildModelSelectionExpression(
       if (!normalizedLabel || detectCandidateVersion(normalizedLabel, normalizedTestId)) {
         return false;
       }
-      if (normalizedLabel === 'pro') {
+      if (normalizedLabel === 'pro' || normalizedLabel.startsWith('pro ')) {
         return wantsPro && !wantsThinking && !wantsInstant;
       }
-      if (normalizedLabel === 'thinking') {
+      if (normalizedLabel === 'thinking' || normalizedLabel.startsWith('thinking ')) {
         return wantsThinking && !wantsPro && !wantsInstant;
       }
-      if (normalizedLabel === 'instant') {
+      if (normalizedLabel === 'instant' || normalizedLabel.startsWith('instant ')) {
         return wantsInstant && !wantsPro && !wantsThinking;
       }
       return false;

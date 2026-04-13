@@ -172,14 +172,31 @@ describe("browser model selection matchers", () => {
   it("accepts shorthand variant rows when ChatGPT keeps the top button generic", () => {
     const expression = buildModelSelectionExpressionForTest("gpt-5.4-pro");
     expect(expression).toContain("const clickedVariantShortcutOption = (match) =>");
-    expect(expression).toContain("if (normalizedLabel === 'pro') {");
-    expect(expression).toContain("if (normalizedLabel === 'thinking') {");
-    expect(expression).toContain("if (normalizedLabel === 'instant') {");
+    expect(expression).toContain(
+      "if (normalizedLabel === 'pro' || normalizedLabel.startsWith('pro ')) {",
+    );
+    expect(expression).toContain(
+      "if (normalizedLabel === 'thinking' || normalizedLabel.startsWith('thinking ')) {",
+    );
+    expect(expression).toContain(
+      "if (normalizedLabel === 'instant' || normalizedLabel.startsWith('instant ')) {",
+    );
     expect(expression).toContain(
       "(clickedExactVersionedOption(match) || clickedVariantShortcutOption(match)) &&",
     );
     expect(expression).toContain(
       "resolve({ status: 'switched', label: match.label || PRIMARY_LABEL });",
+    );
+  });
+
+  it("accepts descriptive variant rows when ChatGPT adds helper copy to the shortcut labels", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.2");
+    expect(expression).toContain("normalizedLabel === 'pro' || normalizedLabel.startsWith('pro ')");
+    expect(expression).toContain(
+      "normalizedLabel === 'thinking' || normalizedLabel.startsWith('thinking ')",
+    );
+    expect(expression).toContain(
+      "normalizedLabel === 'instant' || normalizedLabel.startsWith('instant ')",
     );
   });
 });
