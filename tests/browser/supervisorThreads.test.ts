@@ -5,6 +5,8 @@ import {
   listSupervisorThreads,
   newSupervisorThread,
   readCurrentSupervisorThread,
+  readAttachedSupervisorThreadHistory,
+  readSupervisorThreadHistory,
 } from "../../src/browser/supervisorThreads.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { openConversationFromSidebarWithRetry } from "../../src/browser/reattachHelpers.js";
@@ -190,39 +192,33 @@ describe("supervisorThreads", () => {
     });
   });
 
-  test("attach_thread accepts an in-place sidebar activation when the URL stays on the prior thread", async () => {
+  test("attach_thread waits for the visible thread to switch instead of trusting sidebar state", async () => {
     vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
+    let currentReadCount = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("const href = window.location.href || ''")) {
+          currentReadCount += 1;
+          if (currentReadCount < 3) {
+            return {
+              result: {
+                value: {
+                  url: "https://chatgpt.com/g/team-space/c/current-1",
+                  conversationId: "current-1",
+                  title: "Current",
+                  isActive: true,
+                },
+              },
+            };
+          }
           return {
             result: {
               value: {
-                url: "https://chatgpt.com/g/team-space/c/current-1",
-                conversationId: "current-1",
-                title: "Current",
+                url: "https://chatgpt.com/g/team-space/c/target-9",
+                conversationId: "target-9",
+                title: "Target",
                 isActive: true,
               },
-            },
-          };
-        }
-        if (expression.includes("const limit =")) {
-          return {
-            result: {
-              value: [
-                {
-                  title: "Current",
-                  url: "https://chatgpt.com/g/team-space/c/current-1",
-                  conversationId: "current-1",
-                  isActive: false,
-                },
-                {
-                  title: "Target",
-                  url: "https://chatgpt.com/g/team-space/c/target-9",
-                  conversationId: "target-9",
-                  isActive: true,
-                },
-              ],
             },
           };
         }
@@ -239,6 +235,86 @@ describe("supervisorThreads", () => {
       url: "https://chatgpt.com/g/team-space/c/target-9",
       conversationId: "target-9",
       isActive: true,
+    });
+    expect(currentReadCount).toBeGreaterThanOrEqual(3);
+  });
+
+  test("readSupervisorThreadHistory returns normalized transcript entries", async () => {
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("const turnSelector =")) {
+          return {
+            result: {
+              value: [
+                { role: "ignored", text: "skip me" },
+                { role: "user", text: "Follow-up" },
+                { role: "assistant", text: "Final answer" },
+                { role: "assistant", text: "Wrap-up" },
+              ],
+            },
+          };
+        }
+        return { result: { value: null } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readSupervisorThreadHistory(runtime, { limit: 3 });
+
+    expect(result).toEqual([
+      { role: "user", text: "Follow-up" },
+      { role: "assistant", text: "Final answer" },
+      { role: "assistant", text: "Wrap-up" },
+    ]);
+  });
+
+  test("readAttachedSupervisorThreadHistory surfaces bounded window metadata", async () => {
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.location.href")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+            },
+          };
+        }
+        return {
+          result: {
+            value: {
+              history: [
+                { role: "assistant", text: "Recent answer" },
+                { role: "user", text: "Latest question" },
+              ],
+              historyWindow: {
+                limit: 2,
+                returnedCount: 2,
+                totalCount: 5,
+                truncated: true,
+              },
+            },
+          },
+        };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readAttachedSupervisorThreadHistory(runtime, {
+      conversationId: "current-9",
+      limit: 2,
+    });
+
+    expect(result.history).toEqual([
+      { role: "assistant", text: "Recent answer" },
+      { role: "user", text: "Latest question" },
+    ]);
+    expect(result.historyWindow).toEqual({
+      limit: 2,
+      returnedCount: 2,
+      totalCount: 5,
+      truncated: true,
     });
   });
 

@@ -1,4 +1,9 @@
 import type { ChromeClient } from "./types.js";
+import {
+  ASSISTANT_ROLE_SELECTOR,
+  CONVERSATION_TURN_SELECTOR,
+  FINISHED_ACTIONS_SELECTOR,
+} from "./constants.js";
 import { delay } from "./utils.js";
 import {
   conversationHrefMatchesConfiguredScope,
@@ -13,6 +18,27 @@ export type { SupervisorThreadInfo };
 
 const ATTACH_CONFIRM_TIMEOUT_MS = 8_000;
 const ATTACH_CONFIRM_POLL_MS = 250;
+const HISTORY_ENTRY_LIMIT_DEFAULT = 100;
+const HISTORY_ENTRY_LIMIT_MAX = 200;
+const HISTORY_STABILITY_POLL_MS = 250;
+const HISTORY_STABILITY_TIMEOUT_MS = 4_000;
+
+export interface SupervisorThreadHistoryEntry {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export interface SupervisorThreadHistoryWindow {
+  limit: number;
+  returnedCount: number;
+  totalCount: number;
+  truncated: boolean;
+}
+
+interface SupervisorThreadHistorySnapshot {
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+}
 
 export async function readCurrentSupervisorThread(
   Runtime: ChromeClient["Runtime"],
@@ -153,25 +179,384 @@ export async function listSupervisorThreads(
     .slice(0, limit);
 }
 
-async function readConfirmedSupervisorThread(
-  Runtime: ChromeClient["Runtime"],
-  conversationId: string,
-  options?: { projectUrl?: string },
-): Promise<SupervisorThreadInfo> {
-  const current = await readCurrentSupervisorThread(Runtime);
+function normalizeHistoryLimit(limit?: number): number {
+  const numeric =
+    typeof limit === "number" && Number.isFinite(limit)
+      ? Math.trunc(limit)
+      : HISTORY_ENTRY_LIMIT_DEFAULT;
+  return Math.min(HISTORY_ENTRY_LIMIT_MAX, Math.max(1, numeric));
+}
+
+function normalizeSupervisorThreadHistoryEntry(
+  value: unknown,
+): SupervisorThreadHistoryEntry | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const role = raw.role === "user" || raw.role === "assistant" ? raw.role : null;
+  const text = typeof raw.text === "string" ? raw.text.trim() : "";
+  if (!role || !text) {
+    return null;
+  }
+  return { role, text };
+}
+
+function normalizeSupervisorThreadHistoryWindow(
+  value: unknown,
+  limit: number,
+  returnedCount: number,
+): SupervisorThreadHistoryWindow {
+  if (!value || typeof value !== "object") {
+    return {
+      limit,
+      returnedCount,
+      totalCount: returnedCount,
+      truncated: false,
+    };
+  }
+  const raw = value as Record<string, unknown>;
+  const numeric = (candidate: unknown, fallback: number): number => {
+    if (typeof candidate !== "number" || !Number.isFinite(candidate)) {
+      return fallback;
+    }
+    return Math.max(0, Math.trunc(candidate));
+  };
+  const normalizedLimit = normalizeHistoryLimit(numeric(raw.limit, limit));
+  const normalizedReturnedCount = numeric(raw.returnedCount, returnedCount);
+  const normalizedTotalCount = Math.max(
+    normalizedReturnedCount,
+    numeric(raw.totalCount, normalizedReturnedCount),
+  );
+  return {
+    limit: normalizedLimit,
+    returnedCount: normalizedReturnedCount,
+    totalCount: normalizedTotalCount,
+    truncated:
+      typeof raw.truncated === "boolean"
+        ? raw.truncated
+        : normalizedTotalCount > normalizedReturnedCount,
+  };
+}
+
+function normalizeSupervisorThreadHistorySnapshot(
+  value: unknown,
+  limit: number,
+): SupervisorThreadHistorySnapshot {
+  const rawHistory = Array.isArray(value)
+    ? value
+    : Array.isArray((value as { history?: unknown })?.history)
+      ? ((value as { history?: unknown[] }).history ?? [])
+      : [];
+  const history = rawHistory
+    .map((entry) => normalizeSupervisorThreadHistoryEntry(entry))
+    .filter((entry): entry is SupervisorThreadHistoryEntry => entry !== null);
+  const historyWindow = normalizeSupervisorThreadHistoryWindow(
+    (value as { historyWindow?: unknown })?.historyWindow,
+    limit,
+    history.length,
+  );
+  return { history, historyWindow };
+}
+
+function supervisorThreadHistorySnapshotsEqual(
+  left: SupervisorThreadHistorySnapshot,
+  right: SupervisorThreadHistorySnapshot,
+): boolean {
   if (
-    current.conversationId === conversationId &&
-    supervisorThreadMatchesProjectScope(current, options?.projectUrl)
+    left.historyWindow.limit !== right.historyWindow.limit ||
+    left.historyWindow.returnedCount !== right.historyWindow.returnedCount ||
+    left.historyWindow.totalCount !== right.historyWindow.totalCount ||
+    left.historyWindow.truncated !== right.historyWindow.truncated ||
+    left.history.length !== right.history.length
   ) {
+    return false;
+  }
+  return left.history.every(
+    (entry, index) =>
+      entry.role === right.history[index]?.role && entry.text === right.history[index]?.text,
+  );
+}
+
+async function readSupervisorThreadHistorySnapshotOnce(
+  Runtime: ChromeClient["Runtime"],
+  limit: number,
+): Promise<SupervisorThreadHistorySnapshot> {
+  const response = await Runtime.evaluate({
+    expression: `(() => {
+      const limit = ${limit};
+      const turnSelector = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
+      const assistantSelector = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};
+      const finishedSelector = ${JSON.stringify(FINISHED_ACTIONS_SELECTOR)};
+      const contentSelector =
+        '.markdown,[data-message-content],[data-testid*="message"],[data-testid*="assistant"],.prose,[class*="markdown"]';
+      const userSelector = '[data-message-author-role="user"], [data-turn="user"]';
+      const normalize = (text) =>
+        (text || '')
+          .replace(/\\u00a0/g, ' ')
+          .replace(/\\r/g, '')
+          .replace(/[ \\t]+\\n/g, '\\n')
+          .replace(/\\n{3,}/g, '\\n\\n')
+          .replace(/[ \\t]{2,}/g, ' ')
+          .trim();
+      const cleanAssistantText = (text) => normalize(text).replace(/^chatgpt said:\\s*/i, '').trim();
+      const isAssistantPlaceholder = ({ text, html }) => {
+        const normalized = cleanAssistantText(text).toLowerCase();
+        const normalizedHtml = String(html || '').toLowerCase();
+        if (!normalized) return true;
+        if (
+          normalized === 'thinking' ||
+          /^thought for\\b[^\\n]*$/.test(normalized) ||
+          /^thought for\\b[^\\n]*\\nthinking$/.test(normalized)
+        ) {
+          return true;
+        }
+        if (
+          normalizedHtml.includes('result-thinking') ||
+          /<p\\b[^>]*>\\s*<\\/p>/.test(normalizedHtml)
+        ) {
+          return true;
+        }
+        if (
+          normalized.includes('answer now') &&
+          (normalized.includes('pro thinking') || normalized.includes('chatgpt'))
+        ) {
+          return true;
+        }
+        return /^(?:starting|finalizing answer|analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\\.{3}|…)?$/.test(
+          normalized,
+        );
+      };
+      const detectRole = (node) => {
+        const ownRole =
+          (node.getAttribute('data-message-author-role') ||
+            node.getAttribute('data-turn') ||
+            node.dataset?.messageAuthorRole ||
+            node.dataset?.turn ||
+            '')
+            .toLowerCase()
+            .trim();
+        if (ownRole === 'user' || ownRole === 'assistant') {
+          return ownRole;
+        }
+        if (node.querySelector(assistantSelector)) {
+          return 'assistant';
+        }
+        if (node.querySelector(userSelector)) {
+          return 'user';
+        }
+        return '';
+      };
+      const readCandidatePayload = (node) => {
+        if (!(node instanceof HTMLElement)) {
+          return null;
+        }
+        const clone = node.cloneNode(true);
+        if (!(clone instanceof HTMLElement)) {
+          return null;
+        }
+        const discardSelector = [
+          'nav',
+          'aside',
+          'form',
+          '[aria-label="Response actions"]',
+          '[role="group"][aria-label="Response actions"]',
+          finishedSelector,
+          '[data-testid*="copy-turn-action-button"]',
+          '[data-testid*="good-response-turn-action-button"]',
+          '[data-testid*="bad-response-turn-action-button"]',
+          '[data-testid*="turn-action"]',
+          '[data-testid*="message-actions"]',
+        ]
+          .filter(Boolean)
+          .join(',');
+        if (discardSelector) {
+          for (const child of clone.querySelectorAll(discardSelector)) {
+            child.remove();
+          }
+        }
+        const innerText = clone.innerText ?? '';
+        const textContent = clone.textContent ?? '';
+        const text = normalize(innerText.trim().length > 0 ? innerText : textContent);
+        if (!text) {
+          return null;
+        }
+        return { text, html: clone.innerHTML ?? '' };
+      };
+      const chooseBetterPayload = (current, candidate) => {
+        if (!candidate) return current;
+        if (!current) return candidate;
+        const currentScore = current.rank * 10000 + current.text.length;
+        const candidateScore = candidate.rank * 10000 + candidate.text.length;
+        return candidateScore > currentScore ? candidate : current;
+      };
+      const expandCollapsibles = (root) => {
+        if (!(root instanceof HTMLElement)) {
+          return;
+        }
+        const normalizeLabel = (value) => (value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        for (const button of Array.from(root.querySelectorAll('button'))) {
+          const label = normalizeLabel(button.getAttribute('aria-label') || button.textContent);
+          const testid = (button.getAttribute('data-testid') || '').toLowerCase();
+          const expanded = (button.getAttribute('aria-expanded') || '').toLowerCase();
+          if (
+            expanded === 'false' ||
+            label === 'more' ||
+            label === 'show more' ||
+            label.startsWith('show more ') ||
+            label === 'expand' ||
+            label.startsWith('expand ') ||
+            testid.includes('markdown') ||
+            testid.includes('toggle') ||
+            testid.includes('expand')
+          ) {
+            button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          }
+        }
+      };
+      const readTurnPayload = (node, role) => {
+        const messageSelector = role === 'assistant' ? assistantSelector : userSelector;
+        const messageRoots = Array.from(node.querySelectorAll(messageSelector)).filter(
+          (candidate) => candidate instanceof HTMLElement,
+        );
+        const messageRoot = messageRoots[messageRoots.length - 1] ?? node;
+        expandCollapsibles(messageRoot);
+        const candidateRoots = [];
+        if (messageRoot.matches?.(contentSelector)) {
+          candidateRoots.push(messageRoot);
+        }
+        candidateRoots.push(...Array.from(messageRoot.querySelectorAll(contentSelector)));
+        const uniqueRoots = Array.from(new Set(candidateRoots));
+        const topLevelRoots = uniqueRoots.filter(
+          (candidate) => !uniqueRoots.some((other) => other !== candidate && other.contains(candidate)),
+        );
+        let bestPayload = null;
+        const aggregatedRoots = topLevelRoots
+          .map((candidate) => readCandidatePayload(candidate))
+          .filter(Boolean);
+        if (aggregatedRoots.length > 1) {
+          bestPayload = chooseBetterPayload(bestPayload, {
+            text: aggregatedRoots.map((payload) => payload.text).join('\\n\\n'),
+            html: aggregatedRoots.map((payload) => payload.html).filter(Boolean).join('\\n'),
+            rank: 4,
+          });
+        }
+        for (const candidate of topLevelRoots) {
+          const payload = readCandidatePayload(candidate);
+          if (!payload) continue;
+          bestPayload = chooseBetterPayload(bestPayload, { ...payload, rank: 3 });
+        }
+        const messagePayload = readCandidatePayload(messageRoot);
+        if (messagePayload) {
+          bestPayload = chooseBetterPayload(bestPayload, { ...messagePayload, rank: 2 });
+        }
+        const turnPayload = readCandidatePayload(node);
+        if (turnPayload) {
+          bestPayload = chooseBetterPayload(bestPayload, { ...turnPayload, rank: 1 });
+        }
+        return bestPayload;
+      };
+      const rawTurns = Array.from(document.querySelectorAll(turnSelector));
+      const turns = rawTurns.filter(
+        (node) => !(node instanceof HTMLElement && node.parentElement?.closest(turnSelector)),
+      );
+      const orderedTurns = turns.length > 0 ? turns : rawTurns;
+      const entries = [];
+      for (const node of orderedTurns) {
+        if (!(node instanceof Element)) continue;
+        const role = detectRole(node);
+        if (!role) continue;
+        const payload = readTurnPayload(node, role);
+        if (!payload?.text) continue;
+        if (role === 'assistant' && isAssistantPlaceholder(payload)) {
+          continue;
+        }
+        const text = payload.text;
+        const last = entries.at(-1);
+        if (last && last.role === role && last.text === text) {
+          continue;
+        }
+        entries.push({ role, text });
+      }
+      const limitedEntries = entries.slice(-limit);
+      return {
+        history: limitedEntries,
+        historyWindow: {
+          limit,
+          returnedCount: limitedEntries.length,
+          totalCount: entries.length,
+          truncated: entries.length > limitedEntries.length,
+        },
+      };
+    })()`,
+    returnByValue: true,
+  });
+  return normalizeSupervisorThreadHistorySnapshot(response.result?.value, limit);
+}
+
+async function readSupervisorThreadHistorySnapshot(
+  Runtime: ChromeClient["Runtime"],
+  options?: { limit?: number },
+): Promise<SupervisorThreadHistorySnapshot> {
+  const limit = normalizeHistoryLimit(options?.limit);
+  let previous = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
+  let current = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
+  if (supervisorThreadHistorySnapshotsEqual(previous, current)) {
     return current;
   }
-  const activeSidebarThread = (
-    await listSupervisorThreads(Runtime, {
-      limit: 50,
-      projectUrl: options?.projectUrl,
-    })
-  ).find((thread) => thread.isActive && thread.conversationId === conversationId);
-  return activeSidebarThread ?? current;
+  const deadline = Date.now() + HISTORY_STABILITY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await delay(HISTORY_STABILITY_POLL_MS);
+    previous = current;
+    current = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
+    if (supervisorThreadHistorySnapshotsEqual(previous, current)) {
+      return current;
+    }
+  }
+  return current;
+}
+
+export async function readSupervisorThreadHistory(
+  Runtime: ChromeClient["Runtime"],
+  options?: { limit?: number },
+): Promise<SupervisorThreadHistoryEntry[]> {
+  return (await readSupervisorThreadHistorySnapshot(Runtime, options)).history;
+}
+
+export async function readAttachedSupervisorThreadHistory(
+  Runtime: ChromeClient["Runtime"],
+  options: { conversationId: string; projectUrl?: string; limit?: number },
+): Promise<{
+  thread: SupervisorThreadInfo;
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+}> {
+  const expectedConversationId = options.conversationId.trim();
+  if (!expectedConversationId) {
+    throw new Error("conversationId is required for thread_history.");
+  }
+  let thread = await readCurrentSupervisorThread(Runtime);
+  if (
+    thread.conversationId !== expectedConversationId ||
+    !supervisorThreadMatchesProjectScope(thread, options.projectUrl)
+  ) {
+    thread = await attachSupervisorThread(Runtime, expectedConversationId, {
+      projectUrl: options.projectUrl,
+    });
+  }
+  if (!supervisorThreadMatchesProjectScope(thread, options.projectUrl)) {
+    throw new Error(
+      `Refusing to read Oracle supervisor thread ${thread.conversationId ?? "unknown"} outside the configured project scope.`,
+    );
+  }
+  const snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  return {
+    thread,
+    history: snapshot.history,
+    historyWindow: snapshot.historyWindow,
+  };
 }
 
 export async function attachSupervisorThread(
@@ -205,7 +590,7 @@ export async function attachSupervisorThread(
   let lastSeen = current;
   while (Date.now() - start < ATTACH_CONFIRM_TIMEOUT_MS) {
     await delay(ATTACH_CONFIRM_POLL_MS);
-    lastSeen = await readConfirmedSupervisorThread(Runtime, normalizedId, options);
+    lastSeen = await readCurrentSupervisorThread(Runtime);
     if (
       lastSeen.conversationId === normalizedId &&
       supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl)
@@ -309,5 +694,9 @@ export async function newSupervisorThread(
 
 export const __test__ = {
   normalizeSupervisorThread,
+  normalizeSupervisorThreadHistoryEntry,
+  readAttachedSupervisorThreadHistory,
+  readSupervisorThreadHistory,
+  readSupervisorThreadHistorySnapshot,
   supervisorThreadMatchesProjectScope,
 };

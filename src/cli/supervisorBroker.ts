@@ -5,7 +5,10 @@ import {
   attachSupervisorThread,
   listSupervisorThreads,
   newSupervisorThread,
+  readAttachedSupervisorThreadHistory,
+  type SupervisorThreadHistoryWindow,
   supervisorThreadMatchesProjectScope,
+  type SupervisorThreadHistoryEntry,
   type SupervisorThreadInfo,
 } from "../browser/supervisorThreads.js";
 import {
@@ -14,7 +17,7 @@ import {
   startChromeFocusGuard,
   finalizeChromeFocusProtection,
 } from "../browser/chromeLifecycle.js";
-import { sessionStore } from "../sessionStore.js";
+import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import {
   connectSupervisorRuntime,
   resolveSupervisorRuntimeContext,
@@ -29,19 +32,27 @@ export type SupervisorBrokerOperation =
   | "run_prompt"
   | "list_threads"
   | "new_thread"
-  | "attach_thread";
+  | "attach_thread"
+  | "thread_history";
 
 export interface SupervisorBrokerRequest extends SupervisorPromptRequest {
   operation?: SupervisorBrokerOperation;
   action?: SupervisorBrokerOperation;
   conversationId?: string;
+  historyLimit?: number;
   shutdown?: boolean;
 }
 
 export type SupervisorBrokerResponse =
   | { ok: true; sessionId: string; output: string }
   | { ok: true; threads: SupervisorThreadInfo[] }
-  | { ok: true; thread: SupervisorThreadInfo; sessionId: string }
+  | {
+      ok: true;
+      thread: SupervisorThreadInfo;
+      sessionId: string;
+      history?: SupervisorThreadHistoryEntry[];
+      historyWindow?: SupervisorThreadHistoryWindow;
+    }
   | { ok: false; error: string; sessionId?: string };
 
 export interface SupervisorBrokerDeps {
@@ -57,12 +68,24 @@ export interface SupervisorBrokerDeps {
   newThread?: (
     request: SupervisorBrokerRequest,
   ) => Promise<{ ok: true; thread: SupervisorThreadInfo; sessionId: string }>;
-  attachThread?: (
-    request: SupervisorBrokerRequest,
-  ) => Promise<{ ok: true; thread: SupervisorThreadInfo; sessionId: string }>;
+  attachThread?: (request: SupervisorBrokerRequest) => Promise<{
+    ok: true;
+    thread: SupervisorThreadInfo;
+    sessionId: string;
+    history?: SupervisorThreadHistoryEntry[];
+    historyWindow?: SupervisorThreadHistoryWindow;
+  }>;
+  threadHistory?: (request: SupervisorBrokerRequest) => Promise<{
+    ok: true;
+    thread: SupervisorThreadInfo;
+    sessionId: string;
+    history: SupervisorThreadHistoryEntry[];
+    historyWindow?: SupervisorThreadHistoryWindow;
+  }>;
 }
 
 const supervisorChromeLogger = Object.assign((_message?: string) => {}, { verbose: false });
+const SUPERVISOR_THREAD_PROMPT_PREFIX = "Supervisor thread:";
 interface ChromeFocusDeps {
   captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
@@ -214,6 +237,21 @@ function supervisorThreadSessionSlug(thread: SupervisorThreadInfo): string {
   return `oracle-thread-${normalized || "chatgpt"}`;
 }
 
+function isReusableSupervisorThreadSession(
+  sessionId: string,
+  meta: SessionMetadata | null,
+): boolean {
+  const parentSessionId = meta?.options?.followupSessionId?.trim();
+  const prompt = meta?.options?.prompt?.trim() || meta?.promptPreview?.trim() || "";
+  return (
+    Boolean(meta?.browser?.runtime) &&
+    meta?.mode === "browser" &&
+    Boolean(parentSessionId) &&
+    parentSessionId !== sessionId &&
+    prompt.startsWith(SUPERVISOR_THREAD_PROMPT_PREFIX)
+  );
+}
+
 async function createSupervisorThreadSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
@@ -276,6 +314,28 @@ async function createAndSyncSupervisorThreadSession(
 ): Promise<string> {
   await syncSupervisorRuntimeSession(sessionId, thread, targetId);
   return await createSupervisorThreadSession(sessionId, thread, targetId);
+}
+
+async function ensureSupervisorThreadSession(
+  sessionId: string,
+  thread: SupervisorThreadInfo,
+  targetId?: string,
+): Promise<string> {
+  const meta = await sessionStore.readSession(sessionId);
+  if (isReusableSupervisorThreadSession(sessionId, meta)) {
+    const parentSessionId = meta?.options?.followupSessionId?.trim();
+    if (!meta || !parentSessionId) {
+      throw new Error(`Supervisor thread session ${sessionId} is missing followup metadata.`);
+    }
+    await syncSupervisorRuntimeSession(sessionId, thread, targetId);
+    await syncSupervisorRuntimeSession(parentSessionId, thread, targetId);
+    return sessionId;
+  }
+  const parentSessionId = meta?.options?.followupSessionId?.trim();
+  if (parentSessionId && parentSessionId !== sessionId) {
+    return await createAndSyncSupervisorThreadSession(parentSessionId, thread, targetId);
+  }
+  return await createAndSyncSupervisorThreadSession(sessionId, thread, targetId);
 }
 
 function normalizeOperation(request: SupervisorBrokerRequest): SupervisorBrokerOperation {
@@ -365,6 +425,39 @@ export async function runSupervisorBrokerRequest(
             }))
         )(request);
       }
+      case "thread_history": {
+        const conversationId = request.conversationId?.trim();
+        if (!conversationId) {
+          return {
+            ok: false,
+            error: "conversationId is required for thread_history.",
+          };
+        }
+        return (
+          deps.threadHistory ??
+          (async (incoming: SupervisorBrokerRequest) =>
+            withSupervisorRuntime(incoming, async ({ Runtime, sessionId, targetId }) => {
+              const meta = await sessionStore.readSession(sessionId);
+              const result = await readAttachedSupervisorThreadHistory(Runtime, {
+                conversationId,
+                projectUrl: configuredSupervisorProjectUrl(meta),
+                limit: incoming.historyLimit,
+              });
+              const threadSessionId = await ensureSupervisorThreadSession(
+                sessionId,
+                result.thread,
+                targetId,
+              );
+              return {
+                ok: true as const,
+                thread: result.thread,
+                sessionId: threadSessionId,
+                history: result.history,
+                historyWindow: result.historyWindow,
+              };
+            }))
+        )(request);
+      }
       default:
         return unsupportedOperationResponse(operation);
     }
@@ -405,6 +498,8 @@ export const __test__ = {
   syncSupervisorRuntimeSession,
   createSupervisorThreadSession,
   createAndSyncSupervisorThreadSession,
+  ensureSupervisorThreadSession,
   filterSupervisorThreadsForBrokerProjectScope,
+  isReusableSupervisorThreadSession,
   supervisorThreadSessionSlug,
 };
