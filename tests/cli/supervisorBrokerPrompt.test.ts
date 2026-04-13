@@ -5,11 +5,7 @@ import fs from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 import { sessionStore } from "../../src/sessionStore.js";
-import {
-  __test__,
-  assertSupervisorRuntimeAttachLeaseAvailable,
-  buildSupervisorBrowserConfig,
-} from "../../src/cli/supervisorBrokerPrompt.ts";
+import { __test__, buildSupervisorBrowserConfig } from "../../src/cli/supervisorBrokerPrompt.ts";
 
 const SUPERVISOR_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
 const SUPERVISOR_PROJECT_URL = "https://chatgpt.com/g/g-p-69ccbf70cff08191bd2a7e61d8962644/project";
@@ -928,7 +924,7 @@ describe("supervisor browser throttling", () => {
     ).rejects.toThrow(/ownership was lost/i);
   });
 
-  test("runtime attach is rejected while another live lease owns the hidden profile", async () => {
+  test("runtime attach lease waits for a competing hidden lease instead of failing", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-throttle-"));
     process.env.ORACLE_SUPERVISOR_THROTTLE_FILE = path.join(tempDir, "throttle.json");
     const throttleFile = __test__.resolveSupervisorBrowserThrottleFile();
@@ -942,7 +938,7 @@ describe("supervisor browser throttling", () => {
               pid: process.pid,
               hostname: "test-host",
               acquiredAt: "2026-04-05T12:00:01.000Z",
-              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              expiresAt: new Date(Date.now() + 50).toISOString(),
             },
           },
         },
@@ -950,9 +946,22 @@ describe("supervisor browser throttling", () => {
       "utf8",
     );
 
-    await expect(assertSupervisorRuntimeAttachLeaseAvailable()).rejects.toThrow(
-      /already leased by pid/i,
+    const log = vi.fn();
+    const startedAt = Date.now();
+    const reservation = await __test__.reserveSupervisorRuntimeAttachLease(log);
+    const elapsedMs = Date.now() - startedAt;
+    const state = JSON.parse(await fs.readFile(throttleFile, "utf8")) as {
+      profiles?: Record<string, { activeLease?: { ownerId?: string; pid?: number } }>;
+    };
+
+    expect(elapsedMs).toBeGreaterThanOrEqual(25);
+    expect(log).toHaveBeenCalled();
+    expect(state.profiles?.[SUPERVISOR_PROFILE_DIR]?.activeLease?.ownerId).toBe(
+      reservation.ownerId,
     );
+    expect(state.profiles?.[SUPERVISOR_PROFILE_DIR]?.activeLease?.pid).toBe(process.pid);
+
+    await __test__.releaseSupervisorBrowserRequestSlot(reservation);
   });
 
   test("rate-limit cooldown preserves an owned active lease instead of clobbering it", async () => {

@@ -240,6 +240,17 @@ describe("runSupervisorBrokerRequest", () => {
         port: 9222,
       };
     });
+    const withSupervisorRuntimeAttachLease = async <T>(
+      _log: (message?: string) => void,
+      work: () => Promise<T>,
+    ): Promise<T> => {
+      callOrder.push("lease-start");
+      try {
+        return await work();
+      } finally {
+        callOrder.push("lease-end");
+      }
+    };
     const captureFrontmostProcess = vi.fn(async () => {
       callOrder.push("capture");
       return "Zed";
@@ -267,6 +278,7 @@ describe("runSupervisorBrokerRequest", () => {
       {
         resolveSupervisorRuntimeContext,
         connectSupervisorRuntime: connectSupervisorRuntime as never,
+        withSupervisorRuntimeAttachLease,
       },
       {
         captureFrontmostProcess,
@@ -278,6 +290,7 @@ describe("runSupervisorBrokerRequest", () => {
 
     expect(result).toBe("ok");
     expect(callOrder).toEqual([
+      "lease-start",
       "resolve",
       "capture",
       "start",
@@ -287,6 +300,7 @@ describe("runSupervisorBrokerRequest", () => {
       "close",
       "hide",
       "stop",
+      "lease-end",
     ]);
   });
 

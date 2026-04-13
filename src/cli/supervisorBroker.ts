@@ -21,6 +21,7 @@ import {
 } from "./supervisorBrokerRuntime.js";
 import {
   runSupervisorPromptOperation,
+  withSupervisorRuntimeAttachLease,
   type SupervisorPromptRequest,
 } from "./supervisorBrokerPrompt.js";
 
@@ -61,7 +62,7 @@ export interface SupervisorBrokerDeps {
   ) => Promise<{ ok: true; thread: SupervisorThreadInfo; sessionId: string }>;
 }
 
-const supervisorChromeLogger = Object.assign((_: string) => {}, { verbose: false });
+const supervisorChromeLogger = Object.assign((_message?: string) => {}, { verbose: false });
 interface ChromeFocusDeps {
   captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
@@ -72,6 +73,7 @@ interface ChromeFocusDeps {
 interface SupervisorRuntimeDeps {
   resolveSupervisorRuntimeContext: typeof resolveSupervisorRuntimeContext;
   connectSupervisorRuntime: typeof connectSupervisorRuntime;
+  withSupervisorRuntimeAttachLease: typeof withSupervisorRuntimeAttachLease;
 }
 
 const chromeFocusDeps: ChromeFocusDeps = {
@@ -84,6 +86,7 @@ const chromeFocusDeps: ChromeFocusDeps = {
 const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
   resolveSupervisorRuntimeContext,
   connectSupervisorRuntime,
+  withSupervisorRuntimeAttachLease,
 };
 
 function configuredSupervisorProjectUrl(
@@ -153,23 +156,25 @@ async function withSupervisorRuntime<T>(
   runtimeDeps: SupervisorRuntimeDeps = supervisorRuntimeDeps,
   focusDeps: ChromeFocusDeps = chromeFocusDeps,
 ): Promise<T> {
-  const context = await runtimeDeps.resolveSupervisorRuntimeContext(request.followupSession);
-  return await withChromeFocusProtection(
-    context.runtime.chromePid,
-    async () => {
-      const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime);
-      try {
-        return await action({
-          Runtime: connection.client.Runtime,
-          sessionId: context.sessionId,
-          targetId: connection.targetId,
-        });
-      } finally {
-        await connection.close();
-      }
-    },
-    focusDeps,
-  );
+  return await runtimeDeps.withSupervisorRuntimeAttachLease(supervisorChromeLogger, async () => {
+    const context = await runtimeDeps.resolveSupervisorRuntimeContext(request.followupSession);
+    return await withChromeFocusProtection(
+      context.runtime.chromePid,
+      async () => {
+        const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime);
+        try {
+          return await action({
+            Runtime: connection.client.Runtime,
+            sessionId: context.sessionId,
+            targetId: connection.targetId,
+          });
+        } finally {
+          await connection.close();
+        }
+      },
+      focusDeps,
+    );
+  });
 }
 
 async function syncSupervisorRuntimeSession(

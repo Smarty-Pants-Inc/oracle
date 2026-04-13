@@ -606,35 +606,6 @@ describe("supervisorBrokerRuntime", () => {
     );
   });
 
-  test("resolveSupervisorRuntimeContext refuses to attach while another hidden lease is active", async () => {
-    vi.resetModules();
-    const ownedMeta = runtimeSession("owned", "completed", "2026-03-31T10:00:00.000Z");
-    vi.doMock("../../src/sessionStore.js", () => ({
-      sessionStore: {
-        readSession: vi.fn(async () => ownedMeta),
-        listSessions: vi.fn(),
-      },
-    }));
-    vi.doMock("../../src/cli/supervisorBrokerPrompt.js", async () => {
-      const actual = await vi.importActual<
-        typeof import("../../src/cli/supervisorBrokerPrompt.js")
-      >("../../src/cli/supervisorBrokerPrompt.js");
-      return {
-        ...actual,
-        assertSupervisorRuntimeAttachLeaseAvailable: vi.fn(async () => {
-          throw new Error(
-            "Oracle hidden browser profile is already leased by pid 4242. Wait for the active supervisor run to finish before attaching to its runtime.",
-          );
-        }),
-      };
-    });
-
-    const { resolveSupervisorRuntimeContext } =
-      await import("../../src/cli/supervisorBrokerRuntime.js");
-
-    await expect(resolveSupervisorRuntimeContext("owned")).rejects.toThrow(/already leased/i);
-  });
-
   test("pickReachableRuntimeCandidate skips hidden runtimes outside the configured project scope", async () => {
     const probe = vi.fn().mockResolvedValue({ ok: true });
     const listTargets = vi.fn().mockResolvedValue([
@@ -1000,6 +971,57 @@ describe("supervisorBrokerRuntime", () => {
     expect(result.targetId).toBe("expected-target");
     await result.close();
     expect(freshConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket runtimes fall back to host:port discovery when the cached browser websocket endpoint is stale", async () => {
+    vi.resetModules();
+    const cdpClient = {
+      Runtime: { enable: vi.fn(async () => ({})) },
+      DOM: { enable: vi.fn(async () => ({})) },
+      close: vi.fn(async () => {}),
+    };
+    const CDP = vi.fn(async () => cdpClient);
+    const connectToRemoteChromeTarget = vi.fn(async () => {
+      throw new Error("Unexpected server response: 404");
+    });
+    const listRemoteChromeTargets = vi.fn(async () => [
+      { targetId: "expected-target", type: "page", url: "https://chatgpt.com/c/expected" },
+    ]);
+
+    vi.doMock("chrome-remote-interface", () => ({
+      default: CDP,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    const result = await connectSupervisorRuntime({
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/stale",
+      chromeTargetId: "stale-target",
+      tabUrl: "https://chatgpt.com/c/expected",
+      conversationId: "expected",
+    });
+
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      browserWSEndpoint: undefined,
+    });
+    expect(CDP).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      target: "expected-target",
+    });
+    expect(result.targetId).toBe("expected-target");
+    await result.close();
+    expect(cdpClient.close).toHaveBeenCalledTimes(1);
   });
 
   test("connectSupervisorRuntime surfaces a clear error when the cached runtime has no tabs", async () => {

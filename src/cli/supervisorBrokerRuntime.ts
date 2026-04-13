@@ -23,7 +23,6 @@ import {
 } from "../browser/reattachHelpers.js";
 import type { BrowserLogger, ChromeClient } from "../browser/types.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
-import { assertSupervisorRuntimeAttachLeaseAvailable } from "./supervisorBrokerPrompt.js";
 
 const noopLogger: BrowserLogger = Object.assign((_: string) => {}, { verbose: false });
 const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
@@ -350,7 +349,6 @@ async function pickReachableRuntimeCandidate(
 export async function resolveSupervisorRuntimeContext(
   followupSession?: string,
 ): Promise<SupervisorRuntimeContext> {
-  await assertSupervisorRuntimeAttachLeaseAvailable();
   const hinted = followupSession?.trim();
   if (hinted) {
     const meta = await sessionStore.readSession(hinted);
@@ -402,17 +400,22 @@ export async function connectSupervisorRuntime(
   if (!port) {
     throw new Error("Browser runtime metadata is missing a reachable DevTools port.");
   }
-  const browserWSEndpoint = runtime.chromeBrowserWSEndpoint ?? undefined;
+  let browserWSEndpoint = runtime.chromeBrowserWSEndpoint ?? undefined;
 
   if (browserWSEndpoint && runtime.chromeTargetId) {
+    let cachedConnection: Awaited<ReturnType<typeof connectToRemoteChromeTarget>> | null = null;
     try {
-      const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
+      cachedConnection = await connectToRemoteChromeTarget(host, port, noopLogger, {
         browserWSEndpoint,
         targetId: runtime.chromeTargetId,
         closeTargetOnDispose: false,
       });
+    } catch {
+      browserWSEndpoint = undefined;
+    }
+    if (cachedConnection) {
       try {
-        const { client } = connection;
+        const { client } = cachedConnection;
         const target = await readConnectedTargetInfo(
           client,
           {
@@ -430,21 +433,19 @@ export async function connectSupervisorRuntime(
         }
         return {
           client,
-          close: connection.close,
+          close: cachedConnection.close,
           host,
           port,
           targetId: runtime.chromeTargetId,
         };
-      } catch (error) {
-        await connection.close().catch(() => undefined);
-        throw error;
+      } catch {
+        await cachedConnection.close().catch(() => undefined);
       }
-    } catch {
-      // fall through to target discovery below
     }
   }
 
-  let targets: TargetInfoLite[];
+  let targets: TargetInfoLite[] | undefined;
+  let targetListError: unknown = null;
   try {
     targets = (await listRemoteChromeTargets({
       host,
@@ -452,13 +453,32 @@ export async function connectSupervisorRuntime(
       browserWSEndpoint,
     })) as TargetInfoLite[];
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    targetListError = error;
+    if (browserWSEndpoint) {
+      browserWSEndpoint = undefined;
+      try {
+        targets = (await listRemoteChromeTargets({
+          host,
+          port,
+        })) as TargetInfoLite[];
+        targetListError = null;
+      } catch (fallbackError) {
+        targetListError = fallbackError;
+      }
+    }
+  }
+  if (targetListError) {
+    const message =
+      targetListError instanceof Error ? targetListError.message : String(targetListError);
     if (/No inspectable targets/i.test(message)) {
       throw new Error(
         "Unable to locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
       );
     }
-    throw error;
+    throw targetListError;
+  }
+  if (!targets) {
+    throw new Error("Unable to list reusable Oracle browser targets for the cached runtime.");
   }
   const strictTargetMatch = Boolean(browserWSEndpoint);
   const target = pickSupervisorRuntimeTarget(targets, runtime, strictTargetMatch);

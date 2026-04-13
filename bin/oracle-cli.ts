@@ -233,7 +233,7 @@ async function flushStandardStream(stream: NodeJS.WriteStream): Promise<void> {
 }
 
 async function exitAfterNonInteractiveCompletion(): Promise<never | void> {
-  if (process.stdout.isTTY) {
+  if (process.stdout.isTTY || process.env.VITEST) {
     return;
   }
   await Promise.allSettled([

@@ -50,6 +50,7 @@ const SUPERVISOR_BROWSER_LEASE_HEARTBEAT_MS = Math.min(
   Math.max(30_000, Math.trunc(SUPERVISOR_BROWSER_LEASE_TTL_MS / 3)),
 );
 const SUPERVISOR_BROWSER_ACTIVE_LEASE_RECHECK_MS = 5_000;
+const SUPERVISOR_BROWSER_RUNTIME_ATTACH_RECHECK_MIN_MS = 250;
 const SUPERVISOR_PROMPT_COMPLETION_POLL_MS = 500;
 const SUPERVISOR_CHATGPT_URL_ENV = "ORACLE_SUPERVISOR_CHATGPT_URL";
 
@@ -716,30 +717,86 @@ async function readSupervisorBrowserThrottleState(): Promise<SupervisorBrowserTh
   }
 }
 
-export async function assertSupervisorRuntimeAttachLeaseAvailable(): Promise<void> {
-  const ownerId = process.env[SUPERVISOR_BROWSER_LEASE_OWNER_ID_ENV]?.trim();
+async function reserveSupervisorRuntimeAttachLease(log: (message?: string) => void): Promise<{
+  profileKey: string;
+  ownerId: string;
+  ownerPid: number;
+  ownerProcessStartMarker?: string;
+  requestStartedAtMs: number;
+}> {
+  const profileKey = SUPERVISOR_BROWSER_PROFILE_DIR;
+  const ownerId =
+    process.env[SUPERVISOR_BROWSER_LEASE_OWNER_ID_ENV]?.trim() ||
+    `${os.hostname()}:${process.pid}:${Date.now()}:${randomUUID()}`;
+  if (!process.env[SUPERVISOR_BROWSER_LEASE_OWNER_ID_ENV]) {
+    process.env[SUPERVISOR_BROWSER_LEASE_OWNER_ID_ENV] = ownerId;
+  }
   const ownerPid = process.pid;
-  const ownerProcessStartMarker = readProcessStartMarker(ownerPid) ?? undefined;
-  const nowMs = Date.now();
-  const state = sanitizeSupervisorBrowserThrottleState(
-    await readSupervisorBrowserThrottleState(),
-    nowMs,
-    { ownerId, ownerPid, ownerProcessStartMarker },
-  );
-  const activeLease = state.profiles?.[SUPERVISOR_BROWSER_PROFILE_DIR]?.activeLease;
-  if (
-    !activeLease ||
-    supervisorBrowserLeaseMatchesOwnerIdentity(activeLease, {
+  const processStartMarker = readProcessStartMarker(process.pid) ?? undefined;
+  while (true) {
+    const decision = await withSupervisorBrowserThrottleLock(async () => {
+      const nowMs = Date.now();
+      const state = sanitizeSupervisorBrowserThrottleState(
+        await readSupervisorBrowserThrottleState(),
+        nowMs,
+        { ownerId, ownerPid, ownerProcessStartMarker: processStartMarker },
+      );
+      const profiles = state.profiles ?? {};
+      const entry = profiles[profileKey];
+      const activeLease = entry?.activeLease;
+      if (
+        activeLease &&
+        !supervisorBrowserLeaseMatchesOwnerIdentity(activeLease, {
+          ownerId,
+          ownerPid,
+          ownerProcessStartMarker: processStartMarker,
+        })
+      ) {
+        const expiresAtMs = Date.parse(activeLease.expiresAt);
+        await writeSupervisorBrowserThrottleState({ profiles });
+        return {
+          delayMs: Math.max(
+            SUPERVISOR_BROWSER_RUNTIME_ATTACH_RECHECK_MIN_MS,
+            Number.isFinite(expiresAtMs)
+              ? expiresAtMs - nowMs
+              : SUPERVISOR_BROWSER_RUNTIME_ATTACH_RECHECK_MIN_MS,
+          ),
+          reason: "active-lease" as const,
+        };
+      }
+      profiles[profileKey] = {
+        ...entry,
+        activeLease: {
+          ownerId,
+          pid: process.pid,
+          hostname: os.hostname(),
+          acquiredAt: new Date(nowMs).toISOString(),
+          expiresAt: new Date(nowMs + SUPERVISOR_BROWSER_LEASE_TTL_MS).toISOString(),
+          processStartMarker,
+        },
+      };
+      await writeSupervisorBrowserThrottleState({ profiles });
+      return {
+        delayMs: 0,
+        reason: null,
+      };
+    });
+    if (decision.delayMs > 0 && decision.reason) {
+      const waitMs = Math.min(decision.delayMs, SUPERVISOR_BROWSER_ACTIVE_LEASE_RECHECK_MS);
+      log(
+        `Supervisor browser throttle (${decision.reason}); waiting ${formatElapsed(waitMs)} before attaching to the Oracle runtime.`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+    return {
+      profileKey,
       ownerId,
       ownerPid,
-      ownerProcessStartMarker,
-    })
-  ) {
-    return;
+      ownerProcessStartMarker: processStartMarker,
+      requestStartedAtMs: Date.now(),
+    };
   }
-  throw new Error(
-    `Oracle hidden browser profile is already leased by pid ${activeLease.pid}. Wait for the active supervisor run to finish before attaching to its runtime.`,
-  );
 }
 
 function resolveSupervisorBrowserThrottleFile(): string {
@@ -1216,6 +1273,18 @@ async function withSupervisorBrowserLeaseHeartbeat<T>(
   }
 }
 
+export async function withSupervisorRuntimeAttachLease<T>(
+  log: (message?: string) => void,
+  work: () => Promise<T>,
+): Promise<T> {
+  const reservation = await reserveSupervisorRuntimeAttachLease(log);
+  try {
+    return await withSupervisorBrowserLeaseHeartbeat(reservation, log, work);
+  } finally {
+    await releaseSupervisorBrowserRequestSlot(reservation);
+  }
+}
+
 async function markSupervisorBrowserRateLimit(
   config: BrowserSessionConfig,
   reservation: {
@@ -1590,7 +1659,6 @@ export async function runSupervisorPromptOperation(
 }
 
 export const __test__ = {
-  assertSupervisorRuntimeAttachLeaseAvailable,
   commitSupervisorBrowserRequestSlot,
   acquireSupervisorBrowserThrottleLock,
   computeSupervisorBrowserThrottleDecision,
@@ -1607,6 +1675,7 @@ export const __test__ = {
   readProcessStartMarker,
   readSupervisorPromptCompletionSnapshot,
   readReusableSupervisorPromptOutput,
+  reserveSupervisorRuntimeAttachLease,
   installSupervisorBrowserRequestSlotSignalCleanup,
   resolveSupervisorBrowserThrottleFile,
   resolveSupervisorBrowserThrottleLockFile,
@@ -1618,5 +1687,6 @@ export const __test__ = {
   supervisorPromptSessionConsumedQuota,
   supervisorBrowserThrottleProfileKey,
   supervisorBrowserLeaseMatchesLiveProcess,
+  withSupervisorRuntimeAttachLease,
   waitForSupervisorPromptRunOutcome,
 };
