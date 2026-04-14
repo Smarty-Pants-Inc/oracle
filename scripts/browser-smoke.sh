@@ -54,6 +54,38 @@ echo "[browser-smoke] fast upload attachment (non-inline)"
 echo "[browser-smoke] fast simple"
 "${CMD[@]}" --model "$FAST_MODEL" --prompt "Return exactly one markdown bullet: '- pro-ok'." --slug browser-smoke-pro --force
 
+echo "[browser-smoke] exact existing-thread attach proof"
+attach_seed_slug="browser-smoke-attach-seed"
+attach_proof_slug="browser-smoke-attach-proof"
+"${CMD[@]}" --model "$FAST_MODEL" --prompt "Return exactly 'attach-seed-ok'." --slug "$attach_seed_slug" --force
+attach_seed_meta="$HOME/.oracle/sessions/$attach_seed_slug/meta.json"
+attach_thread_url="$(node -e "const fs=require('fs');const meta=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const url=meta?.browser?.runtime?.tabUrl||'';if(!url.includes('/c/'))process.exit(1);process.stdout.write(url);" "$attach_seed_meta")" || {
+  echo "[browser-smoke] attach proof: missing exact thread url"
+  exit 1
+}
+attach_conversation_id="$(node -e "const fs=require('fs');const meta=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const id=meta?.browser?.runtime?.conversationId||'';if(!id)process.exit(1);process.stdout.write(id);" "$attach_seed_meta")" || {
+  echo "[browser-smoke] attach proof: missing conversation id"
+  exit 1
+}
+"${CMD[@]}" --model "$FAST_MODEL" --chatgpt-url "$attach_thread_url" --prompt "Return exactly 'attach-proof-ok'." --slug "$attach_proof_slug" --force
+attach_proof_meta="$HOME/.oracle/sessions/$attach_proof_slug/meta.json"
+node - <<'NODE' "$attach_proof_meta" "$attach_thread_url" "$attach_conversation_id"
+const fs = require('fs');
+const [metaPath, expectedUrl, expectedConversationId] = process.argv.slice(2);
+const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+const runtime = meta?.browser?.runtime ?? {};
+const normalize = (value) => String(value ?? '').replace(/\/+$/, '');
+if (runtime.conversationId !== expectedConversationId) {
+  throw new Error(`attach proof conversation mismatch: expected ${expectedConversationId}, got ${runtime.conversationId ?? 'unknown'}`);
+}
+if (normalize(runtime.tabUrl) !== normalize(expectedUrl)) {
+  throw new Error(`attach proof tab url mismatch: expected ${expectedUrl}, got ${runtime.tabUrl ?? 'unknown'}`);
+}
+if (meta?.response?.assistantOutput?.trim() !== 'attach-proof-ok') {
+  throw new Error('attach proof output mismatch');
+}
+NODE
+
 echo "[browser-smoke] fast with attachment preview (inline)"
 "${CMD[@]}" --model "$FAST_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
 
@@ -108,11 +140,6 @@ if ! grep -q "reattach-ok" "$reattach_log"; then
   exit 1
 fi
 
-# Cleanup Chrome if it was left running.
-chrome_pid=$(node -e "const fs=require('fs');try{const j=JSON.parse(fs.readFileSync('$meta','utf8'));if(j.browser?.runtime?.chromePid){console.log(j.browser.runtime.chromePid);} }catch{}")
-if [ -n "${chrome_pid:-}" ]; then
-  kill "$chrome_pid" 2>/dev/null || true
-fi
 rm -rf "$HOME/.oracle/sessions/$slug" "$logfile" "$reattach_log"
 
 rm -f "$tmpfile"

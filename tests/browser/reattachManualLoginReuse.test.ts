@@ -697,4 +697,100 @@ describe("continueBrowserSession manual-login reuse", () => {
     );
     expect(result.answerMarkdown).toBe("hello after reconnect");
   });
+
+  test("fails closed instead of relaunching a fresh hidden browser when the managed profile is not reusable", async () => {
+    const launchChrome = vi.fn(async () => {
+      throw new Error("launchChrome should not be called");
+    });
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
+        "../../src/browser/chromeLifecycle.js",
+      );
+      return {
+        ...original,
+        launchChrome,
+      };
+    });
+    vi.doMock("../../src/browser/detect.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/detect.js")>(
+        "../../src/browser/detect.js",
+      );
+      return {
+        ...original,
+        readDevToolsActivePortInfo: vi.fn(async () => null),
+      };
+    });
+    vi.doMock("../../src/browser/profileState.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
+        "../../src/browser/profileState.js",
+      );
+      return {
+        ...original,
+        readChromePid: vi.fn(async () => null),
+        resolveChromePidForUserDataDir: vi.fn(async () => null),
+      };
+    });
+
+    const { resumeBrowserSession, continueBrowserSession } =
+      await import("../../src/browser/reattach.js");
+    const logger = vi.fn() as BrowserLogger;
+    logger.verbose = true;
+
+    await expect(
+      resumeBrowserSession(
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9333,
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9333/devtools/browser/browser-1",
+          chromeTargetId: "cached-target",
+          tabUrl: "https://chatgpt.com/g/team-space-oracle/c/thread-1",
+          conversationId: "thread-1",
+          userDataDir: "/tmp/oracle-browser-profile-hidden",
+        },
+        {
+          timeoutMs: 2_000,
+          modelStrategy: "ignore",
+          keepBrowser: true,
+          manualLogin: true,
+          manualLoginProfileDir: "/tmp/oracle-browser-profile-hidden",
+          hideWindow: true,
+        },
+        logger,
+        {},
+      ),
+    ).rejects.toThrow(/Refusing to relaunch the Oracle hidden browser/i);
+
+    expect(launchChrome).not.toHaveBeenCalled();
+
+    await expect(
+      continueBrowserSession(
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9333,
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9333/devtools/browser/browser-1",
+          chromeTargetId: "cached-target",
+          tabUrl: "https://chatgpt.com/g/team-space-oracle/c/thread-1",
+          conversationId: "thread-1",
+          userDataDir: "/tmp/oracle-browser-profile-hidden",
+        },
+        {
+          timeoutMs: 2_000,
+          modelStrategy: "ignore",
+          keepBrowser: true,
+          manualLogin: true,
+          manualLoginProfileDir: "/tmp/oracle-browser-profile-hidden",
+          hideWindow: true,
+        },
+        logger,
+        {
+          prompt: "hello again",
+          attachments: [],
+        },
+        {},
+      ),
+    ).rejects.toThrow(/Refusing to relaunch the Oracle hidden browser/i);
+
+    expect(launchChrome).not.toHaveBeenCalled();
+  });
 });

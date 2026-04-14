@@ -37,7 +37,12 @@ export async function reportBrowserProgress(
     return;
   }
   logger.sessionLog?.(`[browser-progress:${update.stage}] ${update.message}`);
-  await logger.progress?.(update);
+  try {
+    await logger.progress?.(update);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.sessionLog?.(`[browser-progress:error] Failed to persist browser progress: ${message}`);
+  }
 }
 
 export interface BrowserAttachment {

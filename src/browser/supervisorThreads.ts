@@ -36,6 +36,7 @@ export interface SupervisorThreadHistoryWindow {
 }
 
 interface SupervisorThreadHistorySnapshot {
+  thread: SupervisorThreadInfo;
   history: SupervisorThreadHistoryEntry[];
   historyWindow: SupervisorThreadHistoryWindow;
 }
@@ -243,6 +244,22 @@ function normalizeSupervisorThreadHistorySnapshot(
   value: unknown,
   limit: number,
 ): SupervisorThreadHistorySnapshot {
+  const readSnapshotThread = (candidate: unknown): SupervisorThreadInfo | null => {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+    const raw = candidate as Record<string, unknown>;
+    const normalized = normalizeSupervisorThread(raw);
+    const hasTitle = typeof raw.title === "string" && raw.title.trim().length > 0;
+    return normalized && (Boolean(normalized.conversationId || normalized.url) || hasTitle)
+      ? normalized
+      : null;
+  };
+  const thread = readSnapshotThread((value as { thread?: unknown })?.thread) ??
+    readSnapshotThread((value as { supervisorThread?: unknown })?.supervisorThread) ?? {
+      title: "Untitled chat",
+      isActive: true,
+    };
   const rawHistory = Array.isArray(value)
     ? value
     : Array.isArray((value as { history?: unknown })?.history)
@@ -256,14 +273,19 @@ function normalizeSupervisorThreadHistorySnapshot(
     limit,
     history.length,
   );
-  return { history, historyWindow };
+  return { thread, history, historyWindow };
 }
 
 function supervisorThreadHistorySnapshotsEqual(
   left: SupervisorThreadHistorySnapshot,
   right: SupervisorThreadHistorySnapshot,
 ): boolean {
+  const sameThread =
+    left.thread.conversationId || right.thread.conversationId
+      ? left.thread.conversationId === right.thread.conversationId
+      : normalizeProjectUrl(left.thread.url) === normalizeProjectUrl(right.thread.url);
   if (
+    !sameThread ||
     left.historyWindow.limit !== right.historyWindow.limit ||
     left.historyWindow.returnedCount !== right.historyWindow.returnedCount ||
     left.historyWindow.totalCount !== right.historyWindow.totalCount ||
@@ -481,7 +503,18 @@ async function readSupervisorThreadHistorySnapshotOnce(
         entries.push({ role, text });
       }
       const limitedEntries = entries.slice(-limit);
+      const href = window.location.href || '';
+      const conversationId = (href.match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '';
       return {
+        thread: {
+          url: href,
+          conversationId,
+          title:
+            (document.querySelector('main h1')?.textContent || '').trim() ||
+            (document.title || '').trim() ||
+            'Untitled chat',
+          isActive: true,
+        },
         history: limitedEntries,
         historyWindow: {
           limit,
@@ -552,6 +585,14 @@ export async function readAttachedSupervisorThreadHistory(
     );
   }
   const snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  if (
+    snapshot.thread.conversationId !== expectedConversationId ||
+    !supervisorThreadMatchesProjectScope(snapshot.thread, options.projectUrl)
+  ) {
+    throw new Error(
+      `Oracle supervisor thread changed during history capture (expected ${expectedConversationId}, current ${snapshot.thread.conversationId ?? "unknown"}).`,
+    );
+  }
   const settledThread = await readCurrentSupervisorThread(Runtime);
   await delay(HISTORY_STABILITY_POLL_MS);
   const confirmedThread = await readCurrentSupervisorThread(Runtime);

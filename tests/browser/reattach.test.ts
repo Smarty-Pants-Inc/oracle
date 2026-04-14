@@ -37,6 +37,7 @@ const isTurnCountProbe = (expression: string) =>
   expression.includes("__oracleCollectThreadEntries");
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.doUnmock("../../src/browser/chromeLifecycle.js");
   vi.resetModules();
   vi.restoreAllMocks();

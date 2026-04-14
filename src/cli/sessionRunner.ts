@@ -46,7 +46,10 @@ import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
-import { extractConversationIdFromUrl } from "../browser/reattachHelpers.js";
+import {
+  conversationHrefMatchesConfiguredScope,
+  extractConversationIdFromUrl,
+} from "../browser/reattachHelpers.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger, BrowserProgressUpdate } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
@@ -72,6 +75,17 @@ function mergeBrowserRuntime(
     ...(tabUrlProvided ? { conversationId: updates?.conversationId ?? derivedConversationId } : {}),
   };
   return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function observedRuntimeConversationId(
+  runtime: BrowserRuntimeMetadata | undefined,
+): string | undefined {
+  const fromUrl = extractConversationIdFromUrl(runtime?.tabUrl ?? "");
+  if (fromUrl) {
+    return fromUrl;
+  }
+  const explicit = runtime?.conversationId?.trim();
+  return explicit ? explicit : undefined;
 }
 
 function buildSessionProgress(
@@ -117,6 +131,54 @@ function applySupervisorThreadBindingToRuntime(
   };
 }
 
+function stabilizeRuntimeWithSupervisorThread(
+  runtime: BrowserRuntimeMetadata | undefined,
+  binding: SupervisorThreadBindingMetadata | null,
+): BrowserRuntimeMetadata | undefined {
+  if (!runtime && !binding) {
+    return undefined;
+  }
+  const next: BrowserRuntimeMetadata = {
+    ...(runtime ?? {}),
+  };
+  if (!next.tabUrl && binding?.url) {
+    next.tabUrl = binding.url;
+  }
+  const conversationId = observedRuntimeConversationId(next);
+  if (conversationId) {
+    next.conversationId = conversationId;
+  } else if (binding?.conversationId) {
+    next.conversationId = binding.conversationId;
+    if (binding.url) {
+      next.tabUrl = binding.url;
+    }
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function observedRuntimeViolatesSupervisorThread(
+  runtime: BrowserRuntimeMetadata | undefined,
+  binding: SupervisorThreadBindingMetadata | null,
+): boolean {
+  if (!runtime || !binding) {
+    return false;
+  }
+  const conversationId = observedRuntimeConversationId(runtime);
+  if (conversationId) {
+    return conversationId !== binding.conversationId;
+  }
+  const tabUrl = runtime.tabUrl?.trim();
+  const projectUrl = binding.projectUrl?.trim();
+  if (tabUrl && projectUrl) {
+    return !conversationHrefMatchesConfiguredScope(tabUrl, projectUrl);
+  }
+  return false;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export interface SessionRunParams {
   sessionMeta: SessionMetadata;
   runOptions: RunOracleOptions;
@@ -145,9 +207,11 @@ export async function performSessionRun({
   muteStdout = false,
 }: SessionRunParams): Promise<void> {
   const sessionSupervisorThread = normalizeSupervisorThreadBinding(sessionMeta.supervisorThread);
-  let latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
-    sessionMeta.browser?.runtime,
-    sessionSupervisorThread,
+  let latestObservedBrowserRuntime = sessionMeta.browser?.runtime;
+  let activeSupervisorThread = sessionSupervisorThread;
+  let latestBrowserRuntime = stabilizeRuntimeWithSupervisorThread(
+    latestObservedBrowserRuntime,
+    activeSupervisorThread,
   );
   const browserSessionLogWriter =
     mode === "browser" ? sessionStore.createLogWriter(sessionMeta.id) : null;
@@ -163,21 +227,31 @@ export async function performSessionRun({
     browserModelLogWriter?.logLine(message);
   };
   const persistBrowserProgress = async (update: BrowserProgressUpdate): Promise<void> => {
-    latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
-      mergeBrowserRuntime(latestBrowserRuntime, update.runtime),
-      sessionSupervisorThread,
+    latestObservedBrowserRuntime = mergeBrowserRuntime(
+      latestObservedBrowserRuntime,
+      update.runtime,
     );
-    await sessionStore.updateSession(sessionMeta.id, {
-      status: "running",
-      mode,
-      browser: browserConfig
-        ? {
-            config: browserConfig,
-            runtime: latestBrowserRuntime,
-          }
-        : undefined,
-      progress: buildSessionProgress(update, latestBrowserRuntime),
-    });
+    latestBrowserRuntime = stabilizeRuntimeWithSupervisorThread(
+      latestObservedBrowserRuntime,
+      activeSupervisorThread,
+    );
+    try {
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "running",
+        mode,
+        browser: browserConfig
+          ? {
+              config: browserConfig,
+              runtime: latestBrowserRuntime,
+            }
+          : undefined,
+        progress: buildSessionProgress(update, latestBrowserRuntime),
+      });
+    } catch (error) {
+      browserSessionLog(
+        `[browser-progress:error] Failed to persist browser progress: ${describeError(error)}`,
+      );
+    }
   };
   const writeInline = (chunk: string): boolean => {
     // Keep session logs intact while still echoing inline output to the user.
@@ -218,14 +292,21 @@ export async function performSessionRun({
       const runnerDeps = {
         ...browserDeps,
         persistRuntimeHint: async (runtime: BrowserRuntimeMetadata) => {
-          latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
-            runtime,
-            sessionSupervisorThread,
+          latestObservedBrowserRuntime = mergeBrowserRuntime(latestObservedBrowserRuntime, runtime);
+          latestBrowserRuntime = stabilizeRuntimeWithSupervisorThread(
+            latestObservedBrowserRuntime,
+            activeSupervisorThread,
           );
-          await sessionStore.updateSession(sessionMeta.id, {
-            status: "running",
-            browser: { config: browserConfig, runtime: latestBrowserRuntime },
-          });
+          try {
+            await sessionStore.updateSession(sessionMeta.id, {
+              status: "running",
+              browser: { config: browserConfig, runtime: latestBrowserRuntime },
+            });
+          } catch (error) {
+            browserSessionLog(
+              `[browser-progress:error] Failed to persist browser runtime hint: ${describeError(error)}`,
+            );
+          }
         },
       };
       const parentSessionId = sessionMeta.options?.followupSessionId?.trim();
@@ -237,6 +318,11 @@ export async function performSessionRun({
       const effectiveSupervisorThread =
         sessionSupervisorThread ??
         normalizeSupervisorThreadBinding(parentSession?.supervisorThread);
+      activeSupervisorThread = effectiveSupervisorThread;
+      latestBrowserRuntime = stabilizeRuntimeWithSupervisorThread(
+        latestObservedBrowserRuntime,
+        activeSupervisorThread,
+      );
       if (parentSessionId && parentSessionId !== sessionMeta.id) {
         if (!parentSession) {
           throw new Error(
@@ -293,6 +379,7 @@ export async function performSessionRun({
           },
         };
         if (effectiveRuntime) {
+          latestObservedBrowserRuntime = effectiveRuntime;
           latestBrowserRuntime = effectiveRuntime;
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
@@ -327,20 +414,29 @@ export async function performSessionRun({
             },
             runnerDeps,
           );
+      const observedBrowserRuntime = mergeBrowserRuntime(
+        latestObservedBrowserRuntime,
+        result.runtime,
+      );
+      const finalizedBrowserRuntime = stabilizeRuntimeWithSupervisorThread(
+        observedBrowserRuntime,
+        activeSupervisorThread,
+      );
       if (
         effectiveSupervisorThread &&
-        result.runtime?.conversationId?.trim() !== effectiveSupervisorThread.conversationId
+        observedRuntimeViolatesSupervisorThread(observedBrowserRuntime, effectiveSupervisorThread)
       ) {
         throw new BrowserAutomationError(
-          `Browser follow-up drifted to Oracle conversation ${result.runtime?.conversationId ?? "unknown"} while ${effectiveSupervisorThread.conversationId} was required.`,
+          `Browser follow-up drifted to Oracle conversation ${observedRuntimeConversationId(observedBrowserRuntime) ?? "unknown"} while ${effectiveSupervisorThread.conversationId} was required.`,
           {
             stage: "browser-followup-thread-identity-mismatch",
-            runtime: result.runtime,
+            runtime: observedBrowserRuntime,
             expectedConversationId: effectiveSupervisorThread.conversationId,
           },
         );
       }
-      latestBrowserRuntime = result.runtime ?? latestBrowserRuntime;
+      latestObservedBrowserRuntime = observedBrowserRuntime;
+      latestBrowserRuntime = finalizedBrowserRuntime ?? latestBrowserRuntime;
       const attemptedOutputWrite = Boolean(runOptions.writeOutputPath);
       const savedOutputPath = await writeAssistantOutput(
         runOptions.writeOutputPath,
@@ -366,15 +462,15 @@ export async function performSessionRun({
         elapsedMs: result.elapsedMs,
         browser: {
           config: browserConfig,
-          runtime: result.runtime,
+          runtime: latestBrowserRuntime,
         },
         progress: {
           stage: "assistant-completed",
           message: "Captured the assistant response.",
           updatedAt: new Date().toISOString(),
-          conversationId: result.runtime?.conversationId,
-          tabUrl: result.runtime?.tabUrl,
-          chromeTargetId: result.runtime?.chromeTargetId,
+          conversationId: latestBrowserRuntime?.conversationId,
+          tabUrl: latestBrowserRuntime?.tabUrl,
+          chromeTargetId: latestBrowserRuntime?.chromeTargetId,
         },
         options: nextOptions,
         response: {

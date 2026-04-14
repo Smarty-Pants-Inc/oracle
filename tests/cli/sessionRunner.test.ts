@@ -822,6 +822,65 @@ describe("performSessionRun", () => {
     );
   });
 
+  test("does not fail the browser run when progress persistence throws", async () => {
+    let updateCount = 0;
+    sessionStoreMock.updateSession.mockImplementation(async () => {
+      updateCount += 1;
+      if (updateCount === 2) {
+        throw new Error("disk full");
+      }
+    });
+    vi.mocked(runBrowserSessionExecution).mockImplementation(async (args) => {
+      await args.persistProgress?.({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation abc.",
+        runtime: {
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+      });
+      return {
+        usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+        elapsedMs: 150,
+        runtime: {
+          chromePid: 123,
+          chromePort: 9222,
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+        answerText: "Answer",
+      };
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const logWriterCalls = sessionStoreMock.createLogWriter.mock.results.map(
+      (entry) => entry.value,
+    );
+    const progressLines = logWriterCalls.flatMap(
+      (writer: { logLine: { mock: { calls: unknown[][] } } }) =>
+        writer.logLine.mock.calls.map((call) => call[0]),
+    );
+    expect(progressLines).toContain(
+      "[browser-progress:error] Failed to persist browser progress: disk full",
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess-1",
+      expect.objectContaining({ status: "completed" }),
+    );
+  });
+
   test("continues browser followups from a stored browser parent session", async () => {
     const parentSession: SessionMetadata = {
       ...baseSessionMeta,
@@ -1089,6 +1148,223 @@ describe("performSessionRun", () => {
       expect.objectContaining({
         status: "error",
         errorMessage: expect.stringContaining("Browser follow-up drifted to Oracle conversation"),
+      }),
+    );
+  });
+
+  test("preserves the inherited supervisor thread binding when the final runtime falls back to the project shell", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      supervisorThread: {
+        conversationId: "bound-1",
+        url: "https://chatgpt.com/c/bound-1",
+        verifiedAt: "2026-04-14T00:00:00.000Z",
+      },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/bound-1",
+          conversationId: "bound-1",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockImplementation(async (args) => {
+      await args.persistProgress?.({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation bound-1.",
+        runtime: {
+          chromeTargetId: "target-bound",
+          tabUrl: "https://chatgpt.com/c/bound-1",
+          conversationId: "bound-1",
+        },
+      });
+      return {
+        usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+        elapsedMs: 900,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-project",
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/project",
+        },
+        answerText: "continued",
+      };
+    });
+
+    await performSessionRun({
+      sessionMeta: {
+        ...baseSessionMeta,
+        mode: "browser",
+        options: { followupSessionId: "parent-browser" },
+      },
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        status: "completed",
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            tabUrl: "https://chatgpt.com/c/bound-1",
+            conversationId: "bound-1",
+          }),
+        }),
+      }),
+    );
+  });
+
+  test("rejects a final runtime that falls back to a shell outside the expected supervisor project scope", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      supervisorThread: {
+        conversationId: "bound-1",
+        url: "https://chatgpt.com/g/g-p-example-oracle/c/bound-1",
+        projectUrl: "https://chatgpt.com/g/g-p-example/project",
+        verifiedAt: "2026-04-14T00:00:00.000Z",
+      },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/bound-1",
+          conversationId: "bound-1",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockImplementation(async (args) => {
+      await args.persistProgress?.({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation bound-1.",
+        runtime: {
+          chromeTargetId: "target-bound",
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/bound-1",
+          conversationId: "bound-1",
+        },
+      });
+      return {
+        usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+        elapsedMs: 900,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-project",
+          tabUrl: "https://chatgpt.com/g/g-p-other/project",
+        },
+        answerText: "continued",
+      };
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          mode: "browser",
+          supervisorThread: parentSession.supervisorThread,
+          options: { followupSessionId: "parent-browser" },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Browser follow-up drifted to Oracle conversation unknown");
+  });
+
+  test("preserves inherited conversation identity when a bound runtime lacks a stored thread url", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      supervisorThread: {
+        conversationId: "bound-1",
+        projectUrl: "https://chatgpt.com/g/g-p-example/project",
+        verifiedAt: "2026-04-14T00:00:00.000Z",
+      },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/bound-1",
+          conversationId: "bound-1",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockImplementation(async (args) => {
+      await args.persistProgress?.({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation bound-1.",
+        runtime: {
+          chromeTargetId: "target-bound",
+          tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/bound-1",
+          conversationId: "bound-1",
+        },
+      });
+      return {
+        usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+        elapsedMs: 900,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-project",
+          tabUrl: "https://chatgpt.com/g/g-p-example/project",
+        },
+        answerText: "continued",
+      };
+    });
+
+    await performSessionRun({
+      sessionMeta: {
+        ...baseSessionMeta,
+        mode: "browser",
+        supervisorThread: parentSession.supervisorThread,
+        options: { followupSessionId: "parent-browser" },
+      },
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        status: "completed",
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            tabUrl: "https://chatgpt.com/g/g-p-example/project",
+            conversationId: "bound-1",
+          }),
+        }),
       }),
     );
   });

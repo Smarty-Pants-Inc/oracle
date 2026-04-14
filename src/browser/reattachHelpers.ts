@@ -395,7 +395,7 @@ export function buildConversationUrl(
     }
     try {
       const base = new URL(baseUrl);
-      const pathRoot = base.pathname.replace(/\/$/, "");
+      const pathRoot = base.pathname.replace(/\/+$/, "").replace(/\/c\/[a-zA-Z0-9-]+$/i, "");
       const prefix = pathRoot === "/" ? "" : pathRoot;
       return `${base.origin}${prefix}/c/${conversationId}`;
     } catch {

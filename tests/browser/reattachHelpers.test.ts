@@ -1,7 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   alignPromptEchoPair,
+  buildConversationUrl,
   buildPromptEchoMatcher,
+  pickTarget,
   readConversationTurnIndex,
 } from "../../src/browser/reattachHelpers.ts";
 
@@ -42,5 +44,45 @@ describe("alignPromptEchoPair", () => {
     } as never);
 
     expect(turnIndex).toBe(4);
+  });
+
+  test("pickTarget rejects a stale chromeTargetId from another conversation in the same project scope", () => {
+    const target = pickTarget(
+      [
+        {
+          targetId: "stale-target",
+          type: "page",
+          url: "https://chatgpt.com/g/team-space-oracle/c/wrong-1",
+        },
+        {
+          targetId: "right-target",
+          type: "page",
+          url: "https://chatgpt.com/g/team-space-oracle/c/right-1",
+        },
+      ],
+      {
+        chromeTargetId: "stale-target",
+        tabUrl: "https://chatgpt.com/g/team-space-oracle/c/right-1",
+        conversationId: "right-1",
+      },
+      { requireMatch: true },
+    );
+
+    expect(target?.targetId).toBe("right-target");
+  });
+
+  test("buildConversationUrl does not duplicate /c/<id> when baseUrl is already conversation-scoped", () => {
+    expect(
+      buildConversationUrl({ conversationId: "next-root" }, "https://chatgpt.com/c/current-root"),
+    ).toBe("https://chatgpt.com/c/next-root");
+    expect(
+      buildConversationUrl(
+        {
+          tabUrl: "https://chatgpt.com/g/team-space-oracle/c/next-project",
+          conversationId: "next-project",
+        },
+        "https://chatgpt.com/g/team-space-oracle/c/current-project",
+      ),
+    ).toBe("https://chatgpt.com/g/team-space-oracle/c/next-project");
   });
 });

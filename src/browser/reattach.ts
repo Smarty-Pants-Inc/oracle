@@ -199,6 +199,15 @@ function isRecoverableSessionDiscoveryError(error: unknown): boolean {
   );
 }
 
+function isHiddenBrowserReuseRequiredError(error: unknown): error is BrowserAutomationError {
+  if (!(error instanceof BrowserAutomationError)) {
+    return false;
+  }
+  return (
+    (error.details as { stage?: string } | undefined)?.stage === "hidden-browser-reuse-required"
+  );
+}
+
 function withTimeoutBudget(
   config: BrowserSessionConfig | undefined,
   timeoutMs: number,
@@ -377,7 +386,7 @@ async function readConnectedTargetInfo(
 async function refreshOwnedManualLoginRuntime(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
-  logger: BrowserLogger,
+  _logger: BrowserLogger,
 ): Promise<BrowserRuntimeMetadata> {
   const resolved = normalizeLocalChromeLaunchConfig(resolveBrowserConfig(config));
   if (
@@ -419,16 +428,19 @@ async function refreshOwnedManualLoginRuntime(
   }
   const chromePid = await resolveChromePidForUserDataDir(normalizedProfileDir, runtime.chromePid);
   if (!devtoolsInfo) {
-    logger(
-      `[reattach] hidden Oracle profile ${normalizedProfileDir} has no DevToolsActivePort; relaunching a fresh hidden browser instead of attaching elsewhere.`,
+    throw new BrowserAutomationError(
+      `Refusing to relaunch the Oracle hidden browser for ${normalizedProfileDir}; reuse the existing hidden browser or start it explicitly before retrying.`,
+      {
+        stage: "hidden-browser-reuse-required",
+        runtime: {
+          ...runtime,
+          chromePid: chromePid ?? runtime.chromePid,
+          userDataDir: normalizedProfileDir,
+        },
+        userDataDir: normalizedProfileDir,
+        chromePid: chromePid ?? runtime.chromePid ?? null,
+      },
     );
-    return {
-      ...runtime,
-      chromePid: chromePid ?? runtime.chromePid,
-      chromePort: undefined,
-      chromeBrowserWSEndpoint: undefined,
-      userDataDir: normalizedProfileDir,
-    };
   }
   return {
     ...runtime,
@@ -1841,6 +1853,9 @@ export async function resumeBrowserSession(
       }
       throw error;
     }
+    if (isHiddenBrowserReuseRequiredError(error)) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
@@ -2207,6 +2222,9 @@ export async function continueBrowserSession(
         );
         return recoverSession(runtime, config);
       }
+      throw error;
+    }
+    if (isHiddenBrowserReuseRequiredError(error)) {
       throw error;
     }
     if (promptSubmitted || errorPromptSubmitted) {

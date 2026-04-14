@@ -270,6 +270,30 @@ describe("supervisorThreads", () => {
   test("readAttachedSupervisorThreadHistory surfaces bounded window metadata", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/c/current-9",
+                  conversationId: "current-9",
+                  title: "Current Chat",
+                  isActive: true,
+                },
+                history: [
+                  { role: "assistant", text: "Recent answer" },
+                  { role: "user", text: "Latest question" },
+                ],
+                historyWindow: {
+                  limit: 2,
+                  returnedCount: 2,
+                  totalCount: 5,
+                  truncated: true,
+                },
+              },
+            },
+          };
+        }
         if (expression.includes("window.location.href")) {
           return {
             result: {
@@ -282,22 +306,7 @@ describe("supervisorThreads", () => {
             },
           };
         }
-        return {
-          result: {
-            value: {
-              history: [
-                { role: "assistant", text: "Recent answer" },
-                { role: "user", text: "Latest question" },
-              ],
-              historyWindow: {
-                limit: 2,
-                returnedCount: 2,
-                totalCount: 5,
-                truncated: true,
-              },
-            },
-          },
-        };
+        throw new Error(`Unexpected expression: ${expression}`);
       }),
     } as unknown as ChromeClient["Runtime"];
 
@@ -365,6 +374,106 @@ describe("supervisorThreads", () => {
         limit: 1,
       }),
     ).rejects.toThrow("Oracle supervisor thread changed during history capture");
+  });
+
+  test("readAttachedSupervisorThreadHistory fails closed when the snapshot itself comes from the wrong thread", async () => {
+    let locationReads = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/c/wrong-4",
+                  conversationId: "wrong-4",
+                  title: "Wrong Chat",
+                  isActive: true,
+                },
+                history: [{ role: "assistant", text: "Recent answer" }],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 1,
+                  totalCount: 1,
+                  truncated: false,
+                },
+              },
+            },
+          };
+        }
+        if (expression.includes("window.location.href")) {
+          locationReads += 1;
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readAttachedSupervisorThreadHistory(runtime, {
+        conversationId: "current-9",
+        limit: 1,
+      }),
+    ).rejects.toThrow("Oracle supervisor thread changed during history capture");
+    expect(locationReads).toBeGreaterThan(0);
+  });
+
+  test("readAttachedSupervisorThreadHistory accepts legacy supervisorThread snapshot payloads", async () => {
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                supervisorThread: {
+                  url: "https://chatgpt.com/c/current-9",
+                  conversationId: "current-9",
+                  title: "Current Chat",
+                  isActive: true,
+                },
+                history: [{ role: "assistant", text: "Recent answer" }],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 1,
+                  totalCount: 1,
+                  truncated: false,
+                },
+              },
+            },
+          };
+        }
+        if (expression.includes("window.location.href")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readAttachedSupervisorThreadHistory(runtime, {
+      conversationId: "current-9",
+      limit: 1,
+    });
+
+    expect(result.thread.conversationId).toBe("current-9");
+    expect(result.history).toEqual([{ role: "assistant", text: "Recent answer" }]);
   });
 
   test("attach_thread fails when the requested conversation never becomes active", async () => {
