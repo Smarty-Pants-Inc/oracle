@@ -86,6 +86,22 @@ export interface BrowserMetadata {
   runtime?: BrowserRuntimeMetadata;
 }
 
+export interface SessionProgressMetadata {
+  stage: string;
+  message: string;
+  updatedAt: string;
+  conversationId?: string;
+  tabUrl?: string;
+  chromeTargetId?: string;
+}
+
+export interface SupervisorThreadBindingMetadata {
+  conversationId: string;
+  url?: string;
+  projectUrl?: string;
+  verifiedAt: string;
+}
+
 export interface SessionResponseMetadata {
   id?: string;
   requestId?: string | null;
@@ -173,6 +189,8 @@ export interface SessionMetadata {
   errorMessage?: string;
   elapsedMs?: number;
   browser?: BrowserMetadata;
+  supervisorThread?: SupervisorThreadBindingMetadata;
+  progress?: SessionProgressMetadata;
   response?: SessionResponseMetadata;
   transport?: SessionTransportMetadata;
   error?: SessionUserErrorMetadata;

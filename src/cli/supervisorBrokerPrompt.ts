@@ -18,7 +18,11 @@ import { isSupervisorScopedChatgptUrl, normalizeChatgptUrl } from "../browser/ut
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../browser/sessionRunner.js";
-import type { BrowserSessionConfig, SessionMetadata } from "../sessionStore.js";
+import type {
+  BrowserSessionConfig,
+  SessionMetadata,
+  SupervisorThreadBindingMetadata,
+} from "../sessionStore.js";
 import type { UserConfig } from "../config.js";
 import type { ThinkingTimeLevel } from "../oracle.js";
 import { asOracleUserError, formatElapsed } from "../oracle.js";
@@ -287,6 +291,7 @@ function sessionMatchesSupervisorPromptRequest(
   request: SupervisorPromptRequest,
   requestedModel: string,
   browserConfig: BrowserSessionConfig,
+  expectedSupervisorThread?: SupervisorThreadBindingMetadata | null,
 ): boolean {
   if ((meta.mode ?? meta.options.mode) !== "browser") {
     return false;
@@ -357,6 +362,12 @@ function sessionMatchesSupervisorPromptRequest(
   ) {
     return false;
   }
+  if (expectedSupervisorThread) {
+    const candidateConversationId = meta.supervisorThread?.conversationId?.trim();
+    if (candidateConversationId !== expectedSupervisorThread.conversationId) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -365,10 +376,17 @@ function pickReusableSupervisorPromptSession(
   request: SupervisorPromptRequest,
   requestedModel: string,
   browserConfig: BrowserSessionConfig,
+  expectedSupervisorThread?: SupervisorThreadBindingMetadata | null,
 ): SessionMetadata | null {
   const matches = metas
     .filter((meta) =>
-      sessionMatchesSupervisorPromptRequest(meta, request, requestedModel, browserConfig),
+      sessionMatchesSupervisorPromptRequest(
+        meta,
+        request,
+        requestedModel,
+        browserConfig,
+        expectedSupervisorThread,
+      ),
     )
     .sort(
       (left, right) =>
@@ -408,10 +426,46 @@ async function readReusableSupervisorPromptOutput(
   return extractSupervisorPromptOutputFromLog(logOutput);
 }
 
+function normalizeSupervisorThreadBinding(
+  value: SessionMetadata["supervisorThread"] | null | undefined,
+): SupervisorThreadBindingMetadata | null {
+  const conversationId = value?.conversationId?.trim();
+  if (!conversationId) {
+    return null;
+  }
+  return {
+    conversationId,
+    url: value?.url?.trim() || undefined,
+    projectUrl: value?.projectUrl?.trim() || undefined,
+    verifiedAt: value?.verifiedAt?.trim() || new Date(0).toISOString(),
+  };
+}
+
+async function resolveSupervisorThreadBinding(
+  sessionId: string | undefined,
+): Promise<SupervisorThreadBindingMetadata | null> {
+  let current = sessionId?.trim();
+  const visited = new Set<string>();
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const meta = await sessionStore.readSession(current).catch(() => null);
+    if (!meta) {
+      return null;
+    }
+    const binding = normalizeSupervisorThreadBinding(meta.supervisorThread);
+    if (binding) {
+      return binding;
+    }
+    current = meta.options.followupSessionId?.trim();
+  }
+  return null;
+}
+
 async function reusableSupervisorPromptResponse(
   meta: SessionMetadata,
 ): Promise<
-  { ok: true; sessionId: string; output: string } | { ok: false; error: string; sessionId?: string }
+  | { ok: true; sessionId: string; output: string; conversationId?: string }
+  | { ok: false; error: string; sessionId?: string }
 > {
   const sessionStatus = meta.response?.status ?? meta.status;
   const incompleteReason = meta.response?.incompleteReason;
@@ -428,6 +482,8 @@ async function reusableSupervisorPromptResponse(
     sessionStatus,
     incompleteReason,
     assistantOutput,
+    normalizeSupervisorThreadBinding(meta.supervisorThread)?.conversationId ??
+      meta.browser?.runtime?.conversationId,
   );
 }
 
@@ -435,8 +491,9 @@ async function findReusableSupervisorPromptResponse(
   request: SupervisorPromptRequest,
   requestedModel: string,
   browserConfig: BrowserSessionConfig,
+  expectedSupervisorThread?: SupervisorThreadBindingMetadata | null,
 ): Promise<
-  | { ok: true; sessionId: string; output: string }
+  | { ok: true; sessionId: string; output: string; conversationId?: string }
   | { ok: false; error: string; sessionId?: string }
   | null
 > {
@@ -445,6 +502,7 @@ async function findReusableSupervisorPromptResponse(
     request,
     requestedModel,
     browserConfig,
+    expectedSupervisorThread,
   );
   return candidate ? await reusableSupervisorPromptResponse(candidate) : null;
 }
@@ -1418,8 +1476,9 @@ function finalizeSupervisorPromptOperationResult(
   sessionStatus: string | undefined,
   incompleteReason: string | null | undefined,
   output: string,
+  conversationId?: string,
 ):
-  | { ok: true; sessionId: string; output: string }
+  | { ok: true; sessionId: string; output: string; conversationId?: string }
   | { ok: false; error: string; sessionId?: string } {
   if (sessionStatus !== "completed") {
     const reasonSuffix = incompleteReason ? ` (${incompleteReason})` : "";
@@ -1436,7 +1495,12 @@ function finalizeSupervisorPromptOperationResult(
       error: `Session ${sessionId} completed without assistant output.`,
     };
   }
-  return { ok: true, sessionId, output: output.trimEnd() };
+  return {
+    ok: true,
+    sessionId,
+    output: output.trimEnd(),
+    ...(conversationId?.trim() ? { conversationId: conversationId.trim() } : {}),
+  };
 }
 
 async function supervisorPromptSessionConsumedQuota(sessionId: string): Promise<boolean> {
@@ -1454,7 +1518,8 @@ async function supervisorPromptSessionConsumedQuota(sessionId: string): Promise<
 export async function runSupervisorPromptOperation(
   request: SupervisorPromptRequest,
 ): Promise<
-  { ok: true; sessionId: string; output: string } | { ok: false; error: string; sessionId?: string }
+  | { ok: true; sessionId: string; output: string; conversationId?: string }
+  | { ok: false; error: string; sessionId?: string }
 > {
   const requestedModel = request.model?.trim() || "gpt-5.4-pro";
   const sessionSlug = sanitizeSessionSlugBase(request.sessionSlug);
@@ -1539,10 +1604,14 @@ export async function runSupervisorPromptOperation(
     defaultManualLoginCookieSync: resolvedRemote.host ? false : process.platform === "darwin",
     useDedicatedHiddenProfile: !resolvedRemote.host,
   });
+  const expectedSupervisorThread = await resolveSupervisorThreadBinding(
+    normalizedRequest.followupSession,
+  );
   const reusableResponse = await findReusableSupervisorPromptResponse(
     normalizedRequest,
     requestedModel,
     browserConfig,
+    expectedSupervisorThread,
   );
   if (reusableResponse) {
     return reusableResponse;
@@ -1570,6 +1639,7 @@ export async function runSupervisorPromptOperation(
     normalizedRequest,
     requestedModel,
     browserConfig,
+    expectedSupervisorThread,
   );
   if (reusableResponseAfterReservation) {
     signalCleanup.dispose();
@@ -1590,7 +1660,7 @@ export async function runSupervisorPromptOperation(
   };
 
   try {
-    const createdSessionMeta = await sessionStore.createSession(
+    let createdSessionMeta = await sessionStore.createSession(
       {
         ...runOptions,
         mode: "browser",
@@ -1602,6 +1672,11 @@ export async function runSupervisorPromptOperation(
       { enabled: false, sound: false },
       sessionSlug,
     );
+    if (expectedSupervisorThread) {
+      createdSessionMeta = await sessionStore.updateSession(createdSessionMeta.id, {
+        supervisorThread: expectedSupervisorThread,
+      });
+    }
     sessionMeta = createdSessionMeta;
     logWriter = sessionStore.createLogWriter(createdSessionMeta.id);
     const runOutcome = await withSupervisorBrowserLeaseHeartbeat(reservation, log, () =>
@@ -1636,6 +1711,7 @@ export async function runSupervisorPromptOperation(
       completionSnapshot.sessionStatus,
       completionSnapshot.incompleteReason,
       completionSnapshot.output,
+      expectedSupervisorThread?.conversationId,
     );
   } catch (error) {
     await commitReservationIfNeeded();

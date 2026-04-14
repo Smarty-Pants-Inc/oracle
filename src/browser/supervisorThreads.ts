@@ -552,8 +552,21 @@ export async function readAttachedSupervisorThreadHistory(
     );
   }
   const snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  const settledThread = await readCurrentSupervisorThread(Runtime);
+  await delay(HISTORY_STABILITY_POLL_MS);
+  const confirmedThread = await readCurrentSupervisorThread(Runtime);
+  if (
+    settledThread.conversationId !== expectedConversationId ||
+    !supervisorThreadMatchesProjectScope(settledThread, options.projectUrl) ||
+    confirmedThread.conversationId !== expectedConversationId ||
+    !supervisorThreadMatchesProjectScope(confirmedThread, options.projectUrl)
+  ) {
+    throw new Error(
+      `Oracle supervisor thread changed during history capture (expected ${expectedConversationId}, current ${confirmedThread.conversationId ?? settledThread.conversationId ?? "unknown"}).`,
+    );
+  }
   return {
-    thread,
+    thread: confirmedThread,
     history: snapshot.history,
     historyWindow: snapshot.historyWindow,
   };

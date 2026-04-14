@@ -4332,3 +4332,34 @@ describe("reattach helpers", () => {
     expect(call?.expression).toContain("const preferProjects = false");
   });
 });
+
+describe("__test__.pickTarget", () => {
+  test("ignores a stale cached target id when it points at a different conversation in the same project", () => {
+    const picked = __test__.pickTarget(
+      [
+        {
+          targetId: "stale-target",
+          type: "page",
+          url: "https://chatgpt.com/g/team-space-oracle/c/wrong-thread",
+        },
+        {
+          targetId: "fresh-target",
+          type: "page",
+          url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        },
+      ],
+      {
+        chromeTargetId: "stale-target",
+        tabUrl: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        conversationId: "right-thread",
+      },
+      { requireMatch: true },
+    );
+
+    expect(picked).toEqual({
+      targetId: "fresh-target",
+      type: "page",
+      url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+    });
+  });
+});

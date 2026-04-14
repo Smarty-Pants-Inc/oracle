@@ -21,7 +21,12 @@ import {
   isAssistantEmptyResponseError,
   isAssistantRateLimitError,
 } from "./pageActions.js";
-import type { BrowserAttachment, BrowserLogger, ChromeClient } from "./types.js";
+import {
+  type BrowserAttachment,
+  type BrowserLogger,
+  type ChromeClient,
+  reportBrowserProgress,
+} from "./types.js";
 import {
   launchChrome,
   connectToChrome,
@@ -143,7 +148,9 @@ function mergeRuntimeMetadata(
     controllerPid?: number;
   },
 ): BrowserRuntimeMetadata {
+  const tabUrlProvided = Object.prototype.hasOwnProperty.call(updates, "tabUrl");
   const tabUrl = updates.tabUrl || runtime.tabUrl;
+  const derivedConversationId = tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined;
   return {
     ...runtime,
     chromePid: updates.chromePid ?? runtime.chromePid,
@@ -154,7 +161,10 @@ function mergeRuntimeMetadata(
         ? undefined
         : (updates.chromeTargetId ?? runtime.chromeTargetId),
     tabUrl,
-    conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : runtime.conversationId,
+    conversationId:
+      runtime.conversationId && !tabUrlProvided && derivedConversationId === undefined
+        ? runtime.conversationId
+        : derivedConversationId,
     userDataDir: updates.userDataDir ?? runtime.userDataDir,
     controllerPid: updates.controllerPid ?? runtime.controllerPid,
   };
@@ -799,6 +809,10 @@ async function captureConversationResponse(
     typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
       ? Math.floor(baselineTurns)
       : await readConversationTurnIndex(Runtime, logger);
+  await reportBrowserProgress(logger, {
+    stage: "assistant-generating",
+    message: "Waiting for ChatGPT to finish the assistant response in the bound conversation.",
+  });
   const promptEcho = buildPromptEchoMatcher(promptPreview);
   let answer = await withTimeout(
     waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
@@ -900,6 +914,10 @@ async function captureConversationResponse(
     answerText = shortRecovered.answerText;
     answerMarkdown = shortRecovered.answerMarkdown;
   }
+  await reportBrowserProgress(logger, {
+    stage: "assistant-completed",
+    message: "Captured the assistant response from the bound ChatGPT conversation.",
+  });
   return {
     answerText,
     answerMarkdown,
@@ -1507,6 +1525,21 @@ async function submitFollowupPrompt(
       messageId?: string | null;
       turnId?: string | null;
     } | null = null;
+    let progressCommitted = false;
+    const markPromptCommitted = async (): Promise<void> => {
+      if (progressCommitted) {
+        return;
+      }
+      progressCommitted = true;
+      const attachmentLabel =
+        attachments.length > 0
+          ? ` with ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`
+          : "";
+      await reportBrowserProgress(logger, {
+        stage: "prompt-committed",
+        message: `Committed the follow-up prompt to the bound ChatGPT conversation${attachmentLabel}.`,
+      });
+    };
     try {
       await ensurePromptReadyForFollowup(Runtime, config?.inputTimeoutMs ?? 60_000, logger);
       await clearComposer(Runtime, logger);
@@ -1583,6 +1616,7 @@ async function submitFollowupPrompt(
         logger,
       );
       promptSubmitted = true;
+      await markPromptCommitted();
       if (attachmentNames.length === 0) {
         return { baselineTurns, baselineAssistant };
       }
@@ -1630,6 +1664,7 @@ async function submitFollowupPrompt(
         baselineAssistant = postSubmitDetails?.baselineAssistant ?? baselineAssistant;
       }
       if (promptSubmitted || errorPromptSubmitted) {
+        await markPromptCommitted();
         throw new BrowserAutomationError(
           error instanceof Error ? error.message : "Follow-up verification failed after send.",
           {
@@ -1725,6 +1760,19 @@ export async function resumeBrowserSession(
         deps.promptPreview,
         reattachBaseUrl,
       );
+      const boundHref = await readCurrentHref(Runtime).catch(() => liveRuntime.tabUrl ?? "");
+      const boundRuntime = mergeRuntimeMetadata(liveRuntime, {
+        chromeHost: host,
+        chromePort: port,
+        chromeTargetId: target?.targetId,
+        tabUrl: boundHref || liveRuntime.tabUrl,
+        controllerPid: process.pid,
+      });
+      await reportBrowserProgress(logger, {
+        stage: "thread-bound",
+        message: `Bound to existing ChatGPT conversation ${boundRuntime.conversationId ?? "unknown"}.`,
+        runtime: boundRuntime,
+      });
       if (deps.forceConversationReload && Page && typeof Page.navigate === "function") {
         const conversationUrl = await readCurrentHref(Runtime);
         const reloadUrl =
@@ -1749,11 +1797,11 @@ export async function resumeBrowserSession(
 
       return {
         ...result,
-        runtime: mergeRuntimeMetadata(liveRuntime, {
+        runtime: mergeRuntimeMetadata(boundRuntime, {
           chromeHost: host,
           chromePort: port,
           chromeTargetId: target?.targetId,
-          tabUrl: href || liveRuntime.tabUrl,
+          tabUrl: href || boundRuntime.tabUrl,
         }),
       };
     });
@@ -1892,6 +1940,23 @@ async function resumeBrowserSessionViaNewChrome(
       );
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
+    const boundHref = await readCurrentHref(Runtime).catch(
+      () => conversationUrl || runtime.tabUrl || "",
+    );
+    const boundRuntime = mergeRuntimeMetadata(runtime, {
+      chromePid: chrome.pid,
+      chromeHost,
+      chromePort: chrome.port,
+      chromeTargetId: isolatedTargetId ?? null,
+      tabUrl: boundHref || conversationUrl || runtime.tabUrl,
+      userDataDir,
+      controllerPid: process.pid,
+    });
+    await reportBrowserProgress(logger, {
+      stage: "thread-bound",
+      message: `Bound to existing ChatGPT conversation ${boundRuntime.conversationId ?? "unknown"}.`,
+      runtime: boundRuntime,
+    });
 
     const result = await captureConversationResponse(
       Runtime,
@@ -1924,12 +1989,12 @@ async function resumeBrowserSessionViaNewChrome(
 
     return {
       ...result,
-      runtime: mergeRuntimeMetadata(runtime, {
+      runtime: mergeRuntimeMetadata(boundRuntime, {
         chromePid: chrome.pid,
         chromeHost,
         chromePort: chrome.port,
-        chromeTargetId: isolatedTargetId ? null : undefined,
-        tabUrl: href || conversationUrl || runtime.tabUrl,
+        chromeTargetId: isolatedTargetId ?? null,
+        tabUrl: href || boundRuntime.tabUrl,
         userDataDir,
         controllerPid: process.pid,
       }),
@@ -2032,6 +2097,19 @@ export async function continueBrowserSession(
         deps.promptPreview,
         reattachBaseUrl,
       );
+      const boundHref = await readCurrentHref(Runtime).catch(() => liveRuntime.tabUrl ?? "");
+      const boundRuntime = mergeRuntimeMetadata(liveRuntime, {
+        chromeHost: host,
+        chromePort: port,
+        chromeTargetId: target?.targetId,
+        tabUrl: boundHref || liveRuntime.tabUrl,
+        controllerPid: process.pid,
+      });
+      await reportBrowserProgress(logger, {
+        stage: "thread-bound",
+        message: `Bound to existing ChatGPT conversation ${boundRuntime.conversationId ?? "unknown"}.`,
+        runtime: boundRuntime,
+      });
       await applyConversationSettings(Runtime, logger, config, deps);
       const submission = await submitFollowupPrompt(
         Runtime,
@@ -2062,11 +2140,11 @@ export async function continueBrowserSession(
 
       return {
         ...result,
-        runtime: mergeRuntimeMetadata(liveRuntime, {
+        runtime: mergeRuntimeMetadata(boundRuntime, {
           chromeHost: host,
           chromePort: port,
           chromeTargetId: target?.targetId,
-          tabUrl: href || liveRuntime.tabUrl,
+          tabUrl: href || boundRuntime.tabUrl,
         }),
       };
     });
@@ -2256,6 +2334,23 @@ async function continueBrowserSessionViaNewChrome(
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
       await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
     }
+    const boundHref = await readCurrentHref(Runtime).catch(
+      () => conversationUrl || runtime.tabUrl || "",
+    );
+    const boundRuntime = mergeRuntimeMetadata(runtime, {
+      chromePid: chrome.pid,
+      chromeHost,
+      chromePort: chrome.port,
+      chromeTargetId: isolatedTargetId ?? null,
+      tabUrl: boundHref || conversationUrl || runtime.tabUrl,
+      userDataDir,
+      controllerPid: process.pid,
+    });
+    await reportBrowserProgress(logger, {
+      stage: "thread-bound",
+      message: `Bound to existing ChatGPT conversation ${boundRuntime.conversationId ?? "unknown"}.`,
+      runtime: boundRuntime,
+    });
 
     await applyConversationSettings(Runtime, logger, launchConfig, deps);
     let submittedPrompt: string;
@@ -2310,8 +2405,8 @@ async function continueBrowserSessionViaNewChrome(
       chromePid: chrome.pid,
       chromeHost,
       chromePort: chrome.port,
-      chromeTargetId: isolatedTargetId ?? undefined,
-      tabUrl: conversationUrl || runtime.tabUrl,
+      chromeTargetId: isolatedTargetId ?? null,
+      tabUrl: boundRuntime.tabUrl,
       userDataDir,
       controllerPid: process.pid,
     });
@@ -2398,8 +2493,8 @@ async function continueBrowserSessionViaNewChrome(
       runtime:
         result.runtime ??
         mergeRuntimeMetadata(launchedRuntime, {
-          chromeTargetId: isolatedTargetId ? null : undefined,
-          tabUrl: href || conversationUrl || runtime.tabUrl,
+          chromeTargetId: isolatedTargetId ?? null,
+          tabUrl: href || boundRuntime.tabUrl,
         }),
     };
   } finally {

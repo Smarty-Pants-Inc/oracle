@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserSessionConfig, SessionMetadata } from "../../src/sessionStore.js";
+import { reportBrowserProgress } from "../../src/browser/types.js";
 import {
   runBrowserSessionExecution,
   continueBrowserSessionExecution,
@@ -523,6 +524,85 @@ describe("continueBrowserSessionExecution", () => {
     });
   });
 
+  test("persists follow-up progress and writes milestone logs even when not verbose", async () => {
+    const log = vi.fn();
+    const sessionLog = vi.fn();
+    const persistProgress = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      response: { status: "completed", assistantOutput: "prior answer" },
+      browser: {
+        config: {},
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    const continueBrowser = vi.fn(async (_runtime, _config, browserLog) => {
+      await reportBrowserProgress(browserLog, {
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation abc.",
+        runtime: {
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+      });
+      return {
+        answerText: "continued",
+        answerMarkdown: "continued",
+        tookMs: 321,
+        answerTokens: 9,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+      };
+    });
+
+    await continueBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: false },
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+        sessionLog,
+        persistProgress,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "never",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        continueBrowser,
+      },
+    );
+
+    expect(persistProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation abc.",
+      }),
+    );
+    expect(sessionLog).toHaveBeenCalledWith(
+      "[browser-progress:thread-bound] Bound to existing ChatGPT conversation abc.",
+    );
+    expect(log.mock.calls.some((call) => String(call[0]).includes("thread-bound"))).toBe(false);
+  });
+
   test("passes follow-up attachments and fallback submission through", async () => {
     const log = vi.fn();
     const parentSession: SessionMetadata = {
@@ -662,6 +742,63 @@ describe("continueBrowserSessionExecution", () => {
       chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/original",
       conversationId: "demo",
     });
+  });
+
+  test("clears stale conversation id when follow-up runtime moves to a non-conversation URL", async () => {
+    const log = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      browser: {
+        config: {},
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+      },
+    };
+
+    const result = await continueBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 10,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "never",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        continueBrowser: vi.fn(async () => ({
+          answerText: "continued",
+          answerMarkdown: "continued",
+          tookMs: 10,
+          answerTokens: 2,
+          runtime: {
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            tabUrl: "https://chatgpt.com/g/g-p-example-oracle/project",
+          },
+        })),
+      },
+    );
+
+    expect(result.runtime.tabUrl).toBe("https://chatgpt.com/g/g-p-example-oracle/project");
+    expect(result.runtime.conversationId).toBeUndefined();
   });
 
   test("wraps generic followup failures as BrowserAutomationError", async () => {

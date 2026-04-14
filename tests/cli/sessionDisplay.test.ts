@@ -291,6 +291,12 @@ describe("attachSession rendering", () => {
     const resumeBrowserSession = vi.fn(async () => ({
       answerText: "reattach-ok",
       answerMarkdown: "reattach-ok",
+      runtime: {
+        chromePort: 9333,
+        chromeTargetId: "fresh-target",
+        tabUrl: "https://chatgpt.com/c/updated-thread",
+        conversationId: "updated-thread",
+      },
     }));
     vi.doMock("../../src/browser/reattach.ts", () => ({
       resumeBrowserSession,
@@ -312,6 +318,15 @@ describe("attachSession rendering", () => {
     expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
       "sess",
       expect.objectContaining({
+        browser: {
+          config: { timeoutMs: 2_000 },
+          runtime: expect.objectContaining({
+            chromePort: 9333,
+            chromeTargetId: "fresh-target",
+            tabUrl: "https://chatgpt.com/c/updated-thread",
+            conversationId: "updated-thread",
+          }),
+        },
         response: {
           status: "completed",
           assistantOutput: "reattach-ok",

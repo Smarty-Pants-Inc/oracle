@@ -11,6 +11,7 @@ import type {
   BrowserAttachment,
   ResolvedBrowserConfig,
 } from "./types.js";
+import { reportBrowserProgress } from "./types.js";
 import {
   launchChrome,
   registerTerminationHooks,
@@ -336,7 +337,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let removeDialogHandler: (() => void) | null = null;
   let appliedCookies = 0;
   let preserveBrowserOnError = false;
+  let browserReadyProgressSent = false;
+  let lastBoundConversationUrl: string | undefined;
   let stopChromeFocusGuard: (() => void) | null = null;
+  const currentRuntimeHint = () => ({
+    chromePid: chrome.pid,
+    chromePort: chrome.port,
+    chromeHost,
+    chromeBrowserWSEndpoint,
+    chromeTargetId: lastTargetId,
+    tabUrl: lastUrl,
+    conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+    userDataDir,
+    controllerPid: process.pid,
+  });
   if (shouldHideChromeWindow) {
     stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
     await hideChromeWindow(chrome, logger, frontmostTarget);
@@ -520,6 +534,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger(`[reattach] chrome port=${chrome.port} host=${chromeHost}${suffix}`);
         }
         await emitRuntimeHint();
+        if (!browserReadyProgressSent) {
+          browserReadyProgressSent = true;
+          await reportBrowserProgress(logger, {
+            stage: "browser-ready",
+            message: "Connected to the ChatGPT browser runtime.",
+            runtime: currentRuntimeHint(),
+          });
+        }
       }
     };
     const updateConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
@@ -531,6 +553,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         lastUrl = conversationUrl;
         logger(`[browser] conversation url (${label}) = ${lastUrl}`);
         await emitRuntimeHint();
+        if (conversationUrl !== lastBoundConversationUrl) {
+          lastBoundConversationUrl = conversationUrl;
+          await reportBrowserProgress(logger, {
+            stage: "thread-bound",
+            message: `Bound to ChatGPT conversation ${extractConversationIdFromUrl(conversationUrl) ?? conversationUrl}.`,
+            runtime: currentRuntimeHint(),
+          });
+        }
         return true;
       }
       return false;
@@ -700,6 +730,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
         });
       }
+      await reportBrowserProgress(logger, {
+        stage: "prompt-committed",
+        message:
+          submissionAttachments.length > 0
+            ? `Committed the prompt to the ChatGPT conversation with ${submissionAttachments.length} attachment${submissionAttachments.length === 1 ? "" : "s"}.`
+            : "Committed the prompt to the ChatGPT conversation.",
+        runtime: currentRuntimeHint(),
+      });
       const immediateConversationHintTimeoutMs = Math.max(
         2_000,
         Math.min(config.timeoutMs ?? 120_000, 10_000),
@@ -751,6 +789,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await releaseProfileLockIfHeld();
     }
     stopThinkingMonitor = startThinkingStatusMonitor(Runtime, logger, options.verbose ?? false);
+    await reportBrowserProgress(logger, {
+      stage: "assistant-generating",
+      message: "Waiting for ChatGPT to finish the assistant response.",
+      runtime: currentRuntimeHint(),
+    });
     let answer: AssistantPayload;
     const recheckDelayMs = Math.max(0, config.assistantRecheckDelayMs ?? 0);
     const recheckTimeoutMs = Math.max(0, config.assistantRecheckTimeoutMs ?? 0);
@@ -904,6 +947,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           ),
         ).catch(() => null),
     }));
+    await reportBrowserProgress(logger, {
+      stage: "assistant-completed",
+      message: "Captured the assistant response from ChatGPT.",
+      runtime: currentRuntimeHint(),
+    });
     if (connectionClosedUnexpectedly) {
       // Bail out on mid-run disconnects so the session stays reattachable.
       throw new Error("Chrome disconnected before completion");

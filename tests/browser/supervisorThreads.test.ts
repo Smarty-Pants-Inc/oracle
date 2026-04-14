@@ -318,6 +318,55 @@ describe("supervisorThreads", () => {
     });
   });
 
+  test("readAttachedSupervisorThreadHistory fails closed when the active thread changes during capture", async () => {
+    let locationReads = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("window.location.href")) {
+          locationReads += 1;
+          return {
+            result: {
+              value:
+                locationReads < 3
+                  ? {
+                      url: "https://chatgpt.com/c/current-9",
+                      conversationId: "current-9",
+                      title: "Current Chat",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/c/wrong-4",
+                      conversationId: "wrong-4",
+                      title: "Wrong Chat",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        return {
+          result: {
+            value: {
+              history: [{ role: "assistant", text: "Recent answer" }],
+              historyWindow: {
+                limit: 1,
+                returnedCount: 1,
+                totalCount: 1,
+                truncated: false,
+              },
+            },
+          },
+        };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readAttachedSupervisorThreadHistory(runtime, {
+        conversationId: "current-9",
+        limit: 1,
+      }),
+    ).rejects.toThrow("Oracle supervisor thread changed during history capture");
+  });
+
   test("attach_thread fails when the requested conversation never becomes active", async () => {
     vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
     let now = 0;

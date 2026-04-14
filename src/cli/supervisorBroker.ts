@@ -27,6 +27,7 @@ import {
   withSupervisorRuntimeAttachLease,
   type SupervisorPromptRequest,
 } from "./supervisorBrokerPrompt.js";
+import type { SupervisorThreadBindingMetadata } from "../sessionStore.js";
 
 export type SupervisorBrokerOperation =
   | "run_prompt"
@@ -237,6 +238,35 @@ function supervisorThreadSessionSlug(thread: SupervisorThreadInfo): string {
   return `oracle-thread-${normalized || "chatgpt"}`;
 }
 
+function buildSupervisorThreadBinding(
+  meta: Awaited<ReturnType<typeof sessionStore.readSession>>,
+  thread: SupervisorThreadInfo,
+): SupervisorThreadBindingMetadata {
+  const conversationId = thread.conversationId?.trim();
+  if (!conversationId) {
+    throw new Error("Oracle supervisor thread binding requires a concrete conversation id.");
+  }
+  return {
+    conversationId,
+    url: thread.url?.trim() || undefined,
+    projectUrl: configuredSupervisorProjectUrl(meta),
+    verifiedAt: new Date().toISOString(),
+  };
+}
+
+function assertReusableSupervisorThreadBinding(
+  sessionId: string,
+  meta: SessionMetadata | null,
+  thread: SupervisorThreadInfo,
+): void {
+  const boundConversationId = meta?.supervisorThread?.conversationId?.trim();
+  if (boundConversationId && boundConversationId !== thread.conversationId) {
+    throw new Error(
+      `Session ${sessionId} is already bound to Oracle conversation ${boundConversationId}; refusing to reuse it for ${thread.conversationId}.`,
+    );
+  }
+}
+
 function isReusableSupervisorThreadSession(
   sessionId: string,
   meta: SessionMetadata | null,
@@ -277,6 +307,7 @@ async function createSupervisorThreadSession(
       conversationId: thread.conversationId,
     },
   };
+  const supervisorThread = buildSupervisorThreadBinding(meta, thread);
 
   const model = meta.options.model ?? meta.options.effectiveModelId ?? meta.model ?? "gpt-5.4-pro";
   const created = await sessionStore.createSession(
@@ -300,6 +331,7 @@ async function createSupervisorThreadSession(
   await sessionStore.updateSession(created.id, {
     status: "completed",
     browser,
+    supervisorThread,
     promptPreview: `Supervisor thread: ${thread.title}`,
     mode: "browser",
     completedAt: new Date().toISOString(),
@@ -322,12 +354,16 @@ async function ensureSupervisorThreadSession(
   targetId?: string,
 ): Promise<string> {
   const meta = await sessionStore.readSession(sessionId);
+  assertReusableSupervisorThreadBinding(sessionId, meta, thread);
   if (isReusableSupervisorThreadSession(sessionId, meta)) {
     const parentSessionId = meta?.options?.followupSessionId?.trim();
     if (!meta || !parentSessionId) {
       throw new Error(`Supervisor thread session ${sessionId} is missing followup metadata.`);
     }
     await syncSupervisorRuntimeSession(sessionId, thread, targetId);
+    await sessionStore.updateSession(sessionId, {
+      supervisorThread: buildSupervisorThreadBinding(meta, thread),
+    });
     await syncSupervisorRuntimeSession(parentSessionId, thread, targetId);
     return sessionId;
   }
@@ -347,6 +383,25 @@ function unsupportedOperationResponse(operation: string): SupervisorBrokerRespon
     ok: false,
     error: `Unsupported supervisor operation: ${operation}`,
   };
+}
+
+function assertRequestedConversationIdentity(
+  operation: "attach_thread" | "thread_history",
+  requestedConversationId: string,
+  thread: SupervisorThreadInfo,
+): void {
+  const actualConversationId = thread.conversationId?.trim();
+  if (!actualConversationId || actualConversationId !== requestedConversationId) {
+    throw new Error(
+      `Oracle ${operation} resolved conversation ${actualConversationId ?? "unknown"} while ${requestedConversationId} was requested.`,
+    );
+  }
+  const urlConversationId = (thread.url?.match(/\/c\/([a-zA-Z0-9-]+)/)?.[1] ?? "").trim();
+  if (urlConversationId && urlConversationId !== requestedConversationId) {
+    throw new Error(
+      `Oracle ${operation} resolved URL conversation ${urlConversationId} while ${requestedConversationId} was requested.`,
+    );
+  }
 }
 
 export async function runSupervisorBrokerRequest(
@@ -412,7 +467,8 @@ export async function runSupervisorBrokerRequest(
               const thread = await attachSupervisorThread(Runtime, conversationId, {
                 projectUrl: configuredSupervisorProjectUrl(meta),
               });
-              const threadSessionId = await createAndSyncSupervisorThreadSession(
+              assertRequestedConversationIdentity("attach_thread", conversationId, thread);
+              const threadSessionId = await ensureSupervisorThreadSession(
                 sessionId,
                 thread,
                 targetId,
@@ -443,6 +499,7 @@ export async function runSupervisorBrokerRequest(
                 projectUrl: configuredSupervisorProjectUrl(meta),
                 limit: incoming.historyLimit,
               });
+              assertRequestedConversationIdentity("thread_history", conversationId, result.thread);
               const threadSessionId = await ensureSupervisorThreadSession(
                 sessionId,
                 result.thread,

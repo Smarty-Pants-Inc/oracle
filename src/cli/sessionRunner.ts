@@ -6,12 +6,15 @@ import type {
   SessionMode,
   BrowserSessionConfig,
   BrowserRuntimeMetadata,
+  SessionProgressMetadata,
+  SupervisorThreadBindingMetadata,
 } from "../sessionStore.js";
 import type { RunOracleOptions, UsageSummary } from "../oracle.js";
 import {
   runOracle,
   OracleResponseError,
   OracleTransportError,
+  BrowserAutomationError,
   extractResponseMetadata,
   asOracleUserError,
   extractTextOutput,
@@ -43,12 +46,76 @@ import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { extractConversationIdFromUrl } from "../browser/reattachHelpers.js";
 import { estimateTokenCount } from "../browser/utils.js";
-import type { BrowserLogger } from "../browser/types.js";
+import type { BrowserLogger, BrowserProgressUpdate } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
+
+function mergeBrowserRuntime(
+  runtime: BrowserRuntimeMetadata | undefined,
+  updates?: Partial<BrowserRuntimeMetadata>,
+): BrowserRuntimeMetadata | undefined {
+  if (!runtime && !updates) {
+    return undefined;
+  }
+  const tabUrlProvided = Boolean(
+    updates && Object.prototype.hasOwnProperty.call(updates, "tabUrl"),
+  );
+  const tabUrl = updates?.tabUrl ?? runtime?.tabUrl;
+  const derivedConversationId = tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined;
+  const next = {
+    ...(runtime ?? {}),
+    ...(updates ?? {}),
+    ...(tabUrlProvided ? { conversationId: updates?.conversationId ?? derivedConversationId } : {}),
+  };
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function buildSessionProgress(
+  update: BrowserProgressUpdate,
+  runtime?: BrowserRuntimeMetadata,
+): SessionProgressMetadata {
+  return {
+    stage: update.stage,
+    message: update.message,
+    updatedAt: new Date().toISOString(),
+    conversationId: update.runtime?.conversationId ?? runtime?.conversationId,
+    tabUrl: update.runtime?.tabUrl ?? runtime?.tabUrl,
+    chromeTargetId: update.runtime?.chromeTargetId ?? runtime?.chromeTargetId,
+  };
+}
+
+function normalizeSupervisorThreadBinding(
+  value: SessionMetadata["supervisorThread"] | null | undefined,
+): SupervisorThreadBindingMetadata | null {
+  const conversationId = value?.conversationId?.trim();
+  if (!conversationId) {
+    return null;
+  }
+  return {
+    conversationId,
+    url: value?.url?.trim() || undefined,
+    projectUrl: value?.projectUrl?.trim() || undefined,
+    verifiedAt: value?.verifiedAt?.trim() || new Date(0).toISOString(),
+  };
+}
+
+function applySupervisorThreadBindingToRuntime(
+  runtime: BrowserRuntimeMetadata | undefined,
+  binding: SupervisorThreadBindingMetadata | null,
+): BrowserRuntimeMetadata | undefined {
+  if (!binding) {
+    return runtime;
+  }
+  return {
+    ...(runtime ?? {}),
+    conversationId: binding.conversationId,
+    tabUrl: binding.url ?? runtime?.tabUrl,
+  };
+}
 
 export interface SessionRunParams {
   sessionMeta: SessionMetadata;
@@ -77,7 +144,41 @@ export async function performSessionRun({
   browserDeps,
   muteStdout = false,
 }: SessionRunParams): Promise<void> {
-  let latestBrowserRuntime: BrowserRuntimeMetadata | undefined = sessionMeta.browser?.runtime;
+  const sessionSupervisorThread = normalizeSupervisorThreadBinding(sessionMeta.supervisorThread);
+  let latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
+    sessionMeta.browser?.runtime,
+    sessionSupervisorThread,
+  );
+  const browserSessionLogWriter =
+    mode === "browser" ? sessionStore.createLogWriter(sessionMeta.id) : null;
+  const browserModelLogWriter =
+    mode === "browser" && sessionMeta.model
+      ? sessionStore.createLogWriter(sessionMeta.id, sessionMeta.model)
+      : null;
+  const browserSessionLog = (message?: string): void => {
+    if (!message) {
+      return;
+    }
+    browserSessionLogWriter?.logLine(message);
+    browserModelLogWriter?.logLine(message);
+  };
+  const persistBrowserProgress = async (update: BrowserProgressUpdate): Promise<void> => {
+    latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
+      mergeBrowserRuntime(latestBrowserRuntime, update.runtime),
+      sessionSupervisorThread,
+    );
+    await sessionStore.updateSession(sessionMeta.id, {
+      status: "running",
+      mode,
+      browser: browserConfig
+        ? {
+            config: browserConfig,
+            runtime: latestBrowserRuntime,
+          }
+        : undefined,
+      progress: buildSessionProgress(update, latestBrowserRuntime),
+    });
+  };
   const writeInline = (chunk: string): boolean => {
     // Keep session logs intact while still echoing inline output to the user.
     write(chunk);
@@ -87,6 +188,17 @@ export async function performSessionRun({
     status: "running",
     startedAt: new Date().toISOString(),
     mode,
+    progress:
+      mode === "browser"
+        ? {
+            stage: "starting",
+            message: "Starting browser session.",
+            updatedAt: new Date().toISOString(),
+            conversationId: latestBrowserRuntime?.conversationId,
+            tabUrl: latestBrowserRuntime?.tabUrl,
+            chromeTargetId: latestBrowserRuntime?.chromeTargetId,
+          }
+        : undefined,
     ...(browserConfig ? { browser: { config: browserConfig } } : {}),
   });
   const notificationSettings =
@@ -106,10 +218,13 @@ export async function performSessionRun({
       const runnerDeps = {
         ...browserDeps,
         persistRuntimeHint: async (runtime: BrowserRuntimeMetadata) => {
-          latestBrowserRuntime = runtime;
+          latestBrowserRuntime = applySupervisorThreadBindingToRuntime(
+            runtime,
+            sessionSupervisorThread,
+          );
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
-            browser: { config: browserConfig, runtime },
+            browser: { config: browserConfig, runtime: latestBrowserRuntime },
           });
         },
       };
@@ -119,6 +234,9 @@ export async function performSessionRun({
           ? await sessionStore.readSession(parentSessionId)
           : null;
       let effectiveParentSession = parentSession;
+      const effectiveSupervisorThread =
+        sessionSupervisorThread ??
+        normalizeSupervisorThreadBinding(parentSession?.supervisorThread);
       if (parentSessionId && parentSessionId !== sessionMeta.id) {
         if (!parentSession) {
           throw new Error(
@@ -154,16 +272,20 @@ export async function performSessionRun({
         }
         const effectiveRuntime =
           parentSession.browser?.runtime || sessionMeta.browser?.runtime
-            ? {
-                ...(parentSession.browser?.runtime ?? {}),
-                ...(sessionMeta.browser?.runtime ?? {}),
-              }
+            ? applySupervisorThreadBindingToRuntime(
+                {
+                  ...(parentSession.browser?.runtime ?? {}),
+                  ...(sessionMeta.browser?.runtime ?? {}),
+                },
+                effectiveSupervisorThread,
+              )
             : undefined;
         const effectiveResponse = sessionMeta.response?.assistantOutput?.trim()
           ? sessionMeta.response
           : parentSession.response;
         effectiveParentSession = {
           ...parentSession,
+          supervisorThread: effectiveSupervisorThread ?? undefined,
           response: effectiveResponse,
           browser: {
             config: sessionMeta.browser?.config ?? parentSession.browser?.config ?? browserConfig,
@@ -183,10 +305,41 @@ export async function performSessionRun({
       }
       const result = effectiveParentSession
         ? await continueBrowserSessionExecution(
-            { runOptions, browserConfig, cwd, log, parentSession: effectiveParentSession },
+            {
+              runOptions,
+              browserConfig,
+              cwd,
+              log,
+              sessionLog: browserSessionLog,
+              persistProgress: persistBrowserProgress,
+              parentSession: effectiveParentSession,
+            },
             runnerDeps,
           )
-        : await runBrowserSessionExecution({ runOptions, browserConfig, cwd, log }, runnerDeps);
+        : await runBrowserSessionExecution(
+            {
+              runOptions,
+              browserConfig,
+              cwd,
+              log,
+              sessionLog: browserSessionLog,
+              persistProgress: persistBrowserProgress,
+            },
+            runnerDeps,
+          );
+      if (
+        effectiveSupervisorThread &&
+        result.runtime?.conversationId?.trim() !== effectiveSupervisorThread.conversationId
+      ) {
+        throw new BrowserAutomationError(
+          `Browser follow-up drifted to Oracle conversation ${result.runtime?.conversationId ?? "unknown"} while ${effectiveSupervisorThread.conversationId} was required.`,
+          {
+            stage: "browser-followup-thread-identity-mismatch",
+            runtime: result.runtime,
+            expectedConversationId: effectiveSupervisorThread.conversationId,
+          },
+        );
+      }
       latestBrowserRuntime = result.runtime ?? latestBrowserRuntime;
       const attemptedOutputWrite = Boolean(runOptions.writeOutputPath);
       const savedOutputPath = await writeAssistantOutput(
@@ -214,6 +367,14 @@ export async function performSessionRun({
         browser: {
           config: browserConfig,
           runtime: result.runtime,
+        },
+        progress: {
+          stage: "assistant-completed",
+          message: "Captured the assistant response.",
+          updatedAt: new Date().toISOString(),
+          conversationId: result.runtime?.conversationId,
+          tabUrl: result.runtime?.tabUrl,
+          chromeTargetId: result.runtime?.chromeTargetId,
         },
         options: nextOptions,
         response: {
@@ -659,6 +820,17 @@ export async function performSessionRun({
             runtime: browserRuntime ?? undefined,
           }
         : undefined,
+      progress:
+        mode === "browser"
+          ? {
+              stage: "error",
+              message,
+              updatedAt: new Date().toISOString(),
+              conversationId: browserRuntime?.conversationId,
+              tabUrl: browserRuntime?.tabUrl,
+              chromeTargetId: browserRuntime?.chromeTargetId,
+            }
+          : undefined,
       response: responseMetadata,
       transport: transportMetadata,
       error: userError
@@ -676,6 +848,9 @@ export async function performSessionRun({
       });
     }
     throw error;
+  } finally {
+    browserSessionLogWriter?.stream.end();
+    browserModelLogWriter?.stream.end();
   }
 }
 

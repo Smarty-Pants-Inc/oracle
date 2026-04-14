@@ -11,7 +11,34 @@ export type BrowserLauncher = "chrome" | "carbonyl";
 export type BrowserLogger = ((message: string) => void) & {
   verbose?: boolean;
   sessionLog?: (message: string) => void;
+  progress?: (update: BrowserProgressUpdate) => void | Promise<void>;
 };
+
+export type BrowserProgressStage =
+  | "starting"
+  | "browser-ready"
+  | "thread-bound"
+  | "prompt-committed"
+  | "assistant-generating"
+  | "assistant-completed"
+  | "error";
+
+export interface BrowserProgressUpdate {
+  stage: BrowserProgressStage;
+  message: string;
+  runtime?: Partial<BrowserRuntimeMetadata>;
+}
+
+export async function reportBrowserProgress(
+  logger: BrowserLogger | undefined,
+  update: BrowserProgressUpdate,
+): Promise<void> {
+  if (!logger) {
+    return;
+  }
+  logger.sessionLog?.(`[browser-progress:${update.stage}] ${update.message}`);
+  await logger.progress?.(update);
+}
 
 export interface BrowserAttachment {
   path: string;

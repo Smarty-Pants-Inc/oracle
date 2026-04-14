@@ -11,7 +11,7 @@ import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserLogger } from "./types.js";
+import type { BrowserLogger, BrowserProgressUpdate } from "./types.js";
 import { estimateTokenCount } from "./utils.js";
 import { continueBrowserSession, type ReattachDeps } from "./reattach.js";
 import { extractConversationIdFromUrl } from "./reattachHelpers.js";
@@ -33,6 +33,8 @@ interface RunBrowserSessionArgs {
   browserConfig: BrowserSessionConfig;
   cwd: string;
   log: (message?: string) => void;
+  sessionLog?: (message?: string) => void;
+  persistProgress?: (update: BrowserProgressUpdate) => Promise<void> | void;
 }
 
 export interface BrowserSessionRunnerDeps extends ReattachDeps {
@@ -64,20 +66,28 @@ function mergeBrowserRuntimeMetadata(
   if (!updates) {
     return runtime;
   }
+  const tabUrlProvided = Object.prototype.hasOwnProperty.call(updates, "tabUrl");
   const tabUrl = updates.tabUrl ?? runtime.tabUrl;
+  const derivedConversationId = tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined;
   return {
     ...runtime,
     ...updates,
     tabUrl,
     conversationId:
       updates.conversationId ??
-      (tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined) ??
-      runtime.conversationId,
+      (tabUrlProvided ? derivedConversationId : (derivedConversationId ?? runtime.conversationId)),
   };
 }
 
 export async function runBrowserSessionExecution(
-  { runOptions, browserConfig, cwd, log }: RunBrowserSessionArgs,
+  {
+    runOptions,
+    browserConfig,
+    cwd,
+    log,
+    sessionLog: sessionLogArg,
+    persistProgress: persistProgressArg,
+  }: RunBrowserSessionArgs,
   deps: BrowserSessionRunnerDeps = {},
 ): Promise<BrowserExecutionResult> {
   const assemblePrompt = deps.assemblePrompt ?? assembleBrowserPrompt;
@@ -127,7 +137,12 @@ export async function runBrowserSessionExecution(
     log(message);
   }) as BrowserLogger;
   automationLogger.verbose = Boolean(runOptions.verbose);
-  automationLogger.sessionLog = runOptions.verbose ? log : () => {};
+  automationLogger.sessionLog = (message) => {
+    if (typeof message === "string") {
+      sessionLogArg?.(message);
+    }
+  };
+  automationLogger.progress = persistProgressArg;
 
   log(headerLine);
   log(chalk.dim("This run can take up to an hour (usually ~10 minutes)."));
@@ -222,7 +237,15 @@ export async function runBrowserSessionExecution(
 }
 
 export async function continueBrowserSessionExecution(
-  { runOptions, browserConfig, cwd, log, parentSession }: ContinueBrowserSessionArgs,
+  {
+    runOptions,
+    browserConfig,
+    cwd,
+    log,
+    sessionLog: sessionLogArg,
+    persistProgress: persistProgressArg,
+    parentSession,
+  }: ContinueBrowserSessionArgs,
   deps: BrowserSessionRunnerDeps = {},
 ): Promise<BrowserExecutionResult> {
   const assemblePrompt = deps.assemblePrompt ?? assembleBrowserPrompt;
@@ -282,7 +305,12 @@ export async function continueBrowserSessionExecution(
     log(message);
   }) as BrowserLogger;
   logger.verbose = Boolean(runOptions.verbose);
-  logger.sessionLog = runOptions.verbose ? log : () => {};
+  logger.sessionLog = (message) => {
+    if (typeof message === "string") {
+      sessionLogArg?.(message);
+    }
+  };
+  logger.progress = persistProgressArg;
   const startedAt = Date.now();
   const parentAssistantOutput = String(parentSession.response?.assistantOutput ?? "").trim();
   const followupDeps =

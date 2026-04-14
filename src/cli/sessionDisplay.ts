@@ -224,7 +224,7 @@ export async function attachSession(
         },
         browser: {
           config: metadata.browser?.config,
-          runtime,
+          runtime: result.runtime ?? runtime,
         },
         response: {
           status: "completed",
@@ -251,6 +251,9 @@ export async function attachSession(
     }
     console.log(`Created: ${metadata.createdAt}`);
     console.log(`Status: ${metadata.status}`);
+    if (metadata.progress?.message) {
+      console.log(dim(`Progress: ${metadata.progress.stage} — ${metadata.progress.message}`));
+    }
     if (metadata.models && metadata.models.length > 0) {
       console.log("Models:");
       for (const run of metadata.models) {

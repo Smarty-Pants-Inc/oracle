@@ -55,6 +55,13 @@ The parent `smarty-code` repo tracks this fork as a gitlink/submodule; move the 
 - Keep framework testing inside the Oracle ChatGPT project scope so live resilience testing does not pollute the user’s main workspace.
 - Keep the browser hidden/backgrounded on this machine. A visible Chrome launch is a regression unless the user is explicitly debugging it.
 - Normal non-test usage may still default to the user’s main/root ChatGPT workspace unless they ask for a project or an existing thread there.
+- In the shared hidden browser, unrelated Oracle project tabs may coexist with an attached root/main ChatGPT thread. Do not use raw DevTools target listings alone as the attach pass/fail oracle.
+- Existing-thread attach verification must prefer:
+  - requested `conversationId` / `tabUrl` in session metadata
+  - browser progress milestones and session logs
+  - captured assistant response / completed session state
+  - direct DOM inspection of the requested thread if extra proof is needed
+- A project-scoped `page` target showing up in `json/list` is not by itself proof that Oracle switched away from the requested root/main thread.
 
 ## Runtime Notes
 

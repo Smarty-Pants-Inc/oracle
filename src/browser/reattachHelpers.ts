@@ -249,15 +249,23 @@ export function pickTarget(
   }
   if (runtime.chromeTargetId) {
     const byId = attachableTargets.find((t) => getTargetId(t) === runtime.chromeTargetId);
+    const runtimeProjectShellUrl = projectConversationShellUrl(runtime.tabUrl);
+    const candidateUrl = byId?.url?.replace(/\/+$/, "");
+    const candidateConversationId = extractConversationIdFromUrl(byId?.url || "");
     if (
       byId &&
-      (!runtime.tabUrl ||
-        byId.url === runtime.tabUrl ||
-        byId.url?.startsWith(runtime.tabUrl) ||
-        runtime.tabUrl.startsWith(byId.url || "") ||
-        urlsShareProjectConversationScope(byId.url, runtime.tabUrl) ||
-        (runtimeConversationId &&
-          extractConversationIdFromUrl(byId.url || "") === runtimeConversationId))
+      (runtimeConversationId
+        ? candidateConversationId === runtimeConversationId ||
+          Boolean(
+            runtimeProjectShellUrl &&
+            candidateUrl &&
+            candidateUrl === runtimeProjectShellUrl.replace(/\/+$/, ""),
+          )
+        : !runtime.tabUrl ||
+          byId.url === runtime.tabUrl ||
+          byId.url?.startsWith(runtime.tabUrl) ||
+          runtime.tabUrl.startsWith(byId.url || "") ||
+          urlsShareProjectConversationScope(byId.url, runtime.tabUrl))
     ) {
       return byId;
     }

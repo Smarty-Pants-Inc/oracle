@@ -255,6 +255,94 @@ describe("continueBrowserSession manual-login reuse", () => {
     },
   );
 
+  test("emits follow-up milestones and refreshes runtime identity after rebinding an existing thread", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        return { result: { value: "https://chatgpt.com/c/abc" } };
+      }
+      if (expression === "1+1") {
+        return { result: { value: 2 } };
+      }
+      return { result: { value: null } };
+    });
+    const connect = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          Input: {},
+          close: vi.fn(async () => {}),
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const listTargets = vi.fn(async () => [
+      { targetId: "fresh-target", type: "page", url: "https://chatgpt.com/c/abc" },
+    ]);
+    const ensurePromptReady = vi.fn(async () => {});
+    const clearPromptComposer = vi.fn(async () => {});
+    const submitPrompt = vi.fn(async () => 1);
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "hello",
+      html: "",
+      meta: { messageId: "m3", turnId: "conversation-turn-3" },
+    }));
+    const captureAssistantMarkdown = vi.fn(async () => "hello");
+
+    const { continueBrowserSession } = await import("../../src/browser/reattach.js");
+    const logger = vi.fn() as BrowserLogger;
+    const progressSpy = vi.fn();
+    const sessionLogSpy = vi.fn();
+    logger.progress = progressSpy;
+    logger.sessionLog = sessionLogSpy;
+
+    const result = await continueBrowserSession(
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "stale-target",
+        tabUrl: "https://chatgpt.com/c/abc",
+        conversationId: "abc",
+      },
+      { timeoutMs: 2_000, inputTimeoutMs: 1_000, modelStrategy: "ignore" },
+      logger,
+      { prompt: "Say hi." },
+      {
+        listTargets: listTargets as unknown as () => Promise<
+          { targetId?: string; type?: string; url?: string }[]
+        >,
+        connect,
+        ensurePromptReady,
+        clearPromptComposer,
+        submitPrompt,
+        waitForAssistantResponse,
+        captureAssistantMarkdown,
+      },
+    );
+
+    const stages = progressSpy.mock.calls.map((call) => call[0]?.stage);
+    expect(stages).toContain("thread-bound");
+    expect(stages).toContain("prompt-committed");
+    expect(stages).toContain("assistant-generating");
+    expect(stages).toContain("assistant-completed");
+    expect(progressSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "thread-bound",
+        runtime: expect.objectContaining({
+          chromeTargetId: "fresh-target",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        }),
+      }),
+    );
+    expect(sessionLogSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[browser-progress:prompt-committed]"),
+    );
+    expect(result.runtime).toMatchObject({
+      chromeTargetId: "fresh-target",
+      tabUrl: "https://chatgpt.com/c/abc",
+      conversationId: "abc",
+    });
+  });
+
   test("treats a fresh chat home page as valid current context when resuming through reopened manual-login chrome", async () => {
     const reusedChrome = {
       pid: 4321,

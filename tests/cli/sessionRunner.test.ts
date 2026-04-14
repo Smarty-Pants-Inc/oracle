@@ -760,6 +760,68 @@ describe("performSessionRun", () => {
     );
   });
 
+  test("records browser progress in session metadata and dedicated logs", async () => {
+    vi.mocked(runBrowserSessionExecution).mockImplementation(async (args) => {
+      await args.persistProgress?.({
+        stage: "thread-bound",
+        message: "Bound to existing ChatGPT conversation abc.",
+        runtime: {
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+      });
+      await args.sessionLog?.(
+        "[browser-progress:thread-bound] Bound to existing ChatGPT conversation abc.",
+      );
+      return {
+        usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+        elapsedMs: 150,
+        runtime: {
+          chromePid: 123,
+          chromePort: 9222,
+          chromeTargetId: "target-1",
+          tabUrl: "https://chatgpt.com/c/abc",
+          conversationId: "abc",
+        },
+        answerText: "Answer",
+      };
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        progress: expect.objectContaining({
+          stage: "thread-bound",
+          message: "Bound to existing ChatGPT conversation abc.",
+          conversationId: "abc",
+          chromeTargetId: "target-1",
+        }),
+      }),
+    );
+    const logWriterCalls = sessionStoreMock.createLogWriter.mock.results.map(
+      (entry) => entry.value,
+    );
+    const progressLines = logWriterCalls.flatMap(
+      (writer: { logLine: { mock: { calls: unknown[][] } } }) =>
+        writer.logLine.mock.calls.map((call) => call[0]),
+    );
+    expect(progressLines).toContain(
+      "[browser-progress:thread-bound] Bound to existing ChatGPT conversation abc.",
+    );
+  });
+
   test("continues browser followups from a stored browser parent session", async () => {
     const parentSession: SessionMetadata = {
       ...baseSessionMeta,
@@ -896,6 +958,137 @@ describe("performSessionRun", () => {
             conversationId: "child",
           }),
         }),
+      }),
+    );
+  });
+
+  test("pins follow-up runtime to the immutable supervisor thread binding", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      supervisorThread: {
+        conversationId: "bound-1",
+        url: "https://chatgpt.com/c/bound-1",
+        verifiedAt: "2026-04-14T00:00:00.000Z",
+      },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-wrong",
+          tabUrl: "https://chatgpt.com/c/wrong-thread",
+          conversationId: "wrong-thread",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+      elapsedMs: 900,
+      runtime: {
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "target-bound",
+        tabUrl: "https://chatgpt.com/c/bound-1",
+        conversationId: "bound-1",
+      },
+      answerText: "continued",
+    });
+
+    await performSessionRun({
+      sessionMeta: {
+        ...baseSessionMeta,
+        mode: "browser",
+        supervisorThread: parentSession.supervisorThread,
+        options: { followupSessionId: "parent-browser" },
+      },
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(continueBrowserSessionExecution)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSession: expect.objectContaining({
+          supervisorThread: expect.objectContaining({ conversationId: "bound-1" }),
+          browser: expect.objectContaining({
+            runtime: expect.objectContaining({
+              tabUrl: "https://chatgpt.com/c/bound-1",
+              conversationId: "bound-1",
+            }),
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  test("fails closed when a follow-up returns the wrong supervisor thread identity", async () => {
+    const parentSession: SessionMetadata = {
+      ...baseSessionMeta,
+      id: "parent-browser",
+      mode: "browser",
+      status: "completed",
+      response: { status: "completed", assistantOutput: "parent baseline" },
+      supervisorThread: {
+        conversationId: "bound-1",
+        url: "https://chatgpt.com/c/bound-1",
+        verifiedAt: "2026-04-14T00:00:00.000Z",
+      },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/bound-1",
+          conversationId: "bound-1",
+        },
+      },
+    };
+    sessionStoreMock.readSession.mockResolvedValue(parentSession);
+    vi.mocked(continueBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 0, totalTokens: 18 },
+      elapsedMs: 900,
+      runtime: {
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        tabUrl: "https://chatgpt.com/c/wrong-thread",
+        conversationId: "wrong-thread",
+      },
+      answerText: "continued",
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          mode: "browser",
+          supervisorThread: parentSession.supervisorThread,
+          options: { followupSessionId: "parent-browser" },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Browser follow-up drifted to Oracle conversation wrong-thread");
+
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess-1",
+      expect.objectContaining({
+        status: "error",
+        errorMessage: expect.stringContaining("Browser follow-up drifted to Oracle conversation"),
       }),
     );
   });
