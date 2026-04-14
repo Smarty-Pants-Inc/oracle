@@ -4,7 +4,6 @@ import {
   PROMPT_PRIMARY_SELECTOR,
   PROMPT_FALLBACK_SELECTOR,
   SEND_BUTTON_SELECTORS,
-  CONVERSATION_TURN_SELECTOR,
   STOP_BUTTON_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
@@ -12,6 +11,7 @@ import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import { buildThreadIntrospectionHelpers } from "../threadIntrospection.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -505,7 +505,6 @@ async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  const turnSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   let baseline: number | null =
     typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
       ? Math.floor(baselineTurns)
@@ -514,9 +513,9 @@ async function verifyPromptCommitted(
     try {
       const { result } = await Runtime.evaluate({
         expression: `(() => {
-          const selector = ${turnSelectorLiteral};
-          return Array.from(document.querySelectorAll(selector)).filter(
-            (node) => !(node.parentElement && node.parentElement.closest(selector)),
+          ${buildThreadIntrospectionHelpers()}
+          return __oracleCollectThreadEntries(__oraclePickThreadRoot()).filter(
+            (entry) => entry.role === 'user' || entry.role === 'assistant',
           ).length;
         })()`,
         returnByValue: true,
@@ -532,90 +531,74 @@ async function verifyPromptCommitted(
   const baselineLiteral = baseline ?? -1;
   // Learned: ChatGPT can echo/format text; normalize markdown and use prefix matches to detect the sent prompt.
   const script = `(() => {
-		    const editor = document.querySelector(${primarySelectorLiteral});
-		    const fallback = document.querySelector(${fallbackSelectorLiteral});
-		    const inputSelectors = ${inputSelectorsLiteral};
-	    const normalize = (value) => {
-	      let text = value?.toLowerCase?.() ?? '';
-	      // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
-	      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-	      text = text.replace(/\`\`\`/g, ' ');
-	      text = text.replace(/\`([^\`]*)\`/g, '$1');
-	      text = text.replace(/\\s+/g, ' ').trim();
-	      return text.replace(/^you said\\s*:?\\s*/, '');
-	    };
-	    const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
-	    const turnNodes = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR)).filter(
-	      (node) => !(node.parentElement && node.parentElement.closest(CONVERSATION_SELECTOR)),
-	    );
-	    const resolveTurnRole = (node) => {
-	      if (!node || typeof node.getAttribute !== 'function') return '';
-	      const ownRole = node.getAttribute('data-message-author-role') || node.getAttribute('data-turn');
-	      if (ownRole) return ownRole.toLowerCase();
-	      const nestedRoleNode =
-	        typeof node.querySelector === 'function'
-	          ? node.querySelector('[data-message-author-role], [data-turn]')
-	          : null;
-	      const nestedRole =
-	        nestedRoleNode?.getAttribute?.('data-message-author-role') ||
-	        nestedRoleNode?.getAttribute?.('data-turn') ||
-	        '';
-	      return String(nestedRole || '').toLowerCase();
-	    };
-	    const normalizedPrompt = normalize(${encodedPrompt});
-	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 60);
-	    const normalizedTurns = turnNodes.map((node) => normalize(node?.innerText));
-	    const turnRoles = turnNodes.map((node) => resolveTurnRole(node));
-	    const readValue = (node) => {
-	      if (!node) return '';
-	      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
-	      return node.innerText ?? '';
-	    };
-	    const isVisible = (node) => {
-	      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-	      const rect = node.getBoundingClientRect();
-	      return rect.width > 0 && rect.height > 0;
-	    };
-	    const inputs = inputSelectors
-	      .map((selector) => document.querySelector(selector))
-	      .filter((node) => Boolean(node));
-	    const visibleInputs = inputs.filter((node) => isVisible(node));
-	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
-		    const baseline = ${baselineLiteral};
-		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
-	    const postBaselineTurnTexts =
-	      baseline < 0 ? normalizedTurns : normalizedTurns.slice(Math.max(0, baseline));
-	    const postBaselineTurnRoles =
-	      baseline < 0 ? turnRoles : turnRoles.slice(Math.max(0, baseline));
-	    const postBaselineUserTurns = postBaselineTurnTexts.filter(
-	      (_text, index) => postBaselineTurnRoles[index] === 'user',
-	    );
-	    const searchableTurns =
-	      postBaselineUserTurns.length > 0
-	        ? postBaselineUserTurns
-	        : (postBaselineTurnTexts.length > 0 ? postBaselineTurnTexts : normalizedTurns);
-	    const userMatched =
-	      normalizedPrompt.length > 0 &&
-	      searchableTurns.some((text) => text.includes(normalizedPrompt));
-	    const prefixMatched =
-	      normalizedPromptPrefix.length > 30 &&
-	      searchableTurns.some((text) => text.includes(normalizedPromptPrefix));
-		    const lastTurn =
-		      (postBaselineUserTurns.length > 0
-		        ? postBaselineUserTurns[postBaselineUserTurns.length - 1]
-		        : postBaselineTurnTexts.length > 0
-		          ? postBaselineTurnTexts[postBaselineTurnTexts.length - 1]
-		          : normalizedTurns[normalizedTurns.length - 1]) ?? '';
-		    const lastMatched =
-		      normalizedPrompt.length > 0 &&
-		      (lastTurn.includes(normalizedPrompt) ||
-		        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
-		    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
-		    const assistantVisible = Boolean(
-		      document.querySelector(${assistantSelectorLiteral}) ||
-		      document.querySelector('[data-testid*="assistant"]'),
-		    );
-	    // Learned: composer clearing + stop button or assistant presence is a reliable fallback signal.
+      ${buildThreadIntrospectionHelpers()}
+      const editor = document.querySelector(${primarySelectorLiteral});
+      const fallback = document.querySelector(${fallbackSelectorLiteral});
+      const inputSelectors = ${inputSelectorsLiteral};
+      const normalize = (value) => {
+        let text = value?.toLowerCase?.() ?? '';
+        text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
+        text = text.replace(/\`\`\`/g, ' ');
+        text = text.replace(/\`([^\`]*)\`/g, '$1');
+        text = text.replace(/\\s+/g, ' ').trim();
+        return text.replace(/^you said\\s*:?\\s*/, '');
+      };
+      const entries = __oracleCollectThreadEntries(__oraclePickThreadRoot()).filter(
+        (entry) => entry.role === 'user' || entry.role === 'assistant',
+      );
+      const normalizedPrompt = normalize(${encodedPrompt});
+      const normalizedPromptPrefix = normalizedPrompt.slice(0, 60);
+      const normalizedTurns = entries.map((entry) => normalize(entry.text));
+      const turnRoles = entries.map((entry) => entry.role);
+      const readValue = (node) => {
+        if (!node) return '';
+        if (node instanceof HTMLTextAreaElement) return node.value ?? '';
+        return node.innerText ?? '';
+      };
+      const isVisible = (node) => {
+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const inputs = inputSelectors
+        .map((selector) => document.querySelector(selector))
+        .filter((node) => Boolean(node));
+      const visibleInputs = inputs.filter((node) => isVisible(node));
+      const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+      const baseline = ${baselineLiteral};
+      const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
+      const postBaselineTurnTexts =
+        baseline < 0 ? normalizedTurns : normalizedTurns.slice(Math.max(0, baseline));
+      const postBaselineTurnRoles =
+        baseline < 0 ? turnRoles : turnRoles.slice(Math.max(0, baseline));
+      const postBaselineUserTurns = postBaselineTurnTexts.filter(
+        (_text, index) => postBaselineTurnRoles[index] === 'user',
+      );
+      const searchableTurns =
+        postBaselineUserTurns.length > 0
+          ? postBaselineUserTurns
+          : (postBaselineTurnTexts.length > 0 ? postBaselineTurnTexts : normalizedTurns);
+      const userMatched =
+        normalizedPrompt.length > 0 &&
+        searchableTurns.some((text) => text.includes(normalizedPrompt));
+      const prefixMatched =
+        normalizedPromptPrefix.length > 30 &&
+        searchableTurns.some((text) => text.includes(normalizedPromptPrefix));
+      const lastTurn =
+        (postBaselineUserTurns.length > 0
+          ? postBaselineUserTurns[postBaselineUserTurns.length - 1]
+          : postBaselineTurnTexts.length > 0
+            ? postBaselineTurnTexts[postBaselineTurnTexts.length - 1]
+            : normalizedTurns[normalizedTurns.length - 1]) ?? '';
+      const lastMatched =
+        normalizedPrompt.length > 0 &&
+        (lastTurn.includes(normalizedPrompt) ||
+          (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
+      const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
+      const assistantVisible = Boolean(
+        document.querySelector(${assistantSelectorLiteral}) ||
+        document.querySelector('[data-testid*="assistant"]'),
+      );
       const editorValue = editor?.innerText ?? '';
       const fallbackValue = fallback?.value ?? '';
       const activeEmpty =
@@ -667,11 +650,10 @@ async function verifyPromptCommitted(
     if (matchesPrompt && (baselineUnknown || info?.hasNewTurn || homePageMatchedCommit)) {
       return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
     }
-    const fallbackCommit =
+    const generationCommit =
       info?.composerCleared &&
       Boolean(info?.hasNewTurn) &&
-      Boolean(info?.stopVisible) &&
-      !info?.inConversation;
+      Boolean(info?.stopVisible || info?.assistantVisible);
     const homePageCommit =
       info?.composerCleared &&
       (info?.stopVisible ?? false) &&
@@ -679,7 +661,7 @@ async function verifyPromptCommitted(
       !info?.assistantVisible &&
       (info?.turnsCount ?? 0) === 0 &&
       ((typeof info?.baseline === "number" && info.baseline === 0) || baselineLiteral === 0);
-    if (fallbackCommit || homePageCommit) {
+    if (generationCommit || homePageCommit) {
       return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
     }
     await delay(100);

@@ -47,7 +47,7 @@ import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
-import { CHATGPT_URL, CONVERSATION_TURN_SELECTOR, DEFAULT_MODEL_STRATEGY } from "./constants.js";
+import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import {
@@ -70,6 +70,7 @@ import {
 import { runProviderSubmissionFlow } from "./providerDomFlow.js";
 import { chatgptDomProvider } from "./providers/index.js";
 import { resolveAttachRunningConnection } from "./attachRunning.js";
+import { buildThreadIntrospectionHelpers } from "./threadIntrospection.js";
 
 export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
 export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
@@ -95,6 +96,24 @@ function shouldPreserveBrowserOnError(error: unknown, headless: boolean): boolea
 
 export function shouldPreserveBrowserOnErrorForTest(error: unknown, headless: boolean): boolean {
   return shouldPreserveBrowserOnError(error, headless);
+}
+
+async function ensureConversationIdentityHint(
+  getCurrentUrl: () => string | undefined,
+  startHint: (label: string, timeoutMs?: number) => Promise<boolean>,
+  label: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (extractConversationIdFromUrl(getCurrentUrl() ?? "")) {
+    return true;
+  }
+  try {
+    return Boolean(
+      (await startHint(label, timeoutMs)) || extractConversationIdFromUrl(getCurrentUrl() ?? ""),
+    );
+  } catch {
+    return Boolean(extractConversationIdFromUrl(getCurrentUrl() ?? ""));
+  }
 }
 
 function attachBrowserRuntimeIfMissing(error: Error, runtime: Record<string, unknown>): Error {
@@ -160,6 +179,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
   let chromeBrowserWSEndpoint: string | undefined;
+  let conversationHintInFlight: Promise<boolean> | null = null;
+  let startConversationHint = async (_label: string, _timeoutMs?: number): Promise<boolean> =>
+    false;
   const emitRuntimeHint = async (): Promise<void> => {
     if (!runtimeHintCb || !chrome?.port) {
       return;
@@ -286,7 +308,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger,
       {
         isInFlight: () => runStatus !== "complete",
-        emitRuntimeHint,
+        emitRuntimeHint: async () => {
+          await ensureConversationIdentityHint(
+            () => lastUrl,
+            startConversationHint,
+            "shutdown",
+            10_000,
+          );
+          await emitRuntimeHint();
+        },
         preserveUserDataDir: manualLogin,
       },
     );
@@ -492,7 +522,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         await emitRuntimeHint();
       }
     };
-    let conversationHintInFlight: Promise<boolean> | null = null;
     const updateConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
       if (!chrome?.port) {
         return false;
@@ -506,17 +535,21 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       return false;
     };
-    const scheduleConversationHint = (label: string, timeoutMs?: number): void => {
+    startConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
       if (conversationHintInFlight) {
-        return;
+        return await conversationHintInFlight;
       }
-      // Learned: the /c/ URL can update after the answer; emit hints in the background.
-      // Run in the background so prompt submission/streaming isn't blocked by slow URL updates.
       conversationHintInFlight = updateConversationHint(label, timeoutMs)
         .catch(() => false)
         .finally(() => {
           conversationHintInFlight = null;
         });
+      return await conversationHintInFlight;
+    };
+    const scheduleConversationHint = (label: string, timeoutMs?: number): void => {
+      // Learned: the /c/ URL can update after the answer; emit hints in the background.
+      // Run in the background so prompt submission/streaming isn't blocked by slow URL updates.
+      void startConversationHint(label, timeoutMs);
     };
     await captureRuntimeSnapshot();
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
@@ -667,8 +700,24 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
         });
       }
-      // Reattach needs a /c/ URL; ChatGPT can update it late, so poll in the background.
-      scheduleConversationHint("post-submit", config.timeoutMs ?? 120_000);
+      const immediateConversationHintTimeoutMs = Math.max(
+        2_000,
+        Math.min(config.timeoutMs ?? 120_000, 10_000),
+      );
+      const hintedConversation = await ensureConversationIdentityHint(
+        () => lastUrl,
+        startConversationHint,
+        "post-submit-prime",
+        immediateConversationHintTimeoutMs,
+      );
+      if (!hintedConversation) {
+        logger(
+          "[browser] ChatGPT did not expose a conversation URL immediately after send; keeping background identity watcher alive.",
+        );
+        scheduleConversationHint("post-submit", 15_000);
+      } else {
+        await emitRuntimeHint();
+      }
       return { baselineTurns, baselineAssistantText };
     };
 
@@ -1583,6 +1632,7 @@ async function runRemoteBrowserMode(
   let client: ChromeClient | null = null;
   let remoteTargetId: string | null = null;
   let lastUrl: string | undefined;
+  let conversationHintInFlight: Promise<boolean> | null = null;
   const runtimeHintCb = options.runtimeHintCb;
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
@@ -1668,7 +1718,6 @@ async function runRemoteBrowserMode(
     } catch {
       // ignore
     }
-    let conversationHintInFlight: Promise<boolean> | null = null;
     const updateConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
       const conversationUrl = await waitForConversationUrlHint(Runtime, timeoutMs);
       if (conversationUrl) {
@@ -1679,15 +1728,19 @@ async function runRemoteBrowserMode(
       }
       return false;
     };
-    const scheduleConversationHint = (label: string, timeoutMs?: number): void => {
+    const startConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
       if (conversationHintInFlight) {
-        return;
+        return await conversationHintInFlight;
       }
       conversationHintInFlight = updateConversationHint(label, timeoutMs)
         .catch(() => false)
         .finally(() => {
           conversationHintInFlight = null;
         });
+      return await conversationHintInFlight;
+    };
+    const scheduleConversationHint = (label: string, timeoutMs?: number): void => {
+      void startConversationHint(label, timeoutMs);
     };
 
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
@@ -1797,7 +1850,24 @@ async function runRemoteBrowserMode(
         skipUiVerification: false,
         logger,
       });
-      scheduleConversationHint("post-submit", config.timeoutMs ?? 120_000);
+      const immediateConversationHintTimeoutMs = Math.max(
+        2_000,
+        Math.min(config.timeoutMs ?? 120_000, 10_000),
+      );
+      const hintedConversation = await ensureConversationIdentityHint(
+        () => lastUrl,
+        startConversationHint,
+        "post-submit-prime",
+        immediateConversationHintTimeoutMs,
+      );
+      if (!hintedConversation) {
+        logger(
+          "[browser] ChatGPT did not expose a conversation URL immediately after send; keeping background identity watcher alive.",
+        );
+        scheduleConversationHint("post-submit", 15_000);
+      } else {
+        await emitRuntimeHint();
+      }
       return { baselineTurns, baselineAssistantText };
     };
 
@@ -2064,6 +2134,7 @@ export const __test__ = {
   shouldReloadAfterAssistantError,
   isAssistantResponseTimeoutError,
   shouldReplaceAssistantCaptureWithDomSnapshot,
+  ensureConversationIdentityHint,
 };
 export { syncCookies } from "./cookies.js";
 export {
@@ -2321,22 +2392,39 @@ async function readConversationTurnCount(
   Runtime: ChromeClient["Runtime"],
   logger?: BrowserLogger,
 ): Promise<number | null> {
-  const selectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
-  const attempts = 4;
+  const attempts = 24;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const { result } = await Runtime.evaluate({
-        expression: `document.querySelectorAll(${selectorLiteral}).length`,
+        expression: `(() => {
+          ${buildThreadIntrospectionHelpers()}
+          const href = typeof location === 'object' && location.href ? location.href : '';
+          const inConversation = /\\/c\\/[a-z0-9-]+/i.test(href);
+          const entries = __oracleCollectThreadEntries(__oraclePickThreadRoot());
+          const turns = entries.filter((entry) => entry.role === 'user' || entry.role === 'assistant');
+          return {
+            href,
+            inConversation,
+            turnCount: turns.length,
+          };
+        })()`,
         returnByValue: true,
       });
-      const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
+      const payload = result?.value as { inConversation?: boolean; turnCount?: number } | undefined;
+      const raw =
+        typeof payload?.turnCount === "number" ? payload.turnCount : Number(payload?.turnCount);
       if (!Number.isFinite(raw)) {
         throw new Error("Turn count not numeric");
       }
-      return Math.max(0, Math.floor(raw));
+      const turnCount = Math.max(0, Math.floor(raw));
+      if (payload?.inConversation && turnCount === 0 && attempt < attempts - 1) {
+        await delay(attempt < 8 ? 250 : 500);
+        continue;
+      }
+      return turnCount;
     } catch (error) {
       if (attempt < attempts - 1) {
-        await delay(150);
+        await delay(attempt < 8 ? 250 : 500);
         continue;
       }
       if (logger?.verbose) {

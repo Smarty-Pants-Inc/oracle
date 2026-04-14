@@ -54,6 +54,10 @@ function isThinkingSummaryPlaceholder(candidate: {
   html?: string | null;
 }): boolean {
   const normalized = cleanAssistantText(candidate.text ?? "").toLowerCase();
+  const withoutPrefix = normalized.replace(/^chatgpt said:\s*/, "").trim();
+  if (withoutPrefix === "pro thinking") {
+    return true;
+  }
   if (!isThinkingSummaryOnlyText(normalized)) {
     return false;
   }
@@ -95,6 +99,7 @@ function isThinkingSummaryOnlyText(normalized: string): boolean {
   const withoutPrefix = normalized.replace(/^chatgpt said:\s*/, "").trim();
   return (
     withoutPrefix === "thinking" ||
+    withoutPrefix === "pro thinking" ||
     /^thought for\b[^\n]*$/.test(withoutPrefix) ||
     /^thought for\b[^\n]*\nthinking$/.test(withoutPrefix)
   );

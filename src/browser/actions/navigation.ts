@@ -2,6 +2,7 @@ import type { ChromeClient, BrowserLogger } from "../types.js";
 import { CLOUDFLARE_SCRIPT_SELECTOR, CLOUDFLARE_TITLE, INPUT_SELECTORS } from "../constants.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
+import { buildThreadIntrospectionHelpers } from "../threadIntrospection.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 export function installJavaScriptDialogAutoDismissal(
@@ -494,6 +495,14 @@ export async function ensurePromptReady(
     await logDomFailure(Runtime, logger, "prompt-textarea");
     throw new Error("Prompt textarea did not appear before timeout");
   }
+  const hydrated = await waitForExistingConversationHydration(
+    Runtime,
+    Math.min(Math.max(Math.floor(timeoutMs / 3), 1_500), 12_000),
+  );
+  if (!hydrated) {
+    await logDomFailure(Runtime, logger, "conversation-hydration");
+    throw new Error("Existing conversation did not hydrate before timeout");
+  }
 }
 
 async function waitForDocumentReady(Runtime: ChromeClient["Runtime"], timeoutMs: number) {
@@ -581,6 +590,42 @@ async function waitForPrompt(
       return true;
     }
     await delay(200);
+  }
+  return false;
+}
+
+async function waitForExistingConversationHydration(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    const { result } = await evaluateWithTimeout(
+      Runtime,
+      {
+        expression: `(() => {
+          ${buildThreadIntrospectionHelpers()}
+          const href = typeof location === 'object' && location.href ? location.href : '';
+          const inConversation = /\\/c\\/[a-z0-9-]+/i.test(href);
+          if (!inConversation) {
+            return { ready: true };
+          }
+          const entries = __oracleCollectThreadEntries(__oraclePickThreadRoot());
+          const turns = entries.filter((entry) => entry.role === 'user' || entry.role === 'assistant');
+          return {
+            ready: turns.length > 0,
+          };
+        })()`,
+        returnByValue: true,
+      },
+      Math.min(5_000, Math.max(1_000, remainingMs)),
+      "Timed out waiting for conversation hydration",
+    );
+    if ((result?.value as { ready?: boolean } | undefined)?.ready) {
+      return true;
+    }
+    await delay(250);
   }
   return false;
 }

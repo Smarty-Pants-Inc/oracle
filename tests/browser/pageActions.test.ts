@@ -195,7 +195,10 @@ describe("navigateToPromptReadyWithFallback", () => {
 describe("ensurePromptReady", () => {
   test("resolves when input selector enabled", async () => {
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: true } }),
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: true } })
+        .mockResolvedValueOnce({ result: { value: { ready: true } } }),
     } as unknown as ChromeClient["Runtime"];
     await expect(ensurePromptReady(runtime, 1000, logger)).resolves.toBeUndefined();
     expect(logger).not.toHaveBeenCalled();
@@ -206,6 +209,25 @@ describe("ensurePromptReady", () => {
       evaluate: vi.fn().mockResolvedValue({ result: { value: false } }),
     } as unknown as ChromeClient["Runtime"];
     await expect(ensurePromptReady(runtime, 0, logger)).rejects.toThrow(/textarea did not appear/i);
+  });
+
+  test("waits for existing conversation hydration after the composer appears", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: true } })
+          .mockResolvedValueOnce({ result: { value: { ready: false } } })
+          .mockResolvedValueOnce({ result: { value: { ready: true } } }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const ready = ensurePromptReady(runtime, 2_000, logger);
+      await vi.advanceTimersByTimeAsync(300);
+      await expect(ready).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -522,6 +544,58 @@ describe("waitForAssistantResponse", () => {
     const result = await waitForAssistantResponse(runtime, 1_500, logger);
 
     expect(result.text).toBe("BROKER-SMOKE-OK");
+    expect(
+      evaluate.mock.calls.some(([params]) =>
+        String((params as { expression?: string }).expression ?? "").includes(
+          "const BUTTON_SELECTOR",
+        ),
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  test("treats short pro-thinking scaffolds as placeholders", async () => {
+    const placeholder = {
+      text: "ChatGPT said:Pro thinking",
+      html: "<p>ChatGPT said:Pro thinking</p>",
+      messageId: "mid",
+      turnId: "tid",
+    };
+    const evaluate = vi
+      .fn()
+      .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+        const expression = String(params?.expression ?? "");
+        if (params?.awaitPromise && expression.includes("MutationObserver")) {
+          return { result: { type: "object", value: placeholder } };
+        }
+        if (params?.awaitPromise && expression.includes("const BUTTON_SELECTOR")) {
+          return {
+            result: {
+              value: {
+                success: true,
+                markdown: "PRO_THINKING_RECOVERED",
+              },
+            },
+          };
+        }
+        if (expression.includes("extractAssistantTurn")) {
+          return { result: { value: placeholder } };
+        }
+        if (expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)) {
+          return { result: { value: false } };
+        }
+        if (expression.includes("hasAssistantFinishedActions")) {
+          return { result: { value: true } };
+        }
+        return { result: { value: null } };
+      });
+    const runtime = {
+      evaluate,
+      terminateExecution: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await waitForAssistantResponse(runtime, 1_500, logger);
+
+    expect(result.text).toBe("PRO_THINKING_RECOVERED");
     expect(
       evaluate.mock.calls.some(([params]) =>
         String((params as { expression?: string }).expression ?? "").includes(

@@ -33,7 +33,7 @@ describe("alignPromptEchoPair", () => {
 
   test("counts only top-level conversation turns for follow-up baselines", async () => {
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
-      expect(expression).toContain("node.parentElement && node.parentElement.closest(selector)");
+      expect(expression).toContain("__oracleCollectThreadEntries");
       return { result: { value: 5 } };
     });
 

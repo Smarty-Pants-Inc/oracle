@@ -32,6 +32,10 @@ type FakeClient = {
   close: () => Promise<void> | void;
 };
 
+const isTurnCountProbe = (expression: string) =>
+  expression.includes("document.querySelectorAll(") ||
+  expression.includes("__oracleCollectThreadEntries");
+
 afterEach(() => {
   vi.doUnmock("../../src/browser/chromeLifecycle.js");
   vi.resetModules();
@@ -60,7 +64,7 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -138,7 +142,7 @@ describe("resumeBrowserSession", () => {
           result: { value: { ok: true, href: runtime.tabUrl, count: 1, scope: "project" } },
         };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -203,7 +207,7 @@ describe("resumeBrowserSession", () => {
         currentHref = JSON.parse(navigateMatch[1] ?? '""');
         return { result: { value: true } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -276,7 +280,7 @@ describe("resumeBrowserSession", () => {
         currentHref = JSON.parse(navigateMatch[1] ?? '""');
         return { result: { value: true } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -348,7 +352,7 @@ describe("resumeBrowserSession", () => {
         currentHref = navigateMatch[1].replace(/\\"/g, '"');
         return { result: { value: true } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -431,7 +435,7 @@ describe("resumeBrowserSession", () => {
         currentHref = expectedUrl;
         return { result: { value: { ok: true, href: expectedUrl, count: 3 } } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -515,7 +519,7 @@ describe("resumeBrowserSession", () => {
           result: { value: { ok: true, href: wrongUrl, count: 1, scope: "project" } },
         };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 4 } };
       }
       return { result: { value: null } };
@@ -754,7 +758,7 @@ describe("resumeBrowserSession", () => {
         currentHref = JSON.parse(navigateMatch[1] ?? '""');
         return { result: { value: true } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -976,7 +980,7 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 4 } };
       }
       return { result: { value: null } };
@@ -1038,7 +1042,7 @@ describe("resumeBrowserSession", () => {
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("retrying via target discovery"));
   });
 
-  test("fails closed when a cached hidden websocket target cannot be verified", async () => {
+  test("reopens the stored conversation when a cached hidden websocket target cannot be verified", async () => {
     vi.resetModules();
     const runtime = {
       chromeHost: "127.0.0.1",
@@ -1074,14 +1078,32 @@ describe("resumeBrowserSession", () => {
     });
     const { resumeBrowserSession: mockedResumeBrowserSession } =
       await import("../../src/browser/reattach.js");
-    const logger = vi.fn() as BrowserLogger;
+    const logger = vi.fn();
+    const recoverSession = vi.fn(async () => ({
+      answerText: "recovered",
+      answerMarkdown: "recovered-md",
+      runtime,
+    }));
 
-    await expect(
-      mockedResumeBrowserSession(runtime, { attachRunning: true, timeoutMs: 2_000 }, logger, {}),
-    ).rejects.toThrow("Unable to locate the existing Oracle browser tab for the reusable runtime");
+    const result = await mockedResumeBrowserSession(
+      runtime,
+      { attachRunning: true, timeoutMs: 2_000 },
+      logger as BrowserLogger,
+      { recoverSession },
+    );
 
+    expect(result.answerMarkdown).toBe("recovered-md");
+    expect(recoverSession).toHaveBeenCalledWith(runtime, {
+      attachRunning: true,
+      timeoutMs: 2_000,
+    });
     expect(listRemoteChromeTargets.mock.calls.length).toBeGreaterThan(1);
-  });
+    expect(
+      logger.mock.calls.some((call) =>
+        String(call[0]).includes("reopening browser to locate the stored conversation"),
+      ),
+    ).toBe(true);
+  }, 10_000);
 
   test("reuses a cached hidden websocket target when the connected target is a chat conversation", async () => {
     vi.resetModules();
@@ -1160,12 +1182,13 @@ describe("resumeBrowserSession", () => {
     expect(listedTargets).toHaveBeenCalledTimes(1);
   });
 
-  test("fails closed when websocket metadata has no matched tab", async () => {
+  test("fails closed when websocket metadata has no matched tab and no conversation identity", async () => {
+    vi.resetModules();
     const runtime = {
       chromeHost: "127.0.0.1",
       chromePort: 9222,
       chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
-      tabUrl: "https://chatgpt.com/c/abc",
+      tabUrl: "https://chatgpt.com/",
     };
     const listTargets = vi.fn(async () => [] satisfies FakeTarget[]) as unknown as () => Promise<
       FakeTarget[]
@@ -1195,10 +1218,22 @@ describe("resumeBrowserSession", () => {
       meta: { messageId: "m1", turnId: "conversation-turn-1" },
     }));
     const captureAssistantMarkdown = vi.fn(async () => "attached-md");
+    const listRemoteChromeTargets = vi.fn(async () => [] satisfies FakeTarget[]);
+    vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
+        "../../src/browser/chromeLifecycle.js",
+      );
+      return {
+        ...actual,
+        listRemoteChromeTargets,
+      };
+    });
+    const { resumeBrowserSession: mockedResumeBrowserSession } =
+      await import("../../src/browser/reattach.js");
     const logger = vi.fn() as BrowserLogger;
 
     await expect(
-      resumeBrowserSession(runtime, { attachRunning: true, timeoutMs: 2_000 }, logger, {
+      mockedResumeBrowserSession(runtime, { attachRunning: true, timeoutMs: 2_000 }, logger, {
         listTargets,
         connect,
         waitForAssistantResponse,
@@ -1206,6 +1241,47 @@ describe("resumeBrowserSession", () => {
       }),
     ).rejects.toThrow("Unable to locate the existing Oracle browser tab for the reusable runtime");
     expect(connect).not.toHaveBeenCalled();
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+  }, 10_000);
+
+  test("reopens the stored conversation when websocket metadata has no matched tab but a conversation id is known", async () => {
+    const runtime = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/recovered-thread",
+      conversationId: "recovered-thread",
+    };
+    const listTargets = vi.fn(async () => [] satisfies FakeTarget[]) as unknown as () => Promise<
+      FakeTarget[]
+    >;
+    const connect = vi.fn() as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const recoverSession = vi.fn(async () => ({
+      answerText: "recovered",
+      answerMarkdown: "recovered-md",
+      runtime,
+    }));
+    const logger = vi.fn();
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { attachRunning: true, timeoutMs: 2_000 },
+      logger as BrowserLogger,
+      {
+        listTargets,
+        connect,
+        recoverSession,
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("recovered-md");
+    expect(connect).not.toHaveBeenCalled();
+    expect(recoverSession).toHaveBeenCalledWith(runtime, { attachRunning: true, timeoutMs: 2_000 });
+    expect(
+      logger.mock.calls.some((call) =>
+        String(call[0]).includes("reopening browser to locate the stored conversation"),
+      ),
+    ).toBe(true);
   });
 
   test("continues a browser follow-up through browser websocket metadata", async () => {
@@ -1305,7 +1381,7 @@ describe("resumeBrowserSession", () => {
         currentHref = conversationUrl;
         return { result: { value: true } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 4 } };
       }
       return { result: { value: null } };
@@ -1397,7 +1473,7 @@ describe("resumeBrowserSession", () => {
       if (expression.includes("const needles =")) {
         return { result: { value: false } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 4 } };
       }
       return { result: { value: null } };
@@ -1485,7 +1561,7 @@ describe("resumeBrowserSession", () => {
           result: { value: { ok: true, href: conversationUrl, count: 1, scope: "project" } },
         };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 4 } };
       }
       return { result: { value: null } };
@@ -1820,7 +1896,7 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -1924,7 +2000,7 @@ describe("resumeBrowserSession", () => {
             },
           };
         }
-        if (expression.includes("document.querySelectorAll(")) {
+        if (isTurnCountProbe(expression)) {
           return { result: { value: 7 } };
         }
         return { result: { value: null } };
@@ -2112,7 +2188,7 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -2176,7 +2252,7 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (expression.includes("document.querySelectorAll(")) {
+      if (isTurnCountProbe(expression)) {
         return { result: { value: 7 } };
       }
       return { result: { value: null } };
@@ -2412,7 +2488,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
             },
           };
         }
-        if (expression.includes("document.querySelectorAll(")) {
+        if (isTurnCountProbe(expression)) {
           return { result: { value: 3 } };
         }
         return { result: { value: null } };
@@ -2556,7 +2632,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
             },
           };
         }
-        if (expression.includes("document.querySelectorAll(")) {
+        if (isTurnCountProbe(expression)) {
           return { result: { value: 3 } };
         }
         return { result: { value: null } };
@@ -2671,7 +2747,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
             },
           };
         }
-        if (expression.includes("document.querySelectorAll(")) {
+        if (isTurnCountProbe(expression)) {
           return { result: { value: 3 } };
         }
         return { result: { value: null } };
@@ -2775,7 +2851,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
             },
           };
         }
-        if (expression.includes("document.querySelectorAll(")) {
+        if (isTurnCountProbe(expression)) {
           return { result: { value: 3 } };
         }
         return { result: { value: null } };
@@ -3831,6 +3907,8 @@ describe("reattach helpers", () => {
   test("treats finalizing-answer status as transient during reattach", () => {
     expect(isTransientReattachAnswer("ChatGPT said:\nFinalizing answer")).toBe(true);
     expect(isTransientReattachAnswer("Finalizing answer")).toBe(true);
+    expect(isTransientReattachAnswer("ChatGPT said:Pro thinking")).toBe(true);
+    expect(isTransientReattachAnswer("Pro thinking")).toBe(true);
     expect(isTransientReattachAnswer("Real answer text")).toBe(false);
   });
 

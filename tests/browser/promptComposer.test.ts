@@ -6,6 +6,12 @@ import {
   CONVERSATION_TURN_SELECTOR,
 } from "../../src/browser/constants.js";
 
+const isThreadSelector = (selector: string) =>
+  selector === CONVERSATION_TURN_SELECTOR ||
+  selector.includes('[data-testid^="conversation-turn"]') ||
+  selector.includes("[data-message-author-role]") ||
+  selector.includes("[data-turn]");
+
 describe("promptComposer", () => {
   test("does not treat cleared composer + stop button as committed without a new turn", async () => {
     vi.useFakeTimers();
@@ -162,10 +168,21 @@ describe("promptComposer", () => {
             "O1_1775534779",
             "Thinking",
           ];
-          const turnNodes = turns.map((text) => ({ innerText: text, textContent: text }));
+          const turnNodes = turns.map((text) => ({
+            innerText: text,
+            textContent: text,
+            querySelectorAll: () => [],
+            querySelector: () => null,
+            closest(selector: string) {
+              return isThreadSelector(selector) ? this : null;
+            },
+            contains(other: unknown) {
+              return other === this;
+            },
+          }));
           const fakeDocument = {
             querySelectorAll(selector: string) {
-              return selector === CONVERSATION_TURN_SELECTOR ? turnNodes : [];
+              return isThreadSelector(selector) ? turnNodes : [];
             },
             querySelector(selector: string) {
               if (
@@ -207,9 +224,13 @@ describe("promptComposer", () => {
         textContent: text,
         parentElement: null,
         getAttribute: () => null,
+        querySelectorAll: () => [],
+        contains(other: unknown) {
+          return other === wrapper || other === roleNode;
+        },
         getBoundingClientRect: () => ({ width: 1, height: 1 }),
         closest(selector: string) {
-          return selector === CONVERSATION_TURN_SELECTOR ? wrapper : null;
+          return isThreadSelector(selector) ? wrapper : null;
         },
         querySelector(selector: string) {
           if (selector.includes("[data-message-author-role]") || selector.includes("[data-turn]")) {
@@ -229,6 +250,13 @@ describe("promptComposer", () => {
           return null;
         },
         querySelector: () => null,
+        querySelectorAll: () => [],
+        closest(selector: string) {
+          return isThreadSelector(selector) ? wrapper : null;
+        },
+        contains(other: unknown) {
+          return other === roleNode;
+        },
         getBoundingClientRect: () => ({ width: 1, height: 1 }),
       };
       return { wrapper, roleNode };
@@ -246,20 +274,39 @@ describe("promptComposer", () => {
       latestAssistant.roleNode,
     ];
 
-    const fakeDocument = {
+    const fakeDocument: {
+      body: unknown;
+      querySelectorAll: (selector: string) => unknown[];
+      querySelector: (selector: string) => unknown;
+      contains: (node: unknown) => boolean;
+      getBoundingClientRect: () => { width: number; height: number };
+      innerText: string;
+      textContent: string;
+    } = {
+      body: null,
       querySelectorAll(selector: string) {
-        if (selector === CONVERSATION_TURN_SELECTOR) {
+        if (isThreadSelector(selector)) {
           return conversationNodes;
         }
         return [];
       },
       querySelector(selector: string) {
+        if (selector === "main" || selector === '[role="main"]') {
+          return this;
+        }
         if (selector === ASSISTANT_ROLE_SELECTOR || selector === '[data-testid*="assistant"]') {
           return latestAssistant.roleNode;
         }
         return null;
       },
+      contains(node: unknown) {
+        return conversationNodes.includes(node as never);
+      },
+      getBoundingClientRect: () => ({ width: 1, height: 1 }),
+      innerText: conversationNodes.map((node) => node.innerText).join("\n"),
+      textContent: conversationNodes.map((node) => node.textContent).join("\n"),
     };
+    fakeDocument.body = fakeDocument;
 
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string; returnByValue?: boolean }) => {
@@ -277,5 +324,118 @@ describe("promptComposer", () => {
     await expect(
       promptComposer.verifyPromptCommitted(runtime as never, prompt, 150, undefined, 1),
     ).resolves.toBe(3);
+  });
+
+  test("matches committed prompts from role-based thread layouts without conversation-turn wrappers", async () => {
+    const prompt = "Reply with exactly PONG_1776119550 and nothing else.";
+    const makeRoleNode = (text: string, role: "user" | "assistant") => ({
+      innerText: text,
+      textContent: text,
+      getAttribute(name: string) {
+        if (name === "data-message-author-role" || name === "data-turn") {
+          return role;
+        }
+        return null;
+      },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      closest(selector: string) {
+        return isThreadSelector(selector) ? this : null;
+      },
+      contains(other: unknown) {
+        return other === this;
+      },
+      getBoundingClientRect: () => ({ width: 1, height: 1 }),
+    });
+
+    const roleNodes = [
+      makeRoleNode("Earlier context", "assistant"),
+      makeRoleNode("Short prior user turn", "user"),
+      makeRoleNode(`You said:\n${prompt}`, "user"),
+      makeRoleNode("PONG_1776119550", "assistant"),
+    ];
+    const fakeDocument: {
+      body: unknown;
+      querySelectorAll: (selector: string) => unknown[];
+      querySelector: (selector: string) => unknown;
+      contains: (node: unknown) => boolean;
+      getBoundingClientRect: () => { width: number; height: number };
+      innerText: string;
+      textContent: string;
+    } = {
+      body: null,
+      querySelectorAll(selector: string) {
+        if (selector === '[data-testid="chat-thread"]') {
+          return [];
+        }
+        if (isThreadSelector(selector)) {
+          return roleNodes;
+        }
+        return [];
+      },
+      querySelector(selector: string) {
+        if (selector === "main" || selector === '[role="main"]') {
+          return this;
+        }
+        if (selector === ASSISTANT_ROLE_SELECTOR || selector === '[data-testid*="assistant"]') {
+          return roleNodes[3];
+        }
+        return null;
+      },
+      contains(node: unknown) {
+        return roleNodes.includes(node as never);
+      },
+      getBoundingClientRect: () => ({ width: 1, height: 1 }),
+      innerText: roleNodes.map((node) => node.innerText).join("\n"),
+      textContent: roleNodes.map((node) => node.textContent).join("\n"),
+    };
+    fakeDocument.body = fakeDocument;
+
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string; returnByValue?: boolean }) => {
+        const value = vm.runInNewContext(expression, {
+          document: fakeDocument,
+          location: { href: "https://chatgpt.com/c/abc" },
+          HTMLTextAreaElement: class HTMLTextAreaElement {},
+        });
+        return { result: { value } };
+      }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, prompt, 150, undefined, 2),
+    ).resolves.toBe(4);
+  });
+
+  test("treats composer-cleared generation on an existing conversation as committed even without prompt echo", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: 68 } })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              baseline: 68,
+              turnsCount: 69,
+              userMatched: false,
+              prefixMatched: false,
+              lastMatched: false,
+              hasNewTurn: true,
+              stopVisible: true,
+              assistantVisible: true,
+              composerCleared: true,
+              inConversation: true,
+            },
+          },
+        }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
+    ).resolves.toBe(69);
   });
 });

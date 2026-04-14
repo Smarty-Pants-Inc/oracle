@@ -2,6 +2,7 @@ import type { BrowserLogger, ChromeClient } from "./types.js";
 import { CONVERSATION_TURN_SELECTOR } from "./constants.js";
 import { delay } from "./utils.js";
 import { readAssistantSnapshot } from "./pageActions.js";
+import { buildThreadIntrospectionHelpers } from "./threadIntrospection.js";
 
 export type TargetInfoLite = {
   targetId?: string;
@@ -703,13 +704,12 @@ export async function readConversationTurnIndex(
   Runtime: ChromeClient["Runtime"],
   logger?: BrowserLogger,
 ): Promise<number | null> {
-  const selectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   try {
     const { result } = await Runtime.evaluate({
       expression: `(() => {
-        const selector = ${selectorLiteral};
-        return Array.from(document.querySelectorAll(selector)).filter(
-          (node) => !(node.parentElement && node.parentElement.closest(selector)),
+        ${buildThreadIntrospectionHelpers()}
+        return __oracleCollectThreadEntries(__oraclePickThreadRoot()).filter(
+          (entry) => entry.role === 'user' || entry.role === 'assistant',
         ).length;
       })()`,
       returnByValue: true,

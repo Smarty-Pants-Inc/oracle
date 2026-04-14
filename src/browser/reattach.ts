@@ -1070,7 +1070,7 @@ function isTransientReattachAnswer(text: string): boolean {
   if (!withoutPrefix) {
     return true;
   }
-  if (withoutPrefix === "thinking") {
+  if (withoutPrefix === "thinking" || withoutPrefix === "pro thinking") {
     return true;
   }
   if (
@@ -1784,6 +1784,13 @@ export async function resumeBrowserSession(
       throw error;
     }
     if (isSessionIdentityError(error)) {
+      if (isRecoverableSessionDiscoveryError(error) && getRuntimeConversationId(runtime)) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger(
+          `Existing Chrome reattach could not safely reuse the prior target (${message}); reopening browser to locate the stored conversation.`,
+        );
+        return recoverSession(runtime, config);
+      }
       throw error;
     }
     const message = error instanceof Error ? error.message : String(error);

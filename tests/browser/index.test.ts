@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { __test__, shouldPreserveBrowserOnErrorForTest } from "../../src/browser/index.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
@@ -75,6 +75,51 @@ describe("assistant retry policy", () => {
     const error = new Error("assistant-response-watchdog-timeout");
     expect(__test__.shouldReloadAfterAssistantError(error)).toBe(true);
     expect(__test__.isAssistantResponseTimeoutError(error)).toBe(true);
+  });
+});
+
+describe("conversation identity hinting", () => {
+  test("returns immediately when the current url already has a conversation id", async () => {
+    const trigger = vi.fn(async () => true);
+    await expect(
+      __test__.ensureConversationIdentityHint(
+        () => "https://chatgpt.com/c/already-there",
+        trigger,
+        "shutdown",
+        5_000,
+      ),
+    ).resolves.toBe(true);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
+  test("waits for a started hint to populate the conversation url", async () => {
+    let currentUrl = "https://chatgpt.com/g/project";
+    const trigger = vi.fn(async () => {
+      currentUrl = "https://chatgpt.com/g/project/c/recovered";
+      return true;
+    });
+    await expect(
+      __test__.ensureConversationIdentityHint(
+        () => currentUrl,
+        trigger,
+        "post-submit-prime",
+        5_000,
+      ),
+    ).resolves.toBe(true);
+    expect(trigger).toHaveBeenCalledWith("post-submit-prime", 5_000);
+  });
+
+  test("returns false when the hint completes without a conversation url", async () => {
+    const trigger = vi.fn(async () => false);
+    await expect(
+      __test__.ensureConversationIdentityHint(
+        () => "https://chatgpt.com/g/project",
+        trigger,
+        "shutdown",
+        5_000,
+      ),
+    ).resolves.toBe(false);
+    expect(trigger).toHaveBeenCalledWith("shutdown", 5_000);
   });
 });
 
