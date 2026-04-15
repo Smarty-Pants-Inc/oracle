@@ -3,7 +3,11 @@ import "dotenv/config";
 import process from "node:process";
 import { startSupervisorBroker } from "../src/cli/supervisorBroker.js";
 
-startSupervisorBroker().catch((error) => {
-  console.error("Failed to start oracle supervisor broker:", error);
-  process.exitCode = 1;
-});
+startSupervisorBroker()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((error) => {
+    console.error("Failed to start oracle supervisor broker:", error);
+    process.exitCode = 1;
+  });

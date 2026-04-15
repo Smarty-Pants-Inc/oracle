@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -56,6 +57,7 @@ const SUPERVISOR_BROWSER_LEASE_HEARTBEAT_MS = Math.min(
 const SUPERVISOR_BROWSER_ACTIVE_LEASE_RECHECK_MS = 5_000;
 const SUPERVISOR_BROWSER_RUNTIME_ATTACH_RECHECK_MIN_MS = 250;
 const SUPERVISOR_PROMPT_COMPLETION_POLL_MS = 500;
+const SUPERVISOR_PROMPT_RUN_SETTLE_GRACE_MS = 10_000;
 const SUPERVISOR_CHATGPT_URL_ENV = "ORACLE_SUPERVISOR_CHATGPT_URL";
 
 interface SupervisorBrowserThrottleLease {
@@ -99,8 +101,11 @@ interface SupervisorPromptCompletionSnapshot {
 type SupervisorPromptRunOutcome =
   | { kind: "run-finished" }
   | { kind: "run-failed"; error: unknown }
+  | { kind: "run-still-pending"; snapshot: SupervisorPromptCompletionSnapshot }
   | { kind: "session-completed"; snapshot: SupervisorPromptCompletionSnapshot }
   | { kind: "session-terminal"; snapshot: SupervisorPromptCompletionSnapshot };
+
+const SUPERVISOR_PROMPT_RUN_STILL_PENDING = Symbol("supervisor-prompt-run-still-pending");
 
 export interface SupervisorPromptRequest {
   prompt: string;
@@ -1405,6 +1410,43 @@ async function readSupervisorPromptCompletionSnapshot(
   };
 }
 
+async function waitForPromiseSettlement<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | typeof SUPERVISOR_PROMPT_RUN_STILL_PENDING> {
+  if (timeoutMs <= 0) {
+    return SUPERVISOR_PROMPT_RUN_STILL_PENDING;
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await new Promise<T | typeof SUPERVISOR_PROMPT_RUN_STILL_PENDING>((resolve, reject) => {
+      timer = setTimeout(() => {
+        timer = null;
+        resolve(SUPERVISOR_PROMPT_RUN_STILL_PENDING);
+      }, timeoutMs);
+      timer.unref?.();
+      promise.then(resolve, reject);
+    });
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function closeWritableStream(stream?: NodeJS.WritableStream | null): Promise<void> {
+  const writable = stream as
+    | (NodeJS.WritableStream & { destroyed?: boolean; writableEnded?: boolean })
+    | null
+    | undefined;
+  if (!writable || writable.destroyed || writable.writableEnded) {
+    return;
+  }
+  const closed = once(writable, "close").then(() => undefined);
+  writable.end();
+  await closed.catch(() => undefined);
+}
+
 async function waitForSupervisorPromptRunOutcome({
   sessionId,
   outputPath,
@@ -1412,6 +1454,7 @@ async function waitForSupervisorPromptRunOutcome({
   readSession,
   readOutput,
   pollIntervalMs = SUPERVISOR_PROMPT_COMPLETION_POLL_MS,
+  runSettleGraceMs = 0,
 }: {
   sessionId: string;
   outputPath: string;
@@ -1422,6 +1465,7 @@ async function waitForSupervisorPromptRunOutcome({
   } | null>;
   readOutput?: (outputPath: string) => Promise<string>;
   pollIntervalMs?: number;
+  runSettleGraceMs?: number;
 }): Promise<SupervisorPromptRunOutcome> {
   let settled = false;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1452,9 +1496,29 @@ async function waitForSupervisorPromptRunOutcome({
         readOutput,
       );
       if (snapshot.sessionStatus === "completed") {
-        return { kind: "session-completed", snapshot };
+        if (runSettleGraceMs <= 0) {
+          return { kind: "session-completed", snapshot };
+        }
+        const settledRun = await waitForPromiseSettlement(runOutcome, runSettleGraceMs);
+        if (settledRun === SUPERVISOR_PROMPT_RUN_STILL_PENDING) {
+          return { kind: "run-still-pending", snapshot };
+        }
+        if (settledRun.kind === "run-failed") {
+          return settledRun;
+        }
+        return settledRun;
       }
       if (snapshot.sessionStatus === "error" || snapshot.sessionStatus === "cancelled") {
+        if (runSettleGraceMs <= 0) {
+          return { kind: "session-terminal", snapshot };
+        }
+        const settledRun = await waitForPromiseSettlement(runOutcome, runSettleGraceMs);
+        if (settledRun === SUPERVISOR_PROMPT_RUN_STILL_PENDING) {
+          return { kind: "run-still-pending", snapshot };
+        }
+        if (settledRun.kind === "run-failed") {
+          return settledRun;
+        }
         return { kind: "session-terminal", snapshot };
       }
       if (settled) {
@@ -1621,6 +1685,7 @@ export async function runSupervisorPromptOperation(
     requestedModel,
     () => undefined,
   );
+  let releaseReservation = true;
   let sessionMeta: Awaited<ReturnType<typeof sessionStore.createSession>> | undefined;
   let logWriter: ReturnType<typeof sessionStore.createLogWriter> | undefined;
   const log = (line?: string): void => logWriter?.logLine(line);
@@ -1696,10 +1761,18 @@ export async function runSupervisorPromptOperation(
           muteStdout: true,
           browserDeps,
         }),
+        runSettleGraceMs: SUPERVISOR_PROMPT_RUN_SETTLE_GRACE_MS,
       }),
     );
     if (runOutcome.kind === "run-failed") {
       throw runOutcome.error;
+    }
+    if (runOutcome.kind === "run-still-pending") {
+      releaseReservation = false;
+      const sessionStatus = runOutcome.snapshot.sessionStatus ?? "unknown";
+      throw new Error(
+        `Session runner did not settle within ${formatElapsed(SUPERVISOR_PROMPT_RUN_SETTLE_GRACE_MS)} after session status became ${sessionStatus}; keeping the supervisor browser lease active until TTL expiry to prevent concurrent runtime reuse.`,
+      );
     }
     await commitReservationIfNeeded();
     const completionSnapshot =
@@ -1728,8 +1801,12 @@ export async function runSupervisorPromptOperation(
     };
   } finally {
     signalCleanup.dispose();
-    await releaseSupervisorBrowserRequestSlot(reservation);
-    logWriter?.stream.end();
+    if (releaseReservation) {
+      await releaseSupervisorBrowserRequestSlot(reservation);
+    } else {
+      log("Supervisor browser lease release deferred because the runner was still pending.");
+    }
+    await closeWritableStream(logWriter?.stream);
     await fs.rm(outputPath, { force: true }).catch(() => undefined);
   }
 }
@@ -1764,5 +1841,7 @@ export const __test__ = {
   supervisorBrowserThrottleProfileKey,
   supervisorBrowserLeaseMatchesLiveProcess,
   withSupervisorRuntimeAttachLease,
+  waitForPromiseSettlement,
+  closeWritableStream,
   waitForSupervisorPromptRunOutcome,
 };

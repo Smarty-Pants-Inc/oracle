@@ -6,14 +6,19 @@ import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import puppeteer from "puppeteer-core";
 import { THINKING_MENU_TRIGGER_SELECTORS } from "../src/browser/constants.js";
+import { extractConversationIdFromUrl } from "../src/browser/reattachHelpers.js";
+import { attachSupervisorThread } from "../src/browser/supervisorThreads.js";
 import type {
   SupervisorBrokerRequest,
   SupervisorBrokerResponse,
 } from "../src/cli/supervisorBroker.js";
-import { sessionStore } from "../src/sessionStore.js";
+import {
+  connectSupervisorRuntime,
+  resolveSupervisorRuntimeContext,
+} from "../src/cli/supervisorBrokerRuntime.js";
 import type { ThinkingTimeLevel } from "../src/oracle/types.js";
+import { sessionStore } from "../src/sessionStore.js";
 import { browserProofScript } from "./supervisor-proof.browser.js";
 
 const LEVELS = new Set<ThinkingTimeLevel>(["light", "standard", "extended", "heavy"]);
@@ -22,6 +27,10 @@ const USAGE =
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TSX_CLI = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
 const BROKER_ENTRYPOINT = path.join(REPO_ROOT, "bin", "oracle-supervisor-broker.ts");
+const BROKER_EXIT_TIMEOUT_MS = 15_000;
+const BROKER_FORCE_KILL_TIMEOUT_MS = 5_000;
+const BROWSER_PROOF_STATE_TIMEOUT_MS = 15_000;
+const CHATGPT_URL = "https://chatgpt.com/";
 
 function parseArgs(argv: string[]) {
   let thinkingTime: ThinkingTimeLevel = "extended";
@@ -34,14 +43,17 @@ function parseArgs(argv: string[]) {
     }
     if (arg === "--thinking-time") {
       const value = argv[++i] as ThinkingTimeLevel | undefined;
-      if (!value || !LEVELS.has(value))
+      if (!value || !LEVELS.has(value)) {
         throw new Error("Expected --thinking-time light|standard|extended|heavy");
+      }
       thinkingTime = value;
       continue;
     }
     if (arg === "--prompt") {
       prompt = argv[++i];
-      if (!prompt) throw new Error("Expected a value after --prompt");
+      if (!prompt) {
+        throw new Error("Expected a value after --prompt");
+      }
       continue;
     }
     throw new Error(`Unknown argument: ${arg}`);
@@ -55,6 +67,169 @@ const isChecked = (item?: { ariaChecked: string | null; dataState: string | null
   item?.dataState === "checked" ||
   item?.dataState === "selected" ||
   item?.dataState === "on";
+
+async function withTimeout<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  errorFactory: () => Error,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        timer = null;
+        reject(errorFactory());
+      }, timeoutMs);
+      timer.unref?.();
+      work.then(resolve, reject);
+    });
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function waitForChildExit(
+  child: Pick<ReturnType<typeof spawn>, "exitCode" | "signalCode" | "once" | "off" | "kill">,
+  timeoutMs: number = BROKER_EXIT_TIMEOUT_MS,
+  forceKillTimeoutMs: number = BROKER_FORCE_KILL_TIMEOUT_MS,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return await new Promise((resolve, reject) => {
+    let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      resolve({ code, signal });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        child.kill("SIGKILL");
+        cleanup();
+        reject(new Error(`Supervisor broker did not exit within ${timeoutMs}ms after responding.`));
+      }, forceKillTimeoutMs);
+      forceKillTimer.unref?.();
+    }, timeoutMs);
+    timer.unref?.();
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+function assertBrokerExitedCleanly(exit: {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}): void {
+  if (exit.signal) {
+    throw new Error(
+      `Supervisor broker exited with signal ${exit.signal} after responding. Refusing to trust partial proof output.`,
+    );
+  }
+  if (exit.code !== 0) {
+    throw new Error(
+      `Supervisor broker exited with code ${exit.code ?? "null"} after responding. Refusing to trust partial proof output.`,
+    );
+  }
+}
+
+function normalizeComparableHref(href: string): string | null {
+  const trimmed = href.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed, CHATGPT_URL);
+    parsed.search = "";
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return parsed.toString();
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+function assertProofOnExpectedThread({
+  expectedConversationId,
+  expectedTabUrl,
+  observedHref,
+}: {
+  expectedConversationId?: string;
+  expectedTabUrl?: string;
+  observedHref: string;
+}): void {
+  const normalizedObservedHref = normalizeComparableHref(observedHref);
+  if (!normalizedObservedHref) {
+    throw new Error("Browser proof did not expose an active tab URL.");
+  }
+  const observedConversationId = extractConversationIdFromUrl(normalizedObservedHref);
+  if (expectedConversationId) {
+    if (observedConversationId !== expectedConversationId) {
+      throw new Error(
+        `Browser proof attached to conversation ${observedConversationId ?? "unknown"} instead of ${expectedConversationId}. Observed URL: ${observedHref}`,
+      );
+    }
+    return;
+  }
+  if (!expectedTabUrl) {
+    return;
+  }
+  const normalizedExpectedHref = normalizeComparableHref(expectedTabUrl);
+  if (normalizedExpectedHref && normalizedObservedHref !== normalizedExpectedHref) {
+    throw new Error(
+      `Browser proof attached to unexpected tab ${observedHref}; expected ${expectedTabUrl}.`,
+    );
+  }
+}
+
+async function evaluateBrowserProofState(
+  Runtime: {
+    evaluate: (params: {
+      expression: string;
+      returnByValue: boolean;
+      awaitPromise: boolean;
+    }) => Promise<{ result?: { value?: unknown }; exceptionDetails?: { text?: string } }>;
+  },
+  args: {
+    chipSelectors: readonly string[];
+    level: ThinkingTimeLevel;
+    token: string;
+  },
+) {
+  const response = await Runtime.evaluate({
+    expression: `(${browserProofScript})(${JSON.stringify(args)})`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (response.exceptionDetails) {
+    throw new Error(response.exceptionDetails.text || "Browser proof evaluation failed");
+  }
+  return response.result?.value as {
+    href: string;
+    title: string;
+    proofPresent: boolean;
+    menuFound: boolean;
+    chipText: string;
+    items: Array<{ text: string; ariaChecked: string | null; dataState: string | null }>;
+    pngDataUrl: string;
+  };
+}
 
 async function runSupervisorBrokerOverWire(
   request: SupervisorBrokerRequest,
@@ -114,11 +289,8 @@ async function runSupervisorBrokerOverWire(
   child.stdin.write(`${JSON.stringify(request)}\n`);
   child.stdin.end(`${JSON.stringify({ shutdown: true })}\n`);
   const response = await responsePromise;
-  if (child.exitCode === null && child.signalCode === null) {
-    await new Promise<void>((resolve) => {
-      child.once("exit", () => resolve());
-    });
-  }
+  const exit = await waitForChildExit(child);
+  assertBrokerExitedCleanly(exit);
   return response;
 }
 
@@ -136,32 +308,52 @@ async function main() {
     browserThinkingTime: thinkingTime,
     cwd: process.cwd(),
   });
-  if (!response.ok) throw new Error(response.error);
+  if (!response.ok) {
+    throw new Error(response.error);
+  }
   if (!("output" in response) || !("sessionId" in response)) {
     throw new Error("Unexpected supervisor broker response for run_prompt");
   }
 
-  const runtime = (await sessionStore.readSession(response.sessionId))?.browser?.runtime;
-  if (!runtime?.tabUrl || !runtime.chromePort)
+  const { runtime } = await resolveSupervisorRuntimeContext(response.sessionId);
+  if (!runtime?.tabUrl || !runtime?.conversationId) {
     throw new Error("Supervisor proof session is missing browser runtime metadata");
+  }
+  const expectedConversationId = extractConversationIdFromUrl(runtime.tabUrl);
+  if (!expectedConversationId || expectedConversationId !== runtime.conversationId) {
+    throw new Error(
+      `Supervisor proof session runtime metadata is missing stable thread identity. tabUrl=${runtime.tabUrl} conversationId=${runtime.conversationId ?? "unknown"}`,
+    );
+  }
 
   const { dir } = await sessionStore.getPaths(response.sessionId);
   const screenshotPath = path.join(dir, `supervisor-proof-${thinkingTime}.png`);
-  const browser = await puppeteer.connect({
-    browserURL: `http://${runtime.chromeHost ?? "127.0.0.1"}:${runtime.chromePort}`,
-    defaultViewport: null,
-    protocolTimeout: 120_000,
-  });
+  const connection = await connectSupervisorRuntime(runtime);
+  if (connection.client.Runtime?.enable) {
+    await connection.client.Runtime.enable();
+  }
+  if (connection.client.DOM?.enable) {
+    await connection.client.DOM.enable();
+  }
 
   try {
-    const page = (await browser.pages()).at(-1);
-    if (!page) throw new Error("No active hidden Oracle browser page found");
-    await page.setViewport({ width: 1600, height: 1400, deviceScaleFactor: 1 });
-    await page.goto(runtime.tabUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("body", { timeout: 60_000 });
-
+    const sessionMeta = await sessionStore.readSession(response.sessionId);
+    const projectUrl =
+      sessionMeta?.supervisorThread?.projectUrl ??
+      sessionMeta?.browser?.config?.supervisorChatgptUrl ??
+      sessionMeta?.browser?.config?.chatgptUrl ??
+      sessionMeta?.browser?.config?.url ??
+      undefined;
+    if (runtime.conversationId) {
+      await attachSupervisorThread(connection.client.Runtime, runtime.conversationId, {
+        projectUrl,
+        threadUrl: runtime.tabUrl ?? undefined,
+      });
+    }
     let state:
       | {
+          href: string;
+          title: string;
           proofPresent: boolean;
           menuFound: boolean;
           chipText: string;
@@ -172,36 +364,20 @@ async function main() {
     let lastError: unknown;
     for (let attempt = 0; attempt < 12; attempt += 1) {
       try {
-        const candidate = (await Promise.race([
-          page.evaluate(
-            ({ source, args }) => {
-              const fn = new Function(`return (${source});`)() as (
-                input: typeof args,
-              ) => Promise<unknown>;
-              return fn(args);
-            },
-            {
-              source: browserProofScript,
-              args: {
-                chipSelectors: THINKING_MENU_TRIGGER_SELECTORS,
-                level: thinkingTime,
-                token: proofToken,
-              },
-            },
-          ),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error("Timed out waiting for browser proof state")),
-              15_000,
-            ),
-          ),
-        ])) as {
-          proofPresent: boolean;
-          menuFound: boolean;
-          chipText: string;
-          items: Array<{ text: string; ariaChecked: string | null; dataState: string | null }>;
-          pngDataUrl: string;
-        };
+        const candidate = await withTimeout(
+          evaluateBrowserProofState(connection.client.Runtime, {
+            chipSelectors: THINKING_MENU_TRIGGER_SELECTORS,
+            level: thinkingTime,
+            token: proofToken,
+          }),
+          BROWSER_PROOF_STATE_TIMEOUT_MS,
+          () => new Error("Timed out waiting for browser proof state"),
+        );
+        assertProofOnExpectedThread({
+          expectedConversationId: runtime.conversationId,
+          expectedTabUrl: runtime.tabUrl,
+          observedHref: candidate.href,
+        });
         const selectedItem = candidate.items.find(
           (item) => item.text.toLowerCase() === titleCase(thinkingTime).toLowerCase(),
         );
@@ -213,7 +389,7 @@ async function main() {
           break;
         }
         lastError = new Error(
-          `Proof not ready yet: ${JSON.stringify({ responseObserved, proofPresent: candidate.proofPresent, menuFound: candidate.menuFound, selectedItem, chipText: candidate.chipText })}`,
+          `Proof not ready yet: ${JSON.stringify({ responseObserved, proofPresent: candidate.proofPresent, menuFound: candidate.menuFound, selectedItem, chipText: candidate.chipText, href: candidate.href })}`,
         );
       } catch (error) {
         lastError = error;
@@ -243,11 +419,25 @@ async function main() {
       ),
     );
   } finally {
-    await browser.disconnect();
+    await connection.close();
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  process.exit(1);
-});
+export const __test__ = {
+  assertBrokerExitedCleanly,
+  assertProofOnExpectedThread,
+  evaluateBrowserProofState,
+  normalizeComparableHref,
+  withTimeout,
+  waitForChildExit,
+};
+
+const isMainModule =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    process.exit(1);
+  });
+}

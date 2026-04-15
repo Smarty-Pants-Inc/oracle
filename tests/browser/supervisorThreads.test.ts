@@ -132,6 +132,9 @@ describe("supervisorThreads", () => {
     vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
     let currentReads = 0;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        return { result: { value: 2 } };
+      }
       if (expression.includes("const href = window.location.href || ''")) {
         currentReads += 1;
         if (currentReads < 3) {
@@ -197,6 +200,9 @@ describe("supervisorThreads", () => {
     let currentReadCount = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 2 } };
+        }
         if (expression.includes("const href = window.location.href || ''")) {
           currentReadCount += 1;
           if (currentReadCount < 3) {
@@ -239,6 +245,100 @@ describe("supervisorThreads", () => {
     expect(currentReadCount).toBeGreaterThanOrEqual(3);
   });
 
+  test("attach_thread fails closed when direct URL navigation lands on a blank shell for the requested conversation", async () => {
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                conversationId: "target-9",
+                title: "ChatGPT",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      attachSupervisorThread(runtime, "target-9", {
+        projectUrl,
+        threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      }),
+    ).rejects.toThrow("Conversation target-9 did not become active after attach_thread");
+    dateNow.mockRestore();
+  });
+
+  test("attach_thread accepts direct URL navigation only after visible conversation turns load", async () => {
+    let currentReadCount = 0;
+    let turnCountReads = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          turnCountReads += 1;
+          return {
+            result: {
+              value: turnCountReads < 2 ? 0 : 2,
+            },
+          };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          currentReadCount += 1;
+          return {
+            result: {
+              value:
+                currentReadCount < 2
+                  ? {
+                      url: "https://chatgpt.com/g/team-space/c/current-1",
+                      conversationId: "current-1",
+                      title: "Current",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                      conversationId: "target-9",
+                      title: "Target",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      projectUrl,
+      threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+    });
+
+    expect(thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(turnCountReads).toBeGreaterThanOrEqual(2);
+  });
+
   test("readSupervisorThreadHistory returns normalized transcript entries", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -270,6 +370,9 @@ describe("supervisorThreads", () => {
   test("readAttachedSupervisorThreadHistory surfaces bounded window metadata", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 2 } };
+        }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
           return {
             result: {
@@ -331,6 +434,9 @@ describe("supervisorThreads", () => {
     let locationReads = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 1 } };
+        }
         if (expression.includes("window.location.href")) {
           locationReads += 1;
           return {
@@ -380,6 +486,9 @@ describe("supervisorThreads", () => {
     let locationReads = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 1 } };
+        }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
           return {
             result: {
@@ -430,6 +539,9 @@ describe("supervisorThreads", () => {
   test("readAttachedSupervisorThreadHistory accepts legacy supervisorThread snapshot payloads", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 1 } };
+        }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
           return {
             result: {
@@ -474,6 +586,44 @@ describe("supervisorThreads", () => {
 
     expect(result.thread.conversationId).toBe("current-9");
     expect(result.history).toEqual([{ role: "assistant", text: "Recent answer" }]);
+  });
+
+  test("readAttachedSupervisorThreadHistory fails closed when the requested conversation has no visible turns", async () => {
+    vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                conversationId: "current-9",
+                title: "ChatGPT",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readAttachedSupervisorThreadHistory(runtime, {
+        conversationId: "current-9",
+        projectUrl,
+        limit: 1,
+      }),
+    ).rejects.toThrow("Conversation current-9 did not become active after attach_thread");
+    dateNow.mockRestore();
   });
 
   test("attach_thread fails when the requested conversation never becomes active", async () => {

@@ -2,9 +2,60 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import readline from "node:readline";
 import { __test__, runSupervisorBrokerRequest } from "../../src/cli/supervisorBroker.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { sessionStore } from "../../src/sessionStore.js";
+
+const SUPERVISOR_BROKER_ENTRY = path.join(process.cwd(), "bin", "oracle-supervisor-broker.ts");
+
+async function waitForBrokerOutputLine(
+  output: readline.Interface,
+  timeoutMs: number,
+): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting ${timeoutMs}ms for broker output.`));
+    }, timeoutMs);
+    const onLine = (line: string) => {
+      cleanup();
+      resolve(line);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("Broker stdout closed before emitting a response line."));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      output.off("line", onLine);
+      output.off("close", onClose);
+    };
+    output.on("line", onLine);
+    output.on("close", onClose);
+  });
+}
+
+async function waitForChildExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`Timed out waiting ${timeoutMs}ms for child process exit.`));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+}
 
 describe("runSupervisorBrokerRequest", () => {
   test("defaults to run_prompt operation for legacy requests", async () => {
@@ -924,6 +975,51 @@ describe("runSupervisorBrokerRequest", () => {
       await rm(oracleHome, { recursive: true, force: true });
     }
   });
+
+  test("exits cleanly after shutdown request without waiting for stdin EOF", async () => {
+    const broker = spawn(process.execPath, ["--import", "tsx", SUPERVISOR_BROKER_ENTRY], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const brokerOutput = readline.createInterface({
+      input: broker.stdout as NodeJS.ReadableStream,
+      crlfDelay: Infinity,
+    });
+    const stderrChunks: string[] = [];
+    broker.stderr?.on("data", (chunk) => {
+      stderrChunks.push(String(chunk));
+    });
+
+    try {
+      if (!broker.stdin) {
+        throw new Error("Supervisor broker stdin is unavailable.");
+      }
+
+      broker.stdin.write(
+        `${JSON.stringify({
+          operation: "attach_thread",
+          prompt: "",
+          sessionSlug: "broker-shutdown-regression",
+        })}\n`,
+      );
+      const validationLine = await waitForBrokerOutputLine(brokerOutput, 5000);
+      const validationResponse = JSON.parse(validationLine) as { ok: boolean; error?: string };
+      expect(validationResponse.ok).toBe(false);
+      expect(validationResponse.error).toContain("conversationId");
+
+      const exitPromise = waitForChildExit(broker, 5000);
+      broker.stdin.write(`${JSON.stringify({ shutdown: true })}\n`);
+
+      const { code, signal } = await exitPromise;
+      expect(code).toBe(0);
+      expect(signal).toBeNull();
+      expect(stderrChunks.join("").trim()).toBe("");
+    } finally {
+      brokerOutput.close();
+      if (!broker.killed && broker.exitCode === null) {
+        broker.kill("SIGKILL");
+      }
+    }
+  }, 15_000);
 
   test("filterSupervisorThreadsForBrokerProjectScope drops in-scope guesses that lack a URL", () => {
     expect(

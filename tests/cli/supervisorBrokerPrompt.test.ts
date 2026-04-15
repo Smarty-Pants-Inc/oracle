@@ -1126,6 +1126,76 @@ describe("supervisor prompt completion", () => {
     }
   });
 
+  test("waits briefly for the run promise to settle after the session completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const readSession = vi
+        .fn()
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValue({ status: "completed", response: { incompleteReason: null } });
+      const readOutput = vi.fn().mockResolvedValue("settled output");
+      const pending = __test__.waitForSupervisorPromptRunOutcome({
+        sessionId: "sess-grace",
+        outputPath: "/tmp/out.md",
+        run: new Promise<void>((resolve) => {
+          setTimeout(resolve, 1_400);
+        }),
+        readSession,
+        readOutput,
+        pollIntervalMs: 1_000,
+        runSettleGraceMs: 1_000,
+      });
+
+      let resolved = false;
+      void pending.then(() => {
+        resolved = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(resolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(400);
+
+      await expect(pending).resolves.toEqual({ kind: "run-finished" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("returns run-still-pending once the run-settle grace expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const readSession = vi
+        .fn()
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValue({ status: "completed", response: { incompleteReason: null } });
+      const readOutput = vi.fn().mockResolvedValue("completed output");
+      const pending = __test__.waitForSupervisorPromptRunOutcome({
+        sessionId: "sess-grace-timeout",
+        outputPath: "/tmp/out.md",
+        run: new Promise<void>(() => {}),
+        readSession,
+        readOutput,
+        pollIntervalMs: 1_000,
+        runSettleGraceMs: 500,
+      });
+
+      await vi.advanceTimersByTimeAsync(1_600);
+
+      await expect(pending).resolves.toEqual({
+        kind: "run-still-pending",
+        snapshot: {
+          sessionStatus: "completed",
+          incompleteReason: null,
+          output: "completed output",
+        },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("returns session-completed once the session finishes even if the output is empty", async () => {
     vi.useFakeTimers();
     try {

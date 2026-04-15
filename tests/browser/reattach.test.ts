@@ -106,7 +106,7 @@ describe("resumeBrowserSession", () => {
     expect(captureAssistantMarkdown).toHaveBeenCalled();
   });
 
-  test("reopens the cached conversation from the project shell via sidebar recovery", async () => {
+  test("reopens the cached conversation from the project shell via direct navigation before sidebar recovery", async () => {
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
@@ -178,7 +178,7 @@ describe("resumeBrowserSession", () => {
       evaluate.mock.calls.some((call) =>
         String(call[0]?.expression ?? "").includes("const conversationId ="),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test("jumps straight to the stored oracle conversation when reattach starts on the wrong project thread", async () => {
@@ -205,7 +205,8 @@ describe("resumeBrowserSession", () => {
       }
       const navigateMatch = expression.match(/^window\.location\.href = ("[^"]+")$/);
       if (navigateMatch) {
-        currentHref = JSON.parse(navigateMatch[1] ?? '""');
+        const requestedHref = JSON.parse(navigateMatch[1] ?? '""');
+        currentHref = requestedHref;
         return { result: { value: true } };
       }
       if (isTurnCountProbe(expression)) {
@@ -315,7 +316,7 @@ describe("resumeBrowserSession", () => {
     expect(currentHref).toBe(expectedUrl);
   }, 10_000);
 
-  test("reopens a project-scoped conversation from conversationId alone via the project shell", async () => {
+  test("reopens a project-scoped conversation from conversationId alone via direct navigation before the project shell", async () => {
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
@@ -392,14 +393,14 @@ describe("resumeBrowserSession", () => {
       evaluate.mock.calls.some((call) =>
         String(call[0]?.expression ?? "").includes("const conversationId ="),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       evaluate.mock.calls.some((call) =>
         String(call[0]?.expression ?? "").includes(
           `window.location.href = ${JSON.stringify(expectedUrl)}`,
         ),
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   test("falls back to sidebar recovery when direct navigation lands outside the configured project scope", async () => {
@@ -429,7 +430,8 @@ describe("resumeBrowserSession", () => {
       }
       const navigateMatch = expression.match(/^window\.location\.href = ("[^"]+")$/);
       if (navigateMatch) {
-        currentHref = JSON.parse(navigateMatch[1] ?? '""');
+        const requestedHref = JSON.parse(navigateMatch[1] ?? '""');
+        currentHref = requestedHref === expectedUrl ? rootConversationUrl : requestedHref;
         return { result: { value: true } };
       }
       if (expression.includes('const conversationId = "abc"')) {
@@ -1529,7 +1531,7 @@ describe("resumeBrowserSession", () => {
     ).toBe(false);
   }, 10_000);
 
-  test("project-scoped followups reopen the project shell and use the sidebar instead of direct conversation navigation", async () => {
+  test("project-scoped followups prefer direct conversation navigation before sidebar recovery", async () => {
     const projectUrl = "https://chatgpt.com/g/g-p-example/project";
     const conversationUrl = `${projectUrl}/c/right-thread`;
     const runtime = {
@@ -1552,6 +1554,11 @@ describe("resumeBrowserSession", () => {
       }
       if (expression === "1+1") {
         return { result: { value: 2 } };
+      }
+      const navigateMatch = expression.match(/^window\.location\.href = ("[^"]+")$/);
+      if (navigateMatch) {
+        currentHref = JSON.parse(navigateMatch[1] ?? '""');
+        return { result: { value: true } };
       }
       if (
         expression.includes("const conversationId =") &&
@@ -1609,14 +1616,14 @@ describe("resumeBrowserSession", () => {
       evaluate.mock.calls.some((call) =>
         String(call[0]?.expression ?? "").includes("const conversationId ="),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       evaluate.mock.calls.some((call) =>
         String(call[0]?.expression ?? "").includes(
           `window.location.href = ${JSON.stringify(conversationUrl)}`,
         ),
       ),
-    ).toBe(false);
+    ).toBe(true);
   }, 10_000);
 
   test("falls back to recovery when existing chrome attach fails", async () => {

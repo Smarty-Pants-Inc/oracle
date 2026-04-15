@@ -7,6 +7,7 @@ import type { SessionMetadata } from "../../src/sessionStore.js";
 const HIDDEN_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
 const SUPERVISOR_PROJECT_URL = "https://chatgpt.com/g/team-space/project";
 const SUPERVISOR_CONVERSATION_ROOT = "https://chatgpt.com/g/team-space";
+const SUPERVISOR_ORACLE_CONVERSATION_ROOT = "https://chatgpt.com/g/team-space-oracle";
 
 function runtimeSession(
   id: string,
@@ -171,6 +172,99 @@ describe("supervisorBrokerRuntime", () => {
     ]);
 
     expect(picked?.id).toBe("completed-newer");
+  });
+
+  test("prefers an unbound hidden runtime over a newer bound supervisor thread session", () => {
+    const picked = __test__.pickReusableRuntimeCandidate([
+      runtimeSession("root-runtime", "completed", "2026-03-31T10:00:00.000Z"),
+      {
+        ...runtimeSession("bound-thread-session", "completed", "2026-03-31T10:05:00.000Z"),
+        supervisorThread: {
+          conversationId: "bound-thread",
+          url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/bound-thread`,
+          projectUrl: SUPERVISOR_PROJECT_URL,
+          verifiedAt: "2026-03-31T10:05:00.000Z",
+        },
+      },
+    ]);
+
+    expect(picked?.id).toBe("root-runtime");
+  });
+
+  test("infers the canonical project scope from project conversation urls", () => {
+    expect(
+      __test__.inferSupervisorRuntimeScopeUrl({
+        tabUrl: "https://chatgpt.com/g/team-space/c/expected",
+        conversationId: "expected",
+      }),
+    ).toBe(SUPERVISOR_PROJECT_URL);
+    expect(
+      __test__.inferSupervisorRuntimeScopeUrl({
+        tabUrl: "https://chatgpt.com/g/team-space-oracle/c/expected",
+        conversationId: "expected",
+      }),
+    ).toBe(SUPERVISOR_PROJECT_URL);
+  });
+
+  test("prefers the project shell recovery target for -oracle conversation runtimes", () => {
+    const picked = __test__.pickSafeSupervisorRecoveryTarget(
+      [
+        { targetId: "project-shell", type: "page", url: SUPERVISOR_PROJECT_URL },
+        {
+          targetId: "other-thread",
+          type: "page",
+          url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-thread`,
+        },
+      ],
+      {
+        chromePort: 9222,
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      },
+    );
+
+    expect(picked?.targetId).toBe("project-shell");
+  });
+
+  test("accepts a reachable runtime when only the unique project shell target remains", async () => {
+    const probe = vi.fn().mockResolvedValue({ ok: true });
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "project-shell",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+    ]);
+
+    const picked = await __test__.pickReachableRuntimeCandidate(
+      [
+        {
+          ...runtimeSession("shell-recoverable", "completed", "2026-03-31T10:05:00.000Z"),
+          browser: {
+            runtime: {
+              chromeHost: "127.0.0.1",
+              chromePort: 9222,
+              tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/shell-recoverable`,
+              conversationId: "shell-recoverable",
+            },
+            config: {
+              manualLogin: true,
+              keepBrowser: true,
+              hideWindow: true,
+              attachRunning: false,
+              launcher: "chrome",
+              manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+              chatgptUrl: SUPERVISOR_PROJECT_URL,
+            },
+          },
+        },
+      ],
+      probe,
+      listTargets,
+    );
+
+    expect(picked?.id).toBe("shell-recoverable");
+    expect(listTargets).toHaveBeenCalledTimes(1);
   });
 
   test("skips an unreachable preferred hidden runtime and falls back to the next reachable hidden candidate", async () => {
@@ -545,6 +639,121 @@ describe("supervisorBrokerRuntime", () => {
 
     expect(context.runtime.chromePid).toBeUndefined();
     expect(context.runtime.chromePort).toBe(9222);
+  });
+
+  test("resolveSupervisorRuntimeContext returns the unbound ancestor session id for a hinted bound thread session", async () => {
+    vi.resetModules();
+    const parentMeta = {
+      ...runtimeSession("owned-root", "completed", "2026-03-31T10:00:00.000Z"),
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromePid: 4242,
+          tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/owned-root`,
+          conversationId: "owned-root",
+        },
+        config: {
+          manualLogin: true,
+          keepBrowser: true,
+          hideWindow: true,
+          attachRunning: false,
+          launcher: "chrome",
+          manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+          chatgptUrl: SUPERVISOR_PROJECT_URL,
+        },
+      },
+    } satisfies SessionMetadata;
+    const boundThreadMeta = {
+      ...runtimeSession("owned-thread", "completed", "2026-03-31T10:05:00.000Z"),
+      options: {
+        model: "gpt-5.4-pro",
+        followupSessionId: "owned-root",
+      },
+      supervisorThread: {
+        conversationId: "owned-thread",
+        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/owned-thread`,
+        projectUrl: SUPERVISOR_PROJECT_URL,
+        verifiedAt: "2026-03-31T10:05:00.000Z",
+      },
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromePid: 4242,
+          tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/owned-thread`,
+          conversationId: "owned-thread",
+        },
+        config: {
+          manualLogin: true,
+          keepBrowser: true,
+          hideWindow: true,
+          attachRunning: false,
+          launcher: "chrome",
+          manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+          chatgptUrl: SUPERVISOR_PROJECT_URL,
+        },
+      },
+    } satisfies SessionMetadata;
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        readSession: vi.fn(async (id: string) => {
+          if (id === "owned-thread") {
+            return boundThreadMeta;
+          }
+          if (id === "owned-root") {
+            return parentMeta;
+          }
+          return null;
+        }),
+        listSessions: vi.fn(),
+      },
+    }));
+    vi.doMock("../../src/browser/profileState.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
+        "../../src/browser/profileState.js",
+      );
+      return {
+        ...actual,
+        readChromePid: vi.fn(async () => null),
+        chromePidMatchesUserDataDir: vi.fn(async () => false),
+        resolveChromePidForUserDataDir: vi.fn(async () => null),
+      };
+    });
+    vi.doMock("../../src/browser/detect.js", () => ({
+      readDevToolsActivePortInfo: vi.fn(async () => ({
+        port: 9222,
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/owned-thread",
+      })),
+    }));
+
+    const { resolveSupervisorRuntimeContext } =
+      await import("../../src/cli/supervisorBrokerRuntime.js");
+    const context = await resolveSupervisorRuntimeContext("owned-thread");
+
+    expect(context.sessionId).toBe("owned-root");
+    expect(context.runtime.conversationId).toBe("owned-thread");
+  });
+
+  test("resolveMutableSupervisorRuntimeAnchorSessionId fails closed when a bound thread session has no reusable parent runtime", async () => {
+    await expect(
+      __test__.resolveMutableSupervisorRuntimeAnchorSessionId(
+        {
+          ...runtimeSession("owned-thread", "completed", "2026-03-31T10:05:00.000Z"),
+          options: {
+            model: "gpt-5.4-pro",
+            followupSessionId: "missing-parent",
+          },
+          supervisorThread: {
+            conversationId: "owned-thread",
+            url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/owned-thread`,
+            projectUrl: SUPERVISOR_PROJECT_URL,
+            verifiedAt: "2026-03-31T10:05:00.000Z",
+          },
+        },
+        vi.fn(async () => null),
+      ),
+    ).rejects.toThrow(/parent session missing-parent was not found/i);
   });
 
   test("resolveSupervisorRuntimeContext rejects a hinted hidden runtime outside the configured project scope", async () => {
@@ -973,11 +1182,194 @@ describe("supervisorBrokerRuntime", () => {
     expect(freshConnection.close).toHaveBeenCalledTimes(1);
   });
 
+  test("browser websocket runtimes can recover via the unique project shell target from stale -oracle metadata", async () => {
+    vi.resetModules();
+    const staleConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "stale-target",
+              type: "page",
+              url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-thread`,
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "stale-target",
+    };
+    const freshConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "project-shell",
+              type: "page",
+              url: SUPERVISOR_PROJECT_URL,
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "project-shell",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockResolvedValueOnce(staleConnection)
+      .mockResolvedValueOnce(freshConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      {
+        targetId: "project-shell",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    const result = await connectSupervisorRuntime({
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      chromeTargetId: "stale-target",
+      tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+      conversationId: "expected",
+    });
+
+    expect(staleConnection.close).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+    expect(connectToRemoteChromeTarget).toHaveBeenNthCalledWith(
+      2,
+      "127.0.0.1",
+      9222,
+      expect.any(Function),
+      expect.objectContaining({
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetId: "project-shell",
+      }),
+    );
+    expect(result.targetId).toBe("project-shell");
+    await result.close();
+    expect(freshConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket runtimes fail closed when only other conversation tabs remain in project scope", async () => {
+    vi.resetModules();
+    const connectToRemoteChromeTarget = vi.fn().mockRejectedValueOnce(new Error("Target closed"));
+    const listRemoteChromeTargets = vi.fn(async () => [
+      {
+        targetId: "other-a",
+        type: "page",
+        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-a`,
+      },
+      {
+        targetId: "other-b",
+        type: "page",
+        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-b`,
+      },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await expect(
+      connectSupervisorRuntime({
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeTargetId: "missing-target",
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      }),
+    ).rejects.toThrow(
+      /Unable to locate the existing Oracle browser tab|Unable to safely locate a reusable Oracle browser tab/i,
+    );
+
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket recovery re-verifies the selected target before returning the runtime", async () => {
+    vi.resetModules();
+    const fallbackConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "unexpected-target",
+              type: "page",
+              url: "https://chatgpt.com/c/unexpected",
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "expected-target",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Target closed"))
+      .mockResolvedValueOnce(fallbackConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      {
+        targetId: "expected-target",
+        type: "page",
+        url: "https://chatgpt.com/c/expected",
+      },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await expect(
+      connectSupervisorRuntime({
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeTargetId: "stale-target",
+        tabUrl: "https://chatgpt.com/c/expected",
+        conversationId: "expected",
+      }),
+    ).rejects.toThrow(/selected Oracle runtime target/i);
+
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(2);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+    expect(fallbackConnection.close).toHaveBeenCalledTimes(1);
+  });
+
   test("browser websocket runtimes fall back to host:port discovery when the cached browser websocket endpoint is stale", async () => {
     vi.resetModules();
     const cdpClient = {
       Runtime: { enable: vi.fn(async () => ({})) },
       DOM: { enable: vi.fn(async () => ({})) },
+      Target: {
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: {
+            targetId: "expected-target",
+            type: "page",
+            url: "https://chatgpt.com/c/expected",
+          },
+        })),
+      },
       close: vi.fn(async () => {}),
     };
     const CDP = vi.fn(async () => cdpClient);

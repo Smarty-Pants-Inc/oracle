@@ -40,6 +40,7 @@ export interface SupervisorBrokerRequest extends SupervisorPromptRequest {
   operation?: SupervisorBrokerOperation;
   action?: SupervisorBrokerOperation;
   conversationId?: string;
+  threadUrl?: string;
   historyLimit?: number;
   shutdown?: boolean;
 }
@@ -453,6 +454,7 @@ export async function runSupervisorBrokerRequest(
         )(request);
       case "attach_thread": {
         const conversationId = request.conversationId?.trim();
+        const threadUrl = request.threadUrl?.trim() || undefined;
         if (!conversationId) {
           return {
             ok: false,
@@ -466,6 +468,7 @@ export async function runSupervisorBrokerRequest(
               const meta = await sessionStore.readSession(sessionId);
               const thread = await attachSupervisorThread(Runtime, conversationId, {
                 projectUrl: configuredSupervisorProjectUrl(meta),
+                threadUrl,
               });
               assertRequestedConversationIdentity("attach_thread", conversationId, thread);
               const threadSessionId = await ensureSupervisorThreadSession(
@@ -528,24 +531,34 @@ export async function runSupervisorBrokerRequest(
 
 export async function startSupervisorBroker(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const line of rl) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
+  const stopInput = () => {
+    rl.close();
+    process.stdin.pause();
+    process.stdin.unref?.();
+  };
+  try {
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      let request: SupervisorBrokerRequest;
+      try {
+        request = JSON.parse(trimmed) as SupervisorBrokerRequest;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stdout.write(`${JSON.stringify({ ok: false, error: message })}\n`);
+        continue;
+      }
+      if (request.shutdown) {
+        stopInput();
+        return;
+      }
+      const response = await runSupervisorBrokerRequest(request);
+      process.stdout.write(`${JSON.stringify(response)}\n`);
     }
-    let request: SupervisorBrokerRequest;
-    try {
-      request = JSON.parse(trimmed) as SupervisorBrokerRequest;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stdout.write(`${JSON.stringify({ ok: false, error: message })}\n`);
-      continue;
-    }
-    if (request.shutdown) {
-      break;
-    }
-    const response = await runSupervisorBrokerRequest(request);
-    process.stdout.write(`${JSON.stringify(response)}\n`);
+  } finally {
+    stopInput();
   }
 }
 

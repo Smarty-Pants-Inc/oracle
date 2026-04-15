@@ -13,6 +13,7 @@ import {
   normalizeSupervisorThread,
   type SupervisorThreadInfo,
 } from "./supervisorThreadNormalize.js";
+import { buildThreadIntrospectionHelpers } from "./threadIntrospection.js";
 
 export type { SupervisorThreadInfo };
 
@@ -39,6 +40,33 @@ interface SupervisorThreadHistorySnapshot {
   thread: SupervisorThreadInfo;
   history: SupervisorThreadHistoryEntry[];
   historyWindow: SupervisorThreadHistoryWindow;
+}
+
+function normalizeNonNegativeInteger(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(numeric));
+}
+
+async function readVisibleSupervisorTurnCount(Runtime: ChromeClient["Runtime"]): Promise<number> {
+  try {
+    const response = await Runtime.evaluate({
+      expression: `(() => {
+        ${buildThreadIntrospectionHelpers()}
+        return __oracleCollectThreadEntries(__oraclePickThreadRoot()).filter(
+          (entry) =>
+            (entry.role === 'user' || entry.role === 'assistant') &&
+            String(entry.text || '').trim().length > 0,
+        ).length;
+      })()`,
+      returnByValue: true,
+    });
+    return normalizeNonNegativeInteger(response?.result?.value);
+  } catch {
+    return 0;
+  }
 }
 
 export async function readCurrentSupervisorThread(
@@ -571,9 +599,11 @@ export async function readAttachedSupervisorThreadHistory(
     throw new Error("conversationId is required for thread_history.");
   }
   let thread = await readCurrentSupervisorThread(Runtime);
+  const visibleTurnCount = await readVisibleSupervisorTurnCount(Runtime);
   if (
     thread.conversationId !== expectedConversationId ||
-    !supervisorThreadMatchesProjectScope(thread, options.projectUrl)
+    !supervisorThreadMatchesProjectScope(thread, options.projectUrl) ||
+    visibleTurnCount === 0
   ) {
     thread = await attachSupervisorThread(Runtime, expectedConversationId, {
       projectUrl: options.projectUrl,
@@ -616,9 +646,10 @@ export async function readAttachedSupervisorThreadHistory(
 export async function attachSupervisorThread(
   Runtime: ChromeClient["Runtime"],
   conversationId: string,
-  options?: { projectUrl?: string },
+  options?: { projectUrl?: string; threadUrl?: string },
 ): Promise<SupervisorThreadInfo> {
   const normalizedId = conversationId.trim();
+  const normalizedThreadUrl = options?.threadUrl?.trim() || undefined;
   if (!normalizedId) {
     throw new Error("conversationId is required for attach_thread.");
   }
@@ -626,18 +657,32 @@ export async function attachSupervisorThread(
   const current = await readCurrentSupervisorThread(Runtime);
   if (
     current.conversationId === normalizedId &&
-    supervisorThreadMatchesProjectScope(current, options?.projectUrl)
+    (!normalizedThreadUrl ||
+      normalizeProjectUrl(current.url) === normalizeProjectUrl(normalizedThreadUrl)) &&
+    supervisorThreadMatchesProjectScope(current, options?.projectUrl) &&
+    (await readVisibleSupervisorTurnCount(Runtime)) > 0
   ) {
     return current;
   }
 
-  const opened = await openConversationFromSidebarWithRetry(
-    Runtime,
-    { conversationId: normalizedId, preferProjects: true },
-    15_000,
-  );
-  if (!opened) {
-    throw new Error(`Unable to find conversation ${normalizedId} in sidebar.`);
+  if (normalizedThreadUrl) {
+    await Runtime.evaluate({
+      expression: `(() => {
+        window.location.assign(${JSON.stringify(normalizedThreadUrl)});
+        return true;
+      })()`,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+  } else {
+    const opened = await openConversationFromSidebarWithRetry(
+      Runtime,
+      { conversationId: normalizedId, preferProjects: true },
+      15_000,
+    );
+    if (!opened) {
+      throw new Error(`Unable to find conversation ${normalizedId} in sidebar.`);
+    }
   }
 
   const start = Date.now();
@@ -647,7 +692,8 @@ export async function attachSupervisorThread(
     lastSeen = await readCurrentSupervisorThread(Runtime);
     if (
       lastSeen.conversationId === normalizedId &&
-      supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl)
+      supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl) &&
+      (await readVisibleSupervisorTurnCount(Runtime)) > 0
     ) {
       return lastSeen;
     }

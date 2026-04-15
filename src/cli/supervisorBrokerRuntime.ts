@@ -16,6 +16,8 @@ import {
 import { readDevToolsActivePortInfo } from "../browser/detect.js";
 import {
   conversationHrefMatchesConfiguredScope,
+  extractConversationIdFromUrl,
+  isAttachableChatTarget,
   pickTarget,
   runtimeHasReusableIdentity,
   runtimeRequiresSpecificTarget,
@@ -87,6 +89,10 @@ function runtimeReusePriority(meta: SessionMetadata): number {
 
 function supervisorRuntimePreference(meta: SessionMetadata): number {
   return isOwnedSupervisorRuntime(meta) ? 1 : 0;
+}
+
+function supervisorRuntimeBindingPreference(meta: SessionMetadata): number {
+  return meta.supervisorThread?.conversationId?.trim() ? 0 : 1;
 }
 
 function hasReusableRuntime(meta: SessionMetadata): meta is SessionMetadata & {
@@ -161,6 +167,7 @@ function sortReusableRuntimeCandidates(
     .sort(
       (left, right) =>
         supervisorRuntimePreference(right) - supervisorRuntimePreference(left) ||
+        supervisorRuntimeBindingPreference(right) - supervisorRuntimeBindingPreference(left) ||
         runtimeReusePriority(right) - runtimeReusePriority(left) ||
         parseSessionTimestamp(right) - parseSessionTimestamp(left),
     );
@@ -170,6 +177,52 @@ function pickReusableRuntimeCandidate(
   metas: SessionMetadata[],
 ): (SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } }) | undefined {
   return sortReusableRuntimeCandidates(metas)[0];
+}
+
+async function resolveMutableSupervisorRuntimeAnchorSessionId(
+  meta: SessionMetadata,
+  readSession: typeof sessionStore.readSession = sessionStore.readSession.bind(sessionStore),
+): Promise<string> {
+  let current = meta;
+  const visited = new Set<string>();
+  while (current.supervisorThread?.conversationId?.trim()) {
+    const currentId = current.id?.trim();
+    if (!currentId) {
+      throw new Error(
+        "Supervisor runtime anchor resolution encountered a bound session without an id.",
+      );
+    }
+    if (visited.has(currentId)) {
+      throw new Error(
+        `Supervisor runtime anchor resolution detected a followup cycle at session ${currentId}.`,
+      );
+    }
+    visited.add(currentId);
+    const parentSessionId = current.options?.followupSessionId?.trim();
+    if (!parentSessionId) {
+      throw new Error(
+        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but has no reusable parent runtime session.`,
+      );
+    }
+    const parent = await readSession(parentSessionId);
+    if (!parent) {
+      throw new Error(
+        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} was not found.`,
+      );
+    }
+    if (!hasReusableRuntime(parent) || !isOwnedSupervisorRuntime(parent)) {
+      throw new Error(
+        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} is not a reusable Oracle-owned hidden runtime.`,
+      );
+    }
+    if (!supervisorRuntimeIsReusableNow(parent)) {
+      throw new Error(
+        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} is not reusable yet.`,
+      );
+    }
+    current = parent;
+  }
+  return current.id;
 }
 
 async function refreshOwnedSupervisorRuntime(
@@ -262,6 +315,13 @@ function resolvePort(runtime: BrowserRuntimeMetadata): number | null {
   }
 }
 
+function browserWSEndpointLooksStale(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Unexpected server response:\s*404|ECONNREFUSED|ECONNRESET|socket hang up|missing browser websocket endpoint/i.test(
+    message,
+  );
+}
+
 function pickSupervisorRuntimeTarget(
   targets: TargetInfoLite[],
   runtime: BrowserRuntimeMetadata,
@@ -269,6 +329,85 @@ function pickSupervisorRuntimeTarget(
 ): TargetInfoLite | undefined {
   const requireMatch = strictTargetMatch || runtimeRequiresSpecificTarget(runtime);
   return pickTarget(targets, runtime, { requireMatch });
+}
+
+function normalizeComparableUrl(url: string | undefined): string | null {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    parsed.search = "";
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return parsed.toString();
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+function inferSupervisorRuntimeScopeUrl(runtime: BrowserRuntimeMetadata): string | undefined {
+  const tabUrl = runtime.tabUrl?.trim();
+  if (!tabUrl) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(tabUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const projectShellPath = pathname.match(/^(\/g\/[^/]+\/project)$/i)?.[1];
+    if (projectShellPath) {
+      return `${parsed.origin}${projectShellPath}`;
+    }
+    const projectConversationSlug = pathname.match(
+      /^\/g\/([^/]+?)(?:-oracle)?(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i,
+    )?.[1];
+    if (projectConversationSlug) {
+      return `${parsed.origin}/g/${projectConversationSlug}/project`;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function pickSafeSupervisorRecoveryTarget(
+  targets: TargetInfoLite[],
+  runtime: BrowserRuntimeMetadata,
+): TargetInfoLite | undefined {
+  const scopeUrl = inferSupervisorRuntimeScopeUrl(runtime);
+  if (!scopeUrl) {
+    return undefined;
+  }
+  const scopeTargets = targets.filter(
+    (target) =>
+      isAttachableChatTarget(target) &&
+      Boolean(target.url) &&
+      conversationHrefMatchesConfiguredScope(target.url ?? "", scopeUrl),
+  );
+  if (scopeTargets.length === 0) {
+    return undefined;
+  }
+  const normalizedScopeUrl = normalizeComparableUrl(scopeUrl);
+  const pageTargets = scopeTargets.filter((target) => target.type === "page");
+  const scopeShellPages = pageTargets.filter(
+    (target) => normalizeComparableUrl(target.url) === normalizedScopeUrl,
+  );
+  if (scopeShellPages.length === 1) {
+    return scopeShellPages[0];
+  }
+  return undefined;
+}
+
+function pickConnectableSupervisorRuntimeTarget(
+  targets: TargetInfoLite[],
+  runtime: BrowserRuntimeMetadata,
+  strictTargetMatch: boolean,
+): TargetInfoLite | undefined {
+  return (
+    pickSupervisorRuntimeTarget(targets, runtime, strictTargetMatch) ??
+    pickSafeSupervisorRecoveryTarget(targets, runtime)
+  );
 }
 
 async function readConnectedTargetInfo(
@@ -300,7 +439,32 @@ function connectedSupervisorTargetMatches(
   runtime: BrowserRuntimeMetadata,
   target: TargetInfoLite,
 ): boolean {
+  const runtimeConversationId = runtime.conversationId?.trim();
+  const targetConversationId = extractConversationIdFromUrl(target.url ?? "")?.trim();
+  if (
+    runtimeConversationId &&
+    targetConversationId &&
+    targetConversationId !== runtimeConversationId
+  ) {
+    return false;
+  }
   return Boolean(pickSupervisorRuntimeTarget([target], runtime, true));
+}
+
+function connectedTargetMatchesExpectedTarget(
+  expected: TargetInfoLite,
+  actual: TargetInfoLite,
+): boolean {
+  if (
+    expected.targetId?.trim() &&
+    actual.targetId?.trim() &&
+    expected.targetId !== actual.targetId
+  ) {
+    return false;
+  }
+  const expectedUrl = normalizeComparableUrl(expected.url);
+  const actualUrl = normalizeComparableUrl(actual.url);
+  return !expectedUrl || !actualUrl || expectedUrl === actualUrl;
 }
 
 async function pickReachableRuntimeCandidate(
@@ -330,7 +494,7 @@ async function pickReachableRuntimeCandidate(
           browserWSEndpoint: candidate.browser.runtime.chromeBrowserWSEndpoint ?? undefined,
         })) as TargetInfoLite[];
         if (
-          pickSupervisorRuntimeTarget(
+          pickConnectableSupervisorRuntimeTarget(
             targets,
             candidate.browser.runtime,
             Boolean(candidate.browser.runtime.chromeBrowserWSEndpoint),
@@ -366,8 +530,9 @@ export async function resolveSupervisorRuntimeContext(
     if (!supervisorRuntimeIsReusableNow(meta)) {
       throw new Error(`Browser runtime session ${hinted} is not reusable yet.`);
     }
+    const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(meta);
     return {
-      sessionId: meta.id,
+      sessionId,
       runtime: await refreshOwnedSupervisorRuntime(meta),
     };
   }
@@ -379,8 +544,9 @@ export async function resolveSupervisorRuntimeContext(
       "No reachable Oracle-owned hidden browser runtime session was found. Run one Oracle browser turn first.",
     );
   }
+  const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(latest);
   return {
-    sessionId: latest.id,
+    sessionId,
     runtime: await refreshOwnedSupervisorRuntime(latest),
   };
 }
@@ -410,8 +576,10 @@ export async function connectSupervisorRuntime(
         targetId: runtime.chromeTargetId,
         closeTargetOnDispose: false,
       });
-    } catch {
-      browserWSEndpoint = undefined;
+    } catch (error) {
+      if (browserWSEndpointLooksStale(error)) {
+        browserWSEndpoint = undefined;
+      }
     }
     if (cachedConnection) {
       try {
@@ -481,7 +649,7 @@ export async function connectSupervisorRuntime(
     throw new Error("Unable to list reusable Oracle browser targets for the cached runtime.");
   }
   const strictTargetMatch = Boolean(browserWSEndpoint);
-  const target = pickSupervisorRuntimeTarget(targets, runtime, strictTargetMatch);
+  const target = pickConnectableSupervisorRuntimeTarget(targets, runtime, strictTargetMatch);
 
   if (!target) {
     throw new Error(
@@ -505,7 +673,45 @@ export async function connectSupervisorRuntime(
       targetId: target?.targetId,
       closeTargetOnDispose: false,
     });
-    const { client } = connection;
+    try {
+      const { client } = connection;
+      const connectedTarget = await readConnectedTargetInfo(client, target, {
+        requireVerification: true,
+      });
+      if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
+        throw new Error("connected target no longer matches the selected Oracle runtime target");
+      }
+      if (client.Runtime?.enable) {
+        await client.Runtime.enable();
+      }
+      if (client.DOM?.enable) {
+        await client.DOM.enable();
+      }
+      return {
+        client,
+        close: connection.close,
+        host,
+        port,
+        targetId: connectedTarget.targetId ?? target?.targetId,
+      };
+    } catch (error) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  const client = (await CDP({
+    host,
+    port,
+    target: target?.targetId,
+  })) as unknown as ChromeClient;
+  try {
+    const connectedTarget = await readConnectedTargetInfo(client, target, {
+      requireVerification: true,
+    });
+    if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
+      throw new Error("connected target no longer matches the selected Oracle runtime target");
+    }
     if (client.Runtime?.enable) {
       await client.Runtime.enable();
     }
@@ -514,41 +720,30 @@ export async function connectSupervisorRuntime(
     }
     return {
       client,
-      close: connection.close,
+      close: async () => closeClient(client),
       host,
       port,
-      targetId: target?.targetId,
+      targetId: connectedTarget.targetId ?? target?.targetId,
     };
+  } catch (error) {
+    await closeClient(client);
+    throw error;
   }
-
-  const client = (await CDP({
-    host,
-    port,
-    target: target?.targetId,
-  })) as unknown as ChromeClient;
-  if (client.Runtime?.enable) {
-    await client.Runtime.enable();
-  }
-  if (client.DOM?.enable) {
-    await client.DOM.enable();
-  }
-  return {
-    client,
-    close: async () => closeClient(client),
-    host,
-    port,
-    targetId: target?.targetId,
-  };
 }
 
 export const __test__ = {
   isOwnedSupervisorRuntime,
+  inferSupervisorRuntimeScopeUrl,
+  pickConnectableSupervisorRuntimeTarget,
   processIsAlive,
   pickSupervisorRuntimeTarget,
   pickReachableRuntimeCandidate,
   pickReusableRuntimeCandidate,
+  pickSafeSupervisorRecoveryTarget,
   refreshOwnedSupervisorRuntime,
+  resolveMutableSupervisorRuntimeAnchorSessionId,
   runtimeControllerIsAlive,
   sortReusableRuntimeCandidates,
   supervisorRuntimePreference,
+  supervisorRuntimeBindingPreference,
 };

@@ -663,18 +663,7 @@ async function ensureConversationOpenForRuntime(
       }
     }
   }
-  if (projectBaseUrl) {
-    if (href.replace(/\/+$/, "") !== projectBaseUrl) {
-      await withTimeout(
-        Runtime.evaluate({
-          expression: `window.location.href = ${JSON.stringify(projectBaseUrl)}`,
-        }),
-        5_000,
-        "Timed out reopening the configured ChatGPT project shell",
-      ).catch(() => undefined);
-      await waitForExactLocation(Runtime, projectBaseUrl, 15_000).catch(() => undefined);
-    }
-  } else if (conversationUrl) {
+  if (conversationUrl && conversationUrl.includes("/c/")) {
     await withTimeout(
       Runtime.evaluate({
         expression: `window.location.href = ${JSON.stringify(conversationUrl)}`,
@@ -685,6 +674,18 @@ async function ensureConversationOpenForRuntime(
     const matched = await waitForConversationLocation(Runtime, expectedConversationId, 15_000);
     if (matched && (await conversationLocationMatchesConfiguredScope(Runtime, baseUrl))) {
       return;
+    }
+  }
+  if (projectBaseUrl) {
+    if (href.replace(/\/+$/, "") !== projectBaseUrl) {
+      await withTimeout(
+        Runtime.evaluate({
+          expression: `window.location.href = ${JSON.stringify(projectBaseUrl)}`,
+        }),
+        5_000,
+        "Timed out reopening the configured ChatGPT project shell",
+      ).catch(() => undefined);
+      await waitForExactLocation(Runtime, projectBaseUrl, 15_000).catch(() => undefined);
     }
   }
   const opened = await openConversationFromSidebarWithRetry(
