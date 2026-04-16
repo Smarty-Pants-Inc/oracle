@@ -226,6 +226,42 @@ describe("supervisorBrokerRuntime", () => {
     expect(picked?.targetId).toBe("project-shell");
   });
 
+  test("accepts duplicate identical project shell pages as a safe recovery target", () => {
+    const picked = __test__.pickSafeSupervisorRecoveryTarget(
+      [
+        { targetId: "project-shell-1", type: "page", url: SUPERVISOR_PROJECT_URL },
+        { targetId: "project-shell-2", type: "page", url: SUPERVISOR_PROJECT_URL },
+      ],
+      {
+        chromePort: 9222,
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      },
+    );
+
+    expect(picked?.targetId).toBe("project-shell-1");
+  });
+
+  test("treats canonical and slugged project shell pages as equivalent recovery targets", () => {
+    const picked = __test__.pickSafeSupervisorRecoveryTarget(
+      [
+        { targetId: "project-shell-1", type: "page", url: SUPERVISOR_PROJECT_URL },
+        {
+          targetId: "project-shell-2",
+          type: "page",
+          url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/project`,
+        },
+      ],
+      {
+        chromePort: 9222,
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      },
+    );
+
+    expect(picked?.targetId).toBe("project-shell-1");
+  });
+
   test("accepts a reachable runtime when only the unique project shell target remains", async () => {
     const probe = vi.fn().mockResolvedValue({ ok: true });
     const listTargets = vi.fn(async () => [
@@ -264,6 +300,98 @@ describe("supervisorBrokerRuntime", () => {
     );
 
     expect(picked?.id).toBe("shell-recoverable");
+    expect(listTargets).toHaveBeenCalledTimes(1);
+  });
+
+  test("accepts a reachable runtime when only duplicate identical project shell targets remain", async () => {
+    const probe = vi.fn().mockResolvedValue({ ok: true });
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "project-shell-1",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+      {
+        targetId: "project-shell-2",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+    ]);
+
+    const picked = await __test__.pickReachableRuntimeCandidate(
+      [
+        {
+          ...runtimeSession("shell-recoverable-duplicate", "completed", "2026-03-31T10:05:00.000Z"),
+          browser: {
+            runtime: {
+              chromeHost: "127.0.0.1",
+              chromePort: 9222,
+              tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/shell-recoverable-duplicate`,
+              conversationId: "shell-recoverable-duplicate",
+            },
+            config: {
+              manualLogin: true,
+              keepBrowser: true,
+              hideWindow: true,
+              attachRunning: false,
+              launcher: "chrome",
+              manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+              chatgptUrl: SUPERVISOR_PROJECT_URL,
+            },
+          },
+        },
+      ],
+      probe,
+      listTargets,
+    );
+
+    expect(picked?.id).toBe("shell-recoverable-duplicate");
+    expect(listTargets).toHaveBeenCalledTimes(1);
+  });
+
+  test("accepts a reachable runtime when only canonical and slugged project shell targets remain", async () => {
+    const probe = vi.fn().mockResolvedValue({ ok: true });
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "project-shell-1",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+      {
+        targetId: "project-shell-2",
+        type: "page",
+        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/project`,
+      },
+    ]);
+
+    const picked = await __test__.pickReachableRuntimeCandidate(
+      [
+        {
+          ...runtimeSession("shell-recoverable-slugged", "completed", "2026-03-31T10:05:00.000Z"),
+          browser: {
+            runtime: {
+              chromeHost: "127.0.0.1",
+              chromePort: 9222,
+              tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/shell-recoverable-slugged`,
+              conversationId: "shell-recoverable-slugged",
+            },
+            config: {
+              manualLogin: true,
+              keepBrowser: true,
+              hideWindow: true,
+              attachRunning: false,
+              launcher: "chrome",
+              manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+              chatgptUrl: SUPERVISOR_PROJECT_URL,
+            },
+          },
+        },
+      ],
+      probe,
+      listTargets,
+    );
+
+    expect(picked?.id).toBe("shell-recoverable-slugged");
     expect(listTargets).toHaveBeenCalledTimes(1);
   });
 
@@ -1180,6 +1308,71 @@ describe("supervisorBrokerRuntime", () => {
     expect(result.targetId).toBe("expected-target");
     await result.close();
     expect(freshConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket recovery rejects a selected target when Target.getTargetInfo omits the URL", async () => {
+    vi.resetModules();
+    const staleConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "hidden-target-1",
+              type: "page",
+              url: "https://chatgpt.com/c/other",
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "hidden-target-1",
+    };
+    const missingUrlConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "expected-target",
+              type: "page",
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "expected-target",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockResolvedValueOnce(staleConnection)
+      .mockResolvedValueOnce(missingUrlConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      { targetId: "expected-target", type: "page", url: "https://chatgpt.com/c/expected" },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await expect(
+      connectSupervisorRuntime({
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeTargetId: "hidden-target-1",
+        tabUrl: "https://chatgpt.com/c/expected",
+        conversationId: "expected",
+      }),
+    ).rejects.toThrow(/selected Oracle runtime target/i);
+
+    expect(staleConnection.close).toHaveBeenCalledTimes(1);
+    expect(missingUrlConnection.close).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
   });
 
   test("browser websocket runtimes can recover via the unique project shell target from stale -oracle metadata", async () => {

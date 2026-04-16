@@ -15,6 +15,10 @@ import { buildConsultBrowserConfig } from "../mcp/tools/consult.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type { BrowserModelStrategy } from "../browser/types.js";
 import { CHATGPT_URL } from "../browser/constants.js";
+import {
+  conversationHrefMatchesConfiguredScope,
+  extractConversationIdFromUrl,
+} from "../browser/reattachHelpers.js";
 import { isSupervisorScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../remote/client.js";
@@ -35,11 +39,14 @@ const SUPERVISOR_BROWSER_THROTTLE_FILE = path.join(
 );
 const SUPERVISOR_BROWSER_THROTTLE_FILE_ENV = "ORACLE_SUPERVISOR_THROTTLE_FILE";
 const SUPERVISOR_BROWSER_LEASE_OWNER_ID_ENV = "ORACLE_SUPERVISOR_LEASE_OWNER_ID";
+const SUPERVISOR_BROWSER_PRO_MAX_REQUESTS_ENV = "ORACLE_SUPERVISOR_PRO_MAX_REQUESTS_PER_WINDOW";
+const SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS_ENV =
+  "ORACLE_SUPERVISOR_DEFAULT_MAX_REQUESTS_PER_WINDOW";
 const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
 const SUPERVISOR_BROWSER_MIN_GAP_MS = 30_000;
 const SUPERVISOR_BROWSER_WINDOW_MS = 30 * 60_000;
-const SUPERVISOR_BROWSER_PRO_MAX_REQUESTS = 6;
-const SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS = 6;
+const SUPERVISOR_BROWSER_PRO_MAX_REQUESTS = 24;
+const SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS = 24;
 const SUPERVISOR_BROWSER_RATE_LIMIT_COOLDOWN_MS = 10 * 60_000;
 const SUPERVISOR_BROWSER_REUSE_WAIT_MS = 30_000;
 const SUPERVISOR_BROWSER_ASSISTANT_RECHECK_DELAY_MS = 30_000;
@@ -262,6 +269,18 @@ function normalizeSupervisorText(value: string | null | undefined): string | nul
   return trimmed ? trimmed : null;
 }
 
+function normalizeSupervisorUrl(value: string | null | undefined): string | null {
+  const normalized = normalizeSupervisorText(value);
+  if (!normalized) {
+    return null;
+  }
+  try {
+    return normalizeChatgptUrl(normalized, CHATGPT_URL);
+  } catch {
+    return normalized;
+  }
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -368,8 +387,43 @@ function sessionMatchesSupervisorPromptRequest(
     return false;
   }
   if (expectedSupervisorThread) {
-    const candidateConversationId = meta.supervisorThread?.conversationId?.trim();
-    if (candidateConversationId !== expectedSupervisorThread.conversationId) {
+    const candidateBinding = normalizeSupervisorThreadBinding(meta.supervisorThread);
+    if (
+      !candidateBinding ||
+      candidateBinding.conversationId !== expectedSupervisorThread.conversationId
+    ) {
+      return false;
+    }
+    const expectedUrl = normalizeSupervisorUrl(expectedSupervisorThread.url);
+    if (expectedUrl && candidateBinding.url !== expectedUrl) {
+      return false;
+    }
+    const expectedProjectUrl = normalizeSupervisorUrl(expectedSupervisorThread.projectUrl);
+    if (expectedProjectUrl && candidateBinding.projectUrl !== expectedProjectUrl) {
+      return false;
+    }
+    const runtimeConversationId = normalizeSupervisorText(meta.browser?.runtime?.conversationId);
+    if (
+      runtimeConversationId &&
+      runtimeConversationId !== expectedSupervisorThread.conversationId
+    ) {
+      return false;
+    }
+    const runtimeTabUrl = normalizeSupervisorUrl(meta.browser?.runtime?.tabUrl);
+    const runtimeTabConversationId = runtimeTabUrl
+      ? extractConversationIdFromUrl(runtimeTabUrl)?.trim()
+      : undefined;
+    if (
+      runtimeTabConversationId &&
+      runtimeTabConversationId !== expectedSupervisorThread.conversationId
+    ) {
+      return false;
+    }
+    if (
+      expectedProjectUrl &&
+      runtimeTabUrl &&
+      !conversationHrefMatchesConfiguredScope(runtimeTabUrl, expectedProjectUrl)
+    ) {
       return false;
     }
   }
@@ -440,8 +494,8 @@ function normalizeSupervisorThreadBinding(
   }
   return {
     conversationId,
-    url: value?.url?.trim() || undefined,
-    projectUrl: value?.projectUrl?.trim() || undefined,
+    url: normalizeSupervisorUrl(value?.url) ?? undefined,
+    projectUrl: normalizeSupervisorUrl(value?.projectUrl) ?? undefined,
     verifiedAt: value?.verifiedAt?.trim() || new Date(0).toISOString(),
   };
 }
@@ -525,10 +579,25 @@ function supervisorBrowserThrottleProfileKey(config: BrowserSessionConfig): stri
   );
 }
 
+function parsePositiveSupervisorThrottleEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function supervisorBrowserMaxRequestsPerWindow(requestedModel: string): number {
   return requestedModel.toLowerCase().includes("pro")
-    ? SUPERVISOR_BROWSER_PRO_MAX_REQUESTS
-    : SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS;
+    ? parsePositiveSupervisorThrottleEnv(
+        SUPERVISOR_BROWSER_PRO_MAX_REQUESTS_ENV,
+        SUPERVISOR_BROWSER_PRO_MAX_REQUESTS,
+      )
+    : parsePositiveSupervisorThrottleEnv(
+        SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS_ENV,
+        SUPERVISOR_BROWSER_DEFAULT_MAX_REQUESTS,
+      );
 }
 
 function pruneSupervisorBrowserRequestTimes(

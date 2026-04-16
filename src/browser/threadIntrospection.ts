@@ -3,12 +3,15 @@ import { CONVERSATION_TURN_SELECTOR } from "./constants.js";
 export function buildThreadIntrospectionHelpers(): string {
   const conversationSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   return `const __oracleThreadSelector = '[data-testid^="conversation-turn"], [data-message-author-role], [data-turn]';
+const __oraclePrimaryThreadRootSelector = '[data-testid="chat-thread"],main,[role="main"]';
+const __oracleConversationIdFromHref = (href) =>
+  ((String(href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '').trim();
 const __oracleIsElement = (node) =>
   Boolean(node && typeof node === 'object' && typeof node.querySelectorAll === 'function');
 const __oracleIsExcluded = (node) =>
   Boolean(
     node?.closest?.(
-      'nav,aside,form,[data-testid*="sidebar"],[data-testid*="chat-history"],[data-testid*="composer"]',
+      'nav,aside,form,[data-testid*="sidebar"],[data-testid*="chat-history"],[data-testid*="composer"],section[data-testid="screen-threadFlyOut"],[data-testid*="threadFlyOut"]',
     ),
   );
 const __oracleThreadText = (node) => {
@@ -52,14 +55,18 @@ const __oracleThreadRole = (node) => {
   if (label.includes('chatgpt said')) return 'assistant';
   return '';
 };
-const __oraclePickThreadRoot = () => {
+const __oracleListThreadRoots = () => {
   const roots = [
-    document.querySelector('section[data-testid="screen-threadFlyOut"]'),
     document.querySelector('[data-testid="chat-thread"]'),
     document.querySelector('main'),
     document.querySelector('[role="main"]'),
+    document.querySelector('section[data-testid="screen-threadFlyOut"]'),
     document.body,
   ].filter(__oracleIsElement);
+  return roots.filter((node, index) => roots.indexOf(node) === index);
+};
+const __oraclePickThreadRoot = () => {
+  const roots = __oracleListThreadRoots();
   const score = (node) => {
     const conversationTurns = node.querySelectorAll('[data-testid^="conversation-turn"]').length;
     const roleTurns = node.querySelectorAll('[data-message-author-role], [data-turn]').length;
@@ -78,6 +85,28 @@ const __oraclePickThreadRoot = () => {
     }
   }
   return best || document.body;
+};
+const __oracleScopeConversationIds = (scope) => {
+  const ids = new Set();
+  if (!__oracleIsElement(scope)) return ids;
+  const add = (value) => {
+    const conversationId = __oracleConversationIdFromHref(value);
+    if (conversationId) ids.add(conversationId);
+  };
+  add(scope?.getAttribute?.('data-conversation-id') || '');
+  for (const node of Array.from(
+    scope.querySelectorAll('[data-conversation-id],a[href*="/c/"],[href*="/c/"]'),
+  )) {
+    if (!__oracleIsElement(node) || __oracleIsExcluded(node)) continue;
+    add(node?.getAttribute?.('data-conversation-id') || '');
+    add(
+      node?.getAttribute?.('href') ||
+        node?.getAttribute?.('data-href') ||
+        node?.getAttribute?.('data-url') ||
+        '',
+    );
+  }
+  return ids;
 };
 const __oracleCollectThreadEntries = (root) => {
   const scope = __oracleIsElement(root) ? root : __oraclePickThreadRoot();
@@ -105,7 +134,33 @@ const __oracleCollectThreadEntries = (root) => {
   return topLevel.map((node) => ({
     role: __oracleThreadRole(node),
     text: __oracleThreadText(node),
-    conversationMatch: Boolean(node?.closest?.(${conversationSelectorLiteral}) || node?.matches?.(${conversationSelectorLiteral})),
+    conversationMatch: Boolean(
+      node?.closest?.(${conversationSelectorLiteral}) || node?.matches?.(${conversationSelectorLiteral}),
+    ),
   }));
+};
+const __oracleHasUsableThreadEntries = (scope) =>
+  __oracleCollectThreadEntries(scope).some(
+    (entry) =>
+      (entry.role === 'user' || entry.role === 'assistant') &&
+      String(entry.text || '').trim().length > 0,
+  );
+const __oraclePickActiveThreadRoot = () => {
+  const expectedConversationId = __oracleConversationIdFromHref(window.location.href || '');
+  for (const scope of __oracleListThreadRoots()) {
+    if (!scope?.matches?.(__oraclePrimaryThreadRootSelector)) continue;
+    const scopedConversationIds = __oracleScopeConversationIds(scope);
+    if (
+      expectedConversationId &&
+      scopedConversationIds.size > 0 &&
+      !scopedConversationIds.has(expectedConversationId)
+    ) {
+      continue;
+    }
+    if (__oracleHasUsableThreadEntries(scope)) {
+      return scope;
+    }
+  }
+  return null;
 };`;
 }

@@ -232,15 +232,20 @@ async function flushStandardStream(stream: NodeJS.WriteStream): Promise<void> {
   });
 }
 
-async function exitAfterNonInteractiveCompletion(): Promise<never | void> {
-  if (process.stdout.isTTY || process.env.VITEST) {
+export async function exitAfterCliCompletion(options?: {
+  isVitest?: boolean;
+  stdout?: NodeJS.WriteStream;
+  stderr?: NodeJS.WriteStream;
+  exitCode?: number;
+  exit?: typeof process.exit;
+}): Promise<never | void> {
+  if (options?.isVitest ?? Boolean(process.env.VITEST)) {
     return;
   }
-  await Promise.allSettled([
-    flushStandardStream(process.stdout),
-    flushStandardStream(process.stderr),
-  ]);
-  process.exit(process.exitCode ?? 0);
+  const stdout = options?.stdout ?? process.stdout;
+  const stderr = options?.stderr ?? process.stderr;
+  await Promise.allSettled([flushStandardStream(stdout), flushStandardStream(stderr)]);
+  (options?.exit ?? process.exit)(options?.exitCode ?? process.exitCode ?? 0);
 }
 
 const program = new Command();
@@ -2310,6 +2315,6 @@ void (async () => {
     }
     process.exitCode = 1;
   } finally {
-    await exitAfterNonInteractiveCompletion();
+    await exitAfterCliCompletion();
   }
 })();

@@ -412,6 +412,7 @@ describe("runSupervisorBrokerRequest", () => {
 
     expect(result).toBe("ok");
     expect(callOrder).toEqual([
+      "resolve",
       "lease-start",
       "resolve",
       "capture",
@@ -424,6 +425,102 @@ describe("runSupervisorBrokerRequest", () => {
       "stop",
       "lease-end",
     ]);
+  });
+
+  test("withSupervisorRuntime bootstraps a hidden thinking runtime on cold start", async () => {
+    const action = vi.fn(async () => "ok");
+    const runtimeClose = vi.fn(async () => {});
+    const resolveSupervisorRuntimeContext = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "No reachable Oracle-owned hidden browser runtime session was found. Run one Oracle browser turn first.",
+        ),
+      )
+      .mockResolvedValue({
+        sessionId: "runtime-1",
+        runtime: {},
+      });
+    const connectSupervisorRuntime = vi.fn(async () => ({
+      client: { Runtime: {} } as never,
+      close: runtimeClose,
+      host: "127.0.0.1",
+      port: 9222,
+    }));
+    const withSupervisorRuntimeAttachLease = async <T>(
+      _log: (message?: string) => void,
+      work: () => Promise<T>,
+    ): Promise<T> => await work();
+    const runPrompt = vi.fn(async () => ({
+      ok: true as const,
+      sessionId: "bootstrap-1",
+      output: "SUPERVISOR_RUNTIME_READY",
+    }));
+
+    const result = await __test__.withSupervisorRuntime(
+      {
+        prompt: "",
+        sessionSlug: "cold-start",
+      },
+      action,
+      {
+        resolveSupervisorRuntimeContext,
+        connectSupervisorRuntime: connectSupervisorRuntime as never,
+        withSupervisorRuntimeAttachLease,
+      },
+      undefined,
+      runPrompt,
+    );
+
+    expect(result).toBe("ok");
+    expect(runPrompt).toHaveBeenCalledTimes(1);
+    expect(runPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gpt-5.4",
+        browserModelStrategy: "select",
+        browserModelLabel: "Thinking 5.4",
+        sessionSlug: expect.stringMatching(/^oracle-supervisor-bootstrap-/),
+      }),
+    );
+    const bootstrapCall = runPrompt.mock.calls[0] as unknown[] | undefined;
+    const bootstrapRequest = bootstrapCall?.[0] as { prompt?: string } | undefined;
+    expect(bootstrapRequest?.prompt).toContain("SUPERVISOR_RUNTIME_READY_");
+    expect(resolveSupervisorRuntimeContext).toHaveBeenCalledTimes(2);
+    expect(connectSupervisorRuntime).toHaveBeenCalledTimes(1);
+    expect(runtimeClose).toHaveBeenCalledTimes(1);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  test("withSupervisorRuntime does not bootstrap when a specific followup session was requested", async () => {
+    const resolveSupervisorRuntimeContext = vi.fn(async () => {
+      throw new Error(
+        "No reachable Oracle-owned hidden browser runtime session was found. Run one Oracle browser turn first.",
+      );
+    });
+    const runPrompt = vi.fn();
+
+    await expect(
+      __test__.withSupervisorRuntime(
+        {
+          prompt: "",
+          sessionSlug: "cold-start-followup",
+          followupSession: "runtime-anchor-1",
+        },
+        async () => "ok",
+        {
+          resolveSupervisorRuntimeContext,
+          connectSupervisorRuntime: vi.fn() as never,
+          withSupervisorRuntimeAttachLease: async <T>(
+            _log: (message?: string) => void,
+            work: () => Promise<T>,
+          ): Promise<T> => await work(),
+        },
+        undefined,
+        runPrompt as never,
+      ),
+    ).rejects.toThrow("No reachable Oracle-owned hidden browser runtime session was found");
+
+    expect(runPrompt).not.toHaveBeenCalled();
   });
 
   test("syncSupervisorRuntimeSession persists the active chrome target for a broker thread", async () => {

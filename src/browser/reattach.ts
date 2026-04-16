@@ -533,9 +533,13 @@ async function connectToExistingRuntime(
   const requireExactTarget = Boolean(
     browserWSEndpoint || runtimeRequiresSpecificTarget(liveRuntime),
   );
+  const allowProjectScopeRecovery = Boolean(
+    requireExactTarget && getRuntimeConversationId(liveRuntime),
+  );
   let targetList = (cachedTargetList ?? (await listTargets())) as TargetInfoLite[];
   let target = pickTarget(targetList, liveRuntime, {
     requireMatch: requireExactTarget,
+    allowProjectScopeRecovery,
   });
   if (!target && requireExactTarget) {
     for (let attempt = 1; attempt <= 5; attempt += 1) {
@@ -543,6 +547,7 @@ async function connectToExistingRuntime(
       targetList = ((await listTargets().catch(() => [])) as TargetInfoLite[]) ?? [];
       target = pickTarget(targetList, liveRuntime, {
         requireMatch: true,
+        allowProjectScopeRecovery,
       });
       if (target) {
         logger(
@@ -559,6 +564,7 @@ async function connectToExistingRuntime(
     }).catch(() => [])) as TargetInfoLite[];
     target = pickTarget(portTargetList, liveRuntime, {
       requireMatch: true,
+      allowProjectScopeRecovery,
     });
     if (target) {
       logger(

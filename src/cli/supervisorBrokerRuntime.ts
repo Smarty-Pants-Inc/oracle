@@ -347,6 +347,21 @@ function normalizeComparableUrl(url: string | undefined): string | null {
   }
 }
 
+function scopeUrlsEquivalent(left: string | undefined, right: string | undefined): boolean {
+  const normalizedLeft = normalizeComparableUrl(left);
+  const normalizedRight = normalizeComparableUrl(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  return (
+    conversationHrefMatchesConfiguredScope(normalizedLeft, normalizedRight) &&
+    conversationHrefMatchesConfiguredScope(normalizedRight, normalizedLeft)
+  );
+}
+
 function inferSupervisorRuntimeScopeUrl(runtime: BrowserRuntimeMetadata): string | undefined {
   const tabUrl = runtime.tabUrl?.trim();
   if (!tabUrl) {
@@ -391,10 +406,20 @@ function pickSafeSupervisorRecoveryTarget(
   const normalizedScopeUrl = normalizeComparableUrl(scopeUrl);
   const pageTargets = scopeTargets.filter((target) => target.type === "page");
   const scopeShellPages = pageTargets.filter(
-    (target) => normalizeComparableUrl(target.url) === normalizedScopeUrl,
+    (target) =>
+      (normalizedScopeUrl && scopeUrlsEquivalent(target.url, normalizedScopeUrl)) || false,
   );
   if (scopeShellPages.length === 1) {
     return scopeShellPages[0];
+  }
+  if (scopeShellPages.length > 1) {
+    const nonShellScopePages = pageTargets.filter(
+      (target) =>
+        !((normalizedScopeUrl && scopeUrlsEquivalent(target.url, normalizedScopeUrl)) || false),
+    );
+    if (nonShellScopePages.length === 0) {
+      return scopeShellPages[0];
+    }
   }
   return undefined;
 }
@@ -415,22 +440,28 @@ async function readConnectedTargetInfo(
   fallback: TargetInfoLite,
   options?: { requireVerification?: boolean },
 ): Promise<TargetInfoLite> {
+  let info:
+    | {
+        targetInfo?: { targetId?: string; type?: string; url?: string };
+      }
+    | undefined;
   try {
-    const info = await client.Target?.getTargetInfo?.({});
-    if (info?.targetInfo) {
-      return {
-        targetId: info.targetInfo.targetId ?? fallback.targetId,
-        type: info.targetInfo.type ?? fallback.type,
-        url: info.targetInfo.url ?? fallback.url,
-      };
-    }
-    if (options?.requireVerification) {
-      throw new Error("Target.getTargetInfo returned no target metadata");
-    }
+    info = await client.Target?.getTargetInfo?.({});
   } catch {
     if (options?.requireVerification) {
       throw new Error("Target.getTargetInfo failed while verifying the cached target");
     }
+  }
+  if (info?.targetInfo) {
+    const verifiedUrl = info.targetInfo.url?.trim();
+    return {
+      targetId: info.targetInfo.targetId ?? fallback.targetId,
+      type: info.targetInfo.type ?? fallback.type,
+      url: verifiedUrl || (options?.requireVerification ? undefined : fallback.url),
+    };
+  }
+  if (options?.requireVerification) {
+    throw new Error("Target.getTargetInfo returned no target metadata");
   }
   return fallback;
 }
@@ -464,7 +495,7 @@ function connectedTargetMatchesExpectedTarget(
   }
   const expectedUrl = normalizeComparableUrl(expected.url);
   const actualUrl = normalizeComparableUrl(actual.url);
-  return !expectedUrl || !actualUrl || expectedUrl === actualUrl;
+  return Boolean(expectedUrl && actualUrl && expectedUrl === actualUrl);
 }
 
 async function pickReachableRuntimeCandidate(
@@ -675,9 +706,14 @@ export async function connectSupervisorRuntime(
     });
     try {
       const { client } = connection;
-      const connectedTarget = await readConnectedTargetInfo(client, target, {
-        requireVerification: true,
-      });
+      let connectedTarget: TargetInfoLite;
+      try {
+        connectedTarget = await readConnectedTargetInfo(client, target, {
+          requireVerification: true,
+        });
+      } catch {
+        throw new Error("connected target no longer matches the selected Oracle runtime target");
+      }
       if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
         throw new Error("connected target no longer matches the selected Oracle runtime target");
       }
@@ -706,9 +742,14 @@ export async function connectSupervisorRuntime(
     target: target?.targetId,
   })) as unknown as ChromeClient;
   try {
-    const connectedTarget = await readConnectedTargetInfo(client, target, {
-      requireVerification: true,
-    });
+    let connectedTarget: TargetInfoLite;
+    try {
+      connectedTarget = await readConnectedTargetInfo(client, target, {
+        requireVerification: true,
+      });
+    } catch {
+      throw new Error("connected target no longer matches the selected Oracle runtime target");
+    }
     if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
       throw new Error("connected target no longer matches the selected Oracle runtime target");
     }

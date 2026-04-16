@@ -9,6 +9,7 @@ import { __test__, buildSupervisorBrowserConfig } from "../../src/cli/supervisor
 
 const SUPERVISOR_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
 const SUPERVISOR_PROJECT_URL = "https://chatgpt.com/g/g-p-69ccbf70cff08191bd2a7e61d8962644/project";
+const SUPERVISOR_ORACLE_CONVERSATION_ROOT = SUPERVISOR_PROJECT_URL.replace(/\/project$/, "-oracle");
 
 afterEach(() => {
   delete process.env.ORACLE_SUPERVISOR_THROTTLE_FILE;
@@ -414,6 +415,122 @@ describe("supervisor prompt replay safety", () => {
     ).toBeNull();
   });
 
+  test("does not reuse a broker session when supervisor thread url or project scope differs", () => {
+    const browserConfig = makeBrowserConfig();
+    const request = makeReplayRequest();
+    const expectedSupervisorThread = {
+      conversationId: "thread-123",
+      url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/thread-123`,
+      projectUrl: SUPERVISOR_PROJECT_URL,
+      verifiedAt: "2026-04-06T12:00:00.000Z",
+    };
+
+    expect(
+      __test__.pickReusableSupervisorPromptSession(
+        [
+          makeReplaySession({
+            supervisorThread: {
+              ...expectedSupervisorThread,
+              url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/thread-999`,
+            },
+          }),
+        ],
+        request,
+        "gpt-5.4",
+        browserConfig,
+        expectedSupervisorThread,
+      ),
+    ).toBeNull();
+
+    expect(
+      __test__.pickReusableSupervisorPromptSession(
+        [
+          makeReplaySession({
+            supervisorThread: {
+              ...expectedSupervisorThread,
+              projectUrl: "https://chatgpt.com/g/g-other/project",
+            },
+          }),
+        ],
+        request,
+        "gpt-5.4",
+        browserConfig,
+        expectedSupervisorThread,
+      ),
+    ).toBeNull();
+
+    const picked = __test__.pickReusableSupervisorPromptSession(
+      [
+        makeReplaySession({
+          supervisorThread: expectedSupervisorThread,
+        }),
+      ],
+      request,
+      "gpt-5.4",
+      browserConfig,
+      expectedSupervisorThread,
+    );
+
+    expect(picked?.id).toBe("codex-oracle-replay");
+  });
+
+  test("does not reuse a broker session when runtime metadata contradicts the expected supervisor thread", () => {
+    const browserConfig = makeBrowserConfig();
+    const request = makeReplayRequest();
+    const expectedSupervisorThread = {
+      conversationId: "thread-123",
+      url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/thread-123`,
+      projectUrl: SUPERVISOR_PROJECT_URL,
+      verifiedAt: "2026-04-06T12:00:00.000Z",
+    };
+
+    expect(
+      __test__.pickReusableSupervisorPromptSession(
+        [
+          makeReplaySession({
+            supervisorThread: expectedSupervisorThread,
+            browser: {
+              config: {
+                manualLoginProfileDir: SUPERVISOR_PROFILE_DIR,
+                chatgptUrl: SUPERVISOR_PROJECT_URL,
+              },
+              runtime: {
+                conversationId: "wrong-thread",
+              },
+            },
+          }),
+        ],
+        request,
+        "gpt-5.4",
+        browserConfig,
+        expectedSupervisorThread,
+      ),
+    ).toBeNull();
+
+    expect(
+      __test__.pickReusableSupervisorPromptSession(
+        [
+          makeReplaySession({
+            supervisorThread: expectedSupervisorThread,
+            browser: {
+              config: {
+                manualLoginProfileDir: SUPERVISOR_PROFILE_DIR,
+                chatgptUrl: SUPERVISOR_PROJECT_URL,
+              },
+              runtime: {
+                tabUrl: "https://chatgpt.com/g/g-other/c/thread-123",
+              },
+            },
+          }),
+        ],
+        request,
+        "gpt-5.4",
+        browserConfig,
+        expectedSupervisorThread,
+      ),
+    ).toBeNull();
+  });
+
   test("does not reuse a broker session when thinking time differs", () => {
     const browserConfig = buildSupervisorBrowserConfig({
       userConfig: {},
@@ -717,16 +834,28 @@ describe("supervisor browser throttling", () => {
     expect(decision.delayMs).toBe(0);
   });
 
-  test("throttles pro requests after the sixth request in the rolling window", () => {
+  test("allows sustained same-profile traffic well past six requests before window throttling", () => {
+    const nowMs = Date.UTC(2026, 3, 5, 12, 29, 0);
+    const recent = Array.from({ length: 12 }, (_, index) =>
+      new Date(nowMs - (29 - index * 2) * 60_000).toISOString(),
+    );
+    const decision = __test__.computeSupervisorBrowserThrottleDecision(
+      {
+        requestStartedAt: recent,
+      },
+      "gpt-5.4-pro",
+      nowMs,
+    );
+
+    expect(decision.reason).toBe(null);
+    expect(decision.delayMs).toBe(0);
+  });
+
+  test("throttles pro requests after the twenty-fourth request in the rolling window", () => {
     const nowMs = Date.UTC(2026, 3, 5, 12, 20, 0);
-    const recent = [
-      nowMs - 25 * 60_000,
-      nowMs - 20 * 60_000,
-      nowMs - 15 * 60_000,
-      nowMs - 10 * 60_000,
-      nowMs - 5 * 60_000,
-      nowMs - 2 * 60_000,
-    ].map((timestamp) => new Date(timestamp).toISOString());
+    const recent = Array.from({ length: 24 }, (_, index) =>
+      new Date(nowMs - (24 - index) * 60_000).toISOString(),
+    );
     const decision = __test__.computeSupervisorBrowserThrottleDecision(
       {
         requestStartedAt: recent,

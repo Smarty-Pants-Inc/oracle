@@ -19,6 +19,9 @@ export type { SupervisorThreadInfo };
 
 const ATTACH_CONFIRM_TIMEOUT_MS = 8_000;
 const ATTACH_CONFIRM_POLL_MS = 250;
+const ATTACH_DIRECT_NAV_RETRY_DELAY_MS = 2_000;
+const ATTACH_SIDEBAR_REPAIR_DELAY_MS = 4_000;
+const ATTACH_REPAIR_CONFIRM_EXTENSION_MS = 1_000;
 const HISTORY_ENTRY_LIMIT_DEFAULT = 100;
 const HISTORY_ENTRY_LIMIT_MAX = 200;
 const HISTORY_STABILITY_POLL_MS = 250;
@@ -40,6 +43,7 @@ interface SupervisorThreadHistorySnapshot {
   thread: SupervisorThreadInfo;
   history: SupervisorThreadHistoryEntry[];
   historyWindow: SupervisorThreadHistoryWindow;
+  activeRootValidated: boolean;
 }
 
 function normalizeNonNegativeInteger(value: unknown): number {
@@ -55,7 +59,11 @@ async function readVisibleSupervisorTurnCount(Runtime: ChromeClient["Runtime"]):
     const response = await Runtime.evaluate({
       expression: `(() => {
         ${buildThreadIntrospectionHelpers()}
-        return __oracleCollectThreadEntries(__oraclePickThreadRoot()).filter(
+        const activeRoot = __oraclePickActiveThreadRoot();
+        if (!activeRoot) {
+          return 0;
+        }
+        return __oracleCollectThreadEntries(activeRoot).filter(
           (entry) =>
             (entry.role === 'user' || entry.role === 'assistant') &&
             String(entry.text || '').trim().length > 0,
@@ -103,6 +111,20 @@ function normalizeProjectUrl(projectUrl?: string): string | undefined {
   } catch {
     return trimmed.replace(/\/+$/, "");
   }
+}
+
+async function navigateSupervisorThreadUrl(
+  Runtime: ChromeClient["Runtime"],
+  threadUrl: string,
+): Promise<void> {
+  await Runtime.evaluate({
+    expression: `(() => {
+      window.location.assign(${JSON.stringify(threadUrl)});
+      return true;
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
 }
 
 export function supervisorThreadMatchesProjectScope(
@@ -272,6 +294,8 @@ function normalizeSupervisorThreadHistorySnapshot(
   value: unknown,
   limit: number,
 ): SupervisorThreadHistorySnapshot {
+  const snapshotRecord =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
   const readSnapshotThread = (candidate: unknown): SupervisorThreadInfo | null => {
     if (!candidate || typeof candidate !== "object") {
       return null;
@@ -283,25 +307,29 @@ function normalizeSupervisorThreadHistorySnapshot(
       ? normalized
       : null;
   };
-  const thread = readSnapshotThread((value as { thread?: unknown })?.thread) ??
-    readSnapshotThread((value as { supervisorThread?: unknown })?.supervisorThread) ?? {
+  const thread = readSnapshotThread(snapshotRecord.thread) ??
+    readSnapshotThread(snapshotRecord.supervisorThread) ?? {
       title: "Untitled chat",
       isActive: true,
     };
   const rawHistory = Array.isArray(value)
     ? value
-    : Array.isArray((value as { history?: unknown })?.history)
-      ? ((value as { history?: unknown[] }).history ?? [])
+    : Array.isArray(snapshotRecord.history)
+      ? (snapshotRecord.history as unknown[])
       : [];
   const history = rawHistory
     .map((entry) => normalizeSupervisorThreadHistoryEntry(entry))
     .filter((entry): entry is SupervisorThreadHistoryEntry => entry !== null);
   const historyWindow = normalizeSupervisorThreadHistoryWindow(
-    (value as { historyWindow?: unknown })?.historyWindow,
+    snapshotRecord.historyWindow,
     limit,
     history.length,
   );
-  return { thread, history, historyWindow };
+  const activeRootValidated =
+    typeof snapshotRecord.activeRootValidated === "boolean"
+      ? snapshotRecord.activeRootValidated
+      : true;
+  return { thread, history, historyWindow, activeRootValidated };
 }
 
 function supervisorThreadHistorySnapshotsEqual(
@@ -314,6 +342,7 @@ function supervisorThreadHistorySnapshotsEqual(
       : normalizeProjectUrl(left.thread.url) === normalizeProjectUrl(right.thread.url);
   if (
     !sameThread ||
+    left.activeRootValidated !== right.activeRootValidated ||
     left.historyWindow.limit !== right.historyWindow.limit ||
     left.historyWindow.returnedCount !== right.historyWindow.returnedCount ||
     left.historyWindow.totalCount !== right.historyWindow.totalCount ||
@@ -334,6 +363,7 @@ async function readSupervisorThreadHistorySnapshotOnce(
 ): Promise<SupervisorThreadHistorySnapshot> {
   const response = await Runtime.evaluate({
     expression: `(() => {
+      ${buildThreadIntrospectionHelpers()}
       const limit = ${limit};
       const turnSelector = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
       const assistantSelector = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};
@@ -341,6 +371,33 @@ async function readSupervisorThreadHistorySnapshotOnce(
       const contentSelector =
         '.markdown,[data-message-content],[data-testid*="message"],[data-testid*="assistant"],.prose,[class*="markdown"]';
       const userSelector = '[data-message-author-role="user"], [data-turn="user"]';
+      const readThread = () => {
+        const href = window.location.href || '';
+        const conversationId = (href.match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '';
+        return {
+          url: href,
+          conversationId,
+          title:
+            (document.querySelector('main h1')?.textContent || '').trim() ||
+            (document.title || '').trim() ||
+            'Untitled chat',
+          isActive: true,
+        };
+      };
+      const activeRoot = __oraclePickActiveThreadRoot();
+      if (!(activeRoot instanceof Element)) {
+        return {
+          thread: readThread(),
+          history: [],
+          historyWindow: {
+            limit,
+            returnedCount: 0,
+            totalCount: 0,
+            truncated: false,
+          },
+          activeRootValidated: false,
+        };
+      }
       const normalize = (text) =>
         (text || '')
           .replace(/\\u00a0/g, ' ')
@@ -508,9 +565,14 @@ async function readSupervisorThreadHistorySnapshotOnce(
         }
         return bestPayload;
       };
-      const rawTurns = Array.from(document.querySelectorAll(turnSelector));
+      const rawTurns = Array.from(activeRoot.querySelectorAll(turnSelector)).filter(
+        (node) => node instanceof Element && !__oracleIsExcluded(node),
+      );
       const turns = rawTurns.filter(
-        (node) => !(node instanceof HTMLElement && node.parentElement?.closest(turnSelector)),
+        (node) =>
+          node instanceof Element &&
+          !__oracleIsExcluded(node) &&
+          !(node instanceof HTMLElement && node.parentElement?.closest(turnSelector)),
       );
       const orderedTurns = turns.length > 0 ? turns : rawTurns;
       const entries = [];
@@ -531,18 +593,8 @@ async function readSupervisorThreadHistorySnapshotOnce(
         entries.push({ role, text });
       }
       const limitedEntries = entries.slice(-limit);
-      const href = window.location.href || '';
-      const conversationId = (href.match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '';
       return {
-        thread: {
-          url: href,
-          conversationId,
-          title:
-            (document.querySelector('main h1')?.textContent || '').trim() ||
-            (document.title || '').trim() ||
-            'Untitled chat',
-          isActive: true,
-        },
+        thread: readThread(),
         history: limitedEntries,
         historyWindow: {
           limit,
@@ -550,6 +602,7 @@ async function readSupervisorThreadHistorySnapshotOnce(
           totalCount: entries.length,
           truncated: entries.length > limitedEntries.length,
         },
+        activeRootValidated: true,
       };
     })()`,
     returnByValue: true,
@@ -615,6 +668,11 @@ export async function readAttachedSupervisorThreadHistory(
     );
   }
   const snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  if (!snapshot.activeRootValidated) {
+    throw new Error(
+      `Oracle supervisor thread history could not validate the active conversation container for ${expectedConversationId}.`,
+    );
+  }
   if (
     snapshot.thread.conversationId !== expectedConversationId ||
     !supervisorThreadMatchesProjectScope(snapshot.thread, options.projectUrl)
@@ -666,14 +724,7 @@ export async function attachSupervisorThread(
   }
 
   if (normalizedThreadUrl) {
-    await Runtime.evaluate({
-      expression: `(() => {
-        window.location.assign(${JSON.stringify(normalizedThreadUrl)});
-        return true;
-      })()`,
-      returnByValue: true,
-      awaitPromise: true,
-    });
+    await navigateSupervisorThreadUrl(Runtime, normalizedThreadUrl);
   } else {
     const opened = await openConversationFromSidebarWithRetry(
       Runtime,
@@ -686,8 +737,11 @@ export async function attachSupervisorThread(
   }
 
   const start = Date.now();
+  let deadline = start + ATTACH_CONFIRM_TIMEOUT_MS;
   let lastSeen = current;
-  while (Date.now() - start < ATTACH_CONFIRM_TIMEOUT_MS) {
+  let retriedDirectNavigation = false;
+  let attemptedSidebarRepair = false;
+  while (Date.now() < deadline) {
     await delay(ATTACH_CONFIRM_POLL_MS);
     lastSeen = await readCurrentSupervisorThread(Runtime);
     if (
@@ -696,6 +750,30 @@ export async function attachSupervisorThread(
       (await readVisibleSupervisorTurnCount(Runtime)) > 0
     ) {
       return lastSeen;
+    }
+
+    const attachIdentityMatches =
+      lastSeen.conversationId === normalizedId &&
+      supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl);
+    if (!normalizedThreadUrl || attachIdentityMatches) {
+      continue;
+    }
+
+    const elapsedMs = Date.now() - start;
+    if (!retriedDirectNavigation && elapsedMs >= ATTACH_DIRECT_NAV_RETRY_DELAY_MS) {
+      retriedDirectNavigation = true;
+      await navigateSupervisorThreadUrl(Runtime, normalizedThreadUrl);
+      deadline = Math.max(deadline, Date.now() + ATTACH_REPAIR_CONFIRM_EXTENSION_MS);
+      continue;
+    }
+    if (!attemptedSidebarRepair && elapsedMs >= ATTACH_SIDEBAR_REPAIR_DELAY_MS) {
+      attemptedSidebarRepair = true;
+      await openConversationFromSidebarWithRetry(
+        Runtime,
+        { conversationId: normalizedId, preferProjects: true },
+        15_000,
+      ).catch(() => false);
+      deadline = Math.max(deadline, Date.now() + ATTACH_REPAIR_CONFIRM_EXTENSION_MS);
     }
   }
 

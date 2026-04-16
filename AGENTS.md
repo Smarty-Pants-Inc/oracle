@@ -28,6 +28,7 @@ The parent `smarty-code` repo tracks this fork as a gitlink/submodule; move the 
 
 ## Browser-Supervisor Changes
 
+- Oracle testing default on this machine is the non-Pro thinking path. Use `gpt-5.4`/Thinking for ordinary framework/live validation, and only use `gpt-5.4-pro` when a test is explicitly about Pro-only behavior.
 - For browser automation, model selection, prompt submission, or supervisor-broker changes, rerun live hidden-browser broker smokes for both:
   - `gpt-5.4-pro`
   - `gpt-5.4` with browser label `Thinking 5.4`

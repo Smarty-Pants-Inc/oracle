@@ -36,6 +36,11 @@ const isTurnCountProbe = (expression: string) =>
   expression.includes("document.querySelectorAll(") ||
   expression.includes("__oracleCollectThreadEntries");
 
+const isSidebarRecoveryProbe = (expression: string) =>
+  expression.includes("const conversationId =") &&
+  expression.includes("allowLooseFallback") &&
+  expression.includes("preferProjects");
+
 afterEach(() => {
   vi.useRealTimers();
   vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -175,9 +180,7 @@ describe("resumeBrowserSession", () => {
     expect(result.answerMarkdown).toBe("direct-nav-md");
     expect(currentHref).toBe(runtime.tabUrl);
     expect(
-      evaluate.mock.calls.some((call) =>
-        String(call[0]?.expression ?? "").includes("const conversationId ="),
-      ),
+      evaluate.mock.calls.some((call) => isSidebarRecoveryProbe(String(call[0]?.expression ?? ""))),
     ).toBe(false);
   });
 
@@ -390,9 +393,7 @@ describe("resumeBrowserSession", () => {
 
     expect(result.answerMarkdown).toBe("project-direct-nav-md");
     expect(
-      evaluate.mock.calls.some((call) =>
-        String(call[0]?.expression ?? "").includes("const conversationId ="),
-      ),
+      evaluate.mock.calls.some((call) => isSidebarRecoveryProbe(String(call[0]?.expression ?? ""))),
     ).toBe(false);
     expect(
       evaluate.mock.calls.some((call) =>
@@ -1613,9 +1614,7 @@ describe("resumeBrowserSession", () => {
     expect(result.answerMarkdown).toBe("project shell recovered markdown");
     expect(submitPrompt).toHaveBeenCalledTimes(1);
     expect(
-      evaluate.mock.calls.some((call) =>
-        String(call[0]?.expression ?? "").includes("const conversationId ="),
-      ),
+      evaluate.mock.calls.some((call) => isSidebarRecoveryProbe(String(call[0]?.expression ?? ""))),
     ).toBe(false);
     expect(
       evaluate.mock.calls.some((call) =>
@@ -3870,6 +3869,12 @@ describe("reattach helpers", () => {
     expect(conversationHrefMatchesConfiguredScope(`${projectUrl}/c/abc`, projectUrl)).toBe(true);
     expect(
       conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example-oracle/project",
+        projectUrl,
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-example-oracle/c/abc",
         projectUrl,
       ),
@@ -3883,6 +3888,27 @@ describe("reattach helpers", () => {
     expect(conversationHrefMatchesConfiguredScope("https://chatgpt.com/c/abc", projectUrl)).toBe(
       false,
     );
+  });
+
+  test("treats canonical and slugged project shells as the same configured project scope", () => {
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example/project",
+        "https://chatgpt.com/g/g-p-example-oracle/project",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example-oracle/project",
+        "https://chatgpt.com/g/g-p-example/project",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-other-oracle/project",
+        "https://chatgpt.com/g/g-p-example/project",
+      ),
+    ).toBe(false);
   });
 
   test("root-scoped supervisor scope only accepts root chatgpt tabs and root conversations", () => {
@@ -4082,6 +4108,33 @@ describe("reattach helpers", () => {
         conversationId: "new-thread",
       }),
     ).toEqual(targets[1]);
+  });
+
+  test("pickTarget does not treat URL prefixes as an identity match", () => {
+    const targets = [
+      { targetId: "t-prefix", type: "page", url: "https://chatgpt.com/c/right" },
+      { targetId: "t-other", type: "page", url: "https://chatgpt.com/c/other-thread" },
+    ];
+
+    expect(
+      pickTarget(targets, {
+        tabUrl: "https://chatgpt.com/c/right-thread",
+      }),
+    ).toBeUndefined();
+  });
+
+  test("pickTarget does not collapse distinct project scope keys", () => {
+    const targets = [
+      { targetId: "t-foo", type: "page", url: "https://chatgpt.com/g/g-p-foo/project" },
+      { targetId: "t-bar", type: "page", url: "https://chatgpt.com/g/g-p-bar/project" },
+    ];
+
+    expect(
+      pickTarget(targets, {
+        tabUrl: "https://chatgpt.com/g/g-p-foo-oracle/c/right-thread",
+        conversationId: "missing-thread",
+      }),
+    ).toBeUndefined();
   });
 
   test("pickTarget derives conversation identity from runtime tabUrl", () => {

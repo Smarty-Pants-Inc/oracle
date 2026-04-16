@@ -132,7 +132,7 @@ describe("supervisorThreads", () => {
     vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
     let currentReads = 0;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
-      if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+      if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
         return { result: { value: 2 } };
       }
       if (expression.includes("const href = window.location.href || ''")) {
@@ -200,7 +200,7 @@ describe("supervisorThreads", () => {
     let currentReadCount = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 2 } };
         }
         if (expression.includes("const href = window.location.href || ''")) {
@@ -253,7 +253,7 @@ describe("supervisorThreads", () => {
     });
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 0 } };
         }
         if (expression.includes("window.location.assign")) {
@@ -284,12 +284,51 @@ describe("supervisorThreads", () => {
     dateNow.mockRestore();
   });
 
+  test("attach_thread fails closed when only a secondary pane has visible turns", async () => {
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                conversationId: "target-9",
+                title: "Target",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      attachSupervisorThread(runtime, "target-9", {
+        projectUrl,
+        threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      }),
+    ).rejects.toThrow("Conversation target-9 did not become active after attach_thread");
+    dateNow.mockRestore();
+  });
+
   test("attach_thread accepts direct URL navigation only after visible conversation turns load", async () => {
     let currentReadCount = 0;
     let turnCountReads = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           turnCountReads += 1;
           return {
             result: {
@@ -339,6 +378,75 @@ describe("supervisorThreads", () => {
     expect(turnCountReads).toBeGreaterThanOrEqual(2);
   });
 
+  test("attach_thread repairs direct URL attach when another in-scope thread stays active", async () => {
+    let now = 0;
+    let navigationCount = 0;
+    let sidebarRepairCount = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 500;
+      return now;
+    });
+    vi.mocked(openConversationFromSidebarWithRetry).mockImplementation(async () => {
+      sidebarRepairCount += 1;
+      return true;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 2 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          navigationCount += 1;
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          if (sidebarRepairCount > 0) {
+            return {
+              result: {
+                value: {
+                  url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                  conversationId: "target-9",
+                  title: "Target",
+                  isActive: true,
+                },
+              },
+            };
+          }
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/other-3",
+                conversationId: "other-3",
+                title: "Other",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      projectUrl,
+      threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+    });
+
+    expect(thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(navigationCount).toBeGreaterThanOrEqual(2);
+    expect(openConversationFromSidebarWithRetry).toHaveBeenCalledWith(
+      runtime,
+      { conversationId: "target-9", preferProjects: true },
+      15_000,
+    );
+    dateNow.mockRestore();
+  });
+
   test("readSupervisorThreadHistory returns normalized transcript entries", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -370,7 +478,7 @@ describe("supervisorThreads", () => {
   test("readAttachedSupervisorThreadHistory surfaces bounded window metadata", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 2 } };
         }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
@@ -434,7 +542,7 @@ describe("supervisorThreads", () => {
     let locationReads = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 1 } };
         }
         if (expression.includes("window.location.href")) {
@@ -486,7 +594,7 @@ describe("supervisorThreads", () => {
     let locationReads = 0;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 1 } };
         }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
@@ -536,10 +644,62 @@ describe("supervisorThreads", () => {
     expect(locationReads).toBeGreaterThan(0);
   });
 
+  test("readAttachedSupervisorThreadHistory fails closed when history comes from an unvalidated secondary pane", async () => {
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 1 } };
+        }
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/c/current-9",
+                  conversationId: "current-9",
+                  title: "Current Chat",
+                  isActive: true,
+                },
+                history: [{ role: "assistant", text: "Secondary pane answer" }],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 1,
+                  totalCount: 1,
+                  truncated: false,
+                },
+                activeRootValidated: false,
+              },
+            },
+          };
+        }
+        if (expression.includes("window.location.href")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readAttachedSupervisorThreadHistory(runtime, {
+        conversationId: "current-9",
+        limit: 1,
+      }),
+    ).rejects.toThrow("could not validate the active conversation container");
+  });
+
   test("readAttachedSupervisorThreadHistory accepts legacy supervisorThread snapshot payloads", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 1 } };
         }
         if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
@@ -597,7 +757,7 @@ describe("supervisorThreads", () => {
     });
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-        if (expression.includes("__oracleCollectThreadEntries(__oraclePickThreadRoot())")) {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 0 } };
         }
         if (expression.includes("const href = window.location.href || ''")) {
