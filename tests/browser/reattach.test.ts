@@ -184,10 +184,10 @@ describe("resumeBrowserSession", () => {
     ).toBe(false);
   });
 
-  test("jumps straight to the stored oracle conversation when reattach starts on the wrong project thread", async () => {
+  test("jumps straight to the stored project conversation when reattach starts on the wrong project thread", async () => {
     const projectUrl = "https://chatgpt.com/g/g-p-example/project";
-    const expectedUrl = "https://chatgpt.com/g/g-p-example-oracle/c/right-thread";
-    const wrongUrl = "https://chatgpt.com/g/g-p-example-oracle/c/wrong-thread";
+    const expectedUrl = "https://chatgpt.com/g/g-p-example/project/c/right-thread";
+    const wrongUrl = "https://chatgpt.com/g/g-p-example/project/c/wrong-thread";
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
@@ -196,7 +196,7 @@ describe("resumeBrowserSession", () => {
       conversationId: "right-thread",
     };
     const listTargets = vi.fn(
-      async () => [{ targetId: "target-1", type: "page", url: wrongUrl }] satisfies FakeTarget[],
+      async () => [{ targetId: "target-1", type: "page", url: projectUrl }] satisfies FakeTarget[],
     ) as unknown as () => Promise<FakeTarget[]>;
     let currentHref = wrongUrl;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
@@ -1361,6 +1361,7 @@ describe("resumeBrowserSession", () => {
 
   test("continues a browser follow-up by reopening the stored conversation from a unique chat shell target", async () => {
     const conversationUrl = "https://chatgpt.com/g/g-p-example-oracle/c/right-thread";
+    const projectShellUrl = "https://chatgpt.com/g/g-p-example-oracle/project";
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
@@ -1369,11 +1370,9 @@ describe("resumeBrowserSession", () => {
     };
     const listTargets = vi.fn(
       async () =>
-        [
-          { targetId: "target-home", type: "page", url: "https://chatgpt.com/" },
-        ] satisfies FakeTarget[],
+        [{ targetId: "target-home", type: "page", url: projectShellUrl }] satisfies FakeTarget[],
     ) as unknown as () => Promise<FakeTarget[]>;
-    let currentHref = "https://chatgpt.com/";
+    let currentHref = projectShellUrl;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression === "location.href") {
         return { result: { value: currentHref } };
@@ -1439,19 +1438,18 @@ describe("resumeBrowserSession", () => {
 
   test("sidebar reopen with a known conversation id does not wait for the new follow-up prompt preview", async () => {
     const conversationUrl = "https://chatgpt.com/g/g-p-example-oracle/c/right-thread";
+    const projectShellUrl = "https://chatgpt.com/g/g-p-example-oracle/project";
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
-      tabUrl: "https://chatgpt.com/g/g-p-example-oracle/project",
+      tabUrl: projectShellUrl,
       conversationId: "right-thread",
     };
     const listTargets = vi.fn(
       async () =>
-        [
-          { targetId: "target-home", type: "page", url: "https://chatgpt.com/" },
-        ] satisfies FakeTarget[],
+        [{ targetId: "target-home", type: "page", url: projectShellUrl }] satisfies FakeTarget[],
     ) as unknown as () => Promise<FakeTarget[]>;
-    let currentHref = "https://chatgpt.com/";
+    let currentHref = projectShellUrl;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression === "location.href") {
         return { result: { value: currentHref } };
@@ -1459,12 +1457,8 @@ describe("resumeBrowserSession", () => {
       if (expression === "1+1") {
         return { result: { value: 2 } };
       }
-      if (
-        expression.includes(
-          `window.location.href = ${JSON.stringify("https://chatgpt.com/g/g-p-example-oracle/project")}`,
-        )
-      ) {
-        currentHref = "https://chatgpt.com/g/g-p-example-oracle/project";
+      if (expression.includes(`window.location.href = ${JSON.stringify(projectShellUrl)}`)) {
+        currentHref = projectShellUrl;
         return { result: { value: true } };
       }
       if (
@@ -3890,13 +3884,13 @@ describe("reattach helpers", () => {
     );
   });
 
-  test("treats canonical and slugged project shells as the same configured project scope", () => {
+  test("keeps slugged configured project scopes exact while canonical scopes accept the slugged conversation family", () => {
     expect(
       conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-example/project",
         "https://chatgpt.com/g/g-p-example-oracle/project",
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-example-oracle/project",
@@ -4028,7 +4022,7 @@ describe("reattach helpers", () => {
     ).toEqual(targets[0]);
   });
 
-  test("pickTarget prefers an interactive project shell over a project conversation shadow target", () => {
+  test("pickTarget fails closed when runtime scope only matches a canonical-vs-slugged project collision", () => {
     const targets = [
       {
         targetId: "t-shadow",
@@ -4045,10 +4039,10 @@ describe("reattach helpers", () => {
         tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
         conversationId: "right-thread",
       }),
-    ).toEqual(targets[1]);
+    ).toBeUndefined();
   });
 
-  test("pickTarget treats slugged project conversation shadow targets as non-attachable", () => {
+  test("pickTarget treats slugged project conversation shadow targets as non-attachable and fails closed", () => {
     const targets = [
       {
         targetId: "t-shadow",
@@ -4064,7 +4058,7 @@ describe("reattach helpers", () => {
         tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
         conversationId: "right-thread",
       }),
-    ).toEqual(targets[1]);
+    ).toBeUndefined();
   });
 
   test("pickTarget fails closed when metadata is missing and multiple chat pages are open", () => {
@@ -4139,8 +4133,16 @@ describe("reattach helpers", () => {
 
   test("pickTarget derives conversation identity from runtime tabUrl", () => {
     const targets = [
-      { targetId: "t-wrong", type: "page", url: "https://chatgpt.com/c/other-thread" },
-      { targetId: "t-right", type: "page", url: "https://chatgpt.com/c/right-thread" },
+      {
+        targetId: "t-wrong",
+        type: "page",
+        url: "https://chatgpt.com/g/g-p-example/project/c/other-thread",
+      },
+      {
+        targetId: "t-right",
+        type: "page",
+        url: "https://chatgpt.com/g/g-p-example/project/c/right-thread",
+      },
     ];
 
     expect(
@@ -4151,7 +4153,7 @@ describe("reattach helpers", () => {
     ).toEqual(targets[1]);
   });
 
-  test("pickTarget can reuse a unique chat shell to reopen a missing conversation", () => {
+  test("pickTarget does not reuse a root shell when runtime metadata requires a project-scoped thread", () => {
     const targets = [{ targetId: "t-home", type: "page", url: "https://chatgpt.com/" }];
 
     expect(
@@ -4159,7 +4161,7 @@ describe("reattach helpers", () => {
         tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
         conversationId: "right-thread",
       }),
-    ).toEqual(targets[0]);
+    ).toBeUndefined();
   });
 
   test("hidden reusable manual-login runtimes require conversation identity metadata", async () => {

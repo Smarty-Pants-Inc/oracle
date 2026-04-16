@@ -86,25 +86,27 @@ const __oraclePickThreadRoot = () => {
   }
   return best || document.body;
 };
+const __oracleNodeConversationId = (node) => {
+  const direct = String(node?.getAttribute?.('data-conversation-id') || '').trim();
+  if (direct) return direct;
+  return __oracleConversationIdFromHref(
+    node?.getAttribute?.('href') ||
+      node?.getAttribute?.('data-href') ||
+      node?.getAttribute?.('data-url') ||
+      '',
+  );
+};
 const __oracleScopeConversationIds = (scope) => {
   const ids = new Set();
   if (!__oracleIsElement(scope)) return ids;
-  const add = (value) => {
-    const conversationId = __oracleConversationIdFromHref(value);
+  const addNode = (node) => {
+    const conversationId = __oracleNodeConversationId(node);
     if (conversationId) ids.add(conversationId);
   };
-  add(scope?.getAttribute?.('data-conversation-id') || '');
-  for (const node of Array.from(
-    scope.querySelectorAll('[data-conversation-id],a[href*="/c/"],[href*="/c/"]'),
-  )) {
+  addNode(scope);
+  for (const node of Array.from(scope.querySelectorAll('[data-conversation-id]'))) {
     if (!__oracleIsElement(node) || __oracleIsExcluded(node)) continue;
-    add(node?.getAttribute?.('data-conversation-id') || '');
-    add(
-      node?.getAttribute?.('href') ||
-        node?.getAttribute?.('data-href') ||
-        node?.getAttribute?.('data-url') ||
-        '',
-    );
+    addNode(node);
   }
   return ids;
 };
@@ -147,20 +149,36 @@ const __oracleHasUsableThreadEntries = (scope) =>
   );
 const __oraclePickActiveThreadRoot = () => {
   const expectedConversationId = __oracleConversationIdFromHref(window.location.href || '');
+  const exactMatches = [];
+  const fallbackMatches = [];
   for (const scope of __oracleListThreadRoots()) {
     if (!scope?.matches?.(__oraclePrimaryThreadRootSelector)) continue;
-    const scopedConversationIds = __oracleScopeConversationIds(scope);
-    if (
-      expectedConversationId &&
-      scopedConversationIds.size > 0 &&
-      !scopedConversationIds.has(expectedConversationId)
-    ) {
+    if (!__oracleHasUsableThreadEntries(scope)) continue;
+    if (!expectedConversationId) {
+      fallbackMatches.push(scope);
       continue;
     }
-    if (__oracleHasUsableThreadEntries(scope)) {
-      return scope;
+    const scopedConversationIds = __oracleScopeConversationIds(scope);
+    if (scopedConversationIds.size === 0) {
+      fallbackMatches.push(scope);
+      continue;
+    }
+    if (
+      scopedConversationIds.size === 1 &&
+      scopedConversationIds.has(expectedConversationId)
+    ) {
+      exactMatches.push(scope);
     }
   }
-  return null;
+  if (!expectedConversationId) {
+    return fallbackMatches[0] || null;
+  }
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+  if (exactMatches.length > 1) {
+    return null;
+  }
+  return fallbackMatches.length === 1 ? fallbackMatches[0] : null;
 };`;
 }

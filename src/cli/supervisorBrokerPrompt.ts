@@ -19,7 +19,7 @@ import {
   conversationHrefMatchesConfiguredScope,
   extractConversationIdFromUrl,
 } from "../browser/reattachHelpers.js";
-import { isSupervisorScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
+import { isProjectScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../browser/sessionRunner.js";
@@ -211,19 +211,24 @@ function resolveConfiguredSupervisorChatgptUrl(
     userConfig.browser?.supervisorChatgptUrl?.trim() ||
     null;
   if (explicitSupervisorUrl) {
-    if (!isSupervisorScopedChatgptUrl(explicitSupervisorUrl)) {
+    if (!isProjectScopedChatgptUrl(explicitSupervisorUrl, CHATGPT_URL)) {
       throw new Error(
-        "Supervisor browser requires ORACLE_SUPERVISOR_CHATGPT_URL/browser.supervisorChatgptUrl to be the ChatGPT root or a /g/.../project URL.",
+        "Supervisor browser requires ORACLE_SUPERVISOR_CHATGPT_URL/browser.supervisorChatgptUrl to be a project-scoped ChatGPT URL (/g/.../project).",
       );
     }
     return normalizeChatgptUrl(explicitSupervisorUrl, CHATGPT_URL);
   }
   const configuredBrowserUrl =
     userConfig.browser?.chatgptUrl?.trim() || userConfig.browser?.url?.trim() || null;
-  if (configuredBrowserUrl && isSupervisorScopedChatgptUrl(configuredBrowserUrl)) {
+  if (configuredBrowserUrl) {
+    if (!isProjectScopedChatgptUrl(configuredBrowserUrl, CHATGPT_URL)) {
+      throw new Error(
+        "Supervisor browser requires browser.chatgptUrl/browser.url to be a project-scoped ChatGPT URL (/g/.../project).",
+      );
+    }
     return normalizeChatgptUrl(configuredBrowserUrl, CHATGPT_URL);
   }
-  return normalizeChatgptUrl(CHATGPT_URL, CHATGPT_URL);
+  return null;
 }
 
 function findRecentSupervisorProjectUrl(
@@ -243,7 +248,7 @@ function findRecentSupervisorProjectUrl(
       continue;
     }
     const candidateUrl = config.chatgptUrl ?? config.url ?? null;
-    if (isSupervisorScopedChatgptUrl(candidateUrl)) {
+    if (isProjectScopedChatgptUrl(candidateUrl, CHATGPT_URL)) {
       return normalizeChatgptUrl(candidateUrl, CHATGPT_URL);
     }
   }
@@ -261,7 +266,9 @@ async function resolveSupervisorChatgptUrl({
   if (configured) {
     return configured;
   }
-  return normalizeChatgptUrl(CHATGPT_URL, CHATGPT_URL);
+  throw new Error(
+    "Supervisor browser requires a project-scoped ChatGPT URL (/g/.../project). Set ORACLE_SUPERVISOR_CHATGPT_URL or browser.supervisorChatgptUrl.",
+  );
 }
 
 function normalizeSupervisorText(value: string | null | undefined): string | null {

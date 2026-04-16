@@ -8,6 +8,7 @@ const HIDDEN_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-h
 const SUPERVISOR_PROJECT_URL = "https://chatgpt.com/g/team-space/project";
 const SUPERVISOR_CONVERSATION_ROOT = "https://chatgpt.com/g/team-space";
 const SUPERVISOR_ORACLE_CONVERSATION_ROOT = "https://chatgpt.com/g/team-space-oracle";
+const SUPERVISOR_ORACLE_PROJECT_URL = `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/project`;
 
 function runtimeSession(
   id: string,
@@ -98,7 +99,7 @@ describe("supervisorBrokerRuntime", () => {
     expect(picked).toBeUndefined();
   });
 
-  test("accepts hidden runtimes pinned to the ChatGPT root", () => {
+  test("rejects hidden runtimes pinned to the ChatGPT root", () => {
     const picked = __test__.pickReusableRuntimeCandidate([
       {
         ...runtimeSession("hidden-root-chat", "completed", "2026-03-31T10:05:00.000Z"),
@@ -121,7 +122,7 @@ describe("supervisorBrokerRuntime", () => {
       },
     ]);
 
-    expect(picked?.id).toBe("hidden-root-chat");
+    expect(picked).toBeUndefined();
   });
 
   test("prefers completed reusable runtimes over running sessions", () => {
@@ -203,17 +204,17 @@ describe("supervisorBrokerRuntime", () => {
         tabUrl: "https://chatgpt.com/g/team-space-oracle/c/expected",
         conversationId: "expected",
       }),
-    ).toBe(SUPERVISOR_PROJECT_URL);
+    ).toBe(SUPERVISOR_ORACLE_PROJECT_URL);
   });
 
-  test("prefers the project shell recovery target for -oracle conversation runtimes", () => {
+  test("fails closed when -oracle runtime metadata only has canonical project-shell recovery targets", () => {
     const picked = __test__.pickSafeSupervisorRecoveryTarget(
       [
         { targetId: "project-shell", type: "page", url: SUPERVISOR_PROJECT_URL },
         {
-          targetId: "other-thread",
+          targetId: "main-chat",
           type: "page",
-          url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-thread`,
+          url: "https://chatgpt.com/c/main-thread",
         },
       ],
       {
@@ -223,10 +224,10 @@ describe("supervisorBrokerRuntime", () => {
       },
     );
 
-    expect(picked?.targetId).toBe("project-shell");
+    expect(picked).toBeUndefined();
   });
 
-  test("accepts duplicate identical project shell pages as a safe recovery target", () => {
+  test("accepts duplicate identical exact-scope project shell pages as a safe recovery target", () => {
     const picked = __test__.pickSafeSupervisorRecoveryTarget(
       [
         { targetId: "project-shell-1", type: "page", url: SUPERVISOR_PROJECT_URL },
@@ -234,7 +235,7 @@ describe("supervisorBrokerRuntime", () => {
       ],
       {
         chromePort: 9222,
-        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/expected`,
         conversationId: "expected",
       },
     );
@@ -242,7 +243,7 @@ describe("supervisorBrokerRuntime", () => {
     expect(picked?.targetId).toBe("project-shell-1");
   });
 
-  test("treats canonical and slugged project shell pages as equivalent recovery targets", () => {
+  test("selects the exact inferred project shell when both canonical and slugged targets are present", () => {
     const picked = __test__.pickSafeSupervisorRecoveryTarget(
       [
         { targetId: "project-shell-1", type: "page", url: SUPERVISOR_PROJECT_URL },
@@ -259,7 +260,31 @@ describe("supervisorBrokerRuntime", () => {
       },
     );
 
-    expect(picked?.targetId).toBe("project-shell-1");
+    expect(picked?.targetId).toBe("project-shell-2");
+  });
+
+  test("accepts the unique remaining page in the exact inferred project scope", () => {
+    const picked = __test__.pickSafeSupervisorRecoveryTarget(
+      [
+        {
+          targetId: "other-thread",
+          type: "page",
+          url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-thread`,
+        },
+        {
+          targetId: "main-chat",
+          type: "page",
+          url: "https://chatgpt.com/c/main-thread",
+        },
+      ],
+      {
+        chromePort: 9222,
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      },
+    );
+
+    expect(picked?.targetId).toBe("other-thread");
   });
 
   test("accepts a reachable runtime when only the unique project shell target remains", async () => {
@@ -280,7 +305,7 @@ describe("supervisorBrokerRuntime", () => {
             runtime: {
               chromeHost: "127.0.0.1",
               chromePort: 9222,
-              tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/shell-recoverable`,
+              tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/shell-recoverable`,
               conversationId: "shell-recoverable",
             },
             config: {
@@ -326,7 +351,7 @@ describe("supervisorBrokerRuntime", () => {
             runtime: {
               chromeHost: "127.0.0.1",
               chromePort: 9222,
-              tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/shell-recoverable-duplicate`,
+              tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/shell-recoverable-duplicate`,
               conversationId: "shell-recoverable-duplicate",
             },
             config: {
@@ -349,7 +374,7 @@ describe("supervisorBrokerRuntime", () => {
     expect(listTargets).toHaveBeenCalledTimes(1);
   });
 
-  test("accepts a reachable runtime when only canonical and slugged project shell targets remain", async () => {
+  test("accepts a reachable runtime when canonical and slugged project shell targets remain in an exact slugged scope", async () => {
     const probe = vi.fn().mockResolvedValue({ ok: true });
     const listTargets = vi.fn(async () => [
       {
@@ -382,7 +407,7 @@ describe("supervisorBrokerRuntime", () => {
               attachRunning: false,
               launcher: "chrome",
               manualLoginProfileDir: HIDDEN_PROFILE_DIR,
-              chatgptUrl: SUPERVISOR_PROJECT_URL,
+              chatgptUrl: SUPERVISOR_ORACLE_PROJECT_URL,
             },
           },
         },
@@ -800,7 +825,7 @@ describe("supervisorBrokerRuntime", () => {
       },
       supervisorThread: {
         conversationId: "owned-thread",
-        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/owned-thread`,
+        url: `${SUPERVISOR_CONVERSATION_ROOT}/c/owned-thread`,
         projectUrl: SUPERVISOR_PROJECT_URL,
         verifiedAt: "2026-03-31T10:05:00.000Z",
       },
@@ -809,7 +834,7 @@ describe("supervisorBrokerRuntime", () => {
           chromeHost: "127.0.0.1",
           chromePort: 9222,
           chromePid: 4242,
-          tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/owned-thread`,
+          tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/owned-thread`,
           conversationId: "owned-thread",
         },
         config: {
@@ -1375,7 +1400,7 @@ describe("supervisorBrokerRuntime", () => {
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
   });
 
-  test("browser websocket runtimes can recover via the unique project shell target from stale -oracle metadata", async () => {
+  test("browser websocket runtimes fail closed when stale -oracle metadata can only recover to a canonical project shell", async () => {
     vi.resetModules();
     const staleConnection = {
       client: {
@@ -1393,32 +1418,87 @@ describe("supervisorBrokerRuntime", () => {
       close: vi.fn(async () => {}),
       targetId: "stale-target",
     };
-    const freshConnection = {
+    const connectToRemoteChromeTarget = vi.fn().mockResolvedValue(staleConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      {
+        targetId: "project-shell",
+        type: "page",
+        url: SUPERVISOR_PROJECT_URL,
+      },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await expect(
+      connectSupervisorRuntime({
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        chromeTargetId: "stale-target",
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      }),
+    ).rejects.toThrow(/Unable to locate the existing Oracle browser tab/i);
+
+    expect(staleConnection.close).toHaveBeenCalledTimes(1);
+    expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket runtimes can recover through the unique remaining page in the exact inferred project scope", async () => {
+    vi.resetModules();
+    const staleConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "stale-target",
+              type: "page",
+              url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/other-thread`,
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "stale-target",
+    };
+    const recoveredConnection = {
       client: {
         Runtime: { enable: vi.fn(async () => ({})) },
         DOM: { enable: vi.fn(async () => ({})) },
         Target: {
           getTargetInfo: vi.fn(async () => ({
             targetInfo: {
-              targetId: "project-shell",
+              targetId: "remaining-thread",
               type: "page",
-              url: SUPERVISOR_PROJECT_URL,
+              url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/remaining-thread`,
             },
           })),
         },
       },
       close: vi.fn(async () => {}),
-      targetId: "project-shell",
+      targetId: "remaining-thread",
     };
     const connectToRemoteChromeTarget = vi
       .fn()
       .mockResolvedValueOnce(staleConnection)
-      .mockResolvedValueOnce(freshConnection);
+      .mockResolvedValueOnce(recoveredConnection);
     const listRemoteChromeTargets = vi.fn(async () => [
       {
-        targetId: "project-shell",
+        targetId: "remaining-thread",
         type: "page",
-        url: SUPERVISOR_PROJECT_URL,
+        url: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/remaining-thread`,
+      },
+      {
+        targetId: "main-chat",
+        type: "page",
+        url: "https://chatgpt.com/c/main-thread",
       },
     ]);
 
@@ -1447,12 +1527,12 @@ describe("supervisorBrokerRuntime", () => {
       expect.any(Function),
       expect.objectContaining({
         browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
-        targetId: "project-shell",
+        targetId: "remaining-thread",
       }),
     );
-    expect(result.targetId).toBe("project-shell");
+    expect(result.targetId).toBe("remaining-thread");
     await result.close();
-    expect(freshConnection.close).toHaveBeenCalledTimes(1);
+    expect(recoveredConnection.close).toHaveBeenCalledTimes(1);
   });
 
   test("browser websocket runtimes fail closed when only other conversation tabs remain in project scope", async () => {

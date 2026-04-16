@@ -7,7 +7,11 @@ import process from "node:process";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { THINKING_MENU_TRIGGER_SELECTORS } from "../src/browser/constants.js";
-import { extractConversationIdFromUrl } from "../src/browser/reattachHelpers.js";
+import {
+  conversationHrefMatchesConfiguredScope,
+  extractConversationIdFromUrl,
+} from "../src/browser/reattachHelpers.js";
+import { isProjectScopedChatgptUrl } from "../src/browser/utils.js";
 import { attachSupervisorThread } from "../src/browser/supervisorThreads.js";
 import type {
   SupervisorBrokerRequest,
@@ -163,6 +167,16 @@ function normalizeComparableHref(href: string): string | null {
   } catch {
     return trimmed.replace(/\/+$/, "");
   }
+}
+
+function requireProjectScopedUrl(url: string | undefined, label: string): string {
+  const candidate = url?.trim();
+  if (!candidate || !isProjectScopedChatgptUrl(candidate, CHATGPT_URL)) {
+    throw new Error(
+      `${label} must be a ChatGPT project URL (/g/.../project). Refusing root/main or missing URL: ${candidate ?? "missing"}`,
+    );
+  }
+  return candidate;
 }
 
 function assertProofOnExpectedThread({
@@ -338,15 +352,22 @@ async function main() {
 
   try {
     const sessionMeta = await sessionStore.readSession(response.sessionId);
-    const projectUrl =
+    const configuredProjectUrl = requireProjectScopedUrl(
       sessionMeta?.supervisorThread?.projectUrl ??
-      sessionMeta?.browser?.config?.supervisorChatgptUrl ??
-      sessionMeta?.browser?.config?.chatgptUrl ??
-      sessionMeta?.browser?.config?.url ??
-      undefined;
+        sessionMeta?.browser?.config?.supervisorChatgptUrl ??
+        sessionMeta?.browser?.config?.chatgptUrl ??
+        sessionMeta?.browser?.config?.url ??
+        undefined,
+      "Supervisor proof scope",
+    );
+    if (!conversationHrefMatchesConfiguredScope(runtime.tabUrl, configuredProjectUrl)) {
+      throw new Error(
+        `Supervisor proof runtime URL is outside the configured project scope. runtime.tabUrl=${runtime.tabUrl} configuredProjectUrl=${configuredProjectUrl}`,
+      );
+    }
     if (runtime.conversationId) {
       await attachSupervisorThread(connection.client.Runtime, runtime.conversationId, {
-        projectUrl,
+        projectUrl: configuredProjectUrl,
         threadUrl: runtime.tabUrl ?? undefined,
       });
     }
@@ -428,6 +449,7 @@ export const __test__ = {
   assertProofOnExpectedThread,
   evaluateBrowserProofState,
   normalizeComparableHref,
+  requireProjectScopedUrl,
   withTimeout,
   waitForChildExit,
 };

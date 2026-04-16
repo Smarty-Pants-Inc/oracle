@@ -9,6 +9,7 @@ import {
   conversationHrefMatchesConfiguredScope,
   openConversationFromSidebarWithRetry,
 } from "./reattachHelpers.js";
+import { readAssistantSnapshot } from "./pageActions.js";
 import {
   normalizeSupervisorThread,
   type SupervisorThreadInfo,
@@ -77,6 +78,26 @@ async function readVisibleSupervisorTurnCount(Runtime: ChromeClient["Runtime"]):
   }
 }
 
+async function hasVisibleSupervisorConversationContent(
+  Runtime: ChromeClient["Runtime"],
+  thread: SupervisorThreadInfo,
+  threadUrl?: string,
+): Promise<boolean> {
+  const visibleTurnCount = await readVisibleSupervisorTurnCount(Runtime);
+  if (visibleTurnCount > 0) {
+    return true;
+  }
+  if (!isRootConversationUrl(thread.url) && !isRootConversationUrl(threadUrl)) {
+    return false;
+  }
+  try {
+    const snapshot = await readAssistantSnapshot(Runtime);
+    return hasReadableAssistantSnapshotText(snapshot);
+  } catch {
+    return false;
+  }
+}
+
 export async function readCurrentSupervisorThread(
   Runtime: ChromeClient["Runtime"],
 ): Promise<SupervisorThreadInfo> {
@@ -111,6 +132,55 @@ function normalizeProjectUrl(projectUrl?: string): string | undefined {
   } catch {
     return trimmed.replace(/\/+$/, "");
   }
+}
+
+function isRootConversationUrl(url?: string): boolean {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return /^\/c\/[a-zA-Z0-9-]+$/i.test(pathname);
+  } catch {
+    return /^https?:\/\/[^/]+\/c\/[a-zA-Z0-9-]+\/?$/i.test(trimmed);
+  }
+}
+
+function hasReadableAssistantSnapshotText(snapshot: unknown): boolean {
+  if (!snapshot || typeof snapshot !== "object") {
+    return false;
+  }
+  const raw = snapshot as Record<string, unknown>;
+  const text = typeof raw.text === "string" ? raw.text.trim() : "";
+  if (!text) {
+    return false;
+  }
+  const normalized = text.toLowerCase();
+  const normalizedHtml = (typeof raw.html === "string" ? raw.html : "").toLowerCase();
+  if (
+    normalized === "thinking" ||
+    /^thought for\b[^\n]*$/.test(normalized) ||
+    /^thought for\b[^\n]*\nthinking$/.test(normalized)
+  ) {
+    return false;
+  }
+  if (normalizedHtml.includes("result-thinking") || /<p\b[^>]*>\s*<\/p>/.test(normalizedHtml)) {
+    return false;
+  }
+  if (
+    normalized.includes("answer now") &&
+    (normalized.includes("pro thinking") || normalized.includes("chatgpt"))
+  ) {
+    return false;
+  }
+  if (normalized.startsWith("you said")) {
+    return false;
+  }
+  return !/^(?:starting|finalizing answer|analyzing|researching|reasoning|planning|drafting|reading|browsing|searching(?: the web)?)(?:\.{3}|…)?$/.test(
+    normalized,
+  );
 }
 
 async function navigateSupervisorThreadUrl(
@@ -652,11 +722,10 @@ export async function readAttachedSupervisorThreadHistory(
     throw new Error("conversationId is required for thread_history.");
   }
   let thread = await readCurrentSupervisorThread(Runtime);
-  const visibleTurnCount = await readVisibleSupervisorTurnCount(Runtime);
   if (
     thread.conversationId !== expectedConversationId ||
     !supervisorThreadMatchesProjectScope(thread, options.projectUrl) ||
-    visibleTurnCount === 0
+    !(await hasVisibleSupervisorConversationContent(Runtime, thread))
   ) {
     thread = await attachSupervisorThread(Runtime, expectedConversationId, {
       projectUrl: options.projectUrl,
@@ -718,7 +787,7 @@ export async function attachSupervisorThread(
     (!normalizedThreadUrl ||
       normalizeProjectUrl(current.url) === normalizeProjectUrl(normalizedThreadUrl)) &&
     supervisorThreadMatchesProjectScope(current, options?.projectUrl) &&
-    (await readVisibleSupervisorTurnCount(Runtime)) > 0
+    (await hasVisibleSupervisorConversationContent(Runtime, current, normalizedThreadUrl))
   ) {
     return current;
   }
@@ -747,7 +816,7 @@ export async function attachSupervisorThread(
     if (
       lastSeen.conversationId === normalizedId &&
       supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl) &&
-      (await readVisibleSupervisorTurnCount(Runtime)) > 0
+      (await hasVisibleSupervisorConversationContent(Runtime, lastSeen, normalizedThreadUrl))
     ) {
       return lastSeen;
     }

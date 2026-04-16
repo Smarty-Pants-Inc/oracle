@@ -1,3 +1,4 @@
+import vm from "node:vm";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import {
   __test__,
@@ -10,6 +11,7 @@ import {
 } from "../../src/browser/supervisorThreads.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { openConversationFromSidebarWithRetry } from "../../src/browser/reattachHelpers.js";
+import { readAssistantSnapshot } from "../../src/browser/pageActions.js";
 
 vi.mock("../../src/browser/utils.js", () => ({
   delay: vi.fn(async () => undefined),
@@ -23,11 +25,115 @@ vi.mock("../../src/browser/reattachHelpers.js", async (importOriginal) => {
   };
 });
 
+vi.mock("../../src/browser/pageActions.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/browser/pageActions.js")>();
+  return {
+    ...actual,
+    readAssistantSnapshot: vi.fn(),
+  };
+});
+
+const isThreadSelector = (selector: string) =>
+  selector.includes('[data-testid^="conversation-turn"]') ||
+  selector.includes("[data-message-author-role]") ||
+  selector.includes("[data-turn]");
+
+const isExcludedSelector = (selector: string) =>
+  selector.includes(
+    'nav,aside,form,[data-testid*="sidebar"],[data-testid*="chat-history"],[data-testid*="composer"],section[data-testid="screen-threadFlyOut"],[data-testid*="threadFlyOut"]',
+  );
+
+function evaluateVisibleTurnCountForBadShape(expression: string): number {
+  const expectedLink = {
+    getAttribute: (name: string) => (name === "href" ? "/c/target-9" : null),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    closest: () => null,
+    matches: () => false,
+    contains: (node: unknown) => node === expectedLink,
+    cloneNode: () => expectedLink,
+    innerText: "",
+    textContent: "",
+  };
+  const turn = {
+    getAttribute: (name: string) => {
+      if (name === "data-testid") return "conversation-turn-1";
+      if (name === "data-message-author-role") return "assistant";
+      return null;
+    },
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    closest: (selector: string) => {
+      if (isExcludedSelector(selector)) return null;
+      return isThreadSelector(selector) ? turn : null;
+    },
+    matches: (selector: string) => isThreadSelector(selector),
+    contains: (node: unknown) => node === turn,
+    cloneNode: () => ({
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      innerText: "Wrong pane answer",
+      textContent: "Wrong pane answer",
+      remove: () => undefined,
+    }),
+    innerText: "Wrong pane answer",
+    textContent: "Wrong pane answer",
+  };
+  const main = {
+    getAttribute: (name: string) => {
+      if (name === "data-conversation-id") return "wrong-4";
+      if (name === "role") return "main";
+      return null;
+    },
+    querySelectorAll: (selector: string) => {
+      if (selector.includes('href*="/c/"')) return [expectedLink];
+      if (isThreadSelector(selector)) return [turn];
+      return [];
+    },
+    querySelector: () => null,
+    closest: () => null,
+    matches: (selector: string) =>
+      selector
+        .split(",")
+        .map((value) => value.trim())
+        .some((value) => value === "main" || value === '[role="main"]'),
+    contains: (node: unknown) => node === main || node === turn || node === expectedLink,
+    cloneNode: () => main,
+    innerText: "",
+    textContent: "",
+  };
+  const body = {
+    getAttribute: () => null,
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    closest: () => null,
+    matches: () => false,
+    contains: (node: unknown) => node === body,
+    cloneNode: () => body,
+    innerText: "",
+    textContent: "",
+  };
+  const document = {
+    body,
+    querySelector: (selector: string) => {
+      if (selector === "main" || selector === '[role="main"]') return main;
+      return null;
+    },
+  };
+  const value = vm.runInNewContext(expression, {
+    document,
+    window: { location: { href: "https://chatgpt.com/c/target-9" } },
+    URL,
+  });
+  return Number(value) || 0;
+}
+
 describe("supervisorThreads", () => {
   const projectUrl = "https://chatgpt.com/g/team-space/project";
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(readAssistantSnapshot).mockResolvedValue(null);
   });
 
   test("normalizes raw thread metadata", () => {
@@ -243,6 +349,139 @@ describe("supervisorThreads", () => {
       isActive: true,
     });
     expect(currentReadCount).toBeGreaterThanOrEqual(3);
+  });
+
+  test("attach_thread accepts root/main attach when a readable assistant snapshot is present", async () => {
+    let currentReadCount = 0;
+    vi.mocked(readAssistantSnapshot).mockResolvedValue({
+      text: "Prior assistant reply.",
+      html: "<p>Prior assistant reply.</p>",
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          currentReadCount += 1;
+          return {
+            result: {
+              value:
+                currentReadCount < 2
+                  ? {
+                      url: "https://chatgpt.com/c/current-1",
+                      conversationId: "current-1",
+                      title: "Current",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/c/target-9",
+                      conversationId: "target-9",
+                      title: "Root seed thread",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        return { result: { value: null } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      threadUrl: "https://chatgpt.com/c/target-9",
+    });
+
+    expect(thread).toEqual({
+      title: "Root seed thread",
+      url: "https://chatgpt.com/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(readAssistantSnapshot).toHaveBeenCalled();
+  });
+
+  test("attach_thread fails closed when visible turns come from a wrong root that only has a descendant expected link", async () => {
+    vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(true);
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: evaluateVisibleTurnCountForBadShape(expression) } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/target-9",
+                conversationId: "target-9",
+                title: "Target",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(attachSupervisorThread(runtime, "target-9")).rejects.toThrow(
+      "Conversation target-9 did not become active after attach_thread",
+    );
+    expect(openConversationFromSidebarWithRetry).toHaveBeenCalledWith(
+      runtime,
+      { conversationId: "target-9", preferProjects: true },
+      15_000,
+    );
+    dateNow.mockRestore();
+  });
+
+  test("attach_thread keeps fail-closed for root/main blank shells despite snapshot fallback", async () => {
+    let now = 0;
+    vi.mocked(readAssistantSnapshot).mockResolvedValue({
+      text: "Thinking",
+      html: '<div class="result-thinking"></div>',
+    });
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/c/target-9",
+                conversationId: "target-9",
+                title: "ChatGPT",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      attachSupervisorThread(runtime, "target-9", {
+        threadUrl: "https://chatgpt.com/c/target-9",
+      }),
+    ).rejects.toThrow("Conversation target-9 did not become active after attach_thread");
+    dateNow.mockRestore();
   });
 
   test("attach_thread fails closed when direct URL navigation lands on a blank shell for the requested conversation", async () => {
@@ -771,6 +1010,12 @@ describe("supervisorThreads", () => {
               },
             },
           };
+        }
+        if (
+          expression.includes("const MIN_TURN_INDEX =") ||
+          expression.includes("extractAssistantTurn")
+        ) {
+          return { result: { value: null } };
         }
         throw new Error(`Unexpected expression: ${expression}`);
       }),

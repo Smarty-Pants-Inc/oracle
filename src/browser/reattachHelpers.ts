@@ -147,6 +147,30 @@ function urlsLooselyMatchRuntimeTab(candidateUrl: string | undefined, runtimeUrl
   }
 }
 
+function projectScopeKey(url: string | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const match = pathname.match(
+      /^\/g\/([^/]+)(?:\/project(?:\/c\/[a-zA-Z0-9-]+)?|\/c\/[a-zA-Z0-9-]+)$/i,
+    );
+    return match?.[1]?.toLowerCase() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeProjectFamilyKey(value: string | null): string | null {
+  return value ? value.replace(/-oracle$/i, "") : null;
+}
+
+function projectScopeFamilyKey(url: string | undefined): string | null {
+  return normalizeProjectFamilyKey(projectScopeKey(url));
+}
+
 function projectConversationScopeKey(url: string | undefined): string | null {
   if (!url) {
     return null;
@@ -155,7 +179,7 @@ function projectConversationScopeKey(url: string | undefined): string | null {
     const parsed = new URL(url);
     const pathname = parsed.pathname.replace(/\/+$/, "");
     const match = pathname.match(/^\/g\/([^/]+)(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i);
-    return match?.[1]?.toLowerCase() ?? null;
+    return normalizeProjectFamilyKey(match?.[1]?.toLowerCase() ?? null);
   } catch {
     return null;
   }
@@ -170,11 +194,34 @@ function urlsShareProjectConversationScope(
   return Boolean(candidateKey && runtimeKey && candidateKey === runtimeKey);
 }
 
-function pickUniqueConversationShellTarget(targets: TargetInfoLite[]): TargetInfoLite | undefined {
+function pickUniqueConversationShellTarget(
+  targets: TargetInfoLite[],
+  runtimeProjectFamilyKey?: string | null,
+): TargetInfoLite | undefined {
   const shells = targets.filter(
-    (target) => isAttachableChatTarget(target) && isConversationShellTargetUrl(target.url),
+    (target) =>
+      isAttachableChatTarget(target) &&
+      isConversationShellTargetUrl(target.url) &&
+      (!runtimeProjectFamilyKey || projectScopeFamilyKey(target.url) === runtimeProjectFamilyKey),
   );
-  return shells.length === 1 ? shells[0] : undefined;
+  const distinctShellUrls = new Set(
+    shells
+      .map((target) => target.url?.replace(/\/+$/, ""))
+      .filter((value): value is string => Boolean(value)),
+  );
+  return distinctShellUrls.size === 1 ? shells[0] : undefined;
+}
+
+function hasProjectConversationShadowTarget(
+  targets: TargetInfoLite[],
+  conversationId: string,
+): boolean {
+  return targets.some(
+    (target) =>
+      !isPageTarget(target) &&
+      isProjectConversationTargetUrl(target.url) &&
+      extractConversationIdFromUrl(target.url || "") === conversationId,
+  );
 }
 
 function pickSafeFallbackTarget(targets: TargetInfoLite[]): TargetInfoLite | undefined {
@@ -233,20 +280,31 @@ export function getRuntimeConversationId(runtime: {
 export function pickTarget(
   targets: TargetInfoLite[],
   runtime: { chromeTargetId?: string; tabUrl?: string; conversationId?: string },
-  options?: { requireMatch?: boolean; allowProjectScopeRecovery?: boolean },
+  options?: {
+    requireMatch?: boolean;
+    allowProjectScopeRecovery?: boolean;
+    allowUniqueProjectShellFallback?: boolean;
+  },
 ): TargetInfoLite | undefined {
   if (!Array.isArray(targets) || targets.length === 0) {
     return undefined;
   }
   const attachableTargets = targets.filter(isAttachableChatTarget);
   const runtimeConversationId = getRuntimeConversationId(runtime);
+  const runtimeProjectScope = projectScopeKey(runtime.tabUrl);
+  const runtimeProjectFamily = normalizeProjectFamilyKey(runtimeProjectScope);
   if (runtimeConversationId) {
-    const projectConversationTarget = targets.find((target) => {
+    const projectConversationTargets = targets.filter((target) => {
       if (!isProjectConversationTargetUrl(target.url)) {
         return false;
       }
-      return extractConversationIdFromUrl(target.url || "") === runtimeConversationId;
+      if (extractConversationIdFromUrl(target.url || "") !== runtimeConversationId) {
+        return false;
+      }
+      return !runtimeProjectScope || projectScopeKey(target.url) === runtimeProjectScope;
     });
+    const projectConversationTarget =
+      projectConversationTargets.length === 1 ? projectConversationTargets[0] : undefined;
     if (projectConversationTarget) {
       const preferredProjectShellUrl = projectConversationShellUrl(projectConversationTarget.url);
       if (preferredProjectShellUrl) {
@@ -268,10 +326,15 @@ export function pickTarget(
     const runtimeProjectShellUrl = projectConversationShellUrl(runtime.tabUrl);
     const candidateUrl = byId?.url?.replace(/\/+$/, "");
     const candidateConversationId = extractConversationIdFromUrl(byId?.url || "");
+    const candidateProjectScope = projectScopeKey(byId?.url);
+    const conversationIdMatches =
+      candidateConversationId === runtimeConversationId &&
+      (!runtimeProjectScope ||
+        Boolean(candidateProjectScope && candidateProjectScope === runtimeProjectScope));
     if (
       byId &&
       (runtimeConversationId
-        ? candidateConversationId === runtimeConversationId ||
+        ? conversationIdMatches ||
           Boolean(
             runtimeProjectShellUrl &&
             candidateUrl &&
@@ -286,9 +349,13 @@ export function pickTarget(
     }
   }
   if (runtimeConversationId) {
-    const byConversation = attachableTargets.find(
-      (t) => extractConversationIdFromUrl(t.url || "") === runtimeConversationId,
-    );
+    const conversationMatches = attachableTargets.filter((t) => {
+      if (extractConversationIdFromUrl(t.url || "") !== runtimeConversationId) {
+        return false;
+      }
+      return !runtimeProjectScope || projectScopeKey(t.url) === runtimeProjectScope;
+    });
+    const byConversation = conversationMatches.length === 1 ? conversationMatches[0] : undefined;
     if (byConversation) {
       if (!isPageTarget(byConversation)) {
         const preferredProjectShellUrl = projectConversationShellUrl(byConversation.url);
@@ -338,8 +405,20 @@ export function pickTarget(
     }
   }
   if (runtimeConversationId) {
-    const shellTarget = pickUniqueConversationShellTarget(attachableTargets);
-    if (shellTarget) {
+    const shellTarget = pickUniqueConversationShellTarget(attachableTargets, runtimeProjectFamily);
+    const uniqueShellFallback =
+      shellTarget &&
+      options?.allowUniqueProjectShellFallback !== false &&
+      runtimeProjectFamily &&
+      attachableTargets.filter((target) => isConversationShellTargetUrl(target.url)).length === 1 &&
+      projectScopeFamilyKey(shellTarget.url) === runtimeProjectFamily &&
+      !hasProjectConversationShadowTarget(targets, runtimeConversationId);
+    if (
+      shellTarget &&
+      (!runtimeProjectScope ||
+        projectScopeKey(shellTarget.url) === runtimeProjectScope ||
+        uniqueShellFallback)
+    ) {
       return shellTarget;
     }
   }
@@ -369,10 +448,6 @@ function normalizeProjectBaseUrl(baseUrl: string): string | null {
     }
   }
   return null;
-}
-
-function escapeRegex(literal: string): string {
-  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function conversationHrefMatchesConfiguredScope(href: string, baseUrl: string): boolean {
@@ -406,24 +481,19 @@ export function conversationHrefMatchesConfiguredScope(href: string, baseUrl: st
       return false;
     }
     const configuredProjectId = projectMatch[1];
-    const projectIdCandidates = new Set([configuredProjectId]);
-    if (configuredProjectId.endsWith("-oracle")) {
-      projectIdCandidates.add(configuredProjectId.slice(0, -"-oracle".length));
-    } else {
-      projectIdCandidates.add(`${configuredProjectId}-oracle`);
+    const targetProjectMatch = normalizedTargetPath.match(
+      /^\/g\/([^/]+)(?:\/project(?:\/c\/[a-zA-Z0-9-]+)?|\/c\/[a-zA-Z0-9-]+)$/i,
+    );
+    const targetProjectId = targetProjectMatch?.[1];
+    if (!targetProjectId) {
+      return false;
     }
-    for (const projectId of projectIdCandidates) {
-      const projectIdPattern = escapeRegex(projectId);
-      if (
-        new RegExp(`^/g/${projectIdPattern}/project(?:/c/[a-zA-Z0-9-]+)?$`, "i").test(
-          normalizedTargetPath,
-        ) ||
-        new RegExp(`^/g/${projectIdPattern}/c/[a-zA-Z0-9-]+$`, "i").test(normalizedTargetPath)
-      ) {
-        return true;
-      }
+    if (/-oracle$/i.test(configuredProjectId)) {
+      return targetProjectId.toLowerCase() === configuredProjectId.toLowerCase();
     }
-    return false;
+    return (
+      normalizeProjectFamilyKey(targetProjectId) === normalizeProjectFamilyKey(configuredProjectId)
+    );
   } catch {
     const trimmedHref = href.replace(/\/+$/, "");
     return trimmedHref === projectBaseUrl || trimmedHref.startsWith(`${projectBaseUrl}/`);

@@ -24,7 +24,7 @@ import {
   type TargetInfoLite,
 } from "../browser/reattachHelpers.js";
 import type { BrowserLogger, ChromeClient } from "../browser/types.js";
-import { normalizeChatgptUrl } from "../browser/utils.js";
+import { isProjectScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
 
 const noopLogger: BrowserLogger = Object.assign((_: string) => {}, { verbose: false });
 const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
@@ -111,7 +111,8 @@ function configuredSupervisorScopeUrl(meta: SessionMetadata): string | undefined
     return undefined;
   }
   try {
-    return normalizeChatgptUrl(configuredProjectUrl, "https://chatgpt.com/");
+    const normalized = normalizeChatgptUrl(configuredProjectUrl, "https://chatgpt.com/");
+    return isProjectScopedChatgptUrl(normalized, "https://chatgpt.com/") ? normalized : undefined;
   } catch {
     return undefined;
   }
@@ -257,7 +258,7 @@ async function refreshOwnedSupervisorRuntime(
   }
   if (!configuredProjectUrl) {
     throw new Error(
-      "Refusing to attach: owned Oracle hidden browser runtime is missing a configured ChatGPT scope.",
+      "Refusing to attach: owned Oracle hidden browser runtime is missing a configured project-scoped ChatGPT URL (/g/.../project).",
     );
   }
   if (!runtimeMatchesConfiguredProjectScope(meta)) {
@@ -328,7 +329,10 @@ function pickSupervisorRuntimeTarget(
   strictTargetMatch: boolean,
 ): TargetInfoLite | undefined {
   const requireMatch = strictTargetMatch || runtimeRequiresSpecificTarget(runtime);
-  return pickTarget(targets, runtime, { requireMatch });
+  return pickTarget(targets, runtime, {
+    requireMatch,
+    allowUniqueProjectShellFallback: false,
+  });
 }
 
 function normalizeComparableUrl(url: string | undefined): string | null {
@@ -375,7 +379,7 @@ function inferSupervisorRuntimeScopeUrl(runtime: BrowserRuntimeMetadata): string
       return `${parsed.origin}${projectShellPath}`;
     }
     const projectConversationSlug = pathname.match(
-      /^\/g\/([^/]+?)(?:-oracle)?(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i,
+      /^\/g\/([^/]+)(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i,
     )?.[1];
     if (projectConversationSlug) {
       return `${parsed.origin}/g/${projectConversationSlug}/project`;
@@ -409,17 +413,21 @@ function pickSafeSupervisorRecoveryTarget(
     (target) =>
       (normalizedScopeUrl && scopeUrlsEquivalent(target.url, normalizedScopeUrl)) || false,
   );
-  if (scopeShellPages.length === 1) {
+  const distinctScopeShellUrls = new Set(
+    scopeShellPages
+      .map((target) => normalizeComparableUrl(target.url))
+      .filter((value): value is string => Boolean(value)),
+  );
+  if (distinctScopeShellUrls.size === 1 && scopeShellPages.length >= 1) {
     return scopeShellPages[0];
   }
-  if (scopeShellPages.length > 1) {
-    const nonShellScopePages = pageTargets.filter(
-      (target) =>
-        !((normalizedScopeUrl && scopeUrlsEquivalent(target.url, normalizedScopeUrl)) || false),
-    );
-    if (nonShellScopePages.length === 0) {
-      return scopeShellPages[0];
-    }
+  const distinctScopePageUrls = new Set(
+    pageTargets
+      .map((target) => normalizeComparableUrl(target.url))
+      .filter((value): value is string => Boolean(value)),
+  );
+  if (distinctScopePageUrls.size === 1 && pageTargets.length >= 1) {
+    return pageTargets[0];
   }
   return undefined;
 }

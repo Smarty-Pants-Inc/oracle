@@ -4,6 +4,7 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 import { __test__, runSupervisorBrokerRequest } from "../../src/cli/supervisorBroker.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { sessionStore } from "../../src/sessionStore.js";
@@ -1116,6 +1117,76 @@ describe("runSupervisorBrokerRequest", () => {
         broker.kill("SIGKILL");
       }
     }
+  }, 15_000);
+
+  test("flushes large piped broker responses before exit", async () => {
+    const brokerModuleUrl = pathToFileURL(
+      path.join(process.cwd(), "src", "cli", "supervisorBroker.ts"),
+    ).href;
+    const child = spawn(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `
+          import { __test__ } from ${JSON.stringify(brokerModuleUrl)};
+
+          const history = Array.from({ length: 180 }, (_, index) => ({
+            role: index % 2 === 0 ? "user" : "assistant",
+            text: \`entry-\${index} \${"x".repeat(512)}\`,
+          }));
+          await __test__.writeSupervisorBrokerResponseLine({
+            ok: true,
+            sessionId: "runtime-history",
+            thread: {
+              title: "Attached thread",
+              conversationId: "abc",
+              url: "https://chatgpt.com/c/abc",
+            },
+            history,
+            historyWindow: {
+              limit: 200,
+              returnedCount: history.length,
+              totalCount: history.length,
+              truncated: false,
+            },
+          });
+        `,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: string[] = [];
+    child.stdout?.on("data", (chunk) => {
+      stdoutChunks.push(Buffer.from(chunk));
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderrChunks.push(String(chunk));
+    });
+
+    const { code, signal } = await waitForChildExit(child, 15_000);
+    expect(code).toBe(0);
+    expect(signal).toBeNull();
+    expect(stderrChunks.join("").trim()).toBe("");
+
+    const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
+    expect(stdout.length).toBeGreaterThan(65_536);
+    const response = JSON.parse(stdout) as {
+      ok: boolean;
+      history: Array<{ role: string; text: string }>;
+      historyWindow: { returnedCount: number; totalCount: number; truncated: boolean };
+    };
+    expect(response.ok).toBe(true);
+    expect(response.history).toHaveLength(180);
+    expect(response.history.at(-1)?.text).toContain("entry-179");
+    expect(response.historyWindow).toEqual({
+      limit: 200,
+      returnedCount: 180,
+      totalCount: 180,
+      truncated: false,
+    });
   }, 15_000);
 
   test("filterSupervisorThreadsForBrokerProjectScope drops in-scope guesses that lack a URL", () => {

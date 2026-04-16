@@ -92,6 +92,20 @@ const SUPERVISOR_THREAD_PROMPT_PREFIX = "Supervisor thread:";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL = "gpt-5.4";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_LABEL = "Thinking 5.4";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_STRATEGY = "select";
+
+async function writeSupervisorBrokerResponseLine(response: unknown): Promise<void> {
+  const line = `${JSON.stringify(response)}\n`;
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(line, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
 interface ChromeFocusDeps {
   captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
@@ -622,7 +636,7 @@ export async function startSupervisorBroker(): Promise<void> {
         request = JSON.parse(trimmed) as SupervisorBrokerRequest;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        process.stdout.write(`${JSON.stringify({ ok: false, error: message })}\n`);
+        await writeSupervisorBrokerResponseLine({ ok: false, error: message });
         continue;
       }
       if (request.shutdown) {
@@ -630,7 +644,7 @@ export async function startSupervisorBroker(): Promise<void> {
         return;
       }
       const response = await runSupervisorBrokerRequest(request);
-      process.stdout.write(`${JSON.stringify(response)}\n`);
+      await writeSupervisorBrokerResponseLine(response);
     }
   } finally {
     stopInput();
@@ -649,4 +663,5 @@ export const __test__ = {
   filterSupervisorThreadsForBrokerProjectScope,
   isReusableSupervisorThreadSession,
   supervisorThreadSessionSlug,
+  writeSupervisorBrokerResponseLine,
 };

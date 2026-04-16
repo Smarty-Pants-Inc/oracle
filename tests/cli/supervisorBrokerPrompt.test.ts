@@ -244,18 +244,18 @@ describe("resolveSupervisorChatgptUrl", () => {
     expect(url).toBe(SUPERVISOR_PROJECT_URL);
   });
 
-  test("accepts an explicit supervisor root override", async () => {
-    const url = await __test__.resolveSupervisorChatgptUrl({
-      userConfig: {
-        browser: {
-          supervisorChatgptUrl: "https://chatgpt.com/",
-          chatgptUrl: SUPERVISOR_PROJECT_URL,
+  test("rejects an explicit supervisor root override", async () => {
+    await expect(
+      __test__.resolveSupervisorChatgptUrl({
+        userConfig: {
+          browser: {
+            supervisorChatgptUrl: "https://chatgpt.com/",
+            chatgptUrl: SUPERVISOR_PROJECT_URL,
+          },
         },
-      },
-      env: {},
-    });
-
-    expect(url).toBe("https://chatgpt.com/");
+        env: {},
+      }),
+    ).rejects.toThrow(/project-scoped ChatGPT URL/i);
   });
 
   test("accepts a project-scoped browser url from config", async () => {
@@ -271,26 +271,26 @@ describe("resolveSupervisorChatgptUrl", () => {
     expect(url).toBe(SUPERVISOR_PROJECT_URL);
   });
 
-  test("defaults supervisor runs to the ChatGPT root when a root browser url is configured", async () => {
-    const url = await __test__.resolveSupervisorChatgptUrl({
-      userConfig: {
-        browser: {
-          chatgptUrl: "https://chatgpt.com/",
+  test("rejects supervisor runs when a root browser url is configured", async () => {
+    await expect(
+      __test__.resolveSupervisorChatgptUrl({
+        userConfig: {
+          browser: {
+            chatgptUrl: "https://chatgpt.com/",
+          },
         },
-      },
-      env: {},
-    });
-
-    expect(url).toBe("https://chatgpt.com/");
+        env: {},
+      }),
+    ).rejects.toThrow(/project-scoped ChatGPT URL/i);
   });
 
-  test("defaults supervisor runs to the ChatGPT root when browser url is omitted", async () => {
-    const url = await __test__.resolveSupervisorChatgptUrl({
-      userConfig: {},
-      env: {},
-    });
-
-    expect(url).toBe("https://chatgpt.com/");
+  test("rejects supervisor runs when no project-scoped URL is configured", async () => {
+    await expect(
+      __test__.resolveSupervisorChatgptUrl({
+        userConfig: {},
+        env: {},
+      }),
+    ).rejects.toThrow(/project-scoped ChatGPT URL/i);
   });
 });
 

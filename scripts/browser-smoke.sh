@@ -16,7 +16,7 @@ CMD=(
   --browser-hide-window
   --chatgpt-url "$PROJECT_URL"
 )
-FAST_MODEL="${ORACLE_BROWSER_SMOKE_FAST_MODEL:-gpt-5.2}"
+BASE_MODEL="${ORACLE_BROWSER_SMOKE_BASE_MODEL:-${ORACLE_BROWSER_SMOKE_FAST_MODEL:-gpt-5.4}}"
 THINKING_MODEL="${ORACLE_BROWSER_SMOKE_THINKING_MODEL:-gpt-5.4}"
 PRO_MODEL="${ORACLE_BROWSER_SMOKE_PRO_MODEL:-gpt-5.4-pro}"
 
@@ -48,16 +48,16 @@ export ORACLE_BROWSER_PROFILE_DIR="$HIDDEN_PROFILE"
 tmpfile="$(mktemp -t oracle-browser-smoke)"
 echo "smoke-attachment" >"$tmpfile"
 
-echo "[browser-smoke] fast upload attachment (non-inline)"
-"${CMD[@]}" --model "$FAST_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-upload --force
+echo "[browser-smoke] base upload attachment (non-inline)"
+"${CMD[@]}" --model "$BASE_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-upload --force
 
-echo "[browser-smoke] fast simple"
-"${CMD[@]}" --model "$FAST_MODEL" --prompt "Return exactly one markdown bullet: '- pro-ok'." --slug browser-smoke-pro --force
+echo "[browser-smoke] base simple"
+"${CMD[@]}" --model "$BASE_MODEL" --prompt "Return exactly one markdown bullet: '- base-ok'." --slug browser-smoke-base --force
 
 echo "[browser-smoke] exact existing-thread attach proof"
 attach_seed_slug="browser-smoke-attach-seed"
 attach_proof_slug="browser-smoke-attach-proof"
-"${CMD[@]}" --model "$FAST_MODEL" --prompt "Return exactly 'attach-seed-ok'." --slug "$attach_seed_slug" --force
+"${CMD[@]}" --model "$BASE_MODEL" --prompt "Return exactly 'attach-seed-ok'." --slug "$attach_seed_slug" --force
 attach_seed_meta="$HOME/.oracle/sessions/$attach_seed_slug/meta.json"
 attach_thread_url="$(node -e "const fs=require('fs');const meta=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const url=meta?.browser?.runtime?.tabUrl||'';if(!url.includes('/c/'))process.exit(1);process.stdout.write(url);" "$attach_seed_meta")" || {
   echo "[browser-smoke] attach proof: missing exact thread url"
@@ -67,7 +67,7 @@ attach_conversation_id="$(node -e "const fs=require('fs');const meta=JSON.parse(
   echo "[browser-smoke] attach proof: missing conversation id"
   exit 1
 }
-"${CMD[@]}" --model "$FAST_MODEL" --chatgpt-url "$attach_thread_url" --prompt "Return exactly 'attach-proof-ok'." --slug "$attach_proof_slug" --force
+"${CMD[@]}" --model "$BASE_MODEL" --chatgpt-url "$attach_thread_url" --prompt "Return exactly 'attach-proof-ok'." --slug "$attach_proof_slug" --force
 attach_proof_meta="$HOME/.oracle/sessions/$attach_proof_slug/meta.json"
 node - <<'NODE' "$attach_proof_meta" "$attach_thread_url" "$attach_conversation_id"
 const fs = require('fs');
@@ -86,8 +86,8 @@ if (meta?.response?.assistantOutput?.trim() !== 'attach-proof-ok') {
 }
 NODE
 
-echo "[browser-smoke] fast with attachment preview (inline)"
-"${CMD[@]}" --model "$FAST_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
+echo "[browser-smoke] base with attachment preview (inline)"
+"${CMD[@]}" --model "$BASE_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
 
 echo "[browser-smoke] thinking model simple"
 "${CMD[@]}" --model "$THINKING_MODEL" --prompt "Return exactly one markdown bullet: '- thinking-ok'." --slug browser-smoke-thinking-model --force
