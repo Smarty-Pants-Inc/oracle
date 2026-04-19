@@ -390,11 +390,13 @@ export async function performSessionRun({
           });
         }
       }
+      const downloadsDir = path.join(sessionStore.sessionsDir(), sessionMeta.id, "downloads");
       const result = effectiveParentSession
         ? await continueBrowserSessionExecution(
             {
               runOptions,
               browserConfig,
+              downloadsDir,
               cwd,
               log,
               sessionLog: browserSessionLog,
@@ -407,6 +409,7 @@ export async function performSessionRun({
             {
               runOptions,
               browserConfig,
+              downloadsDir,
               cwd,
               log,
               sessionLog: browserSessionLog,
@@ -476,6 +479,7 @@ export async function performSessionRun({
         response: {
           status: "completed",
           assistantOutput: result.answerText ?? "",
+          downloads: result.downloads,
         },
         transport: undefined,
         error: undefined,
@@ -1093,6 +1097,7 @@ async function autoReattachUntilComplete({
       };
       const result = await resumeBrowserSession(currentRuntime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
+        downloadsDir: path.join(sessionStore.sessionsDir(), sessionMeta.id, "downloads"),
       });
       currentRuntime = result.runtime ?? currentRuntime;
       const answerText = result.answerMarkdown || result.answerText || "";
@@ -1142,6 +1147,7 @@ async function autoReattachUntilComplete({
         response: {
           status: "completed",
           assistantOutput: answerText,
+          downloads: result.downloads,
         },
         error: undefined,
         transport: undefined,

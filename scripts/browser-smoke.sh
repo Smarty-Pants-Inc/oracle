@@ -89,6 +89,34 @@ NODE
 echo "[browser-smoke] base with attachment preview (inline)"
 "${CMD[@]}" --model "$BASE_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
 
+echo "[browser-smoke] assistant hyperlinked file download"
+download_token="BROWSER_SMOKE_DOWNLOAD_$(date +%s)"
+download_slug="browser-smoke-download"
+"${CMD[@]}" --model "$BASE_MODEL" --prompt $'Generate an example markdown file named browser-smoke-download.md whose exact contents are:\n# Browser Smoke Download\n\n'"$download_token"$'\n\nProvide it in your reply as a clickable markdown hyperlink to the file, with no extra explanation.' --slug "$download_slug" --force
+download_meta="$HOME/.oracle/sessions/$download_slug/meta.json"
+node - <<'NODE' "$download_meta" "$download_token"
+const fs = require('fs');
+const [metaPath, expectedToken] = process.argv.slice(2);
+const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+if (!String(meta?.response?.assistantOutput ?? '').includes('browser-smoke-download.md')) {
+  throw new Error(`download proof output mismatch: ${meta?.response?.assistantOutput ?? 'missing'}`);
+}
+const downloads = Array.isArray(meta?.response?.downloads) ? meta.response.downloads : [];
+if (downloads.length === 0) {
+  throw new Error('download proof missing response.downloads metadata');
+}
+const matched = downloads.some((entry) => {
+  const filePath = entry?.path;
+  if (!filePath || !fs.existsSync(filePath)) {
+    return false;
+  }
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n') === `# Browser Smoke Download\n\n${expectedToken}\n`;
+});
+if (!matched) {
+  throw new Error(`download proof did not save a file containing ${expectedToken}`);
+}
+NODE
+
 echo "[browser-smoke] thinking model simple"
 "${CMD[@]}" --model "$THINKING_MODEL" --prompt "Return exactly one markdown bullet: '- thinking-ok'." --slug browser-smoke-thinking-model --force
 

@@ -3,6 +3,7 @@ import type { RunOracleOptions } from "../oracle.js";
 import { formatTokenCount } from "../oracle/runUtils.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
 import type {
+  BrowserDownloadedFile,
   BrowserSessionConfig,
   BrowserRuntimeMetadata,
   SessionMetadata,
@@ -26,11 +27,13 @@ export interface BrowserExecutionResult {
   elapsedMs: number;
   runtime: BrowserRuntimeMetadata;
   answerText: string;
+  downloads?: BrowserDownloadedFile[];
 }
 
 interface RunBrowserSessionArgs {
   runOptions: RunOracleOptions;
   browserConfig: BrowserSessionConfig;
+  downloadsDir?: string;
   cwd: string;
   log: (message?: string) => void;
   sessionLog?: (message?: string) => void;
@@ -83,6 +86,7 @@ export async function runBrowserSessionExecution(
   {
     runOptions,
     browserConfig,
+    downloadsDir,
     cwd,
     log,
     sessionLog: sessionLogArg,
@@ -162,6 +166,7 @@ export async function runBrowserSessionExecution(
           }
         : undefined,
       config: browserConfig,
+      downloadsDir,
       log: automationLogger,
       heartbeatIntervalMs: runOptions.heartbeatIntervalMs,
       verbose: runOptions.verbose,
@@ -233,6 +238,7 @@ export async function runBrowserSessionExecution(
       controllerPid: browserResult.controllerPid ?? process.pid,
     },
     answerText,
+    downloads: browserResult.downloads,
   };
 }
 
@@ -240,6 +246,7 @@ export async function continueBrowserSessionExecution(
   {
     runOptions,
     browserConfig,
+    downloadsDir,
     cwd,
     log,
     sessionLog: sessionLogArg,
@@ -317,11 +324,15 @@ export async function continueBrowserSessionExecution(
     !deps.baselineAssistant && parentAssistantOutput
       ? {
           ...deps,
+          downloadsDir,
           baselineAssistant: {
             text: parentAssistantOutput,
           },
         }
-      : deps;
+      : {
+          ...deps,
+          downloadsDir,
+        };
   let result;
   try {
     result = await continueBrowser(
@@ -331,6 +342,7 @@ export async function continueBrowserSessionExecution(
       {
         prompt: promptArtifacts.composerText,
         attachments: promptArtifacts.attachments,
+        downloadsDir,
         fallbackSubmission: promptArtifacts.fallback
           ? {
               prompt: promptArtifacts.fallback.composerText,
@@ -391,5 +403,6 @@ export async function continueBrowserSessionExecution(
     elapsedMs,
     runtime: mergedRuntime,
     answerText: result.answerMarkdown || result.answerText || "",
+    downloads: result.downloads,
   };
 }

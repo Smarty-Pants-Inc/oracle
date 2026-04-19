@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import kleur from "kleur";
+import path from "node:path";
 import type {
   SessionMetadata,
   SessionTransportMetadata,
@@ -193,7 +194,10 @@ export async function attachSession(
           }) as unknown as BrowserLogger,
           { verbose: true },
         ),
-        { promptPreview: metadata.promptPreview },
+        {
+          promptPreview: metadata.promptPreview,
+          downloadsDir: path.join(sessionStore.sessionsDir(), metadata.id, "downloads"),
+        },
       );
       const outputTokens = estimateTokenCount(result.answerMarkdown);
       const logWriter = sessionStore.createLogWriter(sessionId);
@@ -229,6 +233,7 @@ export async function attachSession(
         response: {
           status: "completed",
           assistantOutput: result.answerMarkdown || result.answerText,
+          downloads: result.downloads,
         },
         error: undefined,
         transport: undefined,

@@ -760,6 +760,54 @@ describe("performSessionRun", () => {
     );
   });
 
+  test("persists browser downloads in session response metadata", async () => {
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 },
+      elapsedMs: 2000,
+      runtime: { chromePid: 123, chromePort: 9222, userDataDir: "/tmp/profile" },
+      answerText: "Answer",
+      downloads: [
+        {
+          path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+          suggestedFilename: "proof.txt",
+          sizeBytes: 12,
+        },
+      ],
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(runBrowserSessionExecution)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+      }),
+      expect.anything(),
+    );
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      response: {
+        status: "completed",
+        assistantOutput: "Answer",
+        downloads: [
+          {
+            path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+            suggestedFilename: "proof.txt",
+            sizeBytes: 12,
+          },
+        ],
+      },
+    });
+  });
+
   test("records browser progress in session metadata and dedicated logs", async () => {
     vi.mocked(runBrowserSessionExecution).mockImplementation(async (args) => {
       await args.persistProgress?.({

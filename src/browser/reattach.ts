@@ -2,7 +2,11 @@ import CDP from "chrome-remote-interface";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
+import type {
+  BrowserDownloadedFile,
+  BrowserRuntimeMetadata,
+  BrowserSessionConfig,
+} from "../sessionStore.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -73,6 +77,7 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { delay, estimateTokenCount, withRetries } from "./utils.js";
+import { captureAssistantDownloads } from "./playwrightDownloads.js";
 
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
@@ -99,12 +104,14 @@ export interface ReattachDeps {
     messageId?: string | null;
     turnId?: string | null;
   } | null;
+  downloadsDir?: string;
   forceConversationReload?: boolean;
 }
 
 export interface ReattachResult {
   answerText: string;
   answerMarkdown: string;
+  downloads?: BrowserDownloadedFile[];
   answerTokens?: number;
   tookMs?: number;
   runtime?: BrowserRuntimeMetadata;
@@ -113,6 +120,7 @@ export interface ReattachResult {
 export interface ContinueBrowserSessionOptions {
   prompt: string;
   attachments?: BrowserAttachment[];
+  downloadsDir?: string;
   fallbackSubmission?: { prompt: string; attachments: BrowserAttachment[] };
 }
 
@@ -814,12 +822,14 @@ async function waitForExactLocation(
 }
 
 async function captureConversationResponse(
+  runtime: BrowserRuntimeMetadata,
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   deps: ReattachDeps,
   timeoutMs: number,
   promptPreview?: string,
   baselineTurns?: number | null,
+  downloadsDir?: string,
 ): Promise<ReattachResult> {
   const startedAt = Date.now();
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
@@ -937,9 +947,27 @@ async function captureConversationResponse(
     stage: "assistant-completed",
     message: "Captured the assistant response from the bound ChatGPT conversation.",
   });
+  const currentUrl = (await readCurrentHref(Runtime).catch(() => "")) || runtime.tabUrl;
+  const downloads = await captureAssistantDownloads({
+    browserWSEndpoint: runtime.chromeBrowserWSEndpoint,
+    chromeHost: runtime.chromeHost,
+    chromePort: runtime.chromePort,
+    chromeTargetId: runtime.chromeTargetId,
+    tabUrl: currentUrl,
+    conversationId: extractConversationIdFromUrl(currentUrl ?? runtime.tabUrl ?? ""),
+    downloadsDir,
+    meta: recovered.meta,
+    logger,
+  }).catch((error) => {
+    logger.sessionLog?.(
+      `[browser-downloads] skipped during follow-up capture: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return [];
+  });
   return {
     answerText,
     answerMarkdown,
+    downloads,
     answerTokens: estimateTokenCount(answerText),
     tookMs: Date.now() - startedAt,
   };
@@ -1804,12 +1832,14 @@ export async function resumeBrowserSession(
         }
       }
       const result = await captureConversationResponse(
+        boundRuntime,
         Runtime,
         logger,
         deps,
         timeoutMs,
         deps.promptPreview,
         deps.baselineTurns,
+        deps.downloadsDir,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -1981,12 +2011,14 @@ async function resumeBrowserSessionViaNewChrome(
     });
 
     const result = await captureConversationResponse(
+      boundRuntime,
       Runtime,
       logger,
       deps,
       resolved.timeoutMs ?? 120_000,
       deps.promptPreview,
       deps.baselineTurns,
+      deps.downloadsDir,
     );
     const href = await readCurrentHref(Runtime);
     await closeClient(client);
@@ -2147,6 +2179,7 @@ export async function continueBrowserSession(
       submittedBaselineAssistant = submission.baselineAssistant;
       promptSubmitted = true;
       const result = await captureConversationResponse(
+        boundRuntime,
         Runtime,
         logger,
         {
@@ -2156,6 +2189,7 @@ export async function continueBrowserSession(
         timeoutMs,
         submittedPromptPreview,
         submission.baselineTurns,
+        options.downloadsDir,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -2439,6 +2473,7 @@ async function continueBrowserSessionViaNewChrome(
     let resumedAfterObservationFailure = false;
     try {
       result = await captureConversationResponse(
+        launchedRuntime,
         Runtime,
         logger,
         {
@@ -2448,6 +2483,7 @@ async function continueBrowserSessionViaNewChrome(
         resolved.timeoutMs ?? 120_000,
         submittedPrompt,
         submittedBaselineTurns,
+        options.downloadsDir,
       );
     } catch (error) {
       const assistantRecheckConfigured =

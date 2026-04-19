@@ -72,6 +72,61 @@ describe("runBrowserSessionExecution", () => {
     expect(log).toHaveBeenCalled();
   });
 
+  test("passes downloadsDir through and surfaces downloaded files", async () => {
+    const log = vi.fn();
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "ok",
+      answerMarkdown: "ok",
+      tookMs: 50,
+      answerTokens: 2,
+      answerChars: 2,
+      downloads: [
+        {
+          path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+          suggestedFilename: "proof.txt",
+          sizeBytes: 12,
+        },
+      ],
+    }));
+
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 10,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+      }),
+    );
+    expect(result.downloads).toEqual([
+      {
+        path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+        suggestedFilename: "proof.txt",
+        sizeBytes: 12,
+      },
+    ]);
+  });
+
   test("persists attach-mode runtime metadata from the browser runner", async () => {
     const log = vi.fn();
     const persistRuntimeHint = vi.fn();
@@ -522,6 +577,83 @@ describe("continueBrowserSessionExecution", () => {
       elapsedMs: 321,
       answerText: "continued",
     });
+  });
+
+  test("threads downloadsDir into browser follow-ups and returns downloads", async () => {
+    const log = vi.fn();
+    const parentSession: SessionMetadata = {
+      id: "parent",
+      createdAt: "2025-01-01T00:00:00Z",
+      status: "completed",
+      mode: "browser",
+      options: {},
+      response: {
+        status: "completed",
+        assistantOutput: "PREVIOUS_ORACLE_RESULT",
+      },
+      browser: {
+        config: {},
+        runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+      },
+    };
+    const continueBrowser = vi.fn(async () => ({
+      answerText: "continued",
+      answerMarkdown: "continued",
+      tookMs: 321,
+      answerTokens: 9,
+      downloads: [
+        {
+          path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+          suggestedFilename: "proof.txt",
+          sizeBytes: 12,
+        },
+      ],
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/abc" },
+    }));
+
+    const result = await continueBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+        cwd: "/repo",
+        log,
+        parentSession,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "never",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        continueBrowser,
+      },
+    );
+
+    expect(continueBrowser).toHaveBeenCalledWith(
+      expect.anything(),
+      baseConfig,
+      expect.any(Function),
+      expect.objectContaining({
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+      }),
+      expect.objectContaining({
+        downloadsDir: "/tmp/.oracle/sessions/sess-1/downloads",
+      }),
+    );
+    expect(result.downloads).toEqual([
+      {
+        path: "/tmp/.oracle/sessions/sess-1/downloads/proof.txt",
+        suggestedFilename: "proof.txt",
+        sizeBytes: 12,
+      },
+    ]);
   });
 
   test("persists follow-up progress and writes milestone logs even when not verbose", async () => {

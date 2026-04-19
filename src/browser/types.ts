@@ -1,6 +1,6 @@
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
-import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { BrowserDownloadedFile, BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
@@ -102,6 +102,7 @@ export interface BrowserAutomationConfig {
 export interface BrowserRunOptions {
   prompt: string;
   attachments?: BrowserAttachment[];
+  downloadsDir?: string;
   /**
    * Optional secondary submission to try if the initial prompt is rejected by ChatGPT
    * (e.g. inline file paste exceeds composer limits). Intended for auto inline->upload fallback.
@@ -119,6 +120,7 @@ export interface BrowserRunResult {
   answerText: string;
   answerMarkdown: string;
   answerHtml?: string;
+  downloads?: BrowserDownloadedFile[];
   tookMs: number;
   answerTokens: number;
   answerChars: number;

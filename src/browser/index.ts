@@ -49,6 +49,7 @@ import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
+import { captureAssistantDownloads } from "./playwrightDownloads.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import {
@@ -331,6 +332,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
+  let answerMeta: { turnId?: string | null; messageId?: string | null } = {};
   let runStatus: "attempted" | "complete" = "attempted";
   let connectionClosedUnexpectedly = false;
   let stopThinkingMonitor: (() => void) | null = null;
@@ -916,7 +918,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     // Ensure we store the final conversation URL even if the UI updated late.
     await updateConversationHint("post-response", 15_000);
-    ({ answerText, answerMarkdown, answerHtml } = await finalizeAssistantResponseCapture({
+    ({
+      answerText,
+      answerMarkdown,
+      answerHtml,
+      meta: answerMeta,
+    } = await finalizeAssistantResponseCapture({
       runtime: Runtime,
       promptText,
       baselineTurns,
@@ -961,10 +968,27 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const durationMs = Date.now() - startedAt;
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
+    const downloads = await captureAssistantDownloads({
+      browserWSEndpoint: chromeBrowserWSEndpoint,
+      chromeHost,
+      chromePort: chrome.port,
+      chromeTargetId: lastTargetId,
+      tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      downloadsDir: options.downloadsDir,
+      meta: answerMeta,
+      logger,
+    }).catch((error) => {
+      logger.sessionLog?.(
+        `[browser-downloads] skipped during browser run: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    });
     return {
       answerText,
       answerMarkdown,
       answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
+      downloads,
       tookMs: durationMs,
       answerTokens,
       answerChars,
@@ -1410,7 +1434,12 @@ async function finalizeAssistantResponseCapture({
   answer: AssistantPayload;
   logger: BrowserLogger;
   captureMarkdown: () => Promise<string | null>;
-}): Promise<{ answerText: string; answerMarkdown: string; answerHtml: string }> {
+}): Promise<{
+  answerText: string;
+  answerMarkdown: string;
+  answerHtml: string;
+  meta: { turnId?: string | null; messageId?: string | null };
+}> {
   const baselineNormalized = baselineAssistantText
     ? normalizeForComparison(baselineAssistantText)
     : "";
@@ -1447,6 +1476,10 @@ async function finalizeAssistantResponseCapture({
   const finalSnapshot = await readAssistantSnapshot(runtime, baselineTurns ?? undefined).catch(
     () => null,
   );
+  const answerMeta = {
+    turnId: answer.meta?.turnId ?? finalSnapshot?.turnId ?? undefined,
+    messageId: answer.meta?.messageId ?? finalSnapshot?.messageId ?? undefined,
+  };
   const finalText = typeof finalSnapshot?.text === "string" ? finalSnapshot.text.trim() : "";
   if (
     shouldReplaceAssistantCaptureWithDomSnapshot({
@@ -1504,6 +1537,7 @@ async function finalizeAssistantResponseCapture({
     answerText,
     answerMarkdown,
     answerHtml,
+    meta: answerMeta,
   };
 }
 
@@ -1704,6 +1738,7 @@ async function runRemoteBrowserMode(
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
+  let answerMeta: { turnId?: string | null; messageId?: string | null } = {};
   let connectionClosedUnexpectedly = false;
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
@@ -2071,7 +2106,12 @@ async function runRemoteBrowserMode(
         throw error;
       }
     }
-    ({ answerText, answerMarkdown, answerHtml } = await finalizeAssistantResponseCapture({
+    ({
+      answerText,
+      answerMarkdown,
+      answerHtml,
+      meta: answerMeta,
+    } = await finalizeAssistantResponseCapture({
       runtime: Runtime,
       promptText,
       baselineTurns,
@@ -2107,11 +2147,28 @@ async function runRemoteBrowserMode(
     const durationMs = Date.now() - startedAt;
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
+    const downloads = await captureAssistantDownloads({
+      browserWSEndpoint: browserWSEndpoint,
+      chromeHost: host,
+      chromePort: port,
+      chromeTargetId: remoteTargetId ?? undefined,
+      tabUrl: lastUrl,
+      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      downloadsDir: options.downloadsDir,
+      meta: answerMeta,
+      logger,
+    }).catch((error) => {
+      logger.sessionLog?.(
+        `[browser-downloads] skipped during remote browser run: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    });
 
     return {
       answerText,
       answerMarkdown,
       answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
+      downloads,
       tookMs: durationMs,
       answerTokens,
       answerChars,

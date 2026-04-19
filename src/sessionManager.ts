@@ -95,6 +95,12 @@ export interface SessionProgressMetadata {
   chromeTargetId?: string;
 }
 
+export interface BrowserDownloadedFile {
+  path: string;
+  suggestedFilename?: string;
+  sizeBytes?: number;
+}
+
 export interface SupervisorThreadBindingMetadata {
   conversationId: string;
   url?: string;
@@ -108,6 +114,7 @@ export interface SessionResponseMetadata {
   status?: string;
   incompleteReason?: string | null;
   assistantOutput?: string;
+  downloads?: BrowserDownloadedFile[];
 }
 
 export interface SessionTransportMetadata {
