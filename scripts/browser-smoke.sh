@@ -47,7 +47,7 @@ export ORACLE_BROWSER_PROFILE_DIR="$HIDDEN_PROFILE"
 
 tmpfile="$(mktemp -t oracle-browser-smoke)"
 echo "smoke-attachment" >"$tmpfile"
-run_id="$(date +%s)-$$"
+run_id="$(date +%s)"
 
 echo "[browser-smoke] base upload attachment (non-inline)"
 "${CMD[@]}" --model "$BASE_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug "browser-smoke-upload-$run_id" --force
