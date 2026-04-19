@@ -91,10 +91,12 @@ echo "[browser-smoke] base with attachment preview (inline)"
 
 echo "[browser-smoke] assistant hyperlinked file download"
 download_token="BROWSER_SMOKE_DOWNLOAD_$(date +%s)"
-download_slug="browser-smoke-download"
-"${CMD[@]}" --model "$BASE_MODEL" --prompt $'Generate an example markdown file named browser-smoke-download.md whose exact contents are:\n# Browser Smoke Download\n\n'"$download_token"$'\n\nProvide it in your reply as a clickable markdown hyperlink to the file, with no extra explanation.' --slug "$download_slug" --force
-download_meta="$HOME/.oracle/sessions/$download_slug/meta.json"
-node - <<'NODE' "$download_meta" "$download_token"
+download_verified=0
+for attempt in 1 2 3; do
+  download_slug="browser-smoke-download-$attempt"
+  "${CMD[@]}" --model "$BASE_MODEL" --prompt $'Generate an example markdown file named browser-smoke-download.md whose exact contents are:\n# Browser Smoke Download\n\n'"$download_token"$'\n\nProvide it in your reply as a clickable markdown hyperlink to the file, with no extra explanation.' --slug "$download_slug" --force
+  download_meta="$HOME/.oracle/sessions/$download_slug/meta.json"
+  if node - <<'NODE' "$download_meta" "$download_token"
 const fs = require('fs');
 const [metaPath, expectedToken] = process.argv.slice(2);
 const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
@@ -116,6 +118,19 @@ if (!matched) {
   throw new Error(`download proof did not save a file containing ${expectedToken}`);
 }
 NODE
+  then
+    download_verified=1
+    break
+  fi
+  if [ "$attempt" -lt 3 ]; then
+    echo "[browser-smoke] download proof attempt $attempt failed; retrying"
+  fi
+done
+
+[ "$download_verified" -eq 1 ] || {
+  echo "[browser-smoke] download proof failed after retries"
+  exit 1
+}
 
 echo "[browser-smoke] thinking model simple"
 "${CMD[@]}" --model "$THINKING_MODEL" --prompt "Return exactly one markdown bullet: '- thinking-ok'." --slug browser-smoke-thinking-model --force
