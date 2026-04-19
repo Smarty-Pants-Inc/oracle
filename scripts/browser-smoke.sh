@@ -47,16 +47,17 @@ export ORACLE_BROWSER_PROFILE_DIR="$HIDDEN_PROFILE"
 
 tmpfile="$(mktemp -t oracle-browser-smoke)"
 echo "smoke-attachment" >"$tmpfile"
+run_id="$(date +%s)-$$"
 
 echo "[browser-smoke] base upload attachment (non-inline)"
-"${CMD[@]}" --model "$BASE_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-upload --force
+"${CMD[@]}" --model "$BASE_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug "browser-smoke-upload-$run_id" --force
 
 echo "[browser-smoke] base simple"
-"${CMD[@]}" --model "$BASE_MODEL" --prompt "Return exactly one markdown bullet: '- base-ok'." --slug browser-smoke-base --force
+"${CMD[@]}" --model "$BASE_MODEL" --prompt "Return exactly one markdown bullet: '- base-ok'." --slug "browser-smoke-base-$run_id" --force
 
 echo "[browser-smoke] exact existing-thread attach proof"
-attach_seed_slug="browser-smoke-attach-seed"
-attach_proof_slug="browser-smoke-attach-proof"
+attach_seed_slug="browser-smoke-attach-seed-$run_id"
+attach_proof_slug="browser-smoke-attach-proof-$run_id"
 "${CMD[@]}" --model "$BASE_MODEL" --prompt "Return exactly 'attach-seed-ok'." --slug "$attach_seed_slug" --force
 attach_seed_meta="$HOME/.oracle/sessions/$attach_seed_slug/meta.json"
 attach_thread_url="$(node -e "const fs=require('fs');const meta=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const url=meta?.browser?.runtime?.tabUrl||'';if(!url.includes('/c/'))process.exit(1);process.stdout.write(url);" "$attach_seed_meta")" || {
@@ -87,13 +88,13 @@ if (meta?.response?.assistantOutput?.trim() !== 'attach-proof-ok') {
 NODE
 
 echo "[browser-smoke] base with attachment preview (inline)"
-"${CMD[@]}" --model "$BASE_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
+"${CMD[@]}" --model "$BASE_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug "browser-smoke-file-$run_id" --preview --force
 
 echo "[browser-smoke] assistant hyperlinked file download"
 download_token="BROWSER_SMOKE_DOWNLOAD_$(date +%s)"
 download_verified=0
 for attempt in 1 2 3; do
-  download_slug="browser-smoke-download-$attempt"
+  download_slug="browser-smoke-download-$run_id-$attempt"
   "${CMD[@]}" --model "$BASE_MODEL" --prompt $'Generate an example markdown file named browser-smoke-download.md whose exact contents are:\n# Browser Smoke Download\n\n'"$download_token"$'\n\nProvide it in your reply as a clickable markdown hyperlink to the file, with no extra explanation.' --slug "$download_slug" --force
   download_meta="$HOME/.oracle/sessions/$download_slug/meta.json"
   if node - <<'NODE' "$download_meta" "$download_token"
@@ -133,13 +134,13 @@ done
 }
 
 echo "[browser-smoke] thinking model simple"
-"${CMD[@]}" --model "$THINKING_MODEL" --prompt "Return exactly one markdown bullet: '- thinking-ok'." --slug browser-smoke-thinking-model --force
+"${CMD[@]}" --model "$THINKING_MODEL" --prompt "Return exactly one markdown bullet: '- thinking-ok'." --slug "browser-smoke-thinking-model-$run_id" --force
 
 echo "[browser-smoke] pro standard markdown check"
-"${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug browser-smoke-thinking --force
+"${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug "browser-smoke-thinking-$run_id" --force
 
 echo "[browser-smoke] reattach flow after controller loss"
-slug="browser-reattach-smoke"
+slug="browser-reattach-smoke-$run_id"
 meta="$HOME/.oracle/sessions/$slug/meta.json"
 logfile="$(mktemp -t oracle-browser-reattach)"
 
