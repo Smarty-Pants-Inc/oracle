@@ -171,6 +171,16 @@ function projectScopeFamilyKey(url: string | undefined): string | null {
   return normalizeProjectFamilyKey(projectScopeKey(url));
 }
 
+function projectScopeMatchesRuntimeFamily(
+  targetUrl: string | undefined,
+  runtimeProjectFamily: string | null,
+): boolean {
+  if (!runtimeProjectFamily) {
+    return false;
+  }
+  return projectScopeFamilyKey(targetUrl) === runtimeProjectFamily;
+}
+
 function projectConversationScopeKey(url: string | undefined): string | null {
   if (!url) {
     return null;
@@ -301,7 +311,9 @@ export function pickTarget(
       if (extractConversationIdFromUrl(target.url || "") !== runtimeConversationId) {
         return false;
       }
-      return !runtimeProjectScope || projectScopeKey(target.url) === runtimeProjectScope;
+      return (
+        !runtimeProjectScope || projectScopeMatchesRuntimeFamily(target.url, runtimeProjectFamily)
+      );
     });
     const projectConversationTarget =
       projectConversationTargets.length === 1 ? projectConversationTargets[0] : undefined;
@@ -326,11 +338,9 @@ export function pickTarget(
     const runtimeProjectShellUrl = projectConversationShellUrl(runtime.tabUrl);
     const candidateUrl = byId?.url?.replace(/\/+$/, "");
     const candidateConversationId = extractConversationIdFromUrl(byId?.url || "");
-    const candidateProjectScope = projectScopeKey(byId?.url);
     const conversationIdMatches =
       candidateConversationId === runtimeConversationId &&
-      (!runtimeProjectScope ||
-        Boolean(candidateProjectScope && candidateProjectScope === runtimeProjectScope));
+      (!runtimeProjectScope || projectScopeMatchesRuntimeFamily(byId?.url, runtimeProjectFamily));
     if (
       byId &&
       (runtimeConversationId
@@ -353,7 +363,7 @@ export function pickTarget(
       if (extractConversationIdFromUrl(t.url || "") !== runtimeConversationId) {
         return false;
       }
-      return !runtimeProjectScope || projectScopeKey(t.url) === runtimeProjectScope;
+      return !runtimeProjectScope || projectScopeMatchesRuntimeFamily(t.url, runtimeProjectFamily);
     });
     const byConversation = conversationMatches.length === 1 ? conversationMatches[0] : undefined;
     if (byConversation) {
@@ -416,7 +426,7 @@ export function pickTarget(
     if (
       shellTarget &&
       (!runtimeProjectScope ||
-        projectScopeKey(shellTarget.url) === runtimeProjectScope ||
+        projectScopeMatchesRuntimeFamily(shellTarget.url, runtimeProjectFamily) ||
         uniqueShellFallback)
     ) {
       return shellTarget;
@@ -438,13 +448,23 @@ function normalizeProjectBaseUrl(baseUrl: string): string | null {
   try {
     const parsed = new URL(baseUrl);
     const pathname = parsed.pathname.replace(/\/+$/, "");
-    if (/^\/g\/[^/]+\/project$/i.test(pathname)) {
-      return `${parsed.origin}${pathname}`;
+    const projectPath =
+      pathname.match(/^(\/g\/[^/]+\/project)(?:\/c\/[a-zA-Z0-9-]+)?$/i)?.[1] ??
+      pathname.match(/^\/g\/([^/]+)\/c\/[a-zA-Z0-9-]+$/i)?.[1];
+    if (projectPath) {
+      return projectPath.startsWith("/g/")
+        ? `${parsed.origin}${projectPath}`
+        : `${parsed.origin}/g/${projectPath}/project`;
     }
   } catch {
     const trimmed = baseUrl.replace(/\/+$/, "");
-    if (/^https:\/\/chatgpt\.com\/g\/[^/]+\/project$/i.test(trimmed)) {
-      return trimmed;
+    const projectPath =
+      trimmed.match(/^https:\/\/chatgpt\.com(\/g\/[^/]+\/project)(?:\/c\/[a-zA-Z0-9-]+)?$/i)?.[1] ??
+      trimmed.match(/^https:\/\/chatgpt\.com\/g\/([^/]+)\/c\/[a-zA-Z0-9-]+$/i)?.[1];
+    if (projectPath) {
+      return projectPath.startsWith("/g/")
+        ? `https://chatgpt.com${projectPath}`
+        : `https://chatgpt.com/g/${projectPath}/project`;
     }
   }
   return null;
@@ -487,9 +507,6 @@ export function conversationHrefMatchesConfiguredScope(href: string, baseUrl: st
     const targetProjectId = targetProjectMatch?.[1];
     if (!targetProjectId) {
       return false;
-    }
-    if (/-oracle$/i.test(configuredProjectId)) {
-      return targetProjectId.toLowerCase() === configuredProjectId.toLowerCase();
     }
     return (
       normalizeProjectFamilyKey(targetProjectId) === normalizeProjectFamilyKey(configuredProjectId)

@@ -207,7 +207,7 @@ describe("supervisorBrokerRuntime", () => {
     ).toBe(SUPERVISOR_ORACLE_PROJECT_URL);
   });
 
-  test("fails closed when -oracle runtime metadata only has canonical project-shell recovery targets", () => {
+  test("accepts canonical project-shell recovery targets for the same normalized project family", () => {
     const picked = __test__.pickSafeSupervisorRecoveryTarget(
       [
         { targetId: "project-shell", type: "page", url: SUPERVISOR_PROJECT_URL },
@@ -224,7 +224,7 @@ describe("supervisorBrokerRuntime", () => {
       },
     );
 
-    expect(picked).toBeUndefined();
+    expect(picked?.targetId).toBe("project-shell");
   });
 
   test("accepts duplicate identical exact-scope project shell pages as a safe recovery target", () => {
@@ -1400,7 +1400,7 @@ describe("supervisorBrokerRuntime", () => {
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
   });
 
-  test("browser websocket runtimes fail closed when stale -oracle metadata can only recover to a canonical project shell", async () => {
+  test("browser websocket runtimes can recover through a canonical project shell in the same normalized family", async () => {
     vi.resetModules();
     const staleConnection = {
       client: {
@@ -1418,7 +1418,27 @@ describe("supervisorBrokerRuntime", () => {
       close: vi.fn(async () => {}),
       targetId: "stale-target",
     };
-    const connectToRemoteChromeTarget = vi.fn().mockResolvedValue(staleConnection);
+    const recoveredConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        Target: {
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: {
+              targetId: "project-shell",
+              type: "page",
+              url: SUPERVISOR_PROJECT_URL,
+            },
+          })),
+        },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "project-shell",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockResolvedValueOnce(staleConnection)
+      .mockResolvedValueOnce(recoveredConnection);
     const listRemoteChromeTargets = vi.fn(async () => [
       {
         targetId: "project-shell",
@@ -1434,20 +1454,21 @@ describe("supervisorBrokerRuntime", () => {
 
     const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
 
-    await expect(
-      connectSupervisorRuntime({
-        chromeHost: "127.0.0.1",
-        chromePort: 9222,
-        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
-        chromeTargetId: "stale-target",
-        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
-        conversationId: "expected",
-      }),
-    ).rejects.toThrow(/Unable to locate the existing Oracle browser tab/i);
+    const result = await connectSupervisorRuntime({
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      chromeTargetId: "stale-target",
+      tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+      conversationId: "expected",
+    });
 
     expect(staleConnection.close).toHaveBeenCalledTimes(1);
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
-    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(1);
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(2);
+    expect(result.targetId).toBe("project-shell");
+    await result.close();
+    expect(recoveredConnection.close).toHaveBeenCalledTimes(1);
   });
 
   test("browser websocket runtimes can recover through the unique remaining page in the exact inferred project scope", async () => {
@@ -1694,6 +1715,12 @@ describe("supervisorBrokerRuntime", () => {
     const listRemoteChromeTargets = vi.fn(async () => {
       throw new Error("No inspectable targets");
     });
+    const mkdir = vi.fn(async () => undefined);
+    const connectPlaywrightSupervisor = vi.fn(async () => ({
+      listPages: () => [],
+      captureArtifacts: vi.fn(async () => ({ warnings: [] })),
+      close: vi.fn(async () => undefined),
+    }));
 
     vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
       const actual = await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
@@ -1704,6 +1731,10 @@ describe("supervisorBrokerRuntime", () => {
         listRemoteChromeTargets,
       };
     });
+    vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
+      connectPlaywrightSupervisor,
+    }));
+    vi.doMock("node:fs/promises", () => ({ mkdir }));
 
     const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
 
@@ -1715,6 +1746,84 @@ describe("supervisorBrokerRuntime", () => {
     ).rejects.toThrow(/reusable Oracle browser tab/i);
 
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
+    expect(connectPlaywrightSupervisor).not.toHaveBeenCalled();
+    expect(mkdir).not.toHaveBeenCalled();
+  });
+
+  test("captureSupervisorRuntimeArtifacts returns page inventory and best-effort artifact paths", async () => {
+    vi.resetModules();
+    const close = vi.fn(async () => undefined);
+    const mkdir = vi.fn(async () => undefined);
+    const captureArtifacts = vi.fn(async ({ screenshotPath }: { screenshotPath?: string }) => ({
+      screenshotPath,
+      warnings: ["trace disabled"],
+    }));
+    const connectPlaywrightSupervisor = vi.fn(async () => ({
+      listPages: () => [
+        {
+          contextIndex: 0,
+          pageIndex: 0,
+          url: SUPERVISOR_PROJECT_URL,
+          normalizedUrl: SUPERVISOR_PROJECT_URL,
+        },
+      ],
+      captureArtifacts,
+      close,
+    }));
+
+    vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
+      connectPlaywrightSupervisor,
+    }));
+    vi.doMock("node:fs/promises", () => ({ mkdir }));
+
+    const { __test__ } = await import("../../src/cli/supervisorBrokerRuntime.js");
+    const result = await __test__.captureSupervisorRuntimeArtifacts(
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        userDataDir: HIDDEN_PROFILE_DIR,
+        conversationId: "expected",
+      },
+      "recover-failure",
+      "synthetic-failure",
+    );
+
+    expect(connectPlaywrightSupervisor).toHaveBeenCalledTimes(1);
+    expect(captureArtifacts).toHaveBeenCalledTimes(1);
+    expect(result?.pages).toHaveLength(1);
+    expect(result?.pages[0]?.normalizedUrl).toBe(SUPERVISOR_PROJECT_URL);
+    expect(result?.screenshotPath).toContain("/.oracle/sessions/expected/artifacts/");
+    expect(result?.warnings).toContain("reason: synthetic-failure");
+    expect(result?.warnings).toContain("trace disabled");
+    expect(mkdir).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test("captureSupervisorRuntimeArtifacts skips non-hidden runtimes", async () => {
+    vi.resetModules();
+    const mkdir = vi.fn(async () => undefined);
+    const connectPlaywrightSupervisor = vi.fn();
+
+    vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
+      connectPlaywrightSupervisor,
+    }));
+    vi.doMock("node:fs/promises", () => ({ mkdir }));
+
+    const { __test__ } = await import("../../src/cli/supervisorBrokerRuntime.js");
+    const result = await __test__.captureSupervisorRuntimeArtifacts(
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        userDataDir: "/tmp/oracle-visible-profile",
+        conversationId: "expected",
+      },
+      "recover-failure",
+      "synthetic-failure",
+    );
+
+    expect(result).toBeNull();
+    expect(connectPlaywrightSupervisor).not.toHaveBeenCalled();
+    expect(mkdir).not.toHaveBeenCalled();
   });
 
   test("owned hidden runtimes without conversation identity are skipped for reuse", async () => {

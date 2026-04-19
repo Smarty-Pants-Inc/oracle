@@ -1,4 +1,5 @@
 import CDP from "chrome-remote-interface";
+import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
@@ -14,6 +15,10 @@ import {
   verifyDevToolsReachable,
 } from "../browser/profileState.js";
 import { readDevToolsActivePortInfo } from "../browser/detect.js";
+import {
+  connectPlaywrightSupervisor,
+  type PlaywrightSupervisorPageInfo,
+} from "../browser/playwrightSupervisor.js";
 import {
   conversationHrefMatchesConfiguredScope,
   extractConversationIdFromUrl,
@@ -40,6 +45,15 @@ export interface SupervisorRuntimeConnection {
   host: string;
   port: number;
   targetId?: string;
+}
+
+type SupervisorRuntimeArtifactStage = "attach-failure" | "recover-failure";
+
+interface SupervisorRuntimeArtifactCapture {
+  pages: PlaywrightSupervisorPageInfo[];
+  screenshotPath?: string;
+  tracePath?: string;
+  warnings: string[];
 }
 
 function parseSessionTimestamp(meta: SessionMetadata): number {
@@ -409,6 +423,15 @@ function pickSafeSupervisorRecoveryTarget(
   }
   const normalizedScopeUrl = normalizeComparableUrl(scopeUrl);
   const pageTargets = scopeTargets.filter((target) => target.type === "page");
+  const exactScopeShellPages = pageTargets.filter((target) => {
+    const normalizedTargetUrl = normalizeComparableUrl(target.url);
+    return Boolean(
+      normalizedScopeUrl && normalizedTargetUrl && normalizedTargetUrl === normalizedScopeUrl,
+    );
+  });
+  if (exactScopeShellPages.length === 1) {
+    return exactScopeShellPages[0];
+  }
   const scopeShellPages = pageTargets.filter(
     (target) =>
       (normalizedScopeUrl && scopeUrlsEquivalent(target.url, normalizedScopeUrl)) || false,
@@ -597,6 +620,93 @@ async function closeClient(client: ChromeClient | null | undefined): Promise<voi
   await client.close().catch(() => undefined);
 }
 
+function supervisorRuntimeArtifactDir(runtime: BrowserRuntimeMetadata): string {
+  const conversationId =
+    runtime.conversationId?.trim() ??
+    extractConversationIdFromUrl(runtime.tabUrl ?? "") ??
+    "unknown-runtime";
+  return path.join(os.homedir(), ".oracle", "sessions", conversationId, "artifacts");
+}
+
+function artifactTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function appendArtifactDetails(
+  message: string,
+  artifacts: SupervisorRuntimeArtifactCapture | null,
+): string {
+  if (!artifacts) {
+    return message;
+  }
+  const details: string[] = [];
+  if (artifacts.screenshotPath) {
+    details.push(`screenshot: ${artifacts.screenshotPath}`);
+  }
+  if (artifacts.tracePath) {
+    details.push(`trace: ${artifacts.tracePath}`);
+  }
+  if (artifacts.pages.length > 0) {
+    details.push(`pages: ${artifacts.pages.length}`);
+  }
+  if (artifacts.warnings.length > 0) {
+    details.push(`warnings: ${artifacts.warnings.join("; ")}`);
+  }
+  return details.length > 0 ? `${message} Diagnostics: ${details.join(" | ")}` : message;
+}
+
+async function captureSupervisorRuntimeArtifacts(
+  runtime: BrowserRuntimeMetadata,
+  stage: SupervisorRuntimeArtifactStage,
+  reason: string,
+): Promise<SupervisorRuntimeArtifactCapture | null> {
+  const runtimeProfileDir = runtime.userDataDir?.trim() || runtime.chromeProfileRoot?.trim();
+  if (!runtimeProfileDir || path.resolve(runtimeProfileDir) != SUPERVISOR_BROWSER_PROFILE_DIR) {
+    // Never probe a user/browser-attached Chrome instance just to collect diagnostics.
+    return null;
+  }
+  if (runtime.chromeBrowserWSEndpoint) {
+    return null;
+  }
+  const port = resolvePort(runtime);
+  if (!port) {
+    return null;
+  }
+  const outputDir = supervisorRuntimeArtifactDir(runtime);
+  const stamp = artifactTimestamp();
+  const screenshotPath = path.join(outputDir, `${stamp}-${stage}.png`);
+  const warnings = [`reason: ${reason}`];
+  let bridge: Awaited<ReturnType<typeof connectPlaywrightSupervisor>> | null = null;
+  try {
+    await mkdir(outputDir, { recursive: true });
+    bridge = await connectPlaywrightSupervisor({
+      browserWSEndpoint: runtime.chromeBrowserWSEndpoint ?? undefined,
+      host: runtime.chromeHost ?? "127.0.0.1",
+      port,
+      timeoutMs: 5_000,
+    });
+    const pages = bridge.listPages();
+    const artifacts = await bridge.captureArtifacts({
+      screenshotPath,
+      fullPage: false,
+    });
+    return {
+      pages,
+      screenshotPath: artifacts.screenshotPath,
+      tracePath: artifacts.tracePath,
+      warnings: warnings.concat(artifacts.warnings),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      pages: bridge?.listPages() ?? [],
+      warnings: warnings.concat(`artifact capture skipped: ${message}`),
+    };
+  } finally {
+    await bridge?.close().catch(() => undefined);
+  }
+}
+
 export async function connectSupervisorRuntime(
   runtime: BrowserRuntimeMetadata,
 ): Promise<SupervisorRuntimeConnection> {
@@ -678,8 +788,16 @@ export async function connectSupervisorRuntime(
     const message =
       targetListError instanceof Error ? targetListError.message : String(targetListError);
     if (/No inspectable targets/i.test(message)) {
+      const artifacts = await captureSupervisorRuntimeArtifacts(
+        runtime,
+        "recover-failure",
+        message,
+      );
       throw new Error(
-        "Unable to locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+        appendArtifactDetails(
+          "Unable to locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+          artifacts,
+        ),
       );
     }
     throw targetListError;
@@ -691,16 +809,32 @@ export async function connectSupervisorRuntime(
   const target = pickConnectableSupervisorRuntimeTarget(targets, runtime, strictTargetMatch);
 
   if (!target) {
+    const artifacts = await captureSupervisorRuntimeArtifacts(
+      runtime,
+      "recover-failure",
+      strictTargetMatch ? "missing-existing-target" : "unsafe-recovery-target",
+    );
     throw new Error(
-      strictTargetMatch
-        ? "Unable to locate the existing Oracle browser tab for the reusable runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls."
-        : "Unable to safely locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+      appendArtifactDetails(
+        strictTargetMatch
+          ? "Unable to locate the existing Oracle browser tab for the reusable runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls."
+          : "Unable to safely locate a reusable Oracle browser tab for the cached runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+        artifacts,
+      ),
     );
   }
 
   if (browserWSEndpoint && !target?.targetId) {
+    const artifacts = await captureSupervisorRuntimeArtifacts(
+      runtime,
+      "attach-failure",
+      "target-missing-target-id",
+    );
     throw new Error(
-      "Unable to locate the existing Oracle browser tab for the reusable runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+      appendArtifactDetails(
+        "Unable to locate the existing Oracle browser tab for the reusable runtime. Run another Oracle browser turn or reopen the Oracle conversation before using supervisor thread controls.",
+        artifacts,
+      ),
     );
   }
 
@@ -781,6 +915,7 @@ export async function connectSupervisorRuntime(
 }
 
 export const __test__ = {
+  captureSupervisorRuntimeArtifacts,
   isOwnedSupervisorRuntime,
   inferSupervisorRuntimeScopeUrl,
   pickConnectableSupervisorRuntimeTarget,

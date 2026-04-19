@@ -3855,6 +3855,15 @@ describe("reattach helpers", () => {
         "https://chatgpt.com/g/g-p-example/project",
       ),
     ).toBe("https://chatgpt.com/g/g-p-example-oracle/c/abc");
+    expect(
+      buildConversationUrl(
+        {
+          tabUrl: "https://chatgpt.com/g/g-p-example/c/abc",
+          conversationId: "abc",
+        },
+        "https://chatgpt.com/g/g-p-example-oracle/c/seed-thread",
+      ),
+    ).toBe("https://chatgpt.com/g/g-p-example/c/abc");
   });
 
   test("rejects root-scoped chat urls when a project-scoped base is required", () => {
@@ -3884,13 +3893,13 @@ describe("reattach helpers", () => {
     );
   });
 
-  test("keeps slugged configured project scopes exact while canonical scopes accept the slugged conversation family", () => {
+  test("normalizes canonical and -oracle project families for configured project scope checks", () => {
     expect(
       conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-example/project",
         "https://chatgpt.com/g/g-p-example-oracle/project",
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-example-oracle/project",
@@ -3899,8 +3908,35 @@ describe("reattach helpers", () => {
     ).toBe(true);
     expect(
       conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example/c/right-thread",
+        "https://chatgpt.com/g/g-p-example-oracle/project",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
         "https://chatgpt.com/g/g-p-other-oracle/project",
         "https://chatgpt.com/g/g-p-example/project",
+      ),
+    ).toBe(false);
+  });
+
+  test("normalizes configured project conversation urls to project-family scope", () => {
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example/project/c/right-thread",
+        "https://chatgpt.com/g/g-p-example-oracle/c/cached-thread",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-example-oracle/project",
+        "https://chatgpt.com/g/g-p-example/c/cached-thread",
+      ),
+    ).toBe(true);
+    expect(
+      conversationHrefMatchesConfiguredScope(
+        "https://chatgpt.com/g/g-p-other/project/c/right-thread",
+        "https://chatgpt.com/g/g-p-example-oracle/c/cached-thread",
       ),
     ).toBe(false);
   });
@@ -4022,7 +4058,7 @@ describe("reattach helpers", () => {
     ).toEqual(targets[0]);
   });
 
-  test("pickTarget fails closed when runtime scope only matches a canonical-vs-slugged project collision", () => {
+  test("pickTarget normalizes canonical and slugged project conversation families to the same shell target", () => {
     const targets = [
       {
         targetId: "t-shadow",
@@ -4039,10 +4075,10 @@ describe("reattach helpers", () => {
         tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
         conversationId: "right-thread",
       }),
-    ).toBeUndefined();
+    ).toEqual(targets[1]);
   });
 
-  test("pickTarget treats slugged project conversation shadow targets as non-attachable and fails closed", () => {
+  test("pickTarget reuses a normalized project shell when runtime metadata is in the slugged project family", () => {
     const targets = [
       {
         targetId: "t-shadow",
@@ -4055,6 +4091,24 @@ describe("reattach helpers", () => {
     expect(
       pickTarget(targets, {
         chromeTargetId: "stale-target",
+        tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
+        conversationId: "right-thread",
+      }),
+    ).toEqual(targets[1]);
+  });
+
+  test("pickTarget fails closed when canonical and slugged project shells are both open for one family", () => {
+    const targets = [
+      { targetId: "t-canonical", type: "page", url: "https://chatgpt.com/g/g-p-example/project" },
+      {
+        targetId: "t-slugged",
+        type: "page",
+        url: "https://chatgpt.com/g/g-p-example-oracle/project",
+      },
+    ];
+
+    expect(
+      pickTarget(targets, {
         tabUrl: "https://chatgpt.com/g/g-p-example-oracle/c/right-thread",
         conversationId: "right-thread",
       }),
@@ -4117,7 +4171,7 @@ describe("reattach helpers", () => {
     ).toBeUndefined();
   });
 
-  test("pickTarget does not collapse distinct project scope keys", () => {
+  test("pickTarget selects the matching normalized project family when distinct scopes exist", () => {
     const targets = [
       { targetId: "t-foo", type: "page", url: "https://chatgpt.com/g/g-p-foo/project" },
       { targetId: "t-bar", type: "page", url: "https://chatgpt.com/g/g-p-bar/project" },
@@ -4127,6 +4181,20 @@ describe("reattach helpers", () => {
       pickTarget(targets, {
         tabUrl: "https://chatgpt.com/g/g-p-foo-oracle/c/right-thread",
         conversationId: "missing-thread",
+      }),
+    ).toEqual(targets[0]);
+  });
+
+  test("pickTarget fails closed when no project target matches the runtime family", () => {
+    const targets = [
+      { targetId: "t-foo", type: "page", url: "https://chatgpt.com/g/g-p-foo/project" },
+      { targetId: "t-bar", type: "page", url: "https://chatgpt.com/g/g-p-bar/project" },
+    ];
+
+    expect(
+      pickTarget(targets, {
+        tabUrl: "https://chatgpt.com/g/g-p-baz-oracle/c/right-thread",
+        conversationId: "right-thread",
       }),
     ).toBeUndefined();
   });

@@ -74,6 +74,7 @@
     "markdansi": "0.2.1",
     "openai": "^6.27.0",
     "osc-progress": "^0.3.0",
+    "playwright-core": "^1.59.1",
     "qs": "^6.15.0",
     "shiki": "^4.0.1",
     "toasted-notifier": "^10.1.0",

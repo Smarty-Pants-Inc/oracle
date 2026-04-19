@@ -17,17 +17,19 @@ import type {
   SupervisorBrokerRequest,
   SupervisorBrokerResponse,
 } from "../src/cli/supervisorBroker.js";
+import { mapModelToBrowserLabel } from "../src/cli/browserConfig.js";
 import {
   connectSupervisorRuntime,
   resolveSupervisorRuntimeContext,
 } from "../src/cli/supervisorBrokerRuntime.js";
-import type { ThinkingTimeLevel } from "../src/oracle/types.js";
+import type { ModelName, ThinkingTimeLevel } from "../src/oracle/types.js";
 import { sessionStore } from "../src/sessionStore.js";
 import { browserProofScript } from "./supervisor-proof.browser.js";
 
 const LEVELS = new Set<ThinkingTimeLevel>(["light", "standard", "extended", "heavy"]);
+const DEFAULT_MODEL: ModelName = "gpt-5.4";
 const USAGE =
-  "Usage: pnpm exec tsx scripts/supervisor-proof.ts [--thinking-time <level>] [--prompt <text>]";
+  "Usage: pnpm exec tsx scripts/supervisor-proof.ts [--thinking-time <level>] [--model <model>] [--prompt <text>]";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TSX_CLI = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
 const BROKER_ENTRYPOINT = path.join(REPO_ROOT, "bin", "oracle-supervisor-broker.ts");
@@ -38,6 +40,7 @@ const CHATGPT_URL = "https://chatgpt.com/";
 
 function parseArgs(argv: string[]) {
   let thinkingTime: ThinkingTimeLevel = "extended";
+  let model: ModelName = DEFAULT_MODEL;
   let prompt: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -53,6 +56,14 @@ function parseArgs(argv: string[]) {
       thinkingTime = value;
       continue;
     }
+    if (arg === "--model") {
+      const value = argv[++i]?.trim();
+      if (!value) {
+        throw new Error("Expected a value after --model");
+      }
+      model = value as ModelName;
+      continue;
+    }
     if (arg === "--prompt") {
       prompt = argv[++i];
       if (!prompt) {
@@ -62,7 +73,7 @@ function parseArgs(argv: string[]) {
     }
     throw new Error(`Unknown argument: ${arg}`);
   }
-  return { thinkingTime, prompt };
+  return { thinkingTime, model, prompt };
 }
 
 const titleCase = (value: string) => value.charAt(0).toUpperCase() + value.slice(1).toLowerCase();
@@ -309,16 +320,16 @@ async function runSupervisorBrokerOverWire(
 }
 
 async function main() {
-  const { thinkingTime, prompt } = parseArgs(process.argv.slice(2));
+  const { thinkingTime, model, prompt } = parseArgs(process.argv.slice(2));
   const proofToken = `PROOF_${Date.now()}_${randomUUID().slice(0, 8)}`;
   const expectsInlineProofToken = !prompt;
   const response = await runSupervisorBrokerOverWire({
     action: "run_prompt",
     prompt: prompt ?? `Reply with exactly ${proofToken} and nothing else.`,
     sessionSlug: `proof-${thinkingTime}-${proofToken.toLowerCase()}`,
-    model: "gpt-5.4-pro",
+    model,
     browserModelStrategy: "select",
-    browserModelLabel: "GPT-5.4 Pro",
+    browserModelLabel: mapModelToBrowserLabel(model),
     browserThinkingTime: thinkingTime,
     cwd: process.cwd(),
   });
