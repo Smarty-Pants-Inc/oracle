@@ -8,8 +8,7 @@ describe("playwrightDownloads", () => {
         {
           index: 0,
           targetId: "target-other",
-          normalizedUrl:
-            "https://chatgpt.com/g/g-p-abc-oracle/c/other-conversation",
+          normalizedUrl: "https://chatgpt.com/g/g-p-abc-oracle/c/other-conversation",
           conversationId: "other-conversation",
         },
         {
@@ -46,8 +45,7 @@ describe("playwrightDownloads", () => {
         {
           index: 0,
           targetId: "target-other",
-          normalizedUrl:
-            "https://chatgpt.com/g/g-p-abc-oracle/c/other-conversation",
+          normalizedUrl: "https://chatgpt.com/g/g-p-abc-oracle/c/other-conversation",
           conversationId: "other-conversation",
         },
       ],

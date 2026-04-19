@@ -195,10 +195,7 @@ function projectFamilyKey(url: string | undefined): string | null {
 
 function pickDirectDownloadTarget(
   targets: TargetInfoLite[],
-  runtime: Pick<
-    AssistantDownloadCaptureOptions,
-    "chromeTargetId" | "tabUrl" | "conversationId"
-  >,
+  runtime: Pick<AssistantDownloadCaptureOptions, "chromeTargetId" | "tabUrl" | "conversationId">,
 ): TargetInfoLite | undefined {
   if (!Array.isArray(targets) || targets.length === 0) {
     return undefined;
@@ -718,7 +715,13 @@ async function captureAssistantDownloadsViaCdp(
 ): Promise<BrowserDownloadedFile[]> {
   const targetId = targetIdentity(target);
   const browserEndpoint = await resolveBrowserClientEndpoint(options);
-  if (!targetId || !browserEndpoint || !options.chromeHost || !options.chromePort || !options.downloadsDir) {
+  if (
+    !targetId ||
+    !browserEndpoint ||
+    !options.chromeHost ||
+    !options.chromePort ||
+    !options.downloadsDir
+  ) {
     return [];
   }
   const browserClient = (await CDP({
@@ -846,10 +849,7 @@ async function collectPageSelectionCandidates(pages: Page[]): Promise<PageSelect
 
 function resolvePageSelection(
   candidates: PageSelectionCandidate[],
-  runtime: Pick<
-    AssistantDownloadCaptureOptions,
-    "chromeTargetId" | "tabUrl" | "conversationId"
-  >,
+  runtime: Pick<AssistantDownloadCaptureOptions, "chromeTargetId" | "tabUrl" | "conversationId">,
   targets: TargetInfoLite[],
 ): PageSelectionResult | null {
   if (candidates.length === 0) {
@@ -864,7 +864,9 @@ function resolvePageSelection(
   );
 
   if (runtime.chromeTargetId) {
-    const byTargetId = candidates.filter((candidate) => candidate.targetId === runtime.chromeTargetId);
+    const byTargetId = candidates.filter(
+      (candidate) => candidate.targetId === runtime.chromeTargetId,
+    );
     if (byTargetId.length === 1) {
       return { index: byTargetId[0].index, reason: "runtime-target-id" };
     }
@@ -874,7 +876,9 @@ function resolvePageSelection(
   }
 
   if (runtimeTabUrl) {
-    const exactUrlMatches = candidates.filter((candidate) => candidate.normalizedUrl === runtimeTabUrl);
+    const exactUrlMatches = candidates.filter(
+      (candidate) => candidate.normalizedUrl === runtimeTabUrl,
+    );
     if (exactUrlMatches.length === 1) {
       return { index: exactUrlMatches[0].index, reason: "runtime-tab-url" };
     }
@@ -894,7 +898,9 @@ function resolvePageSelection(
   );
   const selectedTargetId = targetIdentity(selectedTarget);
   if (selectedTargetId) {
-    const bySelectedTargetId = candidates.filter((candidate) => candidate.targetId === selectedTargetId);
+    const bySelectedTargetId = candidates.filter(
+      (candidate) => candidate.targetId === selectedTargetId,
+    );
     if (bySelectedTargetId.length === 1) {
       return { index: bySelectedTargetId[0].index, reason: "browser-target-id" };
     }
