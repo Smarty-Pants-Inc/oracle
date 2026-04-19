@@ -975,15 +975,6 @@ export async function captureAssistantDownloads(
       tabUrl: options.tabUrl,
       conversationId: runtimeConversationId,
     });
-    const selectedTarget = pickTarget(
-      browserTargets,
-      {
-        chromeTargetId: options.chromeTargetId,
-        tabUrl: options.tabUrl,
-        conversationId: runtimeConversationId,
-      },
-      { requireMatch: hasRuntimeIdentity },
-    );
     if (directDownloadTarget && directDownloadTarget.type && directDownloadTarget.type !== "page") {
       logger?.sessionLog?.(
         `[browser-downloads] falling back to raw CDP capture for ${directDownloadTarget.type}:${targetIdentity(directDownloadTarget) ?? "unknown"}:${directDownloadTarget.url ?? "about:blank"}`,
