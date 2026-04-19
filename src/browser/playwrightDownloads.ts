@@ -967,9 +967,6 @@ export async function captureAssistantDownloads(
     ]);
     const runtimeConversationId =
       options.conversationId ?? extractConversationIdFromUrl(options.tabUrl ?? "");
-    const hasRuntimeIdentity = Boolean(
-      options.chromeTargetId || options.tabUrl || runtimeConversationId,
-    );
     const directDownloadTarget = pickDirectDownloadTarget(browserTargets, {
       chromeTargetId: options.chromeTargetId,
       tabUrl: options.tabUrl,
