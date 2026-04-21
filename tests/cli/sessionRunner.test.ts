@@ -132,7 +132,11 @@ describe("performSessionRun", () => {
       mode: "live",
       usage: { inputTokens: 10, outputTokens: 20, reasoningTokens: 0, totalTokens: 30 },
       elapsedMs: 1234,
-      response: { id: "resp", usage: {}, output: [] },
+      response: {
+        id: "resp",
+        usage: {},
+        output: [{ type: "message", content: [{ type: "output_text", text: "Answer" }] }],
+      },
     };
     vi.mocked(runOracle).mockResolvedValue(liveResult);
 
@@ -152,7 +156,10 @@ describe("performSessionRun", () => {
     expect(finalUpdate).toMatchObject({
       status: "completed",
       usage: { totalTokens: 30 },
-      response: expect.objectContaining({ responseId: expect.any(String) }),
+      response: expect.objectContaining({
+        responseId: expect.any(String),
+        assistantOutput: "Answer",
+      }),
     });
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,

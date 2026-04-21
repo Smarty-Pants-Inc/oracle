@@ -753,7 +753,10 @@ export async function performSessionRun({
       usage: result.usage,
       elapsedMs: result.elapsedMs,
       options: nextOptions,
-      response: extractResponseMetadata(result.response),
+      response: {
+        ...extractResponseMetadata(result.response),
+        assistantOutput: answerText,
+      },
       transport: undefined,
       error: undefined,
     });

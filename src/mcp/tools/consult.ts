@@ -402,6 +402,25 @@ export function registerConsultTool(server: McpServer): void {
         const summary = `Session ${sessionMeta.id} (${finalMeta.status})`;
         const logTail = await readSessionLogTail(sessionMeta.id, 4000);
         const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
+        const requestedModels = Array.isArray(runOptions.models)
+          ? runOptions.models.filter(Boolean)
+          : [];
+        const expectsCanonicalReply = requestedModels.length <= 1;
+        const finalStatus = String(finalMeta.status ?? "").toLowerCase();
+        const responseStatus = String(finalMeta.response?.status ?? "").toLowerCase();
+        const assistantOutput = String(finalMeta.response?.assistantOutput ?? "").trim();
+        if (
+          expectsCanonicalReply &&
+          finalStatus === "completed" &&
+          (!assistantOutput || (responseStatus && responseStatus !== "completed"))
+        ) {
+          return {
+            isError: true,
+            content: textContent(
+              `Session ${sessionMeta.id} completed without a canonical persisted reply in meta.json.`,
+            ),
+          };
+        }
         return {
           content: textContent([summary, logTail || "(log empty)"].join("\n").trim()),
           structuredContent: {
