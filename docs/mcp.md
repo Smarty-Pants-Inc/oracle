@@ -10,6 +10,8 @@
 - Browser-only extras: `browserAttachments?: "auto"|"never"|"always"`, `browserBundleFiles?: boolean`, `browserThinkingTime?: "light"|"standard"|"extended"|"heavy"`, `browserKeepBrowser?: boolean`, `browserModelLabel?: string`.
 - Behavior: starts a session, runs it with the chosen engine, returns final output + metadata. Background/foreground follows the CLI (e.g., GPT‑5 Pro detaches by default).
 - Logging: emits MCP logs (`info` per line, `debug` for streamed chunks with byte sizes). If browser prerequisites are missing, returns an error payload instead of running.
+- Stable cross-repo call shape: `prompt`, `files`, `engine`, `model`, `slug`, `browserAttachments`, `browserBundleFiles`, and `browserThinkingTime`. When another repo invokes MCP, prefer absolute file paths; relative paths resolve from the MCP server working directory.
+- Structured success output includes `sessionId` and `status` (plus `output`, and optional per-model metadata). Error payloads do not always include a `sessionId`; early validation failures and late metadata-read failures can return MCP errors without structured session metadata.
 
 ### `sessions`
 
@@ -32,6 +34,7 @@
 - From the repo (contributors):
   - `pnpm build`
   - `pnpm mcp` (or `oracle-mcp` in the repo root)
+  - From the `smarty-code` parent repo: `cd forks/oracle && node dist/bin/oracle-mcp.js`
 - mcporter example (stdio):
   ```json
   {
@@ -54,3 +57,11 @@
   - Claude Code: `oracle bridge claude-config`
 - Tools and resources operate on the same session store as `oracle status|session`.
 - Defaults (model/engine/etc.) come from your Oracle CLI config; see `docs/configuration.md` or `~/.oracle/config.json`.
+
+## External callers
+
+- For external callers such as `smarty-agents`, treat `consult` as the execution boundary and `~/.oracle/sessions/<sessionId>/meta.json` as the canonical receipt boundary.
+- Assistant-created downloads are stored under `~/.oracle/sessions/<sessionId>/downloads/`.
+- `output.log` is diagnostic text, not the structured receipt contract.
+- Prefer a deterministic `slug` so the caller can correlate request artifacts, MCP runs, and the stored Oracle session id.
+- External callers should not parse `oracle_control` or duplicate Oracle browser/broker logic; hand Oracle the prompt/files, capture the returned `sessionId`, then read receipt/artifact data from the session store.
