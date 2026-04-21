@@ -61,6 +61,9 @@
 ## External callers
 
 - For external callers such as `smarty-agents`, treat `consult` as the execution boundary and `~/.oracle/sessions/<sessionId>/meta.json` as the canonical receipt boundary.
+- API-mode sessions may not have any ChatGPT browser conversation id or URL. For API-mode receipt ingestion, treat `meta.json.id` as the stable Oracle session identity.
+- Browser/supervisor sessions should prefer `browser.runtime.conversationId`, `supervisorThread.conversationId`, and the corresponding URLs when those fields are present.
+- Completed single-answer sessions should persist `response.assistantOutput` in `meta.json`.
 - Assistant-created downloads are stored under `~/.oracle/sessions/<sessionId>/downloads/`.
 - `output.log` is diagnostic text, not the structured receipt contract.
 - Prefer a deterministic `slug` so the caller can correlate request artifacts, MCP runs, and the stored Oracle session id.
