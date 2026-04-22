@@ -4,16 +4,21 @@ export function buildThreadIntrospectionHelpers(): string {
   const conversationSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   return `const __oracleThreadSelector = '[data-testid^="conversation-turn"], [data-message-author-role], [data-turn]';
 const __oraclePrimaryThreadRootSelector = '[data-testid="chat-thread"],main,[role="main"]';
+const __oracleSecondaryThreadRootSelector =
+  'section[data-testid="screen-threadFlyOut"],[data-testid*="threadFlyOut"]';
 const __oracleConversationIdFromHref = (href) =>
   ((String(href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '').trim();
 const __oracleIsElement = (node) =>
   Boolean(node && typeof node === 'object' && typeof node.querySelectorAll === 'function');
-const __oracleIsExcluded = (node) =>
-  Boolean(
-    node?.closest?.(
-      'nav,aside,form,[data-testid*="sidebar"],[data-testid*="chat-history"],[data-testid*="composer"],section[data-testid="screen-threadFlyOut"],[data-testid*="threadFlyOut"]',
-    ),
+const __oracleExcludedAncestor = (node) =>
+  node?.closest?.(
+    'nav,aside,form,[data-testid*="sidebar"],[data-testid*="chat-history"],[data-testid*="composer"],section[data-testid="screen-threadFlyOut"],[data-testid*="threadFlyOut"]',
   );
+const __oracleIsExcluded = (node) => Boolean(__oracleExcludedAncestor(node));
+const __oracleIsExcludedWithinScope = (node, scope) => {
+  const excluded = __oracleExcludedAncestor(node);
+  return Boolean(excluded && excluded !== scope);
+};
 const __oracleThreadText = (node) => {
   if (!__oracleIsElement(node)) return '';
   const source = typeof node.cloneNode === 'function' ? node.cloneNode(true) : node;
@@ -115,12 +120,12 @@ const __oracleCollectThreadEntries = (root) => {
   if (!__oracleIsElement(scope)) return [];
   const candidates = [];
   for (const node of Array.from(scope.querySelectorAll(__oracleThreadSelector))) {
-    if (!__oracleIsElement(node) || __oracleIsExcluded(node)) continue;
+    if (!__oracleIsElement(node) || __oracleIsExcludedWithinScope(node, scope)) continue;
     const container =
       node.closest?.('[data-testid^="conversation-turn"]') ||
       node.closest?.('[data-message-author-role], [data-turn]') ||
       node;
-    if (!__oracleIsElement(container) || __oracleIsExcluded(container)) continue;
+    if (!__oracleIsElement(container) || __oracleIsExcludedWithinScope(container, scope)) continue;
     if (typeof scope.contains === 'function' && !scope.contains(container)) continue;
     if (!candidates.includes(container)) {
       candidates.push(container);
@@ -149,11 +154,17 @@ const __oracleHasUsableThreadEntries = (scope) =>
   );
 const __oraclePickActiveThreadRoot = () => {
   const expectedConversationId = __oracleConversationIdFromHref(window.location.href || '');
-  const exactMatches = [];
-  const fallbackMatches = [];
+  const primaryExactMatches = [];
+  const primaryFallbackMatches = [];
+  const secondaryExactMatches = [];
+  const secondaryFallbackMatches = [];
   for (const scope of __oracleListThreadRoots()) {
-    if (!scope?.matches?.(__oraclePrimaryThreadRootSelector)) continue;
+    const isPrimary = scope?.matches?.(__oraclePrimaryThreadRootSelector);
+    const isSecondary = !isPrimary && scope?.matches?.(__oracleSecondaryThreadRootSelector);
+    if (!isPrimary && !isSecondary) continue;
     if (!__oracleHasUsableThreadEntries(scope)) continue;
+    const exactMatches = isPrimary ? primaryExactMatches : secondaryExactMatches;
+    const fallbackMatches = isPrimary ? primaryFallbackMatches : secondaryFallbackMatches;
     if (!expectedConversationId) {
       fallbackMatches.push(scope);
       continue;
@@ -171,14 +182,30 @@ const __oraclePickActiveThreadRoot = () => {
     }
   }
   if (!expectedConversationId) {
-    return fallbackMatches[0] || null;
+    return (
+      primaryFallbackMatches[0] ||
+      (primaryFallbackMatches.length === 0 ? secondaryFallbackMatches[0] : null) ||
+      null
+    );
   }
-  if (exactMatches.length === 1) {
-    return exactMatches[0];
+  if (primaryExactMatches.length === 1) {
+    return primaryExactMatches[0];
   }
-  if (exactMatches.length > 1) {
+  if (primaryExactMatches.length > 1) {
     return null;
   }
-  return fallbackMatches.length === 1 ? fallbackMatches[0] : null;
+  if (primaryFallbackMatches.length === 1) {
+    return primaryFallbackMatches[0];
+  }
+  if (primaryFallbackMatches.length > 1) {
+    return null;
+  }
+  if (secondaryExactMatches.length === 1) {
+    return secondaryExactMatches[0];
+  }
+  if (secondaryExactMatches.length > 1) {
+    return null;
+  }
+  return secondaryFallbackMatches.length === 1 ? secondaryFallbackMatches[0] : null;
 };`;
 }

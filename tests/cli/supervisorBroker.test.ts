@@ -1074,6 +1074,511 @@ describe("runSupervisorBrokerRequest", () => {
     }
   });
 
+  test("resolveRequestedThreadUrl reuses the bound project thread URL from the followup session", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-thread-url-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const runtimeSession = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(runtimeSession.id, {
+        status: "completed",
+        browser: {
+          config: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          runtime: {
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            tabUrl: "https://chatgpt.com/g/team-space/project",
+          },
+        },
+      });
+      const threadSession = await sessionStore.createSession(
+        {
+          prompt: "Supervisor thread: Target",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          followupSessionId: runtimeSession.id,
+        },
+        process.cwd(),
+        undefined,
+        "oracle-thread-target-9",
+      );
+      await sessionStore.updateSession(threadSession.id, {
+        status: "completed",
+        supervisorThread: {
+          conversationId: "target-9",
+          url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+          projectUrl: "https://chatgpt.com/g/team-space/project",
+          verifiedAt: new Date().toISOString(),
+        },
+      });
+
+      const runtimeMeta = await sessionStore.readSession(runtimeSession.id);
+      const threadUrl = await __test__.resolveRequestedThreadUrl(
+        {
+          operation: "thread_history",
+          prompt: "",
+          sessionSlug: "slug-history",
+          conversationId: " target-9 ",
+          followupSession: threadSession.id,
+        },
+        runtimeMeta,
+      );
+
+      expect(threadUrl).toBe("https://chatgpt.com/g/team-space-oracle/c/target-9");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveRequestedThreadUrl rejects followup session URLs outside the configured project scope", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-thread-url-scope-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const runtimeSession = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(runtimeSession.id, {
+        status: "completed",
+        browser: {
+          config: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          runtime: {
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            tabUrl: "https://chatgpt.com/g/team-space/project",
+          },
+        },
+      });
+      const threadSession = await sessionStore.createSession(
+        {
+          prompt: "Supervisor thread: Target",
+          model: "gpt-5.4",
+          mode: "browser",
+          browserConfig: {
+            manualLogin: true,
+            keepBrowser: true,
+            chatgptUrl: "https://chatgpt.com/g/team-space/project",
+          },
+          followupSessionId: runtimeSession.id,
+        },
+        process.cwd(),
+        undefined,
+        "oracle-thread-target-9",
+      );
+      await sessionStore.updateSession(threadSession.id, {
+        status: "completed",
+        supervisorThread: {
+          conversationId: "target-9",
+          url: "https://chatgpt.com/c/target-9",
+          projectUrl: "https://chatgpt.com/g/team-space/project",
+          verifiedAt: new Date().toISOString(),
+        },
+      });
+
+      const runtimeMeta = await sessionStore.readSession(runtimeSession.id);
+      const threadUrl = await __test__.resolveRequestedThreadUrl(
+        {
+          operation: "thread_history",
+          prompt: "",
+          sessionSlug: "slug-history",
+          conversationId: "target-9",
+          followupSession: threadSession.id,
+        },
+        runtimeMeta,
+      );
+
+      expect(threadUrl).toBeUndefined();
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("parseBackendConversationHistoryEntries normalizes backend-api mapping entries", () => {
+    const history = __test__.parseBackendConversationHistoryEntries(
+      {
+        conversation_id: "target-9",
+        mapping: {
+          "assistant-1": {
+            message: {
+              author: { role: "assistant" },
+              create_time: 2,
+              content: { parts: ["First answer"] },
+            },
+          },
+          "user-1": {
+            message: {
+              author: { role: "user" },
+              create_time: 1,
+              content: { parts: ["First question"] },
+            },
+          },
+          "assistant-duplicate": {
+            message: {
+              author: { role: "assistant" },
+              create_time: 3,
+              content: { parts: ["First answer"] },
+            },
+          },
+          "ignored-tool": {
+            message: {
+              author: { role: "tool" },
+              create_time: 4,
+              content: { parts: ["internal"] },
+            },
+          },
+          "assistant-2": {
+            message: {
+              role: "assistant",
+              create_time: 5,
+              content: { parts: [{ text: "Second answer" }] },
+            },
+          },
+        },
+      },
+      "target-9",
+    );
+
+    expect(history).toEqual([
+      { role: "user", text: "First question" },
+      { role: "assistant", text: "First answer" },
+      { role: "assistant", text: "Second answer" },
+    ]);
+  });
+
+  test("selectProjectScopedHistoryFallback uses backend history only when project-scoped DOM history is underfilled", () => {
+    const recovered = __test__.selectProjectScopedHistoryFallback({
+      projectUrl: "https://chatgpt.com/g/team-space/project",
+      expectedConversationId: "target-9",
+      requestedLimit: 4,
+      placeholderShellUnderfill: true,
+      domHistory: [{ role: "assistant", text: "Visible only" }],
+      backendBody: {
+        conversation_id: "target-9",
+        mapping: {
+          "user-1": {
+            message: {
+              author: { role: "user" },
+              create_time: 1,
+              content: { parts: ["Q1"] },
+            },
+          },
+          "assistant-1": {
+            message: {
+              author: { role: "assistant" },
+              create_time: 2,
+              content: { parts: ["A1"] },
+            },
+          },
+          "user-2": {
+            message: {
+              author: { role: "user" },
+              create_time: 3,
+              content: { parts: ["Q2"] },
+            },
+          },
+          "assistant-2": {
+            message: {
+              author: { role: "assistant" },
+              create_time: 4,
+              content: { parts: ["A2"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(recovered).toEqual({
+      history: [
+        { role: "user", text: "Q1" },
+        { role: "assistant", text: "A1" },
+        { role: "user", text: "Q2" },
+        { role: "assistant", text: "A2" },
+      ],
+      historyWindow: {
+        limit: 4,
+        returnedCount: 4,
+        totalCount: 4,
+        truncated: false,
+      },
+    });
+    expect(
+      __test__.selectProjectScopedHistoryFallback({
+        projectUrl: undefined,
+        expectedConversationId: "target-9",
+        requestedLimit: 4,
+        placeholderShellUnderfill: true,
+        domHistory: [{ role: "assistant", text: "Visible only" }],
+        backendBody: {
+          conversation_id: "target-9",
+          mapping: {},
+        },
+      }),
+    ).toBeNull();
+    expect(
+      __test__.selectProjectScopedHistoryFallback({
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        expectedConversationId: "target-9",
+        requestedLimit: 4,
+        placeholderShellUnderfill: false,
+        domHistory: [{ role: "assistant", text: "Visible only" }],
+        backendBody: {
+          conversation_id: "target-9",
+          mapping: {},
+        },
+      }),
+    ).toBeNull();
+    expect(
+      __test__.selectProjectScopedHistoryFallback({
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        expectedConversationId: "target-9",
+        requestedLimit: 4,
+        placeholderShellUnderfill: true,
+        domHistory: [{ role: "assistant", text: "Visible only" }],
+        backendBody: {
+          conversation_id: "wrong-conversation",
+          mapping: {
+            "user-1": {
+              message: {
+                author: { role: "user" },
+                create_time: 1,
+                content: { parts: ["Q1"] },
+              },
+            },
+            "assistant-1": {
+              message: {
+                author: { role: "assistant" },
+                create_time: 2,
+                content: { parts: ["A1"] },
+              },
+            },
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("recoverProjectScopedSupervisorThreadHistoryFromBackendApi captures backend-api history through CDP", async () => {
+    const listeners = new Map<string, (params: Record<string, unknown>) => void>();
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: {
+            url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
+            conversationId: "current-1",
+            title: "Current",
+            isActive: true,
+          },
+        },
+      })),
+    };
+    const Network = {
+      enable: vi.fn(async () => ({})),
+      getResponseBody: vi.fn(async ({ requestId }: { requestId: string }) => {
+        expect(requestId).toBe("req-1");
+        return {
+          base64Encoded: false,
+          body: JSON.stringify({
+            conversation_id: "target-9",
+            current_node: "assistant-1",
+            mapping: {
+              root: {},
+              "user-1": {
+                parent: "root",
+                message: {
+                  author: { role: "user" },
+                  content: { parts: ["Q1"] },
+                },
+              },
+              "assistant-1": {
+                parent: "user-1",
+                message: {
+                  author: { role: "assistant" },
+                  content: { parts: ["A1"] },
+                },
+              },
+            },
+          }),
+        };
+      }),
+    };
+    const Page = {
+      enable: vi.fn(async () => ({})),
+      navigate: vi.fn(async ({ url }: { url: string }) => {
+        expect(url).toBe("https://chatgpt.com/g/team-space-oracle/c/target-9");
+        listeners.get("Network.requestWillBeSent")?.({
+          request: {
+            url: "https://chatgpt.com/backend-api/conversation/target-9",
+            headers: { "chatgpt-project-id": "team-space" },
+          },
+        });
+        listeners.get("Network.responseReceived")?.({
+          requestId: "req-1",
+          response: {
+            url: "https://chatgpt.com/backend-api/conversation/target-9",
+            status: 200,
+          },
+        });
+        listeners.get("Network.loadingFinished")?.({
+          requestId: "req-1",
+        });
+        return {};
+      }),
+    };
+    const client = {
+      Runtime,
+      Network,
+      Page,
+      on: vi.fn((event: string, listener: (params: Record<string, unknown>) => void) => {
+        listeners.set(event, listener);
+      }),
+    };
+
+    const recovered = await __test__.recoverProjectScopedSupervisorThreadHistoryFromBackendApi(
+      client as never,
+      {
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        expectedConversationId: "target-9",
+        requestedLimit: 5,
+        domHistory: [{ role: "assistant", text: "Only visible answer" }],
+        threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+        placeholderShellUnderfill: true,
+      },
+    );
+
+    expect(client.on).toHaveBeenCalledTimes(4);
+    expect(Network.enable).toHaveBeenCalledTimes(1);
+    expect(Page.enable).toHaveBeenCalledTimes(1);
+    expect(Page.navigate).toHaveBeenCalledTimes(1);
+    expect(Network.getResponseBody).toHaveBeenCalledTimes(1);
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(1);
+    const runtimeEvaluateExpression = String(Runtime.evaluate.mock.calls[0]?.[0]?.expression ?? "");
+    expect(runtimeEvaluateExpression).not.toContain("/backend-api/conversation/");
+    expect(recovered).toEqual({
+      history: [
+        { role: "user", text: "Q1" },
+        { role: "assistant", text: "A1" },
+      ],
+      historyWindow: {
+        limit: 5,
+        returnedCount: 2,
+        totalCount: 2,
+        truncated: false,
+      },
+    });
+  });
+
+  test("recoverProjectScopedSupervisorThreadHistoryFromBackendApi fails closed on project header mismatch", async () => {
+    const listeners = new Map<string, (params: Record<string, unknown>) => void>();
+    const client = {
+      Runtime: {
+        evaluate: vi.fn(async () => ({
+          result: {
+            value: {
+              url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
+              conversationId: "current-1",
+              title: "Current",
+              isActive: true,
+            },
+          },
+        })),
+      },
+      Network: {
+        enable: vi.fn(async () => ({})),
+        getResponseBody: vi.fn(async () => ({
+          base64Encoded: false,
+          body: JSON.stringify({
+            conversation_id: "target-9",
+            current_node: "assistant-1",
+            mapping: {
+              root: {},
+              "assistant-1": {
+                parent: "root",
+                message: {
+                  author: { role: "assistant" },
+                  content: { parts: ["A1"] },
+                },
+              },
+            },
+          }),
+        })),
+      },
+      Page: {
+        enable: vi.fn(async () => ({})),
+        navigate: vi.fn(async () => {
+          listeners.get("Network.requestWillBeSent")?.({
+            request: {
+              url: "https://chatgpt.com/backend-api/conversation/target-9",
+              headers: { "chatgpt-project-id": "wrong-project" },
+            },
+          });
+          listeners.get("Network.responseReceived")?.({
+            requestId: "req-1",
+            response: {
+              url: "https://chatgpt.com/backend-api/conversation/target-9",
+              status: 200,
+            },
+          });
+          listeners.get("Network.loadingFinished")?.({
+            requestId: "req-1",
+          });
+          return {};
+        }),
+      },
+      on: vi.fn((event: string, listener: (params: Record<string, unknown>) => void) => {
+        listeners.set(event, listener);
+      }),
+    };
+
+    await expect(
+      __test__.recoverProjectScopedSupervisorThreadHistoryFromBackendApi(client as never, {
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        expectedConversationId: "target-9",
+        requestedLimit: 5,
+        domHistory: [{ role: "assistant", text: "Only visible answer" }],
+        threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+        placeholderShellUnderfill: true,
+      }),
+    ).rejects.toThrow("Oracle conversation response used project wrong-project instead of team-space.");
+    expect(client.Network.getResponseBody).not.toHaveBeenCalled();
+  });
+
   test("exits cleanly after shutdown request without waiting for stdin EOF", async () => {
     const broker = spawn(process.execPath, ["--import", "tsx", SUPERVISOR_BROKER_ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],

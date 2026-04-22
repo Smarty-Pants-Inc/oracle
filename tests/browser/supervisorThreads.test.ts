@@ -288,17 +288,61 @@ describe("supervisorThreads", () => {
       projectUrl,
     });
 
-    expect(openConversationFromSidebarWithRetry).toHaveBeenCalledWith(
-      runtime,
-      { conversationId: "target-9", preferProjects: true },
-      15_000,
-    );
+    expect(openConversationFromSidebarWithRetry).not.toHaveBeenCalled();
     expect(thread).toEqual({
       title: "Target",
       url: "https://chatgpt.com/g/team-space/c/target-9",
       conversationId: "target-9",
       isActive: true,
     });
+  });
+
+  test("attach_thread reconstructs a project-scoped thread URL before relying on sidebar lookup", async () => {
+    let currentReads = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 2 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          currentReads += 1;
+          return {
+            result: {
+              value:
+                currentReads < 2
+                  ? {
+                      url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
+                      conversationId: "current-1",
+                      title: "Current",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/g/team-space/c/target-9",
+                      conversationId: "target-9",
+                      title: "Target",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const thread = await attachSupervisorThread(runtime, "target-9", {
+      projectUrl,
+    });
+
+    expect(thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(openConversationFromSidebarWithRetry).not.toHaveBeenCalled();
   });
 
   test("attach_thread waits for the visible thread to switch instead of trusting sidebar state", async () => {
@@ -714,6 +758,104 @@ describe("supervisorThreads", () => {
     ]);
   });
 
+  test("readSupervisorThreadHistorySnapshot keeps polling until the active conversation container validates", async () => {
+    let snapshotReads = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (!expression.includes("const turnSelector =")) {
+          throw new Error(`Unexpected expression: ${expression}`);
+        }
+        snapshotReads += 1;
+        if (snapshotReads < 4) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                  conversationId: "current-9",
+                  title: "Current Chat",
+                  isActive: true,
+                },
+                history: [],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 0,
+                  totalCount: 0,
+                  truncated: false,
+                },
+                activeRootValidated: false,
+              },
+            },
+          };
+        }
+        return {
+          result: {
+            value: {
+              thread: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+              history: [{ role: "assistant", text: "Recent answer" }],
+              historyWindow: {
+                limit: 1,
+                returnedCount: 1,
+                totalCount: 1,
+                truncated: false,
+              },
+              activeRootValidated: true,
+            },
+          },
+        };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const snapshot = await __test__.readSupervisorThreadHistorySnapshot(runtime, { limit: 1 });
+
+    expect(snapshot.activeRootValidated).toBe(true);
+    expect(snapshot.placeholderShellUnderfill).toBe(false);
+    expect(snapshot.history).toEqual([{ role: "assistant", text: "Recent answer" }]);
+    expect(snapshotReads).toBeGreaterThanOrEqual(4);
+  });
+
+  test("readSupervisorThreadHistorySnapshot exposes placeholder shell underfill signal", async () => {
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (!expression.includes("const turnSelector =")) {
+          throw new Error(`Unexpected expression: ${expression}`);
+        }
+        return {
+          result: {
+            value: {
+              thread: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+              history: [{ role: "assistant", text: "Recent answer" }],
+              historyWindow: {
+                limit: 3,
+                returnedCount: 1,
+                totalCount: 1,
+                truncated: false,
+              },
+              activeRootValidated: true,
+              placeholderShellUnderfill: true,
+            },
+          },
+        };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const snapshot = await __test__.readSupervisorThreadHistorySnapshot(runtime, { limit: 3 });
+
+    expect(snapshot.activeRootValidated).toBe(true);
+    expect(snapshot.placeholderShellUnderfill).toBe(true);
+    expect(snapshot.history).toEqual([{ role: "assistant", text: "Recent answer" }]);
+  });
+
   test("readAttachedSupervisorThreadHistory surfaces bounded window metadata", async () => {
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -775,6 +917,248 @@ describe("supervisorThreads", () => {
       totalCount: 5,
       truncated: true,
     });
+  });
+
+  test("readAttachedSupervisorThreadHistory retries once through the sidebar when the first snapshot cannot validate the active root", async () => {
+    let sidebarRepairCount = 0;
+    vi.mocked(openConversationFromSidebarWithRetry).mockImplementation(async () => {
+      sidebarRepairCount += 1;
+      return true;
+    });
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("const turnSelector =")) {
+          if (sidebarRepairCount === 0) {
+            return {
+              result: {
+                value: {
+                  thread: {
+                    url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                    conversationId: "current-9",
+                    title: "Current Chat",
+                    isActive: true,
+                  },
+                  history: [],
+                  historyWindow: {
+                    limit: 1,
+                    returnedCount: 0,
+                    totalCount: 0,
+                    truncated: false,
+                  },
+                  activeRootValidated: false,
+                },
+              },
+            };
+          }
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                  conversationId: "current-9",
+                  title: "Current Chat",
+                  isActive: true,
+                },
+                history: [{ role: "assistant", text: "Recovered answer" }],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 1,
+                  totalCount: 1,
+                  truncated: false,
+                },
+                activeRootValidated: true,
+              },
+            },
+          };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          return {
+            result: {
+              value: {
+                url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                conversationId: "current-9",
+                title: "Current Chat",
+                isActive: true,
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readAttachedSupervisorThreadHistory(runtime, {
+      conversationId: "current-9",
+      projectUrl,
+      limit: 1,
+    });
+
+    expect(result.history).toEqual([{ role: "assistant", text: "Recovered answer" }]);
+    expect(openConversationFromSidebarWithRetry).toHaveBeenCalledWith(
+      runtime,
+      { conversationId: "current-9", preferProjects: true },
+      5_000,
+    );
+  });
+
+  test("readAttachedSupervisorThreadHistory reattaches with the provided project thread URL when sidebar lookup would miss", async () => {
+    let currentReadCount = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                  conversationId: "target-9",
+                  title: "Target",
+                  isActive: true,
+                },
+                history: [
+                  { role: "user", text: "Follow-up" },
+                  { role: "assistant", text: "Recent answer" },
+                ],
+                historyWindow: {
+                  limit: 2,
+                  returnedCount: 2,
+                  totalCount: 2,
+                  truncated: false,
+                },
+              },
+            },
+          };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          currentReadCount += 1;
+          return {
+            result: {
+              value:
+                currentReadCount < 2
+                  ? {
+                      url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
+                      conversationId: "current-1",
+                      title: "Current",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+                      conversationId: "target-9",
+                      title: "Target",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readAttachedSupervisorThreadHistory(runtime, {
+      conversationId: "target-9",
+      projectUrl,
+      threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      limit: 2,
+    });
+
+    expect(result.thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(result.history).toEqual([
+      { role: "user", text: "Follow-up" },
+      { role: "assistant", text: "Recent answer" },
+    ]);
+    expect(openConversationFromSidebarWithRetry).not.toHaveBeenCalled();
+  });
+
+  test("readAttachedSupervisorThreadHistory reconstructs a project conversation URL when only the project root is configured", async () => {
+    let currentReadCount = 0;
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
+          return { result: { value: 0 } };
+        }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("window.location.href") && expression.includes("historyWindow")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/g/team-space/c/target-9",
+                  conversationId: "target-9",
+                  title: "Target",
+                  isActive: true,
+                },
+                history: [
+                  { role: "user", text: "Follow-up" },
+                  { role: "assistant", text: "Recent answer" },
+                ],
+                historyWindow: {
+                  limit: 2,
+                  returnedCount: 2,
+                  totalCount: 2,
+                  truncated: false,
+                },
+              },
+            },
+          };
+        }
+        if (expression.includes("const href = window.location.href || ''")) {
+          currentReadCount += 1;
+          return {
+            result: {
+              value:
+                currentReadCount < 2
+                  ? {
+                      url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
+                      conversationId: "current-1",
+                      title: "Current",
+                      isActive: true,
+                    }
+                  : {
+                      url: "https://chatgpt.com/g/team-space/c/target-9",
+                      conversationId: "target-9",
+                      title: "Target",
+                      isActive: true,
+                    },
+            },
+          };
+        }
+        throw new Error(`Unexpected expression: ${expression}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const result = await readAttachedSupervisorThreadHistory(runtime, {
+      conversationId: "target-9",
+      projectUrl,
+      limit: 2,
+    });
+
+    expect(result.thread).toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
+    expect(result.history).toEqual([
+      { role: "user", text: "Follow-up" },
+      { role: "assistant", text: "Recent answer" },
+    ]);
+    expect(openConversationFromSidebarWithRetry).not.toHaveBeenCalled();
   });
 
   test("readAttachedSupervisorThreadHistory fails closed when the active thread changes during capture", async () => {
@@ -999,6 +1383,31 @@ describe("supervisorThreads", () => {
         if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
           return { result: { value: 0 } };
         }
+        if (expression.includes("window.location.assign")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("const turnSelector =")) {
+          return {
+            result: {
+              value: {
+                thread: {
+                  url: "https://chatgpt.com/g/team-space-oracle/c/current-9",
+                  conversationId: "current-9",
+                  title: "ChatGPT",
+                  isActive: true,
+                },
+                history: [],
+                historyWindow: {
+                  limit: 1,
+                  returnedCount: 0,
+                  totalCount: 0,
+                  truncated: false,
+                },
+                activeRootValidated: false,
+              },
+            },
+          };
+        }
         if (expression.includes("const href = window.location.href || ''")) {
           return {
             result: {
@@ -1011,12 +1420,6 @@ describe("supervisorThreads", () => {
             },
           };
         }
-        if (
-          expression.includes("const MIN_TURN_INDEX =") ||
-          expression.includes("extractAssistantTurn")
-        ) {
-          return { result: { value: null } };
-        }
         throw new Error(`Unexpected expression: ${expression}`);
       }),
     } as unknown as ChromeClient["Runtime"];
@@ -1027,7 +1430,7 @@ describe("supervisorThreads", () => {
         projectUrl,
         limit: 1,
       }),
-    ).rejects.toThrow("Conversation current-9 did not become active after attach_thread");
+    ).rejects.toThrow("could not validate the active conversation container");
     dateNow.mockRestore();
   });
 

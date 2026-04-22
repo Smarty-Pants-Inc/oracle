@@ -7,11 +7,13 @@ import {
   listSupervisorThreads,
   newSupervisorThread,
   readAttachedSupervisorThreadHistory,
+  readCurrentSupervisorThread,
   type SupervisorThreadHistoryWindow,
   supervisorThreadMatchesProjectScope,
   type SupervisorThreadHistoryEntry,
   type SupervisorThreadInfo,
 } from "../browser/supervisorThreads.js";
+import { normalizeSupervisorThread } from "../browser/supervisorThreadNormalize.js";
 import {
   captureFrontmostProcess,
   hideChromeWindow,
@@ -92,6 +94,9 @@ const SUPERVISOR_THREAD_PROMPT_PREFIX = "Supervisor thread:";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL = "gpt-5.4";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_LABEL = "Thinking 5.4";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_STRATEGY = "select";
+const SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS = 12_000;
+const SUPERVISOR_HISTORY_LIMIT_DEFAULT = 100;
+const SUPERVISOR_HISTORY_LIMIT_MAX = 200;
 
 async function writeSupervisorBrokerResponseLine(response: unknown): Promise<void> {
   const line = `${JSON.stringify(response)}\n`;
@@ -119,6 +124,8 @@ interface SupervisorRuntimeDeps {
   withSupervisorRuntimeAttachLease: typeof withSupervisorRuntimeAttachLease;
 }
 
+type SupervisorRuntimeClient = Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"];
+
 const chromeFocusDeps: ChromeFocusDeps = {
   captureFrontmostProcess,
   hideChromeWindow,
@@ -131,6 +138,360 @@ const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
   connectSupervisorRuntime,
   withSupervisorRuntimeAttachLease,
 };
+
+function normalizeComparableUrl(url?: string | null): string | undefined {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+function extractProjectIdFromUrl(projectUrl?: string): string | undefined {
+  const normalized = normalizeComparableUrl(projectUrl);
+  if (!normalized) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(normalized);
+    return parsed.pathname.match(/^\/g\/([^/]+)/i)?.[1];
+  } catch {
+    return normalized.match(/\/g\/([^/]+)/i)?.[1];
+  }
+}
+
+function readHeaderValue(
+  headers: Record<string, unknown> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) {
+    return undefined;
+  }
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === target && typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function removeSupervisorRuntimeListener(
+  client: SupervisorRuntimeClient,
+  eventName: string,
+  listener: (params: object, sessionId?: string) => void,
+): void {
+  const emitter = client as unknown as {
+    off?: (event: string, callback: (params: object, sessionId?: string) => void) => void;
+    removeListener?: (event: string, callback: (params: object, sessionId?: string) => void) => void;
+  };
+  if (typeof emitter.off === "function") {
+    emitter.off(eventName, listener);
+    return;
+  }
+  if (typeof emitter.removeListener === "function") {
+    emitter.removeListener(eventName, listener);
+  }
+}
+
+function collectConversationTextSegments(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.trim().length > 0 ? [value] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => collectConversationTextSegments(entry));
+  }
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.text === "string" && record.text.trim().length > 0) {
+    return [record.text];
+  }
+  if (typeof record.content === "string" && record.content.trim().length > 0) {
+    return [record.content];
+  }
+  return [];
+}
+
+function normalizeConversationHistoryText(text: string): string {
+  return text
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function decodeConversationResponseHistory(
+  payload: unknown,
+  options: { conversationId: string; limit?: number },
+): {
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+} {
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const responseConversationId =
+    (typeof record.conversation_id === "string" && record.conversation_id.trim()) ||
+    (typeof record.id === "string" && record.id.trim()) ||
+    undefined;
+  if (responseConversationId && responseConversationId !== options.conversationId) {
+    throw new Error(
+      `Oracle conversation response returned ${responseConversationId} while ${options.conversationId} was requested.`,
+    );
+  }
+  const currentNodeId =
+    typeof record.current_node === "string" && record.current_node.trim().length > 0
+      ? record.current_node.trim()
+      : undefined;
+  const mapping =
+    record.mapping && typeof record.mapping === "object"
+      ? (record.mapping as Record<string, unknown>)
+      : undefined;
+  if (!currentNodeId || !mapping) {
+    throw new Error("Oracle conversation response did not include a current mapping path.");
+  }
+
+  const orderedPath: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined = currentNodeId;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const node = mapping[cursor];
+    if (!node || typeof node !== "object") {
+      break;
+    }
+    const recordNode = node as Record<string, unknown>;
+    orderedPath.push(recordNode);
+    cursor =
+      typeof recordNode.parent === "string" && recordNode.parent.trim().length > 0
+        ? recordNode.parent.trim()
+        : undefined;
+  }
+  orderedPath.reverse();
+
+  const history: SupervisorThreadHistoryEntry[] = [];
+  for (const node of orderedPath) {
+    const message =
+      node.message && typeof node.message === "object"
+        ? (node.message as Record<string, unknown>)
+        : undefined;
+    if (!message) {
+      continue;
+    }
+    const author =
+      message.author && typeof message.author === "object"
+        ? (message.author as Record<string, unknown>)
+        : undefined;
+    const role = author?.role;
+    if (role !== "user" && role !== "assistant") {
+      continue;
+    }
+    const metadata =
+      message.metadata && typeof message.metadata === "object"
+        ? (message.metadata as Record<string, unknown>)
+        : undefined;
+    if (metadata?.is_visually_hidden_from_conversation === true) {
+      continue;
+    }
+    const content =
+      message.content && typeof message.content === "object"
+        ? (message.content as Record<string, unknown>)
+        : undefined;
+    const text = normalizeConversationHistoryText(
+      collectConversationTextSegments(content?.parts).join("\n\n"),
+    );
+    if (!text) {
+      continue;
+    }
+    const last = history.at(-1);
+    if (last && last.role === role && last.text === text) {
+      continue;
+    }
+    history.push({ role, text });
+  }
+
+  const limit = Math.min(Math.max(1, Math.trunc(options.limit ?? 100)), 200);
+  const limitedHistory = history.slice(-limit);
+  return {
+    history: limitedHistory,
+    historyWindow: {
+      limit,
+      returnedCount: limitedHistory.length,
+      totalCount: history.length,
+      truncated: history.length > limitedHistory.length,
+    },
+  };
+}
+
+async function readProjectConversationHistoryFromResponse(
+  client: SupervisorRuntimeClient,
+  options: {
+    conversationId: string;
+    threadUrl: string;
+    projectUrl: string;
+    limit?: number;
+  },
+): Promise<{
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+}> {
+  const { Network, Page, Runtime } = client;
+  if (!Network || !Page || !Runtime) {
+    throw new Error("Oracle supervisor runtime is missing Network/Page domains for history recovery.");
+  }
+
+  const normalizedThreadUrl = normalizeComparableUrl(options.threadUrl);
+  if (!normalizedThreadUrl) {
+    throw new Error("Oracle history recovery requires a concrete thread URL.");
+  }
+  const responseUrl = new URL(
+    `/backend-api/conversation/${options.conversationId}`,
+    normalizedThreadUrl,
+  ).toString();
+  const comparableResponseUrl = normalizeComparableUrl(responseUrl);
+  const expectedProjectId = extractProjectIdFromUrl(options.projectUrl);
+  let requestHeaders: Record<string, unknown> | undefined;
+  const matchesResponseUrl = (value: unknown): boolean =>
+    typeof value === "string" && normalizeComparableUrl(value) === comparableResponseUrl;
+
+  const responseMatch = await new Promise<{ requestId: string; status: number }>(
+    async (resolve, reject) => {
+      let settled = false;
+      let matchedResponse: { requestId: string; status: number } | null = null;
+      const finishedRequestIds = new Set<string>();
+      const requestListener = (params: object) => {
+        if (settled) {
+          return;
+        }
+        const request = (params as Record<string, unknown>).request as
+          | Record<string, unknown>
+          | undefined;
+        if (!request || !matchesResponseUrl(request.url)) {
+          return;
+        }
+        requestHeaders =
+          request.headers && typeof request.headers === "object"
+            ? (request.headers as Record<string, unknown>)
+            : undefined;
+      };
+      const loadingFinishedListener = (params: object) => {
+        if (settled) {
+          return;
+        }
+        const requestId = String((params as Record<string, unknown>).requestId);
+        finishedRequestIds.add(requestId);
+        tryResolveLoadedResponse(requestId);
+      };
+      const loadingFailedListener = (params: object) => {
+        if (settled || !matchedResponse) {
+          return;
+        }
+        const requestId = String((params as Record<string, unknown>).requestId);
+        if (requestId !== matchedResponse.requestId) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(
+          new Error(
+            `Oracle conversation response failed to load for ${options.conversationId}: ${String(
+              (params as Record<string, unknown>).errorText ?? "unknown error",
+            )}.`,
+          ),
+        );
+      };
+      const responseReceivedListener = (params: object) => {
+        if (settled) {
+          return;
+        }
+        const response = (params as Record<string, unknown>).response as
+          | Record<string, unknown>
+          | undefined;
+        if (!response || !matchesResponseUrl(response.url)) {
+          return;
+        }
+        matchedResponse = {
+          requestId: String((params as Record<string, unknown>).requestId),
+          status: Number(response.status ?? 0),
+        };
+        tryResolveLoadedResponse(matchedResponse.requestId);
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        removeSupervisorRuntimeListener(client, "Network.requestWillBeSent", requestListener);
+        removeSupervisorRuntimeListener(client, "Network.loadingFinished", loadingFinishedListener);
+        removeSupervisorRuntimeListener(client, "Network.loadingFailed", loadingFailedListener);
+        removeSupervisorRuntimeListener(client, "Network.responseReceived", responseReceivedListener);
+      };
+      const timer = setTimeout(() => {
+        settled = true;
+        cleanup();
+        reject(new Error(`Timed out waiting for Oracle conversation response ${options.conversationId}.`));
+      }, SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS);
+      const tryResolveLoadedResponse = (requestId: string) => {
+        if (
+          settled ||
+          !matchedResponse ||
+          matchedResponse.requestId !== requestId ||
+          !finishedRequestIds.has(requestId)
+        ) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(matchedResponse);
+      };
+
+      client.on("Network.requestWillBeSent", requestListener);
+      client.on("Network.loadingFinished", loadingFinishedListener);
+      client.on("Network.loadingFailed", loadingFailedListener);
+      client.on("Network.responseReceived", responseReceivedListener);
+
+      try {
+        await Promise.all([Network.enable({}), Page.enable()]);
+        const currentThread = await readCurrentSupervisorThread(Runtime);
+        if (normalizeComparableUrl(currentThread.url) === normalizedThreadUrl) {
+          await Page.reload({ ignoreCache: true });
+        } else {
+          await Page.navigate({ url: normalizedThreadUrl });
+        }
+      } catch (error) {
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    },
+  );
+
+  if (expectedProjectId) {
+    const requestProjectId = readHeaderValue(requestHeaders, "chatgpt-project-id");
+    if (requestProjectId !== expectedProjectId) {
+      throw new Error(
+        `Oracle conversation response used project ${requestProjectId ?? "unknown"} instead of ${expectedProjectId}.`,
+      );
+    }
+  }
+  if (responseMatch.status !== 200) {
+    throw new Error(
+      `Oracle conversation response returned HTTP ${responseMatch.status} for ${options.conversationId}.`,
+    );
+  }
+
+  const responseBody = await Network.getResponseBody({ requestId: responseMatch.requestId });
+  const rawBody = responseBody.base64Encoded
+    ? Buffer.from(responseBody.body, "base64").toString("utf8")
+    : responseBody.body;
+  return decodeConversationResponseHistory(JSON.parse(rawBody), options);
+}
 
 function isMissingSupervisorRuntimeError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -232,6 +593,7 @@ async function withChromeFocusProtection<T>(
 async function withSupervisorRuntime<T>(
   request: SupervisorBrokerRequest,
   action: (args: {
+    client: SupervisorRuntimeClient;
     Runtime: Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"]["Runtime"];
     sessionId: string;
     targetId?: string;
@@ -249,6 +611,7 @@ async function withSupervisorRuntime<T>(
         const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime);
         try {
           return await action({
+            client: connection.client,
             Runtime: connection.client.Runtime,
             sessionId: context.sessionId,
             targetId: connection.targetId,
@@ -313,6 +676,315 @@ function buildSupervisorThreadBinding(
     projectUrl: configuredSupervisorProjectUrl(meta),
     verifiedAt: new Date().toISOString(),
   };
+}
+
+function normalizeRequestedThreadUrlCandidate(
+  requestedConversationId: string,
+  projectUrl: string | undefined,
+  candidate: { url?: string | null; conversationId?: string | null } | null | undefined,
+): string | undefined {
+  const url = candidate?.url?.trim();
+  if (!url) {
+    return undefined;
+  }
+  const normalized = normalizeSupervisorThread({
+    url,
+    conversationId: candidate?.conversationId?.trim() || undefined,
+    title: "Oracle thread",
+  });
+  if (
+    !normalized ||
+    normalized.conversationId?.trim() !== requestedConversationId ||
+    !supervisorThreadMatchesProjectScope(normalized, projectUrl)
+  ) {
+    return undefined;
+  }
+  return url;
+}
+
+function normalizeSupervisorHistoryLimit(limit?: number): number {
+  const numeric =
+    typeof limit === "number" && Number.isFinite(limit)
+      ? Math.trunc(limit)
+      : SUPERVISOR_HISTORY_LIMIT_DEFAULT;
+  return Math.min(SUPERVISOR_HISTORY_LIMIT_MAX, Math.max(1, numeric));
+}
+
+function normalizeBackendMessageText(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\r/g, "").trim() : "";
+}
+
+function extractBackendMessageTextPart(value: unknown): string {
+  if (typeof value === "string") {
+    return normalizeBackendMessageText(value);
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  const record = value as Record<string, unknown>;
+  const directFields = [record.text, record.content, record.value, record.body];
+  for (const candidate of directFields) {
+    const text = normalizeBackendMessageText(candidate);
+    if (text) {
+      return text;
+    }
+  }
+  const nestedCollections = [record.parts, record.content, record.items, record.output];
+  for (const collection of nestedCollections) {
+    const text = extractBackendMessageTextCollection(collection);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function extractBackendMessageTextCollection(value: unknown): string {
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((part) => extractBackendMessageTextPart(part))
+      .filter((part) => part.length > 0);
+    return parts.join("\n\n").trim();
+  }
+  return extractBackendMessageTextPart(value);
+}
+
+function extractBackendConversationMessageText(message: Record<string, unknown>): string {
+  const content = message.content;
+  if (content && typeof content === "object") {
+    const record = content as Record<string, unknown>;
+    const partsText = extractBackendMessageTextCollection(record.parts);
+    if (partsText) {
+      return partsText;
+    }
+    const textFields = [record.text, record.result, record.output_text];
+    for (const candidate of textFields) {
+      const text = extractBackendMessageTextCollection(candidate);
+      if (text) {
+        return text;
+      }
+    }
+  }
+  const fallbackFields = [message.text, message.content, message.result, message.output_text];
+  for (const candidate of fallbackFields) {
+    const text = extractBackendMessageTextCollection(candidate);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function extractBackendConversationMessageRole(
+  message: Record<string, unknown>,
+): "user" | "assistant" | null {
+  const author = message.author;
+  const authorRole =
+    author && typeof author === "object"
+      ? normalizeBackendMessageText((author as Record<string, unknown>).role).toLowerCase()
+      : "";
+  const directRole = normalizeBackendMessageText(message.role).toLowerCase();
+  const role = authorRole || directRole;
+  return role === "user" || role === "assistant" ? role : null;
+}
+
+function parseBackendConversationHistoryEntries(
+  body: unknown,
+  expectedConversationId: string,
+): SupervisorThreadHistoryEntry[] {
+  if (!body || typeof body !== "object") {
+    return [];
+  }
+  const record = body as Record<string, unknown>;
+  const backendConversationId = normalizeBackendMessageText(record.conversation_id);
+  if (backendConversationId && backendConversationId !== expectedConversationId) {
+    return [];
+  }
+  const mapping = record.mapping;
+  if (!mapping || typeof mapping !== "object") {
+    return [];
+  }
+  const rawEntries: Array<{
+    role: "user" | "assistant";
+    text: string;
+    createdAt: number;
+    index: number;
+  }> = [];
+  let fallbackIndex = 0;
+  for (const node of Object.values(mapping as Record<string, unknown>)) {
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+    const nodeRecord = node as Record<string, unknown>;
+    const message = nodeRecord.message;
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    const messageRecord = message as Record<string, unknown>;
+    const role = extractBackendConversationMessageRole(messageRecord);
+    if (!role) {
+      continue;
+    }
+    const text = extractBackendConversationMessageText(messageRecord);
+    if (!text) {
+      continue;
+    }
+    const createTimeCandidate = messageRecord.create_time ?? nodeRecord.create_time;
+    const createTimeNumeric =
+      typeof createTimeCandidate === "number"
+        ? createTimeCandidate
+        : Number.parseFloat(String(createTimeCandidate ?? ""));
+    rawEntries.push({
+      role,
+      text,
+      createdAt: Number.isFinite(createTimeNumeric) ? createTimeNumeric : Number.POSITIVE_INFINITY,
+      index: fallbackIndex,
+    });
+    fallbackIndex += 1;
+  }
+  rawEntries.sort((left, right) =>
+    left.createdAt === right.createdAt ? left.index - right.index : left.createdAt - right.createdAt,
+  );
+  const deduped: SupervisorThreadHistoryEntry[] = [];
+  for (const entry of rawEntries) {
+    const last = deduped.at(-1);
+    if (last && last.role === entry.role && last.text === entry.text) {
+      continue;
+    }
+    deduped.push({ role: entry.role, text: entry.text });
+  }
+  return deduped;
+}
+
+function selectProjectScopedHistoryFallback(
+  args: {
+    projectUrl?: string;
+    expectedConversationId: string;
+    requestedLimit?: number;
+    placeholderShellUnderfill?: boolean;
+    domHistory: SupervisorThreadHistoryEntry[];
+    backendBody: unknown;
+  },
+): { history: SupervisorThreadHistoryEntry[]; historyWindow: SupervisorThreadHistoryWindow } | null {
+  if (!args.projectUrl?.trim() || args.placeholderShellUnderfill !== true) {
+    return null;
+  }
+  const limit = normalizeSupervisorHistoryLimit(args.requestedLimit);
+  const domHistory = Array.isArray(args.domHistory) ? args.domHistory : [];
+  if (domHistory.length >= limit) {
+    return null;
+  }
+  const backendHistory = parseBackendConversationHistoryEntries(
+    args.backendBody,
+    args.expectedConversationId,
+  );
+  if (backendHistory.length <= domHistory.length) {
+    return null;
+  }
+  const limited = backendHistory.slice(-limit);
+  return {
+    history: limited,
+    historyWindow: {
+      limit,
+      returnedCount: limited.length,
+      totalCount: backendHistory.length,
+      truncated: backendHistory.length > limited.length,
+    },
+  };
+}
+
+async function recoverProjectScopedSupervisorThreadHistoryFromBackendApi(
+  runtime: SupervisorRuntimeClient,
+  args: {
+    projectUrl?: string;
+    expectedConversationId: string;
+    requestedLimit?: number;
+    domHistory: SupervisorThreadHistoryEntry[];
+    threadUrl?: string;
+    placeholderShellUnderfill?: boolean;
+  },
+): Promise<{ history: SupervisorThreadHistoryEntry[]; historyWindow: SupervisorThreadHistoryWindow } | null> {
+  if (!args.projectUrl?.trim() || args.placeholderShellUnderfill !== true) {
+    return null;
+  }
+  const limit = normalizeSupervisorHistoryLimit(args.requestedLimit);
+  if (args.domHistory.length >= limit) {
+    return null;
+  }
+
+  const threadUrl = args.threadUrl?.trim();
+  if (threadUrl) {
+    const candidateThread = normalizeSupervisorThread({
+      title: "Oracle thread",
+      url: threadUrl,
+      conversationId: args.expectedConversationId,
+    });
+    if (candidateThread && supervisorThreadMatchesProjectScope(candidateThread, args.projectUrl)) {
+      const client = runtime as SupervisorRuntimeClient;
+      if (client.Network && client.Page && client.Runtime) {
+        try {
+          const recovered = await readProjectConversationHistoryFromResponse(client, {
+            conversationId: args.expectedConversationId,
+            threadUrl,
+            projectUrl: args.projectUrl,
+            limit: limit,
+          });
+          if (recovered.history.length > args.domHistory.length) {
+            return recovered;
+          }
+          return null;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (
+            message.includes("while") &&
+            message.includes("requested") &&
+            message.includes("conversation response returned")
+          ) {
+            throw error;
+          }
+          if (message.includes("used project") && message.includes("instead of")) {
+            throw error;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveRequestedThreadUrl(
+  request: SupervisorBrokerRequest,
+  runtimeSessionMeta: SessionMetadata | null,
+): Promise<string | undefined> {
+  const requestedConversationId = request.conversationId?.trim();
+  if (!requestedConversationId) {
+    return undefined;
+  }
+  const projectUrl = configuredSupervisorProjectUrl(runtimeSessionMeta);
+  const explicit = normalizeRequestedThreadUrlCandidate(requestedConversationId, projectUrl, {
+    url: request.threadUrl,
+    conversationId: requestedConversationId,
+  });
+  if (explicit) {
+    return explicit;
+  }
+  const followupSessionId = request.followupSession?.trim();
+  if (!followupSessionId) {
+    return undefined;
+  }
+  const followupMeta = await sessionStore.readSession(followupSessionId).catch(() => null);
+  return (
+    normalizeRequestedThreadUrlCandidate(
+      requestedConversationId,
+      projectUrl,
+      followupMeta?.supervisorThread,
+    ) ??
+    normalizeRequestedThreadUrlCandidate(requestedConversationId, projectUrl, {
+      url: followupMeta?.browser?.runtime?.tabUrl,
+      conversationId: followupMeta?.browser?.runtime?.conversationId,
+    })
+  );
 }
 
 function assertReusableSupervisorThreadBinding(
@@ -527,7 +1199,6 @@ export async function runSupervisorBrokerRequest(
         )(request);
       case "attach_thread": {
         const conversationId = request.conversationId?.trim();
-        const threadUrl = request.threadUrl?.trim() || undefined;
         if (!conversationId) {
           return {
             ok: false,
@@ -541,6 +1212,7 @@ export async function runSupervisorBrokerRequest(
               incoming,
               async ({ Runtime, sessionId, targetId }) => {
                 const meta = await sessionStore.readSession(sessionId);
+                const threadUrl = await resolveRequestedThreadUrl(incoming, meta);
                 const thread = await attachSupervisorThread(Runtime, conversationId, {
                   projectUrl: configuredSupervisorProjectUrl(meta),
                   threadUrl,
@@ -576,11 +1248,14 @@ export async function runSupervisorBrokerRequest(
           (async (incoming: SupervisorBrokerRequest) =>
             withSupervisorRuntime(
               incoming,
-              async ({ Runtime, sessionId, targetId }) => {
+              async ({ client, Runtime, sessionId, targetId }) => {
                 const meta = await sessionStore.readSession(sessionId);
+                const projectUrl = configuredSupervisorProjectUrl(meta);
+                const threadUrl = await resolveRequestedThreadUrl(incoming, meta);
                 const result = await readAttachedSupervisorThreadHistory(Runtime, {
                   conversationId,
-                  projectUrl: configuredSupervisorProjectUrl(meta),
+                  projectUrl,
+                  threadUrl,
                   limit: incoming.historyLimit,
                 });
                 assertRequestedConversationIdentity(
@@ -588,6 +1263,20 @@ export async function runSupervisorBrokerRequest(
                   conversationId,
                   result.thread,
                 );
+                const backendRecoveredHistory =
+                  await recoverProjectScopedSupervisorThreadHistoryFromBackendApi(client, {
+                    projectUrl,
+                    expectedConversationId: conversationId,
+                    requestedLimit: incoming.historyLimit,
+                    domHistory: result.history,
+                    threadUrl: threadUrl ?? result.thread.url,
+                    placeholderShellUnderfill: result.placeholderShellUnderfill,
+                  });
+                if (result.placeholderShellUnderfill && !backendRecoveredHistory) {
+                  throw new Error(
+                    `Oracle supervisor thread history for ${conversationId} remained underfilled after backend recovery.`,
+                  );
+                }
                 const threadSessionId = await ensureSupervisorThreadSession(
                   sessionId,
                   result.thread,
@@ -597,8 +1286,8 @@ export async function runSupervisorBrokerRequest(
                   ok: true as const,
                   thread: result.thread,
                   sessionId: threadSessionId,
-                  history: result.history,
-                  historyWindow: result.historyWindow,
+                  history: backendRecoveredHistory?.history ?? result.history,
+                  historyWindow: backendRecoveredHistory?.historyWindow ?? result.historyWindow,
                 };
               },
               supervisorRuntimeDeps,
@@ -661,6 +1350,11 @@ export const __test__ = {
   createAndSyncSupervisorThreadSession,
   ensureSupervisorThreadSession,
   filterSupervisorThreadsForBrokerProjectScope,
+  normalizeSupervisorHistoryLimit,
+  parseBackendConversationHistoryEntries,
+  recoverProjectScopedSupervisorThreadHistoryFromBackendApi,
+  resolveRequestedThreadUrl,
+  selectProjectScopedHistoryFallback,
   isReusableSupervisorThreadSession,
   supervisorThreadSessionSlug,
   writeSupervisorBrokerResponseLine,

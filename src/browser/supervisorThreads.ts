@@ -6,6 +6,7 @@ import {
 } from "./constants.js";
 import { delay } from "./utils.js";
 import {
+  buildConversationUrl,
   conversationHrefMatchesConfiguredScope,
   openConversationFromSidebarWithRetry,
 } from "./reattachHelpers.js";
@@ -45,6 +46,7 @@ interface SupervisorThreadHistorySnapshot {
   history: SupervisorThreadHistoryEntry[];
   historyWindow: SupervisorThreadHistoryWindow;
   activeRootValidated: boolean;
+  placeholderShellUnderfill: boolean;
 }
 
 function normalizeNonNegativeInteger(value: unknown): number {
@@ -131,6 +133,29 @@ function normalizeProjectUrl(projectUrl?: string): string | undefined {
     return parsed.toString().replace(/\/+$/, "");
   } catch {
     return trimmed.replace(/\/+$/, "");
+  }
+}
+
+function buildProjectScopedConversationUrl(
+  conversationId: string,
+  projectUrl?: string,
+): string | undefined {
+  const normalizedConversationId = conversationId.trim();
+  const normalizedProjectUrl = normalizeProjectUrl(projectUrl);
+  if (!normalizedConversationId || !normalizedProjectUrl) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(normalizedProjectUrl);
+    const projectRoot = parsed.pathname
+      .replace(/\/+$/, "")
+      .match(/^(\/g\/[^/]+)\/project(?:\/c\/[a-zA-Z0-9-]+)?$/i)?.[1];
+    if (!projectRoot) {
+      return undefined;
+    }
+    return `${parsed.origin}${projectRoot}/c/${normalizedConversationId}`;
+  } catch {
+    return undefined;
   }
 }
 
@@ -399,7 +424,8 @@ function normalizeSupervisorThreadHistorySnapshot(
     typeof snapshotRecord.activeRootValidated === "boolean"
       ? snapshotRecord.activeRootValidated
       : true;
-  return { thread, history, historyWindow, activeRootValidated };
+  const placeholderShellUnderfill = snapshotRecord.placeholderShellUnderfill === true;
+  return { thread, history, historyWindow, activeRootValidated, placeholderShellUnderfill };
 }
 
 function supervisorThreadHistorySnapshotsEqual(
@@ -413,6 +439,7 @@ function supervisorThreadHistorySnapshotsEqual(
   if (
     !sameThread ||
     left.activeRootValidated !== right.activeRootValidated ||
+    left.placeholderShellUnderfill !== right.placeholderShellUnderfill ||
     left.historyWindow.limit !== right.historyWindow.limit ||
     left.historyWindow.returnedCount !== right.historyWindow.returnedCount ||
     left.historyWindow.totalCount !== right.historyWindow.totalCount ||
@@ -466,6 +493,7 @@ async function readSupervisorThreadHistorySnapshotOnce(
             truncated: false,
           },
           activeRootValidated: false,
+          placeholderShellUnderfill: false,
         };
       }
       const normalize = (text) =>
@@ -646,13 +674,22 @@ async function readSupervisorThreadHistorySnapshotOnce(
       );
       const orderedTurns = turns.length > 0 ? turns : rawTurns;
       const entries = [];
+      let roleTurnCount = 0;
+      let assistantPlaceholderShellCount = 0;
       for (const node of orderedTurns) {
         if (!(node instanceof Element)) continue;
         const role = detectRole(node);
         if (!role) continue;
+        roleTurnCount += 1;
         const payload = readTurnPayload(node, role);
-        if (!payload?.text) continue;
+        if (!payload?.text) {
+          if (role === 'assistant') {
+            assistantPlaceholderShellCount += 1;
+          }
+          continue;
+        }
         if (role === 'assistant' && isAssistantPlaceholder(payload)) {
+          assistantPlaceholderShellCount += 1;
           continue;
         }
         const text = payload.text;
@@ -663,6 +700,9 @@ async function readSupervisorThreadHistorySnapshotOnce(
         entries.push({ role, text });
       }
       const limitedEntries = entries.slice(-limit);
+      const expectedHistoryCount = Math.min(limit, roleTurnCount);
+      const placeholderShellUnderfill =
+        assistantPlaceholderShellCount > 0 && limitedEntries.length < expectedHistoryCount;
       return {
         thread: readThread(),
         history: limitedEntries,
@@ -673,6 +713,7 @@ async function readSupervisorThreadHistorySnapshotOnce(
           truncated: entries.length > limitedEntries.length,
         },
         activeRootValidated: true,
+        placeholderShellUnderfill,
       };
     })()`,
     returnByValue: true,
@@ -687,7 +728,7 @@ async function readSupervisorThreadHistorySnapshot(
   const limit = normalizeHistoryLimit(options?.limit);
   let previous = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
   let current = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
-  if (supervisorThreadHistorySnapshotsEqual(previous, current)) {
+  if (current.activeRootValidated && supervisorThreadHistorySnapshotsEqual(previous, current)) {
     return current;
   }
   const deadline = Date.now() + HISTORY_STABILITY_TIMEOUT_MS;
@@ -695,7 +736,7 @@ async function readSupervisorThreadHistorySnapshot(
     await delay(HISTORY_STABILITY_POLL_MS);
     previous = current;
     current = await readSupervisorThreadHistorySnapshotOnce(Runtime, limit);
-    if (supervisorThreadHistorySnapshotsEqual(previous, current)) {
+    if (current.activeRootValidated && supervisorThreadHistorySnapshotsEqual(previous, current)) {
       return current;
     }
   }
@@ -711,11 +752,17 @@ export async function readSupervisorThreadHistory(
 
 export async function readAttachedSupervisorThreadHistory(
   Runtime: ChromeClient["Runtime"],
-  options: { conversationId: string; projectUrl?: string; limit?: number },
+  options: {
+    conversationId: string;
+    projectUrl?: string;
+    threadUrl?: string;
+    limit?: number;
+  },
 ): Promise<{
   thread: SupervisorThreadInfo;
   history: SupervisorThreadHistoryEntry[];
   historyWindow: SupervisorThreadHistoryWindow;
+  placeholderShellUnderfill: boolean;
 }> {
   const expectedConversationId = options.conversationId.trim();
   if (!expectedConversationId) {
@@ -724,11 +771,12 @@ export async function readAttachedSupervisorThreadHistory(
   let thread = await readCurrentSupervisorThread(Runtime);
   if (
     thread.conversationId !== expectedConversationId ||
-    !supervisorThreadMatchesProjectScope(thread, options.projectUrl) ||
-    !(await hasVisibleSupervisorConversationContent(Runtime, thread))
+    !supervisorThreadMatchesProjectScope(thread, options.projectUrl)
   ) {
     thread = await attachSupervisorThread(Runtime, expectedConversationId, {
       projectUrl: options.projectUrl,
+      threadUrl: options.threadUrl,
+      requireVisibleConversationContent: false,
     });
   }
   if (!supervisorThreadMatchesProjectScope(thread, options.projectUrl)) {
@@ -736,7 +784,24 @@ export async function readAttachedSupervisorThreadHistory(
       `Refusing to read Oracle supervisor thread ${thread.conversationId ?? "unknown"} outside the configured project scope.`,
     );
   }
-  const snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  let snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+  if (!snapshot.activeRootValidated) {
+    const repaired = await openConversationFromSidebarWithRetry(
+      Runtime,
+      { conversationId: expectedConversationId, preferProjects: true },
+      5_000,
+    ).catch(() => false);
+    if (repaired) {
+      const repairedThread = await readCurrentSupervisorThread(Runtime);
+      if (
+        repairedThread.conversationId === expectedConversationId &&
+        supervisorThreadMatchesProjectScope(repairedThread, options.projectUrl)
+      ) {
+        thread = repairedThread;
+        snapshot = await readSupervisorThreadHistorySnapshot(Runtime, { limit: options.limit });
+      }
+    }
+  }
   if (!snapshot.activeRootValidated) {
     throw new Error(
       `Oracle supervisor thread history could not validate the active conversation container for ${expectedConversationId}.`,
@@ -767,16 +832,32 @@ export async function readAttachedSupervisorThreadHistory(
     thread: confirmedThread,
     history: snapshot.history,
     historyWindow: snapshot.historyWindow,
+    placeholderShellUnderfill: snapshot.placeholderShellUnderfill,
   };
 }
 
 export async function attachSupervisorThread(
   Runtime: ChromeClient["Runtime"],
   conversationId: string,
-  options?: { projectUrl?: string; threadUrl?: string },
+  options?: {
+    projectUrl?: string;
+    threadUrl?: string;
+    requireVisibleConversationContent?: boolean;
+  },
 ): Promise<SupervisorThreadInfo> {
   const normalizedId = conversationId.trim();
   const normalizedThreadUrl = options?.threadUrl?.trim() || undefined;
+  const projectScopedThreadUrl = buildProjectScopedConversationUrl(
+    normalizedId,
+    options?.projectUrl,
+  );
+  const directAttachUrl =
+    normalizedThreadUrl ||
+    projectScopedThreadUrl ||
+    (options?.projectUrl
+      ? (buildConversationUrl({ conversationId: normalizedId }, options.projectUrl) ?? undefined)
+      : undefined);
+  const requireVisibleConversationContent = options?.requireVisibleConversationContent ?? true;
   if (!normalizedId) {
     throw new Error("conversationId is required for attach_thread.");
   }
@@ -784,16 +865,17 @@ export async function attachSupervisorThread(
   const current = await readCurrentSupervisorThread(Runtime);
   if (
     current.conversationId === normalizedId &&
-    (!normalizedThreadUrl ||
-      normalizeProjectUrl(current.url) === normalizeProjectUrl(normalizedThreadUrl)) &&
+    (!directAttachUrl ||
+      normalizeProjectUrl(current.url) === normalizeProjectUrl(directAttachUrl)) &&
     supervisorThreadMatchesProjectScope(current, options?.projectUrl) &&
-    (await hasVisibleSupervisorConversationContent(Runtime, current, normalizedThreadUrl))
+    (!requireVisibleConversationContent ||
+      (await hasVisibleSupervisorConversationContent(Runtime, current, directAttachUrl)))
   ) {
     return current;
   }
 
-  if (normalizedThreadUrl) {
-    await navigateSupervisorThreadUrl(Runtime, normalizedThreadUrl);
+  if (directAttachUrl) {
+    await navigateSupervisorThreadUrl(Runtime, directAttachUrl);
   } else {
     const opened = await openConversationFromSidebarWithRetry(
       Runtime,
@@ -816,7 +898,8 @@ export async function attachSupervisorThread(
     if (
       lastSeen.conversationId === normalizedId &&
       supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl) &&
-      (await hasVisibleSupervisorConversationContent(Runtime, lastSeen, normalizedThreadUrl))
+      (!requireVisibleConversationContent ||
+        (await hasVisibleSupervisorConversationContent(Runtime, lastSeen, directAttachUrl)))
     ) {
       return lastSeen;
     }
@@ -824,14 +907,14 @@ export async function attachSupervisorThread(
     const attachIdentityMatches =
       lastSeen.conversationId === normalizedId &&
       supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl);
-    if (!normalizedThreadUrl || attachIdentityMatches) {
+    if (!directAttachUrl || attachIdentityMatches) {
       continue;
     }
 
     const elapsedMs = Date.now() - start;
     if (!retriedDirectNavigation && elapsedMs >= ATTACH_DIRECT_NAV_RETRY_DELAY_MS) {
       retriedDirectNavigation = true;
-      await navigateSupervisorThreadUrl(Runtime, normalizedThreadUrl);
+      await navigateSupervisorThreadUrl(Runtime, directAttachUrl);
       deadline = Math.max(deadline, Date.now() + ATTACH_REPAIR_CONFIRM_EXTENSION_MS);
       continue;
     }
