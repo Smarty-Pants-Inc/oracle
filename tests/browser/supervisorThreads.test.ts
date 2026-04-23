@@ -921,6 +921,11 @@ describe("supervisorThreads", () => {
 
   test("readAttachedSupervisorThreadHistory retries once through the sidebar when the first snapshot cannot validate the active root", async () => {
     let sidebarRepairCount = 0;
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
     vi.mocked(openConversationFromSidebarWithRetry).mockImplementation(async () => {
       sidebarRepairCount += 1;
       return true;
@@ -1002,6 +1007,7 @@ describe("supervisorThreads", () => {
       { conversationId: "current-9", preferProjects: true },
       5_000,
     );
+    dateNow.mockRestore();
   });
 
   test("readAttachedSupervisorThreadHistory reattaches with the provided project thread URL when sidebar lookup would miss", async () => {
@@ -1268,6 +1274,12 @@ describe("supervisorThreads", () => {
   });
 
   test("readAttachedSupervisorThreadHistory fails closed when history comes from an unvalidated secondary pane", async () => {
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 3_000;
+      return now;
+    });
+    vi.mocked(openConversationFromSidebarWithRetry).mockResolvedValue(false);
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("return __oracleCollectThreadEntries(activeRoot).filter(")) {
@@ -1317,6 +1329,7 @@ describe("supervisorThreads", () => {
         limit: 1,
       }),
     ).rejects.toThrow("could not validate the active conversation container");
+    dateNow.mockRestore();
   });
 
   test("readAttachedSupervisorThreadHistory accepts legacy supervisorThread snapshot payloads", async () => {
