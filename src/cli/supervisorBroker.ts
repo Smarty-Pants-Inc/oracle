@@ -190,7 +190,10 @@ function removeSupervisorRuntimeListener(
 ): void {
   const emitter = client as unknown as {
     off?: (event: string, callback: (params: object, sessionId?: string) => void) => void;
-    removeListener?: (event: string, callback: (params: object, sessionId?: string) => void) => void;
+    removeListener?: (
+      event: string,
+      callback: (params: object, sessionId?: string) => void,
+    ) => void;
   };
   if (typeof emitter.off === "function") {
     emitter.off(eventName, listener);
@@ -346,7 +349,9 @@ async function readProjectConversationHistoryFromResponse(
 }> {
   const { Network, Page, Runtime } = client;
   if (!Network || !Page || !Runtime) {
-    throw new Error("Oracle supervisor runtime is missing Network/Page domains for history recovery.");
+    throw new Error(
+      "Oracle supervisor runtime is missing Network/Page domains for history recovery.",
+    );
   }
 
   const normalizedThreadUrl = normalizeComparableUrl(options.threadUrl);
@@ -364,7 +369,7 @@ async function readProjectConversationHistoryFromResponse(
     typeof value === "string" && normalizeComparableUrl(value) === comparableResponseUrl;
 
   const responseMatch = await new Promise<{ requestId: string; status: number }>(
-    async (resolve, reject) => {
+    (resolve, reject) => {
       let settled = false;
       let matchedResponse: { requestId: string; status: number } | null = null;
       const finishedRequestIds = new Set<string>();
@@ -430,12 +435,20 @@ async function readProjectConversationHistoryFromResponse(
         removeSupervisorRuntimeListener(client, "Network.requestWillBeSent", requestListener);
         removeSupervisorRuntimeListener(client, "Network.loadingFinished", loadingFinishedListener);
         removeSupervisorRuntimeListener(client, "Network.loadingFailed", loadingFailedListener);
-        removeSupervisorRuntimeListener(client, "Network.responseReceived", responseReceivedListener);
+        removeSupervisorRuntimeListener(
+          client,
+          "Network.responseReceived",
+          responseReceivedListener,
+        );
       };
       const timer = setTimeout(() => {
         settled = true;
         cleanup();
-        reject(new Error(`Timed out waiting for Oracle conversation response ${options.conversationId}.`));
+        reject(
+          new Error(
+            `Timed out waiting for Oracle conversation response ${options.conversationId}.`,
+          ),
+        );
       }, SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS);
       const tryResolveLoadedResponse = (requestId: string) => {
         if (
@@ -456,19 +469,21 @@ async function readProjectConversationHistoryFromResponse(
       client.on("Network.loadingFailed", loadingFailedListener);
       client.on("Network.responseReceived", responseReceivedListener);
 
-      try {
-        await Promise.all([Network.enable({}), Page.enable()]);
-        const currentThread = await readCurrentSupervisorThread(Runtime);
-        if (normalizeComparableUrl(currentThread.url) === normalizedThreadUrl) {
-          await Page.reload({ ignoreCache: true });
-        } else {
-          await Page.navigate({ url: normalizedThreadUrl });
+      void (async () => {
+        try {
+          await Promise.all([Network.enable({}), Page.enable()]);
+          const currentThread = await readCurrentSupervisorThread(Runtime);
+          if (normalizeComparableUrl(currentThread.url) === normalizedThreadUrl) {
+            await Page.reload({ ignoreCache: true });
+          } else {
+            await Page.navigate({ url: normalizedThreadUrl });
+          }
+        } catch (error) {
+          settled = true;
+          cleanup();
+          reject(error);
         }
-      } catch (error) {
-        settled = true;
-        cleanup();
-        reject(error);
-      }
+      })();
     },
   );
 
@@ -843,7 +858,9 @@ function parseBackendConversationHistoryEntries(
     fallbackIndex += 1;
   }
   rawEntries.sort((left, right) =>
-    left.createdAt === right.createdAt ? left.index - right.index : left.createdAt - right.createdAt,
+    left.createdAt === right.createdAt
+      ? left.index - right.index
+      : left.createdAt - right.createdAt,
   );
   const deduped: SupervisorThreadHistoryEntry[] = [];
   for (const entry of rawEntries) {
@@ -856,16 +873,17 @@ function parseBackendConversationHistoryEntries(
   return deduped;
 }
 
-function selectProjectScopedHistoryFallback(
-  args: {
-    projectUrl?: string;
-    expectedConversationId: string;
-    requestedLimit?: number;
-    placeholderShellUnderfill?: boolean;
-    domHistory: SupervisorThreadHistoryEntry[];
-    backendBody: unknown;
-  },
-): { history: SupervisorThreadHistoryEntry[]; historyWindow: SupervisorThreadHistoryWindow } | null {
+function selectProjectScopedHistoryFallback(args: {
+  projectUrl?: string;
+  expectedConversationId: string;
+  requestedLimit?: number;
+  placeholderShellUnderfill?: boolean;
+  domHistory: SupervisorThreadHistoryEntry[];
+  backendBody: unknown;
+}): {
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+} | null {
   if (!args.projectUrl?.trim() || args.placeholderShellUnderfill !== true) {
     return null;
   }
@@ -903,7 +921,10 @@ async function recoverProjectScopedSupervisorThreadHistoryFromBackendApi(
     threadUrl?: string;
     placeholderShellUnderfill?: boolean;
   },
-): Promise<{ history: SupervisorThreadHistoryEntry[]; historyWindow: SupervisorThreadHistoryWindow } | null> {
+): Promise<{
+  history: SupervisorThreadHistoryEntry[];
+  historyWindow: SupervisorThreadHistoryWindow;
+} | null> {
   if (!args.projectUrl?.trim() || args.placeholderShellUnderfill !== true) {
     return null;
   }

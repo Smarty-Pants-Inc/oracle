@@ -1397,7 +1397,7 @@ describe("runSupervisorBrokerRequest", () => {
   test("recoverProjectScopedSupervisorThreadHistoryFromBackendApi captures backend-api history through CDP", async () => {
     const listeners = new Map<string, (params: Record<string, unknown>) => void>();
     const Runtime = {
-      evaluate: vi.fn(async () => ({
+      evaluate: vi.fn(async (_params?: { expression?: string }) => ({
         result: {
           value: {
             url: "https://chatgpt.com/g/team-space-oracle/c/current-1",
@@ -1575,7 +1575,9 @@ describe("runSupervisorBrokerRequest", () => {
         threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
         placeholderShellUnderfill: true,
       }),
-    ).rejects.toThrow("Oracle conversation response used project wrong-project instead of team-space.");
+    ).rejects.toThrow(
+      "Oracle conversation response used project wrong-project instead of team-space.",
+    );
     expect(client.Network.getResponseBody).not.toHaveBeenCalled();
   });
 
