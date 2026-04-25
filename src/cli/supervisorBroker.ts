@@ -4,7 +4,7 @@ import readline from "node:readline";
 import type { LaunchedChrome } from "chrome-launcher";
 import {
   attachSupervisorThread,
-  listSupervisorThreads,
+  listSupervisorBrowserEntries,
   newSupervisorThread,
   readAttachedSupervisorThreadHistory,
   readCurrentSupervisorThread,
@@ -12,6 +12,7 @@ import {
   supervisorThreadMatchesProjectScope,
   type SupervisorThreadHistoryEntry,
   type SupervisorThreadInfo,
+  type SupervisorBrowserEntry,
 } from "../browser/supervisorThreads.js";
 import { normalizeSupervisorThread } from "../browser/supervisorThreadNormalize.js";
 import {
@@ -45,12 +46,14 @@ export interface SupervisorBrokerRequest extends SupervisorPromptRequest {
   conversationId?: string;
   threadUrl?: string;
   historyLimit?: number;
+  browseScope?: "root" | "project";
+  projectUrl?: string;
   shutdown?: boolean;
 }
 
 export type SupervisorBrokerResponse =
   | { ok: true; sessionId: string; output: string }
-  | { ok: true; threads: SupervisorThreadInfo[] }
+  | { ok: true; threads: (SupervisorThreadInfo | SupervisorBrowserEntry)[] }
   | {
       ok: true;
       thread: SupervisorThreadInfo;
@@ -69,7 +72,7 @@ export interface SupervisorBrokerDeps {
   >;
   listThreads?: (
     request: SupervisorBrokerRequest,
-  ) => Promise<{ ok: true; threads: SupervisorThreadInfo[] }>;
+  ) => Promise<{ ok: true; threads: (SupervisorThreadInfo | SupervisorBrowserEntry)[] }>;
   newThread?: (
     request: SupervisorBrokerRequest,
   ) => Promise<{ ok: true; thread: SupervisorThreadInfo; sessionId: string }>;
@@ -97,6 +100,8 @@ const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_STRATEGY = "select";
 const SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS = 12_000;
 const SUPERVISOR_HISTORY_LIMIT_DEFAULT = 100;
 const SUPERVISOR_HISTORY_LIMIT_MAX = 200;
+const SUPERVISOR_CHATGPT_URL_ENV = "ORACLE_SUPERVISOR_CHATGPT_URL";
+const CHATGPT_ROOT_URL = "https://chatgpt.com/";
 
 async function writeSupervisorBrokerResponseLine(response: unknown): Promise<void> {
   const line = `${JSON.stringify(response)}\n`;
@@ -122,6 +127,11 @@ interface SupervisorRuntimeDeps {
   resolveSupervisorRuntimeContext: typeof resolveSupervisorRuntimeContext;
   connectSupervisorRuntime: typeof connectSupervisorRuntime;
   withSupervisorRuntimeAttachLease: typeof withSupervisorRuntimeAttachLease;
+}
+
+interface SupervisorRuntimeUseOptions {
+  allowChatgptShellRecovery?: boolean;
+  dedicatedHiddenTargetUrl?: string;
 }
 
 type SupervisorRuntimeClient = Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"];
@@ -165,6 +175,21 @@ function extractProjectIdFromUrl(projectUrl?: string): string | undefined {
   } catch {
     return normalized.match(/\/g\/([^/]+)/i)?.[1];
   }
+}
+
+function isProjectUrl(url?: string | null): boolean {
+  return Boolean(extractProjectIdFromUrl(url ?? undefined));
+}
+
+function normalizeProjectIdForComparison(projectId?: string | null): string | undefined {
+  const trimmed = projectId?.trim().toLowerCase();
+  return trimmed ? trimmed.replace(/-oracle$/i, "") : undefined;
+}
+
+function projectIdsEquivalent(left?: string | null, right?: string | null): boolean {
+  const normalizedLeft = normalizeProjectIdForComparison(left);
+  const normalizedRight = normalizeProjectIdForComparison(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
 }
 
 function readHeaderValue(
@@ -489,7 +514,7 @@ async function readProjectConversationHistoryFromResponse(
 
   if (expectedProjectId) {
     const requestProjectId = readHeaderValue(requestHeaders, "chatgpt-project-id");
-    if (requestProjectId !== expectedProjectId) {
+    if (!projectIdsEquivalent(requestProjectId, expectedProjectId)) {
       throw new Error(
         `Oracle conversation response used project ${requestProjectId ?? "unknown"} instead of ${expectedProjectId}.`,
       );
@@ -531,12 +556,13 @@ async function ensureSupervisorRuntimeReady(
   request: SupervisorBrokerRequest,
   runtimeDeps: SupervisorRuntimeDeps,
   promptRunner: NonNullable<SupervisorBrokerDeps["runPrompt"]>,
+  options: SupervisorRuntimeUseOptions = {},
 ): Promise<void> {
   if (request.followupSession?.trim()) {
     return;
   }
   try {
-    await runtimeDeps.resolveSupervisorRuntimeContext(undefined);
+    await runtimeDeps.resolveSupervisorRuntimeContext(undefined, options);
   } catch (error) {
     if (!isMissingSupervisorRuntimeError(error)) {
       throw error;
@@ -551,6 +577,10 @@ async function ensureSupervisorRuntimeReady(
 function configuredSupervisorProjectUrl(
   meta: Awaited<ReturnType<typeof sessionStore.readSession>>,
 ): string | undefined {
+  const envProjectUrl = process.env[SUPERVISOR_CHATGPT_URL_ENV]?.trim();
+  if (envProjectUrl && isProjectUrl(envProjectUrl)) {
+    return envProjectUrl;
+  }
   return (
     meta?.browser?.config?.supervisorChatgptUrl ??
     meta?.browser?.config?.chatgptUrl ??
@@ -572,6 +602,195 @@ function filterSupervisorThreadsForBrokerProjectScope(
       Boolean(thread.url?.trim()) &&
       supervisorThreadMatchesProjectScope(thread, normalizedProjectUrl),
   );
+}
+
+function brokerListBrowseOptions(
+  request: SupervisorBrokerRequest,
+  configuredProjectUrl?: string,
+):
+  | {
+      ok: true;
+      rootScope: true;
+      includeProjects: true;
+      fallbackProjectUrl?: string;
+      scopeUrl: string;
+    }
+  | { ok: true; projectUrl: string; scopeUrl: string }
+  | { ok: false; error: string } {
+  const requestedProjectUrl = request.projectUrl?.trim();
+  const browseScope = request.browseScope ?? (requestedProjectUrl ? "project" : "root");
+  if (browseScope === "root") {
+    const fallbackProjectUrl =
+      configuredProjectUrl?.trim() && isProjectUrl(configuredProjectUrl)
+        ? configuredProjectUrl.trim()
+        : undefined;
+    return {
+      ok: true,
+      rootScope: true,
+      includeProjects: true,
+      ...(fallbackProjectUrl ? { fallbackProjectUrl } : {}),
+      scopeUrl: CHATGPT_ROOT_URL,
+    };
+  }
+  const projectUrl = requestedProjectUrl || configuredProjectUrl?.trim();
+  if (!projectUrl) {
+    return {
+      ok: false,
+      error: "projectUrl is required when browseScope is project.",
+    };
+  }
+  return { ok: true, projectUrl, scopeUrl: projectUrl };
+}
+
+function conversationIdFromUrl(url?: string | null): string | undefined {
+  return url?.match(/\/c\/([a-zA-Z0-9-]+)/)?.[1]?.trim() || undefined;
+}
+
+function isProjectConversationUrl(url?: string | null): boolean {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const pathname = new URL(trimmed).pathname.replace(/\/+$/, "");
+    return /^\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i.test(pathname);
+  } catch {
+    return /\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+\/?$/i.test(trimmed);
+  }
+}
+
+function isRootConversationUrl(url?: string | null): boolean {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const pathname = new URL(trimmed).pathname.replace(/\/+$/, "");
+    return /^\/c\/[a-zA-Z0-9-]+$/i.test(pathname);
+  } catch {
+    return /\/c\/[a-zA-Z0-9-]+\/?$/i.test(trimmed) && !isProjectConversationUrl(trimmed);
+  }
+}
+
+function supervisorProjectRow(projectUrl?: string): SupervisorBrowserEntry | undefined {
+  const normalizedProjectUrl = normalizeComparableUrl(projectUrl);
+  const projectId = extractProjectIdFromUrl(normalizedProjectUrl);
+  if (!normalizedProjectUrl || !projectId) {
+    return undefined;
+  }
+  return {
+    kind: "project",
+    title: "Oracle project",
+    projectId,
+    projectUrl: normalizedProjectUrl,
+  };
+}
+
+function sessionRecencyMs(meta: SessionMetadata): number {
+  for (const candidate of [meta.completedAt, meta.startedAt, meta.createdAt]) {
+    const millis = Date.parse(candidate ?? "");
+    if (Number.isFinite(millis)) {
+      return millis;
+    }
+  }
+  return 0;
+}
+
+function localRootThreadFromSession(
+  meta: SessionMetadata,
+): (SupervisorThreadInfo & { kind: "thread" }) | undefined {
+  const binding = meta.supervisorThread;
+  const runtime = meta.browser?.runtime;
+  const progress = meta.progress;
+  const url = binding?.url?.trim() || runtime?.tabUrl?.trim() || progress?.tabUrl?.trim();
+  const conversationId =
+    binding?.conversationId?.trim() ||
+    runtime?.conversationId?.trim() ||
+    progress?.conversationId?.trim() ||
+    conversationIdFromUrl(url);
+  if (!conversationId) {
+    return undefined;
+  }
+  if (isProjectUrl(binding?.projectUrl) || isProjectConversationUrl(url)) {
+    return undefined;
+  }
+  const threadUrl = isRootConversationUrl(url) ? url : `https://chatgpt.com/c/${conversationId}`;
+  return {
+    kind: "thread",
+    title: meta.promptPreview?.trim() || `ChatGPT conversation ${conversationId}`,
+    conversationId,
+    url: threadUrl,
+  };
+}
+
+async function listLocalRootSupervisorThreads(): Promise<
+  (SupervisorThreadInfo & { kind: "thread" })[]
+> {
+  const sessions = await sessionStore.listSessions();
+  return sessions
+    .map((meta) => ({ meta, thread: localRootThreadFromSession(meta) }))
+    .filter(
+      (
+        entry,
+      ): entry is { meta: SessionMetadata; thread: SupervisorThreadInfo & { kind: "thread" } } =>
+        entry.thread !== undefined,
+    )
+    .sort((left, right) => sessionRecencyMs(right.meta) - sessionRecencyMs(left.meta))
+    .map((entry) => entry.thread);
+}
+
+function entryDedupeKey(entry: SupervisorBrowserEntry): string {
+  if (entry.kind === "project") {
+    const projectId =
+      normalizeProjectIdForComparison(entry.projectId) ??
+      normalizeProjectIdForComparison(extractProjectIdFromUrl(entry.projectUrl));
+    return projectId
+      ? `project:${projectId}`
+      : `project:${normalizeComparableUrl(entry.projectUrl) ?? entry.projectUrl}`;
+  }
+  const conversationId = entry.conversationId?.trim();
+  if (conversationId) {
+    return `thread:${conversationId}`;
+  }
+  return `url:${normalizeComparableUrl(entry.url) ?? entry.url ?? entry.title}`;
+}
+
+function dedupeSupervisorBrowserEntries(
+  entries: SupervisorBrowserEntry[],
+): SupervisorBrowserEntry[] {
+  const seen = new Set<string>();
+  const result: SupervisorBrowserEntry[] = [];
+  for (const entry of entries) {
+    const key = entryDedupeKey(entry);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(entry);
+  }
+  return result;
+}
+
+async function rootListThreadsWithLocalFallback(
+  liveEntries: SupervisorBrowserEntry[],
+  configuredProjectUrl?: string,
+  options: { forceLocalFallback?: boolean } = {},
+): Promise<SupervisorBrowserEntry[]> {
+  const liveRootThreads = liveEntries.filter(
+    (entry) => entry.kind === "thread" && !isProjectConversationUrl(entry.url),
+  );
+  const projectEntries = liveEntries.filter((entry) => entry.kind === "project");
+  const projectRow = supervisorProjectRow(configuredProjectUrl);
+  const fallbackThreads =
+    options.forceLocalFallback || liveRootThreads.length === 0
+      ? await listLocalRootSupervisorThreads()
+      : [];
+  return dedupeSupervisorBrowserEntries([
+    ...liveRootThreads,
+    ...fallbackThreads,
+    ...(projectRow ? [projectRow] : []),
+    ...projectEntries,
+  ]);
 }
 
 async function withChromeFocusProtection<T>(
@@ -611,25 +830,29 @@ async function withSupervisorRuntime<T>(
     client: SupervisorRuntimeClient;
     Runtime: Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"]["Runtime"];
     sessionId: string;
-    targetId?: string;
+    targetId?: string | null;
   }) => Promise<T>,
   runtimeDeps: SupervisorRuntimeDeps = supervisorRuntimeDeps,
   focusDeps: ChromeFocusDeps = chromeFocusDeps,
   promptRunner: NonNullable<SupervisorBrokerDeps["runPrompt"]> = runSupervisorPromptOperation,
+  options: SupervisorRuntimeUseOptions = {},
 ): Promise<T> {
-  await ensureSupervisorRuntimeReady(request, runtimeDeps, promptRunner);
+  await ensureSupervisorRuntimeReady(request, runtimeDeps, promptRunner, options);
   return await runtimeDeps.withSupervisorRuntimeAttachLease(supervisorChromeLogger, async () => {
-    const context = await runtimeDeps.resolveSupervisorRuntimeContext(request.followupSession);
+    const context = await runtimeDeps.resolveSupervisorRuntimeContext(
+      request.followupSession,
+      options,
+    );
     return await withChromeFocusProtection(
       context.runtime.chromePid,
       async () => {
-        const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime);
+        const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime, options);
         try {
           return await action({
             client: connection.client,
             Runtime: connection.client.Runtime,
             sessionId: context.sessionId,
-            targetId: connection.targetId,
+            targetId: connection.persistTargetId === false ? null : connection.targetId,
           });
         } finally {
           await connection.close();
@@ -643,7 +866,7 @@ async function withSupervisorRuntime<T>(
 async function syncSupervisorRuntimeSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
-  targetId?: string,
+  targetId?: string | null,
 ): Promise<void> {
   const meta = await sessionStore.readSession(sessionId);
   const runtime = meta?.browser?.runtime;
@@ -660,7 +883,7 @@ async function syncSupervisorRuntimeSession(
       config: meta.browser?.config,
       runtime: {
         ...runtime,
-        chromeTargetId: targetId ?? runtime.chromeTargetId,
+        chromeTargetId: targetId === undefined ? runtime.chromeTargetId : targetId || undefined,
         tabUrl: thread.url ?? runtime.tabUrl,
         conversationId: thread.conversationId,
       },
@@ -1039,7 +1262,7 @@ function isReusableSupervisorThreadSession(
 async function createSupervisorThreadSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
-  targetId?: string,
+  targetId?: string | null,
 ): Promise<string> {
   const meta = await sessionStore.readSession(sessionId);
   const runtime = meta?.browser?.runtime;
@@ -1056,7 +1279,7 @@ async function createSupervisorThreadSession(
     config: meta.browser?.config,
     runtime: {
       ...runtime,
-      chromeTargetId: targetId ?? runtime.chromeTargetId,
+      chromeTargetId: targetId === undefined ? runtime.chromeTargetId : targetId || undefined,
       tabUrl: thread.url ?? runtime.tabUrl,
       conversationId: thread.conversationId,
     },
@@ -1096,7 +1319,7 @@ async function createSupervisorThreadSession(
 async function createAndSyncSupervisorThreadSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
-  targetId?: string,
+  targetId?: string | null,
 ): Promise<string> {
   await syncSupervisorRuntimeSession(sessionId, thread, targetId);
   return await createSupervisorThreadSession(sessionId, thread, targetId);
@@ -1105,7 +1328,7 @@ async function createAndSyncSupervisorThreadSession(
 async function ensureSupervisorThreadSession(
   sessionId: string,
   thread: SupervisorThreadInfo,
-  targetId?: string,
+  targetId?: string | null,
 ): Promise<string> {
   const meta = await sessionStore.readSession(sessionId);
   assertReusableSupervisorThreadBinding(sessionId, meta, thread);
@@ -1171,25 +1394,62 @@ export async function runSupervisorBrokerRequest(
       case "list_threads":
         return (
           deps.listThreads ??
-          (async (incoming: SupervisorBrokerRequest) =>
-            withSupervisorRuntime(
+          (async (incoming: SupervisorBrokerRequest) => {
+            const browseScope =
+              incoming.browseScope ?? (incoming.projectUrl?.trim() ? "project" : "root");
+            const dedicatedHiddenTargetUrl =
+              browseScope === "root" ? CHATGPT_ROOT_URL : incoming.projectUrl?.trim();
+            return withSupervisorRuntime(
               incoming,
               async ({ Runtime, sessionId }) => {
                 const meta = await sessionStore.readSession(sessionId);
+                const browseOptions = brokerListBrowseOptions(
+                  incoming,
+                  configuredSupervisorProjectUrl(meta),
+                );
+                if (!browseOptions.ok) {
+                  return { ok: false as const, error: browseOptions.error };
+                }
+                if (browseScope === "root") {
+                  let liveEntries: SupervisorBrowserEntry[] = [];
+                  let liveError: unknown;
+                  try {
+                    liveEntries = await listSupervisorBrowserEntries(Runtime, browseOptions);
+                  } catch (error) {
+                    liveError = error;
+                  }
+                  const threads = await rootListThreadsWithLocalFallback(
+                    liveEntries,
+                    configuredSupervisorProjectUrl(meta),
+                    { forceLocalFallback: liveError !== undefined },
+                  );
+                  if (threads.length === 0 && liveError) {
+                    throw liveError;
+                  }
+                  if (threads.length === 0) {
+                    throw new Error(
+                      "No Oracle supervisor root threads, local root sessions, or configured project rows were available.",
+                    );
+                  }
+                  return {
+                    ok: true as const,
+                    threads,
+                  };
+                }
                 return {
                   ok: true as const,
-                  threads: filterSupervisorThreadsForBrokerProjectScope(
-                    await listSupervisorThreads(Runtime, {
-                      projectUrl: configuredSupervisorProjectUrl(meta),
-                    }),
-                    configuredSupervisorProjectUrl(meta),
-                  ),
+                  threads: await listSupervisorBrowserEntries(Runtime, browseOptions),
                 };
               },
               supervisorRuntimeDeps,
               chromeFocusDeps,
               promptRunner,
-            ))
+              {
+                allowChatgptShellRecovery: browseScope === "root",
+                dedicatedHiddenTargetUrl,
+              },
+            );
+          })
         )(request);
       case "new_thread":
         return (
@@ -1216,6 +1476,7 @@ export async function runSupervisorBrokerRequest(
               supervisorRuntimeDeps,
               chromeFocusDeps,
               promptRunner,
+              { allowChatgptShellRecovery: true },
             ))
         )(request);
       case "attach_thread": {
@@ -1226,6 +1487,7 @@ export async function runSupervisorBrokerRequest(
             error: "conversationId is required for attach_thread.",
           };
         }
+        const dedicatedHiddenTargetUrl = request.threadUrl?.trim();
         return (
           deps.attachThread ??
           (async (incoming: SupervisorBrokerRequest) =>
@@ -1253,6 +1515,10 @@ export async function runSupervisorBrokerRequest(
               supervisorRuntimeDeps,
               chromeFocusDeps,
               promptRunner,
+              {
+                allowChatgptShellRecovery: true,
+                ...(dedicatedHiddenTargetUrl ? { dedicatedHiddenTargetUrl } : {}),
+              },
             ))
         )(request);
       }
@@ -1264,6 +1530,7 @@ export async function runSupervisorBrokerRequest(
             error: "conversationId is required for thread_history.",
           };
         }
+        const dedicatedHiddenTargetUrl = request.threadUrl?.trim();
         return (
           deps.threadHistory ??
           (async (incoming: SupervisorBrokerRequest) =>
@@ -1314,6 +1581,10 @@ export async function runSupervisorBrokerRequest(
               supervisorRuntimeDeps,
               chromeFocusDeps,
               promptRunner,
+              {
+                allowChatgptShellRecovery: true,
+                ...(dedicatedHiddenTargetUrl ? { dedicatedHiddenTargetUrl } : {}),
+              },
             ))
         )(request);
       }
@@ -1363,6 +1634,10 @@ export async function startSupervisorBroker(): Promise<void> {
 
 export const __test__ = {
   buildSupervisorRuntimeBootstrapRequest,
+  brokerListBrowseOptions,
+  configuredSupervisorProjectUrl,
+  rootListThreadsWithLocalFallback,
+  listLocalRootSupervisorThreads,
   ensureSupervisorRuntimeReady,
   withChromeFocusProtection,
   withSupervisorRuntime,

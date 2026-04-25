@@ -6,6 +6,7 @@ import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js
 import { sessionStore } from "../sessionStore.js";
 import {
   connectToRemoteChromeTarget,
+  getBrowserWebSocketDebuggerUrl,
   listRemoteChromeTargets,
 } from "../browser/chromeLifecycle.js";
 import {
@@ -33,6 +34,9 @@ import { isProjectScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils
 
 const noopLogger: BrowserLogger = Object.assign((_: string) => {}, { verbose: false });
 const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "browser-profile-hidden");
+const DEFAULT_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS = 30_000;
+const SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_ENV =
+  "ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS";
 
 export interface SupervisorRuntimeContext {
   sessionId: string;
@@ -45,6 +49,12 @@ export interface SupervisorRuntimeConnection {
   host: string;
   port: number;
   targetId?: string;
+  persistTargetId?: boolean;
+}
+
+export interface SupervisorRuntimeReuseOptions {
+  allowChatgptShellRecovery?: boolean;
+  dedicatedHiddenTargetUrl?: string;
 }
 
 type SupervisorRuntimeArtifactStage = "attach-failure" | "recover-failure";
@@ -60,6 +70,37 @@ function parseSessionTimestamp(meta: SessionMetadata): number {
   const candidate = meta.startedAt ?? meta.completedAt ?? meta.createdAt;
   const parsed = Date.parse(candidate ?? "");
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function withSupervisorRuntimeCdpTimeout<T>(task: Promise<T>, context: string): Promise<T> {
+  const timeoutMs = supervisorRuntimeCdpCommandTimeoutMs();
+  let timeoutId: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      task,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`Timed out ${context} after ${timeoutMs}ms.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function supervisorRuntimeCdpCommandTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = env[SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_ENV]?.trim();
+  if (!configured) {
+    return DEFAULT_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS;
+  }
+  const parsed = Number(configured);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS;
+  }
+  return Math.trunc(parsed);
 }
 
 function processIsAlive(pid: number | null | undefined): boolean {
@@ -89,7 +130,17 @@ function supervisorRuntimeIsReusableNow(meta: SessionMetadata): boolean {
   const incompleteReason = meta.response?.incompleteReason?.trim();
   const completed =
     sessionStatus === "completed" || (!sessionStatus && responseStatus === "completed");
-  return completed && (!responseStatus || responseStatus === "completed") && !incompleteReason;
+  if (completed && (!responseStatus || responseStatus === "completed") && !incompleteReason) {
+    return true;
+  }
+  return Boolean(
+    meta.mode === "browser" &&
+    hasReusableRuntime(meta) &&
+    sessionStatus === "running" &&
+    (!responseStatus || responseStatus === "running") &&
+    !incompleteReason &&
+    !runtimeControllerIsAlive(meta),
+  );
 }
 
 function runtimeReusePriority(meta: SessionMetadata): number {
@@ -140,6 +191,45 @@ function runtimeMatchesConfiguredProjectScope(meta: SessionMetadata): boolean {
     tabUrl &&
     conversationHrefMatchesConfiguredScope(tabUrl, configuredProjectUrl),
   );
+}
+
+function isChatgptShellUrl(url: string | undefined): boolean {
+  try {
+    const parsed = new URL(url ?? "");
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return (
+      parsed.hostname.toLowerCase() === "chatgpt.com" &&
+      (pathname === "/" || /^\/g\/[^/]+\/project$/i.test(pathname))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function runtimeMatchesConfiguredProjectScopeForUse(
+  meta: SessionMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
+): boolean {
+  if (runtimeMatchesConfiguredProjectScope(meta)) {
+    return true;
+  }
+  return Boolean(
+    options.allowChatgptShellRecovery && isChatgptShellUrl(meta.browser?.runtime?.tabUrl),
+  );
+}
+
+function runtimeAllowsChatgptShellRecovery(
+  runtime: BrowserRuntimeMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
+): boolean {
+  return Boolean(options.allowChatgptShellRecovery && isChatgptShellUrl(runtime.tabUrl));
+}
+
+function runtimeHasReusableIdentityForUse(
+  runtime: BrowserRuntimeMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
+): boolean {
+  return runtimeHasReusableIdentity(runtime) || runtimeAllowsChatgptShellRecovery(runtime, options);
 }
 
 function isOwnedSupervisorRuntime(meta: SessionMetadata): meta is SessionMetadata & {
@@ -242,6 +332,7 @@ async function resolveMutableSupervisorRuntimeAnchorSessionId(
 
 async function refreshOwnedSupervisorRuntime(
   meta: SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } },
+  options: SupervisorRuntimeReuseOptions = {},
 ): Promise<BrowserRuntimeMetadata> {
   const runtime = meta.browser.runtime;
   if (!isOwnedSupervisorRuntime(meta)) {
@@ -275,12 +366,12 @@ async function refreshOwnedSupervisorRuntime(
       "Refusing to attach: owned Oracle hidden browser runtime is missing a configured project-scoped ChatGPT URL (/g/.../project).",
     );
   }
-  if (!runtimeMatchesConfiguredProjectScope(meta)) {
+  if (!runtimeMatchesConfiguredProjectScopeForUse(meta, options)) {
     throw new Error(
       "Refusing to attach: cached Oracle hidden browser tab is outside the configured ChatGPT scope.",
     );
   }
-  if (!runtimeHasReusableIdentity(runtime)) {
+  if (!runtimeHasReusableIdentityForUse(runtime, options)) {
     throw new Error(
       "Refusing to attach supervisor controls: cached Oracle hidden browser runtime is missing conversation identity metadata.",
     );
@@ -288,6 +379,15 @@ async function refreshOwnedSupervisorRuntime(
   const devtoolsInfo = await readDevToolsActivePortInfo(normalizedProfileDir, {
     host: runtime.chromeHost ?? "127.0.0.1",
   });
+  if (!devtoolsInfo) {
+    throw new Error(
+      "Owned Oracle hidden browser profile is not exposing DevTools. Run another Oracle browser turn to relaunch the hidden profile instead of attaching elsewhere.",
+    );
+  }
+  const chromeHost = runtime.chromeHost ?? "127.0.0.1";
+  const liveBrowserWSEndpoint =
+    (await getBrowserWebSocketDebuggerUrl(chromeHost, devtoolsInfo.port).catch(() => undefined)) ??
+    devtoolsInfo.browserWSEndpoint;
   const discoveredChromePid = await readChromePid(normalizedProfileDir);
   if (
     discoveredChromePid &&
@@ -298,17 +398,12 @@ async function refreshOwnedSupervisorRuntime(
     );
   }
   const chromePid = await resolveChromePidForUserDataDir(normalizedProfileDir, runtime.chromePid);
-  if (!devtoolsInfo) {
-    throw new Error(
-      "Owned Oracle hidden browser profile is not exposing DevTools. Run another Oracle browser turn to relaunch the hidden profile instead of attaching elsewhere.",
-    );
-  }
   return {
     ...runtime,
     chromePid: chromePid ?? undefined,
-    chromeHost: runtime.chromeHost ?? "127.0.0.1",
+    chromeHost,
     chromePort: devtoolsInfo.port,
-    chromeBrowserWSEndpoint: devtoolsInfo.browserWSEndpoint,
+    chromeBrowserWSEndpoint: liveBrowserWSEndpoint,
     userDataDir: normalizedProfileDir,
   };
 }
@@ -407,10 +502,11 @@ function inferSupervisorRuntimeScopeUrl(runtime: BrowserRuntimeMetadata): string
 function pickSafeSupervisorRecoveryTarget(
   targets: TargetInfoLite[],
   runtime: BrowserRuntimeMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
 ): TargetInfoLite | undefined {
   const scopeUrl = inferSupervisorRuntimeScopeUrl(runtime);
   if (!scopeUrl) {
-    return undefined;
+    return options.allowChatgptShellRecovery ? pickChatgptShellRecoveryTarget(targets) : undefined;
   }
   const scopeTargets = targets.filter(
     (target) =>
@@ -419,7 +515,7 @@ function pickSafeSupervisorRecoveryTarget(
       conversationHrefMatchesConfiguredScope(target.url ?? "", scopeUrl),
   );
   if (scopeTargets.length === 0) {
-    return undefined;
+    return options.allowChatgptShellRecovery ? pickChatgptShellRecoveryTarget(targets) : undefined;
   }
   const normalizedScopeUrl = normalizeComparableUrl(scopeUrl);
   const pageTargets = scopeTargets.filter((target) => target.type === "page");
@@ -452,18 +548,42 @@ function pickSafeSupervisorRecoveryTarget(
   if (distinctScopePageUrls.size === 1 && pageTargets.length >= 1) {
     return pageTargets[0];
   }
+  if (options.allowChatgptShellRecovery) {
+    return pickChatgptShellRecoveryTarget(targets);
+  }
   return undefined;
+}
+
+function pickChatgptShellRecoveryTarget(targets: TargetInfoLite[]): TargetInfoLite | undefined {
+  const shellPages = targets.filter((target) => {
+    if (target.type !== "page") {
+      return false;
+    }
+    try {
+      const parsed = new URL(target.url ?? "");
+      const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+      return isChatgptShellUrl(`${parsed.origin}${pathname}`);
+    } catch {
+      return false;
+    }
+  });
+  return shellPages.length === 1 ? shellPages[0] : undefined;
 }
 
 function pickConnectableSupervisorRuntimeTarget(
   targets: TargetInfoLite[],
   runtime: BrowserRuntimeMetadata,
   strictTargetMatch: boolean,
+  options: SupervisorRuntimeReuseOptions = {},
 ): TargetInfoLite | undefined {
   return (
     pickSupervisorRuntimeTarget(targets, runtime, strictTargetMatch) ??
-    pickSafeSupervisorRecoveryTarget(targets, runtime)
+    pickSafeSupervisorRecoveryTarget(targets, runtime, options)
   );
+}
+
+function connectedTargetIsChatgptShell(target: TargetInfoLite): boolean {
+  return Boolean(pickChatgptShellRecoveryTarget([target]));
 }
 
 async function readConnectedTargetInfo(
@@ -477,7 +597,14 @@ async function readConnectedTargetInfo(
       }
     | undefined;
   try {
-    info = await client.Target?.getTargetInfo?.({});
+    const targetId = fallback.targetId ?? fallback.id;
+    const targetInfoTask = client.Target?.getTargetInfo?.(targetId ? { targetId } : {});
+    info = targetInfoTask
+      ? await withSupervisorRuntimeCdpTimeout(
+          targetInfoTask,
+          "verifying the connected Oracle browser target",
+        )
+      : undefined;
   } catch {
     if (options?.requireVerification) {
       throw new Error("Target.getTargetInfo failed while verifying the cached target");
@@ -500,7 +627,11 @@ async function readConnectedTargetInfo(
 function connectedSupervisorTargetMatches(
   runtime: BrowserRuntimeMetadata,
   target: TargetInfoLite,
+  options: SupervisorRuntimeReuseOptions = {},
 ): boolean {
+  if (options.allowChatgptShellRecovery && connectedTargetIsChatgptShell(target)) {
+    return true;
+  }
   const runtimeConversationId = runtime.conversationId?.trim();
   const targetConversationId = extractConversationIdFromUrl(target.url ?? "")?.trim();
   if (
@@ -516,7 +647,11 @@ function connectedSupervisorTargetMatches(
 function connectedTargetMatchesExpectedTarget(
   expected: TargetInfoLite,
   actual: TargetInfoLite,
+  options: SupervisorRuntimeReuseOptions = {},
 ): boolean {
+  if (options.allowChatgptShellRecovery && connectedTargetIsChatgptShell(actual)) {
+    return true;
+  }
   if (
     expected.targetId?.trim() &&
     actual.targetId?.trim() &&
@@ -533,13 +668,14 @@ async function pickReachableRuntimeCandidate(
   metas: SessionMetadata[],
   probe: typeof verifyDevToolsReachable = verifyDevToolsReachable,
   listTargets: typeof listRemoteChromeTargets = listRemoteChromeTargets,
+  options: SupervisorRuntimeReuseOptions = {},
 ): Promise<(SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } }) | undefined> {
   const candidates = sortReusableRuntimeCandidates(metas);
   for (const candidate of candidates) {
-    if (!runtimeMatchesConfiguredProjectScope(candidate)) {
+    if (!runtimeMatchesConfiguredProjectScopeForUse(candidate, options)) {
       continue;
     }
-    if (!runtimeHasReusableIdentity(candidate.browser.runtime)) {
+    if (!runtimeHasReusableIdentityForUse(candidate.browser.runtime, options)) {
       continue;
     }
     const port = resolvePort(candidate.browser.runtime);
@@ -560,6 +696,7 @@ async function pickReachableRuntimeCandidate(
             targets,
             candidate.browser.runtime,
             Boolean(candidate.browser.runtime.chromeBrowserWSEndpoint),
+            options,
           )
         ) {
           return candidate;
@@ -574,6 +711,7 @@ async function pickReachableRuntimeCandidate(
 
 export async function resolveSupervisorRuntimeContext(
   followupSession?: string,
+  options: SupervisorRuntimeReuseOptions = {},
 ): Promise<SupervisorRuntimeContext> {
   const hinted = followupSession?.trim();
   if (hinted) {
@@ -595,12 +733,17 @@ export async function resolveSupervisorRuntimeContext(
     const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(meta);
     return {
       sessionId,
-      runtime: await refreshOwnedSupervisorRuntime(meta),
+      runtime: await refreshOwnedSupervisorRuntime(meta, options),
     };
   }
 
   const metas = await sessionStore.listSessions();
-  const latest = await pickReachableRuntimeCandidate(metas);
+  const latest = await pickReachableRuntimeCandidate(
+    metas,
+    verifyDevToolsReachable,
+    listRemoteChromeTargets,
+    options,
+  );
   if (!latest) {
     throw new Error(
       "No reachable Oracle-owned hidden browser runtime session was found. Run one Oracle browser turn first.",
@@ -609,7 +752,7 @@ export async function resolveSupervisorRuntimeContext(
   const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(latest);
   return {
     sessionId,
-    runtime: await refreshOwnedSupervisorRuntime(latest),
+    runtime: await refreshOwnedSupervisorRuntime(latest, options),
   };
 }
 
@@ -707,8 +850,60 @@ async function captureSupervisorRuntimeArtifacts(
   }
 }
 
+async function enableSupervisorRuntimeDomains(client: ChromeClient): Promise<void> {
+  if (client.Runtime?.enable) {
+    await withSupervisorRuntimeCdpTimeout(
+      client.Runtime.enable(),
+      "enabling Runtime for the Oracle browser target",
+    );
+  }
+  if (client.DOM?.enable) {
+    await withSupervisorRuntimeCdpTimeout(
+      client.DOM.enable(),
+      "enabling DOM for the Oracle browser target",
+    );
+  }
+}
+
+async function connectDedicatedHiddenSupervisorTarget(
+  runtime: BrowserRuntimeMetadata,
+  host: string,
+  port: number,
+  targetUrl: string,
+): Promise<SupervisorRuntimeConnection> {
+  const browserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
+  if (!browserWSEndpoint) {
+    throw new Error("Browser runtime metadata is missing a browser websocket endpoint.");
+  }
+  const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
+    browserWSEndpoint,
+    targetUrl,
+    closeTargetOnDispose: true,
+    createTargetOptions: {
+      hidden: true,
+      background: true,
+      focus: false,
+    },
+  });
+  try {
+    await enableSupervisorRuntimeDomains(connection.client);
+    return {
+      client: connection.client,
+      close: connection.close,
+      host,
+      port,
+      targetId: connection.targetId,
+      persistTargetId: false,
+    };
+  } catch (error) {
+    await connection.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function connectSupervisorRuntime(
   runtime: BrowserRuntimeMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
 ): Promise<SupervisorRuntimeConnection> {
   const host = runtime.chromeHost ?? "127.0.0.1";
   const port = resolvePort(runtime);
@@ -716,6 +911,15 @@ export async function connectSupervisorRuntime(
     throw new Error("Browser runtime metadata is missing a reachable DevTools port.");
   }
   let browserWSEndpoint = runtime.chromeBrowserWSEndpoint ?? undefined;
+  const dedicatedHiddenTargetUrl = options.dedicatedHiddenTargetUrl?.trim();
+  if (dedicatedHiddenTargetUrl) {
+    return await connectDedicatedHiddenSupervisorTarget(
+      runtime,
+      host,
+      port,
+      dedicatedHiddenTargetUrl,
+    );
+  }
 
   if (browserWSEndpoint && runtime.chromeTargetId) {
     let cachedConnection: Awaited<ReturnType<typeof connectToRemoteChromeTarget>> | null = null;
@@ -742,12 +946,10 @@ export async function connectSupervisorRuntime(
           },
           { requireVerification: true },
         );
-        if (!connectedSupervisorTargetMatches(runtime, target)) {
+        if (!connectedSupervisorTargetMatches(runtime, target, options)) {
           throw new Error("cached target no longer matches the reusable runtime");
         }
-        if (client.Runtime?.enable) {
-          await client.Runtime.enable();
-        }
+        await enableSupervisorRuntimeDomains(client);
         return {
           client,
           close: cachedConnection.close,
@@ -805,8 +1007,13 @@ export async function connectSupervisorRuntime(
   if (!targets) {
     throw new Error("Unable to list reusable Oracle browser targets for the cached runtime.");
   }
-  const strictTargetMatch = Boolean(browserWSEndpoint);
-  const target = pickConnectableSupervisorRuntimeTarget(targets, runtime, strictTargetMatch);
+  const strictTargetMatch = Boolean(browserWSEndpoint) && !options.allowChatgptShellRecovery;
+  const target = pickConnectableSupervisorRuntimeTarget(
+    targets,
+    runtime,
+    strictTargetMatch,
+    options,
+  );
 
   if (!target) {
     const artifacts = await captureSupervisorRuntimeArtifacts(
@@ -856,15 +1063,10 @@ export async function connectSupervisorRuntime(
       } catch {
         throw new Error("connected target no longer matches the selected Oracle runtime target");
       }
-      if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
+      if (!connectedTargetMatchesExpectedTarget(target, connectedTarget, options)) {
         throw new Error("connected target no longer matches the selected Oracle runtime target");
       }
-      if (client.Runtime?.enable) {
-        await client.Runtime.enable();
-      }
-      if (client.DOM?.enable) {
-        await client.DOM.enable();
-      }
+      await enableSupervisorRuntimeDomains(client);
       return {
         client,
         close: connection.close,
@@ -892,15 +1094,10 @@ export async function connectSupervisorRuntime(
     } catch {
       throw new Error("connected target no longer matches the selected Oracle runtime target");
     }
-    if (!connectedTargetMatchesExpectedTarget(target, connectedTarget)) {
+    if (!connectedTargetMatchesExpectedTarget(target, connectedTarget, options)) {
       throw new Error("connected target no longer matches the selected Oracle runtime target");
     }
-    if (client.Runtime?.enable) {
-      await client.Runtime.enable();
-    }
-    if (client.DOM?.enable) {
-      await client.DOM.enable();
-    }
+    await enableSupervisorRuntimeDomains(client);
     return {
       client,
       close: async () => closeClient(client),
@@ -924,10 +1121,13 @@ export const __test__ = {
   pickReachableRuntimeCandidate,
   pickReusableRuntimeCandidate,
   pickSafeSupervisorRecoveryTarget,
+  pickChatgptShellRecoveryTarget,
   refreshOwnedSupervisorRuntime,
   resolveMutableSupervisorRuntimeAnchorSessionId,
   runtimeControllerIsAlive,
   sortReusableRuntimeCandidates,
   supervisorRuntimePreference,
   supervisorRuntimeBindingPreference,
+  supervisorRuntimeCdpCommandTimeoutMs,
+  withSupervisorRuntimeCdpTimeout,
 };

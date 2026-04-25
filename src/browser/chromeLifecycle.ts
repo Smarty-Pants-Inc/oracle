@@ -534,7 +534,7 @@ function normalizeRemoteTargetInfo(target: RemoteTargetInfo): RemoteTargetInfo {
   };
 }
 
-async function getBrowserWebSocketDebuggerUrl(
+export async function getBrowserWebSocketDebuggerUrl(
   host: string,
   port: number,
 ): Promise<string | undefined> {

@@ -110,6 +110,253 @@ describe("runSupervisorBrokerRequest", () => {
     });
   });
 
+  test("list browse options default to root and honor requested projects", () => {
+    expect(__test__.brokerListBrowseOptions({ prompt: "", sessionSlug: "root" })).toEqual({
+      ok: true,
+      rootScope: true,
+      includeProjects: true,
+      scopeUrl: "https://chatgpt.com/",
+    });
+    expect(
+      __test__.brokerListBrowseOptions({ prompt: "", sessionSlug: "root" }, "https://chatgpt.com/"),
+    ).toEqual({
+      ok: true,
+      rootScope: true,
+      includeProjects: true,
+      scopeUrl: "https://chatgpt.com/",
+    });
+
+    expect(
+      __test__.brokerListBrowseOptions(
+        {
+          prompt: "",
+          sessionSlug: "project",
+          browseScope: "project",
+          projectUrl: "https://chatgpt.com/g/team-space/project",
+        },
+        "https://chatgpt.com/g/configured/project",
+      ),
+    ).toEqual({
+      ok: true,
+      projectUrl: "https://chatgpt.com/g/team-space/project",
+      scopeUrl: "https://chatgpt.com/g/team-space/project",
+    });
+  });
+
+  test("configured supervisor project URL honors the current env override", () => {
+    const original = process.env.ORACLE_SUPERVISOR_CHATGPT_URL;
+    process.env.ORACLE_SUPERVISOR_CHATGPT_URL = "https://chatgpt.com/g/team-space-oracle/project";
+    try {
+      expect(
+        __test__.configuredSupervisorProjectUrl({
+          browser: {
+            config: {
+              supervisorChatgptUrl: "https://chatgpt.com/g/team-space/project",
+            },
+          },
+        } as never),
+      ).toBe("https://chatgpt.com/g/team-space-oracle/project");
+    } finally {
+      if (original === undefined) {
+        delete process.env.ORACLE_SUPERVISOR_CHATGPT_URL;
+      } else {
+        process.env.ORACLE_SUPERVISOR_CHATGPT_URL = original;
+      }
+    }
+  });
+
+  test("root list fallback merges recent local root sessions and keeps the configured project row", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-root-list-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const olderRoot = await sessionStore.createSession(
+        {
+          prompt: "Older root chat",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(olderRoot.id, {
+        status: "completed",
+        completedAt: "2026-04-20T00:00:00.000Z",
+        supervisorThread: {
+          conversationId: "root-old",
+          url: "https://chatgpt.com/c/root-old",
+          projectUrl: "https://chatgpt.com/",
+          verifiedAt: "2026-04-20T00:00:00.000Z",
+        },
+      });
+      const projectScoped = await sessionStore.createSession(
+        {
+          prompt: "Project chat",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(projectScoped.id, {
+        status: "completed",
+        completedAt: "2026-04-21T00:00:00.000Z",
+        supervisorThread: {
+          conversationId: "project-thread",
+          url: "https://chatgpt.com/g/team-space-oracle/c/project-thread",
+          projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
+          verifiedAt: "2026-04-21T00:00:00.000Z",
+        },
+      });
+      const newerRoot = await sessionStore.createSession(
+        {
+          prompt: "Newer root chat",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(newerRoot.id, {
+        status: "completed",
+        completedAt: "2026-04-22T00:00:00.000Z",
+        browser: {
+          runtime: {
+            conversationId: "root-new",
+          },
+        },
+      });
+      const duplicateRoot = await sessionStore.createSession(
+        {
+          prompt: "Duplicate root chat",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(duplicateRoot.id, {
+        status: "completed",
+        completedAt: "2026-04-19T00:00:00.000Z",
+        browser: {
+          runtime: {
+            tabUrl: "https://chatgpt.com/c/root-new",
+          },
+        },
+      });
+
+      const entries = await __test__.rootListThreadsWithLocalFallback(
+        [],
+        "https://chatgpt.com/g/team-space-oracle/project",
+      );
+
+      expect(entries).toEqual([
+        {
+          kind: "thread",
+          title: "Newer root chat",
+          conversationId: "root-new",
+          url: "https://chatgpt.com/c/root-new",
+        },
+        {
+          kind: "thread",
+          title: "Older root chat",
+          conversationId: "root-old",
+          url: "https://chatgpt.com/c/root-old",
+        },
+        {
+          kind: "project",
+          title: "Oracle project",
+          projectId: "team-space-oracle",
+          projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
+        },
+      ]);
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("root list fallback does not add local sessions when live root threads are available", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-root-live-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const localRoot = await sessionStore.createSession(
+        {
+          prompt: "Local root chat",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(localRoot.id, {
+        status: "completed",
+        completedAt: "2026-04-22T00:00:00.000Z",
+        browser: {
+          runtime: {
+            tabUrl: "https://chatgpt.com/c/local-root",
+            conversationId: "local-root",
+          },
+        },
+      });
+
+      const entries = await __test__.rootListThreadsWithLocalFallback(
+        [
+          {
+            kind: "thread",
+            title: "Live root chat",
+            conversationId: "live-root",
+            url: "https://chatgpt.com/c/live-root",
+          },
+        ],
+        undefined,
+      );
+
+      expect(entries).toEqual([
+        {
+          kind: "thread",
+          title: "Live root chat",
+          conversationId: "live-root",
+          url: "https://chatgpt.com/c/live-root",
+        },
+      ]);
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("root list prefers the configured project URL over live canonical project rows", async () => {
+    const entries = await __test__.rootListThreadsWithLocalFallback(
+      [
+        {
+          kind: "thread",
+          title: "Live root chat",
+          conversationId: "live-root",
+          url: "https://chatgpt.com/c/live-root",
+        },
+        {
+          kind: "project",
+          title: "Oracle project",
+          projectId: "team-space",
+          projectUrl: "https://chatgpt.com/g/team-space/project",
+        },
+      ],
+      "https://chatgpt.com/g/team-space-oracle/project",
+    );
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Live root chat",
+        conversationId: "live-root",
+        url: "https://chatgpt.com/c/live-root",
+      },
+      {
+        kind: "project",
+        title: "Oracle project",
+        projectId: "team-space-oracle",
+        projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
+      },
+    ]);
+  });
+
   test("accepts legacy action alias for thread operations", async () => {
     const listThreads = vi.fn(async () => ({
       ok: true as const,
@@ -492,6 +739,55 @@ describe("runSupervisorBrokerRequest", () => {
     expect(action).toHaveBeenCalledTimes(1);
   });
 
+  test("withSupervisorRuntime forwards shell-recovery options into runtime readiness and connect", async () => {
+    const action = vi.fn(async () => "ok");
+    const runtimeClose = vi.fn(async () => {});
+    const runtimeOptions = { allowChatgptShellRecovery: true };
+    const resolveSupervisorRuntimeContext = vi.fn(async () => ({
+      sessionId: "runtime-1",
+      runtime: {
+        chromePort: 9222,
+        tabUrl: "https://chatgpt.com/",
+      },
+    }));
+    const connectSupervisorRuntime = vi.fn(async () => ({
+      client: { Runtime: {} } as never,
+      close: runtimeClose,
+      host: "127.0.0.1",
+      port: 9222,
+    }));
+    const withSupervisorRuntimeAttachLease = async <T>(
+      _log: (message?: string) => void,
+      work: () => Promise<T>,
+    ): Promise<T> => await work();
+
+    const result = await __test__.withSupervisorRuntime(
+      {
+        prompt: "",
+        sessionSlug: "shell-recovery",
+      },
+      action,
+      {
+        resolveSupervisorRuntimeContext,
+        connectSupervisorRuntime: connectSupervisorRuntime as never,
+        withSupervisorRuntimeAttachLease,
+      },
+      undefined,
+      vi.fn() as never,
+      runtimeOptions,
+    );
+
+    expect(result).toBe("ok");
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, runtimeOptions);
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, undefined, runtimeOptions);
+    expect(connectSupervisorRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ tabUrl: "https://chatgpt.com/" }),
+      runtimeOptions,
+    );
+    expect(runtimeClose).toHaveBeenCalledTimes(1);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
   test("withSupervisorRuntime does not bootstrap when a specific followup session was requested", async () => {
     const resolveSupervisorRuntimeContext = vi.fn(async () => {
       throw new Error(
@@ -563,6 +859,53 @@ describe("runSupervisorBrokerRequest", () => {
 
       const updated = await sessionStore.readSession(meta.id);
       expect(updated?.browser?.runtime?.chromeTargetId).toBe("fresh-target");
+      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/fresh-thread");
+      expect(updated?.browser?.runtime?.conversationId).toBe("fresh-thread");
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  test("syncSupervisorRuntimeSession clears ephemeral chrome targets", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-broker-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      await sessionStore.ensureStorage();
+      const meta = await sessionStore.createSession(
+        {
+          prompt: "broker runtime",
+          model: "gpt-5.4",
+          mode: "browser",
+        },
+        process.cwd(),
+      );
+      await sessionStore.updateSession(meta.id, {
+        browser: {
+          config: undefined,
+          runtime: {
+            chromePid: 1234,
+            chromePort: 9222,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "stale-target",
+            tabUrl: "https://chatgpt.com/c/stale-thread",
+            conversationId: "stale-thread",
+          },
+        },
+      });
+
+      await __test__.syncSupervisorRuntimeSession(
+        meta.id,
+        {
+          title: "Fresh thread",
+          url: "https://chatgpt.com/c/fresh-thread",
+          conversationId: "fresh-thread",
+        },
+        null,
+      );
+
+      const updated = await sessionStore.readSession(meta.id);
+      expect(updated?.browser?.runtime?.chromeTargetId).toBeUndefined();
       expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/fresh-thread");
       expect(updated?.browser?.runtime?.conversationId).toBe("fresh-thread");
     } finally {
@@ -1473,7 +1816,7 @@ describe("runSupervisorBrokerRequest", () => {
     const recovered = await __test__.recoverProjectScopedSupervisorThreadHistoryFromBackendApi(
       client as never,
       {
-        projectUrl: "https://chatgpt.com/g/team-space/project",
+        projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
         expectedConversationId: "target-9",
         requestedLimit: 5,
         domHistory: [{ role: "assistant", text: "Only visible answer" }],

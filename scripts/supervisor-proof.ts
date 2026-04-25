@@ -353,29 +353,25 @@ async function main() {
 
   const { dir } = await sessionStore.getPaths(response.sessionId);
   const screenshotPath = path.join(dir, `supervisor-proof-${thinkingTime}.png`);
-  const connection = await connectSupervisorRuntime(runtime);
-  if (connection.client.Runtime?.enable) {
-    await connection.client.Runtime.enable();
+  const sessionMeta = await sessionStore.readSession(response.sessionId);
+  const configuredProjectUrl = requireProjectScopedUrl(
+    sessionMeta?.supervisorThread?.projectUrl ??
+      sessionMeta?.browser?.config?.supervisorChatgptUrl ??
+      sessionMeta?.browser?.config?.chatgptUrl ??
+      sessionMeta?.browser?.config?.url ??
+      undefined,
+    "Supervisor proof scope",
+  );
+  if (!conversationHrefMatchesConfiguredScope(runtime.tabUrl, configuredProjectUrl)) {
+    throw new Error(
+      `Supervisor proof runtime URL is outside the configured project scope. runtime.tabUrl=${runtime.tabUrl} configuredProjectUrl=${configuredProjectUrl}`,
+    );
   }
-  if (connection.client.DOM?.enable) {
-    await connection.client.DOM.enable();
-  }
+  const connection = await connectSupervisorRuntime(runtime, {
+    dedicatedHiddenTargetUrl: runtime.tabUrl,
+  });
 
   try {
-    const sessionMeta = await sessionStore.readSession(response.sessionId);
-    const configuredProjectUrl = requireProjectScopedUrl(
-      sessionMeta?.supervisorThread?.projectUrl ??
-        sessionMeta?.browser?.config?.supervisorChatgptUrl ??
-        sessionMeta?.browser?.config?.chatgptUrl ??
-        sessionMeta?.browser?.config?.url ??
-        undefined,
-      "Supervisor proof scope",
-    );
-    if (!conversationHrefMatchesConfiguredScope(runtime.tabUrl, configuredProjectUrl)) {
-      throw new Error(
-        `Supervisor proof runtime URL is outside the configured project scope. runtime.tabUrl=${runtime.tabUrl} configuredProjectUrl=${configuredProjectUrl}`,
-      );
-    }
     if (runtime.conversationId) {
       await attachSupervisorThread(connection.client.Runtime, runtime.conversationId, {
         projectUrl: configuredProjectUrl,

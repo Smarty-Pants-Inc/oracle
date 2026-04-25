@@ -19,6 +19,18 @@ import { buildThreadIntrospectionHelpers } from "./threadIntrospection.js";
 
 export type { SupervisorThreadInfo };
 
+export interface SupervisorProjectInfo {
+  kind: "project";
+  title: string;
+  projectId?: string;
+  projectUrl: string;
+  isActive?: boolean;
+}
+
+export type SupervisorBrowserEntry =
+  | (SupervisorThreadInfo & { kind: "thread" })
+  | SupervisorProjectInfo;
+
 const ATTACH_CONFIRM_TIMEOUT_MS = 8_000;
 const ATTACH_CONFIRM_POLL_MS = 250;
 const ATTACH_DIRECT_NAV_RETRY_DELAY_MS = 2_000;
@@ -28,6 +40,8 @@ const HISTORY_ENTRY_LIMIT_DEFAULT = 100;
 const HISTORY_ENTRY_LIMIT_MAX = 200;
 const HISTORY_STABILITY_POLL_MS = 250;
 const HISTORY_STABILITY_TIMEOUT_MS = 4_000;
+const BROWSE_SCOPE_READY_TIMEOUT_MS = 30_000;
+const BROWSE_RUNTIME_EVALUATE_TIMEOUT_MS = 8_000;
 
 export interface SupervisorThreadHistoryEntry {
   role: "user" | "assistant";
@@ -173,6 +187,83 @@ function isRootConversationUrl(url?: string): boolean {
   }
 }
 
+function isProjectConversationUrl(url?: string): boolean {
+  const trimmed = url?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return /^\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+$/i.test(pathname);
+  } catch {
+    return /^https?:\/\/[^/]+\/g\/[^/]+(?:\/project)?\/c\/[a-zA-Z0-9-]+\/?$/i.test(trimmed);
+  }
+}
+
+function supervisorThreadMatchesRootScope(thread: SupervisorThreadInfo): boolean {
+  const url = thread.url?.trim();
+  if (!url) {
+    return true;
+  }
+  return isRootConversationUrl(url);
+}
+
+function normalizeSupervisorProjectUrl(url?: string): string | undefined {
+  const normalizedUrl = normalizeProjectUrl(url);
+  if (!normalizedUrl) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(normalizedUrl);
+    const match = parsed.pathname.replace(/\/+$/, "").match(/^(\/g\/[^/]+\/project)$/i);
+    if (!match?.[1]) {
+      return undefined;
+    }
+    return `${parsed.origin}${match[1]}`;
+  } catch {
+    return /^https:\/\/chatgpt\.com\/g\/[^/]+\/project$/i.test(normalizedUrl)
+      ? normalizedUrl
+      : undefined;
+  }
+}
+
+function normalizeSupervisorBrowserEntry(raw: unknown): SupervisorBrowserEntry | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const kind = typeof record.kind === "string" ? record.kind.trim().toLowerCase() : "";
+  const projectUrl = normalizeSupervisorProjectUrl(
+    typeof record.projectUrl === "string" ? record.projectUrl : undefined,
+  );
+  if (kind === "project" || (kind !== "thread" && projectUrl)) {
+    if (!projectUrl) {
+      return null;
+    }
+    const title =
+      typeof record.title === "string" && record.title.trim()
+        ? record.title.trim()
+        : "Untitled project";
+    const projectId =
+      typeof record.projectId === "string" && record.projectId.trim()
+        ? record.projectId.trim()
+        : undefined;
+    return {
+      kind: "project",
+      title,
+      projectId,
+      projectUrl,
+      isActive: record.isActive === true,
+    };
+  }
+  const thread = normalizeSupervisorThread(record);
+  if (!thread?.conversationId?.trim()) {
+    return null;
+  }
+  return { ...thread, kind: "thread" };
+}
+
 function hasReadableAssistantSnapshotText(snapshot: unknown): boolean {
   if (!snapshot || typeof snapshot !== "object") {
     return false;
@@ -222,6 +313,95 @@ async function navigateSupervisorThreadUrl(
   });
 }
 
+async function waitForSupervisorBrowseScope(
+  Runtime: ChromeClient["Runtime"],
+  options: { projectUrl?: string; scopeUrl?: string; timeoutMs?: number },
+): Promise<boolean> {
+  const scopePath = (() => {
+    try {
+      return new URL(options.scopeUrl ?? "").pathname.replace(/\/+$/, "") || "/";
+    } catch {
+      return "";
+    }
+  })();
+  const projectId = (() => {
+    try {
+      return new URL(options.projectUrl ?? "").pathname.match(/^\/g\/([^/]+)\/project$/i)?.[1];
+    } catch {
+      return undefined;
+    }
+  })();
+  const deadline = Date.now() + (options.timeoutMs ?? 5_000);
+  while (true) {
+    const response = await evaluateSupervisorBrowseRuntime(
+      Runtime,
+      {
+        expression: `(() => {
+          const __oracleBrowseScopeReady = true;
+          const projectId = ${JSON.stringify(projectId ?? "")};
+          const scopePath = ${JSON.stringify(scopePath)};
+          const currentPath = window.location.pathname.replace(/\\/+$/, '') || '/';
+          const onScope = !scopePath || currentPath === scopePath || Boolean(projectId && currentPath.startsWith('/g/' + projectId + '/'));
+          const anchors = Array.from(document.querySelectorAll('a[href]')).map((anchor) => {
+            try {
+              return new URL(anchor.getAttribute('href') || '', window.location.origin).pathname.replace(/\\/+$/, '');
+            } catch {
+              return '';
+            }
+          });
+          const rootConversationLinks = anchors.filter((path) => /^\\/c\\/[a-zA-Z0-9-]+$/i.test(path)).length;
+          const browseLinks = anchors.filter((path) => /\\/c\\/[a-zA-Z0-9-]+$/i.test(path) || /^\\/g\\/[^/]+\\/project$/i.test(path)).length;
+          const projectScopedLinks = projectId
+            ? anchors.filter((path) => path.startsWith('/g/' + projectId + '/c/')).length
+            : 0;
+          return { browseLinks, onScope, projectScopedLinks, rootConversationLinks };
+        })()`,
+        returnByValue: true,
+        awaitPromise: true,
+      },
+      "waiting for ChatGPT browse scope readiness",
+    );
+    const value = (response.result?.value ?? {}) as {
+      browseLinks?: number;
+      onScope?: boolean;
+      projectScopedLinks?: number;
+      rootConversationLinks?: number;
+    };
+    if (
+      value.onScope &&
+      (projectId ? (value.projectScopedLinks ?? 0) > 0 : (value.rootConversationLinks ?? 0) > 0)
+    ) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await delay(250);
+  }
+}
+
+async function evaluateSupervisorBrowseRuntime(
+  Runtime: ChromeClient["Runtime"],
+  params: Parameters<ChromeClient["Runtime"]["evaluate"]>[0],
+  context: string,
+): Promise<Awaited<ReturnType<ChromeClient["Runtime"]["evaluate"]>>> {
+  let timeoutId: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      Runtime.evaluate(params),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`Timed out ${context} after ${BROWSE_RUNTIME_EVALUATE_TIMEOUT_MS}ms.`));
+        }, BROWSE_RUNTIME_EVALUATE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 export function supervisorThreadMatchesProjectScope(
   thread: SupervisorThreadInfo,
   projectUrl?: string,
@@ -241,11 +421,75 @@ export async function listSupervisorThreads(
   Runtime: ChromeClient["Runtime"],
   options?: { limit?: number; projectUrl?: string },
 ): Promise<SupervisorThreadInfo[]> {
-  const limit = Math.min(200, Math.max(1, options?.limit ?? 50));
+  const entries = await listSupervisorBrowserEntries(Runtime, options);
+  return entries
+    .filter((entry): entry is SupervisorThreadInfo & { kind: "thread" } => entry.kind === "thread")
+    .map(({ kind: _kind, ...thread }) => thread);
+}
+
+export async function listSupervisorBrowserEntries(
+  Runtime: ChromeClient["Runtime"],
+  options?: {
+    limit?: number;
+    projectUrl?: string;
+    includeProjects?: boolean;
+    fallbackProjectUrl?: string;
+    rootScope?: boolean;
+    scopeUrl?: string;
+    scopeReadyTimeoutMs?: number;
+  },
+): Promise<SupervisorBrowserEntry[]> {
+  const requestedLimit = Math.min(200, Math.max(1, options?.limit ?? 50));
   const projectUrl = options?.projectUrl;
-  const response = await Runtime.evaluate({
-    expression: `(() => {
+  const includeProjects = options?.includeProjects === true;
+  const fallbackProjectUrl = normalizeSupervisorProjectUrl(options?.fallbackProjectUrl);
+  const rootScope = options?.rootScope === true;
+  const limit =
+    options?.limit === undefined && (projectUrl || includeProjects) ? 200 : requestedLimit;
+  const scopeUrl = normalizeProjectUrl(options?.scopeUrl) ?? options?.scopeUrl?.trim();
+  if (scopeUrl) {
+    await evaluateSupervisorBrowseRuntime(
+      Runtime,
+      {
+        expression: `(() => {
+          const target = ${JSON.stringify(scopeUrl)};
+          const normalize = (value) => {
+            try {
+              const parsed = new URL(value, window.location.origin);
+              parsed.search = '';
+              parsed.hash = '';
+              return parsed.toString().replace(/\\/+$/, '');
+            } catch {
+              return String(value || '').replace(/\\/+$/, '');
+            }
+          };
+          if (normalize(window.location.href || '') !== normalize(target)) {
+            window.location.assign(target);
+          }
+          return true;
+        })()`,
+        returnByValue: true,
+        awaitPromise: true,
+      },
+      "navigating ChatGPT browse scope",
+    );
+    const scopeReady = await waitForSupervisorBrowseScope(Runtime, {
+      projectUrl,
+      scopeUrl,
+      timeoutMs:
+        options?.scopeReadyTimeoutMs ?? (rootScope ? BROWSE_SCOPE_READY_TIMEOUT_MS : undefined),
+    });
+    if (!scopeReady && (projectUrl || rootScope || !fallbackProjectUrl)) {
+      throw new Error(`ChatGPT browse scope did not become ready for ${scopeUrl}.`);
+    }
+  }
+  const response = await evaluateSupervisorBrowseRuntime(
+    Runtime,
+    {
+      expression: `(() => {
       const limit = ${limit};
+      const includeProjects = ${includeProjects ? "true" : "false"};
+      const fallbackProjectUrl = ${JSON.stringify(fallbackProjectUrl ?? "")};
       const toAbsolute = (href) => {
         if (!href) return '';
         try {
@@ -253,6 +497,30 @@ export async function listSupervisorThreads(
         } catch {
           return href;
         }
+      };
+      const addProjectEntry = (hrefRaw, titleRaw) => {
+        const href = toAbsolute(hrefRaw).replace(/\\/+$/, '');
+        const projectMatch = (() => {
+          try {
+            const parsed = new URL(href);
+            return parsed.pathname.replace(/\\/+$/, '').match(/^\\/g\\/([^/]+)\\/project$/i);
+          } catch {
+            return null;
+          }
+        })();
+        const projectId = projectMatch?.[1] || '';
+        if (!projectId) return false;
+        const key = 'project:' + projectId;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        entries.push({
+          kind: 'project',
+          projectId,
+          projectUrl: href,
+          title: String(titleRaw || '').replace(/\\s+/g, ' ').trim() || 'Oracle project',
+          isActive: currentHref.replace(/\\/+$/, '') === href,
+        });
+        return true;
       };
       const extractId = (href) => ((href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/) || [])[1] || '';
       const isVisible = (el) => {
@@ -270,12 +538,11 @@ export async function listSupervisorThreads(
       ];
       const nodes = Array.from(new Set(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))));
       const seen = new Set();
-      const threads = [];
+      const entries = [];
       const currentHref = window.location.href || '';
       const currentId = extractId(currentHref);
       for (const node of nodes) {
         const clickable = node.closest('a,button,[role="link"],[role="button"]') || node;
-        if (!isVisible(clickable)) continue;
         const hrefRaw =
           clickable.getAttribute('href') ||
           clickable.getAttribute('data-href') ||
@@ -285,11 +552,13 @@ export async function listSupervisorThreads(
           node.getAttribute('data-url') ||
           '';
         const href = toAbsolute(hrefRaw);
+        const hasConversationHref = href.includes('/c/');
         const conversationId =
           clickable.getAttribute('data-conversation-id') ||
           node.getAttribute('data-conversation-id') ||
           extractId(href);
-        if (!conversationId && !href.includes('/c/')) continue;
+        if (!conversationId && !hasConversationHref) continue;
+        if (!isVisible(clickable) && !hasConversationHref) continue;
         const title = (clickable.textContent || node.textContent || '').replace(/\\s+/g, ' ').trim();
         const key = conversationId || href || title;
         if (!key || seen.has(key)) continue;
@@ -300,27 +569,70 @@ export async function listSupervisorThreads(
           clickable.classList.contains('active') ||
           (conversationId && conversationId === currentId) ||
           (href && href === currentHref);
-        threads.push({
+        entries.push({
+          kind: 'thread',
           conversationId,
           url: href,
           title: title || 'Untitled chat',
           isActive,
         });
-        if (threads.length >= limit) break;
+        if (entries.length >= limit) break;
       }
-      return threads;
+      if (includeProjects && entries.length < limit) {
+        const projectSelectors = [
+          'nav a[href*="/g/"][href*="/project"]',
+          'aside a[href*="/g/"][href*="/project"]',
+          'a[href*="/g/"][href*="/project"]',
+        ];
+        const projectNodes = Array.from(new Set(projectSelectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))));
+        for (const node of projectNodes) {
+          const clickable = node.closest('a,button,[role="link"],[role="button"]') || node;
+          const hrefRaw =
+            clickable.getAttribute('href') ||
+            clickable.getAttribute('data-href') ||
+            clickable.getAttribute('data-url') ||
+            node.getAttribute('href') ||
+            node.getAttribute('data-href') ||
+            node.getAttribute('data-url') ||
+            '';
+          const href = toAbsolute(hrefRaw);
+          const hasProjectHref = (() => {
+            try {
+              return /^\\/g\\/[^/]+\\/project$/i.test(new URL(href).pathname.replace(/\\/+$/, ''));
+            } catch {
+              return false;
+            }
+          })();
+          if (!isVisible(clickable) && !hasProjectHref) continue;
+          const title = (clickable.textContent || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          addProjectEntry(hrefRaw, title || 'Untitled project');
+          if (entries.length >= limit) break;
+        }
+        if (fallbackProjectUrl && entries.length < limit) {
+          addProjectEntry(fallbackProjectUrl, 'Oracle project');
+        }
+      }
+      return entries;
     })()`,
-    returnByValue: true,
-  });
+      returnByValue: true,
+    },
+    "listing ChatGPT browse entries",
+  );
 
-  const rawThreads = Array.isArray(response.result?.value) ? response.result.value : [];
-  return rawThreads
-    .map((raw) => normalizeSupervisorThread((raw ?? {}) as Record<string, unknown>))
-    .filter((value): value is SupervisorThreadInfo => value !== null)
+  const rawEntries = Array.isArray(response.result?.value) ? response.result.value : [];
+  return rawEntries
+    .map((raw) => normalizeSupervisorBrowserEntry(raw))
+    .filter((value): value is SupervisorBrowserEntry => value !== null)
     .filter(
       (value) =>
-        Boolean(value.conversationId?.trim()) &&
-        supervisorThreadMatchesProjectScope(value, projectUrl),
+        value.kind === "project" ||
+        (projectUrl
+          ? supervisorThreadMatchesProjectScope(value, projectUrl)
+          : !rootScope || supervisorThreadMatchesRootScope(value)),
+    )
+    .filter(
+      (value) =>
+        value.kind === "project" || Boolean(projectUrl) || !isProjectConversationUrl(value.url),
     )
     .slice(0, limit);
 }

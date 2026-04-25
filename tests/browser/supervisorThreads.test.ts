@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import {
   __test__,
   attachSupervisorThread,
+  listSupervisorBrowserEntries,
   listSupervisorThreads,
   newSupervisorThread,
   readCurrentSupervisorThread,
@@ -228,6 +229,357 @@ describe("supervisorThreads", () => {
       {
         title: "In scope",
         url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        conversationId: "right-thread",
+        isActive: false,
+      },
+    ]);
+  });
+
+  test("lists root threads and projects as browse entries", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        return {
+          result: {
+            value: {
+              browseLinks: 1,
+              onScope: true,
+              projectScopedLinks: 0,
+              rootConversationLinks: 1,
+            },
+          },
+        };
+      }
+      return {
+        result: {
+          value: [
+            {
+              kind: "thread",
+              title: "Root",
+              url: "https://chatgpt.com/c/root",
+              conversationId: "root",
+            },
+            {
+              kind: "thread",
+              title: "Project chat",
+              url: "https://chatgpt.com/g/team-space-oracle/c/project-thread",
+              conversationId: "project-thread",
+            },
+            {
+              kind: "project",
+              title: "Team space",
+              projectId: "team-space",
+              projectUrl: "https://chatgpt.com/g/team-space/project",
+            },
+          ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, {
+      rootScope: true,
+      includeProjects: true,
+      scopeUrl: "https://chatgpt.com/",
+    });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Root",
+        url: "https://chatgpt.com/c/root",
+        conversationId: "root",
+        isActive: false,
+      },
+      {
+        kind: "project",
+        title: "Team space",
+        projectId: "team-space",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        isActive: false,
+      },
+    ]);
+    expect(evaluate).toHaveBeenCalledTimes(3);
+  });
+
+  test("waits past project-only root browse DOM before listing root entries", async () => {
+    let readinessReads = 0;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        readinessReads += 1;
+        return {
+          result: {
+            value:
+              readinessReads === 1
+                ? {
+                    browseLinks: 1,
+                    onScope: true,
+                    projectScopedLinks: 0,
+                    rootConversationLinks: 0,
+                  }
+                : {
+                    browseLinks: 2,
+                    onScope: true,
+                    projectScopedLinks: 0,
+                    rootConversationLinks: 1,
+                  },
+          },
+        };
+      }
+      return {
+        result: {
+          value: [
+            {
+              kind: "thread",
+              title: "Root",
+              url: "https://chatgpt.com/c/root",
+              conversationId: "root",
+            },
+            {
+              kind: "project",
+              title: "Team space",
+              projectId: "team-space",
+              projectUrl: "https://chatgpt.com/g/team-space/project",
+            },
+          ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, {
+      rootScope: true,
+      includeProjects: true,
+      scopeUrl: "https://chatgpt.com/",
+    });
+
+    expect(readinessReads).toBe(2);
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Root",
+        url: "https://chatgpt.com/c/root",
+        conversationId: "root",
+        isActive: false,
+      },
+      {
+        kind: "project",
+        title: "Team space",
+        projectId: "team-space",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        isActive: false,
+      },
+    ]);
+  });
+
+  test("does not report project-only fallback as a ready root browse", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        return {
+          result: {
+            value: {
+              browseLinks: 1,
+              onScope: true,
+              projectScopedLinks: 0,
+              rootConversationLinks: 0,
+            },
+          },
+        };
+      }
+      return {
+        result: {
+          value: [
+            {
+              kind: "project",
+              title: "Team space",
+              projectId: "team-space",
+              projectUrl: "https://chatgpt.com/g/team-space/project",
+            },
+          ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      listSupervisorBrowserEntries(runtime, {
+        rootScope: true,
+        includeProjects: true,
+        fallbackProjectUrl: "https://chatgpt.com/g/team-space/project",
+        scopeUrl: "https://chatgpt.com/",
+        scopeReadyTimeoutMs: 0,
+      }),
+    ).rejects.toThrow("ChatGPT browse scope did not become ready");
+  });
+
+  test("adds configured project fallback when root DOM omits project links", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        return {
+          result: {
+            value: {
+              browseLinks: 1,
+              onScope: true,
+              projectScopedLinks: 0,
+              rootConversationLinks: 1,
+            },
+          },
+        };
+      }
+      expect(expression).toContain(
+        'const fallbackProjectUrl = "https://chatgpt.com/g/team-space/project"',
+      );
+      return {
+        result: {
+          value: [
+            {
+              kind: "thread",
+              title: "Root",
+              url: "https://chatgpt.com/c/root",
+              conversationId: "root",
+            },
+            {
+              kind: "project",
+              title: "Oracle project",
+              projectId: "team-space",
+              projectUrl: "https://chatgpt.com/g/team-space/project",
+            },
+          ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, {
+      rootScope: true,
+      includeProjects: true,
+      fallbackProjectUrl: "https://chatgpt.com/g/team-space/project",
+      scopeUrl: "https://chatgpt.com/",
+    });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Root",
+        url: "https://chatgpt.com/c/root",
+        conversationId: "root",
+        isActive: false,
+      },
+      {
+        kind: "project",
+        title: "Oracle project",
+        projectId: "team-space",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        isActive: false,
+      },
+    ]);
+  });
+
+  test("lists project browse entries from the requested project scope", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        return { result: { value: { browseLinks: 1, onScope: true, projectScopedLinks: 1 } } };
+      }
+      return {
+        result: {
+          value: [
+            {
+              kind: "thread",
+              title: "In scope",
+              url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+              conversationId: "right-thread",
+              projectUrl,
+            },
+            {
+              kind: "thread",
+              title: "Root",
+              url: "https://chatgpt.com/c/root",
+              conversationId: "root",
+            },
+          ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, {
+      projectUrl,
+      scopeUrl: projectUrl,
+    });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "In scope",
+        url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        conversationId: "right-thread",
+        isActive: false,
+      },
+    ]);
+  });
+
+  test("keeps href-backed project threads when hidden browser targets report them offscreen", async () => {
+    class MockHTMLElement {
+      constructor(
+        private readonly href: string,
+        readonly textContent: string,
+      ) {}
+      readonly classList = { contains: () => false };
+      closest() {
+        return this;
+      }
+      getAttribute(name: string) {
+        return name === "href" ? this.href : null;
+      }
+      getBoundingClientRect() {
+        return { width: 0, height: 60, x: -8, y: -80 };
+      }
+    }
+    const anchors = [
+      new MockHTMLElement("/g/team-space/c/right-thread", "Hidden project thread"),
+      new MockHTMLElement("/c/root-thread", "Hidden root thread"),
+    ];
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: {
+        value: vm.runInNewContext(expression, {
+          document: {
+            querySelectorAll: (selector: string) => (selector.includes("/c/") ? anchors : []),
+          },
+          HTMLElement: MockHTMLElement,
+          URL,
+          window: {
+            getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+            location: {
+              href: projectUrl,
+              origin: "https://chatgpt.com",
+            },
+          },
+        }),
+      },
+    }));
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, { projectUrl });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Hidden project thread",
+        url: "https://chatgpt.com/g/team-space/c/right-thread",
         conversationId: "right-thread",
         isActive: false,
       },

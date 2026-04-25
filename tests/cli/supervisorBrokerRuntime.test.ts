@@ -44,9 +44,39 @@ function runtimeSession(
 afterEach(() => {
   vi.resetModules();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("supervisorBrokerRuntime", () => {
+  test("uses a configurable supervisor runtime CDP command timeout", () => {
+    expect(__test__.supervisorRuntimeCdpCommandTimeoutMs({})).toBe(30_000);
+    expect(
+      __test__.supervisorRuntimeCdpCommandTimeoutMs({
+        ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS: "120000",
+      }),
+    ).toBe(120_000);
+    expect(
+      __test__.supervisorRuntimeCdpCommandTimeoutMs({
+        ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS: "nope",
+      }),
+    ).toBe(30_000);
+  });
+
+  test("fails slow supervisor runtime CDP commands with the configured timeout", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS", "25");
+    try {
+      const pending = expect(
+        __test__.withSupervisorRuntimeCdpTimeout(new Promise(() => {}), "testing Runtime"),
+      ).rejects.toThrow(/Timed out testing Runtime after 25ms/);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("prefers supervisor-style hidden runtimes over attach-running sessions", () => {
     const picked = __test__.pickReusableRuntimeCandidate([
       {
@@ -243,6 +273,39 @@ describe("supervisorBrokerRuntime", () => {
     expect(picked?.targetId).toBe("project-shell-1");
   });
 
+  test("accepts a unique ChatGPT shell page only when shell recovery is allowed", () => {
+    const targets = [{ targetId: "chatgpt-shell", type: "page", url: "https://chatgpt.com/" }];
+    const runtime = {
+      chromePort: 9222,
+      tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+      conversationId: "expected",
+    };
+
+    expect(__test__.pickSafeSupervisorRecoveryTarget(targets, runtime)).toBeUndefined();
+    expect(
+      __test__.pickSafeSupervisorRecoveryTarget(targets, runtime, {
+        allowChatgptShellRecovery: true,
+      })?.targetId,
+    ).toBe("chatgpt-shell");
+  });
+
+  test("prefers the exact inferred project shell over the ChatGPT root shell during shell recovery", () => {
+    const picked = __test__.pickSafeSupervisorRecoveryTarget(
+      [
+        { targetId: "chatgpt-shell-a", type: "page", url: "https://chatgpt.com/" },
+        { targetId: "chatgpt-shell-b", type: "page", url: SUPERVISOR_PROJECT_URL },
+      ],
+      {
+        chromePort: 9222,
+        tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+        conversationId: "expected",
+      },
+      { allowChatgptShellRecovery: true },
+    );
+
+    expect(picked?.targetId).toBe("chatgpt-shell-b");
+  });
+
   test("selects the exact inferred project shell when both canonical and slugged targets are present", () => {
     const picked = __test__.pickSafeSupervisorRecoveryTarget(
       [
@@ -417,6 +480,47 @@ describe("supervisorBrokerRuntime", () => {
     );
 
     expect(picked?.id).toBe("shell-recoverable-slugged");
+    expect(listTargets).toHaveBeenCalledTimes(1);
+  });
+
+  test("accepts a reachable runtime when only a unique ChatGPT root shell target remains and shell recovery is allowed", async () => {
+    const probe = vi.fn().mockResolvedValue({ ok: true });
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "chatgpt-shell",
+        type: "page",
+        url: "https://chatgpt.com/",
+      },
+    ]);
+
+    const picked = await __test__.pickReachableRuntimeCandidate(
+      [
+        {
+          ...runtimeSession("shell-root-recoverable", "completed", "2026-03-31T10:05:00.000Z"),
+          browser: {
+            runtime: {
+              chromeHost: "127.0.0.1",
+              chromePort: 9222,
+              tabUrl: `${SUPERVISOR_ORACLE_PROJECT_URL}`,
+            },
+            config: {
+              manualLogin: true,
+              keepBrowser: true,
+              hideWindow: true,
+              attachRunning: false,
+              launcher: "chrome",
+              manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+              chatgptUrl: SUPERVISOR_ORACLE_PROJECT_URL,
+            },
+          },
+        },
+      ],
+      probe,
+      listTargets,
+      { allowChatgptShellRecovery: true },
+    );
+
+    expect(picked?.id).toBe("shell-root-recoverable");
     expect(listTargets).toHaveBeenCalledTimes(1);
   });
 
@@ -947,6 +1051,68 @@ describe("supervisorBrokerRuntime", () => {
     );
   });
 
+  test("resolveSupervisorRuntimeContext allows a hinted ChatGPT root shell runtime only when shell recovery is enabled", async () => {
+    vi.resetModules();
+    const ownedMeta = {
+      ...runtimeSession("owned-root-shell", "completed", "2026-03-31T10:00:00.000Z"),
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromePid: 4242,
+          tabUrl: "https://chatgpt.com/",
+        },
+        config: {
+          manualLogin: true,
+          keepBrowser: true,
+          hideWindow: true,
+          attachRunning: false,
+          launcher: "chrome",
+          manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+          chatgptUrl: SUPERVISOR_ORACLE_PROJECT_URL,
+        },
+      },
+    } satisfies SessionMetadata;
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        readSession: vi.fn(async () => ownedMeta),
+        listSessions: vi.fn(),
+      },
+    }));
+    vi.doMock("../../src/browser/profileState.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
+        "../../src/browser/profileState.js",
+      );
+      return {
+        ...actual,
+        readChromePid: vi.fn(async () => null),
+        chromePidMatchesUserDataDir: vi.fn(async () => false),
+        resolveChromePidForUserDataDir: vi.fn(async () => null),
+      };
+    });
+    vi.doMock("../../src/browser/detect.js", () => ({
+      readDevToolsActivePortInfo: vi.fn(async () => ({
+        port: 9222,
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/owned-root-shell",
+      })),
+    }));
+
+    const { resolveSupervisorRuntimeContext } =
+      await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await expect(resolveSupervisorRuntimeContext("owned-root-shell")).rejects.toThrow(
+      /outside the configured chatgpt scope/i,
+    );
+
+    const context = await resolveSupervisorRuntimeContext("owned-root-shell", {
+      allowChatgptShellRecovery: true,
+    });
+
+    expect(context.sessionId).toBe("owned-root-shell");
+    expect(context.runtime.tabUrl).toBe("https://chatgpt.com/");
+    expect(context.runtime.conversationId).toBeUndefined();
+  });
+
   test("resolveSupervisorRuntimeContext rejects a hinted running hidden runtime", async () => {
     vi.resetModules();
     const ownedMeta = {
@@ -966,6 +1132,71 @@ describe("supervisorBrokerRuntime", () => {
     await expect(resolveSupervisorRuntimeContext("owned-running")).rejects.toThrow(
       /not reusable yet/i,
     );
+  });
+
+  test("resolveSupervisorRuntimeContext reuses a hinted running hidden runtime when its controller died", async () => {
+    vi.resetModules();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid === 4242) {
+        throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      }
+      return true;
+    });
+    const ownedMeta = {
+      ...runtimeSession("owned-dead-controller", "running", "2026-03-31T10:00:00.000Z"),
+      mode: "browser",
+      response: { status: "running" },
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromePid: 1111,
+          controllerPid: 4242,
+          tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/owned-dead-controller`,
+          conversationId: "owned-dead-controller",
+        },
+        config: {
+          manualLogin: true,
+          keepBrowser: true,
+          hideWindow: true,
+          attachRunning: false,
+          launcher: "chrome",
+          manualLoginProfileDir: HIDDEN_PROFILE_DIR,
+          chatgptUrl: SUPERVISOR_PROJECT_URL,
+        },
+      },
+    } satisfies SessionMetadata;
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        readSession: vi.fn(async () => ownedMeta),
+        listSessions: vi.fn(),
+      },
+    }));
+    vi.doMock("../../src/browser/profileState.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
+        "../../src/browser/profileState.js",
+      );
+      return {
+        ...actual,
+        readChromePid: vi.fn(async () => null),
+        chromePidMatchesUserDataDir: vi.fn(async () => false),
+        resolveChromePidForUserDataDir: vi.fn(async () => null),
+      };
+    });
+    vi.doMock("../../src/browser/detect.js", () => ({
+      readDevToolsActivePortInfo: vi.fn(async () => ({
+        port: 9222,
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/owned-dead-controller",
+      })),
+    }));
+
+    const { resolveSupervisorRuntimeContext } =
+      await import("../../src/cli/supervisorBrokerRuntime.js");
+    const context = await resolveSupervisorRuntimeContext("owned-dead-controller");
+
+    expect(context.sessionId).toBe("owned-dead-controller");
+    expect(context.runtime.chromePort).toBe(9222);
+    expect(killSpy).toHaveBeenCalledWith(4242, 0);
   });
 
   test("pickReachableRuntimeCandidate skips hidden runtimes outside the configured project scope", async () => {
@@ -1596,6 +1827,84 @@ describe("supervisorBrokerRuntime", () => {
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
   });
 
+  test("browser websocket runtimes can recover through a unique ChatGPT shell only when allowed", async () => {
+    vi.resetModules();
+    const shellClient = {
+      Runtime: { enable: vi.fn(async () => ({})) },
+      DOM: { enable: vi.fn(async () => ({})) },
+      Target: {
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: {
+            targetId: "chatgpt-shell",
+            type: "page",
+            url: "https://chatgpt.com/",
+          },
+        })),
+      },
+      close: vi.fn(async () => {}),
+    };
+    const CDP = vi.fn(async () => shellClient);
+    const recoveredConnection = {
+      client: shellClient,
+      close: vi.fn(async () => {}),
+      targetId: "chatgpt-shell",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        throw new Error("Target closed");
+      })
+      .mockImplementationOnce(async () => {
+        throw new Error("Target closed");
+      })
+      .mockImplementationOnce(async () => recoveredConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      { targetId: "chatgpt-shell", type: "page", url: "https://chatgpt.com/" },
+    ]);
+
+    vi.doMock("chrome-remote-interface", () => ({
+      default: CDP,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+    const runtime = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      chromeTargetId: "stale-target",
+      tabUrl: `${SUPERVISOR_ORACLE_CONVERSATION_ROOT}/c/expected`,
+      conversationId: "expected",
+    };
+
+    await expect(connectSupervisorRuntime(runtime)).rejects.toThrow(
+      /Unable to locate the existing Oracle browser tab|Unable to safely locate a reusable Oracle browser tab/i,
+    );
+
+    const result = await connectSupervisorRuntime(runtime, {
+      allowChatgptShellRecovery: true,
+    });
+
+    expect(result.targetId).toBe("chatgpt-shell");
+    expect(connectToRemoteChromeTarget).toHaveBeenNthCalledWith(
+      3,
+      "127.0.0.1",
+      9222,
+      expect.any(Function),
+      expect.objectContaining({
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetId: "chatgpt-shell",
+        closeTargetOnDispose: false,
+      }),
+    );
+    expect(CDP).not.toHaveBeenCalled();
+    await result.close();
+    expect(recoveredConnection.close).toHaveBeenCalledTimes(1);
+  });
+
   test("browser websocket recovery re-verifies the selected target before returning the runtime", async () => {
     vi.resetModules();
     const fallbackConnection = {
@@ -1648,6 +1957,60 @@ describe("supervisorBrokerRuntime", () => {
     expect(connectToRemoteChromeTarget).toHaveBeenCalledTimes(2);
     expect(listRemoteChromeTargets).toHaveBeenCalledTimes(1);
     expect(fallbackConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("browser websocket recovery verifies the selected page target by id", async () => {
+    vi.resetModules();
+    const getTargetInfo = vi.fn(async (params?: { targetId?: string }) => ({
+      targetInfo:
+        params?.targetId === "expected-target"
+          ? {
+              targetId: "expected-target",
+              type: "page",
+              url: "https://chatgpt.com/c/expected",
+            }
+          : {
+              targetId: "browser-target",
+              type: "browser",
+              url: "",
+            },
+    }));
+    const fallbackConnection = {
+      client: {
+        Runtime: { enable: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        Target: { getTargetInfo },
+      },
+      close: vi.fn(async () => {}),
+      targetId: "expected-target",
+    };
+    const connectToRemoteChromeTarget = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Target closed"))
+      .mockResolvedValueOnce(fallbackConnection);
+    const listRemoteChromeTargets = vi.fn(async () => [
+      { targetId: "expected-target", type: "page", url: "https://chatgpt.com/c/expected" },
+    ]);
+
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      listRemoteChromeTargets,
+    }));
+
+    const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    const result = await connectSupervisorRuntime({
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      chromeTargetId: "stale-target",
+      tabUrl: "https://chatgpt.com/c/expected",
+      conversationId: "expected",
+    });
+
+    expect(result.targetId).toBe("expected-target");
+    expect(getTargetInfo).toHaveBeenCalledWith({ targetId: "expected-target" });
+    await result.close();
   });
 
   test("browser websocket runtimes fall back to host:port discovery when the cached browser websocket endpoint is stale", async () => {
