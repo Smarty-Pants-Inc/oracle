@@ -1,9 +1,8 @@
-import { mkdir, readdir, stat } from "node:fs/promises";
+import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import CDP from "chrome-remote-interface";
 import type { Browser, Locator, Page } from "playwright-core";
 import type { BrowserDownloadedFile } from "../sessionStore.js";
-import { connectToRemoteChromeTarget } from "./chromeLifecycle.js";
 import { ASSISTANT_ROLE_SELECTOR, CONVERSATION_TURN_SELECTOR } from "./constants.js";
 import {
   extractConversationIdFromUrl,
@@ -17,6 +16,7 @@ import type { BrowserLogger, ChromeClient } from "./types.js";
 const DOWNLOAD_CANDIDATE_SELECTOR = 'a, button, [role="button"], [role="link"]';
 const DOWNLOAD_EVENT_TIMEOUT_MS = 10_000;
 const CLICK_TIMEOUT_MS = 5_000;
+const DOWNLOAD_PREVIEW_SETTLE_MS = 1_000;
 const FILE_NAME_PATTERN =
   /\.(?:txt|csv|md|markdown|json|zip|pdf|png|jpg|jpeg|gif|svg|html|xml|yaml|yml|toml|log|py|js|ts|tsx|rs)\b/i;
 
@@ -28,7 +28,9 @@ export interface AssistantDownloadCaptureOptions {
   tabUrl?: string;
   conversationId?: string;
   downloadsDir?: string;
+  assistantMarkdown?: string;
   meta?: { turnId?: string | null; messageId?: string | null };
+  targetClient?: ChromeClient;
   logger?: BrowserLogger;
 }
 
@@ -75,6 +77,17 @@ type EventedChromeClient = ChromeClient & {
   on: (event: string, listener: (...args: unknown[]) => void) => void;
   off?: (event: string, listener: (...args: unknown[]) => void) => void;
   removeListener: (event: string, listener: (...args: unknown[]) => void) => void;
+};
+type CandidateCollectionMode = "scope" | "document";
+type ChromeClientWithEmulation = ChromeClient & {
+  Emulation?: {
+    setDeviceMetricsOverride?: (params: {
+      width: number;
+      height: number;
+      deviceScaleFactor: number;
+      mobile: boolean;
+    }) => Promise<unknown>;
+  };
 };
 
 function escapeAttributeValue(value: string): string {
@@ -417,7 +430,7 @@ function buildAssistantScopeExpression(meta: AssistantDownloadCaptureOptions["me
 
 function buildCollectTargetCandidatesExpression(
   meta: AssistantDownloadCaptureOptions["meta"],
-  mode: "scope" | "document",
+  mode: CandidateCollectionMode,
 ): string {
   return `(() => {
     const collectMatches = (root, selector) => {
@@ -462,6 +475,7 @@ function buildCollectTargetCandidatesExpression(
 function buildClickTargetCandidateExpression(
   meta: AssistantDownloadCaptureOptions["meta"],
   candidateIndex: number,
+  mode: CandidateCollectionMode = "scope",
 ): string {
   return `(() => {
     const collectMatches = (root, selector) => {
@@ -480,7 +494,11 @@ function buildClickTargetCandidateExpression(
       visit(root);
       return matches;
     };
-    const scope = ${buildAssistantScopeExpression(meta)};
+    const scope = ${
+      mode === "document"
+        ? "document.body || document.documentElement"
+        : buildAssistantScopeExpression(meta)
+    };
     if (!scope) {
       return { clicked: false, reason: 'scope-missing' };
     }
@@ -502,27 +520,93 @@ function buildClickTargetCandidateExpression(
   })()`;
 }
 
-async function resolveBrowserClientEndpoint(
-  options: Pick<AssistantDownloadCaptureOptions, "browserWSEndpoint" | "chromeHost" | "chromePort">,
-): Promise<string | null> {
-  const browserWSEndpoint = options.browserWSEndpoint?.trim();
-  if (browserWSEndpoint) {
-    return browserWSEndpoint;
+function buildTargetCandidateClickPointExpression(
+  meta: AssistantDownloadCaptureOptions["meta"],
+  candidateIndex: number,
+  mode: CandidateCollectionMode = "scope",
+): string {
+  return `(() => {
+    const collectMatches = (root, selector) => {
+      const matches = [];
+      const visit = (node) => {
+        if (!node || typeof node.querySelectorAll !== 'function') {
+          return;
+        }
+        matches.push(...Array.from(node.querySelectorAll(selector)));
+        for (const element of Array.from(node.querySelectorAll('*'))) {
+          if (element.shadowRoot) {
+            visit(element.shadowRoot);
+          }
+        }
+      };
+      visit(root);
+      return matches;
+    };
+    const scope = ${
+      mode === "document"
+        ? "document.body || document.documentElement"
+        : buildAssistantScopeExpression(meta)
+    };
+    if (!scope) {
+      return { found: false, reason: 'scope-missing' };
+    }
+    const nodes = collectMatches(scope, ${JSON.stringify(DOWNLOAD_CANDIDATE_SELECTOR)});
+    const node = nodes[${candidateIndex}];
+    if (!node) {
+      return { found: false, reason: 'candidate-missing' };
+    }
+    try {
+      node.scrollIntoView?.({ block: 'center', inline: 'center' });
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) {
+        return { found: false, reason: 'candidate-not-visible' };
+      }
+      const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+      if (viewportWidth <= 0 || viewportHeight <= 0) {
+        return { found: false, reason: 'viewport-missing' };
+      }
+      return {
+        found: true,
+        x: Math.max(1, Math.min(viewportWidth - 2, rect.left + rect.width / 2)),
+        y: Math.max(1, Math.min(viewportHeight - 2, rect.top + rect.height / 2)),
+      };
+    } catch (error) {
+      return { found: false, reason: String(error || 'candidate-point-failed') };
+    }
+  })()`;
+}
+
+async function ensureClickableViewport(client: ChromeClient): Promise<void> {
+  const viewportResult = await client.Runtime.evaluate({
+    expression: `(() => ({
+      width: window.innerWidth || document.documentElement?.clientWidth || 0,
+      height: window.innerHeight || document.documentElement?.clientHeight || 0,
+    }))()`,
+    returnByValue: true,
+  }).catch(() => null);
+  const viewport = (viewportResult?.result?.value ?? null) as {
+    width?: number;
+    height?: number;
+  } | null;
+  if ((viewport?.width ?? 0) > 0 && (viewport?.height ?? 0) > 0) {
+    return;
   }
-  if (!options.chromeHost || !options.chromePort) {
-    return null;
-  }
-  const response = await fetch(`http://${options.chromeHost}:${options.chromePort}/json/version`);
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  const payload = (await response.json()) as { webSocketDebuggerUrl?: string };
-  return payload.webSocketDebuggerUrl?.trim() || null;
+  const emulation = (client as ChromeClientWithEmulation).Emulation;
+  await emulation
+    ?.setDeviceMetricsOverride?.({
+      width: 1280,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    })
+    .catch(() => undefined);
 }
 
 async function collectTargetDownloadCandidates(
   client: ChromeClient,
   meta: AssistantDownloadCaptureOptions["meta"],
+  mode: CandidateCollectionMode = "scope",
 ): Promise<{
   candidates: DownloadCandidateDescriptor[];
   source: "scope" | "document" | "none";
@@ -530,7 +614,7 @@ async function collectTargetDownloadCandidates(
   rawSample: DownloadCandidateInput[];
 }> {
   const result = await client.Runtime.evaluate({
-    expression: buildCollectTargetCandidatesExpression(meta, "scope"),
+    expression: buildCollectTargetCandidatesExpression(meta, mode),
     returnByValue: true,
   });
   const payload = (result.result?.value ?? null) as {
@@ -542,11 +626,19 @@ async function collectTargetDownloadCandidates(
     if (scopedCandidates.length > 0) {
       return {
         candidates: scopedCandidates,
-        source: "scope",
+        source: mode,
         rawCount: payload.candidates.length,
         rawSample: payload.candidates.slice(0, 8),
       };
     }
+  }
+  if (mode === "document") {
+    return {
+      candidates: [],
+      source: "none",
+      rawCount: Array.isArray(payload?.candidates) ? payload.candidates.length : 0,
+      rawSample: Array.isArray(payload?.candidates) ? payload.candidates.slice(0, 8) : [],
+    };
   }
   const documentResult = await client.Runtime.evaluate({
     expression: buildCollectTargetCandidatesExpression(meta, "document"),
@@ -580,9 +672,45 @@ async function clickTargetDownloadCandidate(
   client: ChromeClient,
   meta: AssistantDownloadCaptureOptions["meta"],
   candidateIndex: number,
+  mode: CandidateCollectionMode = "scope",
 ): Promise<{ clicked: boolean; reason?: string }> {
+  const input = client.Input;
+  if (input && typeof input.dispatchMouseEvent === "function") {
+    await ensureClickableViewport(client);
+    const pointResult = await client.Runtime.evaluate({
+      expression: buildTargetCandidateClickPointExpression(meta, candidateIndex, mode),
+      returnByValue: true,
+    });
+    const point = (pointResult.result?.value ?? null) as {
+      found?: boolean;
+      x?: number;
+      y?: number;
+      reason?: string;
+    } | null;
+    if (!point?.found || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+      return { clicked: false, reason: point?.reason ?? "candidate-point-missing" };
+    }
+    const x = point.x as number;
+    const y = point.y as number;
+    await input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
+    await input.dispatchMouseEvent({
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      clickCount: 1,
+    });
+    await input.dispatchMouseEvent({
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      clickCount: 1,
+    });
+    return { clicked: true };
+  }
   const result = await client.Runtime.evaluate({
-    expression: buildClickTargetCandidateExpression(meta, candidateIndex),
+    expression: buildClickTargetCandidateExpression(meta, candidateIndex, mode),
     returnByValue: true,
     userGesture: true,
     awaitPromise: true,
@@ -629,11 +757,211 @@ async function resolveDownloadedFilePath(
   return null;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractSandboxDownloadNames(markdown: string | undefined): string[] {
+  const names = new Set<string>();
+  for (const match of String(markdown ?? "").matchAll(/sandbox:\/mnt\/data\/([^)\]\s"'<>]+)/g)) {
+    const rawName = match[1]?.trim();
+    if (!rawName) {
+      continue;
+    }
+    names.add(sanitizeSuggestedFilename(decodeURIComponent(rawName)));
+  }
+  return [...names];
+}
+
+function projectIdFromUrl(url: string | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    return new URL(url).pathname.match(/^\/g\/([^/]+)\//i)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function collectConversationMessages(conversation: unknown): Array<Record<string, unknown>> {
+  if (!conversation || typeof conversation !== "object") {
+    return [];
+  }
+  const mapping = (conversation as { mapping?: unknown }).mapping;
+  if (!mapping || typeof mapping !== "object") {
+    return [];
+  }
+  return Object.values(mapping)
+    .map((node) =>
+      node && typeof node === "object" ? (node as { message?: unknown }).message : null,
+    )
+    .filter((message): message is Record<string, unknown> =>
+      Boolean(message && typeof message === "object"),
+    );
+}
+
+function extractHeredocContent(text: string, filename: string): string | null {
+  if (!text.includes(`/mnt/data/${filename}`)) {
+    return null;
+  }
+  const escapedName = escapeRegExp(filename);
+  const match = text.match(
+    new RegExp(`/mnt/data/${escapedName}[^\\n]*<<['"]?([A-Za-z0-9_]+)['"]?\\n([\\s\\S]*?)\\n\\1`),
+  );
+  return match?.[2] ? `${match[2]}\n` : null;
+}
+
+function extractToolOutputContent(text: string, filename: string): string | null {
+  const targetPath = `/mnt/data/${filename}`;
+  if (!text.includes(targetPath)) {
+    return null;
+  }
+  const lines = text.split("\n");
+  const pathLine = lines.findIndex((line) => line.includes(targetPath));
+  if (pathLine < 0) {
+    return null;
+  }
+  const content = lines.slice(pathLine + 1).join("\n");
+  return content.length > 0 ? content : null;
+}
+
+function extractSandboxFileContent(conversation: unknown, filename: string): string | null {
+  for (const message of collectConversationMessages(conversation)) {
+    const content = message.content;
+    if (!content || typeof content !== "object") {
+      continue;
+    }
+    const contentRecord = content as Record<string, unknown>;
+    const parts = Array.isArray(contentRecord.parts) ? contentRecord.parts : [];
+    const contentText =
+      typeof contentRecord.text === "string"
+        ? contentRecord.text
+        : typeof parts[0] === "string"
+          ? parts[0]
+          : "";
+    const heredocContent = extractHeredocContent(contentText, filename);
+    if (heredocContent !== null) {
+      return heredocContent;
+    }
+    if (contentRecord.content_type === "execution_output") {
+      const outputContent = extractToolOutputContent(contentText, filename);
+      if (outputContent !== null) {
+        return outputContent;
+      }
+    }
+    const aggregate = (
+      message.metadata as { aggregate_result?: { final_expression_output?: unknown } }
+    )?.aggregate_result;
+    if (typeof aggregate?.final_expression_output === "string") {
+      const outputContent = extractToolOutputContent(aggregate.final_expression_output, filename);
+      if (outputContent !== null) {
+        return outputContent;
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchConversationSnapshot(
+  client: ChromeClient,
+  options: AssistantDownloadCaptureOptions,
+): Promise<unknown | null> {
+  const conversationId = options.conversationId?.trim();
+  if (!conversationId) {
+    return null;
+  }
+  const projectId = projectIdFromUrl(options.tabUrl);
+  const result = await client.Runtime.evaluate({
+    expression: `(async () => {
+      const session = await fetch('/api/auth/session', { credentials: 'include' })
+        .then((response) => response.ok ? response.json() : null)
+        .catch(() => null);
+      const headers = { 'OAI-Language': 'en-US' };
+      if (session?.accessToken) {
+        headers.Authorization = 'Bearer ' + session.accessToken;
+      }
+      const projectId = ${JSON.stringify(projectId)};
+      if (projectId) {
+        headers['chatgpt-project-id'] = projectId;
+      }
+      const response = await fetch(${JSON.stringify(`/backend-api/conversation/${conversationId}`)}, {
+        credentials: 'include',
+        headers,
+      });
+      return {
+        status: response.status,
+        text: await response.text(),
+      };
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  const payload = (result.result?.value ?? null) as { status?: number; text?: string } | null;
+  if (payload?.status !== 200 || !payload.text) {
+    options.logger?.sessionLog?.(
+      `[browser-downloads] sandbox conversation fetch failed: HTTP ${payload?.status ?? "unknown"}`,
+    );
+    return null;
+  }
+  try {
+    return JSON.parse(payload.text);
+  } catch {
+    options.logger?.sessionLog?.(
+      "[browser-downloads] sandbox conversation fetch returned JSON that could not be parsed",
+    );
+    return null;
+  }
+}
+
+async function captureSandboxDownloadsFromConversation(
+  client: ChromeClient,
+  options: AssistantDownloadCaptureOptions,
+): Promise<BrowserDownloadedFile[]> {
+  if (!options.downloadsDir) {
+    return [];
+  }
+  const names = extractSandboxDownloadNames(options.assistantMarkdown);
+  if (names.length === 0) {
+    return [];
+  }
+  const conversation = await fetchConversationSnapshot(client, options);
+  if (!conversation) {
+    return [];
+  }
+  await mkdir(options.downloadsDir, { recursive: true });
+  const downloads: BrowserDownloadedFile[] = [];
+  for (const filename of names) {
+    const content = extractSandboxFileContent(conversation, filename);
+    if (content === null) {
+      options.logger?.sessionLog?.(
+        `[browser-downloads] sandbox content not found in conversation for ${filename}`,
+      );
+      continue;
+    }
+    const targetPath = await resolveUniqueDownloadPath(options.downloadsDir, filename);
+    await writeFile(targetPath, content);
+    const fileStat = await stat(targetPath);
+    downloads.push({
+      path: targetPath,
+      suggestedFilename: filename,
+      sizeBytes: fileStat.size,
+    });
+  }
+  if (downloads.length > 0) {
+    options.logger?.sessionLog?.(
+      `[browser-downloads] recovered ${downloads.length} sandbox file(s) from conversation metadata`,
+    );
+  }
+  return downloads;
+}
+
 async function waitForBrowserDownload(
   browserClient: EventedChromeClient,
   downloadsDir: string,
   beforeFiles: Set<string>,
   trigger: () => Promise<boolean>,
+  timeoutMs: number = DOWNLOAD_EVENT_TIMEOUT_MS,
 ): Promise<BrowserDownloadedFile | null> {
   let trackedGuid: string | undefined;
   let willBegin: DownloadEventInfo | undefined;
@@ -695,7 +1023,7 @@ async function waitForBrowserDownload(
     browserClient.on("Browser.downloadProgress", onProgress);
     timeoutId = setTimeout(() => {
       void finish(null);
-    }, DOWNLOAD_EVENT_TIMEOUT_MS);
+    }, timeoutMs);
 
     void trigger()
       .then((clicked) => {
@@ -709,35 +1037,159 @@ async function waitForBrowserDownload(
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function tryTargetDownloadCandidate(params: {
+  browserClient: EventedChromeClient;
+  targetClient: ChromeClient;
+  options: AssistantDownloadCaptureOptions;
+  candidate: DownloadCandidateDescriptor;
+  mode: CandidateCollectionMode;
+  timeoutMs?: number;
+  label: string;
+}): Promise<BrowserDownloadedFile | null> {
+  const { browserClient, targetClient, options, candidate, mode, timeoutMs, label } = params;
+  if (!options.downloadsDir) {
+    return null;
+  }
+  const beforeFiles = new Set(await readdir(options.downloadsDir).catch(() => []));
+  options.logger?.sessionLog?.(
+    `[browser-downloads] raw CDP trying ${label} candidate ${candidate.index} (${mode}) score=${candidate.score}`,
+  );
+  const download = await waitForBrowserDownload(
+    browserClient,
+    options.downloadsDir,
+    beforeFiles,
+    async () => {
+      const clickResult = await clickTargetDownloadCandidate(
+        targetClient,
+        options.meta,
+        candidate.index,
+        mode,
+      );
+      if (!clickResult.clicked) {
+        options.logger?.sessionLog?.(
+          `[browser-downloads] raw CDP click failed for ${label} candidate ${candidate.index} (${mode}): ${clickResult.reason ?? "unknown"}`,
+        );
+      }
+      return clickResult.clicked;
+    },
+    timeoutMs,
+  );
+  if (!download) {
+    options.logger?.sessionLog?.(
+      `[browser-downloads] raw CDP ${label} candidate ${candidate.index} (${mode}) did not download`,
+    );
+  }
+  return download;
+}
+
+async function tryScopedThenPreviewDownloadCandidate(params: {
+  browserClient: EventedChromeClient;
+  targetClient: ChromeClient;
+  options: AssistantDownloadCaptureOptions;
+  candidate: DownloadCandidateDescriptor;
+}): Promise<BrowserDownloadedFile | null> {
+  const { browserClient, targetClient, options, candidate } = params;
+  if (!options.downloadsDir) {
+    return null;
+  }
+  const beforeFiles = new Set(await readdir(options.downloadsDir).catch(() => []));
+  options.logger?.sessionLog?.(
+    `[browser-downloads] raw CDP trying scoped candidate ${candidate.index} (scope) score=${candidate.score}`,
+  );
+  const download = await waitForBrowserDownload(
+    browserClient,
+    options.downloadsDir,
+    beforeFiles,
+    async () => {
+      const clickResult = await clickTargetDownloadCandidate(
+        targetClient,
+        options.meta,
+        candidate.index,
+        "scope",
+      );
+      if (!clickResult.clicked) {
+        options.logger?.sessionLog?.(
+          `[browser-downloads] raw CDP click failed for scoped candidate ${candidate.index} (scope): ${clickResult.reason ?? "unknown"}`,
+        );
+        return false;
+      }
+      await sleep(DOWNLOAD_PREVIEW_SETTLE_MS);
+      const documentCandidates = await collectAndLogTargetDownloadCandidates(
+        targetClient,
+        options,
+        "document",
+      );
+      let clickedPreview = false;
+      for (const documentCandidate of documentCandidates) {
+        options.logger?.sessionLog?.(
+          `[browser-downloads] raw CDP trying preview candidate ${documentCandidate.index} (document) score=${documentCandidate.score}`,
+        );
+        const previewClick = await clickTargetDownloadCandidate(
+          targetClient,
+          options.meta,
+          documentCandidate.index,
+          "document",
+        );
+        if (!previewClick.clicked) {
+          options.logger?.sessionLog?.(
+            `[browser-downloads] raw CDP click failed for preview candidate ${documentCandidate.index} (document): ${previewClick.reason ?? "unknown"}`,
+          );
+          continue;
+        }
+        clickedPreview = true;
+        break;
+      }
+      return clickedPreview || documentCandidates.length === 0;
+    },
+  );
+  if (!download) {
+    options.logger?.sessionLog?.(
+      `[browser-downloads] raw CDP scoped candidate ${candidate.index} (scope) and preview fallback did not download`,
+    );
+  }
+  return download;
+}
+
+async function collectAndLogTargetDownloadCandidates(
+  client: ChromeClient,
+  options: AssistantDownloadCaptureOptions,
+  mode: CandidateCollectionMode,
+): Promise<DownloadCandidateDescriptor[]> {
+  const { candidates, source, rawCount, rawSample } = await collectTargetDownloadCandidates(
+    client,
+    options.meta,
+    mode,
+  );
+  options.logger?.sessionLog?.(
+    `[browser-downloads] raw CDP ${mode} candidates found: ${candidates.length} (${source}); raw controls=${rawCount}; sample=${JSON.stringify(rawSample)}`,
+  );
+  return candidates;
+}
+
 async function captureAssistantDownloadsViaCdp(
   options: AssistantDownloadCaptureOptions,
   target: TargetInfoLite,
 ): Promise<BrowserDownloadedFile[]> {
   const targetId = targetIdentity(target);
-  const browserEndpoint = await resolveBrowserClientEndpoint(options);
-  if (
-    !targetId ||
-    !browserEndpoint ||
-    !options.chromeHost ||
-    !options.chromePort ||
-    !options.downloadsDir
-  ) {
+  if (!targetId || !options.chromeHost || !options.chromePort || !options.downloadsDir) {
     return [];
   }
   const browserClient = (await CDP({
-    target: browserEndpoint,
-    local: true,
+    host: options.chromeHost,
+    port: options.chromePort,
   })) as EventedChromeClient;
-  const targetConnection = await connectToRemoteChromeTarget(
-    options.chromeHost,
-    options.chromePort,
-    options.logger ?? (() => {}),
-    {
-      browserWSEndpoint: browserEndpoint,
-      targetId,
-      closeTargetOnDispose: false,
-    },
-  );
+  const providedTargetClient = options.targetClient;
+  const targetClient =
+    providedTargetClient ??
+    ((await CDP({
+      host: options.chromeHost,
+      port: options.chromePort,
+      target: targetId,
+    })) as ChromeClient);
   try {
     await mkdir(options.downloadsDir, { recursive: true });
     await browserClient.Browser.setDownloadBehavior({
@@ -745,52 +1197,48 @@ async function captureAssistantDownloadsViaCdp(
       downloadPath: options.downloadsDir,
       eventsEnabled: true,
     });
-    await targetConnection.client.Runtime.enable().catch(() => undefined);
-    const { candidates, source, rawCount, rawSample } = await collectTargetDownloadCandidates(
-      targetConnection.client,
-      options.meta,
-    );
-    options.logger?.sessionLog?.(
-      `[browser-downloads] raw CDP candidates found: ${candidates.length} (${source}); raw controls=${rawCount}; sample=${JSON.stringify(rawSample)}`,
-    );
-    if (candidates.length === 0) {
-      return [];
-    }
+    await targetClient.Runtime.enable().catch(() => undefined);
+    const candidates = await collectAndLogTargetDownloadCandidates(targetClient, options, "scope");
     const downloads: BrowserDownloadedFile[] = [];
     for (const candidate of candidates) {
-      const beforeFiles = new Set(await readdir(options.downloadsDir).catch(() => []));
-      options.logger?.sessionLog?.(
-        `[browser-downloads] raw CDP trying candidate ${candidate.index} score=${candidate.score}`,
-      );
-      const download = await waitForBrowserDownload(
+      const download = await tryScopedThenPreviewDownloadCandidate({
         browserClient,
-        options.downloadsDir,
-        beforeFiles,
-        async () => {
-          const clickResult = await clickTargetDownloadCandidate(
-            targetConnection.client,
-            options.meta,
-            candidate.index,
-          );
-          if (!clickResult.clicked) {
-            options.logger?.sessionLog?.(
-              `[browser-downloads] raw CDP click failed for candidate ${candidate.index}: ${clickResult.reason ?? "unknown"}`,
-            );
-          }
-          return clickResult.clicked;
-        },
-      );
+        targetClient,
+        options,
+        candidate,
+      });
       if (download) {
         downloads.push(download);
-      } else {
-        options.logger?.sessionLog?.(
-          `[browser-downloads] raw CDP candidate ${candidate.index} did not download`,
-        );
+      }
+    }
+    if (downloads.length === 0) {
+      downloads.push(...(await captureSandboxDownloadsFromConversation(targetClient, options)));
+    }
+    if (candidates.length === 0) {
+      const documentCandidates = await collectAndLogTargetDownloadCandidates(
+        targetClient,
+        options,
+        "document",
+      );
+      for (const candidate of documentCandidates) {
+        const download = await tryTargetDownloadCandidate({
+          browserClient,
+          targetClient,
+          options,
+          candidate,
+          mode: "document",
+          label: "document",
+        });
+        if (download) {
+          downloads.push(download);
+        }
       }
     }
     return downloads;
   } finally {
-    await targetConnection.close().catch(() => undefined);
+    if (!providedTargetClient) {
+      await targetClient.close().catch(() => undefined);
+    }
     await browserClient.close().catch(() => undefined);
   }
 }
@@ -944,20 +1392,60 @@ function resolvePageSelection(
 export async function captureAssistantDownloads(
   options: AssistantDownloadCaptureOptions,
 ): Promise<BrowserDownloadedFile[]> {
+  const logger = options.logger;
   if (!options.downloadsDir) {
     return [];
   }
   if (!isLocalEndpoint(options.browserWSEndpoint, options.chromeHost)) {
-    options.logger?.sessionLog?.(
+    logger?.sessionLog?.(
       "[browser-downloads] skipped: download capture only supports same-host CDP sessions",
     );
     return [];
   }
-  const logger = options.logger;
+  if (options.chromeTargetId) {
+    const runtimeTarget: TargetInfoLite = {
+      targetId: options.chromeTargetId,
+      type: "page",
+      url: options.tabUrl,
+    };
+    logger?.sessionLog?.(
+      `[browser-downloads] trying runtime target via raw CDP before Playwright attach: ${options.chromeTargetId}`,
+    );
+    const rawDownloads = await captureAssistantDownloadsViaCdp(options, runtimeTarget).catch(
+      (error) => {
+        logger?.sessionLog?.(
+          `[browser-downloads] raw CDP runtime target capture failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return [];
+      },
+    );
+    if (rawDownloads.length > 0) {
+      return rawDownloads;
+    }
+    if (options.targetClient) {
+      const sandboxDownloads = await captureSandboxDownloadsFromConversation(
+        options.targetClient,
+        options,
+      ).catch((error) => {
+        logger?.sessionLog?.(
+          `[browser-downloads] sandbox metadata capture failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return [];
+      });
+      if (sandboxDownloads.length > 0) {
+        return sandboxDownloads;
+      }
+    }
+  }
   const bridge = await connectPlaywrightSupervisor({
     browserWSEndpoint: options.browserWSEndpoint,
     host: options.chromeHost,
     port: options.chromePort,
+    timeoutMs: 30_000,
   });
   try {
     const pages = bridge.browser.contexts().flatMap((context) => context.pages());
@@ -1051,6 +1539,8 @@ export async function captureAssistantDownloads(
 
 export const __test__ = {
   candidateFingerprint,
+  extractSandboxDownloadNames,
+  extractSandboxFileContent,
   resolvePageSelection,
   sanitizeSuggestedFilename,
   scoreDownloadCandidate,

@@ -830,6 +830,7 @@ async function captureConversationResponse(
   promptPreview?: string,
   baselineTurns?: number | null,
   downloadsDir?: string,
+  targetClient?: ChromeClient,
 ): Promise<ReattachResult> {
   const startedAt = Date.now();
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
@@ -956,7 +957,9 @@ async function captureConversationResponse(
     tabUrl: currentUrl,
     conversationId: extractConversationIdFromUrl(currentUrl ?? runtime.tabUrl ?? ""),
     downloadsDir,
+    assistantMarkdown: answerMarkdown,
     meta: recovered.meta,
+    targetClient,
     logger,
   }).catch((error) => {
     logger.sessionLog?.(
@@ -1840,6 +1843,7 @@ export async function resumeBrowserSession(
         deps.promptPreview,
         deps.baselineTurns,
         deps.downloadsDir,
+        client,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -2019,6 +2023,7 @@ async function resumeBrowserSessionViaNewChrome(
       deps.promptPreview,
       deps.baselineTurns,
       deps.downloadsDir,
+      client,
     );
     const href = await readCurrentHref(Runtime);
     await closeClient(client);
@@ -2190,6 +2195,7 @@ export async function continueBrowserSession(
         submittedPromptPreview,
         submission.baselineTurns,
         options.downloadsDir,
+        client,
       );
       const href = await readCurrentHref(Runtime);
       await connection.close().catch(() => undefined);
@@ -2484,6 +2490,7 @@ async function continueBrowserSessionViaNewChrome(
         submittedPrompt,
         submittedBaselineTurns,
         options.downloadsDir,
+        client,
       );
     } catch (error) {
       const assistantRecheckConfigured =

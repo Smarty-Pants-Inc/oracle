@@ -976,7 +976,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       tabUrl: lastUrl,
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       downloadsDir: options.downloadsDir,
+      assistantMarkdown: answerMarkdown,
       meta: answerMeta,
+      targetClient: client,
       logger,
     }).catch((error) => {
       logger.sessionLog?.(
@@ -2155,7 +2157,9 @@ async function runRemoteBrowserMode(
       tabUrl: lastUrl,
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       downloadsDir: options.downloadsDir,
+      assistantMarkdown: answerMarkdown,
       meta: answerMeta,
+      targetClient: client,
       logger,
     }).catch((error) => {
       logger.sessionLog?.(

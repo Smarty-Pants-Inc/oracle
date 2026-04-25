@@ -111,4 +111,30 @@ describe("playwrightDownloads", () => {
   test("sanitizes suggested filenames for session-local storage", () => {
     expect(__test__.sanitizeSuggestedFilename("../unsafe:proof?.txt")).toBe("unsafe_proof_.txt");
   });
+
+  test("extracts sandbox filenames from assistant markdown", () => {
+    expect(
+      __test__.extractSandboxDownloadNames(
+        "[proof](sandbox:/mnt/data/proof.md) and [unsafe](sandbox:/mnt/data/../bad?.txt)",
+      ),
+    ).toEqual(["proof.md", "bad_.txt"]);
+  });
+
+  test("recovers sandbox file content from conversation tool output", () => {
+    const conversation = {
+      mapping: {
+        tool: {
+          message: {
+            content: {
+              content_type: "execution_output",
+              text: "-rw-r--r-- 1 root oai_shared 13 /mnt/data/proof.md\n# Proof\n\nOK\n",
+            },
+            metadata: {},
+          },
+        },
+      },
+    };
+
+    expect(__test__.extractSandboxFileContent(conversation, "proof.md")).toBe("# Proof\n\nOK\n");
+  });
 });
