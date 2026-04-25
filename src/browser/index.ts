@@ -16,7 +16,6 @@ import {
   launchChrome,
   registerTerminationHooks,
   hideChromeWindow,
-  captureFrontmostProcess,
   startChromeFocusGuard,
   finalizeChromeFocusProtection,
   connectToRemoteChrome,
@@ -274,7 +273,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
 
   const shouldHideChromeWindow =
     config.launcher !== "carbonyl" && !config.headless && config.hideWindow;
-  const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
 
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const reusedChrome = manualLogin
@@ -354,8 +352,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     controllerPid: process.pid,
   });
   if (shouldHideChromeWindow) {
-    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
-    await hideChromeWindow(chrome, logger, frontmostTarget);
+    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger);
+    await hideChromeWindow(chrome, logger);
   }
 
   try {
@@ -1086,7 +1084,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     removeDialogHandler?.();
     if (shouldHideChromeWindow) {
-      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard);
       stopChromeFocusGuard = null;
     }
     removeTerminationHooks?.();

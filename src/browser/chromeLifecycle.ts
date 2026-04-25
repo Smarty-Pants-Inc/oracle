@@ -186,7 +186,7 @@ export function registerTerminationHooks(
 export async function hideChromeWindow(
   chrome: LaunchedChrome,
   logger: BrowserLogger,
-  restoreTarget?: FrontmostProcessTarget | string | null,
+  _restoreTarget?: FrontmostProcessTarget | string | null,
 ): Promise<void> {
   if (process.platform !== "darwin") {
     logger("Window hiding is only supported on macOS");
@@ -196,10 +196,6 @@ export async function hideChromeWindow(
     logger("Unable to hide window: missing Chrome PID");
     return;
   }
-  const normalizedRestoreTarget = normalizeRestorableTarget(restoreTarget);
-  const shouldRestore = normalizedRestoreTarget
-    ? await isProcessFrontmost(chrome.pid, logger)
-    : false;
   const script = `tell application "System Events"
     try
       set visible of (first process whose unix id is ${chrome.pid}) to false
@@ -208,9 +204,6 @@ export async function hideChromeWindow(
   try {
     await execFileAsync("osascript", ["-e", script]);
     logger("Chrome window hidden (Cmd-H)");
-    if (shouldRestore && normalizedRestoreTarget) {
-      await restoreFrontmostApplication(normalizedRestoreTarget, logger);
-    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger(`Failed to hide Chrome window: ${message}`);
@@ -255,157 +248,29 @@ export async function captureFrontmostProcess(
   }
 }
 
-async function isProcessFrontmost(pid: number, logger: BrowserLogger): Promise<boolean> {
-  const frontmost = await captureFrontmostProcess(logger);
-  return matchesChromeProcess(frontmost, pid);
-}
-
 export function startChromeFocusGuard(
-  chrome: LaunchedChrome,
-  logger: BrowserLogger,
-  restoreTargetInput?: FrontmostProcessTarget | string | null,
-  intervalMs = 250,
-  maxDurationMs: number | null = DEFAULT_FOCUS_GUARD_WINDOW_MS,
+  _chrome: LaunchedChrome,
+  _logger: BrowserLogger,
+  _restoreTargetInput?: FrontmostProcessTarget | string | null,
+  _intervalMs = 250,
+  _maxDurationMs: number | null = DEFAULT_FOCUS_GUARD_WINDOW_MS,
 ): () => void {
-  if (process.platform !== "darwin" || !chrome.pid) {
-    return () => {};
-  }
-  if (typeof maxDurationMs === "number" && maxDurationMs <= 0) {
-    return () => {};
-  }
-
-  let stopped = false;
-  let inFlight = false;
-  let restoreTarget = normalizeRestorableTarget(restoreTargetInput);
-  const deadline =
-    typeof maxDurationMs === "number" && Number.isFinite(maxDurationMs)
-      ? Date.now() + maxDurationMs
-      : null;
-  const stop = () => {
-    if (stopped) {
-      return;
-    }
-    stopped = true;
-    clearInterval(timer);
-  };
-  const tick = async () => {
-    if (stopped || inFlight) {
-      return;
-    }
-    if (deadline !== null && Date.now() >= deadline) {
-      stop();
-      return;
-    }
-    inFlight = true;
-    try {
-      const frontmost = await captureFrontmostProcess(logger);
-      const targetIsFrontmost = matchesChromeProcess(frontmost, chrome.pid);
-      if (!targetIsFrontmost) {
-        const latestRestoreTarget = normalizeRestorableTarget(frontmost);
-        if (latestRestoreTarget && !isChromeProcessName(latestRestoreTarget.name)) {
-          restoreTarget = latestRestoreTarget;
-        }
-      }
-      if (targetIsFrontmost) {
-        await hideChromeWindow(chrome, logger, restoreTarget);
-      }
-    } finally {
-      inFlight = false;
-    }
-  };
-
-  const timer = setInterval(() => {
-    void tick();
-  }, intervalMs);
-  timer.unref?.();
-
-  return stop;
+  // Repeatedly hiding Chrome steals focus from the user's active app. Hidden-mode callers
+  // issue bounded hide operations around browser work; this guard remains as an API no-op.
+  return () => {};
 }
 
 export async function finalizeChromeFocusProtection(
   chrome: LaunchedChrome,
   logger: BrowserLogger,
   stopFocusGuard: (() => void) | null | undefined,
-  restoreTarget?: FrontmostProcessTarget | string | null,
+  _restoreTarget?: FrontmostProcessTarget | string | null,
 ): Promise<void> {
   try {
-    await hideChromeWindow(chrome, logger, restoreTarget).catch(() => undefined);
+    await hideChromeWindow(chrome, logger).catch(() => undefined);
   } finally {
     stopFocusGuard?.();
   }
-}
-
-async function restoreFrontmostApplication(
-  restoreTarget: FrontmostProcessTarget | string,
-  logger: BrowserLogger,
-): Promise<void> {
-  const normalized = normalizeRestorableTarget(restoreTarget);
-  if (!normalized) {
-    return;
-  }
-  if (normalized.pid && normalized.pid > 0) {
-    try {
-      await execFileAsync("osascript", [
-        "-e",
-        `tell application "System Events"
-          try
-            set frontmost of (first application process whose unix id is ${normalized.pid}) to true
-          on error
-            return
-          end try
-        end tell`,
-      ]);
-      logger(`Restored focus to ${normalized.name}`);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to restore focus to ${normalized.name}: ${message}`);
-    }
-  }
-  const escaped = normalized.name.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-  try {
-    await execFileAsync("osascript", ["-e", `tell application "${escaped}" to activate`]);
-    logger(`Restored focus to ${normalized.name}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to restore focus to ${normalized.name}: ${message}`);
-  }
-}
-
-function normalizeRestorableTarget(
-  target?: FrontmostProcessTarget | string | null,
-): FrontmostProcessTarget | null {
-  if (typeof target === "string") {
-    const name = target.trim();
-    if (!name || isChromeProcessName(name)) {
-      return null;
-    }
-    return { name, pid: null };
-  }
-  const name = target?.name?.trim();
-  if (!name || isChromeProcessName(name)) {
-    return null;
-  }
-  const pid = target?.pid;
-  return {
-    name,
-    pid: typeof pid === "number" && Number.isFinite(pid) && pid > 0 ? pid : null,
-  };
-}
-
-function matchesChromeProcess(
-  processTarget: FrontmostProcessTarget | null | undefined,
-  pid: number | null | undefined,
-): boolean {
-  if (!Number.isFinite(pid) || (pid ?? 0) <= 0) {
-    return false;
-  }
-  return processTarget?.pid === pid;
-}
-
-function isChromeProcessName(name?: string | null): boolean {
-  const normalized = name?.trim().toLowerCase();
-  return normalized === "google chrome" || normalized === "chromium";
 }
 
 export async function connectToChrome(

@@ -16,7 +16,6 @@ import {
 } from "../browser/supervisorThreads.js";
 import { normalizeSupervisorThread } from "../browser/supervisorThreadNormalize.js";
 import {
-  captureFrontmostProcess,
   hideChromeWindow,
   startChromeFocusGuard,
   finalizeChromeFocusProtection,
@@ -117,7 +116,6 @@ async function writeSupervisorBrokerResponseLine(response: unknown): Promise<voi
 }
 
 interface ChromeFocusDeps {
-  captureFrontmostProcess: typeof captureFrontmostProcess;
   hideChromeWindow: typeof hideChromeWindow;
   startChromeFocusGuard: typeof startChromeFocusGuard;
   finalizeChromeFocusProtection: typeof finalizeChromeFocusProtection;
@@ -137,7 +135,6 @@ interface SupervisorRuntimeUseOptions {
 type SupervisorRuntimeClient = Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"];
 
 const chromeFocusDeps: ChromeFocusDeps = {
-  captureFrontmostProcess,
   hideChromeWindow,
   startChromeFocusGuard,
   finalizeChromeFocusProtection,
@@ -802,25 +799,12 @@ async function withChromeFocusProtection<T>(
     return action();
   }
   const chrome = { pid: chromePid } as LaunchedChrome;
-  const frontmostProcess = await deps.captureFrontmostProcess(supervisorChromeLogger);
-  const stopFocusGuard = deps.startChromeFocusGuard(
-    chrome,
-    supervisorChromeLogger,
-    frontmostProcess,
-    250,
-  );
+  const stopFocusGuard = deps.startChromeFocusGuard(chrome, supervisorChromeLogger);
   try {
-    await deps
-      .hideChromeWindow(chrome, supervisorChromeLogger, frontmostProcess)
-      .catch(() => undefined);
+    await deps.hideChromeWindow(chrome, supervisorChromeLogger).catch(() => undefined);
     return await action();
   } finally {
-    await deps.finalizeChromeFocusProtection(
-      chrome,
-      supervisorChromeLogger,
-      stopFocusGuard,
-      frontmostProcess,
-    );
+    await deps.finalizeChromeFocusProtection(chrome, supervisorChromeLogger, stopFocusGuard);
   }
 }
 

@@ -853,7 +853,7 @@ describe("connectWithNewTab", () => {
     expect(browserClient.Target.createTarget).toHaveBeenCalledTimes(2);
   });
 
-  test("keeps the focus guard active until explicitly stopped when no deadline is provided", async () => {
+  test("does not run a polling focus guard when no deadline is provided", async () => {
     vi.useFakeTimers();
     vi.resetModules();
     const frontmostProcesses = [
@@ -905,12 +905,10 @@ describe("connectWithNewTab", () => {
       100,
     );
 
-    await vi.advanceTimersByTimeAsync(300);
-    const callsAt300ms = execFileMock.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(300);
+    await vi.advanceTimersByTimeAsync(600);
     stop();
 
-    expect(execFileMock.mock.calls.length).toBeGreaterThan(callsAt300ms);
+    expect(execFileMock).not.toHaveBeenCalled();
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
@@ -1123,7 +1121,7 @@ describe("startChromeFocusGuard", () => {
     vi.restoreAllMocks();
   });
 
-  test("updates the restore target using the specific frontmost process and expires cleanly", async () => {
+  test("does not poll or restore the prior frontmost app", async () => {
     const frontmostProcesses = [
       "Google Chrome\n4242\n",
       "Google Chrome\n4242\n",
@@ -1177,25 +1175,20 @@ describe("startChromeFocusGuard", () => {
     await vi.advanceTimersByTimeAsync(100);
     await vi.advanceTimersByTimeAsync(100);
     await vi.advanceTimersByTimeAsync(100);
-    const callsBeforeExpiry = execFileMock.mock.calls.length;
     await vi.advanceTimersByTimeAsync(500);
     stop();
 
     const restoreScripts = execFileMock.mock.calls
       .map(([, args]) => args[1] ?? args[0] ?? "")
-      .filter((script) => script.includes("set frontmost of"));
+      .filter(
+        (script) =>
+          script.includes("set frontmost of") ||
+          script.includes('tell application "Zed" to activate') ||
+          script.includes('tell application "Messages" to activate'),
+      );
 
-    expect(
-      restoreScripts.some((script) =>
-        script.includes("set frontmost of (first application process whose unix id is 7001)"),
-      ),
-    ).toBe(true);
-    expect(
-      restoreScripts.some((script) =>
-        script.includes("set frontmost of (first application process whose unix id is 9001)"),
-      ),
-    ).toBe(true);
-    expect(execFileMock.mock.calls.length).toBe(callsBeforeExpiry);
+    expect(restoreScripts).toEqual([]);
+    expect(execFileMock).not.toHaveBeenCalled();
   });
 
   test("does not restore another app when hiding a background chrome process", async () => {
@@ -1370,7 +1363,7 @@ describe("startChromeFocusGuard", () => {
     expect(restoreScripts).toEqual([]);
   });
 
-  test("does not adopt another Chrome app as the restore target", async () => {
+  test("does not poll for another Chrome app or a prior non-Chrome app", async () => {
     const frontmostProcesses = [
       "Messages\n9001\n",
       "Google Chrome\n9999\n",
@@ -1426,17 +1419,15 @@ describe("startChromeFocusGuard", () => {
 
     const restoreScripts = execFileMock.mock.calls
       .map(([, args]) => args[1] ?? args[0] ?? "")
-      .filter((script) => script.includes("set frontmost of"));
+      .filter(
+        (script) =>
+          script.includes("set frontmost of") ||
+          script.includes('tell application "Zed" to activate') ||
+          script.includes('tell application "Messages" to activate') ||
+          script.includes('tell application "Google Chrome" to activate'),
+      );
 
-    expect(
-      restoreScripts.some((script) =>
-        script.includes("set frontmost of (first application process whose unix id is 9001)"),
-      ),
-    ).toBe(true);
-    expect(
-      restoreScripts.some((script) =>
-        script.includes("set frontmost of (first application process whose unix id is 9999)"),
-      ),
-    ).toBe(false);
+    expect(restoreScripts).toEqual([]);
+    expect(execFileMock).not.toHaveBeenCalled();
   });
 });

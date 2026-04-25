@@ -2075,12 +2075,10 @@ describe("resumeBrowserSession", () => {
 
   test("guards an existing hidden chrome follow-up before reconnecting and sending", async () => {
     vi.resetModules();
-    const frontmostTarget = { name: "Zed", pid: 77 };
-    const captureFrontmostProcess = vi.fn(async () => frontmostTarget);
     const hideChromeWindow = vi.fn(async (..._args: unknown[]) => {});
     const startChromeFocusGuard = vi.fn(() => vi.fn());
-    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop, restoreTarget) => {
-      await hideChromeWindow(chrome as never, loggerArg as never, restoreTarget as never);
+    const finalizeChromeFocusProtection = vi.fn(async (chrome, loggerArg, stop) => {
+      await hideChromeWindow(chrome as never, loggerArg as never);
       stop?.();
     });
     vi.doMock("../../src/browser/chromeLifecycle.js", async () => {
@@ -2089,7 +2087,6 @@ describe("resumeBrowserSession", () => {
       );
       return {
         ...original,
-        captureFrontmostProcess,
         hideChromeWindow,
         startChromeFocusGuard,
         finalizeChromeFocusProtection,
@@ -2157,11 +2154,10 @@ describe("resumeBrowserSession", () => {
     );
 
     expect(result.answerMarkdown).toBe("supervisor markdown");
-    expect(captureFrontmostProcess).toHaveBeenCalledWith(logger);
     expect(hideChromeWindow).toHaveBeenCalledTimes(2);
-    expect(hideChromeWindow).toHaveBeenNthCalledWith(1, { pid: 4242 }, logger, frontmostTarget);
-    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, { pid: 4242 }, logger, frontmostTarget);
-    expect(startChromeFocusGuard).toHaveBeenCalledWith({ pid: 4242 }, logger, frontmostTarget);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(1, { pid: 4242 }, logger);
+    expect(hideChromeWindow).toHaveBeenNthCalledWith(2, { pid: 4242 }, logger);
+    expect(startChromeFocusGuard).toHaveBeenCalledWith({ pid: 4242 }, logger);
     expect(hideChromeWindow.mock.invocationCallOrder[0]).toBeLessThan(
       connectMock.mock.invocationCallOrder[0],
     );

@@ -37,7 +37,6 @@ import {
   connectWithNewTab,
   closeTab,
   hideChromeWindow,
-  captureFrontmostProcess,
   startChromeFocusGuard,
   finalizeChromeFocusProtection,
   connectToRemoteChromeTarget,
@@ -264,14 +263,13 @@ async function withHiddenExistingChrome<T>(
     return action(liveRuntime);
   }
 
-  const frontmostTarget = await captureFrontmostProcess(logger);
   const chrome = { pid: liveRuntime.chromePid } as Parameters<typeof hideChromeWindow>[0];
-  const stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
+  const stopChromeFocusGuard = startChromeFocusGuard(chrome, logger);
   try {
-    await hideChromeWindow(chrome, logger, frontmostTarget);
+    await hideChromeWindow(chrome, logger);
     return await action(liveRuntime);
   } finally {
-    await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+    await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard);
   }
 }
 
@@ -1923,7 +1921,6 @@ async function resumeBrowserSessionViaNewChrome(
   }
   const shouldHideChromeWindow =
     launchConfig.launcher !== "carbonyl" && !launchConfig.headless && launchConfig.hideWindow;
-  const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
         waitForPortMs: launchConfig.reuseChromeWaitMs,
@@ -1935,8 +1932,8 @@ async function resumeBrowserSessionViaNewChrome(
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
   if (shouldHideChromeWindow) {
-    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
-    await hideChromeWindow(chrome, logger, frontmostTarget);
+    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger);
+    await hideChromeWindow(chrome, logger);
   }
   try {
     const { client, isolatedTargetId } = await connectReopenedChrome(
@@ -2060,7 +2057,7 @@ async function resumeBrowserSessionViaNewChrome(
     };
   } finally {
     if (shouldHideChromeWindow) {
-      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard);
       stopChromeFocusGuard = null;
     }
   }
@@ -2325,7 +2322,6 @@ async function continueBrowserSessionViaNewChrome(
   }
   const shouldHideChromeWindow =
     launchConfig.launcher !== "carbonyl" && !launchConfig.headless && launchConfig.hideWindow;
-  const frontmostTarget = shouldHideChromeWindow ? await captureFrontmostProcess(logger) : null;
   const reusedChrome = manualLogin
     ? await maybeReuseRunningChrome(userDataDir, logger, {
         waitForPortMs: launchConfig.reuseChromeWaitMs,
@@ -2337,8 +2333,8 @@ async function continueBrowserSessionViaNewChrome(
   const strictTabIsolation = Boolean(manualLogin && reusedChrome);
   let stopChromeFocusGuard: (() => void) | null = null;
   if (shouldHideChromeWindow) {
-    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger, frontmostTarget);
-    await hideChromeWindow(chrome, logger, frontmostTarget);
+    stopChromeFocusGuard = startChromeFocusGuard(chrome, logger);
+    await hideChromeWindow(chrome, logger);
   }
   try {
     const { client, isolatedTargetId } = await connectReopenedChrome(
@@ -2567,7 +2563,7 @@ async function continueBrowserSessionViaNewChrome(
     };
   } finally {
     if (shouldHideChromeWindow) {
-      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard, frontmostTarget);
+      await finalizeChromeFocusProtection(chrome, logger, stopChromeFocusGuard);
       stopChromeFocusGuard = null;
     }
   }
