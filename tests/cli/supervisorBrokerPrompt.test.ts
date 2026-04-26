@@ -21,8 +21,8 @@ describe("buildSupervisorBrowserConfig", () => {
     const config = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -32,7 +32,7 @@ describe("buildSupervisorBrowserConfig", () => {
       cookieSync: true,
       keepBrowser: true,
       attachRunning: false,
-      desiredModel: "GPT-5.4 Pro",
+      desiredModel: "GPT-5.5 Pro",
       reuseChromeWaitMs: 30_000,
       assistantRecheckDelayMs: 30_000,
       assistantRecheckTimeoutMs: 300_000,
@@ -51,8 +51,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -73,8 +73,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -91,8 +91,8 @@ describe("buildSupervisorBrowserConfig", () => {
       env: {
         ORACLE_BROWSER_PROFILE_DIR: "/tmp/oracle-hidden-profile",
       },
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -103,8 +103,8 @@ describe("buildSupervisorBrowserConfig", () => {
     const config = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: false,
       useDedicatedHiddenProfile: false,
     });
@@ -128,8 +128,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -153,8 +153,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
 
@@ -177,8 +177,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       supervisorChatgptUrl: SUPERVISOR_PROJECT_URL,
       defaultManualLoginCookieSync: true,
     });
@@ -195,8 +195,8 @@ describe("buildSupervisorBrowserConfig", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       browserThinkingTime: "extended",
       defaultManualLoginCookieSync: true,
     });
@@ -208,15 +208,15 @@ describe("buildSupervisorBrowserConfig", () => {
     const localConfig = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       defaultManualLoginCookieSync: true,
     });
     const remoteConfig = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       supervisorThrottleScope: "remote:oracle.example.test",
       defaultManualLoginCookieSync: false,
       useDedicatedHiddenProfile: false,
@@ -299,8 +299,8 @@ describe("supervisor prompt replay safety", () => {
     return buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4",
-      inputModel: "gpt-5.4",
+      runModel: "gpt-5.5",
+      inputModel: "gpt-5.5",
       supervisorChatgptUrl: SUPERVISOR_PROJECT_URL,
       defaultManualLoginCookieSync: true,
     });
@@ -310,7 +310,7 @@ describe("supervisor prompt replay safety", () => {
     return {
       prompt: "Reply with exactly READY.",
       sessionSlug: "codex-oracle-replay",
-      model: "gpt-5.4",
+      model: "gpt-5.5",
       followupSession: "parent-session",
       cwd: "/tmp/project-a",
       files: ["src/a.ts", "src/b.ts"],
@@ -331,7 +331,7 @@ describe("supervisor prompt replay safety", () => {
   ): SessionMetadata {
     const sessionId = overrides.id ?? "codex-oracle-replay";
     const status = overrides.status ?? "completed";
-    const model = overrides.model ?? "gpt-5.4";
+    const model = overrides.model ?? "gpt-5.5";
     return {
       id: sessionId,
       createdAt: overrides.createdAt ?? "2026-04-06T12:00:00.000Z",
@@ -385,7 +385,7 @@ describe("supervisor prompt replay safety", () => {
         }),
       ],
       request,
-      "gpt-5.4",
+      "gpt-5.5",
       browserConfig,
     );
 
@@ -400,7 +400,7 @@ describe("supervisor prompt replay safety", () => {
       __test__.pickReusableSupervisorPromptSession(
         [makeReplaySession({ cwd: "/tmp/project-b" })],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
       ),
     ).toBeNull();
@@ -409,7 +409,7 @@ describe("supervisor prompt replay safety", () => {
       __test__.pickReusableSupervisorPromptSession(
         [makeReplaySession({ files: ["src/a.ts", "src/c.ts"] })],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
       ),
     ).toBeNull();
@@ -436,7 +436,7 @@ describe("supervisor prompt replay safety", () => {
           }),
         ],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
         expectedSupervisorThread,
       ),
@@ -453,7 +453,7 @@ describe("supervisor prompt replay safety", () => {
           }),
         ],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
         expectedSupervisorThread,
       ),
@@ -466,7 +466,7 @@ describe("supervisor prompt replay safety", () => {
         }),
       ],
       request,
-      "gpt-5.4",
+      "gpt-5.5",
       browserConfig,
       expectedSupervisorThread,
     );
@@ -501,7 +501,7 @@ describe("supervisor prompt replay safety", () => {
           }),
         ],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
         expectedSupervisorThread,
       ),
@@ -524,7 +524,7 @@ describe("supervisor prompt replay safety", () => {
           }),
         ],
         request,
-        "gpt-5.4",
+        "gpt-5.5",
         browserConfig,
         expectedSupervisorThread,
       ),
@@ -535,23 +535,23 @@ describe("supervisor prompt replay safety", () => {
     const browserConfig = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       browserThinkingTime: "extended",
       supervisorChatgptUrl: SUPERVISOR_PROJECT_URL,
       defaultManualLoginCookieSync: true,
     });
     const request = {
       ...makeReplayRequest(),
-      model: "gpt-5.4-pro",
+      model: "gpt-5.5-pro",
       browserThinkingTime: "extended" as const,
     };
 
     expect(
       __test__.pickReusableSupervisorPromptSession(
-        [makeReplaySession({ model: "gpt-5.4-pro", thinkingTime: "standard" })],
+        [makeReplaySession({ model: "gpt-5.5-pro", thinkingTime: "standard" })],
         request,
-        "gpt-5.4-pro",
+        "gpt-5.5-pro",
         browserConfig,
       ),
     ).toBeNull();
@@ -561,8 +561,8 @@ describe("supervisor prompt replay safety", () => {
     const browserConfig = buildSupervisorBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       supervisorThrottleScope: "remote:host-b",
       supervisorChatgptUrl: SUPERVISOR_PROJECT_URL,
       defaultManualLoginCookieSync: false,
@@ -573,7 +573,7 @@ describe("supervisor prompt replay safety", () => {
       __test__.pickReusableSupervisorPromptSession(
         [
           makeReplaySession({
-            model: "gpt-5.4-pro",
+            model: "gpt-5.5-pro",
             browser: {
               config: {
                 manualLoginProfileDir: null,
@@ -584,8 +584,8 @@ describe("supervisor prompt replay safety", () => {
             options: {
               prompt: "Reply with exactly READY.",
               file: ["src/a.ts", "src/b.ts"],
-              model: "gpt-5.4-pro",
-              effectiveModelId: "gpt-5.4-pro",
+              model: "gpt-5.5-pro",
+              effectiveModelId: "gpt-5.5-pro",
               followupSessionId: "parent-session",
               mode: "browser",
               browserConfig: {
@@ -596,9 +596,9 @@ describe("supervisor prompt replay safety", () => {
         ],
         {
           ...makeReplayRequest(),
-          model: "gpt-5.4-pro",
+          model: "gpt-5.5-pro",
         },
-        "gpt-5.4-pro",
+        "gpt-5.5-pro",
         browserConfig,
       ),
     ).toBeNull();
@@ -616,7 +616,7 @@ describe("supervisor prompt replay safety", () => {
         }),
       ],
       request,
-      "gpt-5.4",
+      "gpt-5.5",
       browserConfig,
     );
 
@@ -632,7 +632,7 @@ describe("supervisor prompt replay safety", () => {
       await expect(
         __test__.findReusableSupervisorPromptResponse(
           makeReplayRequest(),
-          "gpt-5.4",
+          "gpt-5.5",
           makeBrowserConfig(),
         ),
       ).resolves.toEqual({
@@ -657,7 +657,7 @@ describe("supervisor prompt replay safety", () => {
       await expect(
         __test__.findReusableSupervisorPromptResponse(
           makeReplayRequest(),
-          "gpt-5.4",
+          "gpt-5.5",
           makeBrowserConfig(),
         ),
       ).resolves.toEqual({
@@ -687,7 +687,7 @@ describe("supervisor prompt replay safety", () => {
       await expect(
         __test__.findReusableSupervisorPromptResponse(
           makeReplayRequest(),
-          "gpt-5.4",
+          "gpt-5.5",
           makeBrowserConfig(),
         ),
       ).resolves.toEqual({
@@ -805,7 +805,7 @@ describe("supervisor browser throttling", () => {
       {
         requestStartedAt: [new Date(nowMs - 5_000).toISOString()],
       },
-      "gpt-5.4-pro",
+      "gpt-5.5-pro",
       nowMs,
     );
 
@@ -826,7 +826,7 @@ describe("supervisor browser throttling", () => {
       {
         requestStartedAt: recent,
       },
-      "gpt-5.4-pro",
+      "gpt-5.5-pro",
       nowMs,
     );
 
@@ -843,7 +843,7 @@ describe("supervisor browser throttling", () => {
       {
         requestStartedAt: recent,
       },
-      "gpt-5.4-pro",
+      "gpt-5.5-pro",
       nowMs,
     );
 
@@ -860,7 +860,7 @@ describe("supervisor browser throttling", () => {
       {
         requestStartedAt: recent,
       },
-      "gpt-5.4-pro",
+      "gpt-5.5-pro",
       nowMs,
     );
 
@@ -874,7 +874,7 @@ describe("supervisor browser throttling", () => {
       {
         cooldownUntil: new Date(nowMs + 90_000).toISOString(),
       },
-      "gpt-5.4",
+      "gpt-5.5",
       nowMs,
     );
 
@@ -894,7 +894,7 @@ describe("supervisor browser throttling", () => {
           expiresAt: new Date(nowMs + 60_000).toISOString(),
         },
       },
-      "gpt-5.4",
+      "gpt-5.5",
       nowMs,
       { isProcessAliveFn: () => false, ownerId: "current-owner" },
     );
@@ -916,7 +916,7 @@ describe("supervisor browser throttling", () => {
           processStartMarker: "old-process-start",
         },
       },
-      "gpt-5.4",
+      "gpt-5.5",
       nowMs,
       {
         isProcessAliveFn: () => true,
@@ -941,7 +941,7 @@ describe("supervisor browser throttling", () => {
           expiresAt: new Date(nowMs + 45_000).toISOString(),
         },
       },
-      "gpt-5.4",
+      "gpt-5.5",
       nowMs,
       { isProcessAliveFn: () => true, ownerId: "current-owner" },
     );
@@ -963,7 +963,7 @@ describe("supervisor browser throttling", () => {
           processStartMarker: "old-process-start",
         },
       },
-      "gpt-5.4",
+      "gpt-5.5",
       nowMs,
       {
         ownerId: "shared-owner",

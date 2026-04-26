@@ -14,7 +14,7 @@
 
 ### Changed
 
-- OpenAI: switch the default Pro target from `gpt-5.2-pro` to `gpt-5.4-pro`, add explicit `gpt-5.4` support, roll `gpt-5.1-pro` and `gpt-5.2-pro` forward to `gpt-5.4-pro`, keep provider-qualified custom ids intact, and map browser default Pro selection to ChatGPT `GPT-5.4 Pro` (#107, thanks @jameskraus).
+- OpenAI: switch the default Pro target from `gpt-5.2-pro` to `gpt-5.5-pro`, add explicit `gpt-5.5` support, roll `gpt-5.1-pro` and `gpt-5.2-pro` forward to `gpt-5.5-pro`, keep provider-qualified custom ids intact, and map browser default Pro selection to ChatGPT `GPT-5.5 Pro` (#107, thanks @jameskraus).
 
 ### Fixed
 

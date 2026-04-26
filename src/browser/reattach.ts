@@ -177,6 +177,21 @@ function mergeRuntimeMetadata(
   };
 }
 
+function isBrowserbaseRuntime(runtime: BrowserRuntimeMetadata): boolean {
+  return runtime.browserProvider === "browserbase";
+}
+
+function browserbaseRecoveryUnavailable(
+  runtime: BrowserRuntimeMetadata,
+  cause?: unknown,
+): BrowserAutomationError {
+  return new BrowserAutomationError(
+    "Browserbase browser sessions cannot be recovered by launching local Chrome. Start a new Browserbase run, or use --browserbase-keep-alive and reattach while the cloud session is still alive.",
+    { stage: "browserbase-reattach-unavailable", runtime },
+    cause,
+  );
+}
+
 function isAssistantRateLimitAutomationError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) {
     return false;
@@ -1765,8 +1780,12 @@ export async function resumeBrowserSession(
   const reattachBaseUrl = resolveBrowserConfig(config ?? {}).url;
   const recoverSession =
     deps.recoverSession ??
-    (async (runtimeMeta, configMeta) =>
-      resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps));
+    (async (runtimeMeta, configMeta) => {
+      if (isBrowserbaseRuntime(runtimeMeta)) {
+        throw browserbaseRecoveryUnavailable(runtimeMeta);
+      }
+      return resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps);
+    });
 
   if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
     logger("No running Chrome detected; reopening browser to locate the session.");
@@ -1976,10 +1995,9 @@ async function resumeBrowserSessionViaNewChrome(
       await navigateToChatGPT(Page, Runtime, launchConfig.url, logger);
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
-    await ensurePromptReadyForFollowup(Runtime, launchConfig.inputTimeoutMs, logger);
-
     const conversationUrl = buildConversationUrl(runtime, launchConfig.url);
-    if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
+    const hasReusableConversation = Boolean(conversationUrl || runtimeHasReusableIdentity(runtime));
+    if (hasReusableConversation) {
       logger(
         conversationUrl
           ? `Reopening conversation at ${conversationUrl}`
@@ -1992,6 +2010,9 @@ async function resumeBrowserSessionViaNewChrome(
         launchConfig.url,
       );
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
+      await ensurePromptReadyForFollowup(Runtime, launchConfig.inputTimeoutMs, logger);
+    } else {
+      await ensurePromptReadyForFollowup(Runtime, launchConfig.inputTimeoutMs, logger);
     }
     const boundHref = await readCurrentHref(Runtime).catch(
       () => conversationUrl || runtime.tabUrl || "",
@@ -2078,8 +2099,12 @@ export async function continueBrowserSession(
 
   const recoverSession =
     deps.recoverSession ??
-    (async (runtimeMeta, configMeta) =>
-      continueBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, options, deps));
+    (async (runtimeMeta, configMeta) => {
+      if (isBrowserbaseRuntime(runtimeMeta)) {
+        throw browserbaseRecoveryUnavailable(runtimeMeta);
+      }
+      return continueBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, options, deps);
+    });
 
   if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
     logger("No running Chrome detected; reopening browser to continue the session.");
@@ -2377,10 +2402,9 @@ async function continueBrowserSessionViaNewChrome(
       await navigateToChatGPT(Page, Runtime, launchConfig.url, logger);
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
     }
-    await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
-
     const conversationUrl = buildConversationUrl(runtime, launchConfig.url);
-    if (conversationUrl || runtimeHasReusableIdentity(runtime)) {
+    const hasReusableConversation = Boolean(conversationUrl || runtimeHasReusableIdentity(runtime));
+    if (hasReusableConversation) {
       logger(
         conversationUrl
           ? `Reopening conversation at ${conversationUrl}`
@@ -2393,6 +2417,8 @@ async function continueBrowserSessionViaNewChrome(
         launchConfig.url,
       );
       await ensureNotBlocked(Runtime, launchConfig.headless, logger);
+      await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
+    } else {
       await ensurePromptReady(Runtime, launchConfig.inputTimeoutMs, logger);
     }
     const boundHref = await readCurrentHref(Runtime).catch(

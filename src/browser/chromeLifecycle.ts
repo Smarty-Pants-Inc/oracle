@@ -1022,6 +1022,7 @@ async function launchBackgroundChromeOnMac({
 }): Promise<LaunchedChrome & { host?: string }> {
   const port = await reserveDevToolsPort(requestedPort);
   const chromeBinary = resolveMacChromeExecutable(chromePath);
+  const chromeAppBundle = resolveMacChromeAppBundle(chromePath);
   await mkdir(userDataDir, { recursive: true });
   const outPath = path.join(userDataDir, "chrome-out.log");
   const errPath = path.join(userDataDir, "chrome-err.log");
@@ -1035,12 +1036,17 @@ async function launchBackgroundChromeOnMac({
   const stderrFd = openSync(errPath, "a");
   let launchedPid: number | null = null;
   try {
-    const chrome = spawn(chromeBinary, launchArgs, {
+    const launchCommand = chromeAppBundle ? "/usr/bin/open" : chromeBinary;
+    const launchCommandArgs = chromeAppBundle
+      ? ["-g", "-j", "-n", chromeAppBundle, "--args", ...launchArgs]
+      : launchArgs;
+    const chrome = spawn(launchCommand, launchCommandArgs, {
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
     });
     chrome.unref();
-    launchedPid = typeof chrome.pid === "number" && chrome.pid > 0 ? chrome.pid : null;
+    launchedPid =
+      !chromeAppBundle && typeof chrome.pid === "number" && chrome.pid > 0 ? chrome.pid : null;
   } finally {
     closeSync(stdoutFd);
     closeSync(stderrFd);
@@ -1088,6 +1094,22 @@ function resolveMacChromeExecutable(chromePath?: string | null): string {
     throw new Error(`Unable to locate a Chrome executable inside ${resolved}`);
   }
   return path.join(macOsDir, executable.name);
+}
+
+function resolveMacChromeAppBundle(chromePath?: string | null): string | null {
+  const resolved = chromePath?.trim() || Launcher.getFirstInstallation();
+  if (!resolved) {
+    return null;
+  }
+  if (resolved.endsWith(".app")) {
+    return resolved;
+  }
+  const marker = ".app" + path.sep;
+  const markerIndex = resolved.indexOf(marker);
+  if (markerIndex === -1) {
+    return null;
+  }
+  return resolved.slice(0, markerIndex + ".app".length);
 }
 
 async function reserveDevToolsPort(preferred?: number): Promise<number> {

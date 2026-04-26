@@ -7,7 +7,7 @@ import {
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 
-type ModelVersion = "5-4" | "5-2" | "5-1" | "5-0";
+type ModelVersion = "5-5" | "5-2" | "5-1" | "5-0";
 
 interface ModelTargetTraits {
   normalizedTarget: string;
@@ -141,11 +141,11 @@ function buildModelSelectionExpression(
         combined.includes('5-2') ||
         combined.includes('5.2') ||
         combined.includes('gpt52');
-      const has54 =
-        combined.includes('5 4') ||
-        combined.includes('5-4') ||
-        combined.includes('5.4') ||
-        combined.includes('gpt54');
+      const has55 =
+        combined.includes('5 5') ||
+        combined.includes('5-5') ||
+        combined.includes('5.5') ||
+        combined.includes('gpt55');
       const has51 =
         combined.includes('5 1') ||
         combined.includes('5-1') ||
@@ -156,7 +156,7 @@ function buildModelSelectionExpression(
         combined.includes('5-0') ||
         combined.includes('5.0') ||
         combined.includes('gpt50');
-      return has54 ? '5-4' : has52 ? '5-2' : has51 ? '5-1' : has50 ? '5-0' : null;
+      return has55 ? '5-5' : has52 ? '5-2' : has51 ? '5-1' : has50 ? '5-0' : null;
     };
     const hasVariant = (normalizedText, normalizedTestId, variant) =>
       hasWord(normalizedText, variant) ||
@@ -735,12 +735,12 @@ function detectModelVersion(text: string, testId = ""): ModelVersion | null {
   const normalizedTestId = testId.toLowerCase();
   const combined = [normalizedText, normalizedTestId].filter(Boolean).join(" ");
   if (
-    combined.includes("5 4") ||
-    combined.includes("5-4") ||
-    combined.includes("5.4") ||
-    combined.includes("gpt54")
+    combined.includes("5 5") ||
+    combined.includes("5-5") ||
+    combined.includes("5.5") ||
+    combined.includes("gpt55")
   ) {
-    return "5-4";
+    return "5-5";
   }
   if (
     combined.includes("5 2") ||
@@ -886,21 +886,21 @@ function buildModelMatchersLiteral(targetModel: string): {
   push(`chatgpt ${dotless}`, labelTokens);
   push(`gpt ${base}`, labelTokens);
   push(`gpt ${dotless}`, labelTokens);
-  // Numeric variations (5.4 ↔ 54 ↔ gpt-5-4)
-  if (base.includes("5.4") || base.includes("5-4") || base.includes("54")) {
-    push("5.4", labelTokens);
-    push("gpt-5.4", labelTokens);
-    push("gpt5.4", labelTokens);
-    push("gpt-5-4", labelTokens);
-    push("gpt5-4", labelTokens);
-    push("gpt54", labelTokens);
-    push("chatgpt 5.4", labelTokens);
+  // Numeric variations (5.5 ↔ 55 ↔ gpt-5-5)
+  if (base.includes("5.5") || base.includes("5-5") || base.includes("55")) {
+    push("5.5", labelTokens);
+    push("gpt-5.5", labelTokens);
+    push("gpt5.5", labelTokens);
+    push("gpt-5-5", labelTokens);
+    push("gpt5-5", labelTokens);
+    push("gpt55", labelTokens);
+    push("chatgpt 5.5", labelTokens);
     if (!base.includes("pro")) {
-      testIdTokens.add("model-switcher-gpt-5-4");
+      testIdTokens.add("model-switcher-gpt-5-5");
     }
-    testIdTokens.add("gpt-5-4");
-    testIdTokens.add("gpt5-4");
-    testIdTokens.add("gpt54");
+    testIdTokens.add("gpt-5-5");
+    testIdTokens.add("gpt5-5");
+    testIdTokens.add("gpt55");
   }
   // Numeric variations (5.1 ↔ 51 ↔ gpt-5-1)
   if (base.includes("5.1") || base.includes("5-1") || base.includes("51")) {
@@ -964,10 +964,10 @@ function buildModelMatchersLiteral(targetModel: string): {
     push("proresearch", labelTokens);
     push("research grade", labelTokens);
     push("advanced reasoning", labelTokens);
-    if (base.includes("5.4") || base.includes("5-4") || base.includes("54")) {
-      testIdTokens.add("gpt-5.4-pro");
-      testIdTokens.add("gpt-5-4-pro");
-      testIdTokens.add("gpt54pro");
+    if (base.includes("5.5") || base.includes("5-5") || base.includes("55")) {
+      testIdTokens.add("gpt-5.5-pro");
+      testIdTokens.add("gpt-5-5-pro");
+      testIdTokens.add("gpt55pro");
     }
     if (base.includes("5.1") || base.includes("5-1") || base.includes("51")) {
       testIdTokens.add("gpt-5.1-pro");

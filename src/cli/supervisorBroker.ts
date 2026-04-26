@@ -93,8 +93,8 @@ export interface SupervisorBrokerDeps {
 
 const supervisorChromeLogger = Object.assign((_message?: string) => {}, { verbose: false });
 const SUPERVISOR_THREAD_PROMPT_PREFIX = "Supervisor thread:";
-const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL = "gpt-5.4";
-const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_LABEL = "Thinking 5.4";
+const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL = "gpt-5.5";
+const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_LABEL = "Thinking 5.5";
 const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_STRATEGY = "select";
 const SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS = 12_000;
 const SUPERVISOR_HISTORY_LIMIT_DEFAULT = 100;
@@ -1270,7 +1270,7 @@ async function createSupervisorThreadSession(
   };
   const supervisorThread = buildSupervisorThreadBinding(meta, thread);
 
-  const model = meta.options.model ?? meta.options.effectiveModelId ?? meta.model ?? "gpt-5.4-pro";
+  const model = meta.options.model ?? meta.options.effectiveModelId ?? meta.model ?? "gpt-5.5-pro";
   const created = await sessionStore.createSession(
     {
       prompt: `Supervisor thread: ${thread.title}`,

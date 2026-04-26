@@ -1170,18 +1170,33 @@ export async function attachSupervisorThread(
       ? (buildConversationUrl({ conversationId: normalizedId }, options.projectUrl) ?? undefined)
       : undefined);
   const requireVisibleConversationContent = options?.requireVisibleConversationContent ?? true;
+  const projectScopedDirectAttachUrl =
+    directAttachUrl && isProjectConversationUrl(directAttachUrl) ? directAttachUrl : undefined;
+  const matchesProjectScopedDirectAttachUrl = (thread: SupervisorThreadInfo): boolean =>
+    Boolean(
+      projectScopedDirectAttachUrl &&
+      normalizeProjectUrl(thread.url) === normalizeProjectUrl(projectScopedDirectAttachUrl),
+    );
+  const hasConfirmedAttachIdentity = async (thread: SupervisorThreadInfo): Promise<boolean> => {
+    if (
+      thread.conversationId !== normalizedId ||
+      !supervisorThreadMatchesProjectScope(thread, options?.projectUrl)
+    ) {
+      return false;
+    }
+    if (!requireVisibleConversationContent || matchesProjectScopedDirectAttachUrl(thread)) {
+      return true;
+    }
+    return hasVisibleSupervisorConversationContent(Runtime, thread, directAttachUrl);
+  };
   if (!normalizedId) {
     throw new Error("conversationId is required for attach_thread.");
   }
 
   const current = await readCurrentSupervisorThread(Runtime);
   if (
-    current.conversationId === normalizedId &&
-    (!directAttachUrl ||
-      normalizeProjectUrl(current.url) === normalizeProjectUrl(directAttachUrl)) &&
-    supervisorThreadMatchesProjectScope(current, options?.projectUrl) &&
-    (!requireVisibleConversationContent ||
-      (await hasVisibleSupervisorConversationContent(Runtime, current, directAttachUrl)))
+    (await hasConfirmedAttachIdentity(current)) &&
+    (!directAttachUrl || normalizeProjectUrl(current.url) === normalizeProjectUrl(directAttachUrl))
   ) {
     return current;
   }
@@ -1207,12 +1222,7 @@ export async function attachSupervisorThread(
   while (Date.now() < deadline) {
     await delay(ATTACH_CONFIRM_POLL_MS);
     lastSeen = await readCurrentSupervisorThread(Runtime);
-    if (
-      lastSeen.conversationId === normalizedId &&
-      supervisorThreadMatchesProjectScope(lastSeen, options?.projectUrl) &&
-      (!requireVisibleConversationContent ||
-        (await hasVisibleSupervisorConversationContent(Runtime, lastSeen, directAttachUrl)))
-    ) {
+    if (await hasConfirmedAttachIdentity(lastSeen)) {
       return lastSeen;
     }
 

@@ -21,7 +21,7 @@ function runtimeSession(
     createdAt: startedAt,
     startedAt,
     status,
-    options: { model: "gpt-5.4-pro" },
+    options: { model: "gpt-5.5-pro" },
     browser: {
       runtime: {
         chromePort: 9222,
@@ -924,7 +924,7 @@ describe("supervisorBrokerRuntime", () => {
     const boundThreadMeta = {
       ...runtimeSession("owned-thread", "completed", "2026-03-31T10:05:00.000Z"),
       options: {
-        model: "gpt-5.4-pro",
+        model: "gpt-5.5-pro",
         followupSessionId: "owned-root",
       },
       supervisorThread: {
@@ -998,7 +998,7 @@ describe("supervisorBrokerRuntime", () => {
         {
           ...runtimeSession("owned-thread", "completed", "2026-03-31T10:05:00.000Z"),
           options: {
-            model: "gpt-5.4-pro",
+            model: "gpt-5.5-pro",
             followupSessionId: "missing-parent",
           },
           supervisorThread: {

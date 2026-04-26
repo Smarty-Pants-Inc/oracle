@@ -891,7 +891,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
       let snapshotCalls = 0;
       const thinkingSummary = {
         text: "ChatGPT said:\nThought for a couple of seconds",
-        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        html: '<div data-message-model-slug="gpt-5-5-thinking"><div class="result-thinking markdown"><p></p></div></div>',
         messageId: "mid-thinking",
         turnId: "tid-thinking",
       };
@@ -1022,7 +1022,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
     try {
       const thinkingSummary = {
         text: "ChatGPT said:\nThought for a few seconds",
-        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        html: '<div data-message-model-slug="gpt-5-5-thinking"><div class="result-thinking markdown"><p></p></div></div>',
         messageId: "mid-thinking",
         turnId: "tid-thinking",
       };
@@ -1070,7 +1070,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
     try {
       const thinkingSummary = {
         text: "ChatGPT said:\nThought for 5s",
-        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        html: '<div data-message-model-slug="gpt-5-5-thinking"><div class="result-thinking markdown"><p></p></div></div>',
         messageId: "mid-thinking-copy",
         turnId: "tid-thinking-copy",
       };
@@ -1128,7 +1128,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
     try {
       const thinkingSummary = {
         text: "ChatGPT said:\nThought for 5s",
-        html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+        html: '<div data-message-model-slug="gpt-5-5-thinking"><div class="result-thinking markdown"><p></p></div></div>',
         messageId: "mid-thinking-recover",
         turnId: "tid-thinking-recover",
       };

@@ -39,6 +39,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   remoteChrome: null,
   remoteChromeBrowserWSEndpoint: null,
   remoteChromeProfileRoot: null,
+  browserbase: null,
   manualLogin: false,
   manualLoginProfileDir: null,
   manualLoginCookieSync: false,
@@ -163,6 +164,7 @@ export function resolveBrowserConfig(
       config?.remoteChromeBrowserWSEndpoint ?? DEFAULT_BROWSER_CONFIG.remoteChromeBrowserWSEndpoint,
     remoteChromeProfileRoot:
       config?.remoteChromeProfileRoot ?? DEFAULT_BROWSER_CONFIG.remoteChromeProfileRoot,
+    browserbase: resolveBrowserbaseConfig(config?.browserbase),
     thinkingTime: config?.thinkingTime,
     manualLogin,
     manualLoginProfileDir: isCarbonyl
@@ -173,6 +175,94 @@ export function resolveBrowserConfig(
     manualLoginCookieSync:
       config?.manualLoginCookieSync ?? DEFAULT_BROWSER_CONFIG.manualLoginCookieSync,
   };
+}
+
+function resolveBrowserbaseConfig(
+  config: BrowserAutomationConfig["browserbase"] | undefined,
+): ResolvedBrowserConfig["browserbase"] {
+  const envConfig = readBrowserbaseEnvConfig();
+  if (!config && !envConfig) return DEFAULT_BROWSER_CONFIG.browserbase;
+  return compactBrowserbaseConfig({
+    ...envConfig,
+    ...config,
+  });
+}
+
+function readBrowserbaseEnvConfig(): BrowserAutomationConfig["browserbase"] | undefined {
+  const enabled = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_ENABLED);
+  const persist = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_PERSIST);
+  const keepAlive = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_KEEP_ALIVE);
+  const stealth = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_STEALTH);
+  const captcha = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_CAPTCHA);
+  const timeoutMs = parsePositiveIntEnv(process.env.ORACLE_BROWSERBASE_TIMEOUT_MS);
+  const proxies = parseListEnv(process.env.ORACLE_BROWSERBASE_PROXIES);
+  const viewport = parseViewportEnv(process.env.ORACLE_BROWSERBASE_VIEWPORT);
+  const config = compactBrowserbaseConfig({
+    enabled,
+    apiKey: firstEnv("ORACLE_BROWSERBASE_API_KEY", "BROWSERBASE_API_KEY"),
+    projectId: firstEnv("ORACLE_BROWSERBASE_PROJECT_ID", "BROWSERBASE_PROJECT_ID"),
+    contextId: firstEnv("ORACLE_BROWSERBASE_CONTEXT_ID", "BROWSERBASE_CONTEXT_ID"),
+    persist,
+    keepAlive,
+    region: firstEnv("ORACLE_BROWSERBASE_REGION", "BROWSERBASE_REGION"),
+    timeoutMs,
+    proxies,
+    stealth,
+    captcha,
+    viewport,
+  });
+  return config ?? undefined;
+}
+
+function compactBrowserbaseConfig(
+  config: BrowserAutomationConfig["browserbase"],
+): BrowserAutomationConfig["browserbase"] | null {
+  if (!config) return null;
+  const next = Object.fromEntries(
+    Object.entries(config).filter(([, value]) => value !== undefined),
+  ) as NonNullable<BrowserAutomationConfig["browserbase"]>;
+  return Object.keys(next).length > 0 ? next : null;
+}
+
+function firstEnv(...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = process.env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function parseBooleanEnv(raw?: string): boolean | undefined {
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return undefined;
+}
+
+function parsePositiveIntEnv(raw?: string): number | undefined {
+  if (!raw?.trim()) return undefined;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function parseListEnv(raw?: string): string[] | undefined {
+  const values = raw
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return values?.length ? values : undefined;
+}
+
+function parseViewportEnv(raw?: string): { width: number; height: number } | undefined {
+  const match = raw?.trim().match(/^(\d+)x(\d+)$/i);
+  if (!match) return undefined;
+  const width = Number.parseInt(match[1] ?? "", 10);
+  const height = Number.parseInt(match[2] ?? "", 10);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return undefined;
+  }
+  return { width, height };
 }
 
 function parseDebugPort(raw?: string | null): number | null {

@@ -168,18 +168,24 @@ export async function attachSession(
     runtime?.tabUrl ||
     runtime?.conversationId,
   );
+  const isBrowserbaseRuntime = runtime?.browserProvider === "browserbase";
+  const browserbaseReattachable =
+    !isBrowserbaseRuntime ||
+    (runtime?.browserbaseKeepAlive === true && Boolean(runtime?.chromeBrowserWSEndpoint));
   const canReattach =
     statusAllowsReattach &&
     metadata.mode === "browser" &&
     hasFallbackSessionInfo &&
+    browserbaseReattachable &&
     (hasChromeDisconnect || (runtime?.controllerPid && !controllerAlive));
 
   if (canReattach) {
     const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
     const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
+    const runtimeLabel = isBrowserbaseRuntime ? "Browserbase session" : "Chrome session";
     console.log(
       chalk.yellow(
-        `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
+        `Attempting to reattach to the existing ${runtimeLabel} (${portInfo}, ${urlInfo})...`,
       ),
     );
     try {

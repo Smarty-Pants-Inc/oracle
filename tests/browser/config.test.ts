@@ -1,6 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { CHATGPT_URL } from "../../src/browser/constants.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("resolveBrowserConfig", () => {
   test("returns defaults when config missing", () => {
@@ -37,6 +41,62 @@ describe("resolveBrowserConfig", () => {
     expect(resolved.chromeProfile).toBe("Profile 1");
     expect(resolved.chromePath).toBe("/Applications/Chrome");
     expect(resolved.debug).toBe(true);
+  });
+
+  test("resolves Browserbase config fields", () => {
+    const resolved = resolveBrowserConfig({
+      browserbase: {
+        enabled: true,
+        apiKey: "bb_api",
+        projectId: "bb_project",
+        contextId: "bb_context",
+        persist: true,
+        keepAlive: true,
+        region: "eu-central-1",
+        timeoutMs: 60_000,
+        proxies: ["true"],
+        stealth: true,
+        captcha: true,
+        viewport: { width: 1440, height: 900 },
+      },
+    });
+
+    expect(resolved.browserbase).toEqual({
+      enabled: true,
+      apiKey: "bb_api",
+      projectId: "bb_project",
+      contextId: "bb_context",
+      persist: true,
+      keepAlive: true,
+      region: "eu-central-1",
+      timeoutMs: 60_000,
+      proxies: ["true"],
+      stealth: true,
+      captcha: true,
+      viewport: { width: 1440, height: 900 },
+    });
+  });
+
+  test("merges Browserbase env config below explicit config", () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "true");
+    vi.stubEnv("BROWSERBASE_API_KEY", "env_api");
+    vi.stubEnv("ORACLE_BROWSERBASE_PROJECT_ID", "env_project");
+    vi.stubEnv("ORACLE_BROWSERBASE_REGION", "us-east-1");
+    vi.stubEnv("ORACLE_BROWSERBASE_VIEWPORT", "1024x768");
+
+    const resolved = resolveBrowserConfig({
+      browserbase: {
+        projectId: "explicit_project",
+      },
+    });
+
+    expect(resolved.browserbase).toMatchObject({
+      enabled: true,
+      apiKey: "env_api",
+      projectId: "explicit_project",
+      region: "us-east-1",
+      viewport: { width: 1024, height: 768 },
+    });
   });
 
   test("rejects temporary chat URLs when desiredModel is Pro", () => {

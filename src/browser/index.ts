@@ -51,6 +51,8 @@ import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import { captureAssistantDownloads } from "./playwrightDownloads.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import { BrowserbaseClient, BrowserbaseError, type BrowserbaseRegion } from "./browserbase.js";
+import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import {
   alignPromptEchoPair,
   buildPromptEchoMatcher,
@@ -213,6 +215,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         promptLength: promptText.length,
       })}`,
     );
+  }
+
+  if (config.browserbase?.enabled) {
+    return await runBrowserbaseBrowserMode(promptText, attachments, config, logger, options);
   }
 
   let attachRunningChromePid: number | undefined;
@@ -1126,6 +1132,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
 }
 
 const DEFAULT_DEBUG_PORT = 9222;
+const BROWSERBASE_MIN_TIMEOUT_MS = 60_000;
+const BROWSERBASE_MAX_TIMEOUT_MS = 21_600_000;
 
 async function pickAvailableDebugPort(
   preferredPort: number,
@@ -1695,12 +1703,232 @@ export async function maybeReuseRunningChrome(
   } as unknown as LaunchedChrome;
 }
 
+async function runBrowserbaseBrowserMode(
+  promptText: string,
+  attachments: BrowserAttachment[],
+  config: ReturnType<typeof resolveBrowserConfig>,
+  logger: BrowserLogger,
+  options: BrowserRunOptions,
+): Promise<BrowserRunResult> {
+  if (config.attachRunning || config.remoteChrome) {
+    throw new Error(
+      "--browserbase cannot be combined with --browser-attach-running or --remote-chrome.",
+    );
+  }
+  const browserbase = config.browserbase;
+  if (!browserbase?.enabled) {
+    throw new Error("Browserbase configuration missing.");
+  }
+  const apiKey = browserbase.apiKey?.trim();
+  if (!apiKey) {
+    throw new BrowserAutomationError(
+      "Browserbase mode requires BROWSERBASE_API_KEY or ORACLE_BROWSERBASE_API_KEY.",
+      { stage: "browserbase-config" },
+    );
+  }
+
+  let effectiveProjectId = browserbase.projectId?.trim() || undefined;
+  const keepAlive = Boolean(browserbase.keepAlive);
+  const timeoutSeconds = resolveBrowserbaseTimeoutSeconds(browserbase.timeoutMs);
+  const client = new BrowserbaseClient({ apiKey, projectId: effectiveProjectId });
+  let contextId = browserbase.contextId?.trim() || undefined;
+  if (!contextId && browserbase.persist !== false) {
+    const context = await client.createContext({ projectId: effectiveProjectId });
+    contextId = context.id;
+    effectiveProjectId = context.projectId ?? effectiveProjectId;
+    logger(`Browserbase Context created: ${contextId}`);
+  }
+  const session = await client
+    .createSession({
+      projectId: effectiveProjectId,
+      contextId,
+      persistContext: browserbase.persist ?? true,
+      keepAlive,
+      timeout: timeoutSeconds,
+      region: resolveBrowserbaseRegion(browserbase.region),
+      proxies: resolveBrowserbaseProxies(browserbase.proxies),
+      browserSettings: {
+        advancedStealth: browserbase.stealth,
+        solveCaptchas: browserbase.captcha,
+        viewport: browserbase.viewport ?? undefined,
+      },
+      userMetadata: {
+        owner: "oracle",
+        client: "oracle-cli",
+      },
+    })
+    .catch((error) => {
+      if (error instanceof BrowserbaseError) {
+        throw new BrowserAutomationError(
+          `Browserbase session creation failed (${error.status}): ${sanitizeBrowserbaseErrorBody(error.body)}`,
+          {
+            stage: "browserbase-session",
+            status: error.status,
+            body: sanitizeBrowserbaseErrorBody(error.body),
+          },
+        );
+      }
+      throw error;
+    });
+
+  const connectUrl = session.connectUrl;
+  const remoteChrome = resolveBrowserbaseRemoteChrome(connectUrl);
+  const releaseSession = async (): Promise<void> => {
+    if (keepAlive) {
+      logger(`Browserbase session kept alive: ${session.id}`);
+      return;
+    }
+    await client.requestSessionRelease(session.id, effectiveProjectId).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Failed to release Browserbase session ${session.id}: ${message}`);
+    });
+  };
+
+  try {
+    if (!connectUrl) {
+      throw new BrowserAutomationError("Browserbase did not return a CDP connectUrl.", {
+        stage: "browserbase-session",
+        details: { sessionId: session.id },
+      });
+    }
+    const debugUrls = await client.getDebugUrls(session.id).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Failed to retrieve Browserbase Live View URL: ${message}`);
+      return null;
+    });
+    if (debugUrls?.debuggerUrl) {
+      logger(`Browserbase Live View: ${debugUrls.debuggerUrl}`);
+    }
+
+    const runtimeMetadata: Partial<BrowserRuntimeMetadata> = {
+      browserTransport: "cdp",
+      browserProvider: "browserbase",
+      browserbaseSessionId: session.id,
+      browserbaseProjectId: session.projectId ?? effectiveProjectId,
+      browserbaseContextId: session.contextId ?? contextId,
+      browserbaseDebugUrl: debugUrls?.debuggerUrl,
+      browserbaseDebuggerFullscreenUrl: debugUrls?.debuggerFullscreenUrl,
+      browserbaseKeepAlive: keepAlive,
+    };
+    await options.runtimeHintCb?.({
+      ...runtimeMetadata,
+      chromeHost: remoteChrome.host,
+      chromePort: remoteChrome.port,
+      chromeBrowserWSEndpoint: connectUrl,
+      controllerPid: process.pid,
+    });
+    return await runRemoteBrowserMode(
+      promptText,
+      attachments,
+      {
+        ...config,
+        attachRunning: false,
+        cookieSync: config.cookieSync && !browserbase.contextId?.trim(),
+        manualLogin: false,
+        remoteChrome,
+        remoteChromeBrowserWSEndpoint: connectUrl,
+        remoteChromeProfileRoot: null,
+        keepBrowser: keepAlive,
+      },
+      logger,
+      options,
+      runtimeMetadata,
+    );
+  } finally {
+    await releaseSession();
+  }
+}
+
+function resolveBrowserbaseRemoteChrome(connectUrl: string | undefined): {
+  host: string;
+  port: number;
+} {
+  if (!connectUrl) {
+    return { host: "connect.browserbase.com", port: 443 };
+  }
+  try {
+    const parsed = new URL(connectUrl);
+    return {
+      host: parsed.hostname || "connect.browserbase.com",
+      port: parsed.port ? Number.parseInt(parsed.port, 10) : 443,
+    };
+  } catch {
+    return { host: "connect.browserbase.com", port: 443 };
+  }
+}
+
+function resolveBrowserbaseProxies(proxies: string[] | null | undefined): boolean | undefined {
+  if (!proxies?.length) {
+    return undefined;
+  }
+  const normalized = proxies.map((value) => value.trim().toLowerCase()).filter(Boolean);
+  if (normalized.length !== 1 || !/^(1|true|yes|on|0|false|no|off|none)$/.test(normalized[0])) {
+    throw new BrowserAutomationError(
+      "--browserbase-proxies currently accepts only a boolean value. Structured Browserbase proxy configs are not exposed by this CLI yet.",
+      { stage: "browserbase-config" },
+    );
+  }
+  return /^(1|true|yes|on)$/.test(normalized[0]) || undefined;
+}
+
+function resolveBrowserbaseRegion(
+  region: string | null | undefined,
+): BrowserbaseRegion | undefined {
+  const normalized = region?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  if (
+    normalized === "us-west-2" ||
+    normalized === "us-east-1" ||
+    normalized === "eu-central-1" ||
+    normalized === "ap-southeast-1"
+  ) {
+    return normalized;
+  }
+  throw new BrowserAutomationError(
+    "Browserbase region must be one of us-west-2, us-east-1, eu-central-1, or ap-southeast-1.",
+    { stage: "browserbase-config", region: normalized },
+  );
+}
+
+function resolveBrowserbaseTimeoutSeconds(timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs === undefined) {
+    return undefined;
+  }
+  if (
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs < BROWSERBASE_MIN_TIMEOUT_MS ||
+    timeoutMs > BROWSERBASE_MAX_TIMEOUT_MS
+  ) {
+    throw new BrowserAutomationError("Browserbase session timeout must be between 60s and 6h.", {
+      stage: "browserbase-config",
+      timeoutMs,
+    });
+  }
+  return Math.ceil(timeoutMs / 1000);
+}
+
+function sanitizeBrowserbaseErrorBody(body: string): string {
+  const compact = body.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "empty response body";
+  }
+  return compact
+    .replace(
+      /(api[_-]?key|token|authorization|password|secret)["'\s:=]+[^"',}\s]+/gi,
+      "$1=<redacted>",
+    )
+    .slice(0, 1_000);
+}
+
 async function runRemoteBrowserMode(
   promptText: string,
   attachments: BrowserAttachment[],
   config: ReturnType<typeof resolveBrowserConfig>,
   logger: BrowserLogger,
   options: BrowserRunOptions,
+  runtimeMetadata: Partial<BrowserRuntimeMetadata> = {},
 ): Promise<BrowserRunResult> {
   const remoteChromeConfig = config.remoteChrome;
   if (!remoteChromeConfig) {
@@ -1715,20 +1943,26 @@ async function runRemoteBrowserMode(
   let remoteTargetId: string | null = null;
   let lastUrl: string | undefined;
   let conversationHintInFlight: Promise<boolean> | null = null;
+  const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
+  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   const runtimeHintCb = options.runtimeHintCb;
+  const currentRuntime = (): BrowserRuntimeMetadata => ({
+    ...runtimeMetadata,
+    browserTransport: "cdp",
+    chromePort: port,
+    chromeHost: host,
+    chromeBrowserWSEndpoint: browserWSEndpoint,
+    chromeProfileRoot,
+    userDataDir: undefined,
+    chromeTargetId: remoteTargetId ?? undefined,
+    tabUrl: lastUrl,
+    conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+    controllerPid: process.pid,
+  });
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
     try {
-      await runtimeHintCb({
-        chromePort: port,
-        chromeHost: host,
-        chromeBrowserWSEndpoint: browserWSEndpoint,
-        chromeProfileRoot,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-        controllerPid: process.pid,
-      });
+      await runtimeHintCb(currentRuntime());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger(`Failed to persist runtime hint: ${message}`);
@@ -1743,8 +1977,6 @@ async function runRemoteBrowserMode(
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
-  const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
-  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   const preserveRemoteTarget = Boolean(config.keepBrowser);
 
   try {
@@ -1768,10 +2000,47 @@ async function runRemoteBrowserMode(
     await Promise.all(domainEnablers);
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
 
-    // Skip cookie sync for remote Chrome - it already has cookies
-    logger("Skipping cookie sync for remote Chrome (using existing session)");
-
     const baseUrl = CHATGPT_URL;
+    const browserbaseRemote = runtimeMetadata.browserProvider === "browserbase";
+    if (browserbaseRemote && config.cookieSync) {
+      if (!config.inlineCookies) {
+        logger(
+          "Browserbase mode: seeding remote browser with ChatGPT cookies from your local Chrome profile.",
+        );
+      } else {
+        logger("Browserbase mode: applying inline cookies to remote browser.");
+      }
+      const cookieCount = await syncCookies(Network, baseUrl, config.chromeProfile, logger, {
+        allowErrors: config.allowCookieErrors ?? false,
+        filterNames: config.cookieNames ?? undefined,
+        inlineCookies: config.inlineCookies ?? undefined,
+        cookiePath: config.chromeCookiePath ?? undefined,
+        waitMs: config.cookieSyncWaitMs ?? 0,
+      });
+      logger(
+        cookieCount > 0
+          ? config.inlineCookies
+            ? `Applied ${cookieCount} inline cookies to Browserbase session`
+            : `Copied ${cookieCount} cookies from Chrome profile ${config.chromeProfile ?? "Default"} to Browserbase session`
+          : config.inlineCookies
+            ? "No inline cookies applied to Browserbase session"
+            : "No Chrome cookies found for Browserbase session",
+      );
+      if (cookieCount === 0 && !config.inlineCookies) {
+        throw new BrowserAutomationError(
+          "No ChatGPT cookies were applied from your Chrome profile; Browserbase cannot proceed without a signed-in context. " +
+            "Sign in through a persisted Browserbase context or provide inline cookies.",
+          { stage: "execute-browser", details: { profile: config.chromeProfile ?? "Default" } },
+        );
+      }
+    } else {
+      logger(
+        browserbaseRemote
+          ? "Skipping Browserbase cookie sync because an explicit Browserbase context is configured."
+          : "Skipping cookie sync for remote Chrome (using existing session)",
+      );
+    }
+
     await navigateToChatGPT(Page, Runtime, baseUrl, logger);
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
@@ -2012,16 +2281,7 @@ async function runRemoteBrowserMode(
               sessionStatus: "needs_login",
               validationReason: sessionValid.reason,
             },
-            runtime: {
-              chromeHost: host,
-              chromePort: port,
-              chromeBrowserWSEndpoint: browserWSEndpoint,
-              chromeProfileRoot,
-              chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              controllerPid: process.pid,
-            },
+            runtime: currentRuntime(),
           },
         );
       }
@@ -2056,16 +2316,7 @@ async function runRemoteBrowserMode(
           // ignore
         }
         await emitRuntimeHint();
-        const runtime = {
-          chromePort: port,
-          chromeHost: host,
-          chromeBrowserWSEndpoint: browserWSEndpoint,
-          chromeProfileRoot,
-          chromeTargetId: remoteTargetId ?? undefined,
-          tabUrl: lastUrl,
-          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-          controllerPid: process.pid,
-        };
+        const runtime = currentRuntime();
         throw new BrowserAutomationError(
           "ChatGPT temporarily limited this browser profile after too many requests. Wait a few minutes before retrying.",
           { stage: "assistant-rate-limit", runtime },
@@ -2086,16 +2337,7 @@ async function runRemoteBrowserMode(
             // ignore
           }
           await emitRuntimeHint();
-          const runtime = {
-            chromePort: port,
-            chromeHost: host,
-            chromeBrowserWSEndpoint: browserWSEndpoint,
-            chromeProfileRoot,
-            chromeTargetId: remoteTargetId ?? undefined,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-            controllerPid: process.pid,
-          };
+          const runtime = currentRuntime();
           throw new BrowserAutomationError(
             "Assistant response timed out before completion; reattach later to capture the answer.",
             { stage: "assistant-timeout", runtime },
@@ -2174,32 +2416,15 @@ async function runRemoteBrowserMode(
       tookMs: durationMs,
       answerTokens,
       answerChars,
-      browserTransport: "cdp",
+      ...currentRuntime(),
       chromePid: undefined,
-      chromePort: port,
-      chromeHost: host,
-      chromeBrowserWSEndpoint: browserWSEndpoint,
-      chromeProfileRoot,
       userDataDir: undefined,
-      chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-      controllerPid: process.pid,
     };
   } catch (error) {
-    const runtime = {
-      chromeHost: host,
-      chromePort: port,
-      chromeBrowserWSEndpoint: browserWSEndpoint,
-      chromeProfileRoot,
-      chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-      controllerPid: process.pid,
-    };
+    const runtime = currentRuntime();
     const normalizedError = attachBrowserRuntimeIfMissing(
       error instanceof Error ? error : new Error(String(error)),
-      runtime,
+      runtime as unknown as Record<string, unknown>,
     );
     stopThinkingMonitor?.();
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);

@@ -79,7 +79,7 @@ describe("launchChrome", () => {
     expect(result.port).toBe(9444);
   });
 
-  test("uses a detached direct Chrome launch when hide-window mode is enabled", async () => {
+  test("uses a non-activating app launch when hide-window mode is enabled", async () => {
     vi.resetModules();
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
@@ -203,8 +203,13 @@ describe("launchChrome", () => {
 
       expect(launchMock).not.toHaveBeenCalled();
       expect(spawnMock).toHaveBeenCalledWith(
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/open",
         expect.arrayContaining([
+          "-g",
+          "-j",
+          "-n",
+          "/Applications/Google Chrome.app",
+          "--args",
           "--default-flag",
           "--remote-debugging-port=9333",
           "--user-data-dir=/tmp/oracle-hidden-profile",
@@ -351,8 +356,13 @@ describe("launchChrome", () => {
 
       expect(launchMock).not.toHaveBeenCalled();
       expect(spawnMock).toHaveBeenCalledWith(
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/open",
         expect.arrayContaining([
+          "-g",
+          "-j",
+          "-n",
+          "/Applications/Google Chrome.app",
+          "--args",
           "--default-flag",
           "--remote-debugging-port=9444",
           "--user-data-dir=/tmp/oracle-forced-hidden-profile",

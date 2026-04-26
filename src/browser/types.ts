@@ -8,6 +8,26 @@ export type CookieParam = Protocol.Network.CookieParam;
 export type BrowserModelStrategy = "select" | "current" | "ignore";
 export type BrowserLauncher = "chrome" | "carbonyl";
 
+export interface BrowserbaseViewport {
+  width: number;
+  height: number;
+}
+
+export interface BrowserbaseConfig {
+  enabled?: boolean;
+  apiKey?: string | null;
+  projectId?: string | null;
+  contextId?: string | null;
+  persist?: boolean;
+  keepAlive?: boolean;
+  region?: string | null;
+  timeoutMs?: number;
+  proxies?: string[] | null;
+  stealth?: boolean;
+  captcha?: boolean;
+  viewport?: BrowserbaseViewport | null;
+}
+
 export type BrowserLogger = ((message: string) => void) & {
   verbose?: boolean;
   sessionLog?: (message: string) => void;
@@ -92,6 +112,7 @@ export interface BrowserAutomationConfig {
   remoteChrome?: { host: string; port: number } | null;
   remoteChromeBrowserWSEndpoint?: string | null;
   remoteChromeProfileRoot?: string | null;
+  browserbase?: BrowserbaseConfig | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
@@ -135,6 +156,13 @@ export interface BrowserRunResult {
   tabUrl?: string;
   conversationId?: string;
   controllerPid?: number;
+  browserProvider?: "browserbase";
+  browserbaseSessionId?: string;
+  browserbaseProjectId?: string;
+  browserbaseContextId?: string;
+  browserbaseDebugUrl?: string;
+  browserbaseDebuggerFullscreenUrl?: string;
+  browserbaseKeepAlive?: boolean;
 }
 
 export type ResolvedBrowserConfig = Required<
@@ -148,6 +176,7 @@ export type ResolvedBrowserConfig = Required<
     | "remoteChrome"
     | "remoteChromeBrowserWSEndpoint"
     | "remoteChromeProfileRoot"
+    | "browserbase"
     | "thinkingTime"
     | "modelStrategy"
   >
@@ -165,6 +194,7 @@ export type ResolvedBrowserConfig = Required<
   remoteChrome?: { host: string; port: number } | null;
   remoteChromeBrowserWSEndpoint?: string | null;
   remoteChromeProfileRoot?: string | null;
+  browserbase?: BrowserbaseConfig | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;

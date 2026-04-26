@@ -122,6 +122,128 @@ describe("session lifecycle", () => {
     expect(updated?.promptPreview).toBe("value");
   });
 
+  test("redacts Browserbase secrets from initialized session metadata", async () => {
+    const meta = await sessionModule.initializeSession(
+      {
+        prompt: "Browserbase metadata",
+        model: "gpt-5.2-pro",
+        mode: "browser",
+        browserConfig: {
+          browserbase: {
+            enabled: true,
+            apiKey: "bb_secret_key",
+            projectId: "proj_123",
+            contextId: "ctx_123",
+            keepAlive: true,
+            region: "us-west-2",
+            timeoutMs: 60_000,
+            viewport: { width: 1280, height: 720 },
+          },
+          remoteChromeBrowserWSEndpoint:
+            "wss://user:ws_secret@connect.browserbase.com/devtools/browser/sess_123?token=query_secret",
+        },
+      },
+      "/tmp/cwd",
+    );
+    const storedRaw = await readFile(
+      path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"),
+      "utf8",
+    );
+    const storedMeta = JSON.parse(storedRaw);
+
+    expect(storedRaw).not.toContain("bb_secret_key");
+    expect(storedRaw).not.toContain("ws_secret");
+    expect(storedRaw).not.toContain("query_secret");
+    expect(storedMeta.browser.config.browserbase).toMatchObject({
+      enabled: true,
+      apiKey: "[redacted]",
+      projectId: "proj_123",
+      contextId: "ctx_123",
+      keepAlive: true,
+      region: "us-west-2",
+      timeoutMs: 60_000,
+      viewport: { width: 1280, height: 720 },
+    });
+    expect(storedMeta.options.browserConfig.browserbase.projectId).toBe("proj_123");
+    expect(storedMeta.browser.config.remoteChromeBrowserWSEndpoint).toBe(
+      "wss://user:%5Bredacted%5D@connect.browserbase.com/devtools/browser/sess_123",
+    );
+  });
+
+  test("redacts credential-bearing browser runtime URLs in updated session metadata", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Browserbase runtime", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      browser: {
+        runtime: {
+          browserProvider: "browserbase",
+          chromeBrowserWSEndpoint:
+            "wss://user:ws_secret@connect.browserbase.com/devtools/browser/sess_123?token=query_secret",
+          browserbaseDebugUrl: "https://browserbase.example/debug?token=debug_secret",
+          browserbaseDebuggerFullscreenUrl:
+            "https://browserbase.example/full?token=fullscreen_secret",
+          browserbaseSessionId: "sess_123",
+          browserbaseProjectId: "proj_123",
+          browserbaseContextId: "ctx_123",
+          browserbaseKeepAlive: true,
+        },
+      },
+      progress: {
+        stage: "browser-ready",
+        message: "ready",
+        updatedAt: "2025-01-01T00:00:00Z",
+        tabUrl: "https://chatgpt.com/c/abc?token=tab_secret",
+      },
+      error: {
+        category: "browser-automation",
+        message: "failed",
+        details: {
+          apiKey: "bb_error_secret",
+          runtime: {
+            chromeBrowserWSEndpoint:
+              "wss://user:error_ws_secret@connect.browserbase.com/devtools/browser/sess_456?token=error_query_secret",
+          },
+          debugUrl: "https://browserbase.example/error?token=error_debug_secret",
+        },
+      },
+    });
+    const storedRaw = await readFile(
+      path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"),
+      "utf8",
+    );
+    const storedMeta = JSON.parse(storedRaw);
+
+    expect(storedRaw).not.toContain("ws_secret");
+    expect(storedRaw).not.toContain("query_secret");
+    expect(storedRaw).not.toContain("debug_secret");
+    expect(storedRaw).not.toContain("fullscreen_secret");
+    expect(storedRaw).not.toContain("tab_secret");
+    expect(storedRaw).not.toContain("bb_error_secret");
+    expect(storedRaw).not.toContain("error_ws_secret");
+    expect(storedRaw).not.toContain("error_query_secret");
+    expect(storedRaw).not.toContain("error_debug_secret");
+    expect(storedMeta.browser.runtime.chromeBrowserWSEndpoint).toBe(
+      "wss://user:%5Bredacted%5D@connect.browserbase.com/devtools/browser/sess_123",
+    );
+    expect(storedMeta.browser.runtime.browserbaseDebugUrl).toBe(
+      "https://browserbase.example/debug",
+    );
+    expect(storedMeta.browser.runtime.browserbaseDebuggerFullscreenUrl).toBe(
+      "https://browserbase.example/full",
+    );
+    expect(storedMeta.browser.runtime.browserbaseProjectId).toBe("proj_123");
+    expect(storedMeta.browser.runtime.browserbaseContextId).toBe("ctx_123");
+    expect(storedMeta.browser.runtime.browserbaseKeepAlive).toBe(true);
+    expect(storedMeta.progress.tabUrl).toBe("https://chatgpt.com/c/abc");
+    expect(storedMeta.error.details.apiKey).toBe("[redacted]");
+    expect(storedMeta.error.details.runtime.chromeBrowserWSEndpoint).toBe(
+      "wss://user:%5Bredacted%5D@connect.browserbase.com/devtools/browser/sess_456",
+    );
+    expect(storedMeta.error.details.debugUrl).toBe("https://browserbase.example/error");
+  });
+
   test("createSessionLogWriter appends logs and supports chunk writes", async () => {
     const meta = await sessionModule.initializeSession(
       { prompt: "Log history", model: "gpt-5.2-pro" },

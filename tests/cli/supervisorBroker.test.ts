@@ -173,7 +173,7 @@ describe("runSupervisorBrokerRequest", () => {
       const olderRoot = await sessionStore.createSession(
         {
           prompt: "Older root chat",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -191,7 +191,7 @@ describe("runSupervisorBrokerRequest", () => {
       const projectScoped = await sessionStore.createSession(
         {
           prompt: "Project chat",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -209,7 +209,7 @@ describe("runSupervisorBrokerRequest", () => {
       const newerRoot = await sessionStore.createSession(
         {
           prompt: "Newer root chat",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -226,7 +226,7 @@ describe("runSupervisorBrokerRequest", () => {
       const duplicateRoot = await sessionStore.createSession(
         {
           prompt: "Duplicate root chat",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -280,7 +280,7 @@ describe("runSupervisorBrokerRequest", () => {
       const localRoot = await sessionStore.createSession(
         {
           prompt: "Local root chat",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -712,9 +712,9 @@ describe("runSupervisorBrokerRequest", () => {
     expect(runPrompt).toHaveBeenCalledTimes(1);
     expect(runPrompt).toHaveBeenCalledWith(
       expect.objectContaining({
-        model: "gpt-5.4",
+        model: "gpt-5.5",
         browserModelStrategy: "select",
-        browserModelLabel: "Thinking 5.4",
+        browserModelLabel: "Thinking 5.5",
         sessionSlug: expect.stringMatching(/^oracle-supervisor-bootstrap-/),
       }),
     );
@@ -816,7 +816,7 @@ describe("runSupervisorBrokerRequest", () => {
       const meta = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -863,7 +863,7 @@ describe("runSupervisorBrokerRequest", () => {
       const meta = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
         },
         process.cwd(),
@@ -910,7 +910,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -985,7 +985,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1056,7 +1056,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1087,7 +1087,7 @@ describe("runSupervisorBrokerRequest", () => {
       const threadSessionId = await sessionStore.createSession(
         {
           prompt: "Supervisor thread: stale thread",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1162,7 +1162,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1193,7 +1193,7 @@ describe("runSupervisorBrokerRequest", () => {
       const unrelatedFollowup = await sessionStore.createSession(
         {
           prompt: "arbitrary followup child",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1269,7 +1269,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1300,7 +1300,7 @@ describe("runSupervisorBrokerRequest", () => {
       const threadSession = await sessionStore.createSession(
         {
           prompt: "Supervisor thread: Right thread",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1361,7 +1361,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1413,7 +1413,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1441,7 +1441,7 @@ describe("runSupervisorBrokerRequest", () => {
       const threadSession = await sessionStore.createSession(
         {
           prompt: "Supervisor thread: Target",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1491,7 +1491,7 @@ describe("runSupervisorBrokerRequest", () => {
       const runtimeSession = await sessionStore.createSession(
         {
           prompt: "broker runtime",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,
@@ -1519,7 +1519,7 @@ describe("runSupervisorBrokerRequest", () => {
       const threadSession = await sessionStore.createSession(
         {
           prompt: "Supervisor thread: Target",
-          model: "gpt-5.4",
+          model: "gpt-5.5",
           mode: "browser",
           browserConfig: {
             manualLogin: true,

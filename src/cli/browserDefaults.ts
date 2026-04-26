@@ -1,7 +1,7 @@
 import { normalizeChatgptUrl, CHATGPT_URL } from "../browserMode.js";
 import type { UserConfig } from "../config.js";
 import type { ThinkingTimeLevel } from "../oracle.js";
-import type { BrowserLauncher, BrowserModelStrategy } from "../browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy, BrowserbaseConfig } from "../browser/types.js";
 
 export interface BrowserDefaultsOptions {
   browserLauncher?: BrowserLauncher;
@@ -29,6 +29,18 @@ export interface BrowserDefaultsOptions {
   browserThinkingTime?: ThinkingTimeLevel;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
+  browserbase?: boolean;
+  browserbaseApiKey?: string;
+  browserbaseProjectId?: string;
+  browserbaseContextId?: string;
+  browserbasePersist?: boolean;
+  browserbaseKeepAlive?: boolean;
+  browserbaseRegion?: string;
+  browserbaseTimeout?: string | number;
+  browserbaseProxies?: string;
+  browserbaseStealth?: boolean;
+  browserbaseCaptcha?: boolean;
+  browserbaseViewport?: string;
 }
 
 type SourceGetter = (key: keyof BrowserDefaultsOptions) => string | undefined;
@@ -126,5 +138,50 @@ export function applyBrowserDefaultsFromConfig(
   }
   if (isUnset("browserManualLoginProfileDir") && browser.manualLoginProfileDir !== undefined) {
     options.browserManualLoginProfileDir = browser.manualLoginProfileDir;
+  }
+  applyBrowserbaseDefaults(options, browser.browserbase, isUnset);
+}
+
+function applyBrowserbaseDefaults(
+  options: BrowserDefaultsOptions,
+  browserbase: BrowserbaseConfig | null | undefined,
+  isUnset: (key: keyof BrowserDefaultsOptions) => boolean,
+): void {
+  if (!browserbase) return;
+  if (isUnset("browserbase") && browserbase.enabled !== undefined) {
+    options.browserbase = browserbase.enabled;
+  }
+  if (isUnset("browserbaseApiKey") && browserbase.apiKey) {
+    options.browserbaseApiKey = browserbase.apiKey;
+  }
+  if (isUnset("browserbaseProjectId") && browserbase.projectId) {
+    options.browserbaseProjectId = browserbase.projectId;
+  }
+  if (isUnset("browserbaseContextId") && browserbase.contextId) {
+    options.browserbaseContextId = browserbase.contextId;
+  }
+  if (isUnset("browserbasePersist") && browserbase.persist !== undefined) {
+    options.browserbasePersist = browserbase.persist;
+  }
+  if (isUnset("browserbaseKeepAlive") && browserbase.keepAlive !== undefined) {
+    options.browserbaseKeepAlive = browserbase.keepAlive;
+  }
+  if (isUnset("browserbaseRegion") && browserbase.region) {
+    options.browserbaseRegion = browserbase.region;
+  }
+  if (isUnset("browserbaseTimeout") && browserbase.timeoutMs !== undefined) {
+    options.browserbaseTimeout = String(browserbase.timeoutMs);
+  }
+  if (isUnset("browserbaseProxies") && browserbase.proxies?.length) {
+    options.browserbaseProxies = browserbase.proxies.join(",");
+  }
+  if (isUnset("browserbaseStealth") && browserbase.stealth !== undefined) {
+    options.browserbaseStealth = browserbase.stealth;
+  }
+  if (isUnset("browserbaseCaptcha") && browserbase.captcha !== undefined) {
+    options.browserbaseCaptcha = browserbase.captcha;
+  }
+  if (isUnset("browserbaseViewport") && browserbase.viewport) {
+    options.browserbaseViewport = `${browserbase.viewport.width}x${browserbase.viewport.height}`;
   }
 }

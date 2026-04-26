@@ -145,6 +145,18 @@ interface CliOptions extends OptionValues {
   browserManualLoginProfileDir?: string;
   browserThinkingTime?: "light" | "standard" | "extended" | "heavy";
   browserAllowCookieErrors?: boolean;
+  browserbase?: boolean;
+  browserbaseApiKey?: string;
+  browserbaseProjectId?: string;
+  browserbaseContextId?: string;
+  browserbasePersist?: boolean;
+  browserbaseKeepAlive?: boolean;
+  browserbaseRegion?: string;
+  browserbaseTimeout?: string;
+  browserbaseProxies?: string;
+  browserbaseStealth?: boolean;
+  browserbaseCaptcha?: boolean;
+  browserbaseViewport?: string;
   browserAttachments?: string;
   browserInlineFiles?: boolean;
   browserBundleFiles?: boolean;
@@ -286,7 +298,7 @@ program.hook("preAction", (thisCommand) => {
 program
   .name("oracle")
   .description(
-    "One-shot GPT-5.4 Pro / GPT-5.4 / GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
+    "One-shot GPT-5.5 Pro / GPT-5.5 / GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
   )
   .version(VERSION)
   .argument("[prompt]", "Prompt text (shorthand for --prompt).")
@@ -340,13 +352,13 @@ program
   .option("-s, --slug <words>", "Custom session slug (3-5 words).")
   .option(
     "-m, --model <model>",
-    'Model to target (gpt-5.4-pro default). Also gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.5-sonnet, claude-4.1-opus, or ChatGPT labels like "5.2 Thinking" for browser runs).',
+    'Model to target (gpt-5.5-pro default). Also gpt-5.5, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.5-sonnet, claude-4.1-opus, or ChatGPT labels like "5.2 Thinking" for browser runs).',
     normalizeModelOption,
   )
   .addOption(
     new Option(
       "--models <models>",
-      'Comma-separated API model list to query in parallel (e.g., "gpt-5.4-pro,gemini-3-pro").',
+      'Comma-separated API model list to query in parallel (e.g., "gpt-5.5-pro,gemini-3-pro").',
     )
       .argParser(collectModelList)
       .default([]),
@@ -384,7 +396,7 @@ program
   .addOption(
     new Option(
       "--timeout <seconds|auto>",
-      "Overall timeout before aborting the API call (auto = 60m for gpt-5.4-pro, 120s otherwise).",
+      "Overall timeout before aborting the API call (auto = 60m for gpt-5.5-pro, 120s otherwise).",
     )
       .argParser(parseTimeoutOption)
       .default("auto"),
@@ -652,6 +664,25 @@ program
       "--browser-allow-cookie-errors",
       "Continue even if Chrome cookies cannot be copied.",
     ).hideHelp(),
+  )
+  .addOption(
+    new Option("--browserbase", "Run ChatGPT browser automation in Browserbase.").hideHelp(),
+  )
+  .addOption(new Option("--browserbase-api-key <key>", "Browserbase API key.").hideHelp())
+  .addOption(new Option("--browserbase-project-id <id>", "Browserbase project ID.").hideHelp())
+  .addOption(new Option("--browserbase-context-id <id>", "Browserbase context ID.").hideHelp())
+  .addOption(new Option("--browserbase-persist", "Persist Browserbase context changes.").hideHelp())
+  .addOption(new Option("--no-browserbase-persist").hideHelp())
+  .addOption(new Option("--browserbase-keep-alive", "Keep Browserbase session alive.").hideHelp())
+  .addOption(new Option("--browserbase-region <region>", "Browserbase region.").hideHelp())
+  .addOption(
+    new Option("--browserbase-timeout <ms|s|m>", "Browserbase session timeout.").hideHelp(),
+  )
+  .addOption(new Option("--browserbase-proxies <list>", "Browserbase proxy mode.").hideHelp())
+  .addOption(new Option("--browserbase-stealth", "Enable Browserbase stealth mode.").hideHelp())
+  .addOption(new Option("--browserbase-captcha", "Enable Browserbase captcha solving.").hideHelp())
+  .addOption(
+    new Option("--browserbase-viewport <WIDTHxHEIGHT>", "Browserbase viewport.").hideHelp(),
   )
   .addOption(
     new Option(
@@ -2235,6 +2266,9 @@ function printDebugHelp(cliName: string): void {
     ["--browser-headless", "Launch Chrome in headless mode."],
     ["--browser-hide-window", "Hide the Chrome window (macOS headful only)."],
     ["--browser-keep-browser", "Leave Chrome running after completion."],
+    ["--browserbase", "Run ChatGPT automation in a Browserbase cloud browser."],
+    ["--browserbase-context-id <id>", "Reuse a Browserbase Context for ChatGPT login state."],
+    ["--browserbase-keep-alive", "Keep the Browserbase session alive after Oracle exits."],
   ]);
   console.log("");
   console.log(chalk.dim(`Tip: run \`${cliName} --help\` to see the primary option set.`));

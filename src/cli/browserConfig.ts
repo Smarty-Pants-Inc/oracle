@@ -12,9 +12,10 @@ import {
 } from "../browserMode.js";
 import { shouldPreferManagedLocalChromeDefaults } from "../browser/config.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
-import type { BrowserLauncher, BrowserModelStrategy } from "../browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy, BrowserbaseConfig } from "../browser/types.js";
 import type { CookieParam } from "../browser/types.js";
 import { getOracleHomeDir } from "../oracleHome.js";
+import { parseBrowserbaseViewportOption } from "./options.js";
 
 const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
 const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
@@ -26,14 +27,14 @@ const DEFAULT_CHROME_PROFILE = "Default";
 // The browser label is passed to the model picker which fuzzy-matches against ChatGPT's UI.
 const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   // Most specific first (e.g., "gpt-5.2-thinking" before "gpt-5.2")
-  ["gpt-5.4-pro", "GPT-5.4 Pro"],
+  ["gpt-5.5-pro", "GPT-5.5 Pro"],
   ["gpt-5.2-thinking", "GPT-5.2 Thinking"],
   ["gpt-5.2-instant", "GPT-5.2 Instant"],
-  ["gpt-5.2-pro", "GPT-5.4 Pro"],
-  ["gpt-5.1-pro", "GPT-5.4 Pro"],
-  ["gpt-5-pro", "GPT-5.4 Pro"],
+  ["gpt-5.2-pro", "GPT-5.5 Pro"],
+  ["gpt-5.1-pro", "GPT-5.5 Pro"],
+  ["gpt-5-pro", "GPT-5.5 Pro"],
   // Base models last (least specific)
-  ["gpt-5.4", "Thinking 5.4"],
+  ["gpt-5.5", "Thinking 5.5"],
   ["gpt-5.2", "Instant"], // Current ChatGPT UI exposes the fast path as a generic Instant row
   ["gpt-5.1", "Instant"], // Legacy alias → Instant
   ["gemini-3-pro", "Gemini 3 Pro"],
@@ -72,6 +73,18 @@ export interface BrowserFlagOptions {
   browserModelLabel?: string;
   browserModelStrategy?: BrowserModelStrategy;
   browserAllowCookieErrors?: boolean;
+  browserbase?: boolean;
+  browserbaseApiKey?: string;
+  browserbaseProjectId?: string;
+  browserbaseContextId?: string;
+  browserbasePersist?: boolean;
+  browserbaseKeepAlive?: boolean;
+  browserbaseRegion?: string;
+  browserbaseTimeout?: string;
+  browserbaseProxies?: string;
+  browserbaseStealth?: boolean;
+  browserbaseCaptcha?: boolean;
+  browserbaseViewport?: string;
   remoteChrome?: string;
   browserPort?: number;
   browserDebugPort?: number;
@@ -85,13 +98,13 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
     return model;
   }
 
-  if (normalized === "gpt-5.4-pro" || normalized === "gpt-5.4") {
+  if (normalized === "gpt-5.5-pro" || normalized === "gpt-5.5") {
     return normalized;
   }
 
   // Pro variants: resolve to the latest Pro model in ChatGPT.
   if (normalized === "gpt-5-pro" || normalized === "gpt-5.1-pro" || normalized === "gpt-5.2-pro") {
-    return "gpt-5.4-pro";
+    return "gpt-5.5-pro";
   }
 
   // Explicit model variants: keep as-is (they have their own browser labels)
@@ -133,6 +146,7 @@ export async function buildBrowserConfig(
   if (inline?.source?.startsWith("home:") && options.browserNoCookieSync !== true) {
     inline = undefined;
   }
+  const browserbase = resolveBrowserbaseFlagConfig(options);
 
   let remoteChrome: { host: string; port: number } | undefined;
   if (options.remoteChrome) {
@@ -170,7 +184,7 @@ export async function buildBrowserConfig(
     );
   }
 
-  return {
+  const browserConfig = {
     launcher,
     chromeProfile: options.browserChromeProfile ?? DEFAULT_CHROME_PROFILE,
     chromePath: options.browserChromePath ?? null,
@@ -233,8 +247,115 @@ export async function buildBrowserConfig(
     // Allow cookie failures by default so runs can continue without Chrome/Keychain secrets.
     allowCookieErrors: options.browserAllowCookieErrors ?? true,
     remoteChrome,
+    browserbase,
     thinkingTime: options.browserThinkingTime,
   };
+  return browserConfig;
+}
+
+function resolveBrowserbaseFlagConfig(options: BrowserFlagOptions): BrowserbaseConfig | null {
+  const config = compactBrowserbaseConfig({
+    enabled: options.browserbase ?? parseBooleanEnv(process.env.ORACLE_BROWSERBASE_ENABLED),
+    apiKey: firstValue(
+      options.browserbaseApiKey,
+      process.env.ORACLE_BROWSERBASE_API_KEY,
+      process.env.BROWSERBASE_API_KEY,
+    ),
+    projectId: firstValue(
+      options.browserbaseProjectId,
+      process.env.ORACLE_BROWSERBASE_PROJECT_ID,
+      process.env.BROWSERBASE_PROJECT_ID,
+    ),
+    contextId: firstValue(
+      options.browserbaseContextId,
+      process.env.ORACLE_BROWSERBASE_CONTEXT_ID,
+      process.env.BROWSERBASE_CONTEXT_ID,
+    ),
+    persist: options.browserbasePersist ?? parseBooleanEnv(process.env.ORACLE_BROWSERBASE_PERSIST),
+    keepAlive:
+      options.browserbaseKeepAlive ?? parseBooleanEnv(process.env.ORACLE_BROWSERBASE_KEEP_ALIVE),
+    region: parseBrowserbaseRegion(
+      firstValue(options.browserbaseRegion, process.env.ORACLE_BROWSERBASE_REGION),
+    ),
+    timeoutMs: parseBrowserbaseTimeout(options.browserbaseTimeout),
+    proxies: parseBrowserbaseProxies(
+      options.browserbaseProxies ?? process.env.ORACLE_BROWSERBASE_PROXIES,
+    ),
+    stealth: options.browserbaseStealth ?? parseBooleanEnv(process.env.ORACLE_BROWSERBASE_STEALTH),
+    captcha: options.browserbaseCaptcha ?? parseBooleanEnv(process.env.ORACLE_BROWSERBASE_CAPTCHA),
+    viewport: parseBrowserbaseViewportOption(
+      options.browserbaseViewport ?? process.env.ORACLE_BROWSERBASE_VIEWPORT,
+    ),
+  });
+  return config ?? null;
+}
+
+function compactBrowserbaseConfig(config: BrowserbaseConfig): BrowserbaseConfig | null {
+  const next = Object.fromEntries(
+    Object.entries(config).filter(([, value]) => value !== undefined),
+  ) as BrowserbaseConfig;
+  return Object.keys(next).length > 0 ? next : null;
+}
+
+function firstValue(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+function parseBooleanEnv(raw?: string): boolean | undefined {
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return undefined;
+}
+
+function parseBrowserbaseTimeout(raw?: string): number | undefined {
+  if (!raw?.trim()) return undefined;
+  const timeoutMs = parseDuration(raw, -1);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 21_600_000) {
+    throw new Error("--browserbase-timeout must be between 60s and 6h.");
+  }
+  return timeoutMs;
+}
+
+function parseStringList(raw?: string): string[] | undefined {
+  const values = raw
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return values?.length ? values : undefined;
+}
+
+function parseBrowserbaseProxies(raw?: string): string[] | undefined {
+  const values = parseStringList(raw);
+  if (!values?.length) return undefined;
+  const normalized = values.map((value) => value.trim().toLowerCase()).filter(Boolean);
+  if (normalized.length !== 1 || !/^(1|true|yes|on|0|false|no|off|none)$/.test(normalized[0])) {
+    throw new Error(
+      "--browserbase-proxies currently accepts only true/false. Structured Browserbase proxy configs are not exposed by this CLI yet.",
+    );
+  }
+  return [normalized[0]];
+}
+
+function parseBrowserbaseRegion(raw?: string): string | undefined {
+  const region = raw?.trim();
+  if (!region) return undefined;
+  if (
+    region === "us-west-2" ||
+    region === "us-east-1" ||
+    region === "eu-central-1" ||
+    region === "ap-southeast-1"
+  ) {
+    return region;
+  }
+  throw new Error(
+    "--browserbase-region must be one of us-west-2, us-east-1, eu-central-1, or ap-southeast-1.",
+  );
 }
 
 function validateAttachRunningOptions(

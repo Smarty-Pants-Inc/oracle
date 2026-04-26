@@ -70,8 +70,8 @@ describe("summarizeModelRunsForConsult", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
     });
 
     const expectsManagedChrome = process.platform === "darwin";
@@ -91,8 +91,8 @@ describe("summarizeModelRunsForConsult", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
     });
 
     expect(config.manualLogin).toBeUndefined();
@@ -140,8 +140,8 @@ describe("summarizeModelRunsForConsult", () => {
         },
       },
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
     });
 
     expect(config).toMatchObject({
@@ -156,19 +156,19 @@ describe("summarizeModelRunsForConsult", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
       inputModel: "gpt-5-pro",
     });
 
-    expect(config.desiredModel).toBe("GPT-5.4 Pro");
+    expect(config.desiredModel).toBe("GPT-5.5 Pro");
   });
 
   test("prefers an explicit GPT browser label override when provided", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4-pro",
-      inputModel: "gpt-5.4-pro",
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
       browserModelLabel: "Pro",
     });
 
@@ -179,8 +179,8 @@ describe("summarizeModelRunsForConsult", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.4",
-      inputModel: "gpt-5.4",
+      runModel: "gpt-5.5",
+      inputModel: "gpt-5.5",
       browserModelStrategy: "current",
     });
 
@@ -206,8 +206,8 @@ describe("summarizeModelRunsForConsult", () => {
           },
         },
         env: {},
-        runModel: "gpt-5.4-pro",
-        inputModel: "gpt-5.4-pro",
+        runModel: "gpt-5.5-pro",
+        inputModel: "gpt-5.5-pro",
         browserModelStrategy: "select",
       }),
     ).toThrow(/Temporary Chat mode does not expose Pro models/);

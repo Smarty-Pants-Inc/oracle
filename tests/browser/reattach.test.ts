@@ -2350,7 +2350,7 @@ describe("resumeBrowserSession", () => {
               result: {
                 value: {
                   text: "Thinking",
-                  html: '<div data-message-model-slug="gpt-5-4-thinking"><div class="result-thinking markdown"><p></p></div></div>',
+                  html: '<div data-message-model-slug="gpt-5-5-thinking"><div class="result-thinking markdown"><p></p></div></div>',
                   messageId: "m-thinking",
                   turnId: "conversation-turn-2",
                 },
@@ -2956,7 +2956,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
       {
         timeoutMs: 2_000,
         inputTimeoutMs: 1_000,
-        desiredModel: "GPT-5.4 Pro",
+        desiredModel: "GPT-5.5 Pro",
         modelStrategy: "select",
         thinkingTime: "extended",
       },
@@ -2977,7 +2977,7 @@ Starting the minimal loop test now. I am not treating it as proven until the orc
 
     expect(ensureModelSelection).toHaveBeenCalledWith(
       expect.anything(),
-      "GPT-5.4 Pro",
+      "GPT-5.5 Pro",
       logger,
       "select",
     );

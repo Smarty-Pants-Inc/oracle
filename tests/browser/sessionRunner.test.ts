@@ -356,6 +356,69 @@ describe("runBrowserSessionExecution", () => {
     );
   });
 
+  test("redacts Browserbase secrets from verbose browser config logs", async () => {
+    const log = vi.fn();
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "text",
+      answerMarkdown: "markdown",
+      tookMs: 10,
+      answerTokens: 1,
+      answerChars: 5,
+    }));
+    const browserConfig: BrowserSessionConfig = {
+      browserbase: {
+        enabled: true,
+        apiKey: "bb_secret_key",
+        projectId: "proj_123",
+        contextId: "ctx_123",
+        keepAlive: true,
+        region: "us-west-2",
+        timeoutMs: 60_000,
+        viewport: { width: 1280, height: 720 },
+      },
+      remoteChromeBrowserWSEndpoint:
+        "wss://user:ws_secret@connect.browserbase.com/devtools/browser/sess_123?token=query_secret",
+    };
+
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: true },
+        browserConfig,
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 1,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+
+    const configLog = log.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes("Browser config"));
+    expect(configLog).toContain('"apiKey":"[redacted]"');
+    expect(configLog).toContain('"projectId":"proj_123"');
+    expect(configLog).toContain('"contextId":"ctx_123"');
+    expect(configLog).toContain('"keepAlive":true');
+    expect(configLog).toContain('"region":"us-west-2"');
+    expect(configLog).toContain('"timeoutMs":60000');
+    expect(configLog).toContain('"viewport":{"width":1280,"height":720}');
+    expect(configLog).not.toContain("bb_secret_key");
+    expect(configLog).not.toContain("ws_secret");
+    expect(configLog).not.toContain("query_secret");
+    expect(executeBrowser).toHaveBeenCalledWith(expect.objectContaining({ config: browserConfig }));
+  });
+
   test("verbose output spells out token labels", async () => {
     const log = vi.fn();
     await runBrowserSessionExecution(

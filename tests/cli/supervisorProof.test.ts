@@ -57,7 +57,7 @@ describe("supervisor proof helpers", () => {
       __test__.assertProofOnExpectedThread({
         expectedConversationId: "thread-abc",
         expectedTabUrl: "https://chatgpt.com/g/proj-1/c/thread-abc",
-        observedHref: "https://chatgpt.com/g/proj-1/c/thread-abc?model=gpt-5.4-pro",
+        observedHref: "https://chatgpt.com/g/proj-1/c/thread-abc?model=gpt-5.5-pro",
       }),
     ).not.toThrow();
   });
@@ -67,7 +67,7 @@ describe("supervisor proof helpers", () => {
       __test__.assertProofOnExpectedThread({
         expectedConversationId: "thread-abc",
         expectedTabUrl: "https://chatgpt.com/g/team-space/project/c/thread-abc",
-        observedHref: "https://chatgpt.com/g/team-space-oracle/c/thread-abc?model=gpt-5.4-pro",
+        observedHref: "https://chatgpt.com/g/team-space-oracle/c/thread-abc?model=gpt-5.5-pro",
       }),
     ).not.toThrow();
   });

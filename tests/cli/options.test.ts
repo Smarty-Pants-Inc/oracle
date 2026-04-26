@@ -152,7 +152,7 @@ describe("parseSearchOption", () => {
 
 describe("normalizeModelOption", () => {
   test("trims whitespace safely", () => {
-    expect(normalizeModelOption("  gpt-5.4-pro  ")).toBe("gpt-5.4-pro");
+    expect(normalizeModelOption("  gpt-5.5-pro  ")).toBe("gpt-5.5-pro");
     expect(normalizeModelOption("  gpt-5.2-pro  ")).toBe("gpt-5.2-pro");
     expect(normalizeModelOption(undefined)).toBe("");
   });
@@ -160,8 +160,8 @@ describe("normalizeModelOption", () => {
 
 describe("resolveApiModel", () => {
   test("accepts canonical names regardless of case", () => {
-    expect(resolveApiModel("gpt-5.4-pro")).toBe("gpt-5.4-pro");
-    expect(resolveApiModel("GPT-5.4")).toBe("gpt-5.4");
+    expect(resolveApiModel("gpt-5.5-pro")).toBe("gpt-5.5-pro");
+    expect(resolveApiModel("GPT-5.5")).toBe("gpt-5.5");
     expect(resolveApiModel("gpt-5.2-pro")).toBe("gpt-5.2-pro");
     expect(resolveApiModel("GPT-5.0-PRO")).toBe("gpt-5-pro");
     expect(resolveApiModel("gpt-5-pro")).toBe("gpt-5-pro");
@@ -196,7 +196,7 @@ describe("resolveApiModel", () => {
 
   test("passes through unknown names (OpenRouter/custom)", () => {
     expect(resolveApiModel("instant")).toBe("instant");
-    expect(resolveApiModel("openai/gpt-5.4")).toBe("openai/gpt-5.4");
+    expect(resolveApiModel("openai/gpt-5.5")).toBe("openai/gpt-5.5");
     expect(resolveApiModel("anthropic/claude-sonnet-4.5")).toBe("anthropic/claude-sonnet-4.5");
     expect(resolveApiModel("google/gemini-2.5-pro")).toBe("google/gemini-2.5-pro");
   });
@@ -204,8 +204,8 @@ describe("resolveApiModel", () => {
 
 describe("inferModelFromLabel", () => {
   test("returns canonical names when label already matches", () => {
-    expect(inferModelFromLabel("gpt-5.4-pro")).toBe("gpt-5.4-pro");
-    expect(inferModelFromLabel("gpt-5.4")).toBe("gpt-5.4");
+    expect(inferModelFromLabel("gpt-5.5-pro")).toBe("gpt-5.5-pro");
+    expect(inferModelFromLabel("gpt-5.5")).toBe("gpt-5.5");
     expect(inferModelFromLabel("gpt-5.2-pro")).toBe("gpt-5.2-pro");
     expect(inferModelFromLabel("gpt-5-pro")).toBe("gpt-5-pro");
     expect(inferModelFromLabel("gpt-5.1")).toBe("gpt-5.1");
@@ -214,14 +214,14 @@ describe("inferModelFromLabel", () => {
   });
 
   test("preserves provider-qualified ids instead of remapping them to built-ins", () => {
-    expect(inferModelFromLabel("openai/gpt-5.4")).toBe("openai/gpt-5.4");
+    expect(inferModelFromLabel("openai/gpt-5.5")).toBe("openai/gpt-5.5");
     expect(inferModelFromLabel("anthropic/claude-sonnet-4.5")).toBe("anthropic/claude-sonnet-4.5");
   });
 
-  test("infers 5.4 variants", () => {
-    expect(inferModelFromLabel("ChatGPT 5.4")).toBe("gpt-5.4");
-    expect(inferModelFromLabel("GPT-5.4 Pro")).toBe("gpt-5.4-pro");
-    expect(inferModelFromLabel("5_4 PRO")).toBe("gpt-5.4-pro");
+  test("infers 5.5 variants", () => {
+    expect(inferModelFromLabel("ChatGPT 5.5")).toBe("gpt-5.5");
+    expect(inferModelFromLabel("GPT-5.5 Pro")).toBe("gpt-5.5-pro");
+    expect(inferModelFromLabel("5_5 PRO")).toBe("gpt-5.5-pro");
   });
 
   test("infers 5.1 variants as gpt-5.1", () => {
@@ -246,7 +246,7 @@ describe("inferModelFromLabel", () => {
   });
 
   test("falls back to pro when the label references pro", () => {
-    expect(inferModelFromLabel("ChatGPT Pro")).toBe("gpt-5.4-pro");
+    expect(inferModelFromLabel("ChatGPT Pro")).toBe("gpt-5.5-pro");
     expect(inferModelFromLabel("GPT-5.2 Pro")).toBe("gpt-5.2-pro");
     expect(inferModelFromLabel("GPT-5 Pro (Classic)")).toBe("gpt-5-pro");
   });
@@ -262,8 +262,8 @@ describe("inferModelFromLabel", () => {
     expect(inferModelFromLabel("Grok-4-1")).toBe("grok-4.1");
   });
 
-  test("falls back to gpt-5.4-pro when label empty and to gpt-5.2 for other ambiguous strings", () => {
-    expect(inferModelFromLabel("")).toBe("gpt-5.4-pro");
+  test("falls back to gpt-5.5-pro when label empty and to gpt-5.2 for other ambiguous strings", () => {
+    expect(inferModelFromLabel("")).toBe("gpt-5.5-pro");
     expect(inferModelFromLabel("something else")).toBe("gpt-5.2");
   });
 });

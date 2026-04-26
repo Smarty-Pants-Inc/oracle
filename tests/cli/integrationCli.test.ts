@@ -367,7 +367,7 @@ describe("oracle CLI integration", () => {
             "--prompt",
             "Browser followup",
             "--model",
-            "gpt-5.4-pro",
+            "gpt-5.5-pro",
             "--followup",
             "resp_parent_1234",
           ],
@@ -396,10 +396,10 @@ describe("oracle CLI integration", () => {
         id: parentId,
         createdAt: "2025-01-01T00:00:00Z",
         status: "completed",
-        model: "gpt-5.4-pro",
+        model: "gpt-5.5-pro",
         options: {
           mode: "browser",
-          model: "gpt-5.4-pro",
+          model: "gpt-5.5-pro",
         },
       });
 
@@ -423,7 +423,7 @@ describe("oracle CLI integration", () => {
             "--prompt",
             "Browser followup",
             "--model",
-            "gpt-5.4-pro",
+            "gpt-5.5-pro",
             "--followup",
             parentId,
           ],
@@ -473,11 +473,11 @@ describe("oracle CLI integration", () => {
             "--prompt",
             "Browser followup",
             "--model",
-            "gpt-5.4-pro",
+            "gpt-5.5-pro",
             "--followup",
             "browser-parent-session",
             "--followup-model",
-            "gpt-5.4-pro",
+            "gpt-5.5-pro",
           ],
           { env },
         );
@@ -505,7 +505,7 @@ describe("oracle CLI integration", () => {
         createdAt: "2025-01-01T00:00:00Z",
         status: "completed",
         mode: "browser",
-        model: "gpt-5.4-pro",
+        model: "gpt-5.5-pro",
         browser: {
           runtime: {
             chromePort: 9222,
@@ -515,7 +515,7 @@ describe("oracle CLI integration", () => {
         },
         options: {
           mode: "browser",
-          model: "gpt-5.4-pro",
+          model: "gpt-5.5-pro",
         },
       });
 

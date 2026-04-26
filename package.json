@@ -1,7 +1,7 @@
 {
   "name": "@steipete/oracle",
   "version": "0.9.0",
-  "description": "CLI wrapper around OpenAI Responses API with GPT-5.4 Pro, GPT-5.4, GPT-5.2, GPT-5.1, and GPT-5.1 Codex high reasoning modes.",
+  "description": "CLI wrapper around OpenAI Responses API with GPT-5.5 Pro, GPT-5.5, GPT-5.2, GPT-5.1, and GPT-5.1 Codex high reasoning modes.",
   "keywords": [],
   "homepage": "https://github.com/steipete/oracle#readme",
   "bugs": {
@@ -49,6 +49,7 @@
     "test:supervisor:proof": "pnpm exec tsx scripts/supervisor-proof.ts",
     "test:live": "ORACLE_LIVE_TEST=1 vitest run tests/live --exclude tests/live/openai-live.test.ts",
     "test:live:fast": "ORACLE_LIVE_TEST=1 ORACLE_LIVE_TEST_FAST=1 vitest run tests/live/browser-fast-live.test.ts",
+    "test:live:browserbase": "pnpm run build && ORACLE_LIVE_TEST=1 ORACLE_LIVE_TEST_BROWSERBASE=1 vitest run tests/live/browserbase-live.test.ts",
     "test:pro": "ORACLE_LIVE_TEST=1 vitest run tests/live/openai-live.test.ts",
     "test:coverage": "vitest run --coverage",
     "prepare": "pnpm run build",

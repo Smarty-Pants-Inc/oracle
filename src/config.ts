@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import JSON5 from "json5";
 import { getOracleHomeDir } from "./oracleHome.js";
-import type { BrowserLauncher, BrowserModelStrategy } from "./browser/types.js";
+import type { BrowserLauncher, BrowserModelStrategy, BrowserbaseConfig } from "./browser/types.js";
 import type { ThinkingTimeLevel } from "./oracle/types.js";
 
 export type EnginePreference = "api" | "browser";
@@ -28,6 +28,8 @@ export interface BrowserConfigDefaults {
   remoteToken?: string | null;
   /** Connect directly to a remote Chrome DevTools host instead of local Chrome. */
   remoteChrome?: { host: string; port: number } | null;
+  /** Browserbase session configuration. Runtime support is provider-gated by browserbase.enabled. */
+  browserbase?: BrowserbaseConfig | null;
   /** Optional metadata for the SSH reverse-tunnel that makes remoteHost reachable. */
   remoteViaSshReverseTunnel?: RemoteViaSshReverseTunnelConfig | null;
   timeoutMs?: number;

@@ -1,9 +1,13 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildBrowserConfig, resolveBrowserModelLabel } from "../../src/cli/browserConfig.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("buildBrowserConfig", () => {
   test("uses defaults when optional flags omitted", async () => {
-    const config = await buildBrowserConfig({ model: "gpt-5.4-pro" });
+    const config = await buildBrowserConfig({ model: "gpt-5.5-pro" });
     const expectsManagedChrome = process.platform === "darwin";
     expect(config).toMatchObject({
       chromeProfile: "Default",
@@ -17,20 +21,20 @@ describe("buildBrowserConfig", () => {
       keepBrowser: expectsManagedChrome ? true : undefined,
       hideWindow: expectsManagedChrome ? true : undefined,
       manualLogin: expectsManagedChrome ? true : undefined,
-      desiredModel: "GPT-5.4 Pro",
+      desiredModel: "GPT-5.5 Pro",
       debug: undefined,
       allowCookieErrors: true,
     });
   });
 
-  test("maps gpt-5.4 browser runs to Thinking 5.4", async () => {
-    const config = await buildBrowserConfig({ model: "gpt-5.4" });
-    expect(config.desiredModel).toBe("Thinking 5.4");
+  test("maps gpt-5.5 browser runs to Thinking 5.5", async () => {
+    const config = await buildBrowserConfig({ model: "gpt-5.5" });
+    expect(config.desiredModel).toBe("Thinking 5.5");
   });
 
   test("passes through the selected browser launcher", async () => {
     const config = await buildBrowserConfig({
-      model: "gpt-5.4-pro",
+      model: "gpt-5.5-pro",
       browserLauncher: "carbonyl",
     });
     expect(config.launcher).toBe("carbonyl");
@@ -38,7 +42,7 @@ describe("buildBrowserConfig", () => {
 
   test("forces Carbonyl away from manual-login Chrome reuse flags", async () => {
     const config = await buildBrowserConfig({
-      model: "gpt-5.4-pro",
+      model: "gpt-5.5-pro",
       browserLauncher: "carbonyl",
       browserHeadless: true,
       browserHideWindow: true,
@@ -98,9 +102,91 @@ describe("buildBrowserConfig", () => {
     });
   });
 
+  test("surfaces Browserbase CLI config without changing local browser defaults", async () => {
+    const config = (await buildBrowserConfig({
+      model: "gpt-5.5-pro",
+      browserbase: true,
+      browserbaseApiKey: "bb_api",
+      browserbaseProjectId: "bb_project",
+      browserbaseContextId: "bb_context",
+      browserbasePersist: true,
+      browserbaseKeepAlive: true,
+      browserbaseRegion: "us-west-2",
+      browserbaseTimeout: "60s",
+      browserbaseProxies: "true",
+      browserbaseStealth: true,
+      browserbaseCaptcha: true,
+      browserbaseViewport: "1280x720",
+    })) as { browserbase?: unknown };
+
+    expect(config.browserbase).toEqual({
+      enabled: true,
+      apiKey: "bb_api",
+      projectId: "bb_project",
+      contextId: "bb_context",
+      persist: true,
+      keepAlive: true,
+      region: "us-west-2",
+      timeoutMs: 60_000,
+      proxies: ["true"],
+      stealth: true,
+      captcha: true,
+      viewport: { width: 1280, height: 720 },
+    });
+  });
+
+  test("surfaces Browserbase env config when CLI values are absent", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "true");
+    vi.stubEnv("BROWSERBASE_API_KEY", "env_api");
+    vi.stubEnv("BROWSERBASE_PROJECT_ID", "env_project");
+    vi.stubEnv("ORACLE_BROWSERBASE_CONTEXT_ID", "env_context");
+    vi.stubEnv("ORACLE_BROWSERBASE_KEEP_ALIVE", "1");
+    vi.stubEnv("ORACLE_BROWSERBASE_VIEWPORT", "1024x768");
+
+    const config = (await buildBrowserConfig({ model: "gpt-5.5-pro" })) as {
+      browserbase?: unknown;
+    };
+
+    expect(config.browserbase).toMatchObject({
+      enabled: true,
+      apiKey: "env_api",
+      projectId: "env_project",
+      contextId: "env_context",
+      keepAlive: true,
+      viewport: { width: 1024, height: 768 },
+    });
+  });
+
+  test("rejects malformed Browserbase viewport values", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.5-pro",
+        browserbaseViewport: "wide",
+      }),
+    ).rejects.toThrow(/WIDTHxHEIGHT/i);
+  });
+
+  test("rejects Browserbase timeout values outside Browserbase limits", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.5-pro",
+        browserbaseTimeout: "30s",
+      }),
+    ).rejects.toThrow(/between 60s and 6h/i);
+  });
+
+  test("rejects unsupported Browserbase proxy modes", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.5-pro",
+        browserbaseProxies: "residential,datacenter",
+      }),
+    ).rejects.toThrow(/only true\/false/i);
+  });
+
   test("preserves explicit false launcher booleans", async () => {
     const config = await buildBrowserConfig({
-      model: "gpt-5.4-pro",
+      model: "gpt-5.5-pro",
       browserManualLogin: false,
       browserHideWindow: false,
       browserKeepBrowser: false,
@@ -116,7 +202,7 @@ describe("buildBrowserConfig", () => {
       model: "gpt-5.2-pro",
       browserModelLabel: "Instant",
     });
-    expect(config.desiredModel).toBe("GPT-5.4 Pro");
+    expect(config.desiredModel).toBe("GPT-5.5 Pro");
   });
 
   test("falls back to canonical label when override matches base model", async () => {
@@ -308,11 +394,11 @@ describe("buildBrowserConfig", () => {
 
 describe("resolveBrowserModelLabel", () => {
   test("returns canonical ChatGPT label when CLI value matches API model", () => {
-    expect(resolveBrowserModelLabel("gpt-5.4-pro", "gpt-5.4-pro")).toBe("GPT-5.4 Pro");
-    expect(resolveBrowserModelLabel("gpt-5.4", "gpt-5.4")).toBe("Thinking 5.4");
-    expect(resolveBrowserModelLabel("gpt-5-pro", "gpt-5-pro")).toBe("GPT-5.4 Pro");
-    expect(resolveBrowserModelLabel("gpt-5.2-pro", "gpt-5.2-pro")).toBe("GPT-5.4 Pro");
-    expect(resolveBrowserModelLabel("gpt-5.1-pro", "gpt-5.1-pro")).toBe("GPT-5.4 Pro");
+    expect(resolveBrowserModelLabel("gpt-5.5-pro", "gpt-5.5-pro")).toBe("GPT-5.5 Pro");
+    expect(resolveBrowserModelLabel("gpt-5.5", "gpt-5.5")).toBe("Thinking 5.5");
+    expect(resolveBrowserModelLabel("gpt-5-pro", "gpt-5-pro")).toBe("GPT-5.5 Pro");
+    expect(resolveBrowserModelLabel("gpt-5.2-pro", "gpt-5.2-pro")).toBe("GPT-5.5 Pro");
+    expect(resolveBrowserModelLabel("gpt-5.1-pro", "gpt-5.1-pro")).toBe("GPT-5.5 Pro");
     expect(resolveBrowserModelLabel("GPT-5.1", "gpt-5.1")).toBe("Instant");
   });
 
@@ -325,7 +411,7 @@ describe("resolveBrowserModelLabel", () => {
   });
 
   test("supports undefined or whitespace-only input", () => {
-    expect(resolveBrowserModelLabel(undefined, "gpt-5.2-pro")).toBe("GPT-5.4 Pro");
+    expect(resolveBrowserModelLabel(undefined, "gpt-5.2-pro")).toBe("GPT-5.5 Pro");
     expect(resolveBrowserModelLabel("   ", "gpt-5.1")).toBe("Instant");
   });
 

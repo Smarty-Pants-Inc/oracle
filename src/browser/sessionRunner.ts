@@ -16,6 +16,7 @@ import type { BrowserLogger, BrowserProgressUpdate } from "./types.js";
 import { estimateTokenCount } from "./utils.js";
 import { continueBrowserSession, type ReattachDeps } from "./reattach.js";
 import { extractConversationIdFromUrl } from "./reattachHelpers.js";
+import { redactBrowserSessionConfig } from "../sessionManager.js";
 
 export interface BrowserExecutionResult {
   usage: {
@@ -100,9 +101,7 @@ export async function runBrowserSessionExecution(
   if (runOptions.verbose) {
     log(
       chalk.dim(
-        `[verbose] Browser config: ${JSON.stringify({
-          ...browserConfig,
-        })}`,
+        `[verbose] Browser config: ${JSON.stringify(redactBrowserSessionConfig(browserConfig))}`,
       ),
     );
     log(chalk.dim(`[verbose] Browser prompt length: ${promptArtifacts.composerText.length} chars`));
@@ -236,6 +235,13 @@ export async function runBrowserSessionExecution(
       tabUrl: browserResult.tabUrl,
       conversationId: browserResult.conversationId,
       controllerPid: browserResult.controllerPid ?? process.pid,
+      browserProvider: browserResult.browserProvider,
+      browserbaseSessionId: browserResult.browserbaseSessionId,
+      browserbaseProjectId: browserResult.browserbaseProjectId,
+      browserbaseContextId: browserResult.browserbaseContextId,
+      browserbaseDebugUrl: browserResult.browserbaseDebugUrl,
+      browserbaseDebuggerFullscreenUrl: browserResult.browserbaseDebuggerFullscreenUrl,
+      browserbaseKeepAlive: browserResult.browserbaseKeepAlive,
     },
     answerText,
     downloads: browserResult.downloads,
@@ -261,9 +267,7 @@ export async function continueBrowserSessionExecution(
   if (runOptions.verbose) {
     log(
       chalk.dim(
-        `[verbose] Browser config: ${JSON.stringify({
-          ...browserConfig,
-        })}`,
+        `[verbose] Browser config: ${JSON.stringify(redactBrowserSessionConfig(browserConfig))}`,
       ),
     );
     log(chalk.dim(`[verbose] Browser prompt length: ${promptArtifacts.composerText.length} chars`));

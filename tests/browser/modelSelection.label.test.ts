@@ -22,18 +22,18 @@ describe("browser model selection arbitrary labels", () => {
     expectSome(labelTokens, (t) => t.includes("thinking"));
   });
 
-  it("matches shorthand Pro labels for GPT-5.4 Pro", () => {
-    expect(modelCandidateMatchesTargetForTest("GPT-5.4 Pro", "Pro")).toBe(true);
+  it("matches shorthand Pro labels for GPT-5.5 Pro", () => {
+    expect(modelCandidateMatchesTargetForTest("GPT-5.5 Pro", "Pro")).toBe(true);
   });
 
   it("rejects shorthand Pro labels when testid proves a different version", () => {
     expect(
-      modelCandidateMatchesTargetForTest("GPT-5.4 Pro", "Pro", "model-switcher-gpt-5-2-pro"),
+      modelCandidateMatchesTargetForTest("GPT-5.5 Pro", "Pro", "model-switcher-gpt-5-2-pro"),
     ).toBe(false);
   });
 
-  it("matches shorthand Thinking labels for Thinking 5.4", () => {
-    expect(modelCandidateMatchesTargetForTest("Thinking 5.4", "Thinking")).toBe(true);
+  it("matches shorthand Thinking labels for Thinking 5.5", () => {
+    expect(modelCandidateMatchesTargetForTest("Thinking 5.5", "Thinking")).toBe(true);
   });
 
   it("matches descriptive shortcut rows for the generic Instant target", () => {
@@ -42,9 +42,9 @@ describe("browser model selection arbitrary labels", () => {
   });
 
   it("rejects shorthand variant labels for a base-model request", () => {
-    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Pro")).toBe(false);
-    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Thinking")).toBe(false);
-    expect(modelCandidateMatchesTargetForTest("GPT-5.4", "Instant")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.5", "Pro")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.5", "Thinking")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.5", "Instant")).toBe(false);
   });
 
   it("accepts version-specific test ids even when the visible label is generic", () => {
@@ -63,7 +63,7 @@ describe("browser model selection arbitrary labels", () => {
   });
 
   it("rejects conflicting shorthand labels", () => {
-    expect(modelCandidateMatchesTargetForTest("GPT-5.4 Pro", "Thinking")).toBe(false);
-    expect(modelCandidateMatchesTargetForTest("Thinking 5.4", "Pro")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("GPT-5.5 Pro", "Thinking")).toBe(false);
+    expect(modelCandidateMatchesTargetForTest("Thinking 5.5", "Pro")).toBe(false);
   });
 });

@@ -186,6 +186,25 @@ export function parseDurationOption(value: string | undefined, label: string): n
   return parsed;
 }
 
+export function parseBrowserbaseViewportOption(value: string | undefined):
+  | {
+      width: number;
+      height: number;
+    }
+  | undefined {
+  if (value == null) return undefined;
+  const match = value.trim().match(/^(\d+)x(\d+)$/i);
+  if (!match) {
+    throw new InvalidArgumentError("Viewport must use WIDTHxHEIGHT, for example 1280x720.");
+  }
+  const width = Number.parseInt(match[1] ?? "", 10);
+  const height = Number.parseInt(match[2] ?? "", 10);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new InvalidArgumentError("Viewport width and height must be positive integers.");
+  }
+  return { width, height };
+}
+
 function isGeminiDeepThinkAlias(normalized: string): boolean {
   return (
     (normalized.includes("gemini") && normalized.includes("deep")) ||
@@ -212,11 +231,11 @@ export function resolveApiModel(modelValue: string): ModelName {
   if (normalized.includes("claude") && normalized.includes("opus")) {
     return "claude-4.1-opus";
   }
-  if (normalized.includes("5.4") && normalized.includes("pro")) {
-    return "gpt-5.4-pro";
+  if (normalized.includes("5.5") && normalized.includes("pro")) {
+    return "gpt-5.5-pro";
   }
-  if (normalized.includes("5.4")) {
-    return "gpt-5.4";
+  if (normalized.includes("5.5")) {
+    return "gpt-5.5";
   }
   if (normalized === "claude" || normalized === "sonnet" || /(^|\b)sonnet(\b|$)/.test(normalized)) {
     return "claude-4.5-sonnet";
@@ -297,11 +316,11 @@ export function inferModelFromLabel(modelValue: string): ModelName {
   if (normalized.includes("classic")) {
     return "gpt-5-pro";
   }
-  if ((normalized.includes("5.4") || normalized.includes("5_4")) && normalized.includes("pro")) {
-    return "gpt-5.4-pro";
+  if ((normalized.includes("5.5") || normalized.includes("5_5")) && normalized.includes("pro")) {
+    return "gpt-5.5-pro";
   }
-  if (normalized.includes("5.4") || normalized.includes("5_4")) {
-    return "gpt-5.4";
+  if (normalized.includes("5.5") || normalized.includes("5_5")) {
+    return "gpt-5.5";
   }
   if ((normalized.includes("5.2") || normalized.includes("5_2")) && normalized.includes("pro")) {
     return "gpt-5.2-pro";
@@ -327,7 +346,7 @@ export function inferModelFromLabel(modelValue: string): ModelName {
     normalized.includes("pro") &&
     !normalized.includes("5.1") &&
     !normalized.includes("5.2") &&
-    !normalized.includes("5.4")
+    !normalized.includes("5.5")
   ) {
     return "gpt-5-pro";
   }

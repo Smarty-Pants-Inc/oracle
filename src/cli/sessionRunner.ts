@@ -805,64 +805,80 @@ export async function performSessionRun({
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
       latestBrowserRuntime = runtime ?? latestBrowserRuntime;
-      log(dim("Chrome disconnected before completion; keeping session running for reattach."));
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+      if (!shouldKeepBrowserSessionRunningForReattach(runtime ?? latestBrowserRuntime)) {
+        log(
+          dim(
+            "Browserbase connection was not kept alive; marking the session errored instead of offering a stale reattach.",
+          ),
+        );
+      } else {
+        log(dim("Chrome disconnected before completion; keeping session running for reattach."));
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "running",
+            completedAt: undefined,
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
           status: "running",
-          completedAt: undefined,
+          errorMessage: message,
+          mode,
+          browser: {
+            config: browserConfig,
+            runtime: runtime ?? latestBrowserRuntime,
+          },
+          response: { status: "running", incompleteReason: "chrome-disconnected" },
         });
+        return;
       }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "running",
-        errorMessage: message,
-        mode,
-        browser: {
-          config: browserConfig,
-          runtime: runtime ?? latestBrowserRuntime,
-        },
-        response: { status: "running", incompleteReason: "chrome-disconnected" },
-      });
-      return;
     }
     if (assistantTimeout && mode === "browser") {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
       latestBrowserRuntime = runtime ?? latestBrowserRuntime;
-      log(dim("Assistant response timed out; keeping session running for reattach."));
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-          status: "running",
-          completedAt: undefined,
-        });
-      }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "running",
-        errorMessage: message,
-        mode,
-        browser: {
-          config: browserConfig,
-          runtime: runtime ?? latestBrowserRuntime,
-        },
-        response: { status: "running", incompleteReason: "assistant-timeout" },
-      });
-      const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
-      if (autoReattachIntervalMs > 0) {
-        const autoRuntime = runtime ?? latestBrowserRuntime;
-        const success = await autoReattachUntilComplete({
-          sessionMeta,
-          runtime: autoRuntime ?? undefined,
-          browserConfig,
-          runOptions,
-          modelForStatus,
-          notificationSettings,
-          log,
-        });
-        if (success) {
-          return;
+      if (!shouldKeepBrowserSessionRunningForReattach(runtime ?? latestBrowserRuntime)) {
+        log(
+          dim(
+            "Browserbase session was not kept alive; marking the timeout as an error instead of offering a stale reattach.",
+          ),
+        );
+      } else {
+        log(dim("Assistant response timed out; keeping session running for reattach."));
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "running",
+            completedAt: undefined,
+          });
         }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "running",
+          errorMessage: message,
+          mode,
+          browser: {
+            config: browserConfig,
+            runtime: runtime ?? latestBrowserRuntime,
+          },
+          response: { status: "running", incompleteReason: "assistant-timeout" },
+        });
+        const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
+        if (autoReattachIntervalMs > 0) {
+          const autoRuntime = runtime ?? latestBrowserRuntime;
+          const success = await autoReattachUntilComplete({
+            sessionMeta,
+            runtime: autoRuntime ?? undefined,
+            browserConfig,
+            runOptions,
+            modelForStatus,
+            notificationSettings,
+            log,
+          });
+          if (success) {
+            return;
+          }
+        }
+        log(dim(`Reattach later with: oracle session ${sessionMeta.id}`));
+        return;
       }
-      log(dim(`Reattach later with: oracle session ${sessionMeta.id}`));
-      return;
     }
     if (assistantRateLimit && mode === "browser") {
       log(
@@ -959,6 +975,15 @@ export async function performSessionRun({
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function shouldKeepBrowserSessionRunningForReattach(
+  runtime: BrowserRuntimeMetadata | undefined,
+): boolean {
+  if (runtime?.browserProvider !== "browserbase") {
+    return true;
+  }
+  return runtime.browserbaseKeepAlive === true && Boolean(runtime.chromeBrowserWSEndpoint);
 }
 
 async function writeAssistantOutput(

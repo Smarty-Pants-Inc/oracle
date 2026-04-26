@@ -3,7 +3,12 @@ import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import type { WriteStream } from "node:fs";
 import net from "node:net";
-import type { BrowserLauncher, BrowserModelStrategy, CookieParam } from "./browser/types.js";
+import type {
+  BrowserLauncher,
+  BrowserModelStrategy,
+  BrowserbaseConfig,
+  CookieParam,
+} from "./browser/types.js";
 import type {
   TransportFailureReason,
   AzureOptions,
@@ -57,6 +62,7 @@ export interface BrowserSessionConfig {
   remoteChrome?: { host: string; port: number } | null;
   remoteChromeBrowserWSEndpoint?: string | null;
   remoteChromeProfileRoot?: string | null;
+  browserbase?: BrowserbaseConfig | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
@@ -79,6 +85,13 @@ export interface BrowserRuntimeMetadata {
   conversationId?: string;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
+  browserProvider?: "browserbase";
+  browserbaseSessionId?: string;
+  browserbaseProjectId?: string;
+  browserbaseContextId?: string;
+  browserbaseDebugUrl?: string;
+  browserbaseDebuggerFullscreenUrl?: string;
+  browserbaseKeepAlive?: boolean;
 }
 
 export interface BrowserMetadata {
@@ -203,6 +216,8 @@ export interface SessionMetadata {
   error?: SessionUserErrorMetadata;
 }
 
+const REDACTED = "[redacted]";
+
 export type SessionStatus = "pending" | "running" | "completed" | "error" | "cancelled";
 
 export interface SessionModelRun {
@@ -298,6 +313,132 @@ function normalizeCustomSlug(candidate: string): string {
     );
   }
   return slug;
+}
+
+function redactUrlCredentials(value: string | undefined): string | undefined {
+  if (!value) {
+    return value;
+  }
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:", "ws:", "wss:"].includes(url.protocol)) {
+      return value;
+    }
+    if (url.password) {
+      url.password = REDACTED;
+    }
+    url.search = "";
+    return url.toString();
+  } catch {
+    return value.replace(/\?.*$/, "").replace(/:\/\/([^:/?#]+):([^@/?#]+)@/, `://$1:${REDACTED}@`);
+  }
+}
+
+export function redactBrowserSessionConfig(
+  config: BrowserSessionConfig | undefined,
+): BrowserSessionConfig | undefined {
+  if (!config) {
+    return config;
+  }
+  return {
+    ...config,
+    url: redactUrlCredentials(config.url),
+    chatgptUrl: redactUrlCredentials(config.chatgptUrl ?? undefined) ?? config.chatgptUrl,
+    supervisorChatgptUrl:
+      redactUrlCredentials(config.supervisorChatgptUrl ?? undefined) ?? config.supervisorChatgptUrl,
+    remoteChromeBrowserWSEndpoint:
+      redactUrlCredentials(config.remoteChromeBrowserWSEndpoint ?? undefined) ??
+      config.remoteChromeBrowserWSEndpoint,
+    browserbase: config.browserbase
+      ? {
+          ...config.browserbase,
+          apiKey: config.browserbase.apiKey ? REDACTED : config.browserbase.apiKey,
+        }
+      : config.browserbase,
+  };
+}
+
+export function redactBrowserRuntimeMetadata(
+  runtime: BrowserRuntimeMetadata | undefined,
+): BrowserRuntimeMetadata | undefined {
+  if (!runtime) {
+    return runtime;
+  }
+  return {
+    ...runtime,
+    chromeBrowserWSEndpoint: redactUrlCredentials(runtime.chromeBrowserWSEndpoint),
+    tabUrl: redactUrlCredentials(runtime.tabUrl),
+    browserbaseDebugUrl: redactUrlCredentials(runtime.browserbaseDebugUrl),
+    browserbaseDebuggerFullscreenUrl: redactUrlCredentials(
+      runtime.browserbaseDebuggerFullscreenUrl,
+    ),
+  };
+}
+
+function redactSessionErrorDetails(
+  details: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!details) {
+    return details;
+  }
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey === "runtime" &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      redacted[key] = redactBrowserRuntimeMetadata(value as BrowserRuntimeMetadata);
+    } else if (
+      (normalizedKey === "browserconfig" || normalizedKey === "config") &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      redacted[key] = redactBrowserSessionConfig(value as BrowserSessionConfig);
+    } else if (normalizedKey.includes("apikey") || normalizedKey.includes("api_key")) {
+      redacted[key] = typeof value === "string" && value ? REDACTED : value;
+    } else if (
+      typeof value === "string" &&
+      (normalizedKey.includes("url") || normalizedKey.includes("endpoint"))
+    ) {
+      redacted[key] = redactUrlCredentials(value);
+    } else {
+      redacted[key] = value;
+    }
+  }
+  return redacted;
+}
+
+function redactSessionMetadataForStorage(meta: SessionMetadata): SessionMetadata {
+  return {
+    ...meta,
+    options: {
+      ...meta.options,
+      browserConfig: redactBrowserSessionConfig(meta.options.browserConfig),
+    },
+    browser: meta.browser
+      ? {
+          ...meta.browser,
+          config: redactBrowserSessionConfig(meta.browser.config),
+          runtime: redactBrowserRuntimeMetadata(meta.browser.runtime),
+        }
+      : meta.browser,
+    progress: meta.progress
+      ? {
+          ...meta.progress,
+          tabUrl: redactUrlCredentials(meta.progress.tabUrl),
+        }
+      : meta.progress,
+    error: meta.error
+      ? {
+          ...meta.error,
+          details: redactSessionErrorDetails(meta.error.details),
+        }
+      : meta.error,
+  };
 }
 
 export function createSessionId(prompt: string, customSlug?: string): string {
@@ -440,7 +581,7 @@ export async function initializeSession(
   const dir = sessionDir(sessionId);
   await ensureDir(dir);
   const mode = options.mode ?? "api";
-  const browserConfig = options.browserConfig;
+  const browserConfig = redactBrowserSessionConfig(options.browserConfig);
   const modelList: ModelName[] =
     Array.isArray(options.models) && options.models.length > 0
       ? options.models
@@ -504,7 +645,11 @@ export async function initializeSession(
     },
   };
   await ensureDir(modelsDir(sessionId));
-  await fs.writeFile(metaPath(sessionId), JSON.stringify(metadata, null, 2), "utf8");
+  await fs.writeFile(
+    metaPath(sessionId),
+    JSON.stringify(redactSessionMetadataForStorage(metadata), null, 2),
+    "utf8",
+  );
   await Promise.all(
     (modelList.length > 0 ? modelList : [metadata.model ?? DEFAULT_MODEL]).map(
       async (modelName) => {
@@ -544,7 +689,7 @@ export async function updateSessionMetadata(
     (await readModernSessionMetadata(sessionId)) ??
     (await readLegacySessionMetadata(sessionId)) ??
     ({ id: sessionId } as SessionMetadata);
-  const next = { ...existing, ...updates };
+  const next = redactSessionMetadataForStorage({ ...existing, ...updates });
   await fs.writeFile(metaPath(sessionId), JSON.stringify(next, null, 2), "utf8");
   return next;
 }
@@ -813,7 +958,11 @@ async function markZombie(
     completedAt: new Date().toISOString(),
   };
   if (persist) {
-    await fs.writeFile(metaPath(meta.id), JSON.stringify(updated, null, 2), "utf8");
+    await fs.writeFile(
+      metaPath(meta.id),
+      JSON.stringify(redactSessionMetadataForStorage(updated), null, 2),
+      "utf8",
+    );
   }
   return updated;
 }
@@ -855,7 +1004,11 @@ async function markDeadBrowser(
     response,
   };
   if (persist) {
-    await fs.writeFile(metaPath(meta.id), JSON.stringify(updated, null, 2), "utf8");
+    await fs.writeFile(
+      metaPath(meta.id),
+      JSON.stringify(redactSessionMetadataForStorage(updated), null, 2),
+      "utf8",
+    );
   }
   return updated;
 }

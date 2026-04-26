@@ -880,7 +880,7 @@ describe("supervisorThreads", () => {
     dateNow.mockRestore();
   });
 
-  test("attach_thread fails closed when direct URL navigation lands on a blank shell for the requested conversation", async () => {
+  test("attach_thread accepts exact project URL identity even when visible-turn detection is empty", async () => {
     let now = 0;
     const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
       now += 3_000;
@@ -915,11 +915,16 @@ describe("supervisorThreads", () => {
         projectUrl,
         threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
       }),
-    ).rejects.toThrow("Conversation target-9 did not become active after attach_thread");
+    ).resolves.toEqual({
+      title: "ChatGPT",
+      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
     dateNow.mockRestore();
   });
 
-  test("attach_thread fails closed when only a secondary pane has visible turns", async () => {
+  test("attach_thread accepts exact project URL identity before secondary-pane probing", async () => {
     let now = 0;
     const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
       now += 3_000;
@@ -954,11 +959,16 @@ describe("supervisorThreads", () => {
         projectUrl,
         threadUrl: "https://chatgpt.com/g/team-space-oracle/c/target-9",
       }),
-    ).rejects.toThrow("Conversation target-9 did not become active after attach_thread");
+    ).resolves.toEqual({
+      title: "Target",
+      url: "https://chatgpt.com/g/team-space-oracle/c/target-9",
+      conversationId: "target-9",
+      isActive: true,
+    });
     dateNow.mockRestore();
   });
 
-  test("attach_thread accepts direct URL navigation only after visible conversation turns load", async () => {
+  test("attach_thread accepts direct project URL navigation once exact conversation URL is active", async () => {
     let currentReadCount = 0;
     let turnCountReads = 0;
     const runtime = {
@@ -1010,7 +1020,7 @@ describe("supervisorThreads", () => {
       conversationId: "target-9",
       isActive: true,
     });
-    expect(turnCountReads).toBeGreaterThanOrEqual(2);
+    expect(turnCountReads).toBe(0);
   });
 
   test("attach_thread repairs direct URL attach when another in-scope thread stays active", async () => {
@@ -1876,7 +1886,7 @@ describe("supervisorThreads", () => {
       __test__.supervisorThreadMatchesProjectScope(
         {
           title: "Fresh",
-          url: "https://chatgpt.com/g/team-space/project?model=gpt-5.4#top",
+          url: "https://chatgpt.com/g/team-space/project?model=gpt-5.5#top",
           conversationId: undefined,
           isActive: true,
         },

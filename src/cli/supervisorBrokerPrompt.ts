@@ -1661,7 +1661,7 @@ export async function runSupervisorPromptOperation(
   | { ok: true; sessionId: string; output: string; conversationId?: string }
   | { ok: false; error: string; sessionId?: string }
 > {
-  const requestedModel = request.model?.trim() || "gpt-5.4-pro";
+  const requestedModel = request.model?.trim() || "gpt-5.5-pro";
   const sessionSlug = sanitizeSessionSlugBase(request.sessionSlug);
   if (!sessionSlug) {
     return {

@@ -27,7 +27,7 @@ import { sessionStore } from "../src/sessionStore.js";
 import { browserProofScript } from "./supervisor-proof.browser.js";
 
 const LEVELS = new Set<ThinkingTimeLevel>(["light", "standard", "extended", "heavy"]);
-const DEFAULT_MODEL: ModelName = "gpt-5.4";
+const DEFAULT_MODEL: ModelName = "gpt-5.5";
 const USAGE =
   "Usage: pnpm exec tsx scripts/supervisor-proof.ts [--thinking-time <level>] [--model <model>] [--prompt <text>]";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
