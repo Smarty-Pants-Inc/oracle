@@ -114,6 +114,10 @@ export class BrowserbaseClient {
     });
   }
 
+  async getSession(sessionId: string): Promise<BrowserbaseSession> {
+    return this.request<BrowserbaseSession>(`sessions/${encodeURIComponent(sessionId)}`);
+  }
+
   async getDebugUrls(sessionId: string): Promise<BrowserbaseDebugUrls> {
     return this.request<BrowserbaseDebugUrls>(`sessions/${encodeURIComponent(sessionId)}/debug`);
   }

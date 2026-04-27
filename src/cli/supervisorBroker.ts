@@ -23,7 +23,9 @@ import {
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import {
   connectSupervisorRuntime,
+  releaseBrowserbaseSupervisorRuntimeSessions,
   resolveSupervisorRuntimeContext,
+  type SupervisorRuntimeBrowserProvider,
 } from "./supervisorBrokerRuntime.js";
 import {
   runSupervisorPromptOperation,
@@ -130,6 +132,7 @@ interface SupervisorRuntimeDeps {
 interface SupervisorRuntimeUseOptions {
   allowChatgptShellRecovery?: boolean;
   dedicatedHiddenTargetUrl?: string;
+  browserProvider?: SupervisorRuntimeBrowserProvider;
 }
 
 type SupervisorRuntimeClient = Awaited<ReturnType<typeof connectSupervisorRuntime>>["client"];
@@ -145,6 +148,129 @@ const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
   connectSupervisorRuntime,
   withSupervisorRuntimeAttachLease,
 };
+
+function parseBooleanEnv(value: string | undefined): boolean | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return undefined;
+}
+
+function supervisorRuntimeBrowserProviderFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): SupervisorRuntimeBrowserProvider | undefined {
+  const browserbaseEnabled = parseBooleanEnv(env.ORACLE_BROWSERBASE_ENABLED);
+  if (browserbaseEnabled === true) {
+    return "browserbase";
+  }
+  if (browserbaseEnabled === false) {
+    return "local-hidden";
+  }
+  return undefined;
+}
+
+function resolveSupervisorRuntimeUseOptions(
+  options: SupervisorRuntimeUseOptions,
+): SupervisorRuntimeUseOptions {
+  if (options.browserProvider) {
+    return options;
+  }
+  const browserProvider = supervisorRuntimeBrowserProviderFromEnv();
+  return browserProvider ? { ...options, browserProvider } : options;
+}
+
+async function releaseBrowserbaseSupervisorRuntimesForBrokerShutdown(
+  releaseSessions: typeof releaseBrowserbaseSupervisorRuntimeSessions = releaseBrowserbaseSupervisorRuntimeSessions,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  await releaseSessions({ env, log: supervisorChromeLogger });
+}
+
+function supervisorBrokerSignalExitCode(signal: NodeJS.Signals): number {
+  switch (signal) {
+    case "SIGHUP":
+      return 129;
+    case "SIGINT":
+      return 130;
+    case "SIGQUIT":
+      return 131;
+    case "SIGTERM":
+      return 143;
+    default:
+      return 1;
+  }
+}
+
+function installSupervisorBrokerBrowserbaseReleaseCleanup({
+  releaseBrowserbaseSessions = releaseBrowserbaseSupervisorRuntimesForBrokerShutdown,
+  processLike = process,
+  exitFn = (code: number) => process.exit(code),
+}: {
+  releaseBrowserbaseSessions?: () => Promise<void>;
+  processLike?: Pick<NodeJS.Process, "on" | "off">;
+  exitFn?: (code: number) => void;
+} = {}): {
+  dispose: () => void;
+  release: () => Promise<void>;
+  waitForCleanup: () => Promise<void>;
+} {
+  let active = true;
+  let cleanup: Promise<void> | null = null;
+  const listeners = new Map<NodeJS.Signals, () => void>();
+
+  const dispose = () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    for (const [signal, handler] of listeners) {
+      processLike.off(signal, handler);
+    }
+    listeners.clear();
+  };
+
+  const runCleanup = (signal?: NodeJS.Signals): Promise<void> => {
+    if (cleanup) {
+      return cleanup;
+    }
+    dispose();
+    cleanup = (async () => {
+      try {
+        await releaseBrowserbaseSessions();
+      } finally {
+        if (signal) {
+          exitFn(supervisorBrokerSignalExitCode(signal));
+        }
+      }
+    })();
+    return cleanup;
+  };
+
+  for (const signal of ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"] as const) {
+    const handler = () => {
+      void runCleanup(signal);
+    };
+    listeners.set(signal, handler);
+    processLike.on(signal, handler);
+  }
+
+  return {
+    dispose,
+    release: async () => {
+      await runCleanup();
+    },
+    waitForCleanup: async () => {
+      await cleanup;
+    },
+  };
+}
 
 function normalizeComparableUrl(url?: string | null): string | undefined {
   const trimmed = url?.trim();
@@ -532,7 +658,7 @@ async function readProjectConversationHistoryFromResponse(
 
 function isMissingSupervisorRuntimeError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /No reachable Oracle-owned hidden browser runtime session was found/i.test(message);
+  return /No reachable Oracle.*runtime session was found/i.test(message);
 }
 
 function buildSupervisorRuntimeBootstrapRequest(
@@ -821,16 +947,20 @@ async function withSupervisorRuntime<T>(
   promptRunner: NonNullable<SupervisorBrokerDeps["runPrompt"]> = runSupervisorPromptOperation,
   options: SupervisorRuntimeUseOptions = {},
 ): Promise<T> {
-  await ensureSupervisorRuntimeReady(request, runtimeDeps, promptRunner, options);
+  const runtimeOptions = resolveSupervisorRuntimeUseOptions(options);
+  await ensureSupervisorRuntimeReady(request, runtimeDeps, promptRunner, runtimeOptions);
   return await runtimeDeps.withSupervisorRuntimeAttachLease(supervisorChromeLogger, async () => {
     const context = await runtimeDeps.resolveSupervisorRuntimeContext(
       request.followupSession,
-      options,
+      runtimeOptions,
     );
     return await withChromeFocusProtection(
       context.runtime.chromePid,
       async () => {
-        const connection = await runtimeDeps.connectSupervisorRuntime(context.runtime, options);
+        const connection = await runtimeDeps.connectSupervisorRuntime(
+          context.runtime,
+          runtimeOptions,
+        );
         try {
           return await action({
             client: connection.client,
@@ -1585,6 +1715,7 @@ export async function runSupervisorBrokerRequest(
 
 export async function startSupervisorBroker(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const releaseCleanup = installSupervisorBrokerBrowserbaseReleaseCleanup();
   const stopInput = () => {
     rl.close();
     process.stdin.pause();
@@ -1605,6 +1736,7 @@ export async function startSupervisorBroker(): Promise<void> {
         continue;
       }
       if (request.shutdown) {
+        await releaseCleanup.release();
         stopInput();
         return;
       }
@@ -1612,6 +1744,7 @@ export async function startSupervisorBroker(): Promise<void> {
       await writeSupervisorBrokerResponseLine(response);
     }
   } finally {
+    await releaseCleanup.release();
     stopInput();
   }
 }
@@ -1636,6 +1769,9 @@ export const __test__ = {
   resolveRequestedThreadUrl,
   selectProjectScopedHistoryFallback,
   isReusableSupervisorThreadSession,
+  installSupervisorBrokerBrowserbaseReleaseCleanup,
+  releaseBrowserbaseSupervisorRuntimesForBrokerShutdown,
+  supervisorBrokerSignalExitCode,
   supervisorThreadSessionSlug,
   writeSupervisorBrokerResponseLine,
 };

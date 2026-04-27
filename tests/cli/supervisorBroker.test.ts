@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { __test__, runSupervisorBrokerRequest } from "../../src/cli/supervisorBroker.js";
@@ -774,6 +775,126 @@ describe("runSupervisorBrokerRequest", () => {
     );
     expect(runtimeClose).toHaveBeenCalledTimes(1);
     expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  test("withSupervisorRuntime constrains runtime selection to Browserbase when enabled", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "1");
+    try {
+      const action = vi.fn(async () => "ok");
+      const runtimeClose = vi.fn(async () => {});
+      const resolveSupervisorRuntimeContext = vi.fn(async () => ({
+        sessionId: "runtime-1",
+        runtime: {
+          browserProvider: "browserbase" as const,
+          chromeBrowserWSEndpoint: "wss://connect.browserbase.com/devtools/browser/bb-runtime",
+        },
+      }));
+      const connectSupervisorRuntime = vi.fn(async () => ({
+        client: { Runtime: {} } as never,
+        close: runtimeClose,
+        host: "connect.browserbase.com",
+        port: 443,
+      }));
+      const withSupervisorRuntimeAttachLease = async <T>(
+        _log: (message?: string) => void,
+        work: () => Promise<T>,
+      ): Promise<T> => await work();
+
+      const result = await __test__.withSupervisorRuntime(
+        {
+          prompt: "",
+          sessionSlug: "browserbase-provider",
+        },
+        action,
+        {
+          resolveSupervisorRuntimeContext,
+          connectSupervisorRuntime: connectSupervisorRuntime as never,
+          withSupervisorRuntimeAttachLease,
+        },
+      );
+
+      const runtimeOptions = { browserProvider: "browserbase" } as const;
+      expect(result).toBe("ok");
+      expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, runtimeOptions);
+      expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, undefined, runtimeOptions);
+      expect(connectSupervisorRuntime).toHaveBeenCalledWith(
+        expect.objectContaining({ browserProvider: "browserbase" }),
+        runtimeOptions,
+      );
+      expect(runtimeClose).toHaveBeenCalledTimes(1);
+      expect(action).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("broker shutdown releases Browserbase supervisor runtimes even if Browserbase mode is unset", async () => {
+    const releaseSessions = vi.fn(async () => 1);
+
+    await __test__.releaseBrowserbaseSupervisorRuntimesForBrokerShutdown(releaseSessions, {
+      ORACLE_BROWSERBASE_ENABLED: "1",
+    } as NodeJS.ProcessEnv);
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(releaseSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({ ORACLE_BROWSERBASE_ENABLED: "1" }),
+      }),
+    );
+
+    releaseSessions.mockClear();
+    await __test__.releaseBrowserbaseSupervisorRuntimesForBrokerShutdown(releaseSessions, {
+      ORACLE_BROWSERBASE_ENABLED: "0",
+    } as NodeJS.ProcessEnv);
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(releaseSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({ ORACLE_BROWSERBASE_ENABLED: "0" }),
+      }),
+    );
+  });
+
+  test("broker signal cleanup releases Browserbase supervisor runtimes before exit", async () => {
+    const releaseSessions = vi.fn(async () => undefined);
+    const exitFn = vi.fn();
+    const processLike = new EventEmitter() as unknown as Pick<NodeJS.Process, "on" | "off"> & {
+      emit: (event: string) => boolean;
+    };
+
+    const cleanup = __test__.installSupervisorBrokerBrowserbaseReleaseCleanup({
+      releaseBrowserbaseSessions: releaseSessions,
+      processLike,
+      exitFn,
+    });
+
+    processLike.emit("SIGTERM");
+    await cleanup.waitForCleanup();
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(exitFn).toHaveBeenCalledWith(143);
+    cleanup.dispose();
+  });
+
+  test("broker terminal hangup cleanup releases Browserbase supervisor runtimes before exit", async () => {
+    const releaseSessions = vi.fn(async () => undefined);
+    const exitFn = vi.fn();
+    const processLike = new EventEmitter() as unknown as Pick<NodeJS.Process, "on" | "off"> & {
+      emit: (event: string) => boolean;
+    };
+
+    const cleanup = __test__.installSupervisorBrokerBrowserbaseReleaseCleanup({
+      releaseBrowserbaseSessions: releaseSessions,
+      processLike,
+      exitFn,
+    });
+
+    processLike.emit("SIGHUP");
+    await cleanup.waitForCleanup();
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(exitFn).toHaveBeenCalledWith(129);
+    cleanup.dispose();
   });
 
   test("withSupervisorRuntime does not bootstrap when a specific followup session was requested", async () => {

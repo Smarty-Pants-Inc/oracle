@@ -250,6 +250,28 @@ describe("ensureNotBlocked", () => {
     await expect(ensureNotBlocked(runtime, false, logger)).resolves.toBeUndefined();
   });
 
+  test("waits for cloudflare interstitial to clear when requested", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: "Just a moment..." } })
+          .mockResolvedValueOnce({ result: { value: "ChatGPT" } })
+          .mockResolvedValueOnce({ result: { value: false } }),
+      } as unknown as ChromeClient["Runtime"];
+      const blocked = ensureNotBlocked(runtime, false, logger, { waitMs: 2_000 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(blocked).resolves.toBeUndefined();
+      expect(logger).toHaveBeenCalledWith(
+        "Cloudflare anti-bot page detected; waiting for it to clear...",
+      );
+      expect(logger).toHaveBeenCalledWith("Cloudflare anti-bot page cleared");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("throws structured browser error when headful cloudflare is detected", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({ result: { value: "Just a moment..." } }),
@@ -300,6 +322,27 @@ describe("ensureLoggedIn", () => {
     await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 0 })).rejects.toThrow(
       /inline cookies/i,
     );
+  });
+
+  test("does not treat failed ChatGPT /me probes as logged in", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            ok: false,
+            status: 200,
+            authenticated: false,
+            url: "/backend-api/me",
+            domLoginCta: false,
+            onAuthPage: false,
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 2 })).rejects.toThrow(
+      /session not detected/i,
+    );
+    expect(logger).toHaveBeenCalledWith(expect.stringContaining("authenticated=false"));
   });
 
   test("uses remote hint for remote sessions", async () => {
@@ -666,6 +709,53 @@ describe("waitForAssistantResponse", () => {
           ),
         ),
       ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  test("captures stable assistant text when ChatGPT leaves a stale stop button visible", async () => {
+    vi.useFakeTimers();
+    try {
+      const answer = {
+        text: "OK",
+        html: "<p>OK</p>",
+        messageId: "mid-answer",
+        turnId: "tid-answer",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params?.expression ?? "");
+          if (params?.awaitPromise && expression.includes("MutationObserver")) {
+            return { result: { type: "object", value: answer } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: answer } };
+          }
+          if (
+            expression.includes(`Boolean(document.querySelector('[data-testid="stop-button"]'))`)
+          ) {
+            return { result: { value: true } };
+          }
+          if (expression.includes("hasAssistantFinishedActions")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: null } };
+        });
+      const runtime = {
+        evaluate,
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAssistantResponse(runtime, 60_000, logger);
+      await vi.advanceTimersByTimeAsync(35_000);
+      const result = await promise;
+
+      expect(result.text).toBe("OK");
+      expect(logger).toHaveBeenCalledWith(
+        "Assistant response text is stable despite a stale stop button; capturing it.",
+      );
     } finally {
       vi.useRealTimers();
     }

@@ -140,6 +140,24 @@ describe("BrowserbaseClient", () => {
     expect(fetchCall(fetcher, 0)[1]).toMatchObject({ method: "GET" });
   });
 
+  test("retrieves a session with a fresh connect url", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        id: "sess_123",
+        projectId: "proj_123",
+        status: "RUNNING",
+        connectUrl: "wss://connect.browserbase.example/devtools/browser/sess_123",
+      }),
+    );
+    const client = new BrowserbaseClient({ apiKey: "bb_test", fetcher });
+
+    await expect(client.getSession("sess/123")).resolves.toMatchObject({
+      connectUrl: "wss://connect.browserbase.example/devtools/browser/sess_123",
+    });
+    expect(fetchCall(fetcher, 0)[0]).toBe("https://api.browserbase.com/v1/sessions/sess%2F123");
+    expect(fetchCall(fetcher, 0)[1]).toMatchObject({ method: "GET" });
+  });
+
   test("requests session release through session update", async () => {
     const fetcher = vi.fn(async () =>
       jsonResponse({ id: "sess_123", projectId: "proj_123", status: "COMPLETED" }),

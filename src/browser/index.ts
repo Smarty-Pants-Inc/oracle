@@ -1182,40 +1182,59 @@ async function findEphemeralPort(): Promise<number> {
   });
 }
 
+function isBackendApiChallengeError(error: unknown): boolean {
+  if (error instanceof BrowserAutomationError) {
+    const details = error.details as { stage?: unknown } | undefined;
+    if (details?.stage === "cloudflare-backend-challenge") {
+      return true;
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /backend API requests are being challenged by Cloudflare/i.test(message);
+}
+
 async function waitForLogin({
   runtime,
   logger,
   appliedCookies,
   manualLogin,
   timeoutMs,
+  remoteSession = false,
+  notice,
 }: {
   runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
   appliedCookies: number;
   manualLogin: boolean;
   timeoutMs: number;
+  remoteSession?: boolean;
+  notice?: string;
 }): Promise<void> {
   if (!manualLogin) {
-    await ensureLoggedIn(runtime, logger, { appliedCookies });
+    await ensureLoggedIn(runtime, logger, { appliedCookies, remoteSession });
     return;
   }
   const deadline = Date.now() + Math.min(timeoutMs ?? 1_200_000, 20 * 60_000);
   let lastNotice = 0;
   while (Date.now() < deadline) {
     try {
-      await ensureLoggedIn(runtime, logger, { appliedCookies });
+      await ensureLoggedIn(runtime, logger, { appliedCookies, remoteSession });
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const loginDetected = message?.toLowerCase().includes("login button");
       const sessionMissing = message?.toLowerCase().includes("session not detected");
-      if (!loginDetected && !sessionMissing) {
+      const backendChallenged = remoteSession && isBackendApiChallengeError(error);
+      if (!loginDetected && !sessionMissing && !backendChallenged) {
         throw error;
       }
       const now = Date.now();
       if (now - lastNotice > 5000) {
         logger(
-          "Manual login mode: please sign into chatgpt.com in the opened Chrome window; waiting for session to appear...",
+          backendChallenged
+            ? "Remote browser session is still clearing a Cloudflare backend challenge; waiting for ChatGPT API access..."
+            : (notice ??
+                "Manual login mode: please sign into chatgpt.com in the opened Chrome window; waiting for session to appear..."),
         );
         lastNotice = now;
       }
@@ -1773,8 +1792,9 @@ async function runBrowserbaseBrowserMode(
 
   const connectUrl = session.connectUrl;
   const remoteChrome = resolveBrowserbaseRemoteChrome(connectUrl);
+  let keepAliveRuntimePersisted = false;
   const releaseSession = async (): Promise<void> => {
-    if (keepAlive) {
+    if (keepAlive && keepAliveRuntimePersisted) {
       logger(`Browserbase session kept alive: ${session.id}`);
       return;
     }
@@ -1810,13 +1830,16 @@ async function runBrowserbaseBrowserMode(
       browserbaseDebuggerFullscreenUrl: debugUrls?.debuggerFullscreenUrl,
       browserbaseKeepAlive: keepAlive,
     };
-    await options.runtimeHintCb?.({
-      ...runtimeMetadata,
-      chromeHost: remoteChrome.host,
-      chromePort: remoteChrome.port,
-      chromeBrowserWSEndpoint: connectUrl,
-      controllerPid: process.pid,
-    });
+    if (options.runtimeHintCb) {
+      await options.runtimeHintCb({
+        ...runtimeMetadata,
+        chromeHost: remoteChrome.host,
+        chromePort: remoteChrome.port,
+        chromeBrowserWSEndpoint: connectUrl,
+        controllerPid: process.pid,
+      });
+      keepAliveRuntimePersisted = true;
+    }
     return await runRemoteBrowserMode(
       promptText,
       attachments,
@@ -1824,7 +1847,7 @@ async function runBrowserbaseBrowserMode(
         ...config,
         attachRunning: false,
         cookieSync: config.cookieSync && !browserbase.contextId?.trim(),
-        manualLogin: false,
+        manualLogin: config.manualLogin,
         remoteChrome,
         remoteChromeBrowserWSEndpoint: connectUrl,
         remoteChromeProfileRoot: null,
@@ -2042,8 +2065,20 @@ async function runRemoteBrowserMode(
     }
 
     await navigateToChatGPT(Page, Runtime, baseUrl, logger);
-    await ensureNotBlocked(Runtime, config.headless, logger);
-    await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+    await ensureNotBlocked(Runtime, config.headless, logger, {
+      waitMs: browserbaseRemote ? 60_000 : 0,
+    });
+    await waitForLogin({
+      runtime: Runtime,
+      logger,
+      appliedCookies: 0,
+      manualLogin: Boolean(config.manualLogin),
+      timeoutMs: config.timeoutMs,
+      remoteSession: true,
+      notice: browserbaseRemote
+        ? "Browserbase manual login mode: sign into chatgpt.com in the Browserbase Live View URL above; waiting for session to appear..."
+        : "Remote browser manual login mode: sign into chatgpt.com in the remote browser; waiting for session to appear...",
+    });
     if (config.url !== baseUrl) {
       await navigateToPromptReadyWithFallback(Page, Runtime, {
         url: config.url,

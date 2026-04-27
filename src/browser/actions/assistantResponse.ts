@@ -21,6 +21,7 @@ const ASSISTANT_RATE_LIMIT_ERROR = "assistant-response-rate-limited";
 const ASSISTANT_EMPTY_RESPONSE_MIN_GRACE_MS = 6_000;
 const ASSISTANT_EMPTY_RESPONSE_MAX_GRACE_MS = 12_000;
 const ASSISTANT_TERMINAL_ERROR_MAX_TEXT_LENGTH = 500;
+const STALE_STOP_BUTTON_STABLE_MS = 30_000;
 
 export function isAssistantEmptyResponseError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
@@ -645,6 +646,12 @@ async function pollAssistantCompletion(
         if (completionEnough || stableEnough) {
           return normalized;
         }
+      } else if (
+        stableMs >= STALE_STOP_BUTTON_STABLE_MS &&
+        stableCycles >= thresholds.requiredStableCycles
+      ) {
+        logger("Assistant response text is stable despite a stale stop button; capturing it.");
+        return normalized;
       }
     } else {
       previousLength = 0;

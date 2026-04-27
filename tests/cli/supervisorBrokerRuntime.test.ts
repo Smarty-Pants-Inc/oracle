@@ -41,6 +41,48 @@ function runtimeSession(
   };
 }
 
+function browserbaseRuntimeSession(
+  id: string,
+  status: SessionMetadata["status"],
+  startedAt: string,
+): SessionMetadata {
+  const conversationId = id.replace(/[^a-zA-Z0-9-]/g, "-");
+  return {
+    id,
+    createdAt: startedAt,
+    startedAt,
+    status,
+    options: { model: "gpt-5.5-pro" },
+    browser: {
+      runtime: {
+        browserProvider: "browserbase",
+        browserbaseSessionId: `bb-${conversationId}`,
+        browserbaseProjectId: "bb-project",
+        browserbaseContextId: "bb-context",
+        browserbaseKeepAlive: true,
+        chromeHost: "connect.browserbase.com",
+        chromePort: 443,
+        chromeBrowserWSEndpoint: `wss://connect.browserbase.com/devtools/browser/bb-${conversationId}`,
+        tabUrl: `${SUPERVISOR_CONVERSATION_ROOT}/c/${conversationId}`,
+        conversationId,
+      },
+      config: {
+        manualLogin: true,
+        keepBrowser: true,
+        attachRunning: false,
+        manualLoginProfileDir: null,
+        chatgptUrl: SUPERVISOR_PROJECT_URL,
+        browserbase: {
+          enabled: true,
+          projectId: "bb-project",
+          contextId: "bb-context",
+          keepAlive: true,
+        },
+      },
+    },
+  };
+}
+
 afterEach(() => {
   vi.resetModules();
   vi.restoreAllMocks();
@@ -109,6 +151,24 @@ describe("supervisorBrokerRuntime", () => {
     ]);
 
     expect(picked?.id).toBe("manual-login-older");
+  });
+
+  test("uses the requested supervisor browser provider when picking reusable runtimes", () => {
+    const localHidden = runtimeSession("local-hidden", "completed", "2026-03-31T10:05:00.000Z");
+    const browserbase = browserbaseRuntimeSession(
+      "browserbase",
+      "completed",
+      "2026-03-31T10:00:00.000Z",
+    );
+
+    expect(__test__.pickReusableRuntimeCandidate([localHidden, browserbase])?.id).toBe(
+      "local-hidden",
+    );
+    expect(
+      __test__.pickReusableRuntimeCandidate([localHidden, browserbase], {
+        browserProvider: "browserbase",
+      })?.id,
+    ).toBe("browserbase");
   });
 
   test("ignores attach-running sessions when no owned hidden runtime exists", () => {
@@ -389,6 +449,34 @@ describe("supervisorBrokerRuntime", () => {
 
     expect(picked?.id).toBe("shell-recoverable");
     expect(listTargets).toHaveBeenCalledTimes(1);
+  });
+
+  test("uses Browserbase websocket target listing instead of local DevTools probing", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_API_KEY", "");
+    vi.stubEnv("BROWSERBASE_API_KEY", "");
+    const probe = vi.fn();
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "browserbase-target",
+        type: "page",
+        url: `${SUPERVISOR_CONVERSATION_ROOT}/c/browserbase`,
+      },
+    ]);
+
+    const picked = await __test__.pickReachableRuntimeCandidate(
+      [browserbaseRuntimeSession("browserbase", "completed", "2026-03-31T10:05:00.000Z")],
+      probe,
+      listTargets,
+      { browserProvider: "browserbase" },
+    );
+
+    expect(picked?.id).toBe("browserbase");
+    expect(probe).not.toHaveBeenCalled();
+    expect(listTargets).toHaveBeenCalledWith({
+      host: "connect.browserbase.com",
+      port: 443,
+      browserWSEndpoint: "wss://connect.browserbase.com/devtools/browser/bb-browserbase",
+    });
   });
 
   test("accepts a reachable runtime when only duplicate identical project shell targets remain", async () => {
@@ -811,6 +899,85 @@ describe("supervisorBrokerRuntime", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  test("classifies only kept-alive Browserbase project runtimes as Browserbase supervisors", () => {
+    const released = browserbaseRuntimeSession("released", "completed", "2026-03-31T10:00:00.000Z");
+    released.browser!.runtime!.browserbaseKeepAlive = false;
+
+    expect(
+      __test__.isBrowserbaseSupervisorRuntime(
+        browserbaseRuntimeSession("browserbase", "completed", "2026-03-31T10:00:00.000Z"),
+      ),
+    ).toBe(true);
+
+    expect(__test__.isBrowserbaseSupervisorRuntime(released)).toBe(false);
+  });
+
+  test("releases kept-alive Browserbase supervisor sessions and marks them non-reusable", async () => {
+    const meta = browserbaseRuntimeSession("browserbase", "completed", "2026-03-31T10:00:00.000Z");
+    const requestSessionRelease = vi.fn(async () => ({
+      id: "bb-browserbase",
+      projectId: "bb-project",
+      status: "COMPLETED" as const,
+    }));
+    const createClient = vi.fn(() => ({ requestSessionRelease }));
+    const updateSession = vi.fn(async (_sessionId: string, updates: Partial<SessionMetadata>) => ({
+      ...meta,
+      ...updates,
+    }));
+
+    const released = await __test__.releaseBrowserbaseSupervisorRuntimeSessions({
+      env: { ORACLE_BROWSERBASE_API_KEY: "bb-test-key" } as NodeJS.ProcessEnv,
+      listSessions: async () => [meta],
+      updateSession,
+      createClient,
+    });
+
+    expect(released).toBe(1);
+    expect(createClient).toHaveBeenCalledWith({
+      apiKey: "bb-test-key",
+      projectId: "bb-project",
+    });
+    expect(requestSessionRelease).toHaveBeenCalledWith("bb-browserbase", "bb-project");
+    expect(updateSession).toHaveBeenCalledWith(
+      "browserbase",
+      expect.objectContaining({
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            browserbaseKeepAlive: false,
+            browserbaseSessionId: "bb-browserbase",
+            chromeBrowserWSEndpoint: undefined,
+          }),
+        }),
+      }),
+    );
+  });
+
+  test("releases stale Browserbase supervisor sessions even when the websocket endpoint is gone", async () => {
+    const meta = browserbaseRuntimeSession("browserbase", "completed", "2026-03-31T10:00:00.000Z");
+    delete meta.browser!.runtime!.chromeBrowserWSEndpoint;
+    const requestSessionRelease = vi.fn(async () => ({
+      id: "bb-browserbase",
+      projectId: "bb-project",
+      status: "COMPLETED" as const,
+    }));
+    const updateSession = vi.fn(async (_sessionId: string, updates: Partial<SessionMetadata>) => ({
+      ...meta,
+      ...updates,
+    }));
+
+    const released = await __test__.releaseBrowserbaseSupervisorRuntimeSessions({
+      env: { ORACLE_BROWSERBASE_API_KEY: "bb-test-key" } as NodeJS.ProcessEnv,
+      listSessions: async () => [meta],
+      updateSession,
+      createClient: () => ({ requestSessionRelease }),
+    });
+
+    expect(__test__.isBrowserbaseSupervisorRuntime(meta)).toBe(false);
+    expect(__test__.isReleasableBrowserbaseSupervisorRuntime(meta)).toBe(true);
+    expect(released).toBe(1);
+    expect(requestSessionRelease).toHaveBeenCalledWith("bb-browserbase", "bb-project");
   });
 
   test("resolveSupervisorRuntimeContext rejects a hinted non-owned runtime", async () => {
