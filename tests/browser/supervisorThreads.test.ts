@@ -252,21 +252,23 @@ describe("supervisorThreads", () => {
           },
         };
       }
+      if (expression.includes("/backend-api/conversations")) {
+        return {
+          result: {
+            value: [
+              {
+                kind: "thread",
+                title: "Root",
+                url: "https://chatgpt.com/c/root",
+                conversationId: "root",
+              },
+            ],
+          },
+        };
+      }
       return {
         result: {
           value: [
-            {
-              kind: "thread",
-              title: "Root",
-              url: "https://chatgpt.com/c/root",
-              conversationId: "root",
-            },
-            {
-              kind: "thread",
-              title: "Project chat",
-              url: "https://chatgpt.com/g/team-space-oracle/c/project-thread",
-              conversationId: "project-thread",
-            },
             {
               kind: "project",
               title: "Team space",
@@ -301,10 +303,10 @@ describe("supervisorThreads", () => {
         isActive: false,
       },
     ]);
-    expect(evaluate).toHaveBeenCalledTimes(3);
+    expect(evaluate).toHaveBeenCalledTimes(4);
   });
 
-  test("waits past project-only root browse DOM before listing root entries", async () => {
+  test("does not wait for root DOM links before listing root API entries", async () => {
     let readinessReads = 0;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression.includes("window.location.assign")) {
@@ -331,15 +333,23 @@ describe("supervisorThreads", () => {
           },
         };
       }
+      if (expression.includes("/backend-api/conversations")) {
+        return {
+          result: {
+            value: [
+              {
+                kind: "thread",
+                title: "Root",
+                url: "https://chatgpt.com/c/root",
+                conversationId: "root",
+              },
+            ],
+          },
+        };
+      }
       return {
         result: {
           value: [
-            {
-              kind: "thread",
-              title: "Root",
-              url: "https://chatgpt.com/c/root",
-              conversationId: "root",
-            },
             {
               kind: "project",
               title: "Team space",
@@ -358,7 +368,7 @@ describe("supervisorThreads", () => {
       scopeUrl: "https://chatgpt.com/",
     });
 
-    expect(readinessReads).toBe(2);
+    expect(readinessReads).toBe(1);
     expect(entries).toEqual([
       {
         kind: "thread",
@@ -377,7 +387,7 @@ describe("supervisorThreads", () => {
     ]);
   });
 
-  test("does not report project-only fallback as a ready root browse", async () => {
+  test("does not block root browse on project-only DOM readiness", async () => {
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression.includes("window.location.assign")) {
         return { result: { value: true } };
@@ -417,7 +427,15 @@ describe("supervisorThreads", () => {
         scopeUrl: "https://chatgpt.com/",
         scopeReadyTimeoutMs: 0,
       }),
-    ).rejects.toThrow("ChatGPT browse scope did not become ready");
+    ).resolves.toEqual([
+      {
+        kind: "project",
+        title: "Team space",
+        projectId: "team-space",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        isActive: false,
+      },
+    ]);
   });
 
   test("adds configured project fallback when root DOM omits project links", async () => {
@@ -437,18 +455,26 @@ describe("supervisorThreads", () => {
           },
         };
       }
+      if (expression.includes("/backend-api/conversations")) {
+        return {
+          result: {
+            value: [
+              {
+                kind: "thread",
+                title: "Root",
+                url: "https://chatgpt.com/c/root",
+                conversationId: "root",
+              },
+            ],
+          },
+        };
+      }
       expect(expression).toContain(
         'const fallbackProjectUrl = "https://chatgpt.com/g/team-space/project"',
       );
       return {
         result: {
           value: [
-            {
-              kind: "thread",
-              title: "Root",
-              url: "https://chatgpt.com/c/root",
-              conversationId: "root",
-            },
             {
               kind: "project",
               title: "Oracle project",
@@ -486,31 +512,168 @@ describe("supervisorThreads", () => {
     ]);
   });
 
-  test("lists project browse entries from the requested project scope", async () => {
+  test("lists root threads from ChatGPT frontend history response", async () => {
+    const listeners = new Map<string, Array<(params: object) => void>>();
+    const emit = (eventName: string, params: object) => {
+      for (const listener of listeners.get(eventName) ?? []) {
+        listener(params);
+      }
+    };
+    const frontendPayload = {
+      items: [
+        { id: "root-one", title: "Root One" },
+        { id: "project-thread", title: "Project thread", project_id: "team-space" },
+      ],
+      total: 2,
+    };
+    const client = {
+      Network: {
+        enable: vi.fn(async () => undefined),
+        getResponseBody: vi.fn(async () => ({
+          body: JSON.stringify(frontendPayload),
+          base64Encoded: false,
+        })),
+      },
+      Page: {
+        navigate: vi.fn(async () => {
+          emit("Network.requestWillBeSent", {
+            requestId: "history-1",
+            request: {
+              url: "https://chatgpt.com/backend-api/conversations?offset=0&limit=28&order=updated&is_archived=false&is_starred=false",
+              headers: { "X-OAI-IS": "opaque" },
+            },
+          });
+          emit("Network.loadingFinished", { requestId: "history-1" });
+          return {};
+        }),
+      },
+      on: vi.fn((eventName: string, listener: (params: object) => void) => {
+        listeners.set(eventName, [...(listeners.get(eventName) ?? []), listener]);
+      }),
+      removeListener: vi.fn((eventName: string, listener: (params: object) => void) => {
+        listeners.set(
+          eventName,
+          (listeners.get(eventName) ?? []).filter((candidate) => candidate !== listener),
+        );
+      }),
+    } as unknown as ChromeClient;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
-      if (expression.includes("window.location.assign")) {
-        return { result: { value: true } };
+      if (expression.includes("/backend-api/conversations")) {
+        throw new Error("bare conversations fetch should not run after frontend capture");
       }
       if (expression.includes("__oracleBrowseScopeReady")) {
-        return { result: { value: { browseLinks: 1, onScope: true, projectScopedLinks: 1 } } };
+        return {
+          result: {
+            value: {
+              browseLinks: 0,
+              onScope: true,
+              projectScopedLinks: 0,
+              rootConversationLinks: 0,
+            },
+          },
+        };
       }
       return {
         result: {
           value: [
             {
-              kind: "thread",
-              title: "In scope",
-              url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
-              conversationId: "right-thread",
-              projectUrl,
-            },
-            {
-              kind: "thread",
-              title: "Root",
-              url: "https://chatgpt.com/c/root",
-              conversationId: "root",
+              kind: "project",
+              title: "Team space",
+              projectId: "team-space",
+              projectUrl: "https://chatgpt.com/g/team-space/project",
             },
           ],
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, {
+      rootScope: true,
+      includeProjects: true,
+      scopeUrl: "https://chatgpt.com/",
+      client,
+    });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Root One",
+        url: "https://chatgpt.com/c/root-one",
+        conversationId: "root-one",
+        isActive: false,
+      },
+      {
+        kind: "project",
+        title: "Team space",
+        projectId: "team-space",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        isActive: false,
+      },
+    ]);
+    expect(client.Network.getResponseBody).toHaveBeenCalledWith({ requestId: "history-1" });
+  });
+
+  test("lists project browse entries from the requested project scope", async () => {
+    class MockHTMLElement {
+      constructor(
+        private readonly href: string,
+        readonly textContent: string,
+      ) {}
+      readonly classList = { contains: () => false };
+      closest() {
+        return this;
+      }
+      getAttribute(name: string) {
+        return name === "href" ? this.href : null;
+      }
+      getBoundingClientRect() {
+        return { width: 120, height: 20, x: 0, y: 0 };
+      }
+    }
+    const anchors = [
+      new MockHTMLElement("/g/team-space/project/c/right-thread", "In scope"),
+      new MockHTMLElement("/c/root-thread", "Root"),
+    ];
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("window.location.assign")) {
+        return { result: { value: true } };
+      }
+      if (expression.includes("__oracleBrowseScopeReady")) {
+        return {
+          result: {
+            value: vm.runInNewContext(expression, {
+              document: {
+                querySelectorAll: () => anchors,
+              },
+              URL,
+              window: {
+                location: {
+                  href: projectUrl,
+                  origin: "https://chatgpt.com",
+                  pathname: "/g/team-space/project",
+                },
+              },
+            }),
+          },
+        };
+      }
+      return {
+        result: {
+          value: vm.runInNewContext(expression, {
+            document: {
+              querySelectorAll: (selector: string) => (selector.includes("/c/") ? anchors : []),
+            },
+            HTMLElement: MockHTMLElement,
+            URL,
+            window: {
+              location: {
+                href: projectUrl,
+                origin: "https://chatgpt.com",
+                pathname: "/g/team-space/project",
+              },
+            },
+          }),
         },
       };
     });
@@ -525,7 +688,7 @@ describe("supervisorThreads", () => {
       {
         kind: "thread",
         title: "In scope",
-        url: "https://chatgpt.com/g/team-space-oracle/c/right-thread",
+        url: "https://chatgpt.com/g/team-space/project/c/right-thread",
         conversationId: "right-thread",
         isActive: false,
       },
@@ -581,6 +744,80 @@ describe("supervisorThreads", () => {
         title: "Hidden project thread",
         url: "https://chatgpt.com/g/team-space/c/right-thread",
         conversationId: "right-thread",
+        isActive: false,
+      },
+    ]);
+  });
+
+  test("root browse entries reject url-less conversation ids from stale project DOM", async () => {
+    class MockHTMLElement {
+      constructor(
+        private readonly attrs: Record<string, string>,
+        readonly textContent: string,
+      ) {}
+      readonly classList = { contains: () => false };
+      closest() {
+        return this;
+      }
+      getAttribute(name: string) {
+        return this.attrs[name] ?? null;
+      }
+      getBoundingClientRect() {
+        return { width: 120, height: 20, x: 0, y: 0 };
+      }
+    }
+    const staleProjectRow = new MockHTMLElement(
+      { "data-conversation-id": "project-thread" },
+      "Project thread without URL",
+    );
+    const rootRow = new MockHTMLElement({ href: "/c/root-thread" }, "Root thread");
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("/backend-api/conversations")) {
+        return {
+          result: {
+            value: [
+              {
+                kind: "thread",
+                title: "Root thread",
+                url: "https://chatgpt.com/c/root-thread",
+                conversationId: "root-thread",
+              },
+            ],
+          },
+        };
+      }
+      return {
+        result: {
+          value: vm.runInNewContext(expression, {
+            document: {
+              querySelectorAll: (selector: string) => {
+                if (selector.includes("[data-conversation-id]")) return [staleProjectRow];
+                if (selector.includes("/c/")) return [rootRow];
+                return [];
+              },
+            },
+            HTMLElement: MockHTMLElement,
+            URL,
+            window: {
+              location: {
+                href: "https://chatgpt.com/",
+                origin: "https://chatgpt.com",
+              },
+            },
+          }),
+        },
+      };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    const entries = await listSupervisorBrowserEntries(runtime, { rootScope: true });
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Root thread",
+        url: "https://chatgpt.com/c/root-thread",
+        conversationId: "root-thread",
         isActive: false,
       },
     ]);

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import process from "node:process";
 import readline from "node:readline";
 import type { LaunchedChrome } from "chrome-launcher";
@@ -23,6 +24,7 @@ import {
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import {
   connectSupervisorRuntime,
+  createBrowserbaseSupervisorShellRuntime,
   releaseBrowserbaseSupervisorRuntimeSessions,
   resolveSupervisorRuntimeContext,
   type SupervisorRuntimeBrowserProvider,
@@ -49,6 +51,8 @@ export interface SupervisorBrokerRequest extends SupervisorPromptRequest {
   historyLimit?: number;
   browseScope?: "root" | "project";
   projectUrl?: string;
+  listOffset?: number;
+  listLimit?: number;
   shutdown?: boolean;
 }
 
@@ -101,8 +105,11 @@ const SUPERVISOR_RUNTIME_BOOTSTRAP_MODEL_STRATEGY = "select";
 const SUPERVISOR_CONVERSATION_RESPONSE_TIMEOUT_MS = 12_000;
 const SUPERVISOR_HISTORY_LIMIT_DEFAULT = 100;
 const SUPERVISOR_HISTORY_LIMIT_MAX = 200;
+const SUPERVISOR_THREAD_LIST_LIMIT_DEFAULT = 50;
+const SUPERVISOR_THREAD_LIST_LIMIT_MAX = 200;
 const SUPERVISOR_CHATGPT_URL_ENV = "ORACLE_SUPERVISOR_CHATGPT_URL";
 const CHATGPT_ROOT_URL = "https://chatgpt.com/";
+const SMARTY_ORACLE_BROWSERBASE_CONTEXT_ID_DEFAULT = "d9ef39cd-4db2-40f7-be9b-636062e23bcf";
 
 async function writeSupervisorBrokerResponseLine(response: unknown): Promise<void> {
   const line = `${JSON.stringify(response)}\n`;
@@ -127,6 +134,7 @@ interface SupervisorRuntimeDeps {
   resolveSupervisorRuntimeContext: typeof resolveSupervisorRuntimeContext;
   connectSupervisorRuntime: typeof connectSupervisorRuntime;
   withSupervisorRuntimeAttachLease: typeof withSupervisorRuntimeAttachLease;
+  createBrowserbaseSupervisorShellRuntime?: typeof createBrowserbaseSupervisorShellRuntime;
 }
 
 interface SupervisorRuntimeUseOptions {
@@ -147,6 +155,7 @@ const supervisorRuntimeDeps: SupervisorRuntimeDeps = {
   resolveSupervisorRuntimeContext,
   connectSupervisorRuntime,
   withSupervisorRuntimeAttachLease,
+  createBrowserbaseSupervisorShellRuntime,
 };
 
 function parseBooleanEnv(value: string | undefined): boolean | undefined {
@@ -163,9 +172,82 @@ function parseBooleanEnv(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
+type BrowserbaseEnvLoader = (env: NodeJS.ProcessEnv) => Partial<NodeJS.ProcessEnv>;
+
+function loadSmartyGlobalBrowserbaseEnv(env: NodeJS.ProcessEnv): Partial<NodeJS.ProcessEnv> {
+  if (!env.HOME?.trim()) {
+    return {};
+  }
+  const output = execFileSync(
+    "/bin/sh",
+    [
+      "-lc",
+      '. "$HOME/.config/smarty/global-oprun.sh" >/dev/null 2>&1 || true; printf "%s\\0%s\\0%s\\0" "${BROWSERBASE_API_KEY:-}" "${BROWSERBASE_PROJECT_ID:-}" "${BROWSERBASE_CONTEXT_ID:-}"',
+    ],
+    {
+      env: env as NodeJS.ProcessEnv,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    },
+  );
+  const [apiKey = "", projectId = "", contextId = ""] = output.toString("utf8").split("\0");
+  return {
+    BROWSERBASE_API_KEY: apiKey,
+    BROWSERBASE_PROJECT_ID: projectId,
+    BROWSERBASE_CONTEXT_ID: contextId,
+  };
+}
+
+function maybeHydrateSmartyGlobalBrowserbaseEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  loader: BrowserbaseEnvLoader = loadSmartyGlobalBrowserbaseEnv,
+): void {
+  if (parseBooleanEnv(env.ORACLE_BROWSERBASE_ENABLED) === false) {
+    return;
+  }
+  let apiKey = env.ORACLE_BROWSERBASE_API_KEY?.trim() || env.BROWSERBASE_API_KEY?.trim();
+  let projectId = env.ORACLE_BROWSERBASE_PROJECT_ID?.trim() || env.BROWSERBASE_PROJECT_ID?.trim();
+  let contextId = env.ORACLE_BROWSERBASE_CONTEXT_ID?.trim() || env.BROWSERBASE_CONTEXT_ID?.trim();
+
+  if (!apiKey || !projectId) {
+    try {
+      const loaded = loader(env);
+      apiKey =
+        apiKey || loaded.ORACLE_BROWSERBASE_API_KEY?.trim() || loaded.BROWSERBASE_API_KEY?.trim();
+      projectId =
+        projectId ||
+        loaded.ORACLE_BROWSERBASE_PROJECT_ID?.trim() ||
+        loaded.BROWSERBASE_PROJECT_ID?.trim();
+      contextId =
+        contextId ||
+        loaded.ORACLE_BROWSERBASE_CONTEXT_ID?.trim() ||
+        loaded.BROWSERBASE_CONTEXT_ID?.trim();
+      if (!env.BROWSERBASE_API_KEY && loaded.BROWSERBASE_API_KEY?.trim()) {
+        env.BROWSERBASE_API_KEY = loaded.BROWSERBASE_API_KEY;
+      }
+      if (!env.BROWSERBASE_PROJECT_ID && loaded.BROWSERBASE_PROJECT_ID?.trim()) {
+        env.BROWSERBASE_PROJECT_ID = loaded.BROWSERBASE_PROJECT_ID;
+      }
+      if (!env.BROWSERBASE_CONTEXT_ID && loaded.BROWSERBASE_CONTEXT_ID?.trim()) {
+        env.BROWSERBASE_CONTEXT_ID = loaded.BROWSERBASE_CONTEXT_ID;
+      }
+    } catch {
+      return;
+    }
+  }
+
+  if (!apiKey || !projectId) {
+    return;
+  }
+  env.ORACLE_BROWSERBASE_ENABLED = env.ORACLE_BROWSERBASE_ENABLED || "1";
+  env.ORACLE_BROWSERBASE_KEEP_ALIVE = env.ORACLE_BROWSERBASE_KEEP_ALIVE || "0";
+  env.ORACLE_BROWSERBASE_CONTEXT_ID = contextId || SMARTY_ORACLE_BROWSERBASE_CONTEXT_ID_DEFAULT;
+}
+
 function supervisorRuntimeBrowserProviderFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): SupervisorRuntimeBrowserProvider | undefined {
+  maybeHydrateSmartyGlobalBrowserbaseEnv(env);
   const browserbaseEnabled = parseBooleanEnv(env.ORACLE_BROWSERBASE_ENABLED);
   if (browserbaseEnabled === true) {
     return "browserbase";
@@ -680,20 +762,39 @@ async function ensureSupervisorRuntimeReady(
   runtimeDeps: SupervisorRuntimeDeps,
   promptRunner: NonNullable<SupervisorBrokerDeps["runPrompt"]>,
   options: SupervisorRuntimeUseOptions = {},
-): Promise<void> {
+): Promise<string | undefined> {
   if (request.followupSession?.trim()) {
-    return;
+    return undefined;
   }
   try {
     await runtimeDeps.resolveSupervisorRuntimeContext(undefined, options);
+    return undefined;
   } catch (error) {
     if (!isMissingSupervisorRuntimeError(error)) {
       throw error;
+    }
+    if (options.browserProvider === "browserbase") {
+      const projectUrl =
+        request.projectUrl?.trim() || process.env[SUPERVISOR_CHATGPT_URL_ENV]?.trim();
+      if (!projectUrl) {
+        throw new Error(
+          "Failed to bootstrap Oracle supervisor Browserbase runtime: projectUrl or ORACLE_SUPERVISOR_CHATGPT_URL is required.",
+        );
+      }
+      const runtime = await (
+        runtimeDeps.createBrowserbaseSupervisorShellRuntime ??
+        createBrowserbaseSupervisorShellRuntime
+      )({
+        projectUrl,
+        cwd: request.cwd,
+      });
+      return runtime.sessionId;
     }
     const bootstrap = await promptRunner(buildSupervisorRuntimeBootstrapRequest(request));
     if (!bootstrap.ok) {
       throw new Error(`Failed to bootstrap Oracle supervisor runtime: ${bootstrap.error}`);
     }
+    return undefined;
   }
 }
 
@@ -765,8 +866,33 @@ function brokerListBrowseOptions(
   return { ok: true, projectUrl, scopeUrl: projectUrl };
 }
 
+function brokerListDedicatedHiddenTargetUrl(
+  request: SupervisorBrokerRequest,
+  browseScope: "root" | "project",
+): string | undefined {
+  if (browseScope === "root") {
+    return CHATGPT_ROOT_URL;
+  }
+  const projectUrl = request.projectUrl?.trim() || process.env[SUPERVISOR_CHATGPT_URL_ENV]?.trim();
+  return isProjectUrl(projectUrl) ? projectUrl : undefined;
+}
+
 function conversationIdFromUrl(url?: string | null): string | undefined {
   return url?.match(/\/c\/([a-zA-Z0-9-]+)/)?.[1]?.trim() || undefined;
+}
+
+function normalizeListOffset(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(value));
+}
+
+function normalizeListLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return SUPERVISOR_THREAD_LIST_LIMIT_DEFAULT;
+  }
+  return Math.min(SUPERVISOR_THREAD_LIST_LIMIT_MAX, Math.max(1, Math.trunc(value)));
 }
 
 function isProjectConversationUrl(url?: string | null): boolean {
@@ -834,7 +960,17 @@ function localRootThreadFromSession(
   if (!conversationId) {
     return undefined;
   }
-  if (isProjectUrl(binding?.projectUrl) || isProjectConversationUrl(url)) {
+  const config = meta.browser?.config;
+  const hasProjectScopedConfig = [
+    config?.supervisorChatgptUrl,
+    config?.chatgptUrl,
+    config?.url,
+  ].some((value) => isProjectUrl(value));
+  if (
+    isProjectUrl(binding?.projectUrl) ||
+    hasProjectScopedConfig ||
+    isProjectConversationUrl(url)
+  ) {
     return undefined;
   }
   const threadUrl = isRootConversationUrl(url) ? url : `https://chatgpt.com/c/${conversationId}`;
@@ -897,23 +1033,33 @@ function dedupeSupervisorBrowserEntries(
 async function rootListThreadsWithLocalFallback(
   liveEntries: SupervisorBrowserEntry[],
   configuredProjectUrl?: string,
-  options: { forceLocalFallback?: boolean } = {},
+  options: {
+    allowLocalFallback?: boolean;
+    forceLocalFallback?: boolean;
+    offset?: number;
+    limit?: number;
+  } = {},
 ): Promise<SupervisorBrowserEntry[]> {
   const liveRootThreads = liveEntries.filter(
-    (entry) => entry.kind === "thread" && !isProjectConversationUrl(entry.url),
+    (entry) => entry.kind === "thread" && isRootConversationUrl(entry.url),
   );
   const projectEntries = liveEntries.filter((entry) => entry.kind === "project");
   const projectRow = supervisorProjectRow(configuredProjectUrl);
   const fallbackThreads =
-    options.forceLocalFallback || liveRootThreads.length === 0
+    options.allowLocalFallback === true &&
+    (options.forceLocalFallback || liveRootThreads.length === 0)
       ? await listLocalRootSupervisorThreads()
       : [];
-  return dedupeSupervisorBrowserEntries([
-    ...liveRootThreads,
-    ...fallbackThreads,
+  const sortedEntries = dedupeSupervisorBrowserEntries([
     ...(projectRow ? [projectRow] : []),
     ...projectEntries,
+    ...liveRootThreads,
+    ...fallbackThreads,
   ]);
+  const offset = normalizeListOffset(options.offset);
+  const limit =
+    options.limit === undefined ? sortedEntries.length : normalizeListLimit(options.limit);
+  return sortedEntries.slice(offset, offset + limit);
 }
 
 async function withChromeFocusProtection<T>(
@@ -948,10 +1094,15 @@ async function withSupervisorRuntime<T>(
   options: SupervisorRuntimeUseOptions = {},
 ): Promise<T> {
   const runtimeOptions = resolveSupervisorRuntimeUseOptions(options);
-  await ensureSupervisorRuntimeReady(request, runtimeDeps, promptRunner, runtimeOptions);
+  const readySessionId = await ensureSupervisorRuntimeReady(
+    request,
+    runtimeDeps,
+    promptRunner,
+    runtimeOptions,
+  );
   return await runtimeDeps.withSupervisorRuntimeAttachLease(supervisorChromeLogger, async () => {
     const context = await runtimeDeps.resolveSupervisorRuntimeContext(
-      request.followupSession,
+      request.followupSession ?? readySessionId,
       runtimeOptions,
     );
     return await withChromeFocusProtection(
@@ -1504,69 +1655,92 @@ export async function runSupervisorBrokerRequest(
     const operation = normalizeOperation(request);
     switch (operation) {
       case "run_prompt":
-        return promptRunner(request);
+        return await promptRunner(request);
       case "list_threads":
-        return (
+        return await (
           deps.listThreads ??
           (async (incoming: SupervisorBrokerRequest) => {
             const browseScope =
               incoming.browseScope ?? (incoming.projectUrl?.trim() ? "project" : "root");
-            const dedicatedHiddenTargetUrl =
-              browseScope === "root" ? CHATGPT_ROOT_URL : incoming.projectUrl?.trim();
-            return withSupervisorRuntime(
+            const dedicatedHiddenTargetUrl = brokerListDedicatedHiddenTargetUrl(
               incoming,
-              async ({ Runtime, sessionId }) => {
-                const meta = await sessionStore.readSession(sessionId);
-                const browseOptions = brokerListBrowseOptions(
-                  incoming,
-                  configuredSupervisorProjectUrl(meta),
-                );
-                if (!browseOptions.ok) {
-                  return { ok: false as const, error: browseOptions.error };
-                }
-                if (browseScope === "root") {
-                  let liveEntries: SupervisorBrowserEntry[] = [];
-                  let liveError: unknown;
-                  try {
-                    liveEntries = await listSupervisorBrowserEntries(Runtime, browseOptions);
-                  } catch (error) {
-                    liveError = error;
-                  }
-                  const threads = await rootListThreadsWithLocalFallback(
-                    liveEntries,
+              browseScope,
+            );
+            const listOffset = normalizeListOffset(incoming.listOffset);
+            const listLimit = normalizeListLimit(incoming.listLimit);
+            try {
+              return await withSupervisorRuntime(
+                incoming,
+                async ({ client, Runtime, sessionId }) => {
+                  const meta = await sessionStore.readSession(sessionId);
+                  const browseOptions = brokerListBrowseOptions(
+                    incoming,
                     configuredSupervisorProjectUrl(meta),
-                    { forceLocalFallback: liveError !== undefined },
                   );
-                  if (threads.length === 0 && liveError) {
-                    throw liveError;
+                  if (!browseOptions.ok) {
+                    return { ok: false as const, error: browseOptions.error };
                   }
-                  if (threads.length === 0) {
-                    throw new Error(
-                      "No Oracle supervisor root threads, local root sessions, or configured project rows were available.",
+                  if (browseScope === "root") {
+                    let liveEntries: SupervisorBrowserEntry[] = [];
+                    let liveError: unknown;
+                    try {
+                      liveEntries = await listSupervisorBrowserEntries(Runtime, {
+                        ...browseOptions,
+                        offset: 0,
+                        limit: listOffset + listLimit,
+                        client,
+                      });
+                    } catch (error) {
+                      liveError = error;
+                    }
+                    const threads = await rootListThreadsWithLocalFallback(
+                      liveEntries,
+                      configuredSupervisorProjectUrl(meta),
+                      {
+                        offset: listOffset,
+                        limit: listLimit,
+                      },
                     );
+                    if (threads.length === 0 && liveError) {
+                      throw liveError;
+                    }
+                    if (threads.length === 0) {
+                      throw new Error(
+                        "No Oracle supervisor root threads, local root sessions, or configured project rows were available.",
+                      );
+                    }
+                    return {
+                      ok: true as const,
+                      threads,
+                    };
                   }
                   return {
                     ok: true as const,
-                    threads,
+                    threads: await listSupervisorBrowserEntries(Runtime, {
+                      ...browseOptions,
+                      offset: listOffset,
+                      limit: listLimit,
+                      client,
+                    }),
                   };
-                }
-                return {
-                  ok: true as const,
-                  threads: await listSupervisorBrowserEntries(Runtime, browseOptions),
-                };
-              },
-              supervisorRuntimeDeps,
-              chromeFocusDeps,
-              promptRunner,
-              {
-                allowChatgptShellRecovery: browseScope === "root",
-                dedicatedHiddenTargetUrl,
-              },
-            );
+                },
+                supervisorRuntimeDeps,
+                chromeFocusDeps,
+                promptRunner,
+                {
+                  allowChatgptShellRecovery: Boolean(dedicatedHiddenTargetUrl),
+                  dedicatedHiddenTargetUrl,
+                },
+              );
+            } finally {
+              if (supervisorRuntimeBrowserProviderFromEnv() === "browserbase") {
+                await releaseBrowserbaseSupervisorRuntimesForBrokerShutdown();
+              }
+            }
           })
         )(request);
       case "new_thread":
-        return (
+        return await (
           deps.newThread ??
           (async (incoming: SupervisorBrokerRequest) =>
             withSupervisorRuntime(
@@ -1602,7 +1776,7 @@ export async function runSupervisorBrokerRequest(
           };
         }
         const dedicatedHiddenTargetUrl = request.threadUrl?.trim();
-        return (
+        return await (
           deps.attachThread ??
           (async (incoming: SupervisorBrokerRequest) =>
             withSupervisorRuntime(
@@ -1645,7 +1819,7 @@ export async function runSupervisorBrokerRequest(
           };
         }
         const dedicatedHiddenTargetUrl = request.threadUrl?.trim();
-        return (
+        return await (
           deps.threadHistory ??
           (async (incoming: SupervisorBrokerRequest) =>
             withSupervisorRuntime(
@@ -1751,6 +1925,7 @@ export async function startSupervisorBroker(): Promise<void> {
 
 export const __test__ = {
   buildSupervisorRuntimeBootstrapRequest,
+  brokerListDedicatedHiddenTargetUrl,
   brokerListBrowseOptions,
   configuredSupervisorProjectUrl,
   rootListThreadsWithLocalFallback,
@@ -1770,6 +1945,7 @@ export const __test__ = {
   selectProjectScopedHistoryFallback,
   isReusableSupervisorThreadSession,
   installSupervisorBrokerBrowserbaseReleaseCleanup,
+  maybeHydrateSmartyGlobalBrowserbaseEnv,
   releaseBrowserbaseSupervisorRuntimesForBrokerShutdown,
   supervisorBrokerSignalExitCode,
   supervisorThreadSessionSlug,

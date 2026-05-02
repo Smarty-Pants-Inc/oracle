@@ -84,6 +84,15 @@ function browserbaseRuntimeSession(
 }
 
 afterEach(() => {
+  vi.doUnmock("../../src/browser/browserbase.js");
+  vi.doUnmock("../../src/browser/chromeLifecycle.js");
+  vi.doUnmock("../../src/browser/cookies.js");
+  vi.doUnmock("../../src/browser/detect.js");
+  vi.doUnmock("../../src/browser/playwrightSupervisor.js");
+  vi.doUnmock("../../src/browser/profileState.js");
+  vi.doUnmock("../../src/sessionStore.js");
+  vi.doUnmock("chrome-remote-interface");
+  vi.doUnmock("node:fs/promises");
   vi.resetModules();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -452,8 +461,27 @@ describe("supervisorBrokerRuntime", () => {
   });
 
   test("uses Browserbase websocket target listing instead of local DevTools probing", async () => {
-    vi.stubEnv("ORACLE_BROWSERBASE_API_KEY", "");
-    vi.stubEnv("BROWSERBASE_API_KEY", "");
+    vi.resetModules();
+    vi.stubEnv("ORACLE_BROWSERBASE_API_KEY", "bb-test-key");
+    const getSession = vi.fn(async () => ({
+      id: "bb-browserbase",
+      projectId: "bb-project",
+      contextId: "bb-context",
+      status: "RUNNING" as const,
+      connectUrl: "wss://connect.browserbase.com/devtools/browser/bb-browserbase",
+    }));
+    vi.doMock("../../src/browser/browserbase.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/browserbase.js")>(
+        "../../src/browser/browserbase.js",
+      );
+      return {
+        ...original,
+        BrowserbaseClient: vi.fn().mockImplementation(function BrowserbaseClient() {
+          return { getSession };
+        }),
+      };
+    });
+    const { __test__: runtimeTest } = await import("../../src/cli/supervisorBrokerRuntime.js");
     const probe = vi.fn();
     const listTargets = vi.fn(async () => [
       {
@@ -463,7 +491,7 @@ describe("supervisorBrokerRuntime", () => {
       },
     ]);
 
-    const picked = await __test__.pickReachableRuntimeCandidate(
+    const picked = await runtimeTest.pickReachableRuntimeCandidate(
       [browserbaseRuntimeSession("browserbase", "completed", "2026-03-31T10:05:00.000Z")],
       probe,
       listTargets,
@@ -477,6 +505,172 @@ describe("supervisorBrokerRuntime", () => {
       port: 443,
       browserWSEndpoint: "wss://connect.browserbase.com/devtools/browser/bb-browserbase",
     });
+  });
+
+  test("seeds ChatGPT cookies before persisting a Browserbase supervisor shell", async () => {
+    vi.resetModules();
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "1");
+    vi.stubEnv("ORACLE_BROWSERBASE_API_KEY", "bb-test-key");
+    vi.stubEnv("ORACLE_BROWSERBASE_PROJECT_ID", "bb-project");
+    vi.stubEnv("ORACLE_BROWSERBASE_CONTEXT_ID", "bb-context");
+    const browserbaseCreateSession = vi.fn(async () => ({
+      id: "bb-shell",
+      projectId: "bb-project",
+      contextId: "bb-context",
+      status: "RUNNING" as const,
+      connectUrl: "wss://connect.browserbase.com/devtools/browser/bb-shell",
+    }));
+    const requestSessionRelease = vi.fn(async () => ({ id: "bb-shell", status: "COMPLETED" }));
+    const network = {
+      clearBrowserCookies: vi.fn(async () => ({})),
+      enable: vi.fn(async () => ({})),
+    };
+    const page = {
+      enable: vi.fn(async () => ({})),
+      navigate: vi.fn(async () => ({})),
+    };
+    const connection = {
+      client: { Network: network, Page: page },
+      close: vi.fn(async () => {}),
+      targetId: "shell-target",
+    };
+    const connectToRemoteChromeTarget = vi.fn(async () => connection);
+    const syncCookies = vi.fn(async () => 7);
+    const createOracleSession = vi.fn(async () => ({ id: "oracle-shell" }));
+    const updateSession = vi.fn(async () => ({ id: "oracle-shell" }));
+
+    vi.doMock("../../src/browser/browserbase.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/browserbase.js")>(
+        "../../src/browser/browserbase.js",
+      );
+      return {
+        ...original,
+        BrowserbaseClient: vi.fn().mockImplementation(function BrowserbaseClient() {
+          return { createSession: browserbaseCreateSession, requestSessionRelease };
+        }),
+      };
+    });
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      connectToRemoteChromeTarget,
+      getBrowserWebSocketDebuggerUrl: vi.fn(),
+      listRemoteChromeTargets: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/cookies.js", () => ({ syncCookies }));
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        createSession: createOracleSession,
+        updateSession,
+      },
+    }));
+    const { createBrowserbaseSupervisorShellRuntime } =
+      await import("../../src/cli/supervisorBrokerRuntime.js");
+
+    await createBrowserbaseSupervisorShellRuntime({
+      projectUrl: SUPERVISOR_PROJECT_URL,
+      cwd: "/repo",
+    });
+
+    expect(syncCookies).toHaveBeenCalledWith(
+      network,
+      SUPERVISOR_PROJECT_URL,
+      undefined,
+      expect.any(Function),
+      {
+        allowErrors: true,
+        filterNames: expect.arrayContaining([
+          "__Secure-next-auth.session-token.0",
+          "__Secure-next-auth.session-token.1",
+          "oai-client-auth-info",
+          "oai-sc",
+        ]),
+      },
+    );
+    expect(network.clearBrowserCookies).toHaveBeenCalledTimes(1);
+    expect(page.navigate).toHaveBeenCalledWith({ url: SUPERVISOR_PROJECT_URL });
+    expect(updateSession).toHaveBeenCalledWith(
+      "oracle-shell",
+      expect.objectContaining({
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            browserbaseSessionId: "bb-shell",
+            chromeTargetId: "shell-target",
+          }),
+        }),
+      }),
+    );
+    expect(requestSessionRelease).not.toHaveBeenCalled();
+  });
+
+  test("skips stale running Browserbase runtimes when the provider session is completed", async () => {
+    vi.resetModules();
+    vi.stubEnv("ORACLE_BROWSERBASE_API_KEY", "bb-test-key");
+    const meta = browserbaseRuntimeSession(
+      "browserbase-stale",
+      "running",
+      "2026-03-31T10:05:00.000Z",
+    );
+    meta.progress = {
+      stage: "browser",
+      message: "starting",
+      updatedAt: "2026-03-31T10:05:01.000Z",
+    };
+    meta.mode = "browser";
+    meta.browser!.runtime!.controllerPid = 999999999;
+    const updateSession = vi.fn(async (_sessionId: string, updates: Partial<SessionMetadata>) => ({
+      ...meta,
+      ...updates,
+    }));
+    const getSession = vi.fn(async () => ({
+      id: "bb-browserbase-stale",
+      projectId: "bb-project",
+      status: "COMPLETED" as const,
+    }));
+    const listTargets = vi.fn();
+
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        updateSession,
+      },
+    }));
+    vi.doMock("../../src/browser/browserbase.js", async () => {
+      const original = await vi.importActual<typeof import("../../src/browser/browserbase.js")>(
+        "../../src/browser/browserbase.js",
+      );
+      return {
+        ...original,
+        BrowserbaseClient: vi.fn().mockImplementation(function BrowserbaseClient() {
+          return { getSession };
+        }),
+      };
+    });
+    const { __test__ } = await import("../../src/cli/supervisorBrokerRuntime.js");
+    expect(
+      __test__.pickReusableRuntimeCandidate([meta], { browserProvider: "browserbase" })?.id,
+    ).toBe("browserbase-stale");
+
+    const picked = await __test__.pickReachableRuntimeCandidate([meta], vi.fn(), listTargets, {
+      browserProvider: "browserbase",
+    });
+
+    expect(picked).toBeUndefined();
+    expect(getSession).toHaveBeenCalledWith("bb-browserbase-stale");
+    expect(listTargets).not.toHaveBeenCalled();
+    expect(updateSession).toHaveBeenCalledWith(
+      "browserbase-stale",
+      expect.objectContaining({
+        status: "error",
+        errorMessage: expect.stringContaining("is COMPLETED"),
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            browserbaseKeepAlive: false,
+            chromeBrowserWSEndpoint: undefined,
+          }),
+        }),
+        progress: expect.objectContaining({
+          message: expect.stringContaining("is COMPLETED"),
+        }),
+      }),
+    );
   });
 
   test("accepts a reachable runtime when only duplicate identical project shell targets remain", async () => {
@@ -2264,7 +2458,10 @@ describe("supervisorBrokerRuntime", () => {
     vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
       connectPlaywrightSupervisor,
     }));
-    vi.doMock("node:fs/promises", () => ({ mkdir }));
+    vi.doMock("node:fs/promises", async () => {
+      const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      return { ...actual, default: { ...actual, mkdir }, mkdir };
+    });
 
     const { connectSupervisorRuntime } = await import("../../src/cli/supervisorBrokerRuntime.js");
 
@@ -2304,7 +2501,10 @@ describe("supervisorBrokerRuntime", () => {
     vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
       connectPlaywrightSupervisor,
     }));
-    vi.doMock("node:fs/promises", () => ({ mkdir }));
+    vi.doMock("node:fs/promises", async () => {
+      const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      return { ...actual, default: { ...actual, mkdir }, mkdir };
+    });
 
     const { __test__ } = await import("../../src/cli/supervisorBrokerRuntime.js");
     const result = await __test__.captureSupervisorRuntimeArtifacts(
@@ -2337,7 +2537,10 @@ describe("supervisorBrokerRuntime", () => {
     vi.doMock("../../src/browser/playwrightSupervisor.js", () => ({
       connectPlaywrightSupervisor,
     }));
-    vi.doMock("node:fs/promises", () => ({ mkdir }));
+    vi.doMock("node:fs/promises", async () => {
+      const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      return { ...actual, default: { ...actual, mkdir }, mkdir };
+    });
 
     const { __test__ } = await import("../../src/cli/supervisorBrokerRuntime.js");
     const result = await __test__.captureSupervisorRuntimeArtifacts(

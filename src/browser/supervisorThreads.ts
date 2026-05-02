@@ -42,6 +42,7 @@ const HISTORY_STABILITY_POLL_MS = 250;
 const HISTORY_STABILITY_TIMEOUT_MS = 4_000;
 const BROWSE_SCOPE_READY_TIMEOUT_MS = 30_000;
 const BROWSE_RUNTIME_EVALUATE_TIMEOUT_MS = 8_000;
+const ROOT_CONVERSATION_RESPONSE_TIMEOUT_MS = 12_000;
 
 export interface SupervisorThreadHistoryEntry {
   role: "user" | "assistant";
@@ -204,9 +205,214 @@ function isProjectConversationUrl(url?: string): boolean {
 function supervisorThreadMatchesRootScope(thread: SupervisorThreadInfo): boolean {
   const url = thread.url?.trim();
   if (!url) {
-    return true;
+    return false;
   }
   return isRootConversationUrl(url);
+}
+
+function normalizeRootConversationApiEntries(payload: unknown): SupervisorBrowserEntry[] {
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const arrays = [
+    record.items,
+    record.conversations,
+    record.history,
+    record.results,
+    Array.isArray(payload) ? payload : undefined,
+  ];
+  const items = arrays.find((value): value is unknown[] => Array.isArray(value)) ?? [];
+  return items
+    .filter((item) => item && typeof item === "object")
+    .filter((item) => {
+      const recordItem = item as Record<string, unknown>;
+      return (
+        !recordItem.project_id &&
+        !recordItem.projectId &&
+        !(recordItem.project as { id?: unknown })?.id
+      );
+    })
+    .map<SupervisorBrowserEntry | null>((item) => {
+      const recordItem = item as Record<string, unknown>;
+      const conversationId = String(
+        recordItem.id || recordItem.conversation_id || recordItem.conversationId || "",
+      ).trim();
+      if (!conversationId) {
+        return null;
+      }
+      return {
+        kind: "thread",
+        conversationId,
+        url: `https://chatgpt.com/c/${conversationId}`,
+        title:
+          String(recordItem.title || "")
+            .replace(/\s+/g, " ")
+            .trim() || "Untitled chat",
+        isActive: false,
+      };
+    })
+    .filter((entry): entry is SupervisorBrowserEntry => entry !== null);
+}
+
+async function listSupervisorRootConversationApiEntries(
+  Runtime: ChromeClient["Runtime"],
+  options: { limit: number },
+): Promise<SupervisorBrowserEntry[]> {
+  const limit = Math.min(200, Math.max(1, Math.trunc(options.limit)));
+  const response = await evaluateSupervisorBrowseRuntime(
+    Runtime,
+    {
+      expression: `(async () => {
+        const response = await fetch('/backend-api/conversations?offset=0&limit=${limit}&order=updated', {
+          credentials: 'include',
+        });
+        if (!response.ok) {
+          return [];
+        }
+        return await response.json().catch(() => null);
+      })()`,
+      returnByValue: true,
+      awaitPromise: true,
+    },
+    "listing ChatGPT root conversations",
+  );
+  return normalizeRootConversationApiEntries(response.result?.value)
+    .map((raw) => normalizeSupervisorBrowserEntry(raw))
+    .filter(
+      (value): value is SupervisorBrowserEntry =>
+        value !== null && value.kind === "thread" && supervisorThreadMatchesRootScope(value),
+    );
+}
+
+function isFrontendRootConversationResponseUrl(url: unknown): boolean {
+  if (typeof url !== "string" || !url.trim()) {
+    return false;
+  }
+  try {
+    const parsed = new URL(url, "https://chatgpt.com");
+    if (parsed.hostname !== "chatgpt.com" || parsed.pathname !== "/backend-api/conversations") {
+      return false;
+    }
+    return (
+      parsed.searchParams.get("order") === "updated" &&
+      parsed.searchParams.get("is_archived") === "false" &&
+      parsed.searchParams.get("is_starred") === "false"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requestHasChatgptClientHeaders(headers: unknown): boolean {
+  if (!headers || typeof headers !== "object") {
+    return false;
+  }
+  const names = Object.keys(headers as Record<string, unknown>).map((name) => name.toLowerCase());
+  return names.includes("x-oai-is") || names.includes("oai-client-version");
+}
+
+function removeSupervisorBrowserListener(
+  client: ChromeClient,
+  eventName: string,
+  listener: (params: object, sessionId?: string) => void,
+): void {
+  const emitter = client as unknown as {
+    off?: (event: string, callback: (params: object, sessionId?: string) => void) => void;
+    removeListener?: (
+      event: string,
+      callback: (params: object, sessionId?: string) => void,
+    ) => void;
+  };
+  if (typeof emitter.off === "function") {
+    emitter.off(eventName, listener);
+    return;
+  }
+  if (typeof emitter.removeListener === "function") {
+    emitter.removeListener(eventName, listener);
+  }
+}
+
+function startFrontendRootConversationCapture(
+  client: ChromeClient | undefined,
+): { promise: Promise<SupervisorBrowserEntry[]>; dispose: () => void } | null {
+  if (!client?.Network || typeof client.on !== "function") {
+    return null;
+  }
+  const trackedRequestIds = new Set<string>();
+  let settled = false;
+  let timer: NodeJS.Timeout;
+  let resolvePromise!: (entries: SupervisorBrowserEntry[]) => void;
+  const promise = new Promise<SupervisorBrowserEntry[]>((resolve) => {
+    resolvePromise = resolve;
+  });
+  const cleanup = () => {
+    clearTimeout(timer);
+    removeSupervisorBrowserListener(client, "Network.requestWillBeSent", requestListener);
+    removeSupervisorBrowserListener(client, "Network.loadingFinished", loadingFinishedListener);
+    removeSupervisorBrowserListener(client, "Network.loadingFailed", loadingFailedListener);
+  };
+  const settle = (entries: SupervisorBrowserEntry[]) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    cleanup();
+    resolvePromise(entries);
+  };
+  const requestListener = (params: object) => {
+    if (settled) {
+      return;
+    }
+    const request = (params as Record<string, unknown>).request as
+      | Record<string, unknown>
+      | undefined;
+    if (
+      request &&
+      isFrontendRootConversationResponseUrl(request.url) &&
+      requestHasChatgptClientHeaders(request.headers)
+    ) {
+      trackedRequestIds.add(String((params as Record<string, unknown>).requestId));
+    }
+  };
+  const loadingFinishedListener = (params: object) => {
+    if (settled) {
+      return;
+    }
+    const requestId = String((params as Record<string, unknown>).requestId);
+    if (!trackedRequestIds.has(requestId)) {
+      return;
+    }
+    void (async () => {
+      try {
+        const responseBody = await client.Network.getResponseBody({ requestId });
+        const bodyText = responseBody.base64Encoded
+          ? Buffer.from(responseBody.body || "", "base64").toString("utf8")
+          : String(responseBody.body || "");
+        const payload = JSON.parse(bodyText) as unknown;
+        const entries = normalizeRootConversationApiEntries(payload);
+        if (entries.length > 0) {
+          settle(entries);
+        }
+      } catch {
+        // Keep waiting for another frontend history response until the capture timeout.
+      }
+    })();
+  };
+  const loadingFailedListener = (params: object) => {
+    const requestId = String((params as Record<string, unknown>).requestId);
+    trackedRequestIds.delete(requestId);
+  };
+  timer = setTimeout(() => settle([]), ROOT_CONVERSATION_RESPONSE_TIMEOUT_MS);
+  client.on("Network.requestWillBeSent", requestListener);
+  client.on("Network.loadingFinished", loadingFinishedListener);
+  client.on("Network.loadingFailed", loadingFailedListener);
+  void client.Network.enable().catch(() => undefined);
+  return {
+    promise,
+    dispose: () => {
+      if (!settled) {
+        settle([]);
+      }
+    },
+  };
 }
 
 function normalizeSupervisorProjectUrl(url?: string): string | undefined {
@@ -352,7 +558,10 @@ async function waitForSupervisorBrowseScope(
           const rootConversationLinks = anchors.filter((path) => /^\\/c\\/[a-zA-Z0-9-]+$/i.test(path)).length;
           const browseLinks = anchors.filter((path) => /\\/c\\/[a-zA-Z0-9-]+$/i.test(path) || /^\\/g\\/[^/]+\\/project$/i.test(path)).length;
           const projectScopedLinks = projectId
-            ? anchors.filter((path) => path.startsWith('/g/' + projectId + '/c/')).length
+            ? anchors.filter((path) =>
+                path.startsWith('/g/' + projectId + '/c/') ||
+                path.startsWith('/g/' + projectId + '/project/c/')
+              ).length
             : 0;
           return { browseLinks, onScope, projectScopedLinks, rootConversationLinks };
         })()`,
@@ -367,10 +576,7 @@ async function waitForSupervisorBrowseScope(
       projectScopedLinks?: number;
       rootConversationLinks?: number;
     };
-    if (
-      value.onScope &&
-      (projectId ? (value.projectScopedLinks ?? 0) > 0 : (value.rootConversationLinks ?? 0) > 0)
-    ) {
+    if (value.onScope && (projectId ? (value.projectScopedLinks ?? 0) > 0 : true)) {
       return true;
     }
     if (Date.now() >= deadline) {
@@ -431,14 +637,17 @@ export async function listSupervisorBrowserEntries(
   Runtime: ChromeClient["Runtime"],
   options?: {
     limit?: number;
+    offset?: number;
     projectUrl?: string;
     includeProjects?: boolean;
     fallbackProjectUrl?: string;
     rootScope?: boolean;
     scopeUrl?: string;
     scopeReadyTimeoutMs?: number;
+    client?: ChromeClient;
   },
 ): Promise<SupervisorBrowserEntry[]> {
+  const requestedOffset = Math.max(0, Math.trunc(options?.offset ?? 0));
   const requestedLimit = Math.min(200, Math.max(1, options?.limit ?? 50));
   const projectUrl = options?.projectUrl;
   const includeProjects = options?.includeProjects === true;
@@ -446,33 +655,41 @@ export async function listSupervisorBrowserEntries(
   const rootScope = options?.rootScope === true;
   const limit =
     options?.limit === undefined && (projectUrl || includeProjects) ? 200 : requestedLimit;
+  const collectLimit = Math.min(200, requestedOffset + limit);
   const scopeUrl = normalizeProjectUrl(options?.scopeUrl) ?? options?.scopeUrl?.trim();
+  const rootConversationCapture = rootScope
+    ? startFrontendRootConversationCapture(options?.client)
+    : null;
   if (scopeUrl) {
-    await evaluateSupervisorBrowseRuntime(
-      Runtime,
-      {
-        expression: `(() => {
-          const target = ${JSON.stringify(scopeUrl)};
-          const normalize = (value) => {
-            try {
-              const parsed = new URL(value, window.location.origin);
-              parsed.search = '';
-              parsed.hash = '';
-              return parsed.toString().replace(/\\/+$/, '');
-            } catch {
-              return String(value || '').replace(/\\/+$/, '');
-            }
-          };
-          if (normalize(window.location.href || '') !== normalize(target)) {
-            window.location.assign(target);
-          }
-          return true;
-        })()`,
-        returnByValue: true,
-        awaitPromise: true,
-      },
-      "navigating ChatGPT browse scope",
-    );
+    if (rootConversationCapture && options?.client?.Page) {
+      await options.client.Page.navigate({ url: scopeUrl });
+    } else {
+      await evaluateSupervisorBrowseRuntime(
+        Runtime,
+        {
+          expression: `(() => {
+	            const target = ${JSON.stringify(scopeUrl)};
+	            const normalize = (value) => {
+	              try {
+	                const parsed = new URL(value, window.location.origin);
+	                parsed.search = '';
+	                parsed.hash = '';
+	                return parsed.toString().replace(/\\/+$/, '');
+	              } catch {
+	                return String(value || '').replace(/\\/+$/, '');
+	              }
+	            };
+	            if (normalize(window.location.href || '') !== normalize(target)) {
+	              window.location.assign(target);
+	            }
+	            return true;
+	          })()`,
+          returnByValue: true,
+          awaitPromise: true,
+        },
+        "navigating ChatGPT browse scope",
+      );
+    }
     const scopeReady = await waitForSupervisorBrowseScope(Runtime, {
       projectUrl,
       scopeUrl,
@@ -487,8 +704,9 @@ export async function listSupervisorBrowserEntries(
     Runtime,
     {
       expression: `(() => {
-      const limit = ${limit};
-      const includeProjects = ${includeProjects ? "true" : "false"};
+	      const limit = ${collectLimit};
+	      const includeProjects = ${includeProjects ? "true" : "false"};
+	      const collectThreadNodes = true;
       const fallbackProjectUrl = ${JSON.stringify(fallbackProjectUrl ?? "")};
       const toAbsolute = (href) => {
         if (!href) return '';
@@ -541,42 +759,44 @@ export async function listSupervisorBrowserEntries(
       const entries = [];
       const currentHref = window.location.href || '';
       const currentId = extractId(currentHref);
-      for (const node of nodes) {
-        const clickable = node.closest('a,button,[role="link"],[role="button"]') || node;
-        const hrefRaw =
-          clickable.getAttribute('href') ||
-          clickable.getAttribute('data-href') ||
-          clickable.getAttribute('data-url') ||
-          node.getAttribute('href') ||
-          node.getAttribute('data-href') ||
-          node.getAttribute('data-url') ||
-          '';
-        const href = toAbsolute(hrefRaw);
-        const hasConversationHref = href.includes('/c/');
-        const conversationId =
-          clickable.getAttribute('data-conversation-id') ||
-          node.getAttribute('data-conversation-id') ||
-          extractId(href);
-        if (!conversationId && !hasConversationHref) continue;
-        if (!isVisible(clickable) && !hasConversationHref) continue;
-        const title = (clickable.textContent || node.textContent || '').replace(/\\s+/g, ' ').trim();
-        const key = conversationId || href || title;
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        const isActive =
-          clickable.getAttribute('aria-current') === 'page' ||
-          clickable.getAttribute('aria-selected') === 'true' ||
-          clickable.classList.contains('active') ||
-          (conversationId && conversationId === currentId) ||
-          (href && href === currentHref);
-        entries.push({
-          kind: 'thread',
-          conversationId,
-          url: href,
-          title: title || 'Untitled chat',
-          isActive,
-        });
-        if (entries.length >= limit) break;
+      if (collectThreadNodes) {
+        for (const node of nodes) {
+          const clickable = node.closest('a,button,[role="link"],[role="button"]') || node;
+          const hrefRaw =
+            clickable.getAttribute('href') ||
+            clickable.getAttribute('data-href') ||
+            clickable.getAttribute('data-url') ||
+            node.getAttribute('href') ||
+            node.getAttribute('data-href') ||
+            node.getAttribute('data-url') ||
+            '';
+          const href = toAbsolute(hrefRaw);
+          const hasConversationHref = href.includes('/c/');
+          const conversationId =
+            clickable.getAttribute('data-conversation-id') ||
+            node.getAttribute('data-conversation-id') ||
+            extractId(href);
+          if (!conversationId && !hasConversationHref) continue;
+          if (!isVisible(clickable) && !hasConversationHref) continue;
+          const title = (clickable.textContent || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          const key = conversationId || href || title;
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          const isActive =
+            clickable.getAttribute('aria-current') === 'page' ||
+            clickable.getAttribute('aria-selected') === 'true' ||
+            clickable.classList.contains('active') ||
+            (conversationId && conversationId === currentId) ||
+            (href && href === currentHref);
+          entries.push({
+            kind: 'thread',
+            conversationId,
+            url: href,
+            title: title || 'Untitled chat',
+            isActive,
+          });
+          if (entries.length >= limit) break;
+        }
       }
       if (includeProjects && entries.length < limit) {
         const projectSelectors = [
@@ -619,7 +839,23 @@ export async function listSupervisorBrowserEntries(
     "listing ChatGPT browse entries",
   );
 
-  const rawEntries = Array.isArray(response.result?.value) ? response.result.value : [];
+  const capturedRootApiEntries = rootConversationCapture
+    ? await rootConversationCapture.promise
+    : [];
+  rootConversationCapture?.dispose();
+  const rootApiEntries = rootScope
+    ? [
+        ...capturedRootApiEntries,
+        ...(capturedRootApiEntries.length === 0
+          ? await listSupervisorRootConversationApiEntries(Runtime, { limit: collectLimit })
+          : []),
+      ]
+    : [];
+  const rawEntries = [
+    ...rootApiEntries,
+    ...(Array.isArray(response.result?.value) ? response.result.value : []),
+  ];
+  const seenEntries = new Set<string>();
   return rawEntries
     .map((raw) => normalizeSupervisorBrowserEntry(raw))
     .filter((value): value is SupervisorBrowserEntry => value !== null)
@@ -634,7 +870,18 @@ export async function listSupervisorBrowserEntries(
       (value) =>
         value.kind === "project" || Boolean(projectUrl) || !isProjectConversationUrl(value.url),
     )
-    .slice(0, limit);
+    .filter((value) => {
+      const key =
+        value.kind === "project"
+          ? `project:${normalizeSupervisorProjectUrl(value.projectUrl) ?? value.projectUrl}`
+          : `thread:${value.conversationId ?? value.url ?? value.title}`;
+      if (seenEntries.has(key)) {
+        return false;
+      }
+      seenEntries.add(key);
+      return true;
+    })
+    .slice(requestedOffset, requestedOffset + limit);
 }
 
 function normalizeHistoryLimit(limit?: number): number {

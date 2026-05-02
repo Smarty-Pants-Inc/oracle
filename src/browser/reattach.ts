@@ -235,9 +235,11 @@ async function refreshBrowserbaseRuntimeForReattach(
     );
   });
   const browserWSEndpoint = session.connectUrl?.trim();
-  if (!browserWSEndpoint) {
+  if (session.status !== "RUNNING" || !browserWSEndpoint) {
     throw new BrowserAutomationError(
-      "Browserbase keep-alive session did not return a CDP connectUrl.",
+      session.status === "RUNNING"
+        ? "Browserbase keep-alive session did not return a CDP connectUrl."
+        : `Browserbase keep-alive session is ${session.status} and can no longer be reattached.`,
       {
         stage: "browserbase-reattach-refresh",
         runtime: {

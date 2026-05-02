@@ -3,7 +3,9 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
+import type { BrowserSessionConfig } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
+import { readBrowserbaseEnvConfig } from "../browser/config.js";
 import {
   connectToRemoteChromeTarget,
   getBrowserWebSocketDebuggerUrl,
@@ -20,7 +22,12 @@ import {
   connectPlaywrightSupervisor,
   type PlaywrightSupervisorPageInfo,
 } from "../browser/playwrightSupervisor.js";
-import { BrowserbaseClient, type BrowserbaseClientOptions } from "../browser/browserbase.js";
+import {
+  BrowserbaseClient,
+  type BrowserbaseClientOptions,
+  type BrowserbaseSessionStatus,
+} from "../browser/browserbase.js";
+import { syncCookies } from "../browser/cookies.js";
 import {
   conversationHrefMatchesConfiguredScope,
   extractConversationIdFromUrl,
@@ -38,6 +45,33 @@ const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "brows
 const DEFAULT_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS = 30_000;
 const SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_ENV =
   "ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS";
+const BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS = 10 * 60_000;
+const BROWSERBASE_MIN_TIMEOUT_MS = 60_000;
+const BROWSERBASE_MAX_TIMEOUT_MS = 21_600_000;
+const BROWSERBASE_SUPERVISOR_COOKIE_NAMES = [
+  "__Host-next-auth.csrf-token",
+  "__Secure-next-auth.callback-url",
+  "__Secure-next-auth.session-token.0",
+  "__Secure-next-auth.session-token.1",
+  "__Secure-oai-is",
+  "__cf_bm",
+  "__cflb",
+  "_account_is_fedramp",
+  "_cfuvid",
+  "_puid",
+  "cf_clearance",
+  "country",
+  "locale",
+  "oai-chat-web-route",
+  "oai-client-auth-info",
+  "oai-default-model-config",
+  "oai-did",
+  "oai-gn",
+  "oai-hlib",
+  "oai-last-model-config",
+  "oai-ll",
+  "oai-sc",
+] as const;
 
 export interface SupervisorRuntimeContext {
   sessionId: string;
@@ -70,6 +104,13 @@ export interface BrowserbaseSupervisorRuntimeReleaseOptions {
   listSessions?: typeof sessionStore.listSessions;
   updateSession?: typeof sessionStore.updateSession;
   createClient?: (options: BrowserbaseClientOptions) => BrowserbaseReleaseClient;
+}
+
+export interface BrowserbaseSupervisorShellRuntimeOptions {
+  projectUrl: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  sessionSlug?: string;
 }
 
 interface SupervisorRuntimeArtifactCapture {
@@ -455,6 +496,195 @@ function releasedBrowserbaseRuntimeMetadata(
   };
 }
 
+function browserbaseTimeoutSeconds(timeoutMs: number | undefined): number {
+  const value = timeoutMs ?? BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS;
+  if (
+    !Number.isFinite(value) ||
+    value < BROWSERBASE_MIN_TIMEOUT_MS ||
+    value > BROWSERBASE_MAX_TIMEOUT_MS
+  ) {
+    return Math.ceil(BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS / 1000);
+  }
+  return Math.ceil(value / 1000);
+}
+
+function browserbaseSessionStatusIsTerminal(status: BrowserbaseSessionStatus | undefined): boolean {
+  return status === "COMPLETED" || status === "ERROR" || status === "TIMED_OUT";
+}
+
+async function markBrowserbaseSupervisorRuntimeUnavailable(
+  meta: SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } },
+  reason: string,
+): Promise<void> {
+  const updates: Partial<SessionMetadata> = {
+    browser: {
+      config: meta.browser.config,
+      runtime: releasedBrowserbaseRuntimeMetadata(meta.browser.runtime),
+    },
+  };
+  if (String(meta.status ?? "").toLowerCase() === "running") {
+    updates.status = "error";
+    updates.errorMessage = reason;
+    updates.completedAt = new Date().toISOString();
+    if (meta.progress) {
+      updates.progress = {
+        ...meta.progress,
+        message: reason,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  }
+  await sessionStore.updateSession(meta.id, updates).catch(() => undefined);
+}
+
+export async function createBrowserbaseSupervisorShellRuntime({
+  projectUrl,
+  cwd,
+  env = process.env,
+  sessionSlug = "oracle-supervisor-browserbase-shell",
+}: BrowserbaseSupervisorShellRuntimeOptions): Promise<SupervisorRuntimeContext> {
+  const normalizedProjectUrl = normalizeChatgptUrl(projectUrl, "https://chatgpt.com/");
+  if (!isProjectScopedChatgptUrl(normalizedProjectUrl, "https://chatgpt.com/")) {
+    throw new Error("Browserbase supervisor shell requires a project-scoped ChatGPT URL.");
+  }
+  const config = readBrowserbaseEnvConfig(env);
+  const apiKey = config?.apiKey?.trim();
+  if (config?.enabled !== true || !apiKey) {
+    throw new Error(
+      "Browserbase supervisor shell requires ORACLE_BROWSERBASE_ENABLED=1 and a Browserbase API key.",
+    );
+  }
+  const projectId = config.projectId?.trim() || undefined;
+  const contextId = config.contextId?.trim() || undefined;
+  const timeoutMs = config.timeoutMs ?? BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS;
+  const client = new BrowserbaseClient({ apiKey, projectId });
+  const session = await client.createSession({
+    projectId,
+    contextId,
+    persistContext: config.persist ?? true,
+    keepAlive: true,
+    timeout: browserbaseTimeoutSeconds(timeoutMs),
+    browserSettings: {
+      advancedStealth: config.stealth,
+      solveCaptchas: config.captcha,
+      viewport: config.viewport ?? undefined,
+    },
+    userMetadata: {
+      owner: "oracle",
+      client: "oracle-supervisor-broker",
+      purpose: "thread-browser",
+    },
+  });
+  const connectUrl = session.connectUrl?.trim();
+  if (!connectUrl) {
+    await client.requestSessionRelease(session.id, projectId).catch(() => undefined);
+    throw new Error("Browserbase did not return a CDP connectUrl for the supervisor shell.");
+  }
+  const endpoint = resolveBrowserbaseRuntimeEndpoint({
+    chromeBrowserWSEndpoint: connectUrl,
+  });
+  let targetId: string | undefined;
+  try {
+    const connection = await connectToRemoteChromeTarget(endpoint.host, endpoint.port, noopLogger, {
+      browserWSEndpoint: connectUrl,
+      targetUrl: normalizedProjectUrl,
+      closeTargetOnDispose: false,
+      createTargetOptions: {
+        hidden: true,
+        background: true,
+        focus: false,
+      },
+    });
+    targetId = connection.targetId;
+    await seedBrowserbaseSupervisorCookies(connection.client, normalizedProjectUrl);
+    await connection.close();
+  } catch (error) {
+    await client.requestSessionRelease(session.id, projectId).catch(() => undefined);
+    throw error;
+  }
+
+  const runtime: BrowserRuntimeMetadata = {
+    browserTransport: "cdp",
+    browserProvider: "browserbase",
+    browserbaseSessionId: session.id,
+    browserbaseProjectId: session.projectId ?? projectId,
+    browserbaseContextId: session.contextId ?? contextId,
+    browserbaseKeepAlive: true,
+    chromeBrowserWSEndpoint: connectUrl,
+    chromeHost: endpoint.host,
+    chromePort: endpoint.port,
+    chromeTargetId: targetId,
+    tabUrl: normalizedProjectUrl,
+  };
+  const browserConfig: BrowserSessionConfig = {
+    manualLogin: true,
+    keepBrowser: true,
+    attachRunning: false,
+    manualLoginProfileDir: null,
+    supervisorChatgptUrl: normalizedProjectUrl,
+    chatgptUrl: normalizedProjectUrl,
+    url: normalizedProjectUrl,
+    browserbase: {
+      enabled: true,
+      apiKey,
+      projectId,
+      contextId,
+      keepAlive: true,
+      timeoutMs,
+    },
+  };
+  const meta = await sessionStore.createSession(
+    {
+      prompt: "Oracle supervisor Browserbase thread-browser shell.",
+      model: "gpt-5.5",
+      mode: "browser",
+      slug: sessionSlug,
+      browserConfig,
+      waitPreference: true,
+    },
+    cwd?.trim() || process.cwd(),
+    { enabled: false, sound: false },
+    sessionSlug,
+  );
+  await sessionStore.updateSession(meta.id, {
+    status: "completed",
+    completedAt: new Date().toISOString(),
+    browser: {
+      config: browserConfig,
+      runtime,
+    },
+    progress: {
+      stage: "ready",
+      message: "Browserbase supervisor shell is ready for thread browsing.",
+      updatedAt: new Date().toISOString(),
+      tabUrl: normalizedProjectUrl,
+      chromeTargetId: targetId,
+    },
+    response: {
+      status: "completed",
+      assistantOutput: "READY",
+    },
+  });
+  return { sessionId: meta.id, runtime };
+}
+
+async function seedBrowserbaseSupervisorCookies(
+  client: ChromeClient,
+  projectUrl: string,
+): Promise<void> {
+  if (!client.Network || !client.Page) {
+    return;
+  }
+  await Promise.all([client.Network.enable({}), client.Page.enable()]);
+  // Persistent Browserbase contexts can accumulate stale copied cookies and trigger HTTP 431.
+  await client.Network.clearBrowserCookies?.();
+  await syncCookies(client.Network, projectUrl, undefined, noopLogger, {
+    allowErrors: true,
+    filterNames: [...BROWSERBASE_SUPERVISOR_COOKIE_NAMES],
+  });
+  await client.Page.navigate({ url: projectUrl });
+}
+
 export async function releaseBrowserbaseSupervisorRuntimeSessions(
   options: BrowserbaseSupervisorRuntimeReleaseOptions = {},
 ): Promise<number> {
@@ -535,24 +765,38 @@ async function refreshBrowserbaseSupervisorRuntime(
       "Refusing to attach supervisor controls: cached Browserbase supervisor runtime is missing conversation identity metadata.",
     );
   }
-  let runtime = meta.browser.runtime;
   const apiKey = browserbaseApiKeyForSupervisorRuntime(meta);
-  if (apiKey && runtime.browserbaseSessionId) {
-    const client = new BrowserbaseClient({
-      apiKey,
-      projectId:
-        runtime.browserbaseProjectId ?? meta.browser.config?.browserbase?.projectId ?? undefined,
-    });
-    const session = await client.getSession(runtime.browserbaseSessionId);
-    if (session.connectUrl?.trim()) {
-      runtime = {
-        ...runtime,
-        chromeBrowserWSEndpoint: session.connectUrl.trim(),
-        browserbaseProjectId: session.projectId ?? runtime.browserbaseProjectId,
-        browserbaseContextId: session.contextId ?? runtime.browserbaseContextId,
-      };
-    }
+  if (!apiKey) {
+    throw new Error(
+      "Browserbase supervisor runtime refresh requires BROWSERBASE_API_KEY or ORACLE_BROWSERBASE_API_KEY.",
+    );
   }
+  let runtime = meta.browser.runtime;
+  const browserbaseSessionId = runtime.browserbaseSessionId?.trim();
+  if (!browserbaseSessionId) {
+    throw new Error("Browserbase supervisor runtime is missing its Browserbase session id.");
+  }
+  const client = new BrowserbaseClient({
+    apiKey,
+    projectId:
+      runtime.browserbaseProjectId ?? meta.browser.config?.browserbase?.projectId ?? undefined,
+  });
+  const session = await client.getSession(browserbaseSessionId);
+  const connectUrl = session.connectUrl?.trim();
+  if (session.status !== "RUNNING" || !connectUrl) {
+    const status = session.status ?? "unknown";
+    const reason = browserbaseSessionStatusIsTerminal(session.status)
+      ? `Browserbase supervisor session ${browserbaseSessionId} is ${status}; cached runtime is no longer attachable.`
+      : `Browserbase supervisor session ${browserbaseSessionId} is ${status} without a CDP connectUrl; cached runtime is not attachable yet.`;
+    await markBrowserbaseSupervisorRuntimeUnavailable(meta, reason);
+    throw new Error(reason);
+  }
+  runtime = {
+    ...runtime,
+    chromeBrowserWSEndpoint: connectUrl,
+    browserbaseProjectId: session.projectId ?? runtime.browserbaseProjectId,
+    browserbaseContextId: session.contextId ?? runtime.browserbaseContextId,
+  };
   const endpoint = resolveBrowserbaseRuntimeEndpoint(runtime);
   return {
     ...runtime,
@@ -1388,6 +1632,7 @@ export async function connectSupervisorRuntime(
 
 export const __test__ = {
   captureSupervisorRuntimeArtifacts,
+  createBrowserbaseSupervisorShellRuntime,
   isBrowserbaseSupervisorRuntime,
   isReleasableBrowserbaseSupervisorRuntime,
   isOwnedSupervisorRuntime,

@@ -1,4 +1,5 @@
 const DEFAULT_BROWSERBASE_API_URL = "https://api.browserbase.com/v1";
+const DEFAULT_BROWSERBASE_API_TIMEOUT_MS = 30_000;
 
 type Fetcher = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -13,6 +14,7 @@ export interface BrowserbaseClientOptions {
   projectId?: string;
   apiUrl?: string;
   fetcher?: Fetcher;
+  requestTimeoutMs?: number;
 }
 
 export interface BrowserbaseContext {
@@ -86,6 +88,7 @@ export class BrowserbaseClient {
   private readonly projectId?: string;
   private readonly apiUrl: string;
   private readonly fetcher: Fetcher;
+  private readonly requestTimeoutMs: number;
 
   constructor(options: BrowserbaseClientOptions = {}) {
     const apiKey = options.apiKey ?? process.env.BROWSERBASE_API_KEY;
@@ -96,6 +99,7 @@ export class BrowserbaseClient {
     this.projectId = options.projectId ?? process.env.BROWSERBASE_PROJECT_ID;
     this.apiUrl = (options.apiUrl ?? DEFAULT_BROWSERBASE_API_URL).replace(/\/+$/, "");
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+    this.requestTimeoutMs = normalizeRequestTimeoutMs(options.requestTimeoutMs);
   }
 
   async createContext(options: { projectId?: string } = {}): Promise<BrowserbaseContext> {
@@ -144,27 +148,69 @@ export class BrowserbaseClient {
     path: string,
     options: { method?: string; body?: JsonRecord } = {},
   ): Promise<T> {
-    const response = await this.fetcher(`${this.apiUrl}/${path}`, {
-      method: options.method ?? "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "X-BB-API-Key": this.apiKey,
+    const url = `${this.apiUrl}/${path}`;
+    return await withBrowserbaseApiTimeout(
+      async (signal) => {
+        const response = await this.fetcher(url, {
+          method: options.method ?? "GET",
+          headers: {
+            "Content-Type": "application/json",
+            "X-BB-API-Key": this.apiKey,
+          },
+          body: options.body ? JSON.stringify(stripUndefined(options.body)) : undefined,
+          signal,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          const suffix = body ? `: ${body}` : "";
+          throw new BrowserbaseError(
+            `Browserbase API request failed: ${response.status}${suffix}`,
+            response.status,
+            body,
+          );
+        }
+        if (response.status === 204) {
+          return undefined as T;
+        }
+        return (await response.json()) as T;
       },
-      body: options.body ? JSON.stringify(stripUndefined(options.body)) : undefined,
-    });
-    if (!response.ok) {
-      const body = await response.text();
-      const suffix = body ? `: ${body}` : "";
-      throw new BrowserbaseError(
-        `Browserbase API request failed: ${response.status}${suffix}`,
-        response.status,
-        body,
-      );
+      this.requestTimeoutMs,
+      url,
+    );
+  }
+}
+
+function normalizeRequestTimeoutMs(value: number | undefined): number {
+  if (!Number.isFinite(value) || (value ?? 0) <= 0) {
+    return DEFAULT_BROWSERBASE_API_TIMEOUT_MS;
+  }
+  return Math.trunc(value as number);
+}
+
+async function withBrowserbaseApiTimeout<T>(
+  task: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  url: string,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutError = new Error(
+    `Browserbase API request to ${url} timed out after ${timeoutMs}ms.`,
+  );
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      task(controller.signal),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(timeoutError);
+          controller.abort(timeoutError);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
     }
-    if (response.status === 204) {
-      return undefined as T;
-    }
-    return (await response.json()) as T;
   }
 }
 

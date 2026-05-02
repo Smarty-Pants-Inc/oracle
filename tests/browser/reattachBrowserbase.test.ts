@@ -57,6 +57,7 @@ describe("Browserbase reattach recovery", () => {
           id: "bb-session-1",
           projectId: "bb-project-1",
           contextId: "bb-context-1",
+          status: "RUNNING",
           connectUrl: refreshedConnectUrl,
         },
       });
@@ -150,6 +151,7 @@ async function loadReattachWithLaunchGuard(options?: {
     id: string;
     projectId?: string;
     contextId?: string;
+    status?: "PENDING" | "RUNNING" | "ERROR" | "TIMED_OUT" | "COMPLETED";
     connectUrl?: string;
   };
 }) {
