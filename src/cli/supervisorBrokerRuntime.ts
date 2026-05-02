@@ -3,7 +3,9 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
+import type { BrowserSessionConfig } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
+import { readBrowserbaseEnvConfig } from "../browser/config.js";
 import {
   connectToRemoteChromeTarget,
   getBrowserWebSocketDebuggerUrl,
@@ -21,6 +23,12 @@ import {
   type PlaywrightSupervisorPageInfo,
 } from "../browser/playwrightSupervisor.js";
 import {
+  BrowserbaseClient,
+  type BrowserbaseClientOptions,
+  type BrowserbaseSessionStatus,
+} from "../browser/browserbase.js";
+import { syncCookies } from "../browser/cookies.js";
+import {
   conversationHrefMatchesConfiguredScope,
   extractConversationIdFromUrl,
   isAttachableChatTarget,
@@ -37,6 +45,33 @@ const SUPERVISOR_BROWSER_PROFILE_DIR = path.join(os.homedir(), ".oracle", "brows
 const DEFAULT_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS = 30_000;
 const SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_ENV =
   "ORACLE_SUPERVISOR_RUNTIME_CDP_COMMAND_TIMEOUT_MS";
+const BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS = 10 * 60_000;
+const BROWSERBASE_MIN_TIMEOUT_MS = 60_000;
+const BROWSERBASE_MAX_TIMEOUT_MS = 21_600_000;
+const BROWSERBASE_SUPERVISOR_COOKIE_NAMES = [
+  "__Host-next-auth.csrf-token",
+  "__Secure-next-auth.callback-url",
+  "__Secure-next-auth.session-token.0",
+  "__Secure-next-auth.session-token.1",
+  "__Secure-oai-is",
+  "__cf_bm",
+  "__cflb",
+  "_account_is_fedramp",
+  "_cfuvid",
+  "_puid",
+  "cf_clearance",
+  "country",
+  "locale",
+  "oai-chat-web-route",
+  "oai-client-auth-info",
+  "oai-default-model-config",
+  "oai-did",
+  "oai-gn",
+  "oai-hlib",
+  "oai-last-model-config",
+  "oai-ll",
+  "oai-sc",
+] as const;
 
 export interface SupervisorRuntimeContext {
   sessionId: string;
@@ -52,12 +87,31 @@ export interface SupervisorRuntimeConnection {
   persistTargetId?: boolean;
 }
 
+export type SupervisorRuntimeBrowserProvider = "local-hidden" | "browserbase";
+
 export interface SupervisorRuntimeReuseOptions {
   allowChatgptShellRecovery?: boolean;
   dedicatedHiddenTargetUrl?: string;
+  browserProvider?: SupervisorRuntimeBrowserProvider;
 }
 
 type SupervisorRuntimeArtifactStage = "attach-failure" | "recover-failure";
+export type BrowserbaseReleaseClient = Pick<BrowserbaseClient, "requestSessionRelease">;
+
+export interface BrowserbaseSupervisorRuntimeReleaseOptions {
+  env?: NodeJS.ProcessEnv;
+  log?: (message?: string) => void;
+  listSessions?: typeof sessionStore.listSessions;
+  updateSession?: typeof sessionStore.updateSession;
+  createClient?: (options: BrowserbaseClientOptions) => BrowserbaseReleaseClient;
+}
+
+export interface BrowserbaseSupervisorShellRuntimeOptions {
+  projectUrl: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  sessionSlug?: string;
+}
 
 interface SupervisorRuntimeArtifactCapture {
   pages: PlaywrightSupervisorPageInfo[];
@@ -261,13 +315,74 @@ function isOwnedSupervisorRuntime(meta: SessionMetadata): meta is SessionMetadat
   );
 }
 
+function isBrowserbaseSupervisorRuntime(meta: SessionMetadata): meta is SessionMetadata & {
+  browser: {
+    runtime: BrowserRuntimeMetadata;
+    config?: NonNullable<SessionMetadata["browser"]>["config"];
+  };
+} {
+  if (!hasReusableRuntime(meta)) {
+    return false;
+  }
+  const runtime = meta.browser.runtime;
+  return Boolean(
+    runtime.browserProvider === "browserbase" &&
+    runtime.browserbaseSessionId?.trim() &&
+    runtime.browserbaseKeepAlive === true &&
+    runtime.chromeBrowserWSEndpoint?.trim() &&
+    configuredSupervisorScopeUrl(meta),
+  );
+}
+
+function isReleasableBrowserbaseSupervisorRuntime(
+  meta: SessionMetadata,
+): meta is SessionMetadata & {
+  browser: {
+    runtime: BrowserRuntimeMetadata;
+    config?: NonNullable<SessionMetadata["browser"]>["config"];
+  };
+} {
+  if (!hasReusableRuntime(meta)) {
+    return false;
+  }
+  const runtime = meta.browser.runtime;
+  return Boolean(
+    runtime.browserProvider === "browserbase" &&
+    runtime.browserbaseSessionId?.trim() &&
+    runtime.browserbaseKeepAlive === true &&
+    configuredSupervisorScopeUrl(meta),
+  );
+}
+
+function supervisorRuntimeProvider(
+  options: SupervisorRuntimeReuseOptions = {},
+): SupervisorRuntimeBrowserProvider {
+  return options.browserProvider ?? "local-hidden";
+}
+
+function supervisorRuntimeProviderDescription(options: SupervisorRuntimeReuseOptions = {}): string {
+  return supervisorRuntimeProvider(options) === "browserbase"
+    ? "Oracle supervisor browserbase runtime"
+    : "Oracle-owned hidden browser runtime";
+}
+
+function isSupervisorRuntimeForProvider(
+  meta: SessionMetadata,
+  options: SupervisorRuntimeReuseOptions = {},
+): meta is SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } } {
+  return supervisorRuntimeProvider(options) === "browserbase"
+    ? isBrowserbaseSupervisorRuntime(meta)
+    : isOwnedSupervisorRuntime(meta);
+}
+
 function sortReusableRuntimeCandidates(
   metas: SessionMetadata[],
+  options: SupervisorRuntimeReuseOptions = {},
 ): (SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } })[] {
   return metas
     .filter(
       (meta): meta is SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } } =>
-        isOwnedSupervisorRuntime(meta) && supervisorRuntimeIsReusableNow(meta),
+        isSupervisorRuntimeForProvider(meta, options) && supervisorRuntimeIsReusableNow(meta),
     )
     .sort(
       (left, right) =>
@@ -280,13 +395,15 @@ function sortReusableRuntimeCandidates(
 
 function pickReusableRuntimeCandidate(
   metas: SessionMetadata[],
+  options: SupervisorRuntimeReuseOptions = {},
 ): (SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } }) | undefined {
-  return sortReusableRuntimeCandidates(metas)[0];
+  return sortReusableRuntimeCandidates(metas, options)[0];
 }
 
 async function resolveMutableSupervisorRuntimeAnchorSessionId(
   meta: SessionMetadata,
   readSession: typeof sessionStore.readSession = sessionStore.readSession.bind(sessionStore),
+  options: SupervisorRuntimeReuseOptions = {},
 ): Promise<string> {
   let current = meta;
   const visited = new Set<string>();
@@ -315,9 +432,9 @@ async function resolveMutableSupervisorRuntimeAnchorSessionId(
         `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} was not found.`,
       );
     }
-    if (!hasReusableRuntime(parent) || !isOwnedSupervisorRuntime(parent)) {
+    if (!hasReusableRuntime(parent) || !isSupervisorRuntimeForProvider(parent, options)) {
       throw new Error(
-        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} is not a reusable Oracle-owned hidden runtime.`,
+        `Session ${currentId} is bound to Oracle conversation ${current.supervisorThread.conversationId} but parent session ${parentSessionId} is not a reusable ${supervisorRuntimeProviderDescription(options)}.`,
       );
     }
     if (!supervisorRuntimeIsReusableNow(parent)) {
@@ -328,6 +445,368 @@ async function resolveMutableSupervisorRuntimeAnchorSessionId(
     current = parent;
   }
   return current.id;
+}
+
+function resolveBrowserbaseRuntimeEndpoint(runtime: BrowserRuntimeMetadata): {
+  host: string;
+  port: number;
+  browserWSEndpoint: string;
+} {
+  const browserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
+  if (!browserWSEndpoint) {
+    throw new Error("Browserbase supervisor runtime is missing its browser websocket endpoint.");
+  }
+  try {
+    const parsed = new URL(browserWSEndpoint);
+    return {
+      host: runtime.chromeHost ?? parsed.hostname,
+      port: runtime.chromePort ?? (parsed.port ? Number.parseInt(parsed.port, 10) : 443),
+      browserWSEndpoint,
+    };
+  } catch {
+    return {
+      host: runtime.chromeHost ?? "connect.browserbase.com",
+      port: runtime.chromePort ?? 443,
+      browserWSEndpoint,
+    };
+  }
+}
+
+function browserbaseApiKeyForSupervisorRuntime(
+  meta: SessionMetadata,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const configured = meta.browser?.config?.browserbase?.apiKey?.trim();
+  if (configured && configured !== "[redacted]") {
+    return configured;
+  }
+  return env.ORACLE_BROWSERBASE_API_KEY?.trim() || env.BROWSERBASE_API_KEY?.trim() || undefined;
+}
+
+function releasedBrowserbaseRuntimeMetadata(
+  runtime: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  return {
+    ...runtime,
+    browserbaseKeepAlive: false,
+    chromeBrowserWSEndpoint: undefined,
+    chromeHost: undefined,
+    chromePort: undefined,
+    chromeTargetId: undefined,
+  };
+}
+
+function browserbaseTimeoutSeconds(timeoutMs: number | undefined): number {
+  const value = timeoutMs ?? BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS;
+  if (
+    !Number.isFinite(value) ||
+    value < BROWSERBASE_MIN_TIMEOUT_MS ||
+    value > BROWSERBASE_MAX_TIMEOUT_MS
+  ) {
+    return Math.ceil(BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS / 1000);
+  }
+  return Math.ceil(value / 1000);
+}
+
+function browserbaseSessionStatusIsTerminal(status: BrowserbaseSessionStatus | undefined): boolean {
+  return status === "COMPLETED" || status === "ERROR" || status === "TIMED_OUT";
+}
+
+async function markBrowserbaseSupervisorRuntimeUnavailable(
+  meta: SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } },
+  reason: string,
+): Promise<void> {
+  const updates: Partial<SessionMetadata> = {
+    browser: {
+      config: meta.browser.config,
+      runtime: releasedBrowserbaseRuntimeMetadata(meta.browser.runtime),
+    },
+  };
+  if (String(meta.status ?? "").toLowerCase() === "running") {
+    updates.status = "error";
+    updates.errorMessage = reason;
+    updates.completedAt = new Date().toISOString();
+    if (meta.progress) {
+      updates.progress = {
+        ...meta.progress,
+        message: reason,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  }
+  await sessionStore.updateSession(meta.id, updates).catch(() => undefined);
+}
+
+export async function createBrowserbaseSupervisorShellRuntime({
+  projectUrl,
+  cwd,
+  env = process.env,
+  sessionSlug = "oracle-supervisor-browserbase-shell",
+}: BrowserbaseSupervisorShellRuntimeOptions): Promise<SupervisorRuntimeContext> {
+  const normalizedProjectUrl = normalizeChatgptUrl(projectUrl, "https://chatgpt.com/");
+  if (!isProjectScopedChatgptUrl(normalizedProjectUrl, "https://chatgpt.com/")) {
+    throw new Error("Browserbase supervisor shell requires a project-scoped ChatGPT URL.");
+  }
+  const config = readBrowserbaseEnvConfig(env);
+  const apiKey = config?.apiKey?.trim();
+  if (config?.enabled !== true || !apiKey) {
+    throw new Error(
+      "Browserbase supervisor shell requires ORACLE_BROWSERBASE_ENABLED=1 and a Browserbase API key.",
+    );
+  }
+  const projectId = config.projectId?.trim() || undefined;
+  const contextId = config.contextId?.trim() || undefined;
+  const timeoutMs = config.timeoutMs ?? BROWSERBASE_SUPERVISOR_SHELL_TIMEOUT_MS;
+  const client = new BrowserbaseClient({ apiKey, projectId });
+  const session = await client.createSession({
+    projectId,
+    contextId,
+    persistContext: config.persist ?? true,
+    keepAlive: true,
+    timeout: browserbaseTimeoutSeconds(timeoutMs),
+    browserSettings: {
+      advancedStealth: config.stealth,
+      solveCaptchas: config.captcha,
+      viewport: config.viewport ?? undefined,
+    },
+    userMetadata: {
+      owner: "oracle",
+      client: "oracle-supervisor-broker",
+      purpose: "thread-browser",
+    },
+  });
+  const connectUrl = session.connectUrl?.trim();
+  if (!connectUrl) {
+    await client.requestSessionRelease(session.id, projectId).catch(() => undefined);
+    throw new Error("Browserbase did not return a CDP connectUrl for the supervisor shell.");
+  }
+  const endpoint = resolveBrowserbaseRuntimeEndpoint({
+    chromeBrowserWSEndpoint: connectUrl,
+  });
+  let targetId: string | undefined;
+  try {
+    const connection = await connectToRemoteChromeTarget(endpoint.host, endpoint.port, noopLogger, {
+      browserWSEndpoint: connectUrl,
+      targetUrl: normalizedProjectUrl,
+      closeTargetOnDispose: false,
+      createTargetOptions: {
+        hidden: true,
+        background: true,
+        focus: false,
+      },
+    });
+    targetId = connection.targetId;
+    await seedBrowserbaseSupervisorCookies(connection.client, normalizedProjectUrl);
+    await connection.close();
+  } catch (error) {
+    await client.requestSessionRelease(session.id, projectId).catch(() => undefined);
+    throw error;
+  }
+
+  const runtime: BrowserRuntimeMetadata = {
+    browserTransport: "cdp",
+    browserProvider: "browserbase",
+    browserbaseSessionId: session.id,
+    browserbaseProjectId: session.projectId ?? projectId,
+    browserbaseContextId: session.contextId ?? contextId,
+    browserbaseKeepAlive: true,
+    chromeBrowserWSEndpoint: connectUrl,
+    chromeHost: endpoint.host,
+    chromePort: endpoint.port,
+    chromeTargetId: targetId,
+    tabUrl: normalizedProjectUrl,
+  };
+  const browserConfig: BrowserSessionConfig = {
+    manualLogin: true,
+    keepBrowser: true,
+    attachRunning: false,
+    manualLoginProfileDir: null,
+    supervisorChatgptUrl: normalizedProjectUrl,
+    chatgptUrl: normalizedProjectUrl,
+    url: normalizedProjectUrl,
+    browserbase: {
+      enabled: true,
+      apiKey,
+      projectId,
+      contextId,
+      keepAlive: true,
+      timeoutMs,
+    },
+  };
+  const meta = await sessionStore.createSession(
+    {
+      prompt: "Oracle supervisor Browserbase thread-browser shell.",
+      model: "gpt-5.5",
+      mode: "browser",
+      slug: sessionSlug,
+      browserConfig,
+      waitPreference: true,
+    },
+    cwd?.trim() || process.cwd(),
+    { enabled: false, sound: false },
+    sessionSlug,
+  );
+  await sessionStore.updateSession(meta.id, {
+    status: "completed",
+    completedAt: new Date().toISOString(),
+    browser: {
+      config: browserConfig,
+      runtime,
+    },
+    progress: {
+      stage: "ready",
+      message: "Browserbase supervisor shell is ready for thread browsing.",
+      updatedAt: new Date().toISOString(),
+      tabUrl: normalizedProjectUrl,
+      chromeTargetId: targetId,
+    },
+    response: {
+      status: "completed",
+      assistantOutput: "READY",
+    },
+  });
+  return { sessionId: meta.id, runtime };
+}
+
+async function seedBrowserbaseSupervisorCookies(
+  client: ChromeClient,
+  projectUrl: string,
+): Promise<void> {
+  if (!client.Network || !client.Page) {
+    return;
+  }
+  await Promise.all([client.Network.enable({}), client.Page.enable()]);
+  // Persistent Browserbase contexts can accumulate stale copied cookies and trigger HTTP 431.
+  await client.Network.clearBrowserCookies?.();
+  await syncCookies(client.Network, projectUrl, undefined, noopLogger, {
+    allowErrors: true,
+    filterNames: [...BROWSERBASE_SUPERVISOR_COOKIE_NAMES],
+  });
+  await client.Page.navigate({ url: projectUrl });
+}
+
+export async function releaseBrowserbaseSupervisorRuntimeSessions(
+  options: BrowserbaseSupervisorRuntimeReleaseOptions = {},
+): Promise<number> {
+  const env = options.env ?? process.env;
+  const log = options.log ?? noopLogger;
+  const listSessions = options.listSessions ?? sessionStore.listSessions.bind(sessionStore);
+  const updateSession = options.updateSession ?? sessionStore.updateSession.bind(sessionStore);
+  const createClient =
+    options.createClient ??
+    ((clientOptions: BrowserbaseClientOptions) => new BrowserbaseClient(clientOptions));
+  let released = 0;
+  let metas: SessionMetadata[];
+  try {
+    metas = await listSessions();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`Failed to list Oracle sessions before Browserbase supervisor release: ${message}`);
+    return 0;
+  }
+  for (const meta of metas) {
+    if (!isReleasableBrowserbaseSupervisorRuntime(meta)) {
+      continue;
+    }
+    const runtime = meta.browser.runtime;
+    const browserbaseSessionId = runtime.browserbaseSessionId?.trim();
+    if (!browserbaseSessionId) {
+      continue;
+    }
+    const apiKey = browserbaseApiKeyForSupervisorRuntime(meta, env);
+    if (!apiKey) {
+      log(
+        `Skipping Browserbase supervisor session release for ${browserbaseSessionId}: API key is unavailable.`,
+      );
+      continue;
+    }
+    const projectId =
+      runtime.browserbaseProjectId ?? meta.browser.config?.browserbase?.projectId ?? undefined;
+    const client = createClient({ apiKey, projectId });
+    try {
+      await client.requestSessionRelease(browserbaseSessionId, projectId);
+      await updateSession(meta.id, {
+        browser: {
+          config: meta.browser.config,
+          runtime: releasedBrowserbaseRuntimeMetadata(runtime),
+        },
+      });
+      released += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Failed to release Browserbase supervisor session ${browserbaseSessionId}: ${message}`);
+    }
+  }
+  return released;
+}
+
+async function refreshBrowserbaseSupervisorRuntime(
+  meta: SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } },
+  options: SupervisorRuntimeReuseOptions = {},
+): Promise<BrowserRuntimeMetadata> {
+  if (!isBrowserbaseSupervisorRuntime(meta)) {
+    throw new Error(
+      "Refusing to attach supervisor controls to a browser runtime that is not an Oracle-owned Browserbase supervisor session.",
+    );
+  }
+  const configuredProjectUrl = configuredSupervisorScopeUrl(meta);
+  if (!configuredProjectUrl) {
+    throw new Error(
+      "Refusing to attach: Browserbase supervisor runtime is missing a configured project-scoped ChatGPT URL (/g/.../project).",
+    );
+  }
+  if (!runtimeMatchesConfiguredProjectScopeForUse(meta, options)) {
+    throw new Error(
+      "Refusing to attach: cached Browserbase supervisor tab is outside the configured ChatGPT scope.",
+    );
+  }
+  if (!runtimeHasReusableIdentityForUse(meta.browser.runtime, options)) {
+    throw new Error(
+      "Refusing to attach supervisor controls: cached Browserbase supervisor runtime is missing conversation identity metadata.",
+    );
+  }
+  const apiKey = browserbaseApiKeyForSupervisorRuntime(meta);
+  if (!apiKey) {
+    throw new Error(
+      "Browserbase supervisor runtime refresh requires BROWSERBASE_API_KEY or ORACLE_BROWSERBASE_API_KEY.",
+    );
+  }
+  let runtime = meta.browser.runtime;
+  const browserbaseSessionId = runtime.browserbaseSessionId?.trim();
+  if (!browserbaseSessionId) {
+    throw new Error("Browserbase supervisor runtime is missing its Browserbase session id.");
+  }
+  const client = new BrowserbaseClient({
+    apiKey,
+    projectId:
+      runtime.browserbaseProjectId ?? meta.browser.config?.browserbase?.projectId ?? undefined,
+  });
+  const session = await client.getSession(browserbaseSessionId);
+  const connectUrl = session.connectUrl?.trim();
+  if (session.status !== "RUNNING" || !connectUrl) {
+    const status = session.status ?? "unknown";
+    const reason = browserbaseSessionStatusIsTerminal(session.status)
+      ? `Browserbase supervisor session ${browserbaseSessionId} is ${status}; cached runtime is no longer attachable.`
+      : `Browserbase supervisor session ${browserbaseSessionId} is ${status} without a CDP connectUrl; cached runtime is not attachable yet.`;
+    await markBrowserbaseSupervisorRuntimeUnavailable(meta, reason);
+    throw new Error(reason);
+  }
+  runtime = {
+    ...runtime,
+    chromeBrowserWSEndpoint: connectUrl,
+    browserbaseProjectId: session.projectId ?? runtime.browserbaseProjectId,
+    browserbaseContextId: session.contextId ?? runtime.browserbaseContextId,
+  };
+  const endpoint = resolveBrowserbaseRuntimeEndpoint(runtime);
+  return {
+    ...runtime,
+    chromeHost: endpoint.host,
+    chromePort: endpoint.port,
+    chromeBrowserWSEndpoint: endpoint.browserWSEndpoint,
+    chromePid: undefined,
+    chromeProfileRoot: undefined,
+    userDataDir: undefined,
+  };
 }
 
 async function refreshOwnedSupervisorRuntime(
@@ -406,6 +885,15 @@ async function refreshOwnedSupervisorRuntime(
     chromeBrowserWSEndpoint: liveBrowserWSEndpoint,
     userDataDir: normalizedProfileDir,
   };
+}
+
+async function refreshSupervisorRuntime(
+  meta: SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } },
+  options: SupervisorRuntimeReuseOptions = {},
+): Promise<BrowserRuntimeMetadata> {
+  return supervisorRuntimeProvider(options) === "browserbase"
+    ? await refreshBrowserbaseSupervisorRuntime(meta, options)
+    : await refreshOwnedSupervisorRuntime(meta, options);
 }
 
 function resolvePort(runtime: BrowserRuntimeMetadata): number | null {
@@ -670,40 +1158,58 @@ async function pickReachableRuntimeCandidate(
   listTargets: typeof listRemoteChromeTargets = listRemoteChromeTargets,
   options: SupervisorRuntimeReuseOptions = {},
 ): Promise<(SessionMetadata & { browser: { runtime: BrowserRuntimeMetadata } }) | undefined> {
-  const candidates = sortReusableRuntimeCandidates(metas);
+  const candidates = sortReusableRuntimeCandidates(metas, options);
   for (const candidate of candidates) {
-    if (!runtimeMatchesConfiguredProjectScopeForUse(candidate, options)) {
-      continue;
-    }
-    if (!runtimeHasReusableIdentityForUse(candidate.browser.runtime, options)) {
-      continue;
-    }
-    const port = resolvePort(candidate.browser.runtime);
-    if (!port) {
-      continue;
-    }
-    const host = candidate.browser.runtime.chromeHost ?? "127.0.0.1";
-    const reachable = await probe({ host, port, attempts: 1, timeoutMs: 1000 });
-    if (reachable.ok) {
+    let runtime = candidate.browser.runtime;
+    if (supervisorRuntimeProvider(options) === "browserbase") {
       try {
-        const targets = (await listTargets({
-          host,
-          port,
-          browserWSEndpoint: candidate.browser.runtime.chromeBrowserWSEndpoint ?? undefined,
-        })) as TargetInfoLite[];
-        if (
-          pickConnectableSupervisorRuntimeTarget(
-            targets,
-            candidate.browser.runtime,
-            Boolean(candidate.browser.runtime.chromeBrowserWSEndpoint),
-            options,
-          )
-        ) {
-          return candidate;
-        }
+        runtime = await refreshBrowserbaseSupervisorRuntime(candidate, options);
       } catch {
         continue;
       }
+    }
+    if (!runtimeMatchesConfiguredProjectScopeForUse(candidate, options)) {
+      continue;
+    }
+    if (!runtimeHasReusableIdentityForUse(runtime, options)) {
+      continue;
+    }
+    const port = resolvePort(runtime);
+    if (!port) {
+      continue;
+    }
+    const host = runtime.chromeHost ?? "127.0.0.1";
+    const browserWSEndpoint = runtime.chromeBrowserWSEndpoint ?? undefined;
+    if (!browserWSEndpoint) {
+      const reachable = await probe({ host, port, attempts: 1, timeoutMs: 1000 });
+      if (!reachable.ok) {
+        continue;
+      }
+    }
+    try {
+      const targets = (await listTargets({
+        host,
+        port,
+        browserWSEndpoint,
+      })) as TargetInfoLite[];
+      if (
+        pickConnectableSupervisorRuntimeTarget(
+          targets,
+          runtime,
+          Boolean(browserWSEndpoint),
+          options,
+        )
+      ) {
+        return {
+          ...candidate,
+          browser: {
+            ...candidate.browser,
+            runtime,
+          },
+        };
+      }
+    } catch {
+      continue;
     }
   }
   return undefined;
@@ -722,18 +1228,22 @@ export async function resolveSupervisorRuntimeContext(
     if (!hasReusableRuntime(meta)) {
       throw new Error(`Session ${hinted} does not have reusable browser runtime metadata.`);
     }
-    if (!isOwnedSupervisorRuntime(meta)) {
+    if (!isSupervisorRuntimeForProvider(meta, options)) {
       throw new Error(
-        `Session ${hinted} is not an Oracle-owned hidden browser runtime. Refusing to attach the supervisor to a non-hidden browser session.`,
+        `Session ${hinted} is not an ${supervisorRuntimeProviderDescription(options)}. Refusing to attach the supervisor to the wrong browser provider.`,
       );
     }
     if (!supervisorRuntimeIsReusableNow(meta)) {
       throw new Error(`Browser runtime session ${hinted} is not reusable yet.`);
     }
-    const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(meta);
+    const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(
+      meta,
+      sessionStore.readSession.bind(sessionStore),
+      options,
+    );
     return {
       sessionId,
-      runtime: await refreshOwnedSupervisorRuntime(meta, options),
+      runtime: await refreshSupervisorRuntime(meta, options),
     };
   }
 
@@ -745,14 +1255,23 @@ export async function resolveSupervisorRuntimeContext(
     options,
   );
   if (!latest) {
+    if (supervisorRuntimeProvider(options) === "browserbase") {
+      throw new Error(
+        "No reachable Oracle supervisor browserbase runtime session was found. Run one Oracle browser turn first.",
+      );
+    }
     throw new Error(
       "No reachable Oracle-owned hidden browser runtime session was found. Run one Oracle browser turn first.",
     );
   }
-  const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(latest);
+  const sessionId = await resolveMutableSupervisorRuntimeAnchorSessionId(
+    latest,
+    sessionStore.readSession.bind(sessionStore),
+    options,
+  );
   return {
     sessionId,
-    runtime: await refreshOwnedSupervisorRuntime(latest, options),
+    runtime: await refreshSupervisorRuntime(latest, options),
   };
 }
 
@@ -1113,7 +1632,11 @@ export async function connectSupervisorRuntime(
 
 export const __test__ = {
   captureSupervisorRuntimeArtifacts,
+  createBrowserbaseSupervisorShellRuntime,
+  isBrowserbaseSupervisorRuntime,
+  isReleasableBrowserbaseSupervisorRuntime,
   isOwnedSupervisorRuntime,
+  isSupervisorRuntimeForProvider,
   inferSupervisorRuntimeScopeUrl,
   pickConnectableSupervisorRuntimeTarget,
   processIsAlive,
@@ -1123,6 +1646,7 @@ export const __test__ = {
   pickSafeSupervisorRecoveryTarget,
   pickChatgptShellRecoveryTarget,
   refreshOwnedSupervisorRuntime,
+  releaseBrowserbaseSupervisorRuntimeSessions,
   resolveMutableSupervisorRuntimeAnchorSessionId,
   runtimeControllerIsAlive,
   sortReusableRuntimeCandidates,

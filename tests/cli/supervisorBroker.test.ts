@@ -1,8 +1,9 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { __test__, runSupervisorBrokerRequest } from "../../src/cli/supervisorBroker.js";
@@ -59,6 +60,10 @@ async function waitForChildExit(
 }
 
 describe("runSupervisorBrokerRequest", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   test("defaults to run_prompt operation for legacy requests", async () => {
     const runPrompt = vi.fn(async () => ({
       ok: true as const,
@@ -110,6 +115,36 @@ describe("runSupervisorBrokerRequest", () => {
     });
   });
 
+  test("returns ok false for async operation failures", async () => {
+    await expect(
+      runSupervisorBrokerRequest(
+        {
+          operation: "run_prompt",
+          prompt: "",
+          sessionSlug: "slug-error",
+        },
+        { runPrompt: vi.fn(() => Promise.reject(new Error("prompt exploded"))) },
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: "prompt exploded",
+    });
+
+    await expect(
+      runSupervisorBrokerRequest(
+        {
+          operation: "list_threads",
+          prompt: "",
+          sessionSlug: "slug-list-error",
+        },
+        { listThreads: vi.fn(() => Promise.reject(new Error("list exploded"))) },
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: "list exploded",
+    });
+  });
+
   test("list browse options default to root and honor requested projects", () => {
     expect(__test__.brokerListBrowseOptions({ prompt: "", sessionSlug: "root" })).toEqual({
       ok: true,
@@ -117,6 +152,9 @@ describe("runSupervisorBrokerRequest", () => {
       includeProjects: true,
       scopeUrl: "https://chatgpt.com/",
     });
+    expect(
+      __test__.brokerListDedicatedHiddenTargetUrl({ prompt: "", sessionSlug: "root" }, "root"),
+    ).toBe("https://chatgpt.com/");
     expect(
       __test__.brokerListBrowseOptions({ prompt: "", sessionSlug: "root" }, "https://chatgpt.com/"),
     ).toEqual({
@@ -141,6 +179,17 @@ describe("runSupervisorBrokerRequest", () => {
       projectUrl: "https://chatgpt.com/g/team-space/project",
       scopeUrl: "https://chatgpt.com/g/team-space/project",
     });
+    expect(
+      __test__.brokerListDedicatedHiddenTargetUrl(
+        {
+          prompt: "",
+          sessionSlug: "project",
+          browseScope: "project",
+          projectUrl: "https://chatgpt.com/g/team-space/project",
+        },
+        "project",
+      ),
+    ).toBe("https://chatgpt.com/g/team-space/project");
   });
 
   test("configured supervisor project URL honors the current env override", () => {
@@ -165,7 +214,7 @@ describe("runSupervisorBrokerRequest", () => {
     }
   });
 
-  test("root list fallback merges recent local root sessions and keeps the configured project row", async () => {
+  test("root list does not synthesize local Oracle sessions by default", async () => {
     const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-root-list-"));
     setOracleHomeDirOverrideForTest(oracleHome);
     try {
@@ -248,18 +297,6 @@ describe("runSupervisorBrokerRequest", () => {
 
       expect(entries).toEqual([
         {
-          kind: "thread",
-          title: "Newer root chat",
-          conversationId: "root-new",
-          url: "https://chatgpt.com/c/root-new",
-        },
-        {
-          kind: "thread",
-          title: "Older root chat",
-          conversationId: "root-old",
-          url: "https://chatgpt.com/c/root-old",
-        },
-        {
           kind: "project",
           title: "Oracle project",
           projectId: "team-space-oracle",
@@ -322,6 +359,46 @@ describe("runSupervisorBrokerRequest", () => {
     }
   });
 
+  test.each(["url", "chatgptUrl", "supervisorChatgptUrl"] as const)(
+    "root list fallback excludes project-scoped local sessions configured with browser.config.%s",
+    async (configKey) => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-supervisor-root-config-"));
+      setOracleHomeDirOverrideForTest(oracleHome);
+      try {
+        await sessionStore.ensureStorage();
+        const projectScoped = await sessionStore.createSession(
+          {
+            prompt: `Project chat from ${configKey}`,
+            model: "gpt-5.5",
+            mode: "browser",
+          },
+          process.cwd(),
+        );
+        await sessionStore.updateSession(projectScoped.id, {
+          status: "completed",
+          completedAt: "2026-04-22T00:00:00.000Z",
+          browser: {
+            config: {
+              [configKey]: "https://chatgpt.com/g/team-space-oracle/project",
+            },
+            runtime: {
+              conversationId: `project-only-${configKey}`,
+            },
+          },
+        });
+
+        const entries = await __test__.rootListThreadsWithLocalFallback([], undefined, {
+          allowLocalFallback: true,
+        });
+
+        expect(entries).toEqual([]);
+      } finally {
+        setOracleHomeDirOverrideForTest(null);
+        await rm(oracleHome, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("root list prefers the configured project URL over live canonical project rows", async () => {
     const entries = await __test__.rootListThreadsWithLocalFallback(
       [
@@ -343,16 +420,86 @@ describe("runSupervisorBrokerRequest", () => {
 
     expect(entries).toEqual([
       {
+        kind: "project",
+        title: "Oracle project",
+        projectId: "team-space-oracle",
+        projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
+      },
+      {
         kind: "thread",
         title: "Live root chat",
         conversationId: "live-root",
         url: "https://chatgpt.com/c/live-root",
       },
+    ]);
+  });
+
+  test("root list fallback rejects ambiguous live threads without root URLs", async () => {
+    const entries = await __test__.rootListThreadsWithLocalFallback(
+      [
+        {
+          kind: "thread",
+          title: "URL-less stale project thread",
+          conversationId: "project-thread",
+        },
+        {
+          kind: "thread",
+          title: "Project-scoped thread",
+          conversationId: "project-thread-2",
+          url: "https://chatgpt.com/g/team-space-oracle/c/project-thread-2",
+        },
+        {
+          kind: "thread",
+          title: "Live root chat",
+          conversationId: "live-root",
+          url: "https://chatgpt.com/c/live-root",
+        },
+      ],
+      undefined,
+    );
+
+    expect(entries).toEqual([
+      {
+        kind: "thread",
+        title: "Live root chat",
+        conversationId: "live-root",
+        url: "https://chatgpt.com/c/live-root",
+      },
+    ]);
+  });
+
+  test("root list pages project rows before root threads", async () => {
+    const entries = await __test__.rootListThreadsWithLocalFallback(
+      [
+        {
+          kind: "thread",
+          title: "First live root chat",
+          conversationId: "root-1",
+          url: "https://chatgpt.com/c/root-1",
+        },
+        {
+          kind: "thread",
+          title: "Second live root chat",
+          conversationId: "root-2",
+          url: "https://chatgpt.com/c/root-2",
+        },
+      ],
+      "https://chatgpt.com/g/team-space-oracle/project",
+      { offset: 0, limit: 2 },
+    );
+
+    expect(entries).toEqual([
       {
         kind: "project",
         title: "Oracle project",
         projectId: "team-space-oracle",
         projectUrl: "https://chatgpt.com/g/team-space-oracle/project",
+      },
+      {
+        kind: "thread",
+        title: "First live root chat",
+        conversationId: "root-1",
+        url: "https://chatgpt.com/c/root-1",
       },
     ]);
   });
@@ -664,6 +811,7 @@ describe("runSupervisorBrokerRequest", () => {
   });
 
   test("withSupervisorRuntime bootstraps a hidden thinking runtime on cold start", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "0");
     const action = vi.fn(async () => "ok");
     const runtimeClose = vi.fn(async () => {});
     const resolveSupervisorRuntimeContext = vi
@@ -728,9 +876,14 @@ describe("runSupervisorBrokerRequest", () => {
   });
 
   test("withSupervisorRuntime forwards shell-recovery options into runtime readiness and connect", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "0");
     const action = vi.fn(async () => "ok");
     const runtimeClose = vi.fn(async () => {});
     const runtimeOptions = { allowChatgptShellRecovery: true };
+    const resolvedRuntimeOptions = {
+      ...runtimeOptions,
+      browserProvider: "local-hidden" as const,
+    };
     const resolveSupervisorRuntimeContext = vi.fn(async () => ({
       sessionId: "runtime-1",
       runtime: {
@@ -766,14 +919,272 @@ describe("runSupervisorBrokerRequest", () => {
     );
 
     expect(result).toBe("ok");
-    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, runtimeOptions);
-    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, undefined, runtimeOptions);
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, resolvedRuntimeOptions);
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, undefined, resolvedRuntimeOptions);
     expect(connectSupervisorRuntime).toHaveBeenCalledWith(
       expect.objectContaining({ tabUrl: "https://chatgpt.com/" }),
-      runtimeOptions,
+      resolvedRuntimeOptions,
     );
     expect(runtimeClose).toHaveBeenCalledTimes(1);
     expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  test("withSupervisorRuntime constrains runtime selection to Browserbase when enabled", async () => {
+    vi.stubEnv("ORACLE_BROWSERBASE_ENABLED", "1");
+    try {
+      const action = vi.fn(async () => "ok");
+      const runtimeClose = vi.fn(async () => {});
+      const resolveSupervisorRuntimeContext = vi.fn(async () => ({
+        sessionId: "runtime-1",
+        runtime: {
+          browserProvider: "browserbase" as const,
+          chromeBrowserWSEndpoint: "wss://connect.browserbase.com/devtools/browser/bb-runtime",
+        },
+      }));
+      const connectSupervisorRuntime = vi.fn(async () => ({
+        client: { Runtime: {} } as never,
+        close: runtimeClose,
+        host: "connect.browserbase.com",
+        port: 443,
+      }));
+      const withSupervisorRuntimeAttachLease = async <T>(
+        _log: (message?: string) => void,
+        work: () => Promise<T>,
+      ): Promise<T> => await work();
+
+      const result = await __test__.withSupervisorRuntime(
+        {
+          prompt: "",
+          sessionSlug: "browserbase-provider",
+        },
+        action,
+        {
+          resolveSupervisorRuntimeContext,
+          connectSupervisorRuntime: connectSupervisorRuntime as never,
+          withSupervisorRuntimeAttachLease,
+        },
+      );
+
+      const runtimeOptions = { browserProvider: "browserbase" } as const;
+      expect(result).toBe("ok");
+      expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, runtimeOptions);
+      expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, undefined, runtimeOptions);
+      expect(connectSupervisorRuntime).toHaveBeenCalledWith(
+        expect.objectContaining({ browserProvider: "browserbase" }),
+        runtimeOptions,
+      );
+      expect(runtimeClose).toHaveBeenCalledTimes(1);
+      expect(action).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  test("broker hydrates Browserbase env from Smarty global cache when parent Codex lacks it", () => {
+    const env = {
+      HOME: "/Users/tester",
+    } as NodeJS.ProcessEnv;
+
+    __test__.maybeHydrateSmartyGlobalBrowserbaseEnv(env, () => ({
+      BROWSERBASE_API_KEY: "bb-key",
+      BROWSERBASE_PROJECT_ID: "bb-project",
+    }));
+
+    expect(env.ORACLE_BROWSERBASE_ENABLED).toBe("1");
+    expect(env.ORACLE_BROWSERBASE_KEEP_ALIVE).toBe("0");
+    expect(env.ORACLE_BROWSERBASE_CONTEXT_ID).toBe("d9ef39cd-4db2-40f7-be9b-636062e23bcf");
+    expect(env.BROWSERBASE_API_KEY).toBe("bb-key");
+    expect(env.BROWSERBASE_PROJECT_ID).toBe("bb-project");
+  });
+
+  test("broker does not hydrate Browserbase when explicitly disabled", () => {
+    const env = {
+      HOME: "/Users/tester",
+      ORACLE_BROWSERBASE_ENABLED: "0",
+    } as NodeJS.ProcessEnv;
+    const loader = vi.fn(() => ({
+      BROWSERBASE_API_KEY: "bb-key",
+      BROWSERBASE_PROJECT_ID: "bb-project",
+    }));
+
+    __test__.maybeHydrateSmartyGlobalBrowserbaseEnv(env, loader);
+
+    expect(loader).not.toHaveBeenCalled();
+    expect(env.ORACLE_BROWSERBASE_ENABLED).toBe("0");
+    expect(env.ORACLE_BROWSERBASE_KEEP_ALIVE).toBeUndefined();
+  });
+
+  test("ensureSupervisorRuntimeReady creates a Browserbase shell instead of prompt bootstrapping", async () => {
+    const createBrowserbaseSupervisorShellRuntime = vi.fn(async () => ({
+      sessionId: "bb-shell",
+      runtime: {
+        browserProvider: "browserbase" as const,
+      },
+    }));
+    const resolveSupervisorRuntimeContext = vi.fn(async () => {
+      throw new Error(
+        "No reachable Oracle supervisor browserbase runtime session was found. Run one Oracle browser turn first.",
+      );
+    });
+    const runPrompt = vi.fn();
+
+    await __test__.ensureSupervisorRuntimeReady(
+      {
+        prompt: "",
+        sessionSlug: "browserbase-cold-start",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        cwd: "/tmp/oracle-workspace",
+      },
+      {
+        resolveSupervisorRuntimeContext,
+        connectSupervisorRuntime: vi.fn() as never,
+        withSupervisorRuntimeAttachLease: vi.fn() as never,
+        createBrowserbaseSupervisorShellRuntime,
+      },
+      runPrompt as never,
+      { browserProvider: "browserbase" },
+    );
+
+    expect(createBrowserbaseSupervisorShellRuntime).toHaveBeenCalledWith({
+      projectUrl: "https://chatgpt.com/g/team-space/project",
+      cwd: "/tmp/oracle-workspace",
+    });
+    expect(runPrompt).not.toHaveBeenCalled();
+  });
+
+  test("withSupervisorRuntime reuses the Browserbase shell created during readiness", async () => {
+    const action = vi.fn(async () => "ok");
+    const runtimeClose = vi.fn(async () => {});
+    const createBrowserbaseSupervisorShellRuntime = vi.fn(async () => ({
+      sessionId: "bb-shell",
+      runtime: {
+        browserProvider: "browserbase" as const,
+        chromeBrowserWSEndpoint: "wss://connect.browserbase.example/devtools/browser/bb-shell",
+      },
+    }));
+    const resolveSupervisorRuntimeContext = vi.fn(async (followupSession?: string | undefined) => {
+      if (!followupSession) {
+        throw new Error(
+          "No reachable Oracle supervisor browserbase runtime session was found. Run one Oracle browser turn first.",
+        );
+      }
+      return {
+        sessionId: followupSession,
+        runtime: {
+          browserProvider: "browserbase" as const,
+          chromeBrowserWSEndpoint: "wss://connect.browserbase.example/devtools/browser/bb-shell",
+        },
+      };
+    });
+    const connectSupervisorRuntime = vi.fn(async () => ({
+      client: { Runtime: {} } as never,
+      close: runtimeClose,
+      host: "connect.browserbase.example",
+      port: 443,
+    }));
+    const withSupervisorRuntimeAttachLease = async <T>(
+      _log: (message?: string) => void,
+      work: () => Promise<T>,
+    ): Promise<T> => await work();
+
+    const result = await __test__.withSupervisorRuntime(
+      {
+        prompt: "",
+        sessionSlug: "browserbase-shell-reuse",
+        projectUrl: "https://chatgpt.com/g/team-space/project",
+        cwd: "/tmp/oracle-workspace",
+      },
+      action,
+      {
+        resolveSupervisorRuntimeContext,
+        connectSupervisorRuntime: connectSupervisorRuntime as never,
+        withSupervisorRuntimeAttachLease,
+        createBrowserbaseSupervisorShellRuntime,
+      },
+      undefined,
+      vi.fn() as never,
+      { browserProvider: "browserbase" },
+    );
+
+    expect(result).toBe("ok");
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(1, undefined, {
+      browserProvider: "browserbase",
+    });
+    expect(resolveSupervisorRuntimeContext).toHaveBeenNthCalledWith(2, "bb-shell", {
+      browserProvider: "browserbase",
+    });
+    expect(connectSupervisorRuntime).toHaveBeenCalledTimes(1);
+    expect(runtimeClose).toHaveBeenCalledTimes(1);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  test("broker shutdown releases Browserbase supervisor runtimes even if Browserbase mode is unset", async () => {
+    const releaseSessions = vi.fn(async () => 1);
+
+    await __test__.releaseBrowserbaseSupervisorRuntimesForBrokerShutdown(releaseSessions, {
+      ORACLE_BROWSERBASE_ENABLED: "1",
+    } as NodeJS.ProcessEnv);
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(releaseSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({ ORACLE_BROWSERBASE_ENABLED: "1" }),
+      }),
+    );
+
+    releaseSessions.mockClear();
+    await __test__.releaseBrowserbaseSupervisorRuntimesForBrokerShutdown(releaseSessions, {
+      ORACLE_BROWSERBASE_ENABLED: "0",
+    } as NodeJS.ProcessEnv);
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(releaseSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({ ORACLE_BROWSERBASE_ENABLED: "0" }),
+      }),
+    );
+  });
+
+  test("broker signal cleanup releases Browserbase supervisor runtimes before exit", async () => {
+    const releaseSessions = vi.fn(async () => undefined);
+    const exitFn = vi.fn();
+    const processLike = new EventEmitter() as unknown as Pick<NodeJS.Process, "on" | "off"> & {
+      emit: (event: string) => boolean;
+    };
+
+    const cleanup = __test__.installSupervisorBrokerBrowserbaseReleaseCleanup({
+      releaseBrowserbaseSessions: releaseSessions,
+      processLike,
+      exitFn,
+    });
+
+    processLike.emit("SIGTERM");
+    await cleanup.waitForCleanup();
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(exitFn).toHaveBeenCalledWith(143);
+    cleanup.dispose();
+  });
+
+  test("broker terminal hangup cleanup releases Browserbase supervisor runtimes before exit", async () => {
+    const releaseSessions = vi.fn(async () => undefined);
+    const exitFn = vi.fn();
+    const processLike = new EventEmitter() as unknown as Pick<NodeJS.Process, "on" | "off"> & {
+      emit: (event: string) => boolean;
+    };
+
+    const cleanup = __test__.installSupervisorBrokerBrowserbaseReleaseCleanup({
+      releaseBrowserbaseSessions: releaseSessions,
+      processLike,
+      exitFn,
+    });
+
+    processLike.emit("SIGHUP");
+    await cleanup.waitForCleanup();
+
+    expect(releaseSessions).toHaveBeenCalledTimes(1);
+    expect(exitFn).toHaveBeenCalledWith(129);
+    cleanup.dispose();
   });
 
   test("withSupervisorRuntime does not bootstrap when a specific followup session was requested", async () => {

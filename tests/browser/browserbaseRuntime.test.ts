@@ -119,10 +119,14 @@ describe("runBrowserMode Browserbase runtime integration", () => {
     });
     const { runBrowserMode } = await import("../../src/browser/index.js");
     const logger = vi.fn() as BrowserLogger;
+    const runtimeHints: unknown[] = [];
 
     await runBrowserMode({
       prompt: "Keep Browserbase alive.",
       log: logger,
+      runtimeHintCb: async (hint) => {
+        runtimeHints.push(hint);
+      },
       config: {
         browserbase: {
           enabled: true,
@@ -139,7 +143,38 @@ describe("runBrowserMode Browserbase runtime integration", () => {
     expect(browserbase.createSession).toHaveBeenCalledWith(
       expect.objectContaining({ contextId: "ctx_created", keepAlive: true }),
     );
+    expect(runtimeHints).toContainEqual(
+      expect.objectContaining({ browserbaseSessionId: "bb-session-keep" }),
+    );
     expect(browserbase.requestSessionRelease).not.toHaveBeenCalled();
+  });
+
+  test("releases a keep-alive Browserbase session when setup fails before metadata is persisted", async () => {
+    const harness = mockBrowserRuntime({
+      keepAlive: true,
+      connectUrl: undefined,
+    });
+    const { runBrowserMode } = await import("../../src/browser/index.js");
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      runBrowserMode({
+        prompt: "Keep Browserbase alive only after handoff.",
+        log: logger,
+        config: {
+          browserbase: {
+            enabled: true,
+            apiKey: "bb_key",
+            projectId: "proj_123",
+            keepAlive: true,
+          },
+          modelStrategy: "ignore",
+        },
+      }),
+    ).rejects.toThrow(/did not return a CDP connectUrl/i);
+
+    const browserbase = harness.browserbaseInstances[0];
+    expect(browserbase.requestSessionRelease).toHaveBeenCalledWith("bb-session-keep", "proj_123");
   });
 
   test("propagates the created Browserbase context project id when explicit project id is absent", async () => {
@@ -234,7 +269,7 @@ function mockBrowserRuntime({
   connectFails = false,
 }: {
   keepAlive: boolean;
-  connectUrl: string;
+  connectUrl: string | undefined;
   connectFails?: boolean;
 }): RuntimeHarness {
   const browserbaseInstances: BrowserbaseClientInstance[] = [];

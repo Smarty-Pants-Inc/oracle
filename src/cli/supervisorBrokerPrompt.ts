@@ -22,6 +22,7 @@ import {
 import { isProjectScopedChatgptUrl, normalizeChatgptUrl } from "../browser/utils.js";
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../remote/client.js";
+import { readBrowserbaseEnvConfig } from "../browser/config.js";
 import type { BrowserSessionRunnerDeps } from "../browser/sessionRunner.js";
 import type {
   BrowserSessionConfig,
@@ -65,7 +66,9 @@ const SUPERVISOR_BROWSER_ACTIVE_LEASE_RECHECK_MS = 5_000;
 const SUPERVISOR_BROWSER_RUNTIME_ATTACH_RECHECK_MIN_MS = 250;
 const SUPERVISOR_PROMPT_COMPLETION_POLL_MS = 500;
 const SUPERVISOR_PROMPT_RUN_SETTLE_GRACE_MS = 10_000;
+const SUPERVISOR_BROWSERBASE_DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const SUPERVISOR_CHATGPT_URL_ENV = "ORACLE_SUPERVISOR_CHATGPT_URL";
+const SUPERVISOR_BROWSERBASE_THROTTLE_SCOPE = "browserbase";
 
 interface SupervisorBrowserThrottleLease {
   ownerId: string;
@@ -114,6 +117,43 @@ type SupervisorPromptRunOutcome =
 
 const SUPERVISOR_PROMPT_RUN_STILL_PENDING = Symbol("supervisor-prompt-run-still-pending");
 
+function compactSupervisorBrowserbaseConfig(
+  config: BrowserSessionConfig["browserbase"],
+): BrowserSessionConfig["browserbase"] | null {
+  if (!config) {
+    return null;
+  }
+  const next = Object.fromEntries(
+    Object.entries(config).filter(([, value]) => value !== undefined),
+  ) as NonNullable<BrowserSessionConfig["browserbase"]>;
+  return Object.keys(next).length > 0 ? next : null;
+}
+
+function buildSupervisorBrowserbaseConfig({
+  existing,
+  env,
+}: {
+  existing: BrowserSessionConfig["browserbase"];
+  env: Record<string, string | undefined>;
+}): BrowserSessionConfig["browserbase"] | null {
+  const envConfig = readBrowserbaseEnvConfig(env);
+  const merged = compactSupervisorBrowserbaseConfig({
+    ...envConfig,
+    ...(existing ?? {}),
+  });
+  if (merged?.enabled !== true) {
+    return merged;
+  }
+  return {
+    ...merged,
+    enabled: true,
+    // Supervisor control needs the Browserbase CDP session to remain reachable
+    // after the bootstrap prompt completes.
+    keepAlive: true,
+    timeoutMs: merged.timeoutMs ?? SUPERVISOR_BROWSERBASE_DEFAULT_TIMEOUT_MS,
+  };
+}
+
 export interface SupervisorPromptRequest {
   prompt: string;
   sessionSlug: string;
@@ -161,13 +201,18 @@ export function buildSupervisorBrowserConfig({
     browserThinkingTime,
     browserKeepBrowser: true,
   });
+  const browserbaseConfig = buildSupervisorBrowserbaseConfig({
+    existing: browserConfig.browserbase,
+    env,
+  });
+  const useBrowserbaseSupervisor = browserbaseConfig?.enabled === true;
   const manualLoginCookieSync =
     userConfig.browser?.manualLoginCookieSync ??
     defaultManualLoginCookieSync ??
     process.platform === "darwin";
-  browserConfig.manualLoginProfileDir = useDedicatedHiddenProfile
-    ? SUPERVISOR_BROWSER_PROFILE_DIR
-    : null;
+  browserConfig.browserbase = browserbaseConfig;
+  browserConfig.manualLoginProfileDir =
+    useDedicatedHiddenProfile && !useBrowserbaseSupervisor ? SUPERVISOR_BROWSER_PROFILE_DIR : null;
   browserConfig.launcher = "chrome";
   browserConfig.keepBrowser = true;
   browserConfig.reuseChromeWaitMs ??= SUPERVISOR_BROWSER_REUSE_WAIT_MS;
@@ -178,15 +223,26 @@ export function buildSupervisorBrowserConfig({
   browserConfig.autoReattachTimeoutMs ??= SUPERVISOR_BROWSER_AUTO_REATTACH_TIMEOUT_MS;
 
   browserConfig.manualLogin = true;
-  browserConfig.manualLoginCookieSync = manualLoginCookieSync;
-  browserConfig.cookieSync = manualLoginCookieSync;
+  browserConfig.manualLoginCookieSync = useBrowserbaseSupervisor ? false : manualLoginCookieSync;
+  browserConfig.cookieSync = useBrowserbaseSupervisor ? false : manualLoginCookieSync;
   browserConfig.attachRunning = false;
   browserConfig.remoteChrome = null;
   browserConfig.remoteChromeBrowserWSEndpoint = null;
   browserConfig.remoteChromeProfileRoot = null;
-  browserConfig.supervisorThrottleScope = supervisorThrottleScope ?? null;
+  browserConfig.supervisorThrottleScope =
+    supervisorThrottleScope ??
+    (useBrowserbaseSupervisor
+      ? [
+          SUPERVISOR_BROWSERBASE_THROTTLE_SCOPE,
+          browserbaseConfig?.projectId?.trim() || null,
+          browserbaseConfig?.contextId?.trim() || null,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(":")
+      : null);
   if (supervisorChatgptUrl) {
     const normalizedSupervisorUrl = normalizeChatgptUrl(supervisorChatgptUrl, CHATGPT_URL);
+    browserConfig.supervisorChatgptUrl = normalizedSupervisorUrl;
     browserConfig.chatgptUrl = normalizedSupervisorUrl;
     browserConfig.url = normalizedSupervisorUrl;
   }

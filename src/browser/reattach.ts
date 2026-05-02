@@ -31,6 +31,7 @@ import {
   type ChromeClient,
   reportBrowserProgress,
 } from "./types.js";
+import { BrowserbaseClient } from "./browserbase.js";
 import {
   launchChrome,
   connectToChrome,
@@ -192,6 +193,101 @@ function browserbaseRecoveryUnavailable(
   );
 }
 
+async function refreshBrowserbaseRuntimeForReattach(
+  runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
+  cause?: unknown,
+): Promise<BrowserRuntimeMetadata> {
+  if (!isBrowserbaseRuntime(runtime)) {
+    return runtime;
+  }
+  if (runtime.browserbaseKeepAlive !== true) {
+    throw browserbaseRecoveryUnavailable(runtime, cause);
+  }
+  const sessionId = runtime.browserbaseSessionId?.trim();
+  const apiKey = browserbaseApiKeyForReattach(config);
+  if (!sessionId || !apiKey) {
+    throw new BrowserAutomationError(
+      "Browserbase keep-alive reattach requires a Browserbase session id and API key.",
+      {
+        stage: "browserbase-reattach-refresh",
+        runtime: {
+          ...runtime,
+          chromeBrowserWSEndpoint: undefined,
+        },
+      },
+      cause,
+    );
+  }
+  const projectId = runtime.browserbaseProjectId ?? config?.browserbase?.projectId ?? undefined;
+  const client = new BrowserbaseClient({ apiKey, projectId });
+  const session = await client.getSession(sessionId).catch((error) => {
+    throw new BrowserAutomationError(
+      "Browserbase keep-alive session details could not be refreshed.",
+      {
+        stage: "browserbase-reattach-refresh",
+        runtime: {
+          ...runtime,
+          chromeBrowserWSEndpoint: undefined,
+        },
+      },
+      error,
+    );
+  });
+  const browserWSEndpoint = session.connectUrl?.trim();
+  if (session.status !== "RUNNING" || !browserWSEndpoint) {
+    throw new BrowserAutomationError(
+      session.status === "RUNNING"
+        ? "Browserbase keep-alive session did not return a CDP connectUrl."
+        : `Browserbase keep-alive session is ${session.status} and can no longer be reattached.`,
+      {
+        stage: "browserbase-reattach-refresh",
+        runtime: {
+          ...runtime,
+          chromeBrowserWSEndpoint: undefined,
+        },
+        status: session.status,
+      },
+      cause,
+    );
+  }
+  const endpoint = resolveBrowserbaseEndpoint(browserWSEndpoint);
+  return {
+    ...runtime,
+    chromeHost: endpoint.host,
+    chromePort: endpoint.port,
+    chromeBrowserWSEndpoint: browserWSEndpoint,
+    chromePid: undefined,
+    chromeProfileRoot: undefined,
+    userDataDir: undefined,
+    browserbaseProjectId: session.projectId ?? runtime.browserbaseProjectId,
+    browserbaseContextId: session.contextId ?? runtime.browserbaseContextId,
+  };
+}
+
+function browserbaseApiKeyForReattach(
+  config: BrowserSessionConfig | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const configured = config?.browserbase?.apiKey?.trim();
+  if (configured && configured !== "[redacted]") {
+    return configured;
+  }
+  return env.ORACLE_BROWSERBASE_API_KEY?.trim() || env.BROWSERBASE_API_KEY?.trim() || undefined;
+}
+
+function resolveBrowserbaseEndpoint(browserWSEndpoint: string): { host: string; port: number } {
+  try {
+    const parsed = new URL(browserWSEndpoint);
+    return {
+      host: parsed.hostname || "connect.browserbase.com",
+      port: parsed.port ? Number.parseInt(parsed.port, 10) : 443,
+    };
+  } catch {
+    return { host: "connect.browserbase.com", port: 443 };
+  }
+}
+
 function isAssistantRateLimitAutomationError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) {
     return false;
@@ -270,7 +366,13 @@ async function withHiddenExistingChrome<T>(
   action: (liveRuntime: BrowserRuntimeMetadata) => Promise<T>,
 ): Promise<T> {
   const resolved = normalizeLocalChromeLaunchConfig(resolveBrowserConfig(config ?? {}));
-  const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+  const liveRuntime =
+    (await refreshAttachRuntime(runtime, config).catch((error) => {
+      if (isBrowserbaseRuntime(runtime)) {
+        throw error;
+      }
+      return runtime;
+    })) ?? runtime;
   if (process.platform !== "darwin" || resolved.headless || !resolved.hideWindow) {
     return action(liveRuntime);
   }
@@ -335,7 +437,12 @@ async function cleanupReopenedChromeLaunch(
 
 async function refreshAttachRuntime(
   runtime: BrowserRuntimeMetadata,
+  config?: BrowserSessionConfig,
+  cause?: unknown,
 ): Promise<BrowserRuntimeMetadata | null> {
+  if (isBrowserbaseRuntime(runtime)) {
+    return refreshBrowserbaseRuntimeForReattach(runtime, config, cause);
+  }
   if (!runtime.chromeProfileRoot) {
     return runtime;
   }
@@ -479,7 +586,9 @@ async function connectToExistingRuntime(
   logger: BrowserLogger,
   deps: ReattachDeps,
 ): Promise<ExistingRuntimeConnection> {
-  const liveRuntime = await refreshOwnedManualLoginRuntime(runtime, config, logger);
+  const liveRuntime = isBrowserbaseRuntime(runtime)
+    ? runtime
+    : await refreshOwnedManualLoginRuntime(runtime, config, logger);
   const host = liveRuntime.chromeHost ?? "127.0.0.1";
   const port =
     liveRuntime.chromePort ?? inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
@@ -516,14 +625,16 @@ async function connectToExistingRuntime(
           closeTargetOnDispose: false,
         });
         try {
-          const target = await readConnectedTargetInfo(
-            connection.client,
-            {
-              targetId: liveRuntime.chromeTargetId,
-              url: liveRuntime.tabUrl,
-            },
-            { requireVerification: true },
-          );
+          const target = isBrowserbaseRuntime(liveRuntime)
+            ? cachedListedTarget
+            : await readConnectedTargetInfo(
+                connection.client,
+                {
+                  targetId: liveRuntime.chromeTargetId,
+                  url: liveRuntime.tabUrl,
+                },
+                { requireVerification: true },
+              );
           if (
             !pickTarget([target], liveRuntime, {
               requireMatch: true,
@@ -608,7 +719,9 @@ async function connectToExistingRuntime(
       targetId: target?.targetId,
       closeTargetOnDispose: false,
     });
-    const connectedTarget = await readConnectedTargetInfo(connection.client, target ?? {});
+    const connectedTarget = isBrowserbaseRuntime(liveRuntime)
+      ? target
+      : await readConnectedTargetInfo(connection.client, target ?? {});
     return {
       client: connection.client,
       close: connection.close,
@@ -1777,6 +1890,7 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
+  runtime = await refreshBrowserbaseRuntimeForReattach(runtime, config);
   const reattachBaseUrl = resolveBrowserConfig(config ?? {}).url;
   const recoverSession =
     deps.recoverSession ??
@@ -2091,6 +2205,7 @@ export async function continueBrowserSession(
   options: ContinueBrowserSessionOptions,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
+  runtime = await refreshBrowserbaseRuntimeForReattach(runtime, config);
   const prompt = options.prompt.trim();
   if (!prompt) {
     throw new Error("Prompt text is required to continue a browser session.");
@@ -2303,7 +2418,13 @@ export async function continueBrowserSession(
           ? "[browser] Existing Chrome follow-up is still on a thinking shell; reattaching without resending."
           : `Existing Chrome follow-up lost DevTools after sending the prompt (${message}); reopening browser to resume without resending.`,
       );
-      const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+      const liveRuntime =
+        (await refreshAttachRuntime(runtime, config, error).catch((refreshError) => {
+          if (isBrowserbaseRuntime(runtime)) {
+            throw refreshError;
+          }
+          return runtime;
+        })) ?? runtime;
       const resumeConfig =
         isAssistantEmptyResponseError(error) && assistantRecheckConfigured
           ? withAssistantRecheckBudget(config)

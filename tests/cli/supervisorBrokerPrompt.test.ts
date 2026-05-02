@@ -119,6 +119,61 @@ describe("buildSupervisorBrowserConfig", () => {
     expect(config.manualLoginProfileDir).toBeNull();
   });
 
+  test("uses Browserbase supervisor config without a local hidden Chrome profile", () => {
+    const config = buildSupervisorBrowserConfig({
+      userConfig: {},
+      env: {
+        ORACLE_BROWSERBASE_ENABLED: "1",
+        ORACLE_BROWSERBASE_PROJECT_ID: "bb_project",
+        ORACLE_BROWSERBASE_CONTEXT_ID: "bb_context",
+        ORACLE_BROWSERBASE_CAPTCHA: "1",
+      },
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
+      defaultManualLoginCookieSync: true,
+    });
+
+    expect(config.browserbase).toMatchObject({
+      enabled: true,
+      projectId: "bb_project",
+      contextId: "bb_context",
+      captcha: true,
+      keepAlive: true,
+      timeoutMs: 3_600_000,
+    });
+    expect(config).toMatchObject({
+      manualLogin: true,
+      manualLoginCookieSync: false,
+      cookieSync: false,
+      keepBrowser: true,
+      attachRunning: false,
+      remoteChrome: null,
+      remoteChromeBrowserWSEndpoint: null,
+      remoteChromeProfileRoot: null,
+      supervisorThrottleScope: "browserbase:bb_project:bb_context",
+    });
+    expect(config.manualLoginProfileDir).toBeNull();
+  });
+
+  test("honors an explicit Browserbase supervisor timeout override", () => {
+    const config = buildSupervisorBrowserConfig({
+      userConfig: {},
+      env: {
+        ORACLE_BROWSERBASE_ENABLED: "1",
+        ORACLE_BROWSERBASE_TIMEOUT_MS: "1200000",
+      },
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
+      defaultManualLoginCookieSync: true,
+    });
+
+    expect(config.browserbase).toMatchObject({
+      enabled: true,
+      keepAlive: true,
+      timeoutMs: 1_200_000,
+    });
+  });
+
   test("ignores configured attach-running browser reuse for supervisor runs", () => {
     const config = buildSupervisorBrowserConfig({
       userConfig: {
@@ -184,6 +239,7 @@ describe("buildSupervisorBrowserConfig", () => {
     });
 
     expect(config.chatgptUrl).toBe(SUPERVISOR_PROJECT_URL);
+    expect(config.supervisorChatgptUrl).toBe(SUPERVISOR_PROJECT_URL);
     expect(config.url).toBe(SUPERVISOR_PROJECT_URL);
   });
 

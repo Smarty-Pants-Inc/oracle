@@ -253,13 +253,26 @@ export async function ensureNotBlocked(
   Runtime: ChromeClient["Runtime"],
   headless: boolean,
   logger: BrowserLogger,
+  options: { waitMs?: number } = {},
 ) {
-  if (await isCloudflareInterstitial(Runtime)) {
-    const message = headless
-      ? "Cloudflare challenge detected in headless mode. Re-run with --headful so you can solve the challenge."
-      : "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.";
-    logger("Cloudflare anti-bot page detected");
-    throw new BrowserAutomationError(message, { stage: "cloudflare-challenge", headless });
+  const deadline = Date.now() + Math.max(0, options.waitMs ?? 0);
+  let loggedWait = false;
+  while (await isCloudflareInterstitial(Runtime)) {
+    if (Date.now() >= deadline) {
+      const message = headless
+        ? "Cloudflare challenge detected in headless mode. Re-run with --headful so you can solve the challenge."
+        : "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.";
+      logger("Cloudflare anti-bot page detected");
+      throw new BrowserAutomationError(message, { stage: "cloudflare-challenge", headless });
+    }
+    if (!loggedWait) {
+      logger("Cloudflare anti-bot page detected; waiting for it to clear...");
+      loggedWait = true;
+    }
+    await delay(1000);
+  }
+  if (loggedWait) {
+    logger("Cloudflare anti-bot page cleared");
   }
 }
 
@@ -298,10 +311,15 @@ export async function ensureLoggedIn(
     returnByValue: true,
   });
   const probe = normalizeLoginProbe(outcome.result?.value);
+  if (probe.challenged) {
+    throwBackendApiChallenge(logger, probe);
+  }
   if (probe.ok) {
     await ensureBackendApiReachable(Runtime, logger, { timeoutMs: LOGIN_CHECK_TIMEOUT_MS });
     logger(
-      `Login check passed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)})`,
+      `Login check passed (status=${probe.status}, authenticated=${Boolean(
+        probe.authenticated,
+      )}, domLoginCta=${Boolean(probe.domLoginCta)})`,
     );
     return;
   }
@@ -317,19 +335,24 @@ export async function ensureLoggedIn(
       returnByValue: true,
     });
     const retryProbe = normalizeLoginProbe(retryOutcome.result?.value);
+    if (retryProbe.challenged) {
+      throwBackendApiChallenge(logger, retryProbe);
+    }
     if (retryProbe.ok) {
       logger("Login restored via Welcome back account picker");
       return;
     }
     logger(
-      `Login retry after Welcome back failed (status=${retryProbe.status}, domLoginCta=${Boolean(
-        retryProbe.domLoginCta,
-      )})`,
+      `Login retry after Welcome back failed (status=${retryProbe.status}, authenticated=${Boolean(
+        retryProbe.authenticated,
+      )}, domLoginCta=${Boolean(retryProbe.domLoginCta)})`,
     );
   }
 
   logger(
-    `Login probe failed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)}, onAuthPage=${Boolean(
+    `Login probe failed (status=${probe.status}, authenticated=${Boolean(
+      probe.authenticated,
+    )}, domLoginCta=${Boolean(probe.domLoginCta)}, onAuthPage=${Boolean(
       probe.onAuthPage,
     )}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`,
   );
@@ -353,6 +376,16 @@ export async function ensureBackendApiReachable(
   if (!probe.challenged) {
     return;
   }
+  throwBackendApiChallenge(logger, probe);
+}
+
+function throwBackendApiChallenge(
+  logger: BrowserLogger,
+  probe: Pick<
+    BackendApiProbeResult,
+    "url" | "status" | "contentType" | "challengeMarkers" | "bodySnippet"
+  >,
+): never {
   logger(
     `ChatGPT backend API probe hit a Cloudflare challenge (url=${probe.url ?? "unknown"}, status=${probe.status ?? 0})`,
   );
@@ -661,7 +694,12 @@ async function isCloudflareInterstitial(Runtime: ChromeClient["Runtime"]): Promi
 type LoginProbeResult = {
   ok: boolean;
   status: number;
+  authenticated?: boolean;
+  challenged?: boolean;
   url?: string | null;
+  contentType?: string | null;
+  challengeMarkers?: string[];
+  bodySnippet?: string | null;
   redirected?: boolean;
   error?: string | null;
   pageUrl?: string | null;
@@ -732,6 +770,11 @@ function buildLoginProbeExpression(timeoutMs: number): string {
   return `(async () => {
     // Learned: /backend-api/me is the most reliable "am I logged in" signal.
     // Some UIs render without a session; use DOM + network for a robust answer.
+    const markers = ${JSON.stringify(Array.from(CLOUDFLARE_BACKEND_MARKERS))};
+    const classify = (text) => {
+      const normalized = String(text || '').toLowerCase();
+      return markers.filter((marker) => normalized.includes(String(marker).toLowerCase()));
+    };
     const timer = setTimeout(() => {}, ${timeoutMs});
     const pageUrl = typeof location === 'object' && location?.href ? location.href : null;
     const onAuthPage =
@@ -777,6 +820,11 @@ function buildLoginProbeExpression(timeoutMs: number): string {
     };
 
     let status = 0;
+    let contentType = null;
+    let bodySnippet = null;
+    let authenticated = false;
+    let challenged = false;
+    let challengeMarkers = [];
     let error = null;
     try {
       if (typeof fetch === 'function') {
@@ -790,6 +838,22 @@ function buildLoginProbeExpression(timeoutMs: number): string {
             signal: controller.signal,
           });
           status = response.status || 0;
+          contentType = response.headers?.get?.('content-type') || null;
+          let text = '';
+          try {
+            text = await response.text();
+          } catch {
+            text = '';
+          }
+          bodySnippet = String(text || '').slice(0, 600);
+          challengeMarkers = classify(text);
+          challenged = challengeMarkers.length > 0;
+          authenticated = Boolean(
+            response.status === 200 &&
+              contentType &&
+              contentType.toLowerCase().includes('application/json') &&
+              !challenged
+          );
         } finally {
           clearTimeout(timeout);
         }
@@ -802,8 +866,13 @@ function buildLoginProbeExpression(timeoutMs: number): string {
     const loginSignals = domLoginCta || onAuthPage;
     clearTimeout(timer);
     return {
-      ok: !loginSignals && (status === 0 || status === 200),
+      ok: !loginSignals && authenticated && !challenged,
       status,
+      authenticated,
+      challenged,
+      contentType,
+      challengeMarkers,
+      bodySnippet,
       redirected: false,
       url: pageUrl,
       pageUrl,
@@ -830,7 +899,14 @@ function normalizeLoginProbe(raw: unknown): LoginProbeResult {
   return {
     ok: Boolean(value.ok),
     status: Number.isFinite(status) ? (status as number) : 0,
+    authenticated: Boolean(value.authenticated),
+    challenged: Boolean(value.challenged),
     url: typeof value.url === "string" ? value.url : null,
+    contentType: typeof value.contentType === "string" ? value.contentType : null,
+    challengeMarkers: Array.isArray(value.challengeMarkers)
+      ? value.challengeMarkers.filter((entry): entry is string => typeof entry === "string")
+      : [],
+    bodySnippet: typeof value.bodySnippet === "string" ? value.bodySnippet : null,
     redirected: Boolean(value.redirected),
     error: typeof value.error === "string" ? value.error : null,
     pageUrl: typeof value.pageUrl === "string" ? value.pageUrl : null,

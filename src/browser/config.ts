@@ -188,23 +188,25 @@ function resolveBrowserbaseConfig(
   });
 }
 
-function readBrowserbaseEnvConfig(): BrowserAutomationConfig["browserbase"] | undefined {
-  const enabled = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_ENABLED);
-  const persist = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_PERSIST);
-  const keepAlive = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_KEEP_ALIVE);
-  const stealth = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_STEALTH);
-  const captcha = parseBooleanEnv(process.env.ORACLE_BROWSERBASE_CAPTCHA);
-  const timeoutMs = parsePositiveIntEnv(process.env.ORACLE_BROWSERBASE_TIMEOUT_MS);
-  const proxies = parseListEnv(process.env.ORACLE_BROWSERBASE_PROXIES);
-  const viewport = parseViewportEnv(process.env.ORACLE_BROWSERBASE_VIEWPORT);
+export function readBrowserbaseEnvConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): BrowserAutomationConfig["browserbase"] | undefined {
+  const enabled = parseBooleanEnv(env.ORACLE_BROWSERBASE_ENABLED);
+  const persist = parseBooleanEnv(env.ORACLE_BROWSERBASE_PERSIST);
+  const keepAlive = parseBooleanEnv(env.ORACLE_BROWSERBASE_KEEP_ALIVE);
+  const stealth = parseBooleanEnv(env.ORACLE_BROWSERBASE_STEALTH);
+  const captcha = parseBooleanEnv(env.ORACLE_BROWSERBASE_CAPTCHA);
+  const timeoutMs = parsePositiveIntEnv(env.ORACLE_BROWSERBASE_TIMEOUT_MS);
+  const proxies = parseListEnv(env.ORACLE_BROWSERBASE_PROXIES);
+  const viewport = parseViewportEnv(env.ORACLE_BROWSERBASE_VIEWPORT);
   const config = compactBrowserbaseConfig({
     enabled,
-    apiKey: firstEnv("ORACLE_BROWSERBASE_API_KEY", "BROWSERBASE_API_KEY"),
-    projectId: firstEnv("ORACLE_BROWSERBASE_PROJECT_ID", "BROWSERBASE_PROJECT_ID"),
-    contextId: firstEnv("ORACLE_BROWSERBASE_CONTEXT_ID", "BROWSERBASE_CONTEXT_ID"),
+    apiKey: firstEnv(env, "ORACLE_BROWSERBASE_API_KEY", "BROWSERBASE_API_KEY"),
+    projectId: firstEnv(env, "ORACLE_BROWSERBASE_PROJECT_ID", "BROWSERBASE_PROJECT_ID"),
+    contextId: firstEnv(env, "ORACLE_BROWSERBASE_CONTEXT_ID", "BROWSERBASE_CONTEXT_ID"),
     persist,
     keepAlive,
-    region: firstEnv("ORACLE_BROWSERBASE_REGION", "BROWSERBASE_REGION"),
+    region: firstEnv(env, "ORACLE_BROWSERBASE_REGION", "BROWSERBASE_REGION"),
     timeoutMs,
     proxies,
     stealth,
@@ -224,9 +226,9 @@ function compactBrowserbaseConfig(
   return Object.keys(next).length > 0 ? next : null;
 }
 
-function firstEnv(...keys: string[]): string | undefined {
+function firstEnv(env: NodeJS.ProcessEnv, ...keys: string[]): string | undefined {
   for (const key of keys) {
-    const value = process.env[key]?.trim();
+    const value = env[key]?.trim();
     if (value) return value;
   }
   return undefined;

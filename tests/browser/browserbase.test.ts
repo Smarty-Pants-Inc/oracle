@@ -11,11 +11,15 @@ describe("BrowserbaseClient", () => {
 
     await expect(client.createContext()).resolves.toEqual({ id: "ctx_123" });
 
-    expect(fetcher).toHaveBeenCalledWith("https://api.browserbase.com/v1/contexts", {
-      method: "POST",
-      headers: browserbaseHeaders("bb_test"),
-      body: JSON.stringify({ projectId: "proj_123" }),
-    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "https://api.browserbase.com/v1/contexts",
+      expect.objectContaining({
+        method: "POST",
+        headers: browserbaseHeaders("bb_test"),
+        body: JSON.stringify({ projectId: "proj_123" }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 
   test("creates contexts without a project id when Browserbase infers it from the API key", async () => {
@@ -24,11 +28,15 @@ describe("BrowserbaseClient", () => {
       const client = new BrowserbaseClient({ apiKey: "bb_test", fetcher });
 
       await expect(client.createContext()).resolves.toEqual({ id: "ctx_123" });
-      expect(fetcher).toHaveBeenCalledWith("https://api.browserbase.com/v1/contexts", {
-        method: "POST",
-        headers: browserbaseHeaders("bb_test"),
-        body: JSON.stringify({}),
-      });
+      expect(fetcher).toHaveBeenCalledWith(
+        "https://api.browserbase.com/v1/contexts",
+        expect.objectContaining({
+          method: "POST",
+          headers: browserbaseHeaders("bb_test"),
+          body: JSON.stringify({}),
+          signal: expect.any(AbortSignal),
+        }),
+      );
     });
   });
 
@@ -140,6 +148,24 @@ describe("BrowserbaseClient", () => {
     expect(fetchCall(fetcher, 0)[1]).toMatchObject({ method: "GET" });
   });
 
+  test("retrieves a session with a fresh connect url", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        id: "sess_123",
+        projectId: "proj_123",
+        status: "RUNNING",
+        connectUrl: "wss://connect.browserbase.example/devtools/browser/sess_123",
+      }),
+    );
+    const client = new BrowserbaseClient({ apiKey: "bb_test", fetcher });
+
+    await expect(client.getSession("sess/123")).resolves.toMatchObject({
+      connectUrl: "wss://connect.browserbase.example/devtools/browser/sess_123",
+    });
+    expect(fetchCall(fetcher, 0)[0]).toBe("https://api.browserbase.com/v1/sessions/sess%2F123");
+    expect(fetchCall(fetcher, 0)[1]).toMatchObject({ method: "GET" });
+  });
+
   test("requests session release through session update", async () => {
     const fetcher = vi.fn(async () =>
       jsonResponse({ id: "sess_123", projectId: "proj_123", status: "COMPLETED" }),
@@ -153,6 +179,51 @@ describe("BrowserbaseClient", () => {
       projectId: "proj_123",
       status: "REQUEST_RELEASE",
     });
+  });
+
+  test("times out unresponsive API calls", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const fetcher = vi.fn(
+      (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        signal = init?.signal as AbortSignal | undefined;
+        return new Promise<Response>(() => {});
+      },
+    );
+    const client = new BrowserbaseClient({
+      apiKey: "bb_test",
+      fetcher,
+      requestTimeoutMs: 25,
+    });
+    try {
+      const pending = expect(client.getSession("sess_123")).rejects.toThrow(
+        "Browserbase API request to https://api.browserbase.com/v1/sessions/sess_123 timed out after 25ms.",
+      );
+      await vi.advanceTimersByTimeAsync(25);
+      await pending;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("times out hanging API response bodies", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn(async () => new Response(new ReadableStream(), { status: 200 }));
+    const client = new BrowserbaseClient({
+      apiKey: "bb_test",
+      fetcher,
+      requestTimeoutMs: 25,
+    });
+    try {
+      const pending = expect(client.getSession("sess_123")).rejects.toThrow(
+        "Browserbase API request to https://api.browserbase.com/v1/sessions/sess_123 timed out after 25ms.",
+      );
+      await vi.advanceTimersByTimeAsync(25);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("surfaces Browserbase API errors with response body", async () => {
