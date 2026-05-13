@@ -1,57 +1,61 @@
 #!/usr/bin/env tsx
 /**
- * Official Codex Chrome-plugin smoke for Oracle browser harnesses.
+ * Open Browser Use MCP smoke for Oracle browser harnesses.
  *
- * This intentionally does not launch Chrome, read cookies, open a DevTools
- * port, or call Oracle's legacy browser engine. The harness now proves the
- * installed Codex Chrome Extension path first, then delegates the live ChatGPT
- * browser smoke to a nested Codex task that must use @chrome.
+ * This intentionally does not call Oracle's legacy browser engine. The harness
+ * proves the installed Open Browser Use CLI/MCP path, opens a live ChatGPT tab
+ * through `obu mcp`, reads page state through MCP CDP, and finalizes the tab.
  */
 
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import {
-  existsSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import path from "node:path";
+import { spawnSync } from "node:child_process";
 import process from "node:process";
 
-const OK_TOKEN = "ORACLE_CHROME_PLUGIN_SMOKE_OK";
-const READY_TOKEN = "ORACLE_CHROME_PLUGIN_READY_OK";
-const FAIL_PREFIX = "ORACLE_CHROME_PLUGIN_SMOKE_FAIL:";
-const REQUIRE_LIVE_SMOKE = process.env.ORACLE_CODEX_CHROME_REQUIRE_LIVE === "1";
+const OK_TOKEN = "ORACLE_OPEN_BROWSER_USE_SMOKE_OK";
+const READY_TOKEN = "ORACLE_OPEN_BROWSER_USE_READY_OK";
+const REQUIRE_LIVE_SMOKE = process.env.ORACLE_OPEN_BROWSER_USE_REQUIRE_LIVE === "1";
 
 type CheckResult = {
   name: string;
   status: number | null;
   stdout: string;
   stderr: string;
+  error?: Error;
 };
 
-type CodexResult = {
-  status: number | null;
-  stdout: string;
-  stderr: string;
-  lastMessage: string;
-};
+type JsonObject = Record<string, unknown>;
 
 function main(): void {
-  const pluginRoot = resolveChromePluginRoot();
-  const browserClient = path.join(pluginRoot, "scripts", "browser-client.mjs");
-  if (!existsSync(browserClient)) {
-    die(`Codex Chrome plugin is missing scripts/browser-client.mjs at ${pluginRoot}`);
+  const obuVersion = runObu(["version"], 10_000);
+  if (obuVersion.status !== 0) {
+    die(
+      [
+        "Open Browser Use CLI is not available. Install it with `npm install -g open-browser-use` and run `open-browser-use setup`.",
+        commandFailure(obuVersion),
+      ]
+        .filter((line): line is string => Boolean(line))
+        .join("\n"),
+    );
   }
 
-  console.log(`[browser-test] Codex Chrome plugin: ${pluginRoot}`);
-  runPluginReadinessCheck(pluginRoot, "chrome-is-running.js", ["--json"]);
-  runPluginReadinessCheck(pluginRoot, "check-extension-installed.js", ["--json"]);
-  runPluginReadinessCheck(pluginRoot, "check-native-host-manifest.js", ["--json"]);
+  console.log(`[browser-test] Open Browser Use CLI: ${obuVersion.stdout.trim()}`);
+  runMcpToolListCheck();
+
+  const ping = runObu(["ping"], 15_000);
+  if (ping.status !== 0) {
+    handleBrowserBackendUnavailable(ping);
+    return;
+  }
+  console.log("[browser-test] Open Browser Use browser backend: ok");
+
+  const info = runObu(["info"], 15_000);
+  if (info.status !== 0) {
+    die(
+      ["Open Browser Use info check failed after ping succeeded.", commandFailure(info)]
+        .filter((line): line is string => Boolean(line))
+        .join("\n"),
+    );
+  }
+  console.log("[browser-test] Open Browser Use info: ok");
 
   const projectUrl =
     normalizeUrl(process.env.ORACLE_CHATGPT_PROJECT_URL) ??
@@ -59,179 +63,222 @@ function main(): void {
     normalizeUrl(process.env.ORACLE_BROWSER_SMOKE_CHATGPT_URL) ??
     "https://chatgpt.com/";
 
-  const result = runCodexChromeSmoke(projectUrl);
-  const lastMessage = result.lastMessage.trim();
-  if (result.status === 0 && lastMessage === OK_TOKEN) {
-    console.log(`[browser-test] ${OK_TOKEN}`);
-    return;
+  runMcpBrowserSmoke(projectUrl);
+  console.log(`[browser-test] ${OK_TOKEN}`);
+}
+
+function runObu(args: string[], timeout: number): CheckResult {
+  const command = process.env.OBU_BIN?.trim() || "obu";
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout,
+  });
+  return {
+    name: `${command} ${args.join(" ")}`,
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error,
+  };
+}
+
+function runMcpToolListCheck(): void {
+  const initialize = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "oracle-browser-smoke", version: "0" },
+    },
+  };
+  const toolsList = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const result = spawnSync(process.env.OBU_BIN?.trim() || "obu", ["mcp"], {
+    encoding: "utf8",
+    input: `${JSON.stringify(initialize)}\n${JSON.stringify(toolsList)}\n`,
+    timeout: 5_000,
+  });
+  const check: CheckResult = {
+    name: "obu mcp tools/list",
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error,
+  };
+  if (check.status !== 0) {
+    die(
+      ["Open Browser Use MCP stdio check failed.", commandFailure(check)]
+        .filter((line): line is string => Boolean(line))
+        .join("\n"),
+    );
   }
 
-  if (!REQUIRE_LIVE_SMOKE && isCodexChromeRuntimeUnavailable(lastMessage)) {
+  for (const toolName of ["ping", "open_tab", "cdp", "run_action_plan", "finalize_tabs"]) {
+    if (!check.stdout.includes(`"name":"${toolName}"`)) {
+      die(
+        `Open Browser Use MCP tools/list did not include ${toolName}.\n${tail("stdout", check.stdout)}`,
+      );
+    }
+  }
+  console.log("[browser-test] Open Browser Use MCP tools: ok");
+}
+
+function runMcpBrowserSmoke(projectUrl: string): void {
+  const requests = [
+    mcpRequest(1, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "oracle-browser-smoke", version: "0" },
+    }),
+    mcpRequest(2, "tools/call", { name: "ping", arguments: {} }),
+    mcpRequest(3, "tools/call", { name: "info", arguments: {} }),
+    mcpRequest(4, "tools/call", {
+      name: "name_session",
+      arguments: { name: "Oracle browser smoke - OBU" },
+    }),
+    mcpRequest(5, "tools/call", { name: "open_tab", arguments: { url: projectUrl } }),
+    mcpRequest(6, "tools/call", {
+      name: "wait_load",
+      arguments: { state: "domcontentloaded" },
+    }),
+    mcpRequest(7, "tools/call", { name: "page_info", arguments: {} }),
+    mcpRequest(8, "tools/call", { name: "finalize_tabs", arguments: { keep: [] } }),
+  ];
+
+  const command = process.env.OBU_BIN?.trim() || "obu";
+  const result = spawnSync(command, ["mcp"], {
+    encoding: "utf8",
+    input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
+    timeout: Number.parseInt(process.env.ORACLE_OPEN_BROWSER_USE_TIMEOUT_MS ?? "60000", 10),
+  });
+  const check: CheckResult = {
+    name: `${command} mcp browser smoke`,
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error,
+  };
+  if (check.status !== 0) {
+    die(
+      ["Open Browser Use MCP browser smoke failed.", commandFailure(check)]
+        .filter((line): line is string => Boolean(line))
+        .join("\n"),
+    );
+  }
+
+  const responses = parseMcpResponses(check.stdout);
+  for (const id of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    const response = responses.get(String(id));
+    if (!response) {
+      die(
+        `Open Browser Use MCP browser smoke missing response id ${id}.\n${tail("stdout", check.stdout)}`,
+      );
+    }
+    if (isObject(response.error)) {
+      die(
+        `Open Browser Use MCP browser smoke response ${id} failed: ${String(response.error.message ?? "unknown error")}`,
+      );
+    }
+  }
+
+  const pageValue = extractMcpPageValue(responses.get("7"));
+  if (!isObject(pageValue)) {
+    die(
+      `Open Browser Use MCP browser smoke could not read page value.\n${tail("stdout", check.stdout)}`,
+    );
+  }
+  const observedUrl = String(pageValue.url ?? "");
+  const observedTitle = String(pageValue.title ?? "");
+  const observedText = String(pageValue.text ?? "");
+  const expectedHost = new URL(projectUrl).hostname;
+  let observedHost = "";
+  try {
+    observedHost = new URL(observedUrl).hostname;
+  } catch {
+    observedHost = "";
+  }
+  if (observedHost !== expectedHost || !observedTitle || !observedText) {
+    die(
+      [
+        "Open Browser Use MCP browser smoke did not observe the expected loaded page.",
+        `expected-host: ${expectedHost}`,
+        `observed-url: ${observedUrl}`,
+        `observed-title: ${observedTitle}`,
+      ].join("\n"),
+    );
+  }
+
+  console.log("[browser-test] Open Browser Use MCP browser smoke: ok");
+}
+
+function mcpRequest(id: number, method: string, params: JsonObject): JsonObject {
+  return { jsonrpc: "2.0", id, method, params };
+}
+
+function parseMcpResponses(stdout: string): Map<string, JsonObject> {
+  const responses = new Map<string, JsonObject>();
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      die(`Open Browser Use MCP emitted non-JSON output: ${trimmed}`);
+    }
+    if (!isObject(parsed)) continue;
+    const id = parsed.id;
+    if (typeof id === "string" || typeof id === "number") {
+      responses.set(String(id), parsed);
+    }
+  }
+  return responses;
+}
+
+function extractMcpPageValue(response: JsonObject | undefined): unknown {
+  const result = isObject(response?.result) ? response.result : null;
+  const structuredContent = isObject(result?.structuredContent) ? result.structuredContent : null;
+  const cliResult = isObject(structuredContent?.result) ? structuredContent.result : null;
+  const cdpResult = isObject(cliResult?.result) ? cliResult.result : null;
+  return cdpResult?.value;
+}
+
+function handleBrowserBackendUnavailable(result: CheckResult): void {
+  if (!REQUIRE_LIVE_SMOKE) {
     console.log(
-      "[browser-test] live @chrome smoke skipped: this codex exec context does not expose the official Chrome plugin tools",
+      "[browser-test] live Open Browser Use smoke skipped: browser extension/native host backend is not connected",
     );
     console.log(
-      "[browser-test] set ORACLE_CODEX_CHROME_REQUIRE_LIVE=1 to fail unless the live @chrome smoke completes",
+      "[browser-test] run `open-browser-use setup`, install or enable the Chrome extension, then verify with `open-browser-use info`",
+    );
+    console.log(
+      "[browser-test] set ORACLE_OPEN_BROWSER_USE_REQUIRE_LIVE=1 to fail unless the live Open Browser Use smoke completes",
     );
     console.log(`[browser-test] ${READY_TOKEN}`);
     return;
   }
 
-  {
-    const detail = lastMessage.startsWith(FAIL_PREFIX)
-      ? lastMessage
-      : [
-          `${FAIL_PREFIX} official Chrome plugin was not usable from codex exec`,
-          lastMessage ? `last-message=${JSON.stringify(lastMessage)}` : null,
-          tail("stdout", result.stdout),
-          tail("stderr", result.stderr),
-        ]
-          .filter((line): line is string => Boolean(line))
-          .join("\n");
-    die(detail);
-  }
-}
-
-function resolveChromePluginRoot(): string {
-  const configured = process.env.CODEX_CHROME_PLUGIN_ROOT?.trim();
-  if (configured) return configured;
-
-  const cacheRoot = path.join(homedir(), ".codex", "plugins", "cache", "openai-bundled", "chrome");
-  if (!existsSync(cacheRoot)) {
-    die(`Codex Chrome plugin cache not found at ${cacheRoot}`);
-  }
-
-  const candidates = readdirSync(cacheRoot)
-    .map((name) => path.join(cacheRoot, name))
-    .filter((candidate) => {
-      try {
-        return statSync(candidate).isDirectory();
-      } catch {
-        return false;
-      }
-    })
-    .filter((candidate) => existsSync(path.join(candidate, "scripts", "browser-client.mjs")))
-    .sort((left, right) => compareVersionPaths(right, left));
-
-  const selected = candidates[0];
-  if (!selected) {
-    die(
-      `No installed Codex Chrome plugin version with scripts/browser-client.mjs under ${cacheRoot}`,
-    );
-  }
-  return selected;
-}
-
-function compareVersionPaths(leftPath: string, rightPath: string): number {
-  const left = path
-    .basename(leftPath)
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const right = path
-    .basename(rightPath)
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
-    const delta = (left[index] ?? 0) - (right[index] ?? 0);
-    if (delta !== 0) return delta;
-  }
-  return leftPath.localeCompare(rightPath);
-}
-
-function runPluginReadinessCheck(pluginRoot: string, scriptName: string, args: string[]): void {
-  const scriptPath = path.join(pluginRoot, "scripts", scriptName);
-  const result = runNode(scriptPath, args, pluginRoot);
-  if (result.status !== 0) {
-    die(
-      [
-        `Codex Chrome plugin readiness check failed: ${scriptName}`,
-        tail("stdout", result.stdout),
-        tail("stderr", result.stderr),
-      ]
-        .filter((line): line is string => Boolean(line))
-        .join("\n"),
-    );
-  }
-  console.log(`[browser-test] ${scriptName}: ok`);
-}
-
-function runNode(scriptPath: string, args: string[], cwd: string): CheckResult {
-  const result = spawnSync(process.execPath, [scriptPath, ...args], {
-    cwd,
-    encoding: "utf8",
-    timeout: 30_000,
-  });
-  return {
-    name: path.basename(scriptPath),
-    status: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-  };
-}
-
-function runCodexChromeSmoke(projectUrl: string): CodexResult {
-  const codexBin = process.env.CODEX_BIN?.trim() || "codex";
-  const cwd = path.resolve(path.join(import.meta.dirname, ".."));
-  const tempRoot = mkdtempSync(path.join(tmpdir(), "oracle-chrome-plugin-smoke-"));
-  const lastMessagePath = path.join(tempRoot, "last-message.txt");
-  const attachmentPath = path.join(tempRoot, "smoke-attachment.txt");
-  writeFileSync(attachmentPath, "smoke-attachment\n", "utf8");
-
-  const prompt = [
-    "Use @chrome only. Do not use shell, AppleScript, raw Chrome DevTools, Playwright outside the official Chrome plugin, Computer Use, or Oracle's legacy browser engine.",
-    "This is the Oracle browser harness smoke.",
-    `Target URL: ${projectUrl}`,
-    `Attachment path: ${attachmentPath}`,
-    `If this Codex runtime does not expose a callable official Chrome plugin browser tool, reply exactly ${FAIL_PREFIX} official Chrome plugin tools unavailable.`,
-    "Open or claim a Chrome tab for the target URL using the official Codex Chrome plugin.",
-    "Upload the attachment through the official Chrome plugin file chooser flow.",
-    "Send this exact ChatGPT prompt: Read the attached file and return exactly one markdown bullet '- upload: smoke-attachment' and nothing else.",
-    "Wait for the assistant response.",
-    `If the response contains '- upload: smoke-attachment', finalize Chrome tabs and reply exactly ${OK_TOKEN}.`,
-    `If the official Chrome plugin is unavailable or the response is not observed, finalize any Chrome tabs you created if possible and reply exactly ${FAIL_PREFIX} <short reason>.`,
-  ].join("\n");
-
-  const result: SpawnSyncReturns<string> = spawnSync(
-    codexBin,
-    ["exec", "--ephemeral", "-C", cwd, "-o", lastMessagePath, prompt],
-    {
-      cwd,
-      encoding: "utf8",
-      input: "",
-      timeout: Number.parseInt(process.env.ORACLE_CODEX_CHROME_TIMEOUT_MS ?? "900000", 10),
-    },
+  die(
+    [
+      "Open Browser Use browser backend is not reachable.",
+      "Run `open-browser-use setup`, install or enable the Chrome extension, restart Chrome if requested, then verify with `open-browser-use info`.",
+      commandFailure(result),
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n"),
   );
-
-  let lastMessage = "";
-  try {
-    lastMessage = readFileSync(lastMessagePath, "utf8");
-  } catch {
-    lastMessage = "";
-  }
-  rmSync(tempRoot, { force: true, recursive: true });
-
-  return {
-    status: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-    lastMessage,
-  };
 }
 
-function isCodexChromeRuntimeUnavailable(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return (
-    normalized.startsWith(FAIL_PREFIX.toLowerCase()) &&
-    normalized.includes("official chrome plugin") &&
-    (normalized.includes("tool") ||
-      normalized.includes("runtime") ||
-      normalized.includes("node_repl") ||
-      normalized.includes("browser-client")) &&
-    (normalized.includes("unavailable") ||
-      normalized.includes("not available") ||
-      normalized.includes("not usable") ||
-      normalized.includes("missing"))
-  );
+function commandFailure(result: CheckResult): string | null {
+  return [
+    result.error ? `error: ${result.error.message}` : null,
+    result.status === null ? null : `exit-status: ${result.status}`,
+    tail("stdout", result.stdout),
+    tail("stderr", result.stderr),
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function normalizeUrl(raw: string | undefined): string | null {
@@ -255,6 +302,10 @@ function tail(label: string, value: string): string | null {
 function die(message: string): never {
   console.error(`[browser-test] ${message}`);
   process.exit(1);
+}
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 main();

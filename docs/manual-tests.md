@@ -7,10 +7,9 @@ and run the live API suite before shipping major transport changes.
 
 ## Prerequisites
 
-- macOS with Chrome running, the Codex Chrome Extension enabled, and the default profile signed in to ChatGPT Pro.
+- macOS with Chrome running, Open Browser Use enabled, and the default profile signed in to ChatGPT Pro.
 - Node 24+ and `pnpm install` already completed.
-- A Codex runtime that exposes the official `@chrome` browser plugin for live
-  smoke validation.
+- Open Browser Use MCP available through `obu mcp` for live smoke validation.
 - When debugging, add `--browser-keep-browser` so Chrome stays open after Oracle exits, then connect with `pnpm exec tsx scripts/browser-tools.ts ...` (screenshot, eval, DOM picker, etc.).
 - Ensure no Chrome instances are force-terminated mid-run; let Oracle clean up once you’re done capturing state.
 - Clipboard checks (`browser-tools.ts eval "navigator.clipboard.readText()"`) trigger a permission dialog in Chrome—approve it for debugging, but remember that we can’t rely on readText in unattended runs.
@@ -19,11 +18,11 @@ and run the live API suite before shipping major transport changes.
 
 ### Quick browser port smoke
 
-- `pnpm test:browser` — verifies the official Codex Chrome plugin/extension/native
-  host path, then runs the live ChatGPT smoke through a nested Codex `@chrome`
-  task when that runtime exposes the official browser tools. It must not launch
-  Chrome, read cookies, or use a DevTools port. Use `pnpm test:browser:live` to
-  require the live ChatGPT smoke and fail when the tools are not exposed.
+- `pnpm test:browser` — verifies the Open Browser Use CLI/MCP path, then runs
+  the live ChatGPT open/read/finalize smoke through `obu mcp` when the backend
+  is connected. It must not use Oracle's legacy browser engine. Use
+  `pnpm test:browser:live` to require the live ChatGPT smoke and fail when the
+  backend or MCP path is not available.
 
 ### Gemini browser mode (Gemini web / cookies)
 
