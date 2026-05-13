@@ -373,7 +373,12 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
 
 ## Testing Notes
 
-- ChatGPT automation smoke: `pnpm test:browser` (official Codex Chrome plugin path)
+- ChatGPT automation smoke: `pnpm test:browser` (official Codex Chrome plugin
+  readiness, plus live `@chrome` smoke when the current Codex runtime exposes
+  the official browser tools). Use `pnpm test:browser:live` to require the live
+  smoke.
 - Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`)
 - `pnpm test --filter browser` does not exist yet; manual runs with `--engine browser -v` are the current validation path.
-- Most legacy browser-engine lifting lives under `src/browser/`. The local Chrome smoke now validates through the official Codex Chrome plugin first; do not use the old cookie/DevTools smoke as substitute evidence.
+- Most legacy browser-engine lifting lives under `src/browser/`. The local
+  Chrome smoke now validates through the official Codex Chrome plugin first; do
+  not use the old cookie/DevTools smoke as substitute evidence.
