@@ -1,112 +1,228 @@
 #!/usr/bin/env tsx
 /**
- * Lightweight browser connectivity smoke test.
- * - Launches Chrome headful with a fixed DevTools port (default 45871 or env ORACLE_BROWSER_PORT/ORACLE_BROWSER_DEBUG_PORT).
- * - Verifies the DevTools /json/version endpoint responds.
- * - Prints a WSL-friendly firewall hint if the port is unreachable.
+ * Official Codex Chrome-plugin smoke for Oracle browser harnesses.
+ *
+ * This intentionally does not launch Chrome, read cookies, open a DevTools
+ * port, or call Oracle's legacy browser engine. The harness now proves the
+ * installed Codex Chrome Extension path first, then delegates the live ChatGPT
+ * browser smoke to a nested Codex task that must use @chrome.
  */
 
-import { setTimeout as sleep } from "node:timers/promises";
-import { launch } from "chrome-launcher";
-import os from "node:os";
-import { readFileSync } from "node:fs";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
+import process from "node:process";
 
-const DEFAULT_PORT = 45871;
-const port =
-  normalizePort(process.env.ORACLE_BROWSER_PORT ?? process.env.ORACLE_BROWSER_DEBUG_PORT) ??
-  DEFAULT_PORT;
-const hostHint = resolveWslHost();
-const targetHost = hostHint ?? "127.0.0.1";
+const OK_TOKEN = "ORACLE_CHROME_PLUGIN_SMOKE_OK";
+const FAIL_PREFIX = "ORACLE_CHROME_PLUGIN_SMOKE_FAIL:";
 
-function normalizePort(raw?: string | null): number | null {
-  if (!raw) return null;
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isFinite(value) || value <= 0 || value > 65535) return null;
-  return value;
-}
+type CheckResult = {
+  name: string;
+  status: number | null;
+  stdout: string;
+  stderr: string;
+};
 
-function isWsl(): boolean {
-  if (process.platform !== "linux") return false;
-  if (process.env.WSL_DISTRO_NAME) return true;
-  return os.release().toLowerCase().includes("microsoft");
-}
+type CodexResult = {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  lastMessage: string;
+};
 
-function resolveWslHost(): string | null {
-  if (!isWsl()) return null;
-  try {
-    const resolv = readFileSync("/etc/resolv.conf", "utf8");
-    for (const line of resolv.split("\n")) {
-      const match = line.match(/^nameserver\s+([0-9.]+)/);
-      if (match?.[1]) return match[1];
-    }
-  } catch {
-    // ignore
+function main(): void {
+  const pluginRoot = resolveChromePluginRoot();
+  const browserClient = path.join(pluginRoot, "scripts", "browser-client.mjs");
+  if (!existsSync(browserClient)) {
+    die(`Codex Chrome plugin is missing scripts/browser-client.mjs at ${pluginRoot}`);
   }
-  return null;
-}
 
-function firewallHint(host: string, devtoolsPort: number): string | null {
-  if (!isWsl()) return null;
-  return [
-    `DevTools port ${host}:${devtoolsPort} is blocked from WSL.`,
-    "",
-    "PowerShell (admin):",
-    `New-NetFirewallRule -DisplayName 'Chrome DevTools ${devtoolsPort}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort ${devtoolsPort}`,
-    "New-NetFirewallRule -DisplayName 'Chrome DevTools (chrome.exe)' -Direction Inbound -Action Allow -Program 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' -Protocol TCP",
-    "",
-    "Re-run ./runner pnpm test:browser after adding the rule.",
-  ].join("\n");
-}
+  console.log(`[browser-test] Codex Chrome plugin: ${pluginRoot}`);
+  runPluginReadinessCheck(pluginRoot, "chrome-is-running.js", ["--json"]);
+  runPluginReadinessCheck(pluginRoot, "check-extension-installed.js", ["--json"]);
+  runPluginReadinessCheck(pluginRoot, "check-native-host-manifest.js", ["--json"]);
 
-async function fetchVersion(host: string, devtoolsPort: number): Promise<boolean> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
-  try {
-    const res = await fetch(`http://${host}:${devtoolsPort}/json/version`, {
-      signal: controller.signal,
-    });
-    if (!res.ok) return false;
-    const json = (await res.json()) as { webSocketDebuggerUrl?: string };
-    return Boolean(json.webSocketDebuggerUrl);
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
+  const projectUrl =
+    normalizeUrl(process.env.ORACLE_CHATGPT_PROJECT_URL) ??
+    normalizeUrl(process.env.ORACLE_SUPERVISOR_CHATGPT_URL) ??
+    normalizeUrl(process.env.ORACLE_BROWSER_SMOKE_CHATGPT_URL) ??
+    "https://chatgpt.com/";
+
+  const result = runCodexChromeSmoke(projectUrl);
+  if (result.status !== 0 || result.lastMessage.trim() !== OK_TOKEN) {
+    const detail = result.lastMessage.trim().startsWith(FAIL_PREFIX)
+      ? result.lastMessage.trim()
+      : [
+          `${FAIL_PREFIX} official Chrome plugin was not usable from codex exec`,
+          result.lastMessage.trim()
+            ? `last-message=${JSON.stringify(result.lastMessage.trim())}`
+            : null,
+          tail("stdout", result.stdout),
+          tail("stderr", result.stderr),
+        ]
+          .filter((line): line is string => Boolean(line))
+          .join("\n");
+    die(detail);
   }
+
+  console.log(`[browser-test] ${OK_TOKEN}`);
 }
 
-async function main() {
-  console.log(`[browser-test] launching Chrome on ${targetHost}:${port} (headful)…`);
-  const chrome = await launch({
-    port,
-    chromeFlags: ["--remote-debugging-address=0.0.0.0"],
+function resolveChromePluginRoot(): string {
+  const configured = process.env.CODEX_CHROME_PLUGIN_ROOT?.trim();
+  if (configured) return configured;
+
+  const cacheRoot = path.join(homedir(), ".codex", "plugins", "cache", "openai-bundled", "chrome");
+  if (!existsSync(cacheRoot)) {
+    die(`Codex Chrome plugin cache not found at ${cacheRoot}`);
+  }
+
+  const candidates = readdirSync(cacheRoot)
+    .map((name) => path.join(cacheRoot, name))
+    .filter((candidate) => {
+      try {
+        return statSync(candidate).isDirectory();
+      } catch {
+        return false;
+      }
+    })
+    .filter((candidate) => existsSync(path.join(candidate, "scripts", "browser-client.mjs")))
+    .sort((left, right) => compareVersionPaths(right, left));
+
+  const selected = candidates[0];
+  if (!selected) {
+    die(
+      `No installed Codex Chrome plugin version with scripts/browser-client.mjs under ${cacheRoot}`,
+    );
+  }
+  return selected;
+}
+
+function compareVersionPaths(leftPath: string, rightPath: string): number {
+  const left = path
+    .basename(leftPath)
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+  const right = path
+    .basename(rightPath)
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const delta = (left[index] ?? 0) - (right[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return leftPath.localeCompare(rightPath);
+}
+
+function runPluginReadinessCheck(pluginRoot: string, scriptName: string, args: string[]): void {
+  const scriptPath = path.join(pluginRoot, "scripts", scriptName);
+  const result = runNode(scriptPath, args, pluginRoot);
+  if (result.status !== 0) {
+    die(
+      [
+        `Codex Chrome plugin readiness check failed: ${scriptName}`,
+        tail("stdout", result.stdout),
+        tail("stderr", result.stderr),
+      ]
+        .filter((line): line is string => Boolean(line))
+        .join("\n"),
+    );
+  }
+  console.log(`[browser-test] ${scriptName}: ok`);
+}
+
+function runNode(scriptPath: string, args: string[], cwd: string): CheckResult {
+  const result = spawnSync(process.execPath, [scriptPath, ...args], {
+    cwd,
+    encoding: "utf8",
+    timeout: 30_000,
   });
+  return {
+    name: path.basename(scriptPath),
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
 
-  let ok = await fetchVersion(targetHost, chrome.port);
-  if (!ok) {
-    await sleep(500);
-    ok = await fetchVersion(targetHost, chrome.port);
+function runCodexChromeSmoke(projectUrl: string): CodexResult {
+  const codexBin = process.env.CODEX_BIN?.trim() || "codex";
+  const cwd = path.resolve(path.join(import.meta.dirname, ".."));
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "oracle-chrome-plugin-smoke-"));
+  const lastMessagePath = path.join(tempRoot, "last-message.txt");
+  const attachmentPath = path.join(tempRoot, "smoke-attachment.txt");
+  writeFileSync(attachmentPath, "smoke-attachment\n", "utf8");
+
+  const prompt = [
+    "Use @chrome only. Do not use shell, AppleScript, raw Chrome DevTools, Playwright outside the official Chrome plugin, Computer Use, or Oracle's legacy browser engine.",
+    "This is the Oracle browser harness smoke.",
+    `Target URL: ${projectUrl}`,
+    `Attachment path: ${attachmentPath}`,
+    "Open or claim a Chrome tab for the target URL using the official Codex Chrome plugin.",
+    "Upload the attachment through the official Chrome plugin file chooser flow.",
+    "Send this exact ChatGPT prompt: Read the attached file and return exactly one markdown bullet '- upload: smoke-attachment' and nothing else.",
+    "Wait for the assistant response.",
+    `If the response contains '- upload: smoke-attachment', finalize Chrome tabs and reply exactly ${OK_TOKEN}.`,
+    `If the official Chrome plugin is unavailable or the response is not observed, finalize any Chrome tabs you created if possible and reply exactly ${FAIL_PREFIX} <short reason>.`,
+  ].join("\n");
+
+  const result: SpawnSyncReturns<string> = spawnSync(
+    codexBin,
+    ["exec", "--ephemeral", "-C", cwd, "-o", lastMessagePath, prompt],
+    {
+      cwd,
+      encoding: "utf8",
+      input: "",
+      timeout: Number.parseInt(process.env.ORACLE_CODEX_CHROME_TIMEOUT_MS ?? "900000", 10),
+    },
+  );
+
+  let lastMessage = "";
+  try {
+    lastMessage = readFileSync(lastMessagePath, "utf8");
+  } catch {
+    lastMessage = "";
   }
+  rmSync(tempRoot, { force: true, recursive: true });
 
-  await chrome.kill();
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    lastMessage,
+  };
+}
 
-  if (ok) {
-    console.log(`[browser-test] PASS: DevTools responding on ${targetHost}:${chrome.port}`);
-    process.exit(0);
+function normalizeUrl(raw: string | undefined): string | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.toString();
+  } catch {
+    die(`Invalid browser smoke URL: ${trimmed}`);
   }
+}
 
-  const hint = firewallHint(targetHost, chrome.port);
-  console.error(`[browser-test] FAIL: DevTools not reachable at ${targetHost}:${chrome.port}`);
-  if (hint) {
-    console.error(hint);
-  }
+function tail(label: string, value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const lines = trimmed.split(/\r?\n/);
+  return `${label}:\n${lines.slice(-40).join("\n")}`;
+}
+
+function die(message: string): never {
+  console.error(`[browser-test] ${message}`);
   process.exit(1);
 }
 
-main().catch((error) => {
-  console.error(
-    "[browser-test] Unexpected failure:",
-    error instanceof Error ? error.message : String(error),
-  );
-  process.exit(1);
-});
+main();
