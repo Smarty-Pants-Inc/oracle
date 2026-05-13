@@ -7,12 +7,18 @@
  * through `obu mcp`, reads page state through MCP CDP, and finalizes the tab.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import process from "node:process";
 
 const OK_TOKEN = "ORACLE_OPEN_BROWSER_USE_SMOKE_OK";
 const READY_TOKEN = "ORACLE_OPEN_BROWSER_USE_READY_OK";
 const REQUIRE_LIVE_SMOKE = process.env.ORACLE_OPEN_BROWSER_USE_REQUIRE_LIVE === "1";
+const REQUIRE_UPLOAD_SMOKE = process.env.ORACLE_OPEN_BROWSER_USE_UPLOAD_SMOKE === "1";
+const SKIP_CHATGPT_SMOKE = process.env.ORACLE_OPEN_BROWSER_USE_SKIP_CHATGPT_SMOKE === "1";
 
 type CheckResult = {
   name: string;
@@ -24,7 +30,7 @@ type CheckResult = {
 
 type JsonObject = Record<string, unknown>;
 
-function main(): void {
+async function main(): Promise<void> {
   const obuVersion = runObu(["version"], 10_000);
   if (obuVersion.status !== 0) {
     die(
@@ -63,7 +69,12 @@ function main(): void {
     normalizeUrl(process.env.ORACLE_BROWSER_SMOKE_CHATGPT_URL) ??
     "https://chatgpt.com/";
 
-  runMcpBrowserSmoke(projectUrl);
+  if (!SKIP_CHATGPT_SMOKE) {
+    runMcpBrowserSmoke(projectUrl);
+  }
+  if (REQUIRE_UPLOAD_SMOKE) {
+    await runUploadSmoke();
+  }
   console.log(`[browser-test] ${OK_TOKEN}`);
 }
 
@@ -80,6 +91,32 @@ function runObu(args: string[], timeout: number): CheckResult {
     stderr: result.stderr ?? "",
     error: result.error,
   };
+}
+
+function runObuAsync(args: string[], timeout: number): Promise<CheckResult> {
+  const command = process.env.OBU_BIN?.trim() || "obu";
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, timeout);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ name: `${command} ${args.join(" ")}`, status: null, stdout, stderr, error });
+    });
+    child.on("exit", (status) => {
+      clearTimeout(timer);
+      resolve({ name: `${command} ${args.join(" ")}`, status, stdout, stderr });
+    });
+  });
 }
 
 function runMcpToolListCheck(): void {
@@ -212,6 +249,308 @@ function runMcpBrowserSmoke(projectUrl: string): void {
   console.log("[browser-test] Open Browser Use MCP browser smoke: ok");
 }
 
+async function runUploadSmoke(): Promise<void> {
+  const sessionID = `oracle-open-browser-use-upload-${Date.now()}`;
+  const tempDir = mkdtempSync(join(tmpdir(), "oracle-obu-upload-"));
+  const uploadPath = join(tempDir, "oracle-upload-smoke.txt");
+  writeFileSync(uploadPath, "oracle open browser use upload smoke\n", "utf8");
+
+  let server: Server | null = null;
+  let waitProcess: ReturnType<typeof spawn> | null = null;
+  try {
+    server = createServer((_request, response) => {
+      response.writeHead(200, {
+        "cache-control": "no-store",
+        connection: "close",
+        "content-type": "text/html; charset=utf-8",
+      });
+      response.end(uploadSmokePage());
+    });
+    const port = await listen(server);
+    const opened = await runObuJSON(
+      [
+        "open-tab",
+        "--session-id",
+        sessionID,
+        "--timeout",
+        "10s",
+        "--url",
+        `http://127.0.0.1:${port}/`,
+      ],
+      20_000,
+      "Open Browser Use upload smoke could not open local test page.",
+    );
+    const tabID = tabIDFromOpenTab(opened);
+    const point = await waitForUploadButtonPoint(sessionID, tabID);
+    await runCDP(sessionID, tabID, "Page.bringToFront", {});
+
+    waitProcess = spawn(process.env.OBU_BIN?.trim() || "obu", [
+      "wait-file-chooser",
+      "--session-id",
+      sessionID,
+      "--tab-id",
+      String(tabID),
+      "--timeout",
+      "10s",
+    ]);
+    const chooserPromise = collectObuProcessJSON(waitProcess);
+    await delay(750);
+    await runCDP(sessionID, tabID, "Input.dispatchMouseEvent", {
+      button: "none",
+      buttons: 0,
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+    });
+    await runCDP(sessionID, tabID, "Input.dispatchMouseEvent", {
+      button: "left",
+      buttons: 1,
+      clickCount: 1,
+      type: "mousePressed",
+      x: point.x,
+      y: point.y,
+    });
+    await runCDP(sessionID, tabID, "Input.dispatchMouseEvent", {
+      button: "left",
+      buttons: 0,
+      clickCount: 1,
+      type: "mouseReleased",
+      x: point.x,
+      y: point.y,
+    });
+
+    const chooser = await chooserPromise;
+    const chooserID = fileChooserID(chooser);
+    if (!chooserID) {
+      die(
+        `Open Browser Use upload smoke did not receive a file chooser id.\n${JSON.stringify(chooser)}`,
+      );
+    }
+
+    const setFiles = await runObuJSON(
+      [
+        "set-file-chooser-files",
+        "--session-id",
+        sessionID,
+        "--timeout",
+        "10s",
+        "--file-chooser-id",
+        chooserID,
+        "--file",
+        uploadPath,
+      ],
+      15_000,
+      "Open Browser Use upload smoke could not set chooser files.",
+    );
+    if (isObject(setFiles.error)) {
+      die(
+        `Open Browser Use upload smoke set-file-chooser-files failed: ${String(setFiles.error.message ?? "unknown error")}`,
+      );
+    }
+
+    const selected = await waitForSelectedUploadName(sessionID, tabID);
+    if (selected !== "oracle-upload-smoke.txt") {
+      die(`Open Browser Use upload smoke selected wrong file: ${selected}`);
+    }
+    console.log("[browser-test] Open Browser Use upload smoke: ok");
+  } finally {
+    if (waitProcess && waitProcess.exitCode === null) {
+      waitProcess.kill("SIGTERM");
+    }
+    await runObuAsync(
+      ["finalize-tabs", "--session-id", sessionID, "--timeout", "10s", "--keep", "[]"],
+      15_000,
+    );
+    await closeServer(server);
+    rmSync(tempDir, { force: true, recursive: true });
+  }
+}
+
+function uploadSmokePage(): string {
+  return `<!doctype html>
+<meta charset="utf-8">
+<title>Oracle Open Browser Use Upload Smoke</title>
+<body>
+  <button id="choose" style="font-size:20px;margin:40px">Choose</button>
+  <input id="file" type="file" multiple style="display:none">
+  <div id="selected">empty</div>
+  <script>
+    choose.addEventListener('click', () => file.click());
+    file.addEventListener('change', () => {
+      selected.textContent = Array.from(file.files).map((entry) => entry.name).join(',') || 'empty';
+    });
+  </script>
+</body>`;
+}
+
+function listen(server: Server): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (typeof address === "object" && address !== null) {
+        resolve(address.port);
+        return;
+      }
+      reject(new Error("local upload smoke server did not bind to a TCP port"));
+    });
+  });
+}
+
+async function closeServer(server: Server | null): Promise<void> {
+  if (!server) return;
+  server.closeAllConnections?.();
+  await new Promise<void>((resolve) => {
+    const fallback = setTimeout(resolve, 500);
+    fallback.unref?.();
+    server.close(() => {
+      clearTimeout(fallback);
+      resolve();
+    });
+  });
+}
+
+function collectObuProcessJSON(child: ReturnType<typeof spawn>): Promise<JsonObject> {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (status) => {
+      if (status !== 0) {
+        reject(new Error(stderr.trim() || `obu wait-file-chooser exited ${status}`));
+        return;
+      }
+      const parsed = parseJSONOutput(
+        stdout,
+        "Open Browser Use wait-file-chooser emitted invalid JSON.",
+      );
+      resolve(parsed);
+    });
+  });
+}
+
+async function waitForUploadButtonPoint(
+  sessionID: string,
+  tabID: number,
+): Promise<{ x: number; y: number }> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const response = await runRuntimeEvaluate(
+      sessionID,
+      tabID,
+      `(() => { const el = document.getElementById('choose'); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`,
+    );
+    const point = extractRuntimeValue(response);
+    if (isObject(point) && typeof point.x === "number" && typeof point.y === "number") {
+      return { x: point.x, y: point.y };
+    }
+    await delay(100);
+  }
+  die("Open Browser Use upload smoke local page did not render the upload button.");
+}
+
+async function waitForSelectedUploadName(sessionID: string, tabID: number): Promise<string> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await runRuntimeEvaluate(
+      sessionID,
+      tabID,
+      `Array.from(document.getElementById('file').files).map((entry) => entry.name).join(',')`,
+    );
+    const selected = extractRuntimeValue(response);
+    if (typeof selected === "string" && selected) return selected;
+    await delay(100);
+  }
+  return "";
+}
+
+async function runRuntimeEvaluate(
+  sessionID: string,
+  tabID: number,
+  expression: string,
+): Promise<JsonObject> {
+  return runCDP(sessionID, tabID, "Runtime.evaluate", { expression, returnByValue: true });
+}
+
+async function runCDP(
+  sessionID: string,
+  tabID: number,
+  method: string,
+  params: JsonObject,
+): Promise<JsonObject> {
+  return runObuJSON(
+    [
+      "cdp",
+      "--session-id",
+      sessionID,
+      "--tab-id",
+      String(tabID),
+      "--timeout",
+      "10s",
+      "--method",
+      method,
+      "--params",
+      JSON.stringify(params),
+    ],
+    15_000,
+    `Open Browser Use upload smoke CDP command failed: ${method}`,
+  );
+}
+
+async function runObuJSON(args: string[], timeout: number, message: string): Promise<JsonObject> {
+  const result = await runObuAsync(args, timeout);
+  if (result.status !== 0) {
+    die(
+      [message, commandFailure(result)].filter((line): line is string => Boolean(line)).join("\n"),
+    );
+  }
+  return parseJSONOutput(result.stdout, message);
+}
+
+function parseJSONOutput(stdout: string, message: string): JsonObject {
+  const trimmed = stdout.trim();
+  if (!trimmed) die(`${message}\nstdout was empty`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    die(`${message}\n${tail("stdout", stdout)}`);
+  }
+  if (!isObject(parsed)) die(`${message}\nJSON output was not an object`);
+  return parsed;
+}
+
+function tabIDFromOpenTab(response: JsonObject): number {
+  const tab = isObject(response.tab) ? response.tab : null;
+  const id = tab?.id;
+  if (typeof id === "number" && Number.isInteger(id) && id > 0) {
+    return id;
+  }
+  die(
+    `Open Browser Use upload smoke open-tab response did not include a tab id.\n${JSON.stringify(response)}`,
+  );
+}
+
+function fileChooserID(response: JsonObject): string | null {
+  const result = isObject(response.result) ? response.result : null;
+  const id = result?.fileChooserId ?? result?.file_chooser_id;
+  return typeof id === "string" && id ? id : null;
+}
+
+function extractRuntimeValue(response: JsonObject): unknown {
+  const result = isObject(response.result) ? response.result : null;
+  const cdpResult = isObject(result?.result) ? result.result : null;
+  return cdpResult?.value;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function mcpRequest(id: number, method: string, params: JsonObject): JsonObject {
   return { jsonrpc: "2.0", id, method, params };
 }
@@ -308,4 +647,6 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-main();
+main().catch((error: unknown) => {
+  die(error instanceof Error ? error.message : String(error));
+});

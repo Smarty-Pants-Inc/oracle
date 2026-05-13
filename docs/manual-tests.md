@@ -23,6 +23,9 @@ and run the live API suite before shipping major transport changes.
   is connected. It must not use Oracle's legacy browser engine. Use
   `pnpm test:browser:live` to require the live ChatGPT smoke and fail when the
   backend or MCP path is not available.
+- `scripts/browser-smoke-upload-only.sh` — verifies the Open Browser Use file
+  chooser upload path against a local test page. This requires Chrome extension
+  file URL access for Open Browser Use.
 
 ### Gemini browser mode (Gemini web / cookies)
 

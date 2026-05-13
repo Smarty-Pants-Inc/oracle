@@ -377,6 +377,9 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
   readiness, plus live ChatGPT open/read/finalize smoke through `obu mcp` when
   the Open Browser Use backend is connected). Use `pnpm test:browser:live` to
   require the live smoke.
+- Upload automation smoke: `scripts/browser-smoke-upload-only.sh` validates
+  the Open Browser Use file chooser upload path against a local page. Chrome
+  must allow file URL access for the Open Browser Use extension.
 - Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`)
 - `pnpm test --filter browser` does not exist yet; manual runs with `--engine browser -v` are the current validation path.
 - Most legacy browser-engine lifting lives under `src/browser/`. The local

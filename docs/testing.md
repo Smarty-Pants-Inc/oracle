@@ -9,6 +9,10 @@
   `ORACLE_OPEN_BROWSER_USE_REQUIRE_LIVE=1 pnpm test:browser` when live browser
   execution must fail closed. Requires Chrome running with Open Browser Use
   enabled and a signed-in ChatGPT session.
+- Upload smoke: `scripts/browser-smoke-upload-only.sh` verifies Open Browser
+  Use file chooser upload against a local test page. Chrome must have Open
+  Browser Use extension file URL access enabled, otherwise Chrome returns
+  `Not allowed` when setting local files.
 - Live API smokes: `ORACLE_LIVE_TEST=1 OPENAI_API_KEY=… pnpm test:live` (excludes OpenAI pro), `ORACLE_LIVE_TEST=1 OPENAI_API_KEY=… pnpm test:pro` (OpenAI pro live). Expect real usage/cost.
 - Gemini web (cookie) live smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`).
 - MCP focused: `pnpm test:mcp` (builds then stdio smoke via mcporter).
