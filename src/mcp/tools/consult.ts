@@ -8,6 +8,10 @@ import { sessionStore } from "../../sessionStore.js";
 import { resolveRemoteServiceConfig } from "../../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../../browser/sessionRunner.js";
+import {
+  buildAgentBlockerFromSession,
+  type OracleAgentBlocker,
+} from "../../oracle/agentDiagnostics.js";
 
 async function readSessionLogTail(sessionId: string, maxBytes: number): Promise<string | null> {
   try {
@@ -176,6 +180,26 @@ const consultDryRunResolvedShape = z.object({
   guidance: z.array(z.string()),
 });
 
+const consultAgentBlockerShape = z.object({
+  kind: z.string(),
+  severity: z.string(),
+  message: z.string(),
+  remediation: z.string(),
+  resumable: z.boolean(),
+  resumeCommand: z.string().optional(),
+  evidence: z
+    .object({
+      sessionId: z.string().optional(),
+      status: z.string().optional(),
+      mode: z.string().optional(),
+      incompleteReason: z.string().nullable().optional(),
+      transportReason: z.string().optional(),
+      errorCategory: z.string().optional(),
+      errorStage: z.string().optional(),
+    })
+    .optional(),
+});
+
 const consultOutputShape = {
   sessionId: z.string().optional(),
   status: z.string(),
@@ -183,10 +207,12 @@ const consultOutputShape = {
   dryRun: z.boolean().optional(),
   resolved: consultDryRunResolvedShape.optional(),
   models: z.array(consultModelSummaryShape).optional(),
+  agentBlocker: consultAgentBlockerShape.optional(),
 } satisfies z.ZodRawShape;
 
 export type ConsultModelSummary = z.infer<typeof consultModelSummaryShape>;
 export type ConsultDryRunResolved = z.infer<typeof consultDryRunResolvedShape>;
+export type ConsultAgentBlocker = OracleAgentBlocker;
 
 export function summarizeModelRunsForConsult(
   runs?: SessionModelRun[] | null,
@@ -580,12 +606,27 @@ export function registerConsultTool(server: McpServer): void {
           browserDeps,
         });
       } catch (error) {
-        log(`Run failed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        log(`Run failed: ${message}`);
+        let finalMeta = sessionMeta;
+        try {
+          finalMeta = (await sessionStore.readSession(sessionMeta.id)) ?? sessionMeta;
+        } catch {
+          finalMeta = sessionMeta;
+        }
+        const logTail = await readSessionLogTail(sessionMeta.id, 4000);
+        const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
+        const agentBlocker = buildAgentBlockerFromSession(finalMeta, { logTail });
         return {
           isError: true,
-          content: textContent(
-            `Session ${sessionMeta.id} failed: ${error instanceof Error ? error.message : String(error)}`,
-          ),
+          content: textContent(`Session ${sessionMeta.id} failed: ${message}`),
+          structuredContent: {
+            sessionId: sessionMeta.id,
+            status: finalMeta.status,
+            output: logTail ?? "",
+            models: modelsSummary,
+            agentBlocker,
+          },
         };
       } finally {
         logWriter.stream.end();
@@ -596,6 +637,7 @@ export function registerConsultTool(server: McpServer): void {
         const summary = `Session ${sessionMeta.id} (${finalMeta.status})`;
         const logTail = await readSessionLogTail(sessionMeta.id, 4000);
         const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
+        const agentBlocker = buildAgentBlockerFromSession(finalMeta, { logTail });
         return {
           content: textContent([summary, logTail || "(log empty)"].join("\n").trim()),
           structuredContent: {
@@ -603,6 +645,7 @@ export function registerConsultTool(server: McpServer): void {
             status: finalMeta.status,
             output: logTail ?? "",
             models: modelsSummary,
+            agentBlocker,
           },
         };
       } catch (error) {
