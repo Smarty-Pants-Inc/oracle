@@ -115,6 +115,7 @@ async function runBrowserDryRun(
   const suffix = buildTokenEstimateSuffix(artifacts);
   const headerLine = `[dry-run] Oracle (${version}) would launch browser mode (${runOptions.model}) with ~${artifacts.estimatedInputTokens.toLocaleString()} tokens${suffix}.`;
   log(chalk.cyan(headerLine));
+  logBrowserTargetSummary(browserConfig, log, "dry-run");
   logBrowserControlPlan(browserConfig, log, "dry-run");
   logBrowserFollowUpSummary(runOptions.browserFollowUps, log, "dry-run");
   logBrowserCookieStrategy(browserConfig, log, "dry-run");
@@ -208,6 +209,7 @@ export async function runBrowserPreview(
   const suffix = buildTokenEstimateSuffix(artifacts);
   const headerLine = `[preview] Oracle (${version}) browser mode (${runOptions.model}) with ~${artifacts.estimatedInputTokens.toLocaleString()} tokens${suffix}.`;
   log(chalk.cyan(headerLine));
+  logBrowserTargetSummary(browserConfig, log, "preview");
   logBrowserControlPlan(browserConfig, log, "preview");
   logBrowserFollowUpSummary(runOptions.browserFollowUps, log, "preview");
   logBrowserFileSummary(artifacts, log, "preview");
@@ -220,6 +222,7 @@ export async function runBrowserPreview(
     const previewPayload = {
       model: runOptions.model,
       engine: "browser" as const,
+      browser: buildBrowserPreviewSummary(browserConfig),
       composerText: artifacts.composerText,
       attachments: attachmentSummary,
       inlineFileCount: artifacts.inlineFileCount,
@@ -236,6 +239,37 @@ export async function runBrowserPreview(
     log(chalk.bold("Composer Text"));
     log(artifacts.composerText || chalk.dim("(empty prompt)"));
   }
+}
+
+function logBrowserTargetSummary(
+  browserConfig: BrowserSessionConfig | undefined,
+  log: (message: string) => void,
+  label: string,
+): void {
+  const summary = buildBrowserPreviewSummary(browserConfig);
+  const parts = [
+    `target: ${summary.chatgptUrl}`,
+    `archive: ${summary.archiveConversations}`,
+    `manual-login: ${summary.manualLogin ? "yes" : "no"}`,
+    `keep-browser: ${summary.keepBrowser ? "yes" : "no"}`,
+    `hide-window: ${summary.hideWindow ? "yes" : "no"}`,
+    summary.modelStrategy ? `model-strategy: ${summary.modelStrategy}` : null,
+    summary.researchMode !== "off" ? `research: ${summary.researchMode}` : null,
+  ].filter((part): part is string => Boolean(part));
+  log(chalk.dim(`[${label}] Browser config: ${parts.join("; ")}.`));
+}
+
+function buildBrowserPreviewSummary(browserConfig: BrowserSessionConfig | undefined) {
+  return {
+    chatgptUrl: browserConfig?.chatgptUrl ?? browserConfig?.url ?? "https://chatgpt.com/",
+    archiveConversations: browserConfig?.archiveConversations ?? "auto",
+    manualLogin: Boolean(browserConfig?.manualLogin),
+    keepBrowser: Boolean(browserConfig?.keepBrowser),
+    hideWindow: Boolean(browserConfig?.hideWindow),
+    attachRunning: Boolean(browserConfig?.attachRunning),
+    modelStrategy: browserConfig?.modelStrategy ?? null,
+    researchMode: browserConfig?.researchMode ?? "off",
+  };
 }
 
 function logBrowserFollowUpSummary(

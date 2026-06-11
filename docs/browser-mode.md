@@ -104,7 +104,7 @@ Notes:
 - `--browser-thinking-time <light|standard|extended|heavy>`: set the ChatGPT thinking-time intensity (Thinking/Pro models only). You can also set a default in `~/.oracle/config.json` via `browser.thinkingTime`.
 - `--browser-research deep`: activate ChatGPT Deep Research before submitting the prompt. Use this for broad public-web research and final cited reports, not as a replacement for GPT-5.x Pro Heavy code review or pure reasoning.
 - `--browser-follow-up <prompt>`: submit another prompt in the same ChatGPT conversation after the initial answer. Repeat the flag for multi-turn reviews such as “challenge your recommendation”, “compare against this constraint”, then “give the final decision”. Deep Research has its own report lifecycle, so browser follow-ups are rejected when `--browser-research deep` is enabled.
-- `--browser-archive <auto|always|never>`: archive completed ChatGPT conversations after local artifacts are saved. The default `auto` archives only successful one-shot chats and skips project, Deep Research, multi-turn, failed, and incomplete sessions.
+- `--browser-archive <auto|always|never>`: archive ChatGPT conversations after local artifacts are saved. The default `auto` archives successful one-shot chats, including project chats, and best-effort archives interrupted one-shots once a conversation exists. It skips Temporary Chat, Deep Research, multi-turn, and pre-conversation failures.
 - `--browser-port <port>` (alias: `--browser-debug-port`; env: `ORACLE_BROWSER_PORT`/`ORACLE_BROWSER_DEBUG_PORT`): pin the DevTools port (handy on WSL/Windows firewalls). When omitted, a random open port is chosen.
 - `--browser-no-cookie-sync`, `--browser-manual-login` (persistent automation profile + user-driven login), `--browser-headless`, `--browser-hide-window`, `--browser-keep-browser`, and the global `-v/--verbose` flag for detailed automation logs.
 - `--browser-url`: override ChatGPT base URL if needed.
@@ -168,9 +168,9 @@ Completed browser sessions also save durable artifacts under `~/.oracle/sessions
 
 ### Conversation archiving
 
-Browser mode keeps the local session as the source of truth, so Oracle can optionally archive the ChatGPT conversation after a successful run. The default `--browser-archive auto` archives only successful non-project, non-Deep-Research, non-multi-turn one-shot chats after `transcript.md`, generated artifacts, the final answer, and the conversation URL are saved locally.
+Browser mode keeps the local session as the source of truth, so Oracle can optionally archive the ChatGPT conversation after a run. The default `--browser-archive auto` archives successful non-Temporary, non-Deep-Research, non-multi-turn one-shot chats, including project chats, after `transcript.md`, generated artifacts, the final answer, and the conversation URL are saved locally.
 
-Oracle does not auto-archive failed, incomplete, running, project, Deep Research, or multi-turn sessions. Use `--browser-archive never` to disable archiving, or `--browser-archive always` when you explicitly want a successful browser conversation archived even outside the default one-shot policy. Archived chats are still visible and manageable from ChatGPT's own archive UI.
+When a one-shot run is interrupted after ChatGPT has created a `/c/...` conversation, Oracle also makes a best-effort archive attempt so failed response capture does not leave active-sidebar residue. Oracle does not auto-archive Temporary Chat, Deep Research, multi-turn sessions, or failures that happen before a conversation URL exists. Use `--browser-archive never` to disable archiving, or `--browser-archive always` when you explicitly want a browser conversation archived outside the default one-shot policy. Archived chats are still visible and manageable from ChatGPT's own archive UI.
 
 ### ChatGPT Project Sources
 
@@ -252,7 +252,7 @@ oracle --engine browser \
 - Oracle launches Chrome headful with a persistent automation profile at `~/.oracle/browser-profile` (override with `ORACLE_BROWSER_PROFILE_DIR` or `browser.manualLoginProfileDir` in `~/.oracle/config.json`).
 - Log into chatgpt.com in that window the first time; Oracle polls until the session is active, then proceeds.
 - Reuse the same profile on subsequent runs (no re-login unless the session expires).
-- Add `--browser-keep-browser` (or config `browser.keepBrowser=true`) when doing the initial login/setup or debugging so the Chrome window stays open after the run. When omitted, Oracle closes Chrome but preserves the profile on disk.
+- Add `--browser-keep-browser` (or config `browser.keepBrowser=true`) when doing the initial login/setup or debugging so the Chrome window stays open after the run. Use `--no-browser-keep-browser` to force cleanup for a smoke run even when config keeps Chrome open. When omitted, Oracle closes Chrome but preserves the profile on disk.
 - Cookie copy is skipped by default in this mode. To automate manual-login runs, set `browser.manualLoginCookieSync=true` in `~/.oracle/config.json` to seed the persistent profile from your existing Chrome cookies; inline cookies apply when cookie sync is enabled.
 - If Chrome is already running with that profile and DevTools remote debugging enabled (see `DevToolsActivePort` in the profile dir), you can reuse it instead of relaunching by pointing Oracle at it with `--remote-chrome <host:port>`.
 - Remote Chrome runs also participate in tab-slot coordination when paired with `--browser-manual-login` and a shared manual-login profile.

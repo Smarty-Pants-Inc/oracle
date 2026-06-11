@@ -6,6 +6,7 @@ export type OracleAgentBlockerKind =
   | "permission"
   | "rate_limit"
   | "selector_drift"
+  | "scope_mismatch"
   | "browser_unavailable"
   | "timeout"
   | "model_unavailable"
@@ -29,6 +30,11 @@ export interface OracleAgentBlocker {
     transportReason?: string;
     errorCategory?: string;
     errorStage?: string;
+    errorCode?: string;
+    expectedUrl?: string;
+    actualUrl?: string;
+    errorSignals?: string[];
+    errorBlockers?: string[];
   };
 }
 
@@ -41,8 +47,28 @@ function readErrorStage(meta: SessionMetadata): string | undefined {
   return typeof stage === "string" ? stage : undefined;
 }
 
+function readErrorCode(meta: SessionMetadata): string | undefined {
+  const code = meta.error?.details?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function readErrorStringDetail(meta: SessionMetadata, key: string): string | undefined {
+  const value = meta.error?.details?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function readErrorStringArrayDetail(meta: SessionMetadata, key: string): string[] | undefined {
+  const value = meta.error?.details?.[key];
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter((entry): entry is string => typeof entry === "string");
+  return strings.length > 0 ? strings : undefined;
+}
+
 function baseEvidence(meta: SessionMetadata): OracleAgentBlocker["evidence"] {
   const stage = readErrorStage(meta);
+  const code = readErrorCode(meta);
   return {
     sessionId: meta.id,
     status: meta.status,
@@ -51,6 +77,11 @@ function baseEvidence(meta: SessionMetadata): OracleAgentBlocker["evidence"] {
     transportReason: meta.transport?.reason,
     errorCategory: meta.error?.category,
     errorStage: stage,
+    errorCode: code,
+    expectedUrl: readErrorStringDetail(meta, "expectedUrl"),
+    actualUrl: readErrorStringDetail(meta, "actualUrl"),
+    errorSignals: readErrorStringArrayDetail(meta, "signals"),
+    errorBlockers: readErrorStringArrayDetail(meta, "blockers"),
   };
 }
 
@@ -63,6 +94,7 @@ function sourceText(meta: SessionMetadata, options: AgentBlockerOptions): string
     meta.errorMessage,
     meta.error?.message,
     readErrorStage(meta),
+    readErrorCode(meta),
     meta.transport?.reason,
     meta.response?.incompleteReason,
     options.logTail,
@@ -91,6 +123,7 @@ export function buildAgentBlockerFromSession(
   options: AgentBlockerOptions = {},
 ): OracleAgentBlocker | undefined {
   const stage = readErrorStage(meta);
+  const code = readErrorCode(meta);
   const incompleteReason = meta.response?.incompleteReason;
   const transportReason = meta.transport?.reason;
   const text = sourceText(meta, options);
@@ -131,7 +164,7 @@ export function buildAgentBlockerFromSession(
     });
   }
 
-  if (transportReason === "model-unavailable") {
+  if (transportReason === "model-unavailable" || code === "model-option-unavailable") {
     return blocker(meta, {
       kind: "model_unavailable",
       severity: "action_required",
@@ -148,6 +181,17 @@ export function buildAgentBlockerFromSession(
       message: "The configured API endpoint does not support Oracle's requested operation.",
       remediation:
         "Use a compatible OpenAI Responses API endpoint or switch to the browser engine.",
+      resumable: false,
+    });
+  }
+
+  if (code === "scope-mismatch" || stage === "chatgpt-scope") {
+    return blocker(meta, {
+      kind: "scope_mismatch",
+      severity: "action_required",
+      message: "ChatGPT did not stay in the requested project or thread scope.",
+      remediation:
+        "Use an accessible ChatGPT project/thread URL, refresh the Oracle profile login, and retry without falling back to root chat.",
       resumable: false,
     });
   }
@@ -193,6 +237,7 @@ export function buildAgentBlockerFromSession(
   }
 
   if (
+    code === "login-required" ||
     sourceMatches(text, [
       /sign in/,
       /log in/,
@@ -212,8 +257,16 @@ export function buildAgentBlockerFromSession(
   }
 
   if (
-    stage === "execute-browser" &&
-    sourceMatches(text, [/selector/, /locator/, /data-testid/, /prompt composer/, /model picker/])
+    code === "prompt-not-accepted" ||
+    code === "model-selector-missing" ||
+    (stage === "execute-browser" &&
+      sourceMatches(text, [
+        /selector/,
+        /locator/,
+        /data-testid/,
+        /prompt composer/,
+        /model picker/,
+      ]))
   ) {
     return blocker(meta, {
       kind: "selector_drift",

@@ -47,11 +47,15 @@ describe("runDryRunSummary", () => {
           chromeProfile: "Default",
           chromePath: null,
           url: "https://chatgpt.com/",
+          chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
           timeoutMs: 1_200_000,
           inputTimeoutMs: 30_000,
           headless: false,
           keepBrowser: false,
-          hideWindow: false,
+          hideWindow: true,
+          manualLogin: true,
+          modelStrategy: "current",
+          archiveConversations: "auto",
           desiredModel: null,
           debug: false,
           allowCookieErrors: false,
@@ -77,7 +81,7 @@ describe("runDryRunSummary", () => {
     expect(header?.[0]).toContain("browser mode");
     expect(
       log.mock.calls.some(([entry]) =>
-        String(entry).includes("Browser control: launch visible Chrome"),
+        String(entry).includes("Browser control: launch Chrome and hide the window"),
       ),
     ).toBe(true);
     expect(log.mock.calls.some(([entry]) => String(entry).includes("Attachments to upload"))).toBe(
@@ -89,6 +93,19 @@ describe("runDryRunSummary", () => {
     ).toBe(true);
     expect(
       log.mock.calls.some(([entry]) => String(entry).includes("ChatGPT archive policy: auto")),
+    ).toBe(true);
+    expect(
+      log.mock.calls.some(([entry]) =>
+        String(entry).includes("target: https://chatgpt.com/g/g-p-demo/project"),
+      ),
+    ).toBe(true);
+    expect(log.mock.calls.some(([entry]) => String(entry).includes("manual-login: yes"))).toBe(
+      true,
+    );
+    expect(log.mock.calls.some(([entry]) => String(entry).includes("keep-browser: no"))).toBe(true);
+    expect(log.mock.calls.some(([entry]) => String(entry).includes("hide-window: yes"))).toBe(true);
+    expect(
+      log.mock.calls.some(([entry]) => String(entry).includes("model-strategy: current")),
     ).toBe(true);
   });
 

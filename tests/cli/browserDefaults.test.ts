@@ -80,6 +80,21 @@ describe("applyBrowserDefaultsFromConfig", () => {
     expect(options.browserKeepBrowser).toBe(true);
   });
 
+  test("does not let browser.keepBrowser config override an explicit false CLI value", () => {
+    const options: BrowserDefaultsOptions = { browserKeepBrowser: false };
+    const config: UserConfig = {
+      browser: {
+        keepBrowser: true,
+      },
+    };
+    const source = (key: keyof BrowserDefaultsOptions) =>
+      key === "browserKeepBrowser" ? "cli" : "default";
+
+    applyBrowserDefaultsFromConfig(options, config, source);
+
+    expect(options.browserKeepBrowser).toBe(false);
+  });
+
   test("applies thinking time when CLI flag is untouched", () => {
     const options: BrowserDefaultsOptions = {};
     const config: UserConfig = {

@@ -7,6 +7,7 @@ import {
   classifyPreservedBrowserErrorForTest,
   formatBrowserTurnTranscript,
   maybeArchiveCompletedConversationForTest,
+  maybeArchiveInterruptedConversationForTest,
   redactBrowserConfigForDebugLogForTest,
   resolveRemoteTabLeaseProfileDirForTest,
   runBrowserMode,
@@ -220,6 +221,66 @@ describe("browser follow-ups", () => {
 });
 
 describe("browser conversation archiving", () => {
+  test("archives interrupted project one-shots in auto mode", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: "https://chatgpt.com/g/g-p-demo/project/c/abc" },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              status: "archived",
+              conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+            },
+          },
+        }),
+    };
+    const log = vi.fn();
+
+    await expect(
+      maybeArchiveInterruptedConversationForTest({
+        Runtime: runtime as never,
+        logger: log as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "auto",
+          chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
+        }),
+        conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+        followUpCount: 0,
+      }),
+    ).resolves.toMatchObject({
+      mode: "auto",
+      attempted: true,
+      archived: true,
+      conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not attempt interrupted archive before a conversation exists", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: { value: "https://chatgpt.com/g/g-p-demo/project" },
+      }),
+    };
+
+    await expect(
+      maybeArchiveInterruptedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "auto",
+          chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
+        }),
+        conversationUrl: "https://chatgpt.com/g/g-p-demo/project",
+        followUpCount: 0,
+      }),
+    ).resolves.toBeNull();
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
   test("does not attempt archive when required local artifacts were not saved", async () => {
     const runtime = {
       evaluate: vi.fn(),

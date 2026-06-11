@@ -362,6 +362,48 @@ describe("browser model selection matchers", () => {
     expect(logger).toHaveBeenCalledWith("Model picker: Thinking 5.5 Heavy");
   });
 
+  it("keeps current model when the selector is missing but the prompt composer is ready", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: { status: "button-missing", promptReady: true } },
+      }),
+    };
+    const logger = vi.fn();
+
+    await expect(
+      ensureModelSelection(runtime as never, "gpt-5.5", logger as never, "current"),
+    ).resolves.toBeUndefined();
+    expect(logger).toHaveBeenCalledWith(
+      "Model picker: current selection (selector unavailable; prompt composer ready)",
+    );
+  });
+
+  it("reports login UI as a structured blocker when the model selector is missing", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            status: "button-missing",
+            promptReady: false,
+            loginVisible: true,
+            url: "https://chatgpt.com/",
+            title: "ChatGPT",
+          },
+        },
+      }),
+    };
+    const logger = vi.fn();
+
+    await expect(
+      ensureModelSelection(runtime as never, "gpt-5.5", logger as never, "current"),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "login-required",
+        code: "login-required",
+      },
+    });
+  });
+
   it("builds composer footer matchers for generic ChatGPT header states", () => {
     expect(buildComposerSignalMatchersForTest("GPT-5.5 Pro")).toEqual({
       includesAny: ["pro"],

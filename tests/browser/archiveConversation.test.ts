@@ -24,21 +24,24 @@ describe("browser conversation archive policy", () => {
     });
   });
 
-  test("does not auto-archive project, Temporary Chat, Deep Research, multi-turn, or missing-url runs", () => {
+  test("auto-archives successful project one-shots", () => {
     expect(
       resolveBrowserArchiveDecision({
         mode: "auto",
         chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
         conversationUrl: "https://chatgpt.com/c/abc",
       }),
-    ).toMatchObject({ shouldArchive: false, reason: "project-conversation" });
+    ).toMatchObject({ shouldArchive: true, reason: "successful-one-shot" });
     expect(
       resolveBrowserArchiveDecision({
         mode: "auto",
         chatgptUrl: "https://chatgpt.com/",
         conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
       }),
-    ).toMatchObject({ shouldArchive: false, reason: "project-conversation" });
+    ).toMatchObject({ shouldArchive: true, reason: "successful-one-shot" });
+  });
+
+  test("does not auto-archive Temporary Chat, Deep Research, multi-turn, or missing-url runs", () => {
     expect(
       resolveBrowserArchiveDecision({
         mode: "auto",
