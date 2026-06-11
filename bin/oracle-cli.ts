@@ -615,6 +615,12 @@ program
   )
   .addOption(
     new Option(
+      "--no-browser-keep-browser",
+      "Close Chrome after completion even when browser.keepBrowser is enabled in config.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
       "--browser-model-strategy <mode>",
       "ChatGPT model picker strategy: select (default) switches to the requested model, current keeps the active model, ignore skips the picker entirely.",
     ).choices(["select", "current", "ignore"]),
@@ -636,7 +642,7 @@ program
   .addOption(
     new Option(
       "--browser-archive <mode>",
-      "Archive completed ChatGPT browser conversations after local artifacts are saved (auto archives successful non-project one-shots only).",
+      "Archive ChatGPT browser conversations after local artifacts are saved (auto archives successful one-shots, including project chats).",
     ).choices(["auto", "always", "never"]),
   )
   .addOption(
@@ -815,6 +821,10 @@ function addProjectSourcesCommonOptions(command: Command): Command {
     .option("--browser-inline-cookies-file <path>", "File containing ChatGPT cookies JSON.")
     .option("--browser-no-cookie-sync", "Skip copying cookies from Chrome.")
     .option("--browser-keep-browser", "Keep Chrome running after completion.", false)
+    .option(
+      "--no-browser-keep-browser",
+      "Close Chrome after completion even when browser.keepBrowser is enabled in config.",
+    )
     .option("--browser-hide-window", "Hide Chrome window after launch on macOS.", false)
     .option("--browser-allow-cookie-errors", "Continue when cookie sync fails.", false)
     .option(
@@ -2313,6 +2323,7 @@ function printDebugHelp(cliName: string): void {
     ["--browser-headless", "Launch Chrome in headless mode."],
     ["--browser-hide-window", "Hide the Chrome window (macOS headful only)."],
     ["--browser-keep-browser", "Leave Chrome running after completion."],
+    ["--no-browser-keep-browser", "Close Chrome even when browser.keepBrowser is enabled."],
   ]);
   console.log("");
   console.log(chalk.dim(`Tip: run \`${cliName} --help\` to see the primary option set.`));

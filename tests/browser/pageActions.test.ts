@@ -9,6 +9,7 @@ import {
   ensurePromptReady,
   ensureNotBlocked,
   ensureLoggedIn,
+  ensureChatGptScopeRetained,
 } from "../../src/browser/pageActions.js";
 import { buildLoginProbeExpressionForTest } from "../../src/browser/actions/navigation.js";
 import * as attachments from "../../src/browser/actions/attachments.js";
@@ -104,7 +105,7 @@ describe("navigateToPromptReadyWithFallback", () => {
         page,
         runtime,
         {
-          url: "https://chatgpt.com/g/missing/project",
+          url: "https://chatgpt.com/?temporary-chat=true",
           fallbackUrl: "https://chatgpt.com/",
           timeoutMs: 5_000,
           headless: false,
@@ -122,7 +123,7 @@ describe("navigateToPromptReadyWithFallback", () => {
       1,
       page,
       runtime,
-      "https://chatgpt.com/g/missing/project",
+      "https://chatgpt.com/?temporary-chat=true",
       logger,
     );
     expect(navigate).toHaveBeenNthCalledWith(2, page, runtime, "about:blank", logger);
@@ -130,6 +131,150 @@ describe("navigateToPromptReadyWithFallback", () => {
     expect(ensureNotBlockedMock).toHaveBeenCalledTimes(2);
     expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(1, runtime, 5_000, logger);
     expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(2, runtime, 120_000, logger);
+  });
+
+  test("does not fall back from a ChatGPT project URL to root chat", async () => {
+    const navigate = vi.fn().mockResolvedValue(undefined);
+    const ensureNotBlockedMock = vi.fn().mockResolvedValue(undefined);
+    const error = new Error("Prompt textarea did not appear before timeout");
+    const ensurePromptReadyMock = vi.fn().mockRejectedValue(error);
+    const runtime = {} as unknown as ChromeClient["Runtime"];
+    const page = {} as unknown as ChromeClient["Page"];
+
+    await expect(
+      navigateToPromptReadyWithFallback(
+        page,
+        runtime,
+        {
+          url: "https://chatgpt.com/g/g-p-test/project",
+          fallbackUrl: "https://chatgpt.com/",
+          timeoutMs: 5_000,
+          headless: false,
+          logger,
+        },
+        {
+          navigateToChatGPT: navigate,
+          ensureNotBlocked: ensureNotBlockedMock,
+          ensurePromptReady: ensurePromptReadyMock,
+        },
+      ),
+    ).rejects.toBe(error);
+
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(ensureNotBlockedMock).toHaveBeenCalledTimes(1);
+    expect(ensurePromptReadyMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects when a ChatGPT project URL redirects to root chat", async () => {
+    const navigate = vi.fn().mockResolvedValue(undefined);
+    const ensureNotBlockedMock = vi.fn().mockResolvedValue(undefined);
+    const ensurePromptReadyMock = vi.fn().mockResolvedValue(undefined);
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "https://chatgpt.com/" } }),
+    } as unknown as ChromeClient["Runtime"];
+    const page = {} as unknown as ChromeClient["Page"];
+
+    await expect(
+      navigateToPromptReadyWithFallback(
+        page,
+        runtime,
+        {
+          url: "https://chatgpt.com/g/g-p-test/project",
+          fallbackUrl: "https://chatgpt.com/",
+          timeoutMs: 5_000,
+          headless: false,
+          logger,
+        },
+        {
+          navigateToChatGPT: navigate,
+          ensureNotBlocked: ensureNotBlockedMock,
+          ensurePromptReady: ensurePromptReadyMock,
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/g/g-p-test/project",
+        actualUrl: "https://chatgpt.com/",
+      },
+    });
+
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(ensurePromptReadyMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ensureChatGptScopeRetained", () => {
+  test("is a no-op for unpinned root ChatGPT URLs", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "https://chatgpt.com/" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/"),
+    ).resolves.toBeUndefined();
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("accepts an active tab that remains in the requested project", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValue({ result: { value: "https://chatgpt.com/g/g-p-test/project" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("enforces exact conversation identity for project conversation URLs", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/g/g-p-test/project/c/abc" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project/c/abc"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("rejects same-project but wrong-conversation targets", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/g/g-p-test/project/c/def" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project/c/abc"),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/g/g-p-test/project/c/abc",
+        actualUrl: "https://chatgpt.com/g/g-p-test/project/c/def",
+      },
+    });
+  });
+
+  test("rejects when a project-scoped target is on root chat", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "https://chatgpt.com/" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project"),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/g/g-p-test/project",
+        actualUrl: "https://chatgpt.com/",
+      },
+    });
   });
 });
 
@@ -285,6 +430,33 @@ describe("ensureLoggedIn", () => {
     await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 0 })).rejects.toThrow(
       /inline cookies/i,
     );
+  });
+
+  test("fast-fails visible login UI when manual intervention is not available", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            ok: false,
+            status: 401,
+            url: "/backend-api/me",
+            pageUrl: "https://chatgpt.com/",
+            domLoginCta: true,
+            onAuthPage: false,
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureLoggedIn(runtime, logger, { appliedCookies: 2, failFastOnLoginCta: true }),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "login-required",
+        code: "login-required",
+      },
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
   });
 
   test("uses remote hint for remote sessions", async () => {

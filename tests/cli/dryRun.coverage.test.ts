@@ -148,7 +148,15 @@ describe("runDryRunSummary", () => {
         version: "0.4.1",
         previewMode: "json",
         log,
-        browserConfig: { attachRunning: true },
+        browserConfig: {
+          attachRunning: true,
+          chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
+          archiveConversations: "auto",
+          manualLogin: true,
+          keepBrowser: false,
+          hideWindow: true,
+          modelStrategy: "current",
+        },
       },
       { assembleBrowserPromptImpl },
     );
@@ -156,6 +164,12 @@ describe("runDryRunSummary", () => {
     expect(joined).toContain("Browser control: attach to an already-running local Chrome session");
     expect(joined).toContain("Preview JSON");
     expect(joined).toContain('"composerText": "Preview text"');
+    expect(joined).toContain('"chatgptUrl": "https://chatgpt.com/g/g-p-demo/project"');
+    expect(joined).toContain('"archiveConversations": "auto"');
+    expect(joined).toContain('"manualLogin": true');
+    expect(joined).toContain('"keepBrowser": false');
+    expect(joined).toContain('"hideWindow": true');
+    expect(joined).toContain('"modelStrategy": "current"');
 
     log.mockClear();
     await runBrowserPreview(

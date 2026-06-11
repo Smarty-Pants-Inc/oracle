@@ -2,9 +2,201 @@ import { describe, expect, test, vi } from "vitest";
 import {
   __test__ as promptComposer,
   clearPromptComposer,
+  submitPrompt,
 } from "../../src/browser/actions/promptComposer.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 describe("promptComposer", () => {
+  test("builds a syntactically valid prompt acceptance probe", () => {
+    const expression = promptComposer.buildPromptAcceptanceProbeExpression(0);
+
+    expect(() => new Function(`return ${expression}`)).not.toThrow();
+  });
+
+  test("fails in the short post-submit gate when ChatGPT never starts running", async () => {
+    vi.useFakeTimers();
+    try {
+      const prompt = "hello acceptance gate";
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("document.readyState === 'complete'")) {
+            return { result: { value: { ready: true, composer: true, fileInput: false } } };
+          }
+          if (expression.includes("const focusNode")) {
+            return { result: { value: { focused: true } } };
+          }
+          if (
+            expression.includes("editorText") &&
+            expression.includes("fallbackValue") &&
+            expression.includes("activeValue")
+          ) {
+            return {
+              result: {
+                value: { editorText: prompt, fallbackValue: "", activeValue: prompt },
+              },
+            };
+          }
+          if (expression.includes("dispatchClickSequence(button)")) {
+            return { result: { value: "clicked" } };
+          }
+          return {
+            result: {
+              value: {
+                baseline: 0,
+                turnsCount: 0,
+                userMatched: false,
+                prefixMatched: false,
+                lastMatched: false,
+                hasNewTurn: false,
+                stopVisible: false,
+                assistantVisible: false,
+                composerCleared: false,
+                inConversation: false,
+                href: "https://chatgpt.com/g/g-p-test/project",
+                fallbackValue: prompt,
+                editorValue: prompt,
+                lastTurn: "",
+              },
+            },
+          };
+        }),
+      };
+      const input = {
+        insertText: vi.fn().mockResolvedValue(undefined),
+        dispatchKeyEvent: vi.fn().mockResolvedValue(undefined),
+      };
+      const logger = Object.assign(vi.fn(), { verbose: false });
+      let rejection: unknown;
+      let settled = false;
+      const pending = submitPrompt(
+        {
+          runtime: runtime as never,
+          input: input as never,
+          baselineTurns: 0,
+          inputTimeoutMs: 1_000,
+        },
+        prompt,
+        logger as never,
+      ).then(
+        () => {
+          settled = true;
+        },
+        (error) => {
+          settled = true;
+          rejection = error;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(5_600);
+
+      expect(settled).toBe(true);
+      expect(rejection).toBeInstanceOf(BrowserAutomationError);
+      expect((rejection as BrowserAutomationError).details).toMatchObject({
+        stage: "submit-prompt",
+        code: "prompt-not-accepted",
+      });
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("reports a login dialog during the post-submit gate as login-required", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            accepted: false,
+            blockedBy: "login-required",
+            signals: [],
+            blockers: ["login-required"],
+            evidence: {
+              url: "https://chatgpt.com/",
+              title: "ChatGPT",
+              buttonLabels: ["Log in", "Sign up"],
+              bodySnippet: "Log in to get answers tailored to you",
+            },
+          },
+        },
+      }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await expect(
+      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 0),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "submit-prompt",
+        code: "login-required",
+        blockers: ["login-required"],
+      },
+    });
+  });
+
+  test("accepts a thinking/status signal before waiting for the committed turn", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            accepted: true,
+            signals: ["thinking-status"],
+            blockers: [],
+            evidence: {
+              statusText: "Thinking",
+              turnsCount: 10,
+              baseline: 10,
+            },
+          },
+        },
+      }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await expect(
+      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 10),
+    ).resolves.toMatchObject({
+      accepted: true,
+      signals: ["thinking-status"],
+    });
+  });
+
+  test("retries through transient navigation while checking prompt acceptance", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new Error("Execution context was destroyed, probably because of a navigation."),
+        )
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              accepted: true,
+              signals: ["new-turn"],
+              blockers: [],
+              evidence: {
+                turnsCount: 11,
+                baseline: 10,
+              },
+            },
+          },
+        }),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await expect(
+      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 10),
+    ).resolves.toMatchObject({
+      accepted: true,
+      signals: ["new-turn"],
+    });
+  });
+
   test("fails composer clearing when stale text remains", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({

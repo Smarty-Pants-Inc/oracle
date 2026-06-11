@@ -4,6 +4,7 @@ export {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  ensureChatGptScopeRetained,
   installJavaScriptDialogAutoDismissal,
 } from "./actions/navigation.js";
 export { ensureModelSelection } from "./actions/modelSelection.js";

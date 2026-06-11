@@ -1,12 +1,14 @@
 import type { ChromeClient, BrowserLogger, BrowserModelStrategy } from "../types.js";
 import {
   COMPOSER_MODEL_SIGNAL_SELECTOR,
+  INPUT_SELECTORS,
   MENU_CONTAINER_SELECTOR,
   MENU_ITEM_SELECTOR,
   MODEL_BUTTON_SELECTOR,
 } from "../constants.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { BrowserAutomationError } from "../../oracle/errors.js";
 
 const LEGACY_PRO_VERSION_WORD_TOKENS = ["5 4", "5 2", "5 1", "5 0", "gpt 5 pro"] as const;
 const LEGACY_PRO_VERSION_COMPACT_TOKENS = ["gpt54", "gpt52", "gpt51", "gpt50"] as const;
@@ -31,7 +33,13 @@ export async function ensureModelSelection(
         status: "option-not-found";
         hint?: { temporaryChat?: boolean; availableOptions?: string[] };
       }
-    | { status: "button-missing" }
+    | {
+        status: "button-missing";
+        promptReady?: boolean;
+        loginVisible?: boolean;
+        url?: string;
+        title?: string;
+      }
     | undefined;
 
   switch (result?.status) {
@@ -58,9 +66,31 @@ export async function ensureModelSelection(
         `Unable to find model option matching "${desiredModel}" in the model switcher.${availableHint}${tempHint}`,
       );
     }
-    default: {
+    case "button-missing": {
+      if (result.loginVisible) {
+        await logDomFailure(Runtime, logger, "model-switcher-login");
+        throw new BrowserAutomationError(
+          "ChatGPT login UI is visible while checking the model picker; ask the user to sign in and provide an active ChatGPT session/cookies before retrying hidden browser automation.",
+          {
+            stage: "login-required",
+            code: "login-required",
+            evidence: {
+              url: result.url ?? null,
+              title: result.title ?? null,
+            },
+          },
+        );
+      }
+      if (strategy === "current" && result.promptReady) {
+        logger("Model picker: current selection (selector unavailable; prompt composer ready)");
+        return;
+      }
       await logDomFailure(Runtime, logger, "model-switcher-button");
       throw new Error("Unable to locate the ChatGPT model selector button.");
+    }
+    default: {
+      await logDomFailure(Runtime, logger, "model-switcher-button");
+      throw new Error("Unable to inspect the ChatGPT model selector state.");
     }
   }
 }
@@ -134,6 +164,7 @@ function buildModelSelectionExpression(
   const composerSignalMatchers = buildComposerSignalMatchers(targetModel);
   const labelLiteral = JSON.stringify(matchers.labelTokens);
   const idLiteral = JSON.stringify(matchers.testIdTokens);
+  const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const primaryLabelLiteral = JSON.stringify(targetModel);
   const strategyLiteral = JSON.stringify(strategy);
   const composerSignalSelectorLiteral = JSON.stringify(COMPOSER_MODEL_SIGNAL_SELECTOR);
@@ -146,6 +177,7 @@ function buildModelSelectionExpression(
     ${buildClickDispatcher()}
     // Capture the selectors and matcher literals up front so the browser expression stays pure.
     const BUTTON_SELECTOR = '${MODEL_BUTTON_SELECTOR}';
+    const INPUT_SELECTORS = ${inputSelectorsLiteral};
     const COMPOSER_MODEL_SIGNAL_SELECTOR = ${composerSignalSelectorLiteral};
     const LABEL_TOKENS = ${labelLiteral};
     const TEST_IDS = ${idLiteral};
@@ -215,10 +247,36 @@ function buildModelSelectionExpression(
     const hasProComposerPill = () => Boolean(
       document.querySelector('button.__composer-pill, button[aria-label="Pro, click to remove"]')
     );
+    const isVisible = (node) => {
+      if (!(node instanceof Element)) return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      if (!style) return false;
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    };
+    const promptReady = INPUT_SELECTORS.some((selector) => {
+      try {
+        return Array.from(document.querySelectorAll(selector)).some((node) => {
+          if (!isVisible(node)) return false;
+          return !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true';
+        });
+      } catch {
+        return false;
+      }
+    });
+    const pageText = String(document.body?.innerText || '');
+    const url = typeof location === 'object' && location.href ? location.href : '';
+    const path = typeof location === 'object' && location.pathname ? location.pathname : '';
+    const title = String(document.title || '');
+    const loginVisible =
+      /auth\\.openai\\.com/i.test(url) ||
+      /^\\/(auth|login|signin)/i.test(path) ||
+      /\\b(log in|login|sign in|signin|continue with google|continue with microsoft|continue with email)\\b/i.test(pageText);
 
     const button = document.querySelector(BUTTON_SELECTOR);
     if (!button) {
-      return { status: 'button-missing' };
+      return { status: 'button-missing', promptReady, loginVisible, url, title };
     }
 
     const closeMenu = () => {

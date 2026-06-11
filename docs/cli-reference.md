@@ -1,9 +1,9 @@
 ---
 title: CLI Reference
-description: "Every flag you'll actually use, grouped by what it does. Run `oracle --help --verbose` for the full hidden list."
+description: "Every flag you'll actually use, grouped by what it does. Run `oracle --debug-help` for the full hidden list."
 ---
 
-This is the curated cheatsheet. The authoritative source is always `oracle --help` (and `oracle --help --verbose` for advanced flags).
+This is the curated cheatsheet. The authoritative source is always `oracle --help` (and `oracle --debug-help` for advanced flags).
 
 ## Commands
 
@@ -65,28 +65,28 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 
 ## Browser mode
 
-| Flag                                                         | Purpose                                                      |
-| ------------------------------------------------------------ | ------------------------------------------------------------ |
-| `--chatgpt-url <url>`                                        | Target a ChatGPT workspace / project folder.                 |
-| `--browser-model-strategy <select\|current\|ignore>`         | Control ChatGPT model picker.                                |
-| `--browser-manual-login`                                     | Use persistent profile + manual login (no Keychain).         |
-| `--browser-attach-running`                                   | Attach to your already-running Chrome via DevTools.          |
-| `--browser-tab <ref>`                                        | Reuse an existing tab (`current`, id, URL, title substring). |
-| `--browser-thinking-time <light\|standard\|extended\|heavy>` | Pro / Thinking model intensity.                              |
-| `--browser-research deep`                                    | Activate Deep Research mode.                                 |
-| `--browser-follow-up <prompt>`                               | Multi-turn in the same ChatGPT conversation.                 |
-| `--browser-port <port>`                                      | Pin Chrome DevTools port.                                    |
-| `--browser-inline-cookies[(-file)] <…>`                      | Supply cookies inline (no Keychain / Chrome).                |
-| `--browser-timeout`, `--browser-input-timeout`               | Overall / input timeouts (h/m/s/ms).                         |
-| `--browser-recheck-delay`, `--browser-recheck-timeout`       | Delayed retry after a timeout.                               |
-| `--browser-auto-reattach-delay/-interval/-timeout`           | Poll the existing tab when ChatGPT redirects mid-load.       |
-| `--browser-reuse-wait`                                       | Wait for shared Chrome profile before launching.             |
-| `--browser-profile-lock-timeout`                             | Wait for the manual-login profile lock.                      |
-| `--browser-max-concurrent-tabs`                              | Soft limit for shared-profile parallel runs (default 3).     |
-| `--browser-keep-browser`                                     | Keep the browser open after the run.                         |
-| `--browser-headless`, `--browser-hide-window`                | Visibility controls.                                         |
-| `--browser-attachments <auto\|never\|always>`                | Attach files inline vs upload.                               |
-| `--browser-chrome-path`, `--browser-cookie-path`             | Override Chrome / cookie store discovery (Linux / Windows).  |
+| Flag                                                         | Purpose                                                                          |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `--chatgpt-url <url>`                                        | Target a ChatGPT workspace / project folder.                                     |
+| `--browser-model-strategy <select\|current\|ignore>`         | Control ChatGPT model picker.                                                    |
+| `--browser-manual-login`                                     | Use persistent profile + manual login (no Keychain).                             |
+| `--browser-attach-running`                                   | Attach to your already-running Chrome via DevTools.                              |
+| `--browser-tab <ref>`                                        | Reuse an existing tab (`current`, id, URL, title substring).                     |
+| `--browser-thinking-time <light\|standard\|extended\|heavy>` | Pro / Thinking model intensity.                                                  |
+| `--browser-research deep`                                    | Activate Deep Research mode.                                                     |
+| `--browser-follow-up <prompt>`                               | Multi-turn in the same ChatGPT conversation.                                     |
+| `--browser-port <port>`                                      | Pin Chrome DevTools port.                                                        |
+| `--browser-inline-cookies[(-file)] <…>`                      | Supply cookies inline (no Keychain / Chrome).                                    |
+| `--browser-timeout`, `--browser-input-timeout`               | Overall / input timeouts (h/m/s/ms).                                             |
+| `--browser-recheck-delay`, `--browser-recheck-timeout`       | Delayed retry after a timeout.                                                   |
+| `--browser-auto-reattach-delay/-interval/-timeout`           | Poll the existing tab when ChatGPT redirects mid-load.                           |
+| `--browser-reuse-wait`                                       | Wait for shared Chrome profile before launching.                                 |
+| `--browser-profile-lock-timeout`                             | Wait for the manual-login profile lock.                                          |
+| `--browser-max-concurrent-tabs`                              | Soft limit for shared-profile parallel runs (default 3).                         |
+| `--browser-keep-browser`, `--no-browser-keep-browser`        | Keep the browser open after the run, or close it even when config keeps it open. |
+| `--browser-headless`, `--browser-hide-window`                | Visibility controls.                                                             |
+| `--browser-attachments <auto\|never\|always>`                | Attach files inline vs upload.                                                   |
+| `--browser-chrome-path`, `--browser-cookie-path`             | Override Chrome / cookie store discovery (Linux / Windows).                      |
 
 See [Browser Mode](browser-mode.md) for usage.
 
@@ -131,5 +131,5 @@ See [Browser Mode](browser-mode.md) for usage.
 ## See also
 
 - `oracle --help` — short usage.
-- `oracle --help --verbose` — every flag, including hidden ones.
+- `oracle --debug-help` — every flag, including hidden ones.
 - [Configuration](configuration.md) — `~/.oracle/config.json` defaults.

@@ -64,6 +64,94 @@ describe("buildAgentBlockerFromSession", () => {
     });
   });
 
+  test("classifies prompt acceptance failures as selector drift", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        errorMessage:
+          "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
+        error: {
+          category: "browser-automation",
+          message:
+            "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
+          details: {
+            stage: "submit-prompt",
+            code: "prompt-not-accepted",
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "selector_drift",
+      severity: "action_required",
+      resumable: false,
+      evidence: {
+        errorStage: "submit-prompt",
+        errorCode: "prompt-not-accepted",
+      },
+    });
+  });
+
+  test("classifies project/thread redirects as scope mismatch with URL evidence", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        errorMessage:
+          "ChatGPT did not stay on the requested project/thread URL; refusing to fall back to root chat.",
+        error: {
+          category: "browser-automation",
+          message:
+            "ChatGPT did not stay on the requested project/thread URL; refusing to fall back to root chat.",
+          details: {
+            stage: "chatgpt-scope",
+            code: "scope-mismatch",
+            expectedUrl: "https://chatgpt.com/g/g-p-test/project",
+            actualUrl: "https://chatgpt.com/",
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "scope_mismatch",
+      severity: "action_required",
+      resumable: false,
+      evidence: {
+        errorStage: "chatgpt-scope",
+        errorCode: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/g/g-p-test/project",
+        actualUrl: "https://chatgpt.com/",
+      },
+    });
+  });
+
+  test("preserves prompt acceptance signals and blockers in diagnostic evidence", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        errorMessage:
+          "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
+        error: {
+          category: "browser-automation",
+          message:
+            "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
+          details: {
+            stage: "submit-prompt",
+            code: "prompt-not-accepted",
+            signals: ["composer-cleared-after-send"],
+            blockers: ["permission-required"],
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "selector_drift",
+      evidence: {
+        errorSignals: ["composer-cleared-after-send"],
+        errorBlockers: ["permission-required"],
+      },
+    });
+  });
+
   test.each([
     {
       name: "login_required",
@@ -114,6 +202,32 @@ describe("buildAgentBlockerFromSession", () => {
       meta: session({ transport: { reason: "model-unavailable" } }),
       logTail: "",
       kind: "model_unavailable",
+      severity: "action_required",
+    },
+    {
+      name: "model_option_unavailable",
+      meta: session({
+        error: {
+          category: "browser-automation",
+          message: 'Unable to find model option matching "Thinking 5.5".',
+          details: { stage: "model-selection", code: "model-option-unavailable" },
+        },
+      }),
+      logTail: "",
+      kind: "model_unavailable",
+      severity: "action_required",
+    },
+    {
+      name: "model_selector_missing",
+      meta: session({
+        error: {
+          category: "browser-automation",
+          message: "Unable to locate the ChatGPT model selector button.",
+          details: { stage: "model-selection", code: "model-selector-missing" },
+        },
+      }),
+      logTail: "",
+      kind: "selector_drift",
       severity: "action_required",
     },
     {

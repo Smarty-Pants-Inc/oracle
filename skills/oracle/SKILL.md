@@ -66,7 +66,7 @@ Recommended defaults:
 
 - Target: keep total input under ~196k tokens.
 - Use `--files-report` (and/or `--dry-run json`) to spot the token hogs before spending.
-- If you need hidden/advanced knobs: `npx -y @steipete/oracle --help --verbose`.
+- If you need hidden/advanced knobs: `npx -y @steipete/oracle --debug-help`.
 
 ## Engines (API vs browser)
 
@@ -78,6 +78,21 @@ Recommended defaults:
 - Remote browser host (signed-in machine runs automation):
   - Host: `oracle serve --host 0.0.0.0 --port 9473 --token <secret>`
   - Client: `oracle --engine browser --remote-host <host:port> --remote-token <secret> -p "<task>" --file "src/**"`
+
+## Browser Failure Handling
+
+For browser-mode failures, inspect Oracle's structured session metadata before guessing from logs. Agent-facing blockers include:
+
+- `login_required`: the browser profile is not signed into ChatGPT; ask the user to sign in through the Oracle automation profile or provide active cookies/session before retrying.
+- `scope_mismatch`: a requested ChatGPT project/thread URL redirected out of scope; repair the URL/account access and do not fall back to root ChatGPT.
+- `selector_drift`: ChatGPT likely changed DOM semantics/selectors; inspect the captured evidence and update the semantic probe.
+- `captcha`, `permission`, `rate_limit`, `browser_unavailable`, `timeout`, `model_unavailable`, `unsupported_endpoint`: fix the named blocker before rerunning.
+
+Prompt submission is not successful just because a click or Enter key was sent. Treat the prompt as accepted only after semantic UI evidence such as a new turn, stop control, thinking/status/progress/shimmer state, cleared/disabled composer, or assistant turn. If ChatGPT changes, extend these probes and preserve `BrowserAutomationError.details` (`stage`, `code`, `signals`, `blockers`, `evidence`) instead of adding blind waits.
+
+When a browser run is intentionally pinned to a ChatGPT project (`/g/.../project`) or thread (`/c/...`), fail closed if ChatGPT redirects to root chat. Root fallback can pollute the user's main chat list and hides account/project-access regressions.
+
+Live ChatGPT browser smokes are opt-in: default to dry-runs, unit tests, and session metadata checks unless the user explicitly approves a live send. Project scoping alone is not a non-pollution proof. Approved live project smokes that send a prompt must also verify cleanup: use `--browser-archive auto` for one-shot smokes, use `--browser-archive always` only when intentionally forcing cleanup outside the default one-shot policy, and check session metadata for `browser.archive.archived: true` after any created `/c/...` conversation. If login/scope/model checks fail before a conversation exists, report the structured blocker instead of retrying. Never clean up previously created ChatGPT test conversations without explicit approval for the conversation ids/URLs.
 
 ## Sessions + slugs (don’t lose work)
 

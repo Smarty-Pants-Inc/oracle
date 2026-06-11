@@ -72,6 +72,62 @@ export interface PromptReadyNavigationDeps {
   ensurePromptReady?: typeof ensurePromptReady;
 }
 
+function shouldFailClosedWithoutFallback(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (!/(^|\.)chatgpt\.com$/i.test(parsed.hostname)) {
+      return false;
+    }
+    return /\/c\//.test(parsed.pathname) || /\/g\/[^/]+\/project(?:\/|$)/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function normalizePinnedChatGptScope(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (!/(^|\.)chatgpt\.com$/i.test(parsed.hostname)) {
+      return null;
+    }
+    const conversationMatch = parsed.pathname.match(/\/c\/([^/?#]+)/);
+    if (conversationMatch?.[1]) {
+      return `conversation:${conversationMatch[1]}`;
+    }
+    const projectMatch = parsed.pathname.match(/^(\/g\/[^/]+\/project)(?:\/|$)/);
+    if (projectMatch?.[1]) {
+      return `project:${projectMatch[1]}`;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export async function ensureChatGptScopeRetained(
+  Runtime: ChromeClient["Runtime"],
+  expectedUrl: string,
+) {
+  const expectedScope = normalizePinnedChatGptScope(expectedUrl);
+  if (!expectedScope) {
+    return;
+  }
+  const actualUrl = (await currentUrl(Runtime)) ?? "";
+  const actualScope = normalizePinnedChatGptScope(actualUrl);
+  if (actualScope === expectedScope) {
+    return;
+  }
+  throw new BrowserAutomationError(
+    "ChatGPT did not stay on the requested project/thread URL; refusing to fall back to root chat.",
+    {
+      stage: "chatgpt-scope",
+      code: "scope-mismatch",
+      expectedUrl,
+      actualUrl,
+    },
+  );
+}
+
 async function dismissBlockingUi(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
@@ -150,9 +206,10 @@ export async function navigateToPromptReadyWithFallback(
   await dismissBlockingUi(Runtime, logger).catch(() => false);
   try {
     await ensureReady(Runtime, timeoutMs, logger);
+    await ensureChatGptScopeRetained(Runtime, url);
     return { usedFallback: false };
   } catch (error) {
-    if (!fallbackUrl || fallbackUrl === url) {
+    if (!fallbackUrl || fallbackUrl === url || shouldFailClosedWithoutFallback(url)) {
       throw error;
     }
     const fallbackTimeout = fallbackTimeoutMs ?? Math.max(timeoutMs * 2, 120_000);
@@ -165,6 +222,7 @@ export async function navigateToPromptReadyWithFallback(
     await ensureBlocked(Runtime, headless, logger);
     await dismissBlockingUi(Runtime, logger).catch(() => false);
     await ensureReady(Runtime, fallbackTimeout, logger);
+    await ensureChatGptScopeRetained(Runtime, fallbackUrl);
     return { usedFallback: true };
   }
 }
@@ -194,7 +252,11 @@ const LOGIN_CHECK_TIMEOUT_MS = 5_000;
 export async function ensureLoggedIn(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
-  options: { appliedCookies?: number | null; remoteSession?: boolean } = {},
+  options: {
+    appliedCookies?: number | null;
+    remoteSession?: boolean;
+    failFastOnLoginCta?: boolean;
+  } = {},
 ) {
   // Learned: ChatGPT can render the UI (project view) while auth silently failed.
   // A backend-api probe plus DOM login CTA check catches both cases.
@@ -209,6 +271,25 @@ export async function ensureLoggedIn(
       `Login check passed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)})`,
     );
     return;
+  }
+
+  if (options.failFastOnLoginCta && (probe.domLoginCta || probe.onAuthPage)) {
+    logger(
+      `Login probe failed fast (status=${probe.status}, domLoginCta=${Boolean(
+        probe.domLoginCta,
+      )}, onAuthPage=${Boolean(probe.onAuthPage)}, url=${probe.pageUrl ?? "n/a"})`,
+    );
+    throw new BrowserAutomationError(
+      "ChatGPT login UI is visible; ask the user to sign in and provide an active ChatGPT session/cookies before retrying hidden browser automation.",
+      {
+        stage: "login-required",
+        code: "login-required",
+        status: probe.status,
+        domLoginCta: Boolean(probe.domLoginCta),
+        onAuthPage: Boolean(probe.onAuthPage),
+        pageUrl: probe.pageUrl ?? null,
+      },
+    );
   }
 
   const accepted = await attemptWelcomeBackLogin(Runtime, logger);

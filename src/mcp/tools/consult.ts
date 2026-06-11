@@ -99,7 +99,7 @@ const consultInputShape = {
     .enum(["auto", "always", "never"])
     .optional()
     .describe(
-      'Browser-only: archive completed ChatGPT conversations after local artifacts are saved. "auto" archives successful non-project one-shots only.',
+      'Browser-only: archive ChatGPT conversations after local artifacts are saved. "auto" archives successful one-shots, including project chats, and best-effort archives interrupted one-shots once a conversation exists.',
     ),
   browserFollowUps: z
     .array(z.string())
@@ -196,6 +196,11 @@ const consultAgentBlockerShape = z.object({
       transportReason: z.string().optional(),
       errorCategory: z.string().optional(),
       errorStage: z.string().optional(),
+      errorCode: z.string().optional(),
+      expectedUrl: z.string().optional(),
+      actualUrl: z.string().optional(),
+      errorSignals: z.array(z.string()).optional(),
+      errorBlockers: z.array(z.string()).optional(),
     })
     .optional(),
 });

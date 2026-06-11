@@ -29,6 +29,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  ensureChatGptScopeRetained,
   installJavaScriptDialogAutoDismissal,
   ensureModelSelection,
   clearPromptComposer,
@@ -385,14 +386,77 @@ async function maybeArchiveCompletedConversation({
       conversationUrl: conversationUrl ?? undefined,
     };
   }
-  return archiveChatGptConversation(Runtime, logger, {
+  return runChatGptArchive({
+    Runtime,
+    logger,
     mode: decision.mode,
+    conversationUrl,
+  });
+}
+
+async function maybeArchiveInterruptedConversation({
+  Runtime,
+  logger,
+  config,
+  conversationUrl,
+  followUpCount,
+}: {
+  Runtime: ChromeClient["Runtime"];
+  logger: BrowserLogger;
+  config: ResolvedBrowserConfig;
+  conversationUrl?: string | null;
+  followUpCount: number;
+}): Promise<BrowserArchiveResult | null> {
+  const currentUrl = await readConversationUrl(Runtime);
+  const resolvedUrl = currentUrl && isConversationUrl(currentUrl) ? currentUrl : conversationUrl;
+  if (!resolvedUrl || !isConversationUrl(resolvedUrl)) {
+    return null;
+  }
+  const decision = resolveBrowserArchiveDecision({
+    mode: config.archiveConversations,
+    chatgptUrl: config.chatgptUrl ?? config.url,
+    conversationUrl: resolvedUrl,
+    researchMode: config.researchMode,
+    followUpCount,
+  });
+  if (!decision.shouldArchive) {
+    logger(`[browser] ChatGPT archive skipped after interrupted run (${decision.reason}).`);
+    return {
+      mode: decision.mode,
+      attempted: false,
+      archived: false,
+      reason: decision.reason,
+      conversationUrl: resolvedUrl,
+    };
+  }
+  logger("[browser] Attempting to archive interrupted ChatGPT conversation.");
+  return runChatGptArchive({
+    Runtime,
+    logger,
+    mode: decision.mode,
+    conversationUrl: resolvedUrl,
+  });
+}
+
+async function runChatGptArchive({
+  Runtime,
+  logger,
+  mode,
+  conversationUrl,
+}: {
+  Runtime: ChromeClient["Runtime"];
+  logger: BrowserLogger;
+  mode: BrowserArchiveResult["mode"];
+  conversationUrl?: string | null;
+}): Promise<BrowserArchiveResult> {
+  return archiveChatGptConversation(Runtime, logger, {
+    mode,
     conversationUrl,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger(`[browser] ChatGPT archive failed (${message}).`);
     return {
-      mode: decision.mode,
+      mode,
       attempted: true,
       archived: false,
       reason: "archive-failed",
@@ -402,10 +466,30 @@ async function maybeArchiveCompletedConversation({
   });
 }
 
+function withInterruptedArchiveDetails(error: Error, archive: BrowserArchiveResult | null): Error {
+  if (!archive || !(error instanceof BrowserAutomationError)) {
+    return error;
+  }
+  return new BrowserAutomationError(
+    error.message,
+    {
+      ...(error.details ?? {}),
+      archive,
+    },
+    error,
+  );
+}
+
 export function maybeArchiveCompletedConversationForTest(
   args: Parameters<typeof maybeArchiveCompletedConversation>[0],
 ): Promise<BrowserArchiveResult> {
   return maybeArchiveCompletedConversation(args);
+}
+
+export function maybeArchiveInterruptedConversationForTest(
+  args: Parameters<typeof maybeArchiveInterruptedConversation>[0],
+): Promise<BrowserArchiveResult | null> {
+  return maybeArchiveInterruptedConversation(args);
 }
 
 type BrowserSubmissionResult = {
@@ -702,6 +786,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   }
 
   let client: ChromeClient | null = null;
+  let browserRuntime: ChromeClient["Runtime"] | null = null;
   let isolatedTargetId: string | null = null;
   let ownsTarget = true;
   const startedAt = Date.now();
@@ -770,6 +855,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
     const { Network, Page, Runtime, Input, DOM } = client;
+    browserRuntime = Runtime;
 
     if (!config.headless && config.hideWindow) {
       await hideChromeWindow(chrome, logger);
@@ -851,6 +937,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
       await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+      await raceWithDisconnect(ensureChatGptScopeRetained(Runtime, config.url));
     } else {
       const baseUrl = CHATGPT_URL;
       // First load the base ChatGPT homepage to satisfy potential interstitials,
@@ -864,6 +951,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
           appliedCookies,
           manualLogin,
+          failFastOnLoginCta: config.hideWindow,
           timeoutMs: config.timeoutMs,
           profileDir: userDataDir,
           keepBrowser: effectiveKeepBrowser,
@@ -979,12 +1067,22 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           },
         ),
       ).catch((error) => {
+        if (error instanceof BrowserAutomationError) {
+          throw error;
+        }
         const base = error instanceof Error ? error.message : String(error);
         const hint =
           appliedCookies === 0
             ? " No cookies were applied; log in to ChatGPT in Chrome or provide inline cookies (--browser-inline-cookies[(-file)] or ORACLE_BROWSER_COOKIES_JSON)."
             : "";
-        throw new Error(`${base}${hint}`);
+        const code = /model option matching/i.test(base)
+          ? "model-option-unavailable"
+          : "model-selector-missing";
+        throw new BrowserAutomationError(`${base}${hint}`, {
+          stage: "model-selection",
+          code,
+          appliedCookies,
+        });
       });
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       logger(
@@ -1731,17 +1829,46 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       );
     }
     if (preservedErrorKind === "reattachable-capture") {
-      preserveBrowserOnError = true;
+      const archive = browserRuntime
+        ? await maybeArchiveInterruptedConversation({
+            Runtime: browserRuntime,
+            logger,
+            config,
+            conversationUrl: lastUrl,
+            followUpCount: followUpPrompts.length,
+          })
+        : null;
+      if (archive?.conversationUrl) {
+        lastUrl = archive.conversationUrl;
+      }
+      preserveBrowserOnError = archive?.archived !== true;
       await emitRuntimeHint();
-      logger("Assistant capture incomplete; leaving browser open for reattach.");
-      throw normalizedError;
+      logger(
+        archive?.archived
+          ? "Assistant capture incomplete; archived conversation and closing browser."
+          : "Assistant capture incomplete; leaving browser open for reattach.",
+      );
+      throw withInterruptedArchiveDetails(normalizedError, archive);
     }
     if (!socketClosed) {
+      const archive = browserRuntime
+        ? await maybeArchiveInterruptedConversation({
+            Runtime: browserRuntime,
+            logger,
+            config,
+            conversationUrl: lastUrl,
+            followUpCount: followUpPrompts.length,
+          })
+        : null;
+      if (archive?.conversationUrl) {
+        lastUrl = archive.conversationUrl;
+        await emitRuntimeHint();
+      }
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      throw normalizedError;
+      throw withInterruptedArchiveDetails(normalizedError, archive);
     }
     if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
       logger(`Chrome window closed before completion: ${normalizedError.message}`);
@@ -1942,6 +2069,7 @@ async function waitForLogin({
   logger,
   appliedCookies,
   manualLogin,
+  failFastOnLoginCta,
   timeoutMs,
   profileDir,
   keepBrowser,
@@ -1950,6 +2078,7 @@ async function waitForLogin({
   logger: BrowserLogger;
   appliedCookies: number;
   manualLogin: boolean;
+  failFastOnLoginCta?: boolean;
   timeoutMs: number;
   profileDir?: string;
   keepBrowser?: boolean;
@@ -1963,7 +2092,7 @@ async function waitForLogin({
   let lastNotice = 0;
   while (Date.now() < deadline) {
     try {
-      await ensureLoggedIn(runtime, logger, { appliedCookies });
+      await ensureLoggedIn(runtime, logger, { appliedCookies, failFastOnLoginCta });
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2209,6 +2338,7 @@ async function runRemoteBrowserMode(
   logger(`Connecting to remote Chrome at ${host}:${port}`);
 
   let client: ChromeClient | null = null;
+  let browserRuntime: ChromeClient["Runtime"] | null = null;
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
@@ -2250,6 +2380,7 @@ async function runRemoteBrowserMode(
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
   const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
+  const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
 
   try {
     const remoteLeaseProfileDir = config.browserTabRef
@@ -2301,6 +2432,7 @@ async function runRemoteBrowserMode(
     };
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM } = client;
+    browserRuntime = Runtime;
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -2317,10 +2449,12 @@ async function runRemoteBrowserMode(
       await ensureNotBlocked(Runtime, config.headless, logger);
       await ensureLoggedIn(Runtime, logger, { remoteSession: true });
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+      await ensureChatGptScopeRetained(Runtime, config.url);
     } else {
       await ensureNotBlocked(Runtime, config.headless, logger);
       await ensureLoggedIn(Runtime, logger, { remoteSession: true });
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+      await ensureChatGptScopeRetained(Runtime, config.url);
     }
     logger(
       `Prompt textarea ready (initial focus, ${promptText.length.toLocaleString()} chars queued)`,
@@ -2855,7 +2989,6 @@ async function runRemoteBrowserMode(
       };
     };
 
-    const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
     const turns: BrowserConversationTurn[] = [];
     const initialTurn = await captureAssistantTurn(promptText, "Initial response");
     turns.push(initialTurn);
@@ -2965,11 +3098,24 @@ async function runRemoteBrowserMode(
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
 
     if (!socketClosed) {
+      const archive = browserRuntime
+        ? await maybeArchiveInterruptedConversation({
+            Runtime: browserRuntime,
+            logger,
+            config,
+            conversationUrl: lastUrl,
+            followUpCount: followUpPrompts.length,
+          })
+        : null;
+      if (archive?.conversationUrl) {
+        lastUrl = archive.conversationUrl;
+        await emitRuntimeHint();
+      }
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      throw normalizedError;
+      throw withInterruptedArchiveDetails(normalizedError, archive);
     }
 
     throw new BrowserAutomationError("Remote Chrome connection lost before Oracle finished.", {

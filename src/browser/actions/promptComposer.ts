@@ -20,6 +20,16 @@ const ENTER_KEY_EVENT = {
   nativeVirtualKeyCode: 13,
 } as const;
 const ENTER_KEY_TEXT = "\r";
+const PROMPT_ACCEPTANCE_TIMEOUT_MS = 5_000;
+const PROMPT_ACCEPTANCE_POLL_MS = 100;
+
+type PromptAcceptanceProbe = {
+  accepted?: boolean;
+  blockedBy?: string | null;
+  signals?: string[];
+  blockers?: string[];
+  evidence?: Record<string, unknown>;
+};
 
 export async function submitPrompt(
   deps: {
@@ -217,6 +227,13 @@ export async function submitPrompt(
   } else {
     logger("Clicked send button");
   }
+
+  await waitForPromptAccepted(
+    runtime,
+    PROMPT_ACCEPTANCE_TIMEOUT_MS,
+    logger,
+    deps.baselineTurns ?? undefined,
+  );
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
@@ -461,6 +478,299 @@ async function attemptSendButton(
   return false;
 }
 
+function buildPromptAcceptanceProbeExpression(baselineTurns?: number): string {
+  const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
+  const sendSelectorsLiteral = JSON.stringify(SEND_BUTTON_SELECTORS);
+  const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
+  const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
+  const turnSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
+  const baselineLiteral =
+    typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
+      ? Math.floor(baselineTurns)
+      : -1;
+  return `(() => {
+    const INPUT_SELECTORS = ${inputSelectorsLiteral};
+    const SEND_SELECTORS = ${sendSelectorsLiteral};
+    const STOP_SELECTOR = ${stopSelectorLiteral};
+    const ASSISTANT_SELECTOR = ${assistantSelectorLiteral};
+    const TURN_SELECTOR = ${turnSelectorLiteral};
+    const baseline = ${baselineLiteral};
+    const normalize = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
+    const isVisible = (node) => {
+      if (!(node instanceof Element)) return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      if (!style) return false;
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    };
+    const labelFor = (node) =>
+      normalize(node?.textContent || node?.getAttribute?.('aria-label') || node?.getAttribute?.('title') || node?.getAttribute?.('data-testid'));
+    const visibleFrom = (selector) => {
+      try {
+        return Array.from(document.querySelectorAll(selector)).filter((node) => isVisible(node));
+      } catch {
+        return [];
+      }
+    };
+    const visibleButtons = Array.from(document.querySelectorAll('button,a,[role="button"]')).filter((node) => isVisible(node));
+    const buttonLabels = visibleButtons.map(labelFor).filter(Boolean).slice(0, 16);
+    const bodyText = normalize(document.body?.innerText || '');
+    const bodyLower = bodyText.toLowerCase();
+    const url = typeof location === 'object' && location.href ? location.href : '';
+    const path = typeof location === 'object' && location.pathname ? location.pathname : '';
+    const title = normalize(document.title);
+    const loginPattern = /\\b(log in|login|sign in|signin|sign up|continue with google|continue with microsoft|continue with email)\\b/i;
+    const loginVisible =
+      /auth\\.openai\\.com/i.test(url) ||
+      /^\\/(auth|login|signin)/i.test(path) ||
+      visibleButtons.some((node) => loginPattern.test(labelFor(node))) ||
+      /log in to get answers|get responses tailored to you|welcome back/i.test(bodyText);
+    const cloudflare =
+      /just a moment/i.test(title) ||
+      Boolean(document.querySelector('script[src*="/challenge-platform/"]')) ||
+      /checking your browser|verify you are human|cf-challenge|cloudflare/i.test(bodyLower);
+    const accountBlocked =
+      /suspicious activity detected|secure your account|regain access/.test(bodyLower);
+    const permissionGate =
+      /does not have access|access denied|permission denied|workspace access|you don't have access/.test(bodyLower);
+
+    const inputs = INPUT_SELECTORS.flatMap((selector) => visibleFrom(selector));
+    const uniqueInputs = Array.from(new Set(inputs));
+    const readValue = (node) => {
+      if (!node) return '';
+      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+        return node.value ?? '';
+      }
+      return node.innerText ?? node.textContent ?? '';
+    };
+    const inputValues = uniqueInputs.map((node) => normalize(readValue(node))).filter(Boolean);
+    const composerCleared = uniqueInputs.length > 0 && inputValues.length === 0;
+    const composerDisabled =
+      uniqueInputs.length > 0 &&
+      uniqueInputs.every((node) => {
+        const element = node;
+        return (
+          element.hasAttribute('disabled') ||
+          element.getAttribute('aria-disabled') === 'true' ||
+          element.getAttribute('contenteditable') === 'false'
+        );
+      });
+    const inputSelectorsFound = INPUT_SELECTORS.filter((selector) => visibleFrom(selector).length > 0);
+
+    const sendButtons = SEND_SELECTORS.flatMap((selector) => visibleFrom(selector));
+    const sendVisible = sendButtons.length > 0;
+    const sendEnabled = sendButtons.some((node) => {
+      const style = window.getComputedStyle(node);
+      return !(
+        node.hasAttribute('disabled') ||
+        node.getAttribute('aria-disabled') === 'true' ||
+        node.getAttribute('data-disabled') === 'true' ||
+        style.pointerEvents === 'none'
+      );
+    });
+    const sendDisabled = sendVisible && !sendEnabled;
+    const stopVisible = [
+      ...visibleFrom(STOP_SELECTOR),
+      ...visibleFrom('button[aria-label*="Stop"]'),
+      ...visibleFrom('button[data-testid*="stop"]'),
+    ].length > 0 || visibleButtons.some((node) => /\\bstop\\b/i.test(labelFor(node)));
+    const turnsCount = document.querySelectorAll(TURN_SELECTOR).length;
+    const hasNewTurn = baseline >= 0 && turnsCount > baseline;
+    const assistantVisible = Boolean(
+      document.querySelector(ASSISTANT_SELECTOR) ||
+      document.querySelector('[data-testid*="assistant"]'),
+    );
+    const inConversation = /\\/c\\//.test(url);
+    const statusNodes = [
+      ...visibleFrom('[aria-live]:not([aria-live="off"])'),
+      ...visibleFrom('[role="status"]'),
+      ...visibleFrom('[role="progressbar"]'),
+      ...visibleFrom('[aria-busy="true"]'),
+      ...visibleFrom('[data-testid*="loading"]'),
+      ...visibleFrom('[data-testid*="progress"]'),
+      ...visibleFrom('[data-testid*="thinking"]'),
+      ...visibleFrom('[data-testid*="reason"]'),
+      ...visibleFrom('[data-testid*="shimmer"]'),
+    ];
+    const statusText = normalize(statusNodes.map(labelFor).filter(Boolean).join(' '));
+    const thinkingVisible = /\\b(thinking|reasoning|working|analyzing|searching|reading|running|responding|generating|loading)\\b/i.test(statusText);
+
+    const signals = [];
+    if (hasNewTurn) signals.push('new-turn');
+    if (stopVisible) signals.push('stop-control');
+    if (thinkingVisible) signals.push('thinking-status');
+    if (assistantVisible && hasNewTurn) signals.push('assistant-turn');
+    if (composerCleared && (hasNewTurn || stopVisible || thinkingVisible || inConversation)) {
+      signals.push('composer-cleared-after-send');
+    }
+    if (composerDisabled && (hasNewTurn || stopVisible || thinkingVisible)) {
+      signals.push('composer-disabled-after-send');
+    }
+    if (sendDisabled && composerCleared && (hasNewTurn || stopVisible || thinkingVisible)) {
+      signals.push('send-disabled-after-send');
+    }
+
+    const blockers = [];
+    if (cloudflare) blockers.push('cloudflare-challenge');
+    if (accountBlocked) blockers.push('chatgpt-account-blocked');
+    if (loginVisible) blockers.push('login-required');
+    if (permissionGate) blockers.push('permission-required');
+    const blockedBy = blockers[0] || null;
+    return {
+      accepted: blockers.length === 0 && signals.length > 0,
+      blockedBy,
+      signals,
+      blockers,
+      evidence: {
+        url,
+        title,
+        baseline,
+        turnsCount,
+        hasNewTurn,
+        stopVisible,
+        sendVisible,
+        sendEnabled,
+        sendDisabled,
+        composerCleared,
+        composerDisabled,
+        inputCount: uniqueInputs.length,
+        inputSelectorsFound,
+        assistantVisible,
+        inConversation,
+        statusText: statusText.slice(0, 240),
+        buttonLabels,
+        bodySnippet: bodyText.slice(0, 500),
+      },
+    };
+  })()`;
+}
+
+async function readPromptAcceptanceState(
+  Runtime: ChromeClient["Runtime"],
+  baselineTurns?: number,
+): Promise<PromptAcceptanceProbe> {
+  const { result } = await Runtime.evaluate({
+    expression: buildPromptAcceptanceProbeExpression(baselineTurns),
+    returnByValue: true,
+  });
+  return (result?.value ?? {}) as PromptAcceptanceProbe;
+}
+
+function buildPromptAcceptanceError(
+  probe: PromptAcceptanceProbe | null,
+  timeoutMs: number,
+): BrowserAutomationError {
+  const code = probe?.blockedBy || "prompt-not-accepted";
+  const details = {
+    stage: "submit-prompt",
+    code,
+    timeoutMs,
+    signals: probe?.signals ?? [],
+    blockers: probe?.blockers ?? [],
+    evidence: probe?.evidence ?? {},
+  };
+  if (code === "login-required") {
+    return new BrowserAutomationError(
+      "ChatGPT login dialog detected after prompt submission; the prompt was not accepted.",
+      details,
+    );
+  }
+  if (code === "cloudflare-challenge") {
+    return new BrowserAutomationError(
+      "ChatGPT browser challenge detected after prompt submission; the prompt was not accepted.",
+      details,
+    );
+  }
+  if (code === "chatgpt-account-blocked") {
+    return new BrowserAutomationError(
+      "ChatGPT account security block detected after prompt submission; the prompt was not accepted.",
+      details,
+    );
+  }
+  if (code === "permission-required") {
+    return new BrowserAutomationError(
+      "ChatGPT reported a permission or workspace access blocker after prompt submission.",
+      details,
+    );
+  }
+  return new BrowserAutomationError(
+    "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
+    details,
+  );
+}
+
+function promptProbeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isTransientPromptProbeError(error: unknown): boolean {
+  return /execution context was destroyed|context was destroyed|cannot find context|navigat|frame was detached/i.test(
+    promptProbeErrorMessage(error),
+  );
+}
+
+async function waitForPromptAccepted(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+  logger?: BrowserLogger,
+  baselineTurns?: number,
+): Promise<PromptAcceptanceProbe> {
+  const deadline = Date.now() + timeoutMs;
+  let latest: PromptAcceptanceProbe | null = null;
+  while (Date.now() < deadline) {
+    try {
+      latest = await readPromptAcceptanceState(Runtime, baselineTurns);
+    } catch (error) {
+      if (isTransientPromptProbeError(error)) {
+        latest = {
+          accepted: false,
+          signals: [],
+          blockers: [],
+          evidence: { probeError: promptProbeErrorMessage(error) },
+        };
+        await delay(PROMPT_ACCEPTANCE_POLL_MS);
+        continue;
+      }
+      throw new BrowserAutomationError(
+        "Failed to inspect ChatGPT prompt acceptance state after submission.",
+        {
+          stage: "submit-prompt",
+          code: "prompt-acceptance-probe-failed",
+          timeoutMs,
+          error: promptProbeErrorMessage(error),
+        },
+        error,
+      );
+    }
+    if (latest.blockedBy) {
+      logger?.(
+        `Prompt acceptance blocked (${latest.blockedBy}); evidence: ${JSON.stringify(
+          latest.evidence ?? {},
+        )}`,
+      );
+      await logDomFailure(Runtime, logger as BrowserLogger, "prompt-acceptance").catch(
+        () => undefined,
+      );
+      throw buildPromptAcceptanceError(latest, timeoutMs);
+    }
+    if (latest.accepted) {
+      logger?.(
+        `Prompt accepted by ChatGPT (${(latest.signals ?? []).join(", ") || "signal detected"})`,
+      );
+      return latest;
+    }
+    await delay(PROMPT_ACCEPTANCE_POLL_MS);
+  }
+  if (logger) {
+    logger(
+      `Prompt acceptance check failed; latest state: ${latest ? JSON.stringify(latest) : "unavailable"}`,
+    );
+    await logDomFailure(Runtime, logger, "prompt-acceptance");
+  }
+  throw buildPromptAcceptanceError(latest, timeoutMs);
+}
+
 async function verifyPromptCommitted(
   Runtime: ChromeClient["Runtime"],
   prompt: string,
@@ -629,5 +939,7 @@ async function verifyPromptCommitted(
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   attemptSendButton,
+  buildPromptAcceptanceProbeExpression,
+  waitForPromptAccepted,
   verifyPromptCommitted,
 };
