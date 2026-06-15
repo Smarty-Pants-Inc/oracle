@@ -88,6 +88,25 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 | `--browser-attachments <auto\|never\|always>`                | Attach files inline vs upload.                                                   |
 | `--browser-chrome-path`, `--browser-cookie-path`             | Override Chrome / cookie store discovery (Linux / Windows).                      |
 
+## ChatGPT thread export
+
+```bash
+oracle chatgpt-export --target-url "https://chatgpt.com/c/<conversation-id>"
+```
+
+`chatgpt-export` attaches to an already-approved open ChatGPT thread, installs a reload-time fetch/XHR capture hook scoped only to `https://chatgpt.com/backend-api/conversation/<conversation-id>`, and writes:
+
+- `backend-conversation.json`
+- `backend-capture-info.json`
+- `conversation.json`
+- `payload.json`
+- `conversation.md`
+- `manifest.json`
+- `redaction-report.json`
+- `SHA256SUMS.txt`
+
+It does not submit prompts, archive/delete/share chats, inspect cookies, inspect localStorage, read browser profiles, or enumerate account history. It fails closed unless the resolved tab is the exact approved `https://chatgpt.com/c/<conversation-id>` URL. Use `--browser-tab <ref>` to choose a specific existing tab, `--remote-chrome <host:port>` for a non-default DevTools endpoint, or `--obu-session-id <id> --obu-tab-id <id>` for an approved Open Browser Use-managed tab.
+
 See [Browser Mode](browser-mode.md) for usage.
 
 ## Remote browser

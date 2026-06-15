@@ -865,6 +865,38 @@ addProjectSourcesCommonOptions(
   await runProjectSourcesCliCommand("add", this.optsWithGlobals());
 });
 
+program
+  .command("chatgpt-export")
+  .description("Export an approved existing ChatGPT conversation by capturing its backend payload.")
+  .requiredOption(
+    "--target-url <url>",
+    "Exact approved ChatGPT conversation URL, e.g. https://chatgpt.com/c/<conversation-id>.",
+  )
+  .option(
+    "--out <dir>",
+    "Output directory (default ~/Documents/chatgpt-conversation-exports/oracle-chatgpt-conversation-...).",
+  )
+  .option(
+    "--browser-tab <ref>",
+    "Existing ChatGPT tab ref to use (defaults to the exact target URL; accepts current, target id, URL, or title substring).",
+  )
+  .option(
+    "--remote-chrome <host:port>",
+    "Chrome DevTools endpoint to inspect (default 127.0.0.1:9222).",
+  )
+  .option("--obu-session-id <id>", "Open Browser Use session id for OBU-managed tabs.")
+  .option("--obu-tab-id <id>", "Open Browser Use tab id for an approved OBU-managed tab.")
+  .option(
+    "--timeout <duration>",
+    "Time to wait for the reload-time backend response (default 45s).",
+  )
+  .option("--chunk-size <chars>", "Characters to retrieve per CDP chunk (default 250000).")
+  .option("--json", "Print structured JSON result.", false)
+  .action(async function (this: Command) {
+    const { handleChatGptExportCommand } = await import("../src/cli/chatgptExport.js");
+    await handleChatGptExportCommand(this.opts());
+  });
+
 const bridgeCommand = program
   .command("bridge")
   .description("Bridge a Windows-hosted ChatGPT session to Linux clients.");

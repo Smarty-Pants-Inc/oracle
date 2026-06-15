@@ -113,6 +113,7 @@ Engine auto-picks API when `OPENAI_API_KEY` is set, otherwise browser; browser i
 - Browser support: stable on macOS; works on Linux (add `--browser-chrome-path/--browser-cookie-path` when needed) and Windows (manual-login or inline cookies recommended when app-bound cookies block decryption).
 - Remote browser service: `oracle serve` on a signed-in host; clients use `--remote-host/--remote-token`.
 - Browser artifacts: browser sessions save `transcript.md` and generated artifacts under `~/.oracle/sessions/<id>/artifacts/`. Deep Research saves `deep-research-report.md` when the report surface is captured; ChatGPT-generated images are downloaded with the active browser cookies when image URLs are present.
+- Full thread export: `oracle chatgpt-export --target-url https://chatgpt.com/c/<conversation-id>` attaches to an already-approved open ChatGPT tab, installs a document-start fetch/XHR capture hook scoped only to that conversation's backend URL, reloads the page, and writes raw backend JSON plus normalized Markdown/JSON. It does not send prompts, archive/delete/share chats, or read cookies/localStorage/browser profiles.
 - Browser archiving: by default, successful one-shot ChatGPT runs, including project chats, are archived after local artifacts are saved; interrupted one-shots are best-effort archived once a conversation exists. Use `--browser-archive never` to disable or `--browser-archive always` to force archiving outside the default one-shot policy. Archived chats remain manageable in ChatGPT.
 - Conversation mode guidance: use one-shot browser runs for narrow bug reports or quick file-set reviews; use explicit browser follow-ups for ambiguous architecture/product tradeoffs where a challenge pass and final decision are valuable; use Deep Research for broad public-web questions that need citations. Oracle never invents follow-ups automatically.
 - Project Sources: `oracle project-sources list|add --chatgpt-url <project-url>` manages the Project Sources tab in ChatGPT browser mode. v1 is append-only (`list`, `add`, `--dry-run`) so agents can share explicit project context without deleting or replacing user sources.
@@ -276,6 +277,16 @@ Browser automation can open or control Chrome, so dry-runs and live runs print a
 | `--generate-image <file>`                                       | Generate image and save to file (Gemini browser mode; ChatGPT browser mode saves downloadable image artifacts when present). Extra ChatGPT images save as numbered siblings.                                                                                                                                                              |
 | `--edit-image <file>`                                           | Edit existing image with `--output` (Gemini browser mode). For ChatGPT browser mode, attach source images with `--file` and use `--generate-image` for the output path.                                                                                                                                                                   |
 | `--azure-endpoint`, `--azure-deployment`, `--azure-api-version` | Target Azure OpenAI endpoints (picks Azure client automatically).                                                                                                                                                                                                                                                                         |
+
+### Export an approved ChatGPT thread
+
+```bash
+oracle chatgpt-export \
+  --target-url "https://chatgpt.com/c/<conversation-id>" \
+  --browser-tab "https://chatgpt.com/c/<conversation-id>"
+```
+
+The export command is read-only with respect to ChatGPT state. It requires an existing signed-in Chrome DevTools endpoint and fails closed if the resolved tab is not the exact approved `/c/<conversation-id>` thread. Use `--remote-chrome host:port` when the tab is exposed on a non-default DevTools endpoint, or `--obu-session-id` / `--obu-tab-id` for an approved Open Browser Use-managed tab. Bundles include the raw `backend-conversation.json`, normalized `conversation.json` / `conversation.md`, capture metadata, redaction report, manifest, and checksums.
 
 ## Configuration
 

@@ -98,6 +98,10 @@ Live ChatGPT browser smokes are opt-in: default to dry-runs, unit tests, and ses
 
 - Stored under `~/.oracle/sessions` (override with `ORACLE_HOME_DIR`).
 - Browser runs save durable files under `~/.oracle/sessions/<id>/artifacts/`, including `transcript.md`, Deep Research reports, and downloaded ChatGPT-generated images when available.
+- Full approved ChatGPT thread export is a separate read-only command, not a prompt run:
+  - `oracle chatgpt-export --target-url "https://chatgpt.com/c/<conversation-id>"`
+  - It attaches to an existing approved tab and captures the page's own reload-time backend response for that exact conversation id.
+  - It does not send prompts, archive/delete/share chats, read cookies/localStorage/profile stores, or browse unrelated history.
 - Runs may detach or take a long time (browser + GPT‑5.4 Pro often does). If the CLI times out: don’t re-run; reattach.
   - List: `oracle status --hours 72`
   - Attach: `oracle session <id> --render`
