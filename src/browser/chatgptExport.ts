@@ -137,14 +137,20 @@ export function conversationIdFromChatGptUrl(rawUrl: string): string {
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error("target-url must be https://chatgpt.com/c/<conversation-id>");
+    throw new Error(
+      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+    );
   }
   if (parsed.protocol !== "https:" || parsed.hostname !== "chatgpt.com") {
-    throw new Error("target-url must be https://chatgpt.com/c/<conversation-id>");
+    throw new Error(
+      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+    );
   }
-  const match = /^\/c\/([^/?#]+)\/?$/.exec(parsed.pathname);
+  const match = /^(?:\/c|\/g\/[^/?#]+\/c)\/([^/?#]+)\/?$/.exec(parsed.pathname);
   if (!match?.[1]) {
-    throw new Error("target-url must be a specific https://chatgpt.com/c/<conversation-id> URL");
+    throw new Error(
+      "target-url must be a specific ChatGPT conversation URL: https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+    );
   }
   return match[1];
 }

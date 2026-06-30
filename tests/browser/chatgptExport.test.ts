@@ -13,6 +13,12 @@ describe("ChatGPT conversation export helpers", () => {
   test("accepts only exact chatgpt.com conversation URLs", () => {
     expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123")).toBe("abc-123");
     expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123/")).toBe("abc-123");
+    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/project-1/c/abc-123")).toBe(
+      "abc-123",
+    );
+    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/g-p-123/c/abc-123/")).toBe(
+      "abc-123",
+    );
     expect(() => conversationIdFromChatGptUrl("https://chat.openai.com/c/abc")).toThrow(
       /chatgpt\.com\/c/,
     );
@@ -27,7 +33,9 @@ describe("ChatGPT conversation export helpers", () => {
       "https://chatgpt.com/backend-api/conversation/conv-1",
     );
     expect(isSameConversationUrl("https://chatgpt.com/c/conv-1", "conv-1")).toBe(true);
+    expect(isSameConversationUrl("https://chatgpt.com/g/project/c/conv-1", "conv-1")).toBe(true);
     expect(isSameConversationUrl("https://chatgpt.com/c/other", "conv-1")).toBe(false);
+    expect(isSameConversationUrl("https://chatgpt.com/g/project/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
   });
 
