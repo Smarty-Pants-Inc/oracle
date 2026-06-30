@@ -19,7 +19,7 @@ export const DEFAULT_REMOTE_CHROME_PORT = 9222;
 const LOGIN_CTA_PATTERN =
   /\b(log in|login|sign up|sign in|continue with google|continue with microsoft)\b/i;
 
-interface ChromeTarget {
+export interface ChromeTarget {
   id?: string;
   targetId?: string;
   type?: string;
@@ -351,44 +351,7 @@ export function classifyTabState(
 export async function collectChatGptTabs(options: HostPort = {}): Promise<ChatGptTabSummary[]> {
   const { host, port } = normalizeHostPort(options);
   const targets = await listChatGptTargets({ host, port });
-  const summaries: ChatGptTabSummary[] = [];
-  for (const target of targets) {
-    try {
-      const summary = await inspectChatGptTab({ host, port, target });
-      summaries.push(summary);
-    } catch (error) {
-      summaries.push({
-        host,
-        port,
-        targetId: extractTargetId(target) ?? "",
-        title: normalizeTitle(target.title ?? ""),
-        url: normalizeUrl(target.url ?? ""),
-        currentModelLabel: "",
-        stopExists: false,
-        sendExists: false,
-        promptReady: false,
-        loginButtonExists: false,
-        authenticated: false,
-        assistantCount: 0,
-        lastAssistantText: "",
-        lastAssistantSnippet: "",
-        lastUserText: "",
-        lastUserSnippet: "",
-        focused: false,
-        visibilityState: "",
-        conversationId: extractConversationIdFromUrl(target.url ?? ""),
-        fingerprint: "",
-        state: "detached",
-        error: error instanceof Error ? error.message : String(error),
-        lastAssistantMarkdown: null,
-      });
-    }
-  }
-  return summaries.sort((left, right) => {
-    const leftScore = (left.focused ? 100 : 0) + (isChatGptConversationUrl(left.url) ? 10 : 0);
-    const rightScore = (right.focused ? 100 : 0) + (isChatGptConversationUrl(right.url) ? 10 : 0);
-    return rightScore - leftScore;
-  });
+  return collectChatGptTabsFromTargets(host, port, targets);
 }
 
 function resolveChatGptTabFromSummaries(
@@ -433,11 +396,80 @@ export function resolveChatGptTabFromSummariesForTest(
   return resolveChatGptTabFromSummaries(summaries, ref);
 }
 
+function resolveExactChatGptTarget(targets: ChromeTarget[], ref?: string): ChromeTarget | null {
+  const trimmedRef = String(ref ?? "").trim();
+  if (!trimmedRef || trimmedRef.toLowerCase() === "current") {
+    return null;
+  }
+  return (
+    targets.find((target) => extractTargetId(target) === trimmedRef) ??
+    targets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
+    null
+  );
+}
+
+export function resolveExactChatGptTargetForTest(
+  targets: ChromeTarget[],
+  ref?: string,
+): ChromeTarget | null {
+  return resolveExactChatGptTarget(targets, ref);
+}
+
+async function collectChatGptTabsFromTargets(
+  host: string,
+  port: number,
+  targets: ChromeTarget[],
+): Promise<ChatGptTabSummary[]> {
+  const summaries: ChatGptTabSummary[] = [];
+  for (const target of targets) {
+    try {
+      const summary = await inspectChatGptTab({ host, port, target });
+      summaries.push(summary);
+    } catch (error) {
+      summaries.push({
+        host,
+        port,
+        targetId: extractTargetId(target) ?? "",
+        title: normalizeTitle(target.title ?? ""),
+        url: normalizeUrl(target.url ?? ""),
+        currentModelLabel: "",
+        stopExists: false,
+        sendExists: false,
+        promptReady: false,
+        loginButtonExists: false,
+        authenticated: false,
+        assistantCount: 0,
+        lastAssistantText: "",
+        lastAssistantSnippet: "",
+        lastUserText: "",
+        lastUserSnippet: "",
+        focused: false,
+        visibilityState: "",
+        conversationId: extractConversationIdFromUrl(target.url ?? ""),
+        fingerprint: "",
+        state: "detached",
+        error: error instanceof Error ? error.message : String(error),
+        lastAssistantMarkdown: null,
+      });
+    }
+  }
+  return summaries.sort((left, right) => {
+    const leftScore = (left.focused ? 100 : 0) + (isChatGptConversationUrl(left.url) ? 10 : 0);
+    const rightScore = (right.focused ? 100 : 0) + (isChatGptConversationUrl(right.url) ? 10 : 0);
+    return rightScore - leftScore;
+  });
+}
+
 export async function resolveChatGptTab(
   options: ResolveChatGptTabOptions = {},
 ): Promise<ChatGptTabSummary> {
   const { host, port } = normalizeHostPort(options);
-  const summaries = await collectChatGptTabs({ host, port });
+  const targets = await listChatGptTargets({ host, port });
+  const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+  if (exactTarget) {
+    return inspectChatGptTab({ host, port, target: exactTarget });
+  }
+  const summaries = await collectChatGptTabsFromTargets(host, port, targets);
   return resolveChatGptTabFromSummaries(summaries, options.ref);
 }
 

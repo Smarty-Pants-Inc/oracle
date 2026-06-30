@@ -2,7 +2,9 @@ import { describe, expect, test } from "vitest";
 import {
   classifyTabState,
   formatBrowserTabState,
+  resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
+  type ChromeTarget,
   sessionMatchesTab,
   type ChatGptTabSummary,
 } from "../../src/browser/liveTabs.js";
@@ -82,6 +84,19 @@ describe("liveTabs helpers", () => {
       "target-1",
     );
     expect(resolveChatGptTabFromSummariesForTest(tabs, "Review B").targetId).toBe("target-2");
+  });
+
+  test("resolves exact target ids and urls from target list before inspecting tabs", () => {
+    const targets: ChromeTarget[] = [
+      { id: "target-1", type: "page", title: "Review A", url: "https://chatgpt.com/c/a" },
+      { id: "target-2", type: "page", title: "Review B", url: "https://chatgpt.com/c/b" },
+    ];
+    expect(resolveExactChatGptTargetForTest(targets, "target-2")?.id).toBe("target-2");
+    expect(resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/c/a")?.id).toBe(
+      "target-1",
+    );
+    expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
+    expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
   });
 
   test("throws on ambiguous title matches", () => {
