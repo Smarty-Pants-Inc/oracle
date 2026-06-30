@@ -415,6 +415,43 @@ export function resolveExactChatGptTargetForTest(
   return resolveExactChatGptTarget(targets, ref);
 }
 
+function summaryFromTarget(host: string, port: number, target: ChromeTarget): ChatGptTabSummary {
+  const targetId = extractTargetId(target) ?? "";
+  const url = normalizeUrl(target.url ?? "");
+  return {
+    host,
+    port,
+    targetId,
+    title: normalizeTitle(target.title ?? ""),
+    url,
+    currentModelLabel: "",
+    stopExists: false,
+    sendExists: false,
+    promptReady: false,
+    loginButtonExists: false,
+    authenticated: false,
+    assistantCount: 0,
+    lastAssistantText: "",
+    lastAssistantSnippet: "",
+    lastUserText: "",
+    lastUserSnippet: "",
+    focused: false,
+    visibilityState: "",
+    conversationId: extractConversationIdFromUrl(url),
+    fingerprint: buildTargetFingerprint({ targetId, url, lastAssistantText: "" }),
+    state: "detached",
+    lastAssistantMarkdown: null,
+  };
+}
+
+export function summaryFromTargetForTest(
+  host: string,
+  port: number,
+  target: ChromeTarget,
+): ChatGptTabSummary {
+  return summaryFromTarget(host, port, target);
+}
+
 async function collectChatGptTabsFromTargets(
   host: string,
   port: number,
@@ -477,6 +514,16 @@ export async function connectToExistingChatGptTab(
   options: ResolveChatGptTabOptions = {},
 ): Promise<{ client: Awaited<ReturnType<typeof CDP>>; targetId: string; tab: ChatGptTabSummary }> {
   const { host, port } = normalizeHostPort(options);
+  const targets = await listChatGptTargets({ host, port });
+  const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+  if (exactTarget) {
+    const targetId = extractTargetId(exactTarget);
+    if (!targetId) {
+      throw new Error("Resolved ChatGPT tab is missing a target id.");
+    }
+    const client = await connectToTarget(host, port, targetId);
+    return { client, targetId, tab: summaryFromTarget(host, port, exactTarget) };
+  }
   const tab = await resolveChatGptTab({ host, port, ref: options.ref });
   const client = await connectToTarget(host, port, tab.targetId);
   return { client, targetId: tab.targetId, tab };

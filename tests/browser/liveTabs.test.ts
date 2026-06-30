@@ -4,6 +4,7 @@ import {
   formatBrowserTabState,
   resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
+  summaryFromTargetForTest,
   type ChromeTarget,
   sessionMatchesTab,
   type ChatGptTabSummary,
@@ -97,6 +98,19 @@ describe("liveTabs helpers", () => {
     );
     expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
     expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
+  });
+
+  test("builds enough summary from exact targets for export scope checks", () => {
+    const summary = summaryFromTargetForTest("127.0.0.1", 9222, {
+      id: "target-1",
+      type: "page",
+      title: "Review A",
+      url: "https://chatgpt.com/g/project/c/conv-1",
+    });
+    expect(summary.targetId).toBe("target-1");
+    expect(summary.url).toBe("https://chatgpt.com/g/project/c/conv-1");
+    expect(summary.conversationId).toBe("conv-1");
+    expect(summary.fingerprint).toBeTruthy();
   });
 
   test("throws on ambiguous title matches", () => {
