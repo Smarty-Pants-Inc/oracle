@@ -308,7 +308,7 @@ Key behavior:
 - Cookie sync is skipped automatically (the remote browser already has cookies). If you need inline cookies, use them on the machine that’s actually running Chrome.
 - Oracle opens a dedicated CDP target (new tab) for each run and closes it afterward so your existing tabs stay untouched.
 - When remote runs are served by an Oracle host with a manual-login profile, the host-side tab lease registry applies the same concurrent tab limit.
-- Attachments are transferred via CDP: Oracle reads each file locally, base64-encodes it, and uses `DataTransfer` inside the remote browser to populate the upload field. Files larger than 20 MB are rejected to keep CDP messages reasonable.
+- Attachments are transferred via CDP: Oracle reads each file locally, base64-encodes it, and uses `DataTransfer` inside the remote browser to populate the upload field. Files larger than 512 MB are rejected.
 - When the remote WebSocket disconnects, Oracle errors with “Remote Chrome connection lost…” so you can re-run after restarting the browser.
 
 ### 3. Troubleshooting

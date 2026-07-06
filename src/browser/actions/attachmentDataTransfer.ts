@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { ChromeClient, BrowserAttachment } from "../types.js";
 
-const MAX_DATA_TRANSFER_BYTES = 20 * 1024 * 1024;
+export const MAX_DATA_TRANSFER_BYTES = 512 * 1024 * 1024;
 
 export async function transferAttachmentViaDataTransfer(
   runtime: ChromeClient["Runtime"],

@@ -58,7 +58,7 @@ Oracle reads an optional per-user config from `~/.oracle/config.json`. The file 
   },
 
   heartbeatSeconds: 30, // default heartbeat interval
-  maxFileSizeBytes: 2097152, // raise/lower the per-file attachment guard (bytes)
+  maxFileSizeBytes: 2097152, // override the default 512 MB per-file guard (bytes)
   filesReport: false, // default per-file token report
   background: true, // default background mode for API runs
   sessionRetentionHours: 72, // prune cached sessions older than 72h before each run (0 disables)

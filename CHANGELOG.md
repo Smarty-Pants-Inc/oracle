@@ -5,6 +5,7 @@
 ### Fixed
 
 - Browser: target ChatGPT's renamed bare Pro picker row for Pro browser runs while keeping older Pro CLI aliases mapped to the current browser target (#190, fixes #182). Thanks @jungdaesuh!
+- CLI: raise the default per-file `--file` guard from 1 MB to 512 MB while keeping `ORACLE_MAX_FILE_SIZE_BYTES` and `maxFileSizeBytes` overrides.
 
 ## 0.11.1 — 2026-05-10
 

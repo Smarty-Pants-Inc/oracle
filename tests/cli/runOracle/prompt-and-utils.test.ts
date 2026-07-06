@@ -8,6 +8,7 @@ import {
   renderPromptMarkdown,
   readFiles,
   createFileSections,
+  DEFAULT_MAX_FILE_SIZE_BYTES,
   MODEL_CONFIGS,
   buildRequestBody,
   extractTextOutput,
@@ -301,12 +302,48 @@ describe("oracle utility helpers", () => {
     }
   });
 
-  test("readFiles rejects files larger than 1 MB", async () => {
+  test("readFiles accepts multi-megabyte files by default", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-large-"));
     try {
       const largeFile = path.join(dir, "huge.bin");
       await writeFile(largeFile, "a".repeat(1_200_000), "utf8");
-      await expect(readFiles([largeFile], { cwd: dir })).rejects.toThrow(/exceed the 1 MB limit/i);
+      const files = await readFiles([largeFile], { cwd: dir });
+      expect(files).toHaveLength(1);
+      expect(files[0].content).toHaveLength(1_200_000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("readFiles rejects files larger than 512 MB by default", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-huge-"));
+    try {
+      const hugeFile = path.join(dir, "huge.bin");
+      const fsModule = {
+        async stat(targetPath: string) {
+          if (targetPath === hugeFile) {
+            return {
+              isFile: () => true,
+              isDirectory: () => false,
+              size: DEFAULT_MAX_FILE_SIZE_BYTES + 1,
+            };
+          }
+          return {
+            isFile: () => false,
+            isDirectory: () => true,
+            size: 0,
+          };
+        },
+        async readdir() {
+          return [];
+        },
+        async readFile() {
+          return "";
+        },
+      };
+      await expect(readFiles([hugeFile], { cwd: dir, fsModule })).rejects.toThrow(
+        /exceed the 512 MB limit/i,
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
