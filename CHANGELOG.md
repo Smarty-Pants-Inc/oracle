@@ -2,9 +2,14 @@
 
 ## 0.11.2 — Unreleased
 
+### Changed
+
+- OpenAI: use the logical `gpt-5.6-sol-pro` alias as the API/browser default, mapping API runs to `gpt-5.6-sol` with Pro reasoning mode and routing legacy Pro aliases to the same behavior.
+
 ### Fixed
 
 - Browser: target ChatGPT's renamed bare Pro picker row for Pro browser runs while keeping older Pro CLI aliases mapped to the current browser target (#190, fixes #182). Thanks @jungdaesuh!
+- ChatGPT export: persist captured backend payloads across page transitions and retry chunk retrieval before reporting a missing capture.
 - CLI: raise the default per-file `--file` guard from 1 MB to 512 MB while keeping `ORACLE_MAX_FILE_SIZE_BYTES` and `maxFileSizeBytes` overrides.
 
 ## 0.11.1 — 2026-05-10

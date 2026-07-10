@@ -73,7 +73,7 @@ oracle --dry-run summary --files-report \
 
 ```bash
 oracle -p "Cross-check the data layer assumptions" \
-  --models gpt-5.5-pro,gemini-3-pro,claude-4.6-sonnet \
+  --models gpt-5.6-sol-pro,gemini-3-pro,claude-4.6-sonnet \
   --file "src/**/*.ts"
 ```
 

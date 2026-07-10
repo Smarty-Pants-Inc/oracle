@@ -116,8 +116,8 @@ describe("summarizeModelRunsForConsult", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
-      runModel: "gpt-5.5-pro",
-      inputModel: "gpt-5.5-pro",
+      runModel: "gpt-5.6-sol-pro",
+      inputModel: "gpt-5.6-sol-pro",
     });
 
     expect(config.manualLogin).toBe(process.platform === "win32");
@@ -165,14 +165,14 @@ describe("summarizeModelRunsForConsult", () => {
       resolvedEngine: "browser",
       runOptions: {
         prompt: "review this",
-        model: "gpt-5.5-pro",
+        model: "gpt-5.6-sol-pro",
         file: ["README.md"],
         browserAttachments: "always",
         browserBundleFiles: true,
         browserFollowUps: ["challenge", "final"],
       },
       browserConfig: {
-        desiredModel: "GPT-5.5 Pro",
+        desiredModel: "Pro",
         thinkingTime: "extended",
         modelStrategy: "select",
         researchMode: "off",
@@ -185,11 +185,11 @@ describe("summarizeModelRunsForConsult", () => {
 
     expect(resolved).toMatchObject({
       resolvedEngine: "browser",
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       files: ["README.md"],
       followUpCount: 2,
       browser: {
-        desiredModel: "GPT-5.5 Pro",
+        desiredModel: "Pro",
         thinkingTime: "extended",
         attachments: "always",
         bundleFiles: true,
@@ -220,7 +220,7 @@ describe("summarizeModelRunsForConsult", () => {
     const result = (await handler({
       dryRun: true,
       engine: "browser",
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       prompt: "review this",
       files: [],
       browserThinkingTime: "extended",
@@ -266,7 +266,7 @@ describe("summarizeModelRunsForConsult", () => {
     const result = (await handler({
       dryRun: true,
       engine: "browser",
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       prompt: "review this",
       files: [],
       run_in_background: true,

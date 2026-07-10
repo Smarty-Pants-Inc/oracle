@@ -7,8 +7,8 @@ const baseSession: SessionMetadata = {
   status: "running",
   cwd: "/tmp/oracle",
   mode: "browser",
-  model: "gpt-5.5-pro",
-  options: { prompt: "review", file: [], model: "gpt-5.5-pro", mode: "browser" },
+  model: "gpt-5.6-sol-pro",
+  options: { prompt: "review", file: [], model: "gpt-5.6-sol-pro", mode: "browser" },
 };
 
 const createSession = vi.fn(async () => baseSession);
@@ -88,7 +88,7 @@ describe("consult MCP failure diagnostics", () => {
 
     const result = (await handler?.({
       engine: "browser",
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       prompt: "review this",
       files: [],
     })) as {

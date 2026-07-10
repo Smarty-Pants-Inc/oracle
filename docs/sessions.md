@@ -59,7 +59,7 @@ oracle session <id>            # blocks until done, then prints the answer
 To block in the original command, pass `--wait`:
 
 ```bash
-oracle --wait --model gpt-5.5-pro -p "Long architecture review" --file "src/**"
+oracle --wait --model gpt-5.6-sol-pro -p "Long architecture review" --file "src/**"
 ```
 
 For browser runs, ChatGPT sometimes redirects mid-page-load. The auto-reattach flags poll the existing tab without manual intervention:
@@ -99,8 +99,8 @@ For multi-model parents, pick the lineage with `--followup-model`. See [Followup
 Force a Responses API run into background mode (create + retrieve) regardless of model defaults:
 
 ```bash
-oracle --background --model gpt-5.5-pro -p "..." --file "src/**"
-oracle --no-background --model gpt-5.5 -p "..." --file "src/**"
+oracle --background --model gpt-5.6-sol-pro -p "..." --file "src/**"
+oracle --no-background --model gpt-5.6 -p "..." --file "src/**"
 ```
 
 GPT-5.x Pro defaults to background; non-Pro models block by default. Override per-run when needed.

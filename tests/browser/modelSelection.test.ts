@@ -259,15 +259,15 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("closeMenu();");
   });
 
-  it("recognizes current GPT-5.5 visible aliases in the picker expression", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
-    expect(expression).toContain("isTargetGpt55VisibleAlias");
+  it("recognizes current Pro visible aliases in the picker expression", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
+    expect(expression).toContain("isTargetCurrentProVisibleAlias");
     // ChatGPT as of 2026-05 shows bare "Pro" (not "Pro Extended") in the picker.
     // Composer pill may also display "Extended Pro" (reversed ordering).
     expect(expression).toContain(
       "label === 'pro' || label === 'pro extended' || label === 'extended pro'",
     );
-    expect(expression).toContain("desiredVersion === '5-5'");
+    expect(expression).toContain("normalizedTarget === 'pro'");
   });
 
   it("recognizes bare Pro as already selected when Pro is the browser target", () => {
@@ -295,7 +295,7 @@ describe("browser model selection matchers", () => {
   });
 
   it("recognizes ChatGPT plus the Pro composer pill as the current Pro model", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
     expect(expression).toContain("const hasProComposerPill = () =>");
     expect(expression).toContain("const withProPillSignal = (label) =>");
     expect(expression).toContain("return resolved + ' + Pro'");
@@ -303,21 +303,21 @@ describe("browser model selection matchers", () => {
   });
 
   it("hard-rejects Thinking candidates when targeting Pro", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
     expect(expression).toContain("const candidateHasThinking =");
     expect(expression).toContain("if (wantsPro && candidateHasThinking) return 0;");
     expect(expression).toContain("if (wantsPro && !candidateHasPro) return 0;");
   });
 
   it("does not treat per-row thinking effort controls as model options", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
     expect(expression).toContain("const isThinkingEffortControl = (node) =>");
     expect(expression).toContain("data-model-picker-thinking-effort-action");
     expect(expression).toContain("if (isThinkingEffortControl(option))");
   });
 
   it("does not accept a changed but wrong model selection as success", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
     expect(expression).toContain("resolve('target')");
     expect(expression).toContain("resolve('changed')");
     expect(expression).toContain("if (selectionSettled === 'target')");
@@ -358,7 +358,7 @@ describe("browser model selection matchers", () => {
     const logger = vi.fn();
 
     await expect(
-      ensureModelSelection(runtime as never, "gpt-5.5-pro", logger as never, "current"),
+      ensureModelSelection(runtime as never, "gpt-5.6-sol-pro", logger as never, "current"),
     ).resolves.toBeUndefined();
     expect(logger).toHaveBeenCalledWith("Model picker: Thinking 5.5 Heavy");
   });
@@ -406,7 +406,7 @@ describe("browser model selection matchers", () => {
   });
 
   it("builds composer footer matchers for generic ChatGPT header states", () => {
-    expect(buildComposerSignalMatchersForTest("GPT-5.5 Pro")).toEqual({
+    expect(buildComposerSignalMatchersForTest("GPT-5.6 Sol Pro")).toEqual({
       includesAny: ["pro"],
       excludesAny: ["thinking"],
       allowBlank: false,
@@ -424,7 +424,7 @@ describe("browser model selection matchers", () => {
   });
 
   it("waits for composer footer state when the header button stays generic", () => {
-    const expression = buildModelSelectionExpressionForTest("GPT-5.5 Pro");
+    const expression = buildModelSelectionExpressionForTest("GPT-5.6 Sol Pro");
     expect(expression).toContain("const readComposerModelSignal = () =>");
     expect(expression).toContain("const activeSelectionMatchesTarget = () =>");
     expect(expression).toContain(
@@ -443,7 +443,7 @@ describe("browser model selection matchers", () => {
   });
 
   it("finds the rewritten ChatGPT composer pill model button", () => {
-    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
     expect(expression).toContain('data-testid="model-switcher-dropdown-button"');
     expect(expression).toContain("button.__composer-pill[aria-haspopup=");
   });

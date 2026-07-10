@@ -4,7 +4,7 @@ import { runOracle } from "@src/oracle.ts";
 import { MockClient, MockStream, buildResponse } from "./helpers.ts";
 
 describe("runOracle request payload", () => {
-  test("maps gpt-5.1-pro alias to gpt-5.5-pro API model", async () => {
+  test("maps gpt-5.1-pro alias to gpt-5.6-sol API model", async () => {
     const stream = new MockStream([], buildResponse());
     const client = new MockClient(stream);
     const logs: string[] = [];
@@ -20,13 +20,14 @@ describe("runOracle request payload", () => {
         log: (msg: string) => logs.push(msg),
       },
     );
-    expect(client.lastRequest?.model).toBe("gpt-5.5-pro");
-    expect(logs.join("\n")).toContain("(API: gpt-5.5-pro)");
+    expect(client.lastRequest?.model).toBe("gpt-5.6-sol");
+    expect(client.lastRequest?.reasoning).toEqual({ effort: "xhigh", mode: "pro" });
+    expect(logs.join("\n")).toContain("(API: gpt-5.6-sol)");
     expect(logs.join("\n")).toContain("gpt-5.1-pro");
-    expect(logs.join("\n")).toContain("OpenAI API uses `gpt-5.5-pro`");
+    expect(logs.join("\n")).toContain("OpenAI API uses `gpt-5.6-sol`");
   });
 
-  test("maps gpt-5.2-pro alias to gpt-5.5-pro API model", async () => {
+  test("maps gpt-5.2-pro alias to gpt-5.6-sol API model", async () => {
     const stream = new MockStream([], buildResponse());
     const client = new MockClient(stream);
     const logs: string[] = [];
@@ -42,10 +43,62 @@ describe("runOracle request payload", () => {
         log: (msg: string) => logs.push(msg),
       },
     );
-    expect(client.lastRequest?.model).toBe("gpt-5.5-pro");
-    expect(logs.join("\n")).toContain("(API: gpt-5.5-pro)");
+    expect(client.lastRequest?.model).toBe("gpt-5.6-sol");
+    expect(client.lastRequest?.reasoning).toEqual({ effort: "xhigh", mode: "pro" });
+    expect(logs.join("\n")).toContain("(API: gpt-5.6-sol)");
     expect(logs.join("\n")).toContain("gpt-5.2-pro");
-    expect(logs.join("\n")).toContain("OpenAI API uses `gpt-5.5-pro`");
+    expect(logs.join("\n")).toContain("OpenAI API uses `gpt-5.6-sol`");
+  });
+
+  test("keeps standard gpt-5.6-sol on xhigh effort without Pro mode", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await runOracle(
+      {
+        prompt: "Standard reasoning check",
+        model: "gpt-5.6-sol",
+        background: false,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: () => {},
+      },
+    );
+    expect(client.lastRequest?.model).toBe("gpt-5.6-sol");
+    expect(client.lastRequest?.reasoning).toEqual({ effort: "xhigh" });
+  });
+
+  test("uses GPT-5.6 long-context pricing above 272k input tokens", async () => {
+    const stream = new MockStream(
+      [],
+      buildResponse({
+        usage: {
+          input_tokens: 300_000,
+          output_tokens: 100_000,
+          reasoning_tokens: 0,
+          total_tokens: 400_000,
+        },
+      }),
+    );
+    const client = new MockClient(stream);
+    const result = await runOracle(
+      {
+        prompt: "Long context pricing check",
+        model: "gpt-5.6-sol-pro",
+        background: false,
+        silent: true,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: () => {},
+      },
+    );
+    expect(result.mode).toBe("live");
+    if (result.mode === "live") {
+      expect(result.usage.cost).toBeCloseTo(7.5);
+    }
   });
 
   test("search enabled by default", async () => {

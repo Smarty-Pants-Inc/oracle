@@ -101,7 +101,7 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
      ```
    - Observe logs for:
      - `Prompt textarea ready (xxx chars queued)` (twice: initial + after model switch).
-     - `Model picker: ... Thinking ...` or the current GPT-5.5 picker label.
+     - `Model picker: ... Thinking ...` or the GPT-5.5 picker label.
      - `Clicked send button` (or Enter fallback).
    - In the attached Chrome window, verify the multi-line prompt appears exactly as sent.
 
@@ -288,7 +288,7 @@ These Vitest cases hit the real OpenAI API to exercise both transports:
    pnpm vitest run tests/live/openai-live.test.ts
    ```
 2. The first two tests target the standard GPT-5 (`gpt-5.1` / `gpt-5.2`) foreground
-   streaming paths. The later background tests send `gpt-5.5-pro` and `gpt-5.2-pro`
+   streaming paths. The later background tests send `gpt-5.6-sol-pro` and `gpt-5.2-pro`
    prompts and expect the CLI to stay in background mode until OpenAI finishes
    (up to 30 minutes).
 3. Watch the console for `Reconnected to OpenAI background response...` if

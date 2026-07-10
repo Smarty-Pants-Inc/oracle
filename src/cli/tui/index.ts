@@ -21,7 +21,11 @@ import { sessionStore, pruneOldSessions } from "../../sessionStore.js";
 import { performSessionRun } from "../sessionRunner.js";
 import { MAX_RENDER_BYTES, trimBeforeFirstAnswer } from "../sessionDisplay.js";
 import { formatSessionTableHeader, formatSessionTableRow } from "../sessionTable.js";
-import { buildBrowserConfig, resolveBrowserModelLabel } from "../browserConfig.js";
+import {
+  buildBrowserConfig,
+  normalizeChatGptModelForBrowser,
+  resolveBrowserModelLabel,
+} from "../browserConfig.js";
 import { resolveNotificationSettings } from "../notifier.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../fileSize.js";
@@ -446,6 +450,8 @@ async function askOracleFlow(version: string, userConfig: UserConfig): Promise<v
   );
 
   const mode = (answers.mode ?? initialMode) as SessionMode;
+  const selectedModel =
+    mode === "browser" ? normalizeChatGptModelForBrowser(answers.model) : answers.model;
   const prompt = await resolvePromptInput(answers.promptInput);
   if (!prompt.trim()) {
     console.log(chalk.yellow("Cancelled."));
@@ -462,15 +468,15 @@ async function askOracleFlow(version: string, userConfig: UserConfig): Promise<v
     Array.isArray(answers.models) && answers.models.length > 0
       ? Array.from(
           new Set(
-            [answers.model, ...answers.models].filter((entry): entry is ModelName =>
+            [selectedModel, ...answers.models].filter((entry): entry is ModelName =>
               modelChoices.includes(entry as ModelName),
             ),
           ),
         )
-      : [answers.model];
+      : [selectedModel];
   const runOptions: RunOracleOptions = {
     prompt: promptWithSuffix,
-    model: answers.model,
+    model: selectedModel,
     file: answers.files,
     maxFileSizeBytes: resolveConfiguredMaxFileSizeBytes(userConfig, process.env),
     models: normalizedMultiModels.length > 1 ? normalizedMultiModels : undefined,
@@ -500,8 +506,8 @@ async function askOracleFlow(version: string, userConfig: UserConfig): Promise<v
           browserCookiePath: answers.chromeCookiePath,
           browserHideWindow: answers.hideWindow,
           browserKeepBrowser: answers.keepBrowser,
-          browserModelLabel: resolveBrowserModelLabel(undefined, answers.model),
-          model: answers.model,
+          browserModelLabel: resolveBrowserModelLabel(undefined, selectedModel),
+          model: selectedModel,
         })
       : undefined;
 

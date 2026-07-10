@@ -140,7 +140,10 @@ export function toTransportError(error: unknown, model?: string): OracleTranspor
       (apiError.status ? `${apiError.status} OpenAI API error` : "OpenAI API error");
     // Friendly guidance when a pro-tier model isn't available on this base URL / API key.
     if (
-      (model === "gpt-5.5-pro" || model === "gpt-5.4-pro") &&
+      (model === "gpt-5.6-sol" ||
+        model === "gpt-5.6-sol-pro" ||
+        model === "gpt-5.5-pro" ||
+        model === "gpt-5.4-pro") &&
       (code === "model_not_found" ||
         messageText.includes("does not exist") ||
         messageText.includes("unknown model") ||

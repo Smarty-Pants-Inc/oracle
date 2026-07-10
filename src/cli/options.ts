@@ -3,7 +3,7 @@ import { parseDuration } from "../browserMode.js";
 import path from "node:path";
 import fg from "fast-glob";
 import type { ModelName, PreviewMode } from "../oracle.js";
-import { DEFAULT_MODEL, MODEL_CONFIGS } from "../oracle.js";
+import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, MODEL_CONFIGS } from "../oracle.js";
 
 export function collectPaths(
   value: string | string[] | undefined,
@@ -202,14 +202,6 @@ function isGeminiDeepThinkAlias(normalized: string): boolean {
 
 export function resolveApiModel(modelValue: string): ModelName {
   const normalized = normalizeModelOption(modelValue).toLowerCase();
-  if (
-    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
-    normalized.includes("pro")
-  ) {
-    throw new InvalidArgumentError(
-      "GPT-5.6 Sol Pro is browser-only today. Use --engine browser --model gpt-5.6-sol-pro, or use gpt-5.6-sol with the API.",
-    );
-  }
   if (normalized in MODEL_CONFIGS) {
     return normalized as ModelName;
   }
@@ -224,6 +216,15 @@ export function resolveApiModel(modelValue: string): ModelName {
   }
   if (normalized.includes("claude") && normalized.includes("opus")) {
     return "claude-4.1-opus";
+  }
+  if (
+    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
+    normalized.includes("pro")
+  ) {
+    return "gpt-5.6-sol-pro";
+  }
+  if (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) {
+    return "gpt-5.6-sol";
   }
   if (normalized.includes("5.5") && normalized.includes("pro")) {
     return "gpt-5.5-pro";
@@ -275,7 +276,7 @@ export function resolveApiModel(modelValue: string): ModelName {
     return "gemini-3-pro";
   }
   if (normalized.includes("pro")) {
-    return DEFAULT_MODEL;
+    return DEFAULT_API_MODEL;
   }
   // Passthrough for custom/OpenRouter model IDs.
   return normalized as ModelName;
@@ -284,7 +285,7 @@ export function resolveApiModel(modelValue: string): ModelName {
 export function inferModelFromLabel(modelValue: string): ModelName {
   const normalized = normalizeModelOption(modelValue).toLowerCase();
   if (!normalized) {
-    return "gpt-5.6-sol-pro";
+    return DEFAULT_BROWSER_MODEL;
   }
   if (normalized in MODEL_CONFIGS) {
     return normalized as ModelName;
@@ -323,7 +324,10 @@ export function inferModelFromLabel(modelValue: string): ModelName {
     (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
     normalized.includes("pro")
   ) {
-    return "gpt-5.6-sol-pro";
+    return DEFAULT_BROWSER_MODEL;
+  }
+  if (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) {
+    return DEFAULT_BROWSER_MODEL;
   }
   if ((normalized.includes("5.5") || normalized.includes("5_5")) && normalized.includes("pro")) {
     return "gpt-5.5-pro";
@@ -370,7 +374,7 @@ export function inferModelFromLabel(modelValue: string): ModelName {
     return "gpt-5.1-pro";
   }
   if (normalized.includes("pro")) {
-    return "gpt-5.6-sol-pro";
+    return DEFAULT_BROWSER_MODEL;
   }
   if (normalized.includes("5.1") || normalized.includes("5_1")) {
     return "gpt-5.1";

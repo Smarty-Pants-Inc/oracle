@@ -1,6 +1,8 @@
 export * from "./oracle/types.js";
 export {
   MODEL_CONFIGS,
+  DEFAULT_API_MODEL,
+  DEFAULT_BROWSER_MODEL,
   DEFAULT_MODEL,
   PRO_MODELS,
   DEFAULT_SYSTEM_PROMPT,

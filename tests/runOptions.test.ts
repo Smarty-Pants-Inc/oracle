@@ -40,6 +40,18 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.model).toBe(DEFAULT_MODEL);
   });
 
+  it("keeps legacy Pro aliases aligned with the current API model metadata", () => {
+    const current = MODEL_CONFIGS["gpt-5.6-sol-pro"];
+    for (const alias of ["gpt-5.1-pro", "gpt-5.2-pro"] as const) {
+      expect(MODEL_CONFIGS[alias]).toMatchObject({
+        apiModel: current.apiModel,
+        inputLimit: current.inputLimit,
+        pricing: current.pricing,
+        reasoning: current.reasoning,
+      });
+    }
+  });
+
   it("uses config model when caller does not provide one", () => {
     const { runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
@@ -212,14 +224,15 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.model).toBe("gpt-5.6-sol-pro");
   });
 
-  it("rejects the GPT-5.6 Sol Pro alias for API runs", () => {
-    expect(() =>
-      resolveRunOptionsFromConfig({
-        prompt: basePrompt,
-        model: "gpt-5.6-sol-pro",
-        engine: "api",
-      }),
-    ).toThrow(/browser-only/i);
+  it("maps the GPT-5.6 Sol Pro alias to Pro reasoning for API runs", () => {
+    const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6-sol-pro",
+      engine: "api",
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("gpt-5.6-sol-pro");
+    expect(runOptions.effectiveModelId).toBe("gpt-5.6-sol");
   });
 
   it("keeps gpt-5.4-pro unchanged for API engine runs", () => {

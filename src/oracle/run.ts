@@ -315,12 +315,14 @@ export async function runOracle(
     }
     if (
       !options.suppressHeader &&
-      (modelConfig.model === "gpt-5.1-pro" || modelConfig.model === "gpt-5.2-pro") &&
-      effectiveModelId === "gpt-5.5-pro"
+      (modelConfig.model === "gpt-5.6-sol-pro" ||
+        modelConfig.model === "gpt-5.1-pro" ||
+        modelConfig.model === "gpt-5.2-pro") &&
+      effectiveModelId === "gpt-5.6-sol"
     ) {
       log(
         dim(
-          `Note: \`${modelConfig.model}\` is a stable CLI alias; OpenAI API uses \`gpt-5.5-pro\`.`,
+          `Note: \`${modelConfig.model}\` is a stable CLI alias; OpenAI API uses \`gpt-5.6-sol\`.`,
         ),
       );
     }
@@ -639,18 +641,24 @@ export async function runOracle(
   const reasoningTokens = usage.reasoning_tokens ?? 0;
   const totalTokens = usage.total_tokens ?? inputTokens + outputTokens + reasoningTokens;
   const pricing = modelConfig.pricing ?? undefined;
-  const cost = pricing
+  const appliedPricing =
+    pricing?.longContext && inputTokens > pricing.longContext.thresholdInputTokens
+      ? pricing.longContext
+      : pricing;
+  const cost = appliedPricing
     ? estimateUsdCost({
         usage: { inputTokens, outputTokens, reasoningTokens, totalTokens },
         pricing: {
-          inputUsdPerToken: pricing.inputPerToken,
-          outputUsdPerToken: pricing.outputPerToken,
+          inputUsdPerToken: appliedPricing.inputPerToken,
+          outputUsdPerToken: appliedPricing.outputPerToken,
         },
       })?.totalUsd
     : undefined;
 
-  const effortLabel = modelConfig.reasoning?.effort;
-  const modelLabel = effortLabel ? `${modelConfig.model}[${effortLabel}]` : modelConfig.model;
+  const reasoningLabel = [modelConfig.reasoning?.mode, modelConfig.reasoning?.effort]
+    .filter(Boolean)
+    .join("/");
+  const modelLabel = reasoningLabel ? `${modelConfig.model}[${reasoningLabel}]` : modelConfig.model;
   const sessionIdContainsModel =
     typeof options.sessionId === "string" &&
     options.sessionId.toLowerCase().includes(modelConfig.model.toLowerCase());

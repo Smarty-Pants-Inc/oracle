@@ -191,6 +191,9 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
       const url = new URL(typeof input === "string" ? input : (input && input.url) || "", location.href).href;
       if (url !== TARGET) return;
       const text = await response.clone().text();
+      try {
+        sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text);
+      } catch {}
       window.__oracleChatGptBackendCapture.hits.push({
         kind,
         url,
@@ -226,14 +229,18 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
       try {
         const href = new URL(requestUrl, location.href).href;
         if (href !== TARGET) return;
+        const text = String(xhr.responseText || "");
+        try {
+          sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text);
+        } catch {}
         window.__oracleChatGptBackendCapture.hits.push({
           kind: "xhr",
           url: href,
           status: xhr.status,
           ok: xhr.status >= 200 && xhr.status < 300,
           contentType: xhr.getResponseHeader("content-type"),
-          chars: String(xhr.responseText || "").length,
-          text: String(xhr.responseText || ""),
+          chars: text.length,
+          text,
           capturedAt: new Date().toISOString()
         });
       } catch {}
@@ -373,7 +380,7 @@ async function pollCapture(
   );
 }
 
-async function retrieveCapturedTextWithEvaluator(
+export async function retrieveCapturedTextWithEvaluator(
   evaluate: EvaluateExpression,
   targetApiUrl: string,
   chars: number,
@@ -387,11 +394,20 @@ async function retrieveCapturedTextWithEvaluator(
   const target = ${jsString(targetApiUrl)};
   const hits = window.__oracleChatGptBackendCapture?.hits || [];
   const hit = hits.find((item) => item.url === target && item.status === 200 && String(item.text || "").startsWith("{"));
-  if (!hit) return null;
-  return String(hit.text || "").slice(${start}, ${end});
+  const text = hit?.text || sessionStorage.getItem("__oracleChatGptBackendCapture:" + target);
+  if (!text || !String(text).startsWith("{")) return null;
+  return String(text).slice(${start}, ${end});
 })()
 `;
-    const part = await evaluate<string | null>(expression, "capture chunk");
+    let part: string | null = null;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      part = await evaluate<string | null>(expression, "capture chunk");
+      if (typeof part === "string") {
+        break;
+      }
+      await delay(250);
+    }
     if (typeof part !== "string") {
       throw new Error(`Missing captured text chunk ${start}:${end}`);
     }

@@ -14,7 +14,7 @@ oracle --engine browser -p "Review the storage layer for schema drift" --file "s
 
 # API path — multi-model cross-check in one run.
 oracle -p "Cross-check the data layer assumptions" \
-  --models gpt-5.5-pro,gemini-3-pro,claude-4.6-sonnet \
+  --models gpt-5.6-sol-pro,gemini-3-pro,claude-4.6-sonnet \
   --file "src/**/*.ts"
 
 # Manual fallback — assemble the bundle and copy it to your clipboard.
@@ -30,7 +30,7 @@ oracle --followup <id> -p "Re-evaluate with this new context" --file "src/**/*.t
 
 ## What Oracle does
 
-- **One CLI to a stable of pro agents.** GPT-5.6 Sol Pro (browser default), GPT-5.5 Pro (API), GPT-5.5, GPT-5.4 Pro, GPT-5.4, GPT-5.2 Pro, GPT-5.1 Pro, GPT-5.1 Codex, Gemini 3.1 Pro, Gemini 3 Pro, Claude Sonnet 4.6, Claude Opus 4.1 — plus any OpenRouter id.
+- **One CLI to a stable of pro agents.** GPT-5.6 Sol Pro (browser/API default), GPT-5.6 Sol, GPT-5.5 Pro, GPT-5.5, GPT-5.4 Pro, GPT-5.4, GPT-5.2 Pro, GPT-5.1 Pro, GPT-5.1 Codex, Gemini 3.1 Pro, Gemini 3 Pro, Claude Sonnet 4.6, Claude Opus 4.1 — plus any OpenRouter id.
 - **Engines, plural.** API mode for reliability, browser mode (Chrome over CDP) when you don't want to pay or want the Pro tier, `--render --copy` when neither is an option.
 - **Multi-model in one run.** Aggregate cost, token usage, and lineage across providers in a single command.
 - **Followups + lineage.** Continue from any stored session id or `resp_…` response id; `oracle status` shows parent/child trees.

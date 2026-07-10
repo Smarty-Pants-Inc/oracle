@@ -4,8 +4,11 @@ import type { ModelConfig, ModelName, KnownModelName, ProModelName, TokenizerFn 
 import { countTokens as countTokensAnthropicRaw } from "@anthropic-ai/tokenizer";
 import { stringifyTokenizerInput } from "./tokenStringifier.js";
 
-export const DEFAULT_MODEL: ModelName = "gpt-5.5-pro";
+export const DEFAULT_API_MODEL: ModelName = "gpt-5.6-sol-pro";
+export const DEFAULT_BROWSER_MODEL: ModelName = "gpt-5.6-sol-pro";
+export const DEFAULT_MODEL: ModelName = DEFAULT_API_MODEL;
 export const PRO_MODELS = new Set<ProModelName>([
+  "gpt-5.6-sol-pro",
   "gpt-5.5-pro",
   "gpt-5.4-pro",
   "gpt-5.1-pro",
@@ -19,6 +22,39 @@ const countTokensAnthropic: TokenizerFn = (input: unknown): number =>
   countTokensAnthropicRaw(stringifyTokenizerInput(input));
 
 export const MODEL_CONFIGS: Record<KnownModelName, ModelConfig> = {
+  "gpt-5.6-sol": {
+    model: "gpt-5.6-sol",
+    provider: "openai",
+    tokenizer: countTokensGpt5 as TokenizerFn,
+    inputLimit: 1_050_000,
+    pricing: {
+      inputPerToken: 5 / 1_000_000,
+      outputPerToken: 30 / 1_000_000,
+      longContext: {
+        thresholdInputTokens: 272_000,
+        inputPerToken: 10 / 1_000_000,
+        outputPerToken: 45 / 1_000_000,
+      },
+    },
+    reasoning: { effort: "xhigh" },
+  },
+  "gpt-5.6-sol-pro": {
+    model: "gpt-5.6-sol-pro",
+    apiModel: "gpt-5.6-sol",
+    provider: "openai",
+    tokenizer: countTokensGpt5 as TokenizerFn,
+    inputLimit: 1_050_000,
+    pricing: {
+      inputPerToken: 5 / 1_000_000,
+      outputPerToken: 30 / 1_000_000,
+      longContext: {
+        thresholdInputTokens: 272_000,
+        inputPerToken: 10 / 1_000_000,
+        outputPerToken: 45 / 1_000_000,
+      },
+    },
+    reasoning: { effort: "xhigh", mode: "pro" },
+  },
   "gpt-5.5-pro": {
     model: "gpt-5.5-pro",
     provider: "openai",
@@ -43,15 +79,20 @@ export const MODEL_CONFIGS: Record<KnownModelName, ModelConfig> = {
   },
   "gpt-5.1-pro": {
     model: "gpt-5.1-pro",
-    apiModel: "gpt-5.5-pro",
+    apiModel: "gpt-5.6-sol",
     provider: "openai",
-    tokenizer: countTokensGpt5Pro as TokenizerFn,
-    inputLimit: 196000,
+    tokenizer: countTokensGpt5 as TokenizerFn,
+    inputLimit: 1_050_000,
     pricing: {
-      inputPerToken: 30 / 1_000_000,
-      outputPerToken: 180 / 1_000_000,
+      inputPerToken: 5 / 1_000_000,
+      outputPerToken: 30 / 1_000_000,
+      longContext: {
+        thresholdInputTokens: 272_000,
+        inputPerToken: 10 / 1_000_000,
+        outputPerToken: 45 / 1_000_000,
+      },
     },
-    reasoning: null,
+    reasoning: { effort: "xhigh", mode: "pro" },
   },
   "gpt-5-pro": {
     model: "gpt-5-pro",
@@ -133,15 +174,20 @@ export const MODEL_CONFIGS: Record<KnownModelName, ModelConfig> = {
   },
   "gpt-5.2-pro": {
     model: "gpt-5.2-pro",
-    apiModel: "gpt-5.5-pro",
+    apiModel: "gpt-5.6-sol",
     provider: "openai",
-    tokenizer: countTokensGpt5Pro as TokenizerFn,
-    inputLimit: 196000,
+    tokenizer: countTokensGpt5 as TokenizerFn,
+    inputLimit: 1_050_000,
     pricing: {
-      inputPerToken: 30 / 1_000_000,
-      outputPerToken: 180 / 1_000_000,
+      inputPerToken: 5 / 1_000_000,
+      outputPerToken: 30 / 1_000_000,
+      longContext: {
+        thresholdInputTokens: 272_000,
+        inputPerToken: 10 / 1_000_000,
+        outputPerToken: 45 / 1_000_000,
+      },
     },
-    reasoning: { effort: "xhigh" },
+    reasoning: { effort: "xhigh", mode: "pro" },
   },
   "gemini-3.1-pro": {
     model: "gemini-3.1-pro",

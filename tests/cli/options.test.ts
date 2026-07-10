@@ -172,6 +172,10 @@ describe("normalizeModelOption", () => {
 
 describe("resolveApiModel", () => {
   test("accepts canonical names regardless of case", () => {
+    expect(resolveApiModel("gpt-5.6-sol")).toBe("gpt-5.6-sol");
+    expect(resolveApiModel("gpt-5.6-sol-pro")).toBe("gpt-5.6-sol-pro");
+    expect(resolveApiModel("GPT-5.6")).toBe("gpt-5.6-sol");
+    expect(resolveApiModel("GPT-5.6 Sol Pro")).toBe("gpt-5.6-sol-pro");
     expect(resolveApiModel("gpt-5.5-pro")).toBe("gpt-5.5-pro");
     expect(resolveApiModel("GPT-5.5")).toBe("gpt-5.5");
     expect(resolveApiModel("gpt-5.4-pro")).toBe("gpt-5.4-pro");
@@ -208,15 +212,6 @@ describe("resolveApiModel", () => {
     );
   });
 
-  test("rejects GPT-5.6 Sol Pro aliases in API mode", () => {
-    expect(() => resolveApiModel("gpt-5.6-sol-pro")).toThrow(
-      "GPT-5.6 Sol Pro is browser-only today",
-    );
-    expect(() => resolveApiModel("GPT-5.6 Sol Pro")).toThrow(
-      "GPT-5.6 Sol Pro is browser-only today",
-    );
-  });
-
   test("passes through unknown names (OpenRouter/custom)", () => {
     expect(resolveApiModel("instant")).toBe("instant");
     expect(resolveApiModel("openai/gpt-5.4")).toBe("openai/gpt-5.4");
@@ -227,6 +222,7 @@ describe("resolveApiModel", () => {
 
 describe("inferModelFromLabel", () => {
   test("returns canonical names when label already matches", () => {
+    expect(inferModelFromLabel("gpt-5.6-sol")).toBe("gpt-5.6-sol");
     expect(inferModelFromLabel("gpt-5.6-sol-pro")).toBe("gpt-5.6-sol-pro");
     expect(inferModelFromLabel("gpt-5.5-pro")).toBe("gpt-5.5-pro");
     expect(inferModelFromLabel("gpt-5.5")).toBe("gpt-5.5");
@@ -251,6 +247,11 @@ describe("inferModelFromLabel", () => {
     expect(inferModelFromLabel("Pro Extended")).toBe("gpt-5.6-sol-pro");
     expect(inferModelFromLabel("Pro")).toBe("gpt-5.6-sol-pro");
     expect(inferModelFromLabel("Thinking Heavy")).toBe("gpt-5.5");
+  });
+
+  test("infers 5.6 browser labels as the current Pro alias", () => {
+    expect(inferModelFromLabel("ChatGPT 5.6")).toBe("gpt-5.6-sol-pro");
+    expect(inferModelFromLabel("GPT-5.6 Sol Pro")).toBe("gpt-5.6-sol-pro");
   });
 
   test("infers 5.4 variants", () => {

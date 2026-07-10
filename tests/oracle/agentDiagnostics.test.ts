@@ -9,8 +9,8 @@ function session(overrides: Partial<SessionMetadata>): SessionMetadata {
     status: "error",
     cwd: "/tmp/oracle",
     mode: "browser",
-    model: "gpt-5.5-pro",
-    options: { prompt: "review", file: [], model: "gpt-5.5-pro", mode: "browser" },
+    model: "gpt-5.6-sol-pro",
+    options: { prompt: "review", file: [], model: "gpt-5.6-sol-pro", mode: "browser" },
     ...overrides,
   };
 }

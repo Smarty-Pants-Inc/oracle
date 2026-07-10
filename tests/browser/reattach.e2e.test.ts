@@ -98,13 +98,13 @@ describe("browser reattach end-to-end (simulated)", () => {
       const sessionMeta = await sessionStore.createSession(
         {
           prompt: "Deep research prompt",
-          model: "gpt-5.5-pro",
+          model: "gpt-5.6-sol-pro",
           mode: "browser",
           browserConfig: { researchMode: "deep" },
         },
         "/repo",
       );
-      await sessionStore.updateModelRun(sessionMeta.id, "gpt-5.5-pro", {
+      await sessionStore.updateModelRun(sessionMeta.id, "gpt-5.6-sol-pro", {
         status: "completed",
         usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
       });

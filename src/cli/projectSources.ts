@@ -94,7 +94,7 @@ export async function buildProjectSourcesBrowserConfig({
   const flagConfig = removeUndefined(
     await buildBrowserConfig({
       ...options,
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       chatgptUrl: projectUrl,
     }),
   );

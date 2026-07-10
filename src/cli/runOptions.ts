@@ -1,5 +1,5 @@
 import type { RunOracleOptions, ModelName } from "../oracle.js";
-import { DEFAULT_MODEL, MODEL_CONFIGS } from "../oracle.js";
+import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, MODEL_CONFIGS } from "../oracle.js";
 import type { UserConfig } from "../config.js";
 import type { EngineMode } from "./engine.js";
 import { resolveEngine } from "./engine.js";
@@ -47,7 +47,13 @@ export function resolveRunOptionsFromConfig({
     .map((entry) => normalizeModelOption(entry))
     .filter(Boolean);
 
-  const cliModelArg = normalizeModelOption(model ?? userConfig?.model) || DEFAULT_MODEL;
+  const defaultModel =
+    normalizedRequestedModels.length > 0
+      ? DEFAULT_API_MODEL
+      : resolvedEngine === "browser"
+        ? DEFAULT_BROWSER_MODEL
+        : DEFAULT_API_MODEL;
+  const cliModelArg = normalizeModelOption(model ?? userConfig?.model) || defaultModel;
   const inferredModel =
     resolvedEngine === "browser" && normalizedRequestedModels.length === 0
       ? inferModelFromLabel(cliModelArg)

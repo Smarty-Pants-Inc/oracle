@@ -18,7 +18,8 @@ import chalk from "chalk";
 import type { SessionMetadata, SessionMode, BrowserSessionConfig } from "../src/sessionStore.js";
 import { sessionStore, pruneOldSessions } from "../src/sessionStore.js";
 import {
-  DEFAULT_MODEL,
+  DEFAULT_API_MODEL,
+  DEFAULT_BROWSER_MODEL,
   MODEL_CONFIGS,
   readFiles,
   estimateRequestTokens,
@@ -267,7 +268,7 @@ program.hook("preAction", async (thisCommand) => {
 program
   .name("oracle")
   .description(
-    "One-shot GPT-5.6 Sol Pro browser / GPT-5.5 Pro API / GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
+    "One-shot GPT-5.6 Sol Pro browser/API and GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
   )
   .version(VERSION)
   .argument("[prompt]", "Prompt text (shorthand for --prompt).")
@@ -321,13 +322,13 @@ program
   .option("-s, --slug <words>", "Custom session slug (3-5 words).")
   .option(
     "-m, --model <model>",
-    'Model to target (gpt-5.6-sol-pro browser default; gpt-5.5-pro API default). Also gpt-5.5, gpt-5.4-pro, gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.6-sonnet, claude-4.1-opus, or ChatGPT labels like "5.6 Sol Pro" / "5.2 Thinking" for browser runs).',
+    'Model to target (gpt-5.6-sol-pro default: ChatGPT Pro in browser mode, gpt-5.6-sol with Pro reasoning in API mode). Also gpt-5.6-sol standard, gpt-5.5-pro, gpt-5.5, gpt-5.4-pro, gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.6-sonnet, claude-4.1-opus, or ChatGPT labels like "5.6 Sol Pro" / "5.2 Thinking" for browser runs).',
     normalizeModelOption,
   )
   .addOption(
     new Option(
       "--models <models>",
-      'Comma-separated API model list to query in parallel (e.g., "gpt-5.5-pro,gemini-3-pro").',
+      'Comma-separated API model list to query in parallel (e.g., "gpt-5.6-sol-pro,gemini-3-pro").',
     )
       .argParser(collectModelList)
       .default([]),
@@ -1376,10 +1377,12 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
   const stored = metadata.options ?? {};
   return {
     prompt: stored.prompt ?? "",
-    model: (stored.model as ModelName) ?? DEFAULT_MODEL,
+    model:
+      (stored.model as ModelName) ??
+      (metadata.mode === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL),
     models: stored.models as ModelName[] | undefined,
     previousResponseId: stored.previousResponseId,
-    effectiveModelId: stored.effectiveModelId ?? stored.model,
+    effectiveModelId: stored.effectiveModelId,
     file: stored.file ?? [],
     maxFileSizeBytes: stored.maxFileSizeBytes,
     slug: stored.slug,
@@ -1580,13 +1583,14 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const normalizedMultiModels: ModelName[] = multiModelProvided
     ? Array.from(new Set(options.models!.map((entry) => resolveApiModel(entry))))
     : [];
+  const defaultModel = engine === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL;
   const cliModelArg =
-    normalizeModelOption(options.model) || (multiModelProvided ? "" : DEFAULT_MODEL);
+    normalizeModelOption(options.model) || (multiModelProvided ? "" : defaultModel);
   const inferredModelCandidate: ModelName = multiModelProvided
     ? normalizedMultiModels[0]
     : engine === "browser"
-      ? inferModelFromLabel(cliModelArg || DEFAULT_MODEL)
-      : resolveApiModel(cliModelArg || DEFAULT_MODEL);
+      ? inferModelFromLabel(cliModelArg || DEFAULT_BROWSER_MODEL)
+      : resolveApiModel(cliModelArg || DEFAULT_API_MODEL);
   const resolvedModelCandidate =
     engine === "browser"
       ? normalizeChatGptModelForBrowser(inferredModelCandidate)
@@ -2184,6 +2188,10 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     }
   }
   const remoteExecutionActive = Boolean(browserDeps);
+  const restartedRunOptions: RunOracleOptions = {
+    ...runOptions,
+    effectiveModelId: resolveEffectiveModelIdForRun(runOptions.model, runOptions.effectiveModelId),
+  };
 
   await sessionStore.ensureStorage();
   const notifications = deriveNotificationSettingsFromMetadata(
@@ -2193,7 +2201,7 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   );
   const sessionMeta = await sessionStore.createSession(
     {
-      ...runOptions,
+      ...restartedRunOptions,
       mode: sessionMode,
       browserConfig,
       followupSessionId: storedOptions.followupSessionId,
@@ -2212,9 +2220,8 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   );
 
   const liveRunOptions: RunOracleOptions = {
-    ...runOptions,
+    ...restartedRunOptions,
     sessionId: sessionMeta.id,
-    effectiveModelId: resolveEffectiveModelIdForRun(runOptions.model, runOptions.effectiveModelId),
   };
 
   const disableDetachEnv = process.env.ORACLE_NO_DETACH === "1";

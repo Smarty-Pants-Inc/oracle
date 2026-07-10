@@ -15,7 +15,7 @@ description: "Continue an OpenAI / Azure Responses API run with new files. Multi
 
 ```bash
 # Initial run
-oracle --model gpt-5.5-pro --slug arch-review \
+oracle --model gpt-5.6-sol-pro --slug arch-review \
   -p "Audit the auth flow end-to-end" \
   --file "src/auth/**"
 
@@ -36,7 +36,7 @@ oracle --followup arch-review \
 When the parent used `--models a,b,c`, pick which lineage to continue from with `--followup-model`:
 
 ```bash
-oracle --followup arch-review --followup-model gpt-5.5-pro \
+oracle --followup arch-review --followup-model gpt-5.6-sol-pro \
   -p "Continue from the Pro answer" \
   --file "src/auth/rate-limiter.ts"
 ```
@@ -74,10 +74,10 @@ Each `--browser-follow-up` is sent after the previous turn completes. Not suppor
 
 ```
 Status    Model         Mode    Timestamp           Chars    Cost  Slug
-completed gpt-5.5-pro   api     05/06 09:00 AM      1800  $2.110  arch-review
-completed gpt-5.5-pro   api     05/06 09:14 AM      2200  $2.980  ├─ arch-review-rate-limiter
-running   gpt-5.5-pro   api     05/06 09:22 AM      1400       -  │  └─ arch-review-implementation
-pending   gpt-5.5-pro   api     05/06 09:25 AM       900       -  └─ arch-review-risk-check
+completed gpt-5.6-sol-pro api     05/06 09:00 AM      1800  $2.110  arch-review
+completed gpt-5.6-sol-pro api     05/06 09:14 AM      2200  $2.980  ├─ arch-review-rate-limiter
+running   gpt-5.6-sol-pro api     05/06 09:22 AM      1400       -  │  └─ arch-review-implementation
+pending   gpt-5.6-sol-pro api     05/06 09:25 AM       900       -  └─ arch-review-risk-check
 ```
 
 Children inherit the parent's slug prefix unless you pass `--slug` explicitly.

@@ -100,6 +100,68 @@ describe("oracle CLI integration", () => {
   );
 
   test(
+    "restart resolves a stored GPT-5.6 Pro alias when effective model metadata is missing",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-restart-model-alias-"));
+      const env = {
+        ...process.env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        OPENAI_API_KEY: "sk-integration",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_HOME_DIR: oracleHome,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_CLIENT_FACTORY: CLIENT_FACTORY,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_NO_DETACH: "1",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_DISABLE_KEYTAR: "1",
+      };
+
+      await execFileAsync(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          CLI_ENTRY,
+          "--prompt",
+          "Restart model alias integration check",
+          "--model",
+          "gpt-5.6-sol-pro",
+          "--no-background",
+          "--wait",
+        ],
+        { env },
+      );
+
+      const sessionsDir = path.join(oracleHome, "sessions");
+      const [parentId] = await readdir(sessionsDir);
+      expect(parentId).toBeTruthy();
+      const parentMetaPath = path.join(sessionsDir, parentId, "meta.json");
+      const parentMeta = JSON.parse(await readFile(parentMetaPath, "utf8"));
+      delete parentMeta.options.effectiveModelId;
+      await writeFile(parentMetaPath, JSON.stringify(parentMeta, null, 2), "utf8");
+
+      await execFileAsync(
+        process.execPath,
+        ["--import", "tsx", CLI_ENTRY, "restart", parentId, "--wait"],
+        { env },
+      );
+
+      const sessionIds = await readdir(sessionsDir);
+      const childId = sessionIds.find((id) => id !== parentId);
+      expect(childId).toBeTruthy();
+      const childMeta = JSON.parse(
+        await readFile(path.join(sessionsDir, String(childId), "meta.json"), "utf8"),
+      );
+      expect(childMeta.model).toBe("gpt-5.6-sol-pro");
+      expect(childMeta.options?.effectiveModelId).toBe("gpt-5.6-sol");
+
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
     "persists followup lineage and reuses previous_response_id during --exec-session",
     async () => {
       const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-followup-"));

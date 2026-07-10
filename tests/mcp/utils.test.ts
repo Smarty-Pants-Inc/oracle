@@ -22,7 +22,7 @@ describe("mapConsultToRunOptions", () => {
     const { runOptions, resolvedEngine } = mapConsultToRunOptions({
       prompt: "review",
       files: [],
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       engine: "browser",
       browserFollowUps: [" challenge previous answer ", "", "final concise decision"],
       userConfig: undefined,

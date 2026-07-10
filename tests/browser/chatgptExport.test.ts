@@ -6,6 +6,7 @@ import {
   contentToText,
   conversationIdFromChatGptUrl,
   isSameConversationUrl,
+  retrieveCapturedTextWithEvaluator,
   scanTextForSecretLikeMarkers,
 } from "../../src/browser/chatgptExport.js";
 
@@ -47,8 +48,30 @@ describe("ChatGPT conversation export helpers", () => {
     expect(hook).toContain("url !== TARGET");
     expect(hook).toContain("window.fetch");
     expect(hook).toContain("XMLHttpRequest");
+    expect(hook).toContain(
+      'sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text)',
+    );
     expect(hook).not.toContain("localStorage");
     expect(hook).not.toContain("cookie");
+  });
+
+  test("retrieves persisted capture text after a transient miss", async () => {
+    const payload = '{"ok":true}';
+    let attempts = 0;
+    const result = await retrieveCapturedTextWithEvaluator(
+      async (expression) => {
+        expect(expression).toContain(
+          'sessionStorage.getItem("__oracleChatGptBackendCapture:" + target)',
+        );
+        attempts += 1;
+        return (attempts === 1 ? null : payload) as never;
+      },
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+      payload.length,
+      payload.length,
+    );
+    expect(result).toBe(payload);
+    expect(attempts).toBe(2);
   });
 
   test("normalizes backend content types without losing structured values", () => {

@@ -16,7 +16,7 @@ import type {
   ModelName,
   ThinkingTimeLevel,
 } from "./oracle.js";
-import { DEFAULT_MODEL, formatElapsed } from "./oracle.js";
+import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, formatElapsed } from "./oracle.js";
 import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
 
@@ -506,20 +506,19 @@ export async function initializeSession(
   };
   await ensureDir(modelsDir(sessionId));
   await fs.writeFile(metaPath(sessionId), JSON.stringify(metadata, null, 2), "utf8");
+  const defaultModel = metadata.mode === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL;
   await Promise.all(
-    (modelList.length > 0 ? modelList : [metadata.model ?? DEFAULT_MODEL]).map(
-      async (modelName) => {
-        const jsonPath = modelJsonPath(sessionId, modelName);
-        const logFilePath = modelLogPath(sessionId, modelName);
-        const modelRecord: SessionModelRun = {
-          model: modelName,
-          status: "pending",
-          log: { path: path.relative(sessionDir(sessionId), logFilePath) },
-        };
-        await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), "utf8");
-        await fs.writeFile(logFilePath, "", "utf8");
-      },
-    ),
+    (modelList.length > 0 ? modelList : [metadata.model ?? defaultModel]).map(async (modelName) => {
+      const jsonPath = modelJsonPath(sessionId, modelName);
+      const logFilePath = modelLogPath(sessionId, modelName);
+      const modelRecord: SessionModelRun = {
+        model: modelName,
+        status: "pending",
+        log: { path: path.relative(sessionDir(sessionId), logFilePath) },
+      };
+      await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), "utf8");
+      await fs.writeFile(logFilePath, "", "utf8");
+    }),
   );
   await fs.writeFile(logPath(sessionId), "", "utf8");
   return metadata;

@@ -86,7 +86,7 @@ oracle --render --copy -p "$TASK" --file "$RELEVANT_FILES"
 For autonomous use, the `--json` envelope is stable:
 
 ```bash
-oracle --json --model gpt-5.5-pro -p "$TASK" --file "$RELEVANT_FILES"
+oracle --json --model gpt-5.6-sol-pro -p "$TASK" --file "$RELEVANT_FILES"
 ```
 
 `stdout` carries one JSON object with `answer`, `usage`, `cost`, `sessionId`, `model`, and `lineage`. `stderr` carries human-readable progress that pipes can drop. Exit code is non-zero on failure.

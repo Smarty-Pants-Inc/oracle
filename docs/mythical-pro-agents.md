@@ -7,22 +7,23 @@ The headline frontier models — the ones marked **Pro** — are slow, expensive
 
 ## The lineup
 
-| Model             | Engine         | API id                  | Browser model picker          | Speciality                                      |
-| ----------------- | -------------- | ----------------------- | ----------------------------- | ----------------------------------------------- |
-| GPT-5.6 Sol Pro   | Browser only   | `gpt-5.6-sol-pro` alias | "Pro"                         | Long-form code review, planning                 |
-| GPT-5.5 Pro       | API            | `gpt-5.5-pro`           | —                             | API Pro review                                  |
-| GPT-5.5           | API or browser | `gpt-5.5`               | "GPT-5.5"                     | Fast everyday consults                          |
-| GPT-5.4 Pro       | API or browser | `gpt-5.4-pro`           | "5.4 Pro"                     | Mature Pro workflow                             |
-| GPT-5.4           | API or browser | `gpt-5.4`               | "GPT-5.4"                     | Mid-tier general                                |
-| GPT-5.2 Pro       | API or browser | `gpt-5.2-pro`           | "5.2 Pro"                     | Heavy reasoning                                 |
-| GPT-5.2           | API or browser | `gpt-5.2`               | "GPT-5.2"                     | Mid-tier                                        |
-| GPT-5.1 Pro       | API or browser | `gpt-5.1-pro`           | "5.1 Pro"                     | Long context                                    |
-| GPT-5.1           | API or browser | `gpt-5.1`               | "GPT-5.1"                     | General                                         |
-| GPT-5.1 Codex     | API only       | `gpt-5.1-codex`         | —                             | Code generation                                 |
-| Gemini 3.1 Pro    | API only       | `gemini-3.1-pro`        | —                             | Long-context multimodal                         |
-| Gemini 3 Pro      | API or browser | `gemini-3-pro`          | (auto on `gemini.google.com`) | Multimodal, image gen, YouTube, free in browser |
-| Claude Opus 4.1   | API only       | `claude-4.1-opus`       | —                             | Deepest single-shot reasoning                   |
-| Claude Sonnet 4.6 | API only       | `claude-4.6-sonnet`     | —                             | Fast Claude                                     |
+| Model             | Engine         | API id                   | Browser model picker          | Speciality                                      |
+| ----------------- | -------------- | ------------------------ | ----------------------------- | ----------------------------------------------- |
+| GPT-5.6 Sol Pro   | API or browser | `gpt-5.6-sol` + Pro mode | "Pro"                         | Long-form code review, planning                 |
+| GPT-5.6 Sol       | API            | `gpt-5.6-sol`            | —                             | Standard GPT-5.6 reasoning                      |
+| GPT-5.5 Pro       | API            | `gpt-5.5-pro`            | —                             | API Pro review                                  |
+| GPT-5.5           | API or browser | `gpt-5.5`                | "GPT-5.5"                     | Fast everyday consults                          |
+| GPT-5.4 Pro       | API or browser | `gpt-5.4-pro`            | "5.4 Pro"                     | Mature Pro workflow                             |
+| GPT-5.4           | API or browser | `gpt-5.4`                | "GPT-5.4"                     | Mid-tier general                                |
+| GPT-5.2 Pro       | API or browser | `gpt-5.2-pro`            | "5.2 Pro"                     | Heavy reasoning                                 |
+| GPT-5.2           | API or browser | `gpt-5.2`                | "GPT-5.2"                     | Mid-tier                                        |
+| GPT-5.1 Pro       | API or browser | `gpt-5.1-pro`            | "5.1 Pro"                     | Long context                                    |
+| GPT-5.1           | API or browser | `gpt-5.1`                | "GPT-5.1"                     | General                                         |
+| GPT-5.1 Codex     | API only       | `gpt-5.1-codex`          | —                             | Code generation                                 |
+| Gemini 3.1 Pro    | API only       | `gemini-3.1-pro`         | —                             | Long-context multimodal                         |
+| Gemini 3 Pro      | API or browser | `gemini-3-pro`           | (auto on `gemini.google.com`) | Multimodal, image gen, YouTube, free in browser |
+| Claude Opus 4.1   | API only       | `claude-4.1-opus`        | —                             | Deepest single-shot reasoning                   |
+| Claude Sonnet 4.6 | API only       | `claude-4.6-sonnet`      | —                             | Fast Claude                                     |
 
 Plus any **OpenRouter** id — e.g. `minimax/minimax-m2`, `openai/gpt-4o-mini`, `qwen/qwen-2.5-coder-32b-instruct` — when you set `OPENROUTER_API_KEY`.
 
@@ -63,7 +64,7 @@ When the answer matters, ask three:
 
 ```bash
 oracle -p "Will this migration corrupt user data under concurrent writes?" \
-  --models gpt-5.5-pro,gemini-3.1-pro,claude-4.1-opus \
+  --models gpt-5.6-sol-pro,gemini-3.1-pro,claude-4.1-opus \
   --file "migrations/0042_user_schema.sql" \
   --file "src/db/**"
 ```

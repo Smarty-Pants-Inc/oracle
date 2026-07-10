@@ -99,6 +99,8 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
 
   // Pro variants: resolve to the latest Pro model in ChatGPT.
   if (
+    normalized === "gpt-5.6-sol" ||
+    normalized === "gpt-5.6" ||
     normalized === "gpt-5.5-pro" ||
     normalized === "gpt-5-pro" ||
     normalized === "gpt-5.1-pro" ||

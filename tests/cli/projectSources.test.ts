@@ -47,7 +47,7 @@ describe("project sources CLI helpers", () => {
       },
       projectUrl: "https://chatgpt.com/g/g-p-123/project?tab=sources",
       configuredBrowser: {
-        desiredModel: "GPT-5.5 Pro",
+        desiredModel: "Pro",
         modelStrategy: "select",
       },
     });

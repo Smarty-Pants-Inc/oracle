@@ -17,7 +17,7 @@ const siteBase = cname ? `https://${cname}` : "";
 const productName = "oracle";
 const productTagline = "Whisper your prompt to a mythical pro agent";
 const productDescription =
-  "Oracle bundles your prompt and files so a Pro AI — GPT-5.5 Pro, Gemini 3 Pro, Claude Opus, and friends — can answer with real repository context. CLI, MCP, browser, and API in one tool.";
+  "Oracle bundles your prompt and files so a Pro AI — GPT-5.6 Sol Pro, Gemini 3 Pro, Claude Opus, and friends — can answer with real repository context. CLI, MCP, browser, and API in one tool.";
 const brewInstall = "brew install steipete/tap/oracle";
 const codeTheme = "github-dark-dimmed";
 const highlighter = await createHighlighter({
@@ -520,7 +520,7 @@ function homeHero(page) {
     ? hrefToOutRel(pageMap.get("quickstart.md").outRel, page.outRel)
     : "quickstart.html";
   const services = [
-    { name: "GPT-5.5 Pro", pro: true },
+    { name: "GPT-5.6 Sol Pro", pro: true },
     { name: "Gemini 3 Pro", pro: true },
     { name: "Claude Opus 4.1", pro: true },
     { name: "Deep Research", pro: true },

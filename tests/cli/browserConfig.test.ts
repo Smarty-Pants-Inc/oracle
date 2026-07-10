@@ -246,7 +246,7 @@ describe("buildBrowserConfig", () => {
 
   test("allows temporary chat URLs when targeting Pro", async () => {
     const config = await buildBrowserConfig({
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       chatgptUrl: "https://chatgpt.com/?temporary-chat=true",
     });
     expect(config.url).toBe("https://chatgpt.com/?temporary-chat=true");
