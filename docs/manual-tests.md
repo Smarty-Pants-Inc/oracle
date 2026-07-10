@@ -171,14 +171,14 @@ Run these four smoke tests whenever we touch browser automation:
    Confirm the logs show Deep Research activation/progress and the final report includes citations or source links. Do not use connected apps or private data.
 
 6. **Multi-turn browser consult smoke**
-   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-pro --browser-thinking-time extended --prompt "Give one architectural recommendation for a tiny CLI cache." --browser-follow-up "Challenge your previous recommendation with one concrete failure mode." --browser-follow-up "Now return the final recommendation in one sentence, starting with CHECK_MULTI_TURN_OK."`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.6-sol-pro --browser-thinking-time extended --prompt "Give one architectural recommendation for a tiny CLI cache." --browser-follow-up "Challenge your previous recommendation with one concrete failure mode." --browser-follow-up "Now return the final recommendation in one sentence, starting with CHECK_MULTI_TURN_OK."`
    Confirm the output contains all captured turns, includes `CHECK_MULTI_TURN_OK`, and the saved `transcript.md` records both follow-up prompts.
 
 7. **Multi-turn value check**
    Run the same initial prompt once without follow-ups and once with the challenge/final-decision follow-ups above. In the PR notes, record concrete differences such as extra failure modes, sharper rollback steps, or test cases. Do not claim a fixed quality percentage.
 
 8. **Auto-archive smoke**
-   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-pro --browser-thinking-time extended --browser-archive always --prompt "Reply exactly CHECK_ARCHIVE_OK."`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.6-sol-pro --browser-thinking-time extended --browser-archive always --prompt "Reply exactly CHECK_ARCHIVE_OK."`
    Confirm the output contains `CHECK_ARCHIVE_OK`, `oracle session <id> --render` still shows the transcript, and ChatGPT shows the conversation under archived chats rather than the active sidebar. Also confirm a default `--browser-archive auto` run with Deep Research or follow-ups is not archived.
 
 Record session IDs and outcomes in the PR description (pass/fail, notable delays). This ensures reviewers can audit real runs.
@@ -240,7 +240,7 @@ Use this when you need to inspect the live ChatGPT composer (DOM state, markdown
    ```bash
    tmux new -d -s oracle-browser \\
      "pnpm run oracle -- --engine browser --browser-keep-browser \\
-      --model 'GPT-5.5 Pro' --prompt 'Debug via DevTools.'"
+      --model 'GPT-5.6 Sol Pro' --prompt 'Debug via DevTools.'"
    ```
 
    Keeping the run in tmux prevents your shell from blocking and ensures Chrome stays open afterward.

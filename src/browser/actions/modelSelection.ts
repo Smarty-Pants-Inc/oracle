@@ -10,8 +10,8 @@ import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
-const LEGACY_PRO_VERSION_WORD_TOKENS = ["5 4", "5 2", "5 1", "5 0", "gpt 5 pro"] as const;
-const LEGACY_PRO_VERSION_COMPACT_TOKENS = ["gpt54", "gpt52", "gpt51", "gpt50"] as const;
+const LEGACY_PRO_VERSION_WORD_TOKENS = ["5 5", "5 4", "5 2", "5 1", "5 0", "gpt 5 pro"] as const;
+const LEGACY_PRO_VERSION_COMPACT_TOKENS = ["gpt55", "gpt54", "gpt52", "gpt51", "gpt50"] as const;
 
 export async function ensureModelSelection(
   Runtime: ChromeClient["Runtime"],
@@ -98,14 +98,17 @@ export async function ensureModelSelection(
 function assertResolvedModelSelection(desiredModel: string, resolvedLabel: string): void {
   const desired = desiredModel.toLowerCase();
   const resolved = resolvedLabel.toLowerCase();
-  const wantsGpt55Pro =
+  const wantsCurrentPro =
     desired === "pro" ||
     desired === "chatgpt pro" ||
+    desired === "gpt-5.6-sol-pro" ||
+    desired.includes("5.6 sol pro") ||
+    desired.includes("5-6-sol-pro") ||
     desired === "gpt-5.5-pro" ||
     desired.includes("5.5 pro") ||
     desired.includes("5-5 pro") ||
     (desired.includes("pro") && desired.includes("extended"));
-  if (!wantsGpt55Pro || !resolved) {
+  if (!wantsCurrentPro || !resolved) {
     return;
   }
   if (
@@ -114,7 +117,7 @@ function assertResolvedModelSelection(desiredModel: string, resolvedLabel: strin
     (resolved.includes("thinking") && !resolved.includes("pro"))
   ) {
     throw new Error(
-      `Model picker selected "${resolvedLabel}" while "${desiredModel}" requires GPT-5.5 Pro. Use model "gpt-5.5" with browser thinking time for the Thinking variant.`,
+      `Model picker selected "${resolvedLabel}" while "${desiredModel}" requires the current ChatGPT Pro model.`,
     );
   }
 }
@@ -132,8 +135,8 @@ function hasCurrentProSignal(resolved: string): boolean {
     resolved.endsWith("pro") ||
     resolved.includes("pro ") ||
     resolved.includes("extended") ||
-    resolved.includes("gpt-5.5-pro") ||
-    resolved.includes("gpt 5 5 pro")
+    resolved.includes("gpt-5.6-sol-pro") ||
+    resolved.includes("gpt 5 6 sol pro")
   );
 }
 
@@ -223,7 +226,7 @@ function buildModelSelectionExpression(
     const targetUsesCurrentGpt55Alias =
       desiredVersion === '5-5' || normalizedTarget === 'pro' || normalizedTarget === 'chatgpt pro';
     const labelHasProWord = (label) => label === 'pro' || label.startsWith('pro ') || label.includes(' pro ') || label.endsWith(' pro');
-    const legacyProVersionTokens = ['5 4', '5 2', '5 1', '5 0', 'gpt54', 'gpt52', 'gpt51', 'gpt50', 'gpt 5 pro'];
+    const legacyProVersionTokens = ['5 5', '5 4', '5 2', '5 1', '5 0', 'gpt55', 'gpt54', 'gpt52', 'gpt51', 'gpt50', 'gpt 5 pro'];
     const labelHasLegacyProVersion = (value) => {
       const label = normalizeText(value);
       return legacyProVersionTokens.some((token) => label.includes(token));

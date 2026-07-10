@@ -53,7 +53,11 @@ import { copyToClipboard } from "../src/cli/clipboard.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
 import { shouldDetachSession } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
-import { buildBrowserConfig, resolveBrowserModelLabel } from "../src/cli/browserConfig.js";
+import {
+  buildBrowserConfig,
+  normalizeChatGptModelForBrowser,
+  resolveBrowserModelLabel,
+} from "../src/cli/browserConfig.js";
 import { performSessionRun } from "../src/cli/sessionRunner.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
@@ -263,7 +267,7 @@ program.hook("preAction", async (thisCommand) => {
 program
   .name("oracle")
   .description(
-    "One-shot GPT-5.5 Pro / GPT-5.5 / GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
+    "One-shot GPT-5.6 Sol Pro browser / GPT-5.5 Pro API / GPT-5.1 Codex tool for hard questions that benefit from large file context and server-side search.",
   )
   .version(VERSION)
   .argument("[prompt]", "Prompt text (shorthand for --prompt).")
@@ -317,7 +321,7 @@ program
   .option("-s, --slug <words>", "Custom session slug (3-5 words).")
   .option(
     "-m, --model <model>",
-    'Model to target (gpt-5.5-pro default). Also gpt-5.5, gpt-5.4-pro, gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.6-sonnet, claude-4.1-opus, or ChatGPT labels like "5.5 Pro" / "5.2 Thinking" for browser runs).',
+    'Model to target (gpt-5.6-sol-pro browser default; gpt-5.5-pro API default). Also gpt-5.5, gpt-5.4-pro, gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-pro API-only, gemini-3-pro, claude-4.6-sonnet, claude-4.1-opus, or ChatGPT labels like "5.6 Sol Pro" / "5.2 Thinking" for browser runs).',
     normalizeModelOption,
   )
   .addOption(
@@ -1578,11 +1582,15 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     : [];
   const cliModelArg =
     normalizeModelOption(options.model) || (multiModelProvided ? "" : DEFAULT_MODEL);
-  const resolvedModelCandidate: ModelName = multiModelProvided
+  const inferredModelCandidate: ModelName = multiModelProvided
     ? normalizedMultiModels[0]
     : engine === "browser"
       ? inferModelFromLabel(cliModelArg || DEFAULT_MODEL)
       : resolveApiModel(cliModelArg || DEFAULT_MODEL);
+  const resolvedModelCandidate =
+    engine === "browser"
+      ? normalizeChatGptModelForBrowser(inferredModelCandidate)
+      : inferredModelCandidate;
   const primaryModelCandidate = normalizedMultiModels[0] ?? resolvedModelCandidate;
   const isGemini = primaryModelCandidate.startsWith("gemini");
   const isCodex = primaryModelCandidate.startsWith("gpt-5.1-codex");

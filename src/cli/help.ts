@@ -64,7 +64,7 @@ export function applyHelpStyling(program: Command, version: string, isTty: boole
 
 function renderHelpBanner(version: string, colors: HelpColors): string {
   const subtitle =
-    "Prompt + files required — GPT-5.5 Pro/GPT-5.5 for tough questions with code/file context.";
+    "Prompt + files required — GPT-5.6 Sol Pro/GPT-5.5 for tough questions with code/file context.";
   return `${colors.banner(`Oracle CLI v${version}`)} ${colors.subtitle(`— ${subtitle}`)}\n`;
 }
 

@@ -11,11 +11,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License"></a>
 </p>
 
-Oracle bundles your prompt and files so another AI can answer with real context. It speaks GPT-5.5 Pro (default), GPT-5.5, GPT-5.4 Pro, GPT-5.4, GPT-5.1 Pro, GPT-5.1 Codex (API-only), GPT-5.1, GPT-5.2, Gemini 3.1 Pro (API-only), Gemini 3 Pro, Claude Sonnet 4.6, Claude Opus 4.1, and more—and it can ask one or multiple models in a single run. Browser automation is available; use `--browser-model-strategy current` to keep the active ChatGPT model (or `ignore` to skip the picker). API remains the most reliable path, and `--copy` is an easy manual fallback.
+Oracle bundles your prompt and files so another AI can answer with real context. It speaks GPT-5.6 Sol Pro (browser default), GPT-5.5 Pro (API), GPT-5.5, GPT-5.4 Pro, GPT-5.4, GPT-5.1 Pro, GPT-5.1 Codex (API-only), GPT-5.1, GPT-5.2, Gemini 3.1 Pro (API-only), Gemini 3 Pro, Claude Sonnet 4.6, Claude Opus 4.1, and more—and it can ask one or multiple models in a single run. Browser automation is available; use `--browser-model-strategy current` to keep the active ChatGPT model (or `ignore` to skip the picker). API remains the most reliable path, and `--copy` is an easy manual fallback.
 
 ## Setting up (macOS Browser Mode)
 
-Browser mode lets you use GPT-5.5 Pro without any API keys — it automates your Chrome browser directly.
+Browser mode lets you use GPT-5.6 Sol Pro without any API keys — it automates your Chrome browser directly.
 
 ### First-time login
 
@@ -83,7 +83,7 @@ npx -y @steipete/oracle project-sources add \
   --dry-run
 
 # Browser multi-turn consult in one ChatGPT conversation
-npx -y @steipete/oracle --engine browser --model gpt-5.5-pro \
+npx -y @steipete/oracle --engine browser --model gpt-5.6-sol-pro \
   -p "Review this migration plan" --file docs/migration.md \
   --browser-follow-up "Challenge your previous recommendation" \
   --browser-follow-up "Give the final decision"
@@ -141,7 +141,7 @@ Engine auto-picks API when `OPENAI_API_KEY` is set, otherwise browser; browser i
 oracle bridge claude-config --local-browser > .mcp.json
 ```
 
-- In MCP `consult`, use `preset: "chatgpt-pro-heavy"` for ChatGPT browser mode with `gpt-5.5-pro` and Pro Extended thinking. Add `dryRun: true` to inspect the resolved run without creating a session or touching Chrome.
+- In MCP `consult`, use `preset: "chatgpt-pro-heavy"` for ChatGPT browser mode with `gpt-5.6-sol-pro` and Pro Extended thinking. Add `dryRun: true` to inspect the resolved run without creating a session or touching Chrome.
 
 ```bash
 npx -y @steipete/oracle oracle-mcp
@@ -229,7 +229,7 @@ Browser automation can open or control Chrome, so dry-runs and live runs print a
 - `--dry-run summary --engine browser ...` previews whether Oracle will launch visible Chrome, hide a new window, attach to an existing browser, or use remote Chrome.
 - `--browser-attach-running` and `--remote-chrome <host:port>` are the calmest options when a signed-in Chrome is already running with DevTools enabled.
 - `--browser-hide-window` is best-effort: Chrome can briefly take focus before Oracle hides it.
-- Long GPT-5.5 Pro browser consults are normal. Use `--heartbeat`, `oracle status`, and `oracle session <id>` instead of starting a duplicate run if the host agent appears to be waiting.
+- Long GPT-5.6 Sol Pro browser consults are normal. Use `--heartbeat`, `oracle status`, and `oracle session <id>` instead of starting a duplicate run if the host agent appears to be waiting.
 - Successful manual-profile runs close Oracle's own ChatGPT tab and clean up leftover blank startup tabs when no other Oracle browser slots are active. Incomplete runs leave the tab open so `oracle session <id>` can reattach.
 
 ## Flags you’ll actually use

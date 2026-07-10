@@ -1,7 +1,7 @@
 {
   "name": "@steipete/oracle",
   "version": "0.11.1",
-  "description": "CLI wrapper around OpenAI Responses API with GPT-5.5 Pro, GPT-5.5, GPT-5.4, GPT-5.2, GPT-5.1, and GPT-5.1 Codex high reasoning modes.",
+  "description": "CLI and browser wrapper for GPT-5.6 Sol Pro, GPT-5.5 Pro, GPT-5.5, GPT-5.4, GPT-5.2, GPT-5.1, and GPT-5.1 Codex.",
   "keywords": [],
   "homepage": "https://github.com/steipete/oracle#readme",
   "bugs": {

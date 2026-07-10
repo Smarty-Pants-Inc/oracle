@@ -19,7 +19,7 @@ describe("summarizeModelRunsForConsult", () => {
       }),
     ).toMatchObject({
       engine: "browser",
-      model: "gpt-5.5-pro",
+      model: "gpt-5.6-sol-pro",
       browserThinkingTime: "extended",
     });
 
@@ -239,7 +239,7 @@ describe("summarizeModelRunsForConsult", () => {
       dryRun: true,
       resolved: {
         resolvedEngine: "browser",
-        model: "gpt-5.5-pro",
+        model: "gpt-5.6-sol-pro",
         browser: expect.objectContaining({
           desiredModel: "Pro",
           thinkingTime: "extended",

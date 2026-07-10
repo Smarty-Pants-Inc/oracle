@@ -19,7 +19,7 @@ If you’re running Gemini, also see `docs/gemini.md`.
 jq '.' ~/.oracle/cookies.json  # file must contain CookieParam[]
 oracle --engine browser \
   --browser-inline-cookies-file ~/.oracle/cookies.json \
-  --model "GPT-5.5 Pro" \
+  --model "GPT-5.6 Sol Pro" \
   -p "Run the UI smoke" \
   --file "src/**/*.ts" --file "!src/**/*.test.ts"
 ```
@@ -49,7 +49,7 @@ Use this when you already have a signed-in Chrome session running with DevTools 
 ```bash
 oracle --engine browser \
   --browser-attach-running \
-  --model "GPT-5.5 Pro" \
+  --model "GPT-5.6 Sol Pro" \
   -p "Summarize the last assistant response in one paragraph"
 ```
 
@@ -61,7 +61,7 @@ Notes:
   oracle --engine browser \
     --browser-attach-running \
     --remote-chrome 127.0.0.1:63332 \
-    --model "GPT-5.5 Pro" \
+    --model "GPT-5.6 Sol Pro" \
     -p "Summarize the last assistant response in one paragraph"
   ```
 - Oracle reads local `DevToolsActivePort` metadata, connects to the browser websocket directly, and then reuses the normal CDP automation flow.
@@ -77,7 +77,7 @@ Notes:
    - Launcher mode starts Chrome via `chrome-launcher` and connects with `chrome-remote-interface`.
    - Attach-running mode reads local `DevToolsActivePort` metadata for the selected local port, connects to the browser websocket, opens a dedicated tab, and reuses the same DOM automation/capture flow against that attached browser.
    - Launcher mode can optionally copy cookies from the requested browser profile via Oracle’s built-in cookie reader (Keychain/DPAPI aware) so you stay signed in.
-   - Navigates to `chatgpt.com`, switches the model to the requested GPT-5.5 / GPT-5.4 / GPT-5.2 variant, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the markdown via the built-in “copy turn” button.
+   - Navigates to `chatgpt.com`, switches the model to the requested GPT-5.6 Sol Pro / GPT-5.5 / GPT-5.4 / GPT-5.2 variant, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the markdown via the built-in “copy turn” button.
    - Immediately probes `/backend-api/me` in the ChatGPT tab to verify the session is authenticated; if the endpoint returns 401/403 we abort early with a login-specific error instead of timing out waiting for the composer.
    - When `--file` inputs would push the pasted composer content over ~60k characters, we switch to uploading attachments (optionally bundled) and wait for ChatGPT to re-enable the send button before submitting the combined system+user prompt.
    - Launcher mode cleans up the temporary profile unless `--browser-keep-browser` is passed.
@@ -112,7 +112,7 @@ Notes:
 - `--browser-inline-files`: alias for `--browser-attachments never` (forces inline paste; never uploads attachments).
 - `--browser-bundle-files`: bundle all resolved attachments into a single temp file before uploading (only used when uploads are enabled/selected).
 - sqlite bindings: automatic rebuilds now require `ORACLE_ALLOW_SQLITE_REBUILD=1`. Without it, the CLI logs instructions instead of running `pnpm rebuild` on your behalf.
-- `--model`: the same flag used for API runs is accepted, but the ChatGPT automation path supports GPT-5.5, GPT-5.4, and GPT-5.2 variants. Use `gpt-5.5-pro`, `gpt-5.5`, `gpt-5.4-pro`, `gpt-5.4`, `gpt-5.2`, `gpt-5.2-thinking`, `gpt-5.2-instant`, or `gpt-5.2-pro`. Legacy Pro aliases still resolve to the latest Pro picker target.
+- `--model`: the same flag used for API runs is accepted, but `gpt-5.6-sol-pro` is a browser-only alias for ChatGPT's current `Pro` picker. The ChatGPT automation path also supports GPT-5.5, GPT-5.4, and GPT-5.2 variants. Legacy Pro aliases resolve to `gpt-5.6-sol-pro`.
 - Cookie sync is mandatory—if we can’t copy cookies from Chrome, the run exits early. By default Oracle copies a small ChatGPT auth/Cloudflare allowlist to avoid oversized request headers; use `--browser-cookie-names` only when you need to override that set. Use the hidden `--browser-allow-cookie-errors` flag only when you’re intentionally running logged out (it skips the early exit but still warns).
 - Attach-running mode is mutually exclusive with launcher-owned flags such as `--browser-manual-login`, `--browser-chrome-profile`, `--browser-cookie-path`, `--browser-hide-window`, `--browser-keep-browser`, and `--browser-port`. `--remote-chrome` is allowed in attach-running mode, but only as the local host:port hint used to find matching `DevToolsActivePort` metadata. `--browser-chrome-path` is accepted but ignored.
 - Experimental cookie controls (hidden flags/env):
@@ -206,7 +206,7 @@ Use browser follow-ups when a one-shot review would be too easy for the model to
 
 ```bash
 oracle --engine browser \
-  --model gpt-5.5-pro \
+  --model gpt-5.6-sol-pro \
   --browser-thinking-time heavy \
   -p "Review this migration plan and identify the top risks." \
   --file docs/migration-plan.md \
@@ -230,7 +230,7 @@ When ChatGPT returns downloadable generated images in browser mode, Oracle downl
 ```bash
 oracle --engine browser \
   --browser-manual-login \
-  --model "GPT-5.5 Pro" \
+  --model "GPT-5.6 Sol Pro" \
   --generate-image /tmp/oracle-image.png \
   -p "Create a simple product icon on a transparent background."
 ```
@@ -245,7 +245,7 @@ Use `--browser-manual-login` when cookie decrypt is blocked (e.g., Windows app-b
 oracle --engine browser \
   --browser-manual-login \
   --browser-keep-browser \
-  --model "GPT-5.5 Pro" \
+  --model "GPT-5.6 Sol Pro" \
   -p "Say hi"
 ```
 

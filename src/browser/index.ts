@@ -164,7 +164,7 @@ export function classifyPreservedBrowserErrorForTest(
 }
 
 // NOTE: Previously, shouldSkipThinkingTimeSelection() would skip the thinking
-// time UI step when desiredModel was gpt-5.5-pro and thinkingTime was "extended",
+// time UI step when desiredModel was gpt-5.6-sol-pro and thinkingTime was "extended",
 // assuming that selecting "Pro Extended" in the old UI already implied Extended
 // effort. This is wrong for lower-tier plans ($100/mo Pro) where selecting "Pro"
 // defaults to Standard effort. ensureThinkingTime() already handles the

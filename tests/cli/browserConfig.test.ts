@@ -3,7 +3,7 @@ import { buildBrowserConfig, resolveBrowserModelLabel } from "../../src/cli/brow
 
 describe("buildBrowserConfig", () => {
   test("uses defaults when optional flags omitted", async () => {
-    const config = await buildBrowserConfig({ model: "gpt-5.5-pro" });
+    const config = await buildBrowserConfig({ model: "gpt-5.6-sol-pro" });
     expect(config).toMatchObject({
       chromeProfile: "Default",
       chromePath: null,
@@ -21,6 +21,11 @@ describe("buildBrowserConfig", () => {
       researchMode: "off",
       archiveConversations: undefined,
     });
+  });
+
+  test("maps legacy Pro aliases to the current ChatGPT Pro target", async () => {
+    const config = await buildBrowserConfig({ model: "gpt-5.5-pro" });
+    expect(config.desiredModel).toBe("Pro");
   });
 
   test("maps gpt-5.4 browser runs to Thinking 5.4", async () => {
@@ -306,6 +311,7 @@ describe("buildBrowserConfig", () => {
 
 describe("resolveBrowserModelLabel", () => {
   test("returns canonical ChatGPT label when CLI value matches API model", () => {
+    expect(resolveBrowserModelLabel("gpt-5.6-sol-pro", "gpt-5.6-sol-pro")).toBe("Pro");
     expect(resolveBrowserModelLabel("gpt-5.5-pro", "gpt-5.5-pro")).toBe("Pro");
     expect(resolveBrowserModelLabel("gpt-5.5", "gpt-5.5")).toBe("Thinking 5.5");
     expect(resolveBrowserModelLabel("gpt-5.4-pro", "gpt-5.4-pro")).toBe("Pro");

@@ -202,6 +202,14 @@ function isGeminiDeepThinkAlias(normalized: string): boolean {
 
 export function resolveApiModel(modelValue: string): ModelName {
   const normalized = normalizeModelOption(modelValue).toLowerCase();
+  if (
+    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
+    normalized.includes("pro")
+  ) {
+    throw new InvalidArgumentError(
+      "GPT-5.6 Sol Pro is browser-only today. Use --engine browser --model gpt-5.6-sol-pro, or use gpt-5.6-sol with the API.",
+    );
+  }
   if (normalized in MODEL_CONFIGS) {
     return normalized as ModelName;
   }
@@ -276,7 +284,7 @@ export function resolveApiModel(modelValue: string): ModelName {
 export function inferModelFromLabel(modelValue: string): ModelName {
   const normalized = normalizeModelOption(modelValue).toLowerCase();
   if (!normalized) {
-    return DEFAULT_MODEL;
+    return "gpt-5.6-sol-pro";
   }
   if (normalized in MODEL_CONFIGS) {
     return normalized as ModelName;
@@ -310,6 +318,12 @@ export function inferModelFromLabel(modelValue: string): ModelName {
   }
   if (normalized.includes("thinking") && normalized.includes("heavy")) {
     return "gpt-5.5";
+  }
+  if (
+    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
+    normalized.includes("pro")
+  ) {
+    return "gpt-5.6-sol-pro";
   }
   if ((normalized.includes("5.5") || normalized.includes("5_5")) && normalized.includes("pro")) {
     return "gpt-5.5-pro";
@@ -356,7 +370,7 @@ export function inferModelFromLabel(modelValue: string): ModelName {
     return "gpt-5.1-pro";
   }
   if (normalized.includes("pro")) {
-    return DEFAULT_MODEL;
+    return "gpt-5.6-sol-pro";
   }
   if (normalized.includes("5.1") || normalized.includes("5_1")) {
     return "gpt-5.1";

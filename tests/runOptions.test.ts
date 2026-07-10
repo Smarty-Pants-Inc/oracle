@@ -24,9 +24,18 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(resolvedEngine).toBe("api");
   });
 
-  it("defaults to gpt-5.5-pro when model not provided", () => {
+  it("defaults browser runs to the current ChatGPT Pro alias", () => {
     const { runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
+      env: {},
+    });
+    expect(runOptions.model).toBe("gpt-5.6-sol-pro");
+  });
+
+  it("keeps the API default unchanged", () => {
+    const { runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      engine: "api",
     });
     expect(runOptions.model).toBe(DEFAULT_MODEL);
   });
@@ -173,14 +182,14 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.model).toBe("gpt-5.2");
   });
 
-  it("maps browser engine Pro aliases to gpt-5.5-pro", () => {
+  it("maps browser engine Pro aliases to the current ChatGPT Pro target", () => {
     const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
       model: "gpt-5.1-pro",
       engine: "browser",
     });
     expect(resolvedEngine).toBe("browser");
-    expect(runOptions.model).toBe("gpt-5.5-pro");
+    expect(runOptions.model).toBe("gpt-5.6-sol-pro");
   });
 
   it("maps browser engine gpt-5.4-pro to the current ChatGPT Pro target", () => {
@@ -190,7 +199,27 @@ describe("resolveRunOptionsFromConfig", () => {
       engine: "browser",
     });
     expect(resolvedEngine).toBe("browser");
-    expect(runOptions.model).toBe("gpt-5.5-pro");
+    expect(runOptions.model).toBe("gpt-5.6-sol-pro");
+  });
+
+  it("keeps the GPT-5.6 Sol Pro alias for browser runs", () => {
+    const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6-sol-pro",
+      engine: "browser",
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gpt-5.6-sol-pro");
+  });
+
+  it("rejects the GPT-5.6 Sol Pro alias for API runs", () => {
+    expect(() =>
+      resolveRunOptionsFromConfig({
+        prompt: basePrompt,
+        model: "gpt-5.6-sol-pro",
+        engine: "api",
+      }),
+    ).toThrow(/browser-only/i);
   });
 
   it("keeps gpt-5.4-pro unchanged for API engine runs", () => {

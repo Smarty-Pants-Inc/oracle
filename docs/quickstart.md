@@ -7,11 +7,11 @@ This walks through the minimum to get a useful answer back. If you haven't insta
 
 ## 1. Pick a mode
 
-| Mode    | When to use it                                                     | What you need                             |
-| ------- | ------------------------------------------------------------------ | ----------------------------------------- |
-| API     | You have an API key and want reliability + multi-model.            | `OPENAI_API_KEY` (or Gemini / Anthropic). |
-| Browser | You have a ChatGPT Plus/Pro account and want GPT-5.5 Pro for free. | Chrome on macOS / Linux / Windows.        |
-| Render  | Air-gapped review, paste into the model of your choice.            | Just Oracle.                              |
+| Mode    | When to use it                                                | What you need                             |
+| ------- | ------------------------------------------------------------- | ----------------------------------------- |
+| API     | You have an API key and want reliability + multi-model.       | `OPENAI_API_KEY` (or Gemini / Anthropic). |
+| Browser | You have a ChatGPT Plus/Pro account and want GPT-5.6 Sol Pro. | Chrome on macOS / Linux / Windows.        |
+| Render  | Air-gapped review, paste into the model of your choice.       | Just Oracle.                              |
 
 If both are available Oracle picks API by default (cheaper to short-circuit). Override per-run with `--engine browser`.
 
@@ -95,7 +95,7 @@ For browser runs, `--browser-auto-reattach-*` polls the existing ChatGPT tab whe
 Drop this in `AGENTS.md` or `CLAUDE.md`:
 
 ```
-- Oracle bundles a prompt plus the right files so a Pro model (GPT-5.5 Pro, Gemini 3 Pro, Claude Opus) can answer. Use when stuck, debugging, or reviewing.
+- Oracle bundles a prompt plus the right files so a Pro model (GPT-5.6 Sol Pro, Gemini 3 Pro, Claude Opus) can answer. Use when stuck, debugging, or reviewing.
 - Run `npx -y @steipete/oracle --help` once per session before first use.
 ```
 

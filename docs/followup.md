@@ -62,7 +62,7 @@ If you try to follow up on an unsupported provider, Oracle errors clearly instea
 In browser mode, `--browser-follow-up` adds extra prompts to the _same ChatGPT conversation_, which is the closest equivalent to a chained API followup:
 
 ```bash
-oracle --engine browser --model gpt-5.5-pro \
+oracle --engine browser --model gpt-5.6-sol-pro \
   -p "Review this migration plan" --file docs/migration.md \
   --browser-follow-up "Challenge your previous recommendation" \
   --browser-follow-up "Give the final decision"

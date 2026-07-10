@@ -326,24 +326,25 @@ describe("browser model selection matchers", () => {
     );
   });
 
-  it("fails loudly if post-selection state resolves to Thinking instead of Pro", () => {
-    expect(() => assertResolvedModelSelectionForTest("gpt-5.5-pro", "Thinking 5.5 Heavy")).toThrow(
-      /requires GPT-5.5 Pro/,
+  it("fails loudly if post-selection state is not the current Pro model", () => {
+    expect(() =>
+      assertResolvedModelSelectionForTest("gpt-5.6-sol-pro", "Thinking 5.5 Heavy"),
+    ).toThrow(/requires the current ChatGPT Pro model/);
+    expect(() => assertResolvedModelSelectionForTest("gpt-5.6-sol-pro", "GPT-5.5 Pro")).toThrow(
+      /requires the current ChatGPT Pro model/,
     );
-    expect(() => assertResolvedModelSelectionForTest("gpt-5.5-pro", "GPT-5.5")).toThrow(
-      /requires GPT-5.5 Pro/,
+    expect(() => assertResolvedModelSelectionForTest("gpt-5.6-sol-pro", "ChatGPT")).toThrow(
+      /requires the current ChatGPT Pro model/,
     );
-    expect(() => assertResolvedModelSelectionForTest("gpt-5.5-pro", "ChatGPT")).toThrow(
-      /requires GPT-5.5 Pro/,
-    );
-    // Both the new bare "Pro" label and the legacy "GPT-5.5 Pro" should pass.
-    expect(() => assertResolvedModelSelectionForTest("gpt-5.5-pro", "Pro")).not.toThrow();
-    expect(() => assertResolvedModelSelectionForTest("gpt-5.5-pro", "GPT-5.5 Pro")).not.toThrow();
+    expect(() => assertResolvedModelSelectionForTest("gpt-5.6-sol-pro", "Pro")).not.toThrow();
+    expect(() =>
+      assertResolvedModelSelectionForTest("gpt-5.6-sol-pro", "GPT-5.6 Sol Pro"),
+    ).not.toThrow();
     expect(() => assertResolvedModelSelectionForTest("Pro", "Thinking 5.5 Heavy")).toThrow(
-      /requires GPT-5.5 Pro/,
+      /requires the current ChatGPT Pro model/,
     );
-    expect(() => assertResolvedModelSelectionForTest("Pro", "GPT-5.4 Pro")).toThrow(
-      /requires GPT-5.5 Pro/,
+    expect(() => assertResolvedModelSelectionForTest("Pro", "GPT-5.5 Pro")).toThrow(
+      /requires the current ChatGPT Pro model/,
     );
     expect(() => assertResolvedModelSelectionForTest("Pro", "Pro")).not.toThrow();
   });

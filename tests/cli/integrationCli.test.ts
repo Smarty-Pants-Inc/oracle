@@ -12,6 +12,42 @@ const INTEGRATION_TIMEOUT = 60000;
 
 describe("oracle CLI integration", () => {
   test(
+    "defaults browser dry-runs to the current ChatGPT Pro alias",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-default-"));
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          CLI_ENTRY,
+          "--dry-run",
+          "json",
+          "--engine",
+          "browser",
+          "--prompt",
+          "Verify the browser model default without sending.",
+        ],
+        {
+          env: {
+            ...process.env,
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_HOME_DIR: oracleHome,
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_DISABLE_KEYTAR: "1",
+            // biome-ignore lint/style/useNamingConvention: env var name
+            OPENAI_API_KEY: "",
+          },
+        },
+      );
+
+      expect(stdout).toContain('"model": "gpt-5.6-sol-pro"');
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
     "stores session metadata using stubbed client factory",
     async () => {
       const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-home-"));
