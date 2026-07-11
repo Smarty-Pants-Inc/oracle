@@ -22,6 +22,7 @@ function isAnswerNowPlaceholderText(normalized: string): boolean {
   if (!text) return false;
   // Learned: "Pro thinking" shows a placeholder turn that contains "Answer now".
   // That is not the final answer and must be ignored in browser automation.
+  if (text === "pro thinking" || text === "thinking" || text === "reasoning") return true;
   if (text === "chatgpt said:" || text === "chatgpt said") return true;
   if (
     text.includes("file upload request") &&
@@ -33,6 +34,11 @@ function isAnswerNowPlaceholderText(normalized: string): boolean {
     text.includes("answer now") && (text.includes("pro thinking") || text.includes("chatgpt said"))
   );
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
+export const __test__ = {
+  isAnswerNowPlaceholderText,
+};
 
 export async function waitForAssistantResponse(
   Runtime: ChromeClient["Runtime"],
@@ -629,6 +635,7 @@ function buildAssistantSnapshotExpression(
     const extracted = extractAssistantTurn();
     const isPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
+      if (normalized === 'pro thinking' || normalized === 'thinking' || normalized === 'reasoning') return true;
       if (normalized === 'chatgpt said:' || normalized === 'chatgpt said') return true;
       if (normalized.includes('file upload request') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'))) {
         return true;
@@ -681,6 +688,7 @@ function buildResponseObserverExpression(
     };
     const isAnswerNowPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
+      if (normalized === 'pro thinking' || normalized === 'thinking' || normalized === 'reasoning') return true;
       if (normalized === 'chatgpt said:' || normalized === 'chatgpt said') return true;
       if (normalized.includes('file upload request') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'))) {
         return true;

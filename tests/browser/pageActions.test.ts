@@ -12,6 +12,7 @@ import {
   ensureChatGptScopeRetained,
 } from "../../src/browser/pageActions.js";
 import { buildLoginProbeExpressionForTest } from "../../src/browser/actions/navigation.js";
+import { __test__ as assistantResponseTest } from "../../src/browser/actions/assistantResponse.js";
 import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
 import type { ChromeClient } from "../../src/browser/types.js";
@@ -509,6 +510,15 @@ describe("ensureLoggedIn", () => {
 });
 
 describe("waitForAssistantResponse", () => {
+  test("treats bare Pro thinking labels as incomplete placeholders", () => {
+    expect(assistantResponseTest.isAnswerNowPlaceholderText("pro thinking")).toBe(true);
+    expect(assistantResponseTest.isAnswerNowPlaceholderText("thinking")).toBe(true);
+    expect(assistantResponseTest.isAnswerNowPlaceholderText("reasoning")).toBe(true);
+    expect(assistantResponseTest.isAnswerNowPlaceholderText("final architecture review")).toBe(
+      false,
+    );
+  });
+
   test("returns captured assistant payload", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({
@@ -581,6 +591,7 @@ describe("waitForAssistantResponse", () => {
     expect(capturedExpression).not.toContain("document.querySelectorAll('.markdown')");
     expect(capturedExpression).toContain("data-message-author-role");
     expect(capturedExpression).toContain("role === 'assistant'");
+    expect(capturedExpression).toContain("normalized === 'pro thinking'");
   });
 
   test("falls back to snapshot when observer fails", async () => {

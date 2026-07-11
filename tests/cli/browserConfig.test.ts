@@ -23,6 +23,12 @@ describe("buildBrowserConfig", () => {
     });
   });
 
+  test("resolves Pro browser runs with a 24-hour default answer budget", async () => {
+    const config = await buildBrowserConfig({ model: "gpt-5.6-sol-pro" });
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    expect(resolveBrowserConfig(config).timeoutMs).toBe(24 * 60 * 60 * 1000);
+  });
+
   test("maps legacy Pro aliases to the current ChatGPT Pro target", async () => {
     const config = await buildBrowserConfig({ model: "gpt-5.5-pro" });
     expect(config.desiredModel).toBe("Pro");

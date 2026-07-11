@@ -26,6 +26,8 @@ export const DEFAULT_CHATGPT_COOKIE_NAMES = [
   "__cflb",
 ];
 
+const PRO_BROWSER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
 export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   chromeProfile: null,
   chromePath: null,
@@ -98,7 +100,11 @@ export function resolveBrowserConfig(
   const researchMode = normalizeResearchMode(config?.researchMode);
   const archiveConversations = normalizeArchiveMode(config?.archiveConversations);
   const defaultTimeoutMs =
-    researchMode === "deep" ? DEEP_RESEARCH_DEFAULT_TIMEOUT_MS : DEFAULT_BROWSER_CONFIG.timeoutMs;
+    researchMode === "deep"
+      ? DEEP_RESEARCH_DEFAULT_TIMEOUT_MS
+      : desiredModel.trim().toLowerCase() === "pro"
+        ? PRO_BROWSER_TIMEOUT_MS
+        : DEFAULT_BROWSER_CONFIG.timeoutMs;
   return {
     ...DEFAULT_BROWSER_CONFIG,
     ...config,
