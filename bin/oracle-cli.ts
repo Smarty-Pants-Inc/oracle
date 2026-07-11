@@ -503,7 +503,7 @@ program
   .addOption(
     new Option(
       "--browser-timeout <ms|s|m>",
-      "Maximum time to wait for an answer (default 1200s / 20m).",
+      "Maximum time to wait for an answer (default 24h for Pro, 20m otherwise).",
     ).hideHelp(),
   )
   .addOption(
