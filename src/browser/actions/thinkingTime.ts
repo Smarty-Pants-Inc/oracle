@@ -242,6 +242,15 @@ function buildThinkingTimeExpression(level: ThinkingTimeLevel): string {
 
     const findModelButton = () => document.querySelector(MODEL_BUTTON_SELECTOR);
     const findTrailingButtons = () => Array.from(document.querySelectorAll(TRAILING_SELECTOR));
+    const selectedUnifiedPro = () => {
+      const menuId = modelBtn?.getAttribute('aria-controls');
+      const menu = menuId ? document.getElementById(menuId) : null;
+      if (!menu) return null;
+      for (const item of menu.querySelectorAll('[role="menuitemradio"]')) {
+        if (normalize(item.textContent ?? '') === 'pro' && optionIsSelected(item)) return item;
+      }
+      return null;
+    };
     const pickTrailingForCurrentModel = () => {
       const trailings = findTrailingButtons();
       if (trailings.length === 0) return null;
@@ -278,6 +287,14 @@ function buildThinkingTimeExpression(level: ThinkingTimeLevel): string {
       await sleep(100);
     }
     if (!trailing) {
+      // ChatGPT's current unified Intelligence menu exposes checked Pro as
+      // the Pro-Extended tier and no longer renders a separate effort button.
+      const unifiedPro = selectedUnifiedPro();
+      if (TARGET_LEVEL === 'extended' && unifiedPro) {
+        const label = unifiedPro.textContent?.trim?.() || 'Pro';
+        closeOpenMenus();
+        return { status: 'already-selected', label };
+      }
       closeOpenMenus();
       return { status: 'chip-not-found' };
     }

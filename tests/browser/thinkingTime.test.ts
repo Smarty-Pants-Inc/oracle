@@ -32,6 +32,13 @@ describe("browser thinking-time selection expression", () => {
     expect(expression).toContain("LEVEL_TOKENS");
   });
 
+  it("accepts the unified checked Pro tier as Pro Extended", () => {
+    const expression = buildThinkingTimeExpressionForTest("extended");
+    expect(expression).toContain("selectedUnifiedPro");
+    expect(expression).toContain("TARGET_LEVEL === 'extended'");
+    expect(expression).toContain("normalize(item.textContent ?? '') === 'pro'");
+  });
+
   it("preserves Chinese thinking-effort labels while normalizing", () => {
     const expression = buildThinkingTimeExpressionForTest("heavy");
     expect(expression).toContain("\\u4e00-\\u9fa5");
