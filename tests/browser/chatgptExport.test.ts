@@ -1,7 +1,9 @@
 import { describe, expect, test } from "vitest";
 import {
   backendToPayload,
+  archivedSettingsUrlFromConversationUrl,
   buildBackendConversationUrl,
+  buildArchivedConversationRecoveryHookForTest,
   buildScopedBackendCaptureHook,
   contentToText,
   conversationIdFromChatGptUrl,
@@ -38,6 +40,27 @@ describe("ChatGPT conversation export helpers", () => {
     expect(isSameConversationUrl("https://chatgpt.com/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/g/project/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
+  });
+
+  test("derives archived-chat settings without leaving the approved project", () => {
+    expect(
+      archivedSettingsUrlFromConversationUrl("https://chatgpt.com/g/g-p-123-oracle/c/conv-1"),
+    ).toBe("https://chatgpt.com/g/g-p-123-oracle/project#settings/DataControls/ArchivedChats");
+    expect(archivedSettingsUrlFromConversationUrl("https://chatgpt.com/c/conv-1")).toBe(
+      "https://chatgpt.com/#settings/DataControls/ArchivedChats",
+    );
+  });
+
+  test("recovers only the exact archived conversation through ChatGPT's authenticated request", () => {
+    const hook = buildArchivedConversationRecoveryHookForTest("conv-1");
+    expect(hook).toContain('const TARGET = "https://chatgpt.com/backend-api/conversation/conv-1"');
+    expect(hook).toContain('url.pathname === "/backend-api/conversations"');
+    expect(hook).toContain('url.searchParams.get("is_archived") === "true"');
+    expect(hook).toContain('method: "PATCH"');
+    expect(hook).toContain("JSON.stringify({ is_archived: false })");
+    expect(hook).toContain("new Headers(request.headers)");
+    expect(hook).not.toContain("localStorage");
+    expect(hook).not.toContain("document.cookie");
   });
 
   test("capture hook scopes recording to one backend URL", () => {

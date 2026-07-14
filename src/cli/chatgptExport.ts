@@ -19,6 +19,8 @@ export interface ChatGptExportCliOptions {
   obuTabId?: string;
   timeout?: string;
   chunkSize?: string;
+  recoverArchived?: boolean;
+  archiveAfterExport?: boolean;
   json?: boolean;
 }
 
@@ -122,6 +124,8 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
         port,
         timeoutMs,
         chunkSize,
+        recoverArchived: options.recoverArchived,
+        archiveAfterExport: options.archiveAfterExport,
       });
 
   if (options.json) {

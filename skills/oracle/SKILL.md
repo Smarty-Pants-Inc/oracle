@@ -98,11 +98,13 @@ Live ChatGPT browser smokes are opt-in: default to dry-runs, unit tests, and ses
 
 - Stored under `~/.oracle/sessions` (override with `ORACLE_HOME_DIR`).
 - Browser runs save durable files under `~/.oracle/sessions/<id>/artifacts/`, including `transcript.md`, Deep Research reports, and downloaded ChatGPT-generated images when available.
-- Full approved ChatGPT thread export is a separate read-only command, not a prompt run:
+- Full approved ChatGPT thread export is a separate state-preserving command, not a prompt run:
   - `oracle chatgpt-export --target-url "https://chatgpt.com/c/<conversation-id>"`
   - It attaches to an existing approved tab and captures the page's own reload-time backend response for that exact conversation id.
-  - It does not send prompts, archive/delete/share chats, read cookies/localStorage/profile stores, or browse unrelated history.
-- Runs may detach or take a long time (browser + GPT‑5.4 Pro often does). If the CLI times out: don’t re-run; reattach.
+  - If the exact conversation is archived, it opens ChatGPT's Archived Chats control in a background tab, reuses ChatGPT's own authenticated archived-list request to unarchive only that exact id, exports it, then restores the archived state. It never records auth values or unrelated conversation payloads.
+  - Use `--no-recover-archived` to fail instead of recovering. Use `--archive-after-export` when an unarchived thread must be archived only after export succeeds.
+  - It does not send prompts, delete/share chats, read cookies/localStorage/profile stores, or browse unrelated conversation content.
+- Runs may detach or take a long time (browser Pro runs commonly take tens of minutes or longer). If the CLI times out: don’t re-run; reattach. A completed archived thread is retained, not lost; recover and export the exact conversation id instead of spending another model turn.
   - List: `oracle status --hours 72`
   - Attach: `oracle session <id> --render`
 - Use `--slug "<3-5 words>"` to keep session IDs readable.

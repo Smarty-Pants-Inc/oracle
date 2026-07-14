@@ -896,6 +896,15 @@ program
     "Time to wait for the reload-time backend response (default 45s).",
   )
   .option("--chunk-size <chars>", "Characters to retrieve per CDP chunk (default 250000).")
+  .option(
+    "--no-recover-archived",
+    "Disable automatic exact-conversation recovery from ChatGPT Archived Chats.",
+  )
+  .option(
+    "--archive-after-export",
+    "Archive the exact conversation only after its export succeeds.",
+    false,
+  )
   .option("--json", "Print structured JSON result.", false)
   .action(async function (this: Command) {
     const { handleChatGptExportCommand } = await import("../src/cli/chatgptExport.js");

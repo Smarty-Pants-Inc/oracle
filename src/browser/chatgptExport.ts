@@ -3,11 +3,13 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ChromeClient } from "./types.js";
+import type { BrowserArchiveResult, ChromeClient } from "./types.js";
+import { archiveChatGptConversation } from "./actions/archiveConversation.js";
 import {
   connectToExistingChatGptTab,
   DEFAULT_REMOTE_CHROME_HOST,
   DEFAULT_REMOTE_CHROME_PORT,
+  openChatGptTarget,
 } from "./liveTabs.js";
 import { delay } from "./utils.js";
 
@@ -53,6 +55,8 @@ export interface ChatGptConversationExportOptions {
   port?: number;
   timeoutMs?: number;
   chunkSize?: number;
+  recoverArchived?: boolean;
+  archiveAfterExport?: boolean;
 }
 
 export interface ChatGptConversationExportObuOptions {
@@ -85,6 +89,16 @@ export interface ChatGptConversationExportResult {
   currentPathNodeCount: number;
   turnCount: number;
   stats: Record<string, unknown>;
+  archiveRecovery: ChatGptArchiveRecoveryResult;
+  postExportArchive?: BrowserArchiveResult;
+}
+
+export interface ChatGptArchiveRecoveryResult {
+  attempted: boolean;
+  recovered: boolean;
+  status: "not-needed" | "recovered";
+  settingsUrl?: string;
+  patchStatus?: number;
 }
 
 interface CaptureHitSummary {
@@ -157,6 +171,13 @@ export function conversationIdFromChatGptUrl(rawUrl: string): string {
 
 export function buildBackendConversationUrl(conversationId: string): string {
   return `https://chatgpt.com/backend-api/conversation/${conversationId}`;
+}
+
+export function archivedSettingsUrlFromConversationUrl(rawUrl: string): string {
+  const parsed = new URL(rawUrl);
+  const project = /^(\/g\/[^/?#]+)\/c\/[^/?#]+\/?$/.exec(parsed.pathname)?.[1];
+  const base = project ? `${parsed.origin}${project}/project` : `${parsed.origin}/`;
+  return `${base}#settings/DataControls/ArchivedChats`;
 }
 
 export function isSameConversationUrl(actualUrl: string, expectedConversationId: string): boolean {
@@ -249,6 +270,163 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
   };
 })();
 `.trim();
+}
+
+export function buildArchivedConversationRecoveryHookForTest(conversationId: string): string {
+  return buildArchivedConversationRecoveryHook(conversationId);
+}
+
+function buildArchivedConversationRecoveryHook(conversationId: string): string {
+  const targetApiUrl = buildBackendConversationUrl(conversationId);
+  return `
+(() => {
+  const TARGET = ${jsString(targetApiUrl)};
+  const KEY = "__oracleArchivedConversationRecovery";
+  if (window[KEY]?.target === TARGET && window[KEY]?.status === "pending") return;
+  const state = window[KEY] = {
+    target: TARGET,
+    status: "pending",
+    attempted: false,
+    recovered: false
+  };
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async function(input, init) {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const response = await originalFetch(input, init);
+    try {
+      const url = new URL(request.url, location.href);
+      if (
+        state.status === "pending" &&
+        request.method.toUpperCase() === "GET" &&
+        url.pathname === "/backend-api/conversations" &&
+        url.searchParams.get("is_archived") === "true"
+      ) {
+        state.attempted = true;
+        state.listStatus = response.status;
+        const headers = new Headers(request.headers);
+        headers.set("content-type", "application/json");
+        headers.delete("content-length");
+        headers.delete("x-openai-target-path");
+        headers.delete("x-openai-target-route");
+        const patch = await originalFetch(TARGET, {
+          method: "PATCH",
+          headers,
+          credentials: "include",
+          body: JSON.stringify({ is_archived: false })
+        });
+        state.patchStatus = patch.status;
+        state.recovered = patch.ok;
+        state.status = patch.ok ? "recovered" : "failed";
+      }
+    } catch (error) {
+      state.status = "failed";
+      state.error = error instanceof Error ? error.message : String(error);
+    }
+    return response;
+  };
+})();
+`.trim();
+}
+
+async function waitForDocument(Runtime: ChromeClient["Runtime"], timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await evaluateByValue<string>(Runtime, "document.readyState", "document ready");
+    if (ready === "interactive" || ready === "complete") return;
+    await delay(100);
+  }
+  throw new Error("Timed out waiting for ChatGPT document readiness.");
+}
+
+async function waitForConversationUrl(
+  Runtime: ChromeClient["Runtime"],
+  conversationId: string,
+  timeoutMs: number,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let lastUrl = "";
+  while (Date.now() < deadline) {
+    lastUrl = await evaluateByValue<string>(Runtime, "location.href", "conversation URL");
+    if (isSameConversationUrl(lastUrl, conversationId)) return lastUrl;
+    await delay(150);
+  }
+  throw new Error(
+    `Recovered conversation did not open at the approved URL; expected ${conversationId}, got ${lastUrl}`,
+  );
+}
+
+async function recoverArchivedConversation({
+  targetUrl,
+  host,
+  port,
+  timeoutMs,
+}: {
+  targetUrl: string;
+  host: string;
+  port: number;
+  timeoutMs: number;
+}): Promise<{
+  client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
+  targetId: string;
+  tabUrl: string;
+  recovery: ChatGptArchiveRecoveryResult;
+}> {
+  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  const settingsUrl = archivedSettingsUrlFromConversationUrl(targetUrl);
+  const projectUrl = settingsUrl.split("#", 1)[0] as string;
+  const targetId = await openChatGptTarget({ host, port, url: projectUrl });
+  const { client } = await connectToExistingChatGptTab({ host, port, ref: targetId });
+  try {
+    const { Page, Runtime } = client;
+    await Page.enable();
+    await waitForDocument(Runtime, timeoutMs);
+    await Runtime.evaluate({
+      expression: buildArchivedConversationRecoveryHook(conversationId),
+      awaitPromise: false,
+      returnByValue: true,
+    });
+    await Page.addScriptToEvaluateOnNewDocument({
+      source: buildArchivedConversationRecoveryHook(conversationId),
+    });
+    await Page.navigate({ url: settingsUrl });
+    const deadline = Date.now() + timeoutMs;
+    let state: JsonRecord = {};
+    while (Date.now() < deadline) {
+      state = await evaluateByValue<JsonRecord>(
+        Runtime,
+        "window.__oracleArchivedConversationRecovery || {}",
+        "archive recovery",
+      );
+      if (state.status === "recovered") break;
+      if (state.status === "failed") {
+        throw new Error(`Archived conversation recovery failed: ${JSON.stringify(state)}`);
+      }
+      await delay(200);
+    }
+    if (state.status !== "recovered") {
+      throw new Error(
+        `Timed out recovering archived ChatGPT conversation: ${JSON.stringify(state)}`,
+      );
+    }
+    await Page.navigate({ url: targetUrl });
+    const tabUrl = await waitForConversationUrl(Runtime, conversationId, timeoutMs);
+    await waitForDocument(Runtime, timeoutMs);
+    return {
+      client,
+      targetId,
+      tabUrl,
+      recovery: {
+        attempted: true,
+        recovered: true,
+        status: "recovered",
+        settingsUrl,
+        patchStatus: Number(state.patchStatus),
+      },
+    };
+  } catch (error) {
+    await client.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 async function evaluateByValue<T>(
@@ -823,7 +1001,7 @@ async function finalizeCapturedExport({
   targetId: string;
   tabUrl: string;
   captureInfo: JsonRecord;
-}): Promise<ChatGptConversationExportResult> {
+}): Promise<Omit<ChatGptConversationExportResult, "archiveRecovery" | "postExportArchive">> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
   if (backend.conversation_id !== conversationId) {
     throw new Error(`Captured wrong conversation id: ${backend.conversation_id ?? "(missing)"}`);
@@ -877,15 +1055,48 @@ export async function captureApprovedChatGptConversationBackend(
   const chunkSize = options.chunkSize ?? 250_000;
   const tabRef = options.tabRef ?? options.targetUrl;
   const outDir = path.resolve(options.outDir);
-
-  const { client, targetId, tab } = await connectToExistingChatGptTab({ host, port, ref: tabRef });
+  let resolved: {
+    client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
+    targetId: string;
+    tabUrl: string;
+    tabTitle: string;
+    recovery: ChatGptArchiveRecoveryResult;
+  };
   try {
-    const { Page, Runtime } = client;
-    if (!isSameConversationUrl(tab.url, conversationId)) {
+    const connected = await connectToExistingChatGptTab({ host, port, ref: tabRef });
+    if (!isSameConversationUrl(connected.tab.url, conversationId)) {
+      await connected.client.close().catch(() => undefined);
       throw new Error(
-        `Resolved ChatGPT tab is not the approved target conversation; expected ${conversationId}, got ${tab.url}`,
+        `Resolved ChatGPT tab is not the approved target conversation; expected ${conversationId}, got ${connected.tab.url}`,
       );
     }
+    resolved = {
+      client: connected.client,
+      targetId: connected.targetId,
+      tabUrl: connected.tab.url,
+      tabTitle: connected.tab.title,
+      recovery: { attempted: false, recovered: false, status: "not-needed" },
+    };
+  } catch (error) {
+    if (options.recoverArchived === false) throw error;
+    const recovered = await recoverArchivedConversation({
+      targetUrl: options.targetUrl,
+      host,
+      port,
+      timeoutMs,
+    });
+    resolved = {
+      client: recovered.client,
+      targetId: recovered.targetId,
+      tabUrl: recovered.tabUrl,
+      tabTitle: "",
+      recovery: recovered.recovery,
+    };
+  }
+  const { client, targetId, tabUrl, tabTitle, recovery } = resolved;
+  let archiveRestored = false;
+  try {
+    const { Page, Runtime } = client;
     await Page.addScriptToEvaluateOnNewDocument({
       source: buildScopedBackendCaptureHook(targetApiUrl),
     });
@@ -900,14 +1111,14 @@ export async function captureApprovedChatGptConversationBackend(
     }
     const rawText = await retrieveCapturedText(Runtime, targetApiUrl, hit.chars, chunkSize);
     const backend = JSON.parse(rawText) as BackendConversation;
-    return await finalizeCapturedExport({
+    const result = await finalizeCapturedExport({
       backend,
       rawText,
       targetUrl: options.targetUrl,
       targetApiUrl,
       outDir,
       targetId,
-      tabUrl: tab.url,
+      tabUrl,
       captureInfo: {
         captured_at: new Date().toISOString(),
         target_url: options.targetUrl,
@@ -916,16 +1127,43 @@ export async function captureApprovedChatGptConversationBackend(
           host,
           port,
           target_id: targetId,
-          url_before_reload: tab.url,
-          title_before_reload: tab.title,
+          url_before_reload: tabUrl,
+          title_before_reload: tabTitle,
         },
         hit: Object.fromEntries(Object.entries(hit).filter(([key]) => key !== "bodyPreview")),
         non_claims: [
           "No cookies, localStorage, profile stores, or unrelated history were read.",
           "The hook captured only the exact target backend conversation URL during page load.",
+          "Archive recovery, when needed, reuses ChatGPT's own authenticated archived-list request only to PATCH the exact approved conversation id and does not record credential values or unrelated conversation payloads.",
         ],
       },
     });
+    const shouldArchive = options.archiveAfterExport === true || recovery.recovered;
+    let postExportArchive: BrowserArchiveResult | undefined;
+    if (shouldArchive) {
+      postExportArchive = await archiveChatGptConversation(Runtime, () => {}, {
+        mode: "always",
+        conversationUrl: options.targetUrl,
+      });
+      if (!postExportArchive.archived) {
+        throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);
+      }
+      archiveRestored = recovery.recovered;
+    }
+    return { ...result, archiveRecovery: recovery, postExportArchive };
+  } catch (error) {
+    if (recovery.recovered && !archiveRestored) {
+      const restore = await archiveChatGptConversation(client.Runtime, () => {}, {
+        mode: "always",
+        conversationUrl: options.targetUrl,
+      }).catch(() => null);
+      if (!restore?.archived) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; archive restore also failed`,
+        );
+      }
+    }
+    throw error;
   } finally {
     await client.close().catch(() => undefined);
   }
@@ -994,5 +1232,12 @@ export async function captureApprovedChatGptConversationBackendViaObu(
         "The hook captured only the exact target backend conversation URL during page load.",
       ],
     },
-  });
+  }).then((result) => ({
+    ...result,
+    archiveRecovery: {
+      attempted: false,
+      recovered: false,
+      status: "not-needed" as const,
+    },
+  }));
 }

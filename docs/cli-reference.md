@@ -105,7 +105,7 @@ oracle chatgpt-export --target-url "https://chatgpt.com/c/<conversation-id>"
 - `redaction-report.json`
 - `SHA256SUMS.txt`
 
-It does not submit prompts, archive/delete/share chats, inspect cookies, inspect localStorage, read browser profiles, or enumerate account history. It fails closed unless the resolved tab is the exact approved `https://chatgpt.com/c/<conversation-id>` URL. Use `--browser-tab <ref>` to choose a specific existing tab, `--remote-chrome <host:port>` for a non-default DevTools endpoint, or `--obu-session-id <id> --obu-tab-id <id>` for an approved Open Browser Use-managed tab.
+It does not submit prompts, delete/share chats, inspect cookies, inspect localStorage, read browser profiles, or export unrelated account history. If the exact thread is archived, CDP mode temporarily unarchives only that conversation through ChatGPT's authenticated Archived Chats request, captures it, and restores the archive state. Use `--no-recover-archived` to disable recovery or `--archive-after-export` to archive an active thread only after capture succeeds. It fails closed unless the resolved or recovered tab is the exact approved `https://chatgpt.com/c/<conversation-id>` URL. Use `--browser-tab <ref>` to choose a specific existing tab, `--remote-chrome <host:port>` for a non-default DevTools endpoint, or `--obu-session-id <id> --obu-tab-id <id>` for an approved Open Browser Use-managed tab.
 
 See [Browser Mode](browser-mode.md) for usage.
 
