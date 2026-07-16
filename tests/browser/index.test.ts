@@ -112,6 +112,42 @@ describe("browser run target cleanup", () => {
   });
 });
 
+describe("attachment upload timeout policy", () => {
+  const attachment = (sizeBytes?: number) => ({
+    path: "/tmp/attachment",
+    displayPath: "attachment",
+    ...(sizeBytes === undefined ? {} : { sizeBytes }),
+  });
+
+  test("adds size budget for a roughly 24 MB attachment", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment(24.4 * 1024 * 1024)])).toBe(
+      95_000,
+    );
+  });
+
+  test("keeps the existing conservative budget for unknown sizes", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment()])).toBe(45_000);
+  });
+
+  test("adds budget for multiple attachments", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment(), attachment()])).toBe(65_000);
+  });
+
+  test("uses inputTimeoutMs as a floor", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment()], 60_000)).toBe(60_000);
+  });
+
+  test("caps automatic scaling for very large attachments", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment(100 * 1024 * 1024)])).toBe(
+      180_000,
+    );
+  });
+
+  test("preserves an explicit inputTimeoutMs above the automatic cap", () => {
+    expect(__test__.resolveAttachmentUploadTimeoutMs([attachment()], 300_000)).toBe(300_000);
+  });
+});
+
 describe("manual-login profile setup gate", () => {
   test("fails fast for an uninitialized manual-login profile unless setup keeps Chrome open", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-empty-profile-"));

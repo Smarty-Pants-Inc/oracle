@@ -15,121 +15,294 @@ const useRealTime = () => {
 };
 
 describe("attachment completion fallbacks", () => {
-  test("waitForAttachmentCompletion resolves when file input contains expected name (no UI chip)", async () => {
+  test("waitForAttachmentCompletion accepts stable count evidence with a disabled send button", async () => {
     useFakeTime();
-
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            state: "ready",
-            uploading: false,
-            filesAttached: true,
-            attachedNames: [],
-            inputNames: ["oracle-attach-verify.txt"],
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["Remove file", "1 file", "24.4 MB"],
+              inputNames: [],
+              fileCount: 1,
+            },
           },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
+        }),
+      } as unknown as ChromeClient["Runtime"];
 
-    const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
-    await vi.advanceTimersByTimeAsync(2_000);
-    await expect(promise).resolves.toBeUndefined();
-    useRealTime();
+      const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      useRealTime();
+    }
   });
 
-  test("waitForAttachmentCompletion resolves even when uploading is flagged, once input match is stable", async () => {
+  test("waitForAttachmentCompletion times out while upload progress remains active", async () => {
     useFakeTime();
-
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            state: "ready",
-            uploading: true,
-            filesAttached: false,
-            attachedNames: [],
-            inputNames: ["oracle-attach-verify.txt"],
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: true,
+              filesAttached: true,
+              attachedNames: ["oracle-attach-verify.txt"],
+              inputNames: [],
+            },
           },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
+        }),
+      } as unknown as ChromeClient["Runtime"];
 
-    const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
-    await vi.advanceTimersByTimeAsync(5_000);
-    await expect(promise).resolves.toBeUndefined();
-    useRealTime();
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
   });
 
-  test("waitForAttachmentCompletion can resolve when send button is missing (input match fallback)", async () => {
+  test("waitForAttachmentCompletion restarts stability after upload progress clears", async () => {
     useFakeTime();
-
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            state: "missing",
-            uploading: false,
-            filesAttached: true,
-            attachedNames: [],
-            inputNames: ["oracle-attach-verify.txt"],
+    try {
+      const evaluate = vi.fn().mockImplementation(async () => {
+        const uploading = evaluate.mock.calls.length <= 3;
+        return {
+          result: {
+            value: {
+              state: "disabled",
+              uploading,
+              filesAttached: true,
+              attachedNames: ["oracle-attach-verify.txt"],
+              inputNames: [],
+            },
           },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
+        };
+      });
+      const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
 
-    const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
-    await vi.advanceTimersByTimeAsync(2_000);
-    await expect(promise).resolves.toBeUndefined();
-    useRealTime();
+      const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(evaluate).toHaveBeenCalledTimes(9);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      useRealTime();
+    }
   });
 
-  test("waitForAttachmentCompletion times out when send button stays disabled (upload likely in progress)", async () => {
+  test("waitForAttachmentCompletion accepts stable matching file-input evidence", async () => {
     useFakeTime();
-
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            state: "disabled",
-            uploading: false,
-            filesAttached: true,
-            attachedNames: ["oracle-attach-verify.txt"],
-            inputNames: [],
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "missing",
+              uploading: false,
+              filesAttached: false,
+              attachedNames: [],
+              inputNames: ["oracle-attach-verify.txt"],
+            },
           },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
+        }),
+      } as unknown as ChromeClient["Runtime"];
 
-    const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
-    const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
-    await vi.advanceTimersByTimeAsync(2_000);
-    await assertion;
-    useRealTime();
+      const promise = waitForAttachmentCompletion(runtime, 10_000, ["oracle-attach-verify.txt"]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      useRealTime();
+    }
   });
 
-  test("waitForAttachmentCompletion times out when neither UI nor file input matches", async () => {
+  test("waitForAttachmentCompletion rejects active upload despite matching file-input evidence", async () => {
     useFakeTime();
-
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            state: "ready",
-            uploading: false,
-            filesAttached: false,
-            attachedNames: [],
-            inputNames: [],
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: true,
+              filesAttached: false,
+              attachedNames: [],
+              inputNames: ["oracle-attach-verify.txt"],
+            },
           },
-        },
-      }),
-    } as unknown as ChromeClient["Runtime"];
+        }),
+      } as unknown as ChromeClient["Runtime"];
 
-    const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
-    const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
-    await vi.advanceTimersByTimeAsync(2_000);
-    await assertion;
-    useRealTime();
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects a mismatched name even when count matches", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "ready",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["other-file.txt"],
+              inputNames: ["other-file.txt"],
+              fileCount: 1,
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects an extensionless mismatch even when count matches", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "ready",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["otherfile"],
+              inputNames: [],
+              fileCount: 1,
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects a rendered filename with a distinct prefix", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["old oracle-attach-verify.txt"],
+              inputNames: [],
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects a rendered suffix collision", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["old-oracle-attach-verify.txt"],
+              inputNames: [],
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects a same-stem different-extension file input", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: false,
+              attachedNames: [],
+              inputNames: ["oracle-attach-verify.pdf"],
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
+  });
+
+  test("waitForAttachmentCompletion rejects a suffix collision in file-input evidence", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: false,
+              attachedNames: [],
+              inputNames: ["old-oracle-attach-verify.txt"],
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 800, ["oracle-attach-verify.txt"]);
+      const assertion = expect(promise).rejects.toThrow(/did not finish uploading/i);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+    } finally {
+      useRealTime();
+    }
   });
 });
 

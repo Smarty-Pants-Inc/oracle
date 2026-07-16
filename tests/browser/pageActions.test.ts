@@ -1332,13 +1332,20 @@ describe("waitForAttachmentCompletion", () => {
     expect(runtime.evaluate).toHaveBeenCalled();
   });
 
-  test("resolves when send button missing but files present", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValueOnce({
-        result: { value: { state: "missing", uploading: false, filesAttached: true } },
-      }),
-    } as unknown as ChromeClient["Runtime"];
-    await expect(waitForAttachmentCompletion(runtime, 200)).resolves.toBeUndefined();
+  test("resolves when send button missing but attachment evidence is stable", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: { value: { state: "missing", uploading: false, filesAttached: true } },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+      const promise = waitForAttachmentCompletion(runtime, 5_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("rejects when timeout reached", async () => {

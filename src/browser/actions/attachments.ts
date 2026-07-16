@@ -1335,8 +1335,8 @@ export async function waitForAttachmentCompletion(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
+  const stableThresholdMs = 1500;
   let inputMatchSince: number | null = null;
-  let sawInputMatch = false;
   let attachmentMatchSince: number | null = null;
   let lastVerboseLog = 0;
   const expression = `(() => {
@@ -1451,10 +1451,18 @@ export async function waitForAttachmentCompletion(
     const inputScope = composerScope ? Array.from(composerScope.querySelectorAll('input[type="file"]')) : [];
     const inputNodes = [];
     const inputSeen = new Set();
-    for (const el of [...inputScope, ...Array.from(document.querySelectorAll('input[type="file"]'))]) {
+    for (const el of inputScope) {
       if (!inputSeen.has(el)) {
         inputSeen.add(el);
         inputNodes.push(el);
+      }
+    }
+    if (inputNodes.length === 0) {
+      for (const el of Array.from(document.querySelectorAll('input[type="file"]'))) {
+        if (!inputSeen.has(el)) {
+          inputSeen.add(el);
+          inputNodes.push(el);
+        }
       }
     }
     for (const input of inputNodes) {
@@ -1594,86 +1602,87 @@ export async function waitForAttachmentCompletion(
         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
         .filter(Boolean);
       const fileCount = typeof value.fileCount === "number" ? value.fileCount : 0;
-      const fileCountSatisfied =
-        expectedNormalized.length > 0 && fileCount >= expectedNormalized.length;
-      const matchesExpected = (expected: string): boolean => {
+      const normalizeRenderedToken = (raw: string): string =>
+        raw
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim()
+          .replace(/^(?:remove|delete)\s+(?:file|attachment)\s*[:-]?\s*/i, "")
+          .replace(/\s+\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb)$/i, "")
+          .trim();
+      const renderedTokens = attachedNames
+        .flatMap((raw) => raw.split(/\r?\n/))
+        .map(normalizeRenderedToken)
+        .filter(Boolean);
+      const isGenericAttachmentToken = (token: string): boolean =>
+        /^(?:file|attachment|document|image|pdf|spreadsheet|presentation|text|code)$/i.test(
+          token,
+        ) ||
+        /^\d+\s+(?:files?|attachments?)$/i.test(token) ||
+        /^\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb)$/i.test(token) ||
+        /^(?:uploading|processing|uploaded|ready)$/i.test(token);
+      const tokenMatchesExpected = (token: string, expected: string): boolean => {
         const baseName = expected.split("/").pop()?.split("\\").pop() ?? expected;
         const normalizedExpected = baseName.toLowerCase().replace(/\s+/g, " ").trim();
-        const expectedNoExt = normalizedExpected.replace(/\.[a-z0-9]{1,10}$/i, "");
-        return attachedNames.some((raw) => {
-          if (raw.includes(normalizedExpected)) return true;
-          if (expectedNoExt.length >= 6 && raw.includes(expectedNoExt)) return true;
-          if (raw.includes("…") || raw.includes("...")) {
-            const marker = raw.includes("…") ? "…" : "...";
-            const [prefixRaw, suffixRaw] = raw.split(marker);
-            const prefix = prefixRaw.trim();
-            const suffix = suffixRaw.trim();
-            const target = expectedNoExt.length >= 6 ? expectedNoExt : normalizedExpected;
-            const matchesPrefix = !prefix || target.includes(prefix);
-            const matchesSuffix = !suffix || target.includes(suffix);
-            return matchesPrefix && matchesSuffix;
-          }
-          return false;
-        });
+        if (token === normalizedExpected) return true;
+        if (token.includes("…") || token.includes("...")) {
+          const marker = token.includes("…") ? "…" : "...";
+          const [prefixRaw, suffixRaw] = token.split(marker);
+          const prefix = prefixRaw.trim();
+          const suffix = suffixRaw.trim();
+          return (
+            Boolean(prefix || suffix) &&
+            normalizedExpected.startsWith(prefix) &&
+            normalizedExpected.endsWith(suffix)
+          );
+        }
+        return false;
       };
+      const matchesExpected = (expected: string): boolean =>
+        renderedTokens.some((token) => tokenMatchesExpected(token, expected));
+      const hasContradictoryName = renderedTokens.some(
+        (token) =>
+          !isGenericAttachmentToken(token) &&
+          !expectedNormalized.some((expected) => tokenMatchesExpected(token, expected)),
+      );
+      const fileCountSatisfied =
+        expectedNormalized.length > 0 &&
+        fileCount >= expectedNormalized.length &&
+        !hasContradictoryName;
       const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
-      if (missing.length === 0 || fileCountSatisfied) {
-        const stableThresholdMs = value.uploading ? 3000 : 1500;
-        if (attachmentMatchSince === null) {
-          attachmentMatchSince = Date.now();
-        }
-        const stable = Date.now() - attachmentMatchSince > stableThresholdMs;
-        if (stable && value.state === "ready") {
-          return;
-        }
-        // Don't treat disabled button as complete - wait for it to become 'ready'.
-        // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
-        if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
-          return;
-        }
-        // If files are attached but button isn't ready yet, give it more time but don't fail immediately.
-        if (value.filesAttached || fileCountSatisfied) {
-          await delay(500);
-          continue;
-        }
-      } else {
+      const renderedEvidence =
+        expectedNormalized.length > 0
+          ? missing.length === 0 || fileCountSatisfied
+          : Boolean(value.filesAttached || fileCount > 0);
+
+      // A disabled pre-prompt send button is normal. Only stable attachment evidence after
+      // explicit upload progress clears proves the upload is ready.
+      if (value.uploading || !renderedEvidence) {
         attachmentMatchSince = null;
+      } else {
+        attachmentMatchSince ??= Date.now();
+        if (Date.now() - attachmentMatchSince > stableThresholdMs) {
+          return;
+        }
       }
 
-      // Fallback: if the file input has the expected names, allow progress once that condition is stable.
-      // Some ChatGPT surfaces only render the filename after sending the message.
+      // Fallback: some ChatGPT surfaces retain the selected file only in the input.
       const inputMissing = expectedNormalized.filter((expected) => {
         const baseName = expected.split("/").pop()?.split("\\").pop() ?? expected;
         const normalizedExpected = baseName.toLowerCase().replace(/\s+/g, " ").trim();
-        const expectedNoExt = normalizedExpected.replace(/\.[a-z0-9]{1,10}$/i, "");
         return !inputNames.some(
-          (raw) =>
-            raw.includes(normalizedExpected) ||
-            (expectedNoExt.length >= 6 && raw.includes(expectedNoExt)),
+          (raw) => raw.toLowerCase().replace(/\s+/g, " ").trim() === normalizedExpected,
         );
       });
-      // Don't include 'disabled' - a disabled button likely means upload is still in progress.
-      const inputStateOk = value.state === "ready" || value.state === "missing";
-      const inputSeenNow = inputMissing.length === 0 || fileCountSatisfied;
-      const inputEvidenceOk =
-        Boolean(value.filesAttached) || Boolean(value.uploading) || fileCountSatisfied;
-      const stableThresholdMs = value.uploading ? 3000 : 1500;
-      if (inputSeenNow && inputStateOk && inputEvidenceOk) {
-        if (inputMatchSince === null) {
-          inputMatchSince = Date.now();
-        }
-        sawInputMatch = true;
-      }
-      if (
-        inputMatchSince !== null &&
-        inputStateOk &&
-        inputEvidenceOk &&
-        Date.now() - inputMatchSince > stableThresholdMs
-      ) {
-        return;
-      }
-      if (!inputSeenNow && !sawInputMatch) {
+      const inputEvidence =
+        expectedNormalized.length > 0 ? inputMissing.length === 0 : inputNames.length > 0;
+      if (value.uploading || !inputEvidence) {
         inputMatchSince = null;
+      } else {
+        inputMatchSince ??= Date.now();
+        if (Date.now() - inputMatchSince > stableThresholdMs) {
+          return;
+        }
       }
     }
     await delay(250);
