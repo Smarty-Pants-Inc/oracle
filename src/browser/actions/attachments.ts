@@ -1621,10 +1621,20 @@ export async function waitForAttachmentCompletion(
         /^\d+\s+(?:files?|attachments?)$/i.test(token) ||
         /^\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb)$/i.test(token) ||
         /^(?:uploading|processing|uploaded|ready)$/i.test(token);
+      const numberedRenameMatch = (token: string, expected: string): boolean => {
+        // ChatGPT dedupes repeat uploads as "name(2).ext"; accept the numbered rename.
+        const dot = expected.lastIndexOf(".");
+        const stem = dot > 0 ? expected.slice(0, dot) : expected;
+        const ext = dot > 0 ? expected.slice(dot) : "";
+        if (!token.startsWith(stem) || (ext && !token.endsWith(ext))) return false;
+        const middle = token.slice(stem.length, token.length - ext.length);
+        return /^\(\d+\)$/.test(middle);
+      };
       const tokenMatchesExpected = (token: string, expected: string): boolean => {
         const baseName = expected.split("/").pop()?.split("\\").pop() ?? expected;
         const normalizedExpected = baseName.toLowerCase().replace(/\s+/g, " ").trim();
         if (token === normalizedExpected) return true;
+        if (numberedRenameMatch(token, normalizedExpected)) return true;
         if (token.includes("…") || token.includes("...")) {
           const marker = token.includes("…") ? "…" : "...";
           const [prefixRaw, suffixRaw] = token.split(marker);

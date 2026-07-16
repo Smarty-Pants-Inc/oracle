@@ -41,6 +41,32 @@ describe("attachment completion fallbacks", () => {
     }
   });
 
+  test("waitForAttachmentCompletion accepts ChatGPT numbered rename chips", async () => {
+    useFakeTime();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              state: "disabled",
+              uploading: false,
+              filesAttached: true,
+              attachedNames: ["attachments-bundle(17).txt"],
+              inputNames: [],
+              fileCount: 1,
+            },
+          },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      const promise = waitForAttachmentCompletion(runtime, 10_000, ["attachments-bundle.txt"]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      useRealTime();
+    }
+  });
+
   test("waitForAttachmentCompletion times out while upload progress remains active", async () => {
     useFakeTime();
     try {

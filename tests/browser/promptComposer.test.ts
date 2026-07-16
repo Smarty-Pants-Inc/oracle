@@ -303,7 +303,90 @@ describe("promptComposer", () => {
         ["oracle-attach-verify.txt"],
       );
       const assertion = expect(promise).rejects.toThrow(/clickable send button/i);
-      await vi.advanceTimersByTimeAsync(21_000);
+      await vi.advanceTimersByTimeAsync(301_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("attachment sends keep waiting through a disabled send button until it enables", async () => {
+    vi.useFakeTimers();
+    try {
+      let clickAttempts = 0;
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("dispatchClickSequence")) {
+            clickAttempts += 1;
+            // Send stays disabled for ~90s of server-side processing, then enables.
+            return { result: { value: clickAttempts < 180 ? "disabled" : "clicked" } };
+          }
+          return { result: { value: true } };
+        }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.attemptSendButton(
+        runtime as never,
+        (() => undefined) as never,
+        ["oracle-attach-verify.txt"],
+      );
+      const assertion = expect(promise).resolves.toBe(true);
+      await vi.advanceTimersByTimeAsync(120_000);
+      await assertion;
+      expect(clickAttempts).toBeGreaterThanOrEqual(180);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("attachment sends keep waiting when the send button is briefly missing", async () => {
+    vi.useFakeTimers();
+    try {
+      let clickAttempts = 0;
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("dispatchClickSequence")) {
+            clickAttempts += 1;
+            // The button node can be swapped out mid-processing; 'missing' must not abort.
+            return { result: { value: clickAttempts < 5 ? "missing" : "clicked" } };
+          }
+          return { result: { value: true } };
+        }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.attemptSendButton(
+        runtime as never,
+        (() => undefined) as never,
+        ["oracle-attach-verify.txt"],
+      );
+      const assertion = expect(promise).resolves.toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("no-attachment sends still bail out fast to the Enter fallback", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn(async () => ({ result: { value: "missing" } })),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.attemptSendButton(
+        runtime as never,
+        (() => undefined) as never,
+        [],
+      );
+      const assertion = expect(promise).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
       await assertion;
     } finally {
       vi.useRealTimers();
