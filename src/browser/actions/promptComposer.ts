@@ -370,9 +370,19 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
             .trim(),
         )
         .filter(Boolean);
+    const numberedRenameMatch = (token, name) => {
+      // ChatGPT dedupes repeat uploads as "name(2).ext"; accept the numbered rename.
+      const dot = name.lastIndexOf('.');
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : '';
+      if (!token.startsWith(stem) || (ext && !token.endsWith(ext))) return false;
+      const middle = token.slice(stem.length, token.length - ext.length);
+      return /^\\(\\d+\\)$/.test(middle);
+    };
     const match = (node, name) =>
       renderedTokens(node).some((token) => {
         if (token === name) return true;
+        if (numberedRenameMatch(token, name)) return true;
         if (token.includes('…') || token.includes('...')) {
           const marker = token.includes('…') ? '…' : '...';
           const [prefixRaw, suffixRaw] = token.split(marker);
@@ -425,10 +435,16 @@ export function buildAttachmentReadyExpressionForTest(attachmentNames: string[])
   return buildAttachmentReadyExpression(attachmentNames);
 }
 
+const SEND_BUTTON_TIMEOUT_MS = 20_000;
+// Server-side attachment processing keeps the send button disabled for minutes after
+// upload evidence stabilizes (observed >2m for a ~25MB text bundle), so wait generously.
+const ATTACHMENT_SEND_READY_TIMEOUT_MS = 300_000;
+
 async function attemptSendButton(
   Runtime: ChromeClient["Runtime"],
-  _logger?: BrowserLogger,
+  logger?: BrowserLogger,
   attachmentNames?: string[],
+  timeoutMs?: number,
 ): Promise<boolean> {
   const script = `(() => {
     ${buildClickDispatcher()}
@@ -456,16 +472,27 @@ async function attemptSendButton(
     for (const selector of selectors) {
       candidates.push(...Array.from(document.querySelectorAll(selector)));
     }
-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
-    if (!button) return 'missing';
-    // Use unified pointer/mouse sequence to satisfy React handlers.
-    dispatchClickSequence(button);
-    return 'clicked';
+    const visible = candidates.filter((node) => isVisible(node));
+    const button = visible.find((node) => isEnabled(node)) || null;
+    if (button) {
+      // Use unified pointer/mouse sequence to satisfy React handlers.
+      dispatchClickSequence(button);
+      return 'clicked';
+    }
+    // A visible-but-disabled send button means the composer is still processing; keep waiting.
+    return visible.length > 0 ? 'disabled' : 'missing';
   })()`;
 
-  const deadline = Date.now() + 20_000;
+  const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
+  const effectiveTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : needAttachment
+        ? ATTACHMENT_SEND_READY_TIMEOUT_MS
+        : SEND_BUTTON_TIMEOUT_MS;
+  const deadline = Date.now() + effectiveTimeoutMs;
+  let loggedDisabledWait = false;
   while (Date.now() < deadline) {
-    const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
     if (needAttachment) {
       const ready = await Runtime.evaluate({
         expression: buildAttachmentReadyExpression(attachmentNames),
@@ -480,18 +507,24 @@ async function attemptSendButton(
     if (result.value === "clicked") {
       return true;
     }
-    if (result.value === "missing") {
+    if (result.value === "missing" && !needAttachment) {
+      // Without attachments the Enter-key fallback is safe; bail out quickly.
       break;
     }
-    await delay(100);
+    if (result.value === "disabled" && needAttachment && !loggedDisabledWait) {
+      loggedDisabledWait = true;
+      logger?.("Send button visible but disabled; waiting for attachment processing to finish.");
+    }
+    await delay(needAttachment ? 500 : 100);
   }
-  if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
+  if (needAttachment) {
     throw new BrowserAutomationError(
       "Attachments never reached a clickable send button before timeout.",
       {
         stage: "submit-prompt",
         code: "attachment-send-not-ready",
         attachmentNames,
+        timeoutMs: effectiveTimeoutMs,
       },
     );
   }

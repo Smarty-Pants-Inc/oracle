@@ -22,4 +22,15 @@ describe("prompt composer attachment expressions", () => {
       'document.querySelectorAll(\'[data-testid*="chip"],[data-testid*="attachment"],a,div,span\')',
     );
   });
+
+  test("attachment ready check tolerates ChatGPT numbered renames", () => {
+    const expression = buildAttachmentReadyExpressionForTest(["attachments-bundle.txt"]);
+    expect(() => new Function(`return ${expression}`)).not.toThrow();
+    expect(expression).toContain("numberedRenameMatch");
+    // The injected matcher must accept "name(2).ext" dedupe renames without substring fallback.
+    expect(expression).toContain(
+      "const middle = token.slice(stem.length, token.length - ext.length);",
+    );
+    expect(expression).toContain("/^\\(\\d+\\)$/.test(middle)");
+  });
 });
