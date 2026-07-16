@@ -357,17 +357,34 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
       document.querySelector('form') ||
       document.body ||
       document;
-    const labelText = (node) =>
-      [
-        node?.textContent,
-        node?.getAttribute?.('aria-label'),
-        node?.getAttribute?.('title'),
-        node?.getAttribute?.('data-testid'),
-      ]
+    const renderedTokens = (node) =>
+      [node?.textContent, node?.getAttribute?.('aria-label'), node?.getAttribute?.('title')]
         .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-    const match = (node, name) => labelText(node).includes(name);
+        .flatMap((value) => String(value).toLowerCase().split(/\\r?\\n/))
+        .map((raw) =>
+          raw
+            .replace(/\\s+/g, ' ')
+            .trim()
+            .replace(/^(?:remove|delete)\\s+(?:file|attachment)\\s*[:\\-]?\\s*/i, '')
+            .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:b|kb|mb|gb|tb)$/i, '')
+            .trim(),
+        )
+        .filter(Boolean);
+    const match = (node, name) =>
+      renderedTokens(node).some((token) => {
+        if (token === name) return true;
+        if (token.includes('…') || token.includes('...')) {
+          const marker = token.includes('…') ? '…' : '...';
+          const [prefixRaw, suffixRaw] = token.split(marker);
+          const prefix = prefixRaw.trim();
+          const suffix = suffixRaw.trim();
+          return Boolean(prefix || suffix) && name.startsWith(prefix) && name.endsWith(suffix);
+        }
+        return false;
+      });
+    const fileNameMatches = (fileName, expectedName) =>
+      String(fileName || '').toLowerCase().replace(/\\s+/g, ' ').trim() ===
+      String(expectedName || '').toLowerCase().replace(/\\s+/g, ' ').trim();
 
     // Restrict to attachment affordances; never scan generic div/span nodes (prompt text can contain the file name).
     const attachmentSelectors = [
@@ -380,19 +397,22 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
       '[aria-label*="remove file"]',
       'button[aria-label*="remove file"]',
     ];
-    const attachmentRoots = Array.from(new Set([composer, document])).filter(Boolean);
-
-    const chipsReady = names.every((name) =>
-      attachmentRoots.some((root) =>
-        Array.from(root.querySelectorAll(attachmentSelectors.join(','))).some((node) => match(node, name)),
-      ),
+    const composerAttachments = Array.from(
+      composer.querySelectorAll(attachmentSelectors.join(',')),
     );
+    const attachmentNodes = composerAttachments.length > 0
+      ? composerAttachments
+      : Array.from(document.querySelectorAll(attachmentSelectors.join(',')));
+
+    const chipsReady = names.every((name) => attachmentNodes.some((node) => match(node, name)));
+    const composerInputs = Array.from(composer.querySelectorAll('input[type="file"]'));
+    const inputNodes = composerInputs.length > 0
+      ? composerInputs
+      : Array.from(document.querySelectorAll('input[type="file"]'));
     const inputsReady = names.every((name) =>
-      attachmentRoots.some((root) =>
-        Array.from(root.querySelectorAll('input[type="file"]')).some((el) =>
-          Array.from((el instanceof HTMLInputElement ? el.files : []) || []).some((file) =>
-            file?.name?.toLowerCase?.().includes(name),
-          ),
+      inputNodes.some((el) =>
+        Array.from((el instanceof HTMLInputElement ? el.files : []) || []).some((file) =>
+          fileNameMatches(file?.name, name),
         ),
       ),
     );

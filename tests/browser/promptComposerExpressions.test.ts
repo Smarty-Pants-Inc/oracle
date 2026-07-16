@@ -5,8 +5,16 @@ describe("prompt composer attachment expressions", () => {
   test("attachment ready check does not match prompt text", () => {
     const expression = buildAttachmentReadyExpressionForTest(["oracle-attach-verify.txt"]);
     expect(expression).toContain("document.querySelector('[data-testid*=\"composer\"]')");
-    expect(expression).toContain("attachmentRoots");
+    expect(expression).toContain("composerAttachments.length > 0");
     expect(expression).toContain('input[type="file"]');
+    expect(expression).toContain("fileNameMatches(file?.name, name)");
+    expect(expression).toContain("renderedTokens(node)");
+    expect(expression).toContain(".flatMap((value)");
+    expect(expression).not.toContain("getAttribute?.('data-testid')");
+    expect(expression).toContain("token === name");
+    expect(expression).toContain("composerInputs.length > 0");
+    expect(expression).not.toContain("file?.name?.toLowerCase?.().includes(name)");
+    expect(expression).not.toContain("fileNoExt");
     expect(expression).toContain('[aria-label*="Remove file"]');
     expect(expression).toContain("getAttribute?.('aria-label')");
     expect(expression).not.toContain("a,div,span");

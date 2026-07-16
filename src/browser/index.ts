@@ -605,6 +605,36 @@ function shouldCloseOwnedRunTargetAfterRun(options: {
   return options.runStatus === "complete" && options.ownsTarget && !options.keepBrowser;
 }
 
+const ATTACHMENT_UPLOAD_BASE_TIMEOUT_MS = 45_000;
+const ATTACHMENT_UPLOAD_PER_FILE_MS = 20_000;
+const ATTACHMENT_UPLOAD_PER_MIB_MS = 2_000;
+const ATTACHMENT_UPLOAD_MAX_TIMEOUT_MS = 180_000;
+
+function resolveAttachmentUploadTimeoutMs(
+  attachments: BrowserAttachment[],
+  inputTimeoutMs?: number,
+): number {
+  const inputFloorMs =
+    typeof inputTimeoutMs === "number" && Number.isFinite(inputTimeoutMs)
+      ? Math.max(0, inputTimeoutMs)
+      : 0;
+  const knownBytes = attachments.reduce(
+    (total, attachment) =>
+      total +
+      (typeof attachment.sizeBytes === "number" && Number.isFinite(attachment.sizeBytes)
+        ? Math.max(0, attachment.sizeBytes)
+        : 0),
+    0,
+  );
+  // 45s baseline (including unknown sizes), +20s per extra file and +2s/MiB.
+  // Cap automatic scaling at 3m, but preserve a larger explicit input-timeout override.
+  const automaticTimeoutMs =
+    ATTACHMENT_UPLOAD_BASE_TIMEOUT_MS +
+    Math.max(0, attachments.length - 1) * ATTACHMENT_UPLOAD_PER_FILE_MS +
+    Math.ceil(knownBytes / (1024 * 1024)) * ATTACHMENT_UPLOAD_PER_MIB_MS;
+  return Math.max(inputFloorMs, Math.min(ATTACHMENT_UPLOAD_MAX_TIMEOUT_MS, automaticTimeoutMs));
+}
+
 export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
   const promptText = options.prompt?.trim();
   if (!promptText) {
@@ -1174,12 +1204,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           }
           await delay(500);
         }
-        // Scale timeout based on number of files: base 45s + 20s per additional file.
-        const baseTimeout = config.inputTimeoutMs ?? 30_000;
-        const perFileTimeout = 20_000;
-        const waitBudget =
-          Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
-        await waitForAttachmentCompletion(Runtime, waitBudget, attachmentNames, logger);
+        await waitForAttachmentCompletion(
+          Runtime,
+          resolveAttachmentUploadTimeoutMs(submissionAttachments, config.inputTimeoutMs),
+          attachmentNames,
+          logger,
+        );
         logger("All attachments uploaded");
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
@@ -2547,12 +2577,12 @@ async function runRemoteBrowserMode(
           await uploadAttachmentViaDataTransfer({ runtime: Runtime, dom: DOM }, attachment, logger);
           await delay(500);
         }
-        // Scale timeout based on number of files: base 30s + 15s per additional file
-        const baseTimeout = config.inputTimeoutMs ?? 30_000;
-        const perFileTimeout = 15_000;
-        const waitBudget =
-          Math.max(baseTimeout, 30_000) + (submissionAttachments.length - 1) * perFileTimeout;
-        await waitForAttachmentCompletion(Runtime, waitBudget, attachmentNames, logger);
+        await waitForAttachmentCompletion(
+          Runtime,
+          resolveAttachmentUploadTimeoutMs(submissionAttachments, config.inputTimeoutMs),
+          attachmentNames,
+          logger,
+        );
         logger("All attachments uploaded");
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
@@ -3175,6 +3205,7 @@ export const __test__ = {
   isImageOnlyUiChromeText,
   listIgnoredRemoteChromeFlags,
   resolveManualLoginWaitMs,
+  resolveAttachmentUploadTimeoutMs,
   shouldCloseOwnedRunTargetAfterRun,
 };
 export { syncCookies } from "./cookies.js";
