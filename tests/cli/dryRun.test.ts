@@ -81,7 +81,9 @@ describe("runDryRunSummary", () => {
     expect(header?.[0]).toContain("browser mode");
     expect(
       log.mock.calls.some(([entry]) =>
-        String(entry).includes("Browser control: launch Chrome and hide the window"),
+        String(entry).includes(
+          "Browser control: launch a dedicated hidden background Chrome instance",
+        ),
       ),
     ).toBe(true);
     expect(log.mock.calls.some(([entry]) => String(entry).includes("Attachments to upload"))).toBe(

@@ -212,7 +212,7 @@ export async function buildBrowserConfig(
     keepBrowser: options.browserKeepBrowser ? true : undefined,
     manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
     manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
-    hideWindow: options.browserHideWindow ? true : undefined,
+    hideWindow: true,
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,

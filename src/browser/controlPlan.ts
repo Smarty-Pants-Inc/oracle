@@ -74,15 +74,15 @@ export function describeBrowserControlPlan(config: BrowserControlConfig = {}): B
   }
 
   if (config.hideWindow) {
-    guidance.push("Chrome may briefly focus while launching before Oracle hides it.");
     guidance.push(
-      "For the calmest shared-desktop flow, prefer --browser-attach-running or --remote-chrome.",
+      "Oracle launches a separate Chrome app instance hidden and backgrounded before its first window can activate.",
     );
+    guidance.push("If hidden launch is unavailable, Oracle fails closed; use --remote-chrome.");
     return {
       mode: "hidden-window",
       launchesChrome: true,
-      mayFocusWindow: true,
-      summary: "launch Chrome and hide the window after startup",
+      mayFocusWindow: false,
+      summary: "launch a dedicated hidden background Chrome instance",
       guidance,
     };
   }
@@ -92,9 +92,7 @@ export function describeBrowserControlPlan(config: BrowserControlConfig = {}): B
       ? "Manual-login mode may show the persistent Oracle Chrome profile for sign-in or automation."
       : "A visible automation Chrome window may take focus while Oracle controls ChatGPT.",
   );
-  guidance.push(
-    "Use --browser-hide-window, --browser-attach-running, or --remote-chrome to reduce desktop disruption.",
-  );
+  guidance.push("Use --browser-hide-window or a dedicated --remote-chrome endpoint.");
   if (config.keepBrowser) {
     guidance.push(
       "Chrome will remain open after the run because --browser-keep-browser is enabled.",

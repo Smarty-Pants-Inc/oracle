@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { LaunchedChrome } from "chrome-launcher";
 
 const cdpNewMock = vi.fn();
 const cdpCloseMock = vi.fn();
@@ -24,6 +25,71 @@ vi.doMock("../../src/browser/profileState.js", async () => {
   };
 });
 
+describe("hidden macOS Chrome launch", () => {
+  test("uses a background-hidden app launch instead of the standard launcher", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const hiddenMacLaunch = vi.fn(
+      async () =>
+        ({
+          pid: 4321,
+          port: 9222,
+          process: undefined,
+          remoteDebuggingPipes: null,
+          kill: vi.fn(),
+        }) as unknown as LaunchedChrome & { host?: string },
+    );
+    const standardLaunch = vi.fn();
+    const logger = vi.fn<(message: string) => void>();
+
+    await launchChrome(
+      resolveBrowserConfig({ hideWindow: false, debugPort: 9222 }),
+      "/tmp/oracle-hidden-profile",
+      logger,
+      { platform: "darwin", hiddenMacLaunch, standardLaunch },
+    );
+
+    expect(hiddenMacLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({ userDataDir: "/tmp/oracle-hidden-profile", requestedPort: 9222 }),
+    );
+    expect(standardLaunch).not.toHaveBeenCalled();
+    expect(logger).toHaveBeenCalledWith(expect.stringContaining("hidden background Chrome"));
+  });
+
+  test("builds an open command that is hidden, backgrounded, and isolated", async () => {
+    const { buildHiddenMacChromeOpenArgs } = await import("../../src/browser/chromeLifecycle.js");
+
+    expect(
+      buildHiddenMacChromeOpenArgs("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", [
+        "--remote-debugging-port=9222",
+        "about:blank",
+      ]),
+    ).toEqual([
+      "-g",
+      "-j",
+      "-n",
+      "/Applications/Google Chrome.app",
+      "--args",
+      "--remote-debugging-port=9222",
+      "about:blank",
+    ]);
+  });
+
+  test("fails closed when hidden headful launch cannot be guaranteed", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+
+    await expect(
+      launchChrome(
+        resolveBrowserConfig({ hideWindow: true }),
+        "/tmp/oracle-hidden-profile",
+        vi.fn<(message: string) => void>(),
+        { platform: "linux" },
+      ),
+    ).rejects.toThrow(/use --remote-chrome/i);
+  });
+});
+
 describe("registerTerminationHooks", () => {
   test("clears stale DevToolsActivePort hints when preserving userDataDir", async () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
@@ -39,7 +105,7 @@ describe("registerTerminationHooks", () => {
     const userDataDir = "/tmp/oracle-manual-login-profile";
 
     const removeHooks = registerTerminationHooks(
-      chrome as unknown as import("chrome-launcher").LaunchedChrome,
+      chrome as unknown as LaunchedChrome,
       userDataDir,
       false,
       logger,

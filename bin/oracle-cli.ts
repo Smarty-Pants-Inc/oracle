@@ -485,8 +485,8 @@ program
   .addOption(
     new Option(
       "--browser-attach-running",
-      "Attach to a running local browser session instead of launching Chrome (defaults to 127.0.0.1:9222; combine with --remote-chrome to hint a different host:port).",
-    ),
+      "Disabled by the background-only browser policy; use --remote-chrome with a dedicated background browser.",
+    ).hideHelp(),
   )
   .addOption(
     new Option(
@@ -675,7 +675,7 @@ program
   .addOption(
     new Option(
       "--remote-chrome <host:port>",
-      "Connect to remote Chrome DevTools Protocol, or when combined with --browser-attach-running use this host:port as the local attach hint.",
+      "Connect to a dedicated background Chrome DevTools Protocol endpoint.",
     ),
   )
   .option(
@@ -2340,7 +2340,7 @@ function printDebugHelp(cliName: string): void {
     ["--browser-cookie-path <path>", "Use a specific Chrome/Chromium cookie store file."],
     [
       "--browser-attach-running",
-      "Attach to your current Chrome session through its local remote debugging toggle.",
+      "Disabled by the background-only policy; use a dedicated --remote-chrome endpoint.",
     ],
     ["--browser-url <url>", "Alias for --chatgpt-url."],
     ["--browser-timeout <ms|s|m>", "Cap total wait time for the assistant response."],

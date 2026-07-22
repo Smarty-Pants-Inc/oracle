@@ -103,30 +103,121 @@ export function resolveSessionTabRefForTest(meta: SessionMetadata): string {
   return resolveSessionTabRef(meta);
 }
 
+function normalizeHarvestComparison(text: string): string {
+  return String(text ?? "")
+    .replace(/\s*attachments-bundle(?:\(\d+\))?(?:\.txtDocument)?\s*/giu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stableProjectKey(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const segment = new URL(value).pathname.match(/^\/g\/([^/]+)/u)?.[1];
+    if (!segment) return null;
+    return (segment.match(/^(g-p-[0-9a-f]+)/iu)?.[1] ?? segment).toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+export function recoverBrowserMetadataFromHarvestForTest(
+  meta: SessionMetadata,
+  harvested: ChatGptTabSummary,
+  persistedOutput?: string,
+): NonNullable<SessionMetadata["browser"]> {
+  const browser = meta.browser ?? {};
+  const conversationId = harvested.conversationId ?? extractConversationIdFromUrl(harvested.url);
+  const promptPreview = normalizeHarvestComparison(meta.promptPreview ?? "");
+  const harvestedPrompt = normalizeHarvestComparison(
+    harvested.lastUserText || harvested.lastUserSnippet,
+  );
+  const promptMatched = Boolean(
+    promptPreview && harvestedPrompt && harvestedPrompt.startsWith(promptPreview),
+  );
+  const outputMatched = Boolean(
+    persistedOutput &&
+    normalizeHarvestComparison(persistedOutput) ===
+      normalizeHarvestComparison(
+        harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "",
+      ),
+  );
+  const configuredProject = stableProjectKey(browser.config?.url);
+  const harvestedProject = stableProjectKey(harvested.url);
+  const existingConversationIds = [
+    browser.runtime?.conversationId,
+    extractConversationIdFromUrl(browser.runtime?.tabUrl ?? ""),
+    extractConversationIdFromUrl(browser.archive?.conversationUrl ?? ""),
+  ].filter((value): value is string => Boolean(value));
+  const runtimeRepaired = Boolean(
+    conversationId &&
+    harvested.targetId &&
+    harvested.state === "completed" &&
+    harvested.stopExists === false &&
+    harvested.assistantCount > 0 &&
+    harvested.currentModelLabel.trim() &&
+    promptMatched &&
+    outputMatched &&
+    (!configuredProject || configuredProject === harvestedProject) &&
+    existingConversationIds.every((value) => value === conversationId),
+  );
+  const harvest = {
+    targetId: harvested.targetId,
+    url: harvested.url,
+    conversationId,
+    harvestedAt: new Date().toISOString(),
+    assistantHash: createHash("sha1")
+      .update(harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "")
+      .digest("hex"),
+    state: harvested.state,
+    stopExists: harvested.stopExists,
+    sendExists: harvested.sendExists,
+    assistantCount: harvested.assistantCount,
+    currentModelLabel: harvested.currentModelLabel,
+    lastAssistantSnippet: harvested.lastAssistantSnippet,
+    lastUserSnippet: harvested.lastUserSnippet,
+    outputMatched,
+    promptMatched,
+    runtimeRepaired,
+  };
+  if (!runtimeRepaired || !conversationId) {
+    return { ...browser, harvest };
+  }
+  return {
+    ...browser,
+    runtime: {
+      ...(browser.runtime ?? {}),
+      chromeTargetId: harvested.targetId,
+      tabUrl: harvested.url,
+      conversationId,
+    },
+    archive: {
+      ...(browser.archive ?? {
+        mode: browser.config?.archiveConversations ?? "never",
+        attempted: false,
+        archived: false,
+      }),
+      conversationUrl: harvested.url,
+    },
+    harvest,
+  };
+}
+
 async function persistHarvest(
   sessionId: string,
   meta: SessionMetadata,
   harvested: ChatGptTabSummary,
 ): Promise<void> {
-  const hash = createHash("sha1")
-    .update(harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "")
-    .digest("hex");
-  const browser = {
-    ...(meta.browser ?? {}),
-    harvest: {
-      targetId: harvested.targetId,
-      url: harvested.url,
-      conversationId: harvested.conversationId ?? extractConversationIdFromUrl(harvested.url),
-      harvestedAt: new Date().toISOString(),
-      assistantHash: hash,
-      state: harvested.state,
-      stopExists: harvested.stopExists,
-      sendExists: harvested.sendExists,
-      assistantCount: harvested.assistantCount,
-      currentModelLabel: harvested.currentModelLabel,
-      lastAssistantSnippet: harvested.lastAssistantSnippet,
-    },
-  };
+  let persistedOutput: string | undefined;
+  try {
+    const outputPath = resolveOutputPath(meta.options.writeOutputPath, meta.cwd ?? process.cwd());
+    if (outputPath && outputPath !== "-" && outputPath !== "/dev/stdout") {
+      persistedOutput = await fs.readFile(outputPath, "utf8");
+    }
+  } catch {
+    // Harvesting remains useful even when the original output artifact is unavailable.
+  }
+  const browser = recoverBrowserMetadataFromHarvestForTest(meta, harvested, persistedOutput);
   await sessionStore.updateSession(sessionId, { browser });
 }
 

@@ -102,6 +102,10 @@ export interface BrowserHarvestMetadata {
   assistantCount?: number;
   currentModelLabel?: string;
   lastAssistantSnippet?: string;
+  lastUserSnippet?: string;
+  outputMatched?: boolean;
+  promptMatched?: boolean;
+  runtimeRepaired?: boolean;
 }
 
 export interface BrowserMetadata {

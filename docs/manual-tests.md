@@ -215,21 +215,15 @@ Run this whenever you touch CDP connection logic (remote chrome lifecycle, attac
 
 Capture the pass/fail result (include the helper’s log snippet) in your PR description alongside other manual browser tests.
 
-### Attach-running smoke test
+### Background-only Chrome smoke test
 
-Run this whenever you touch the local attach path (`--browser-attach-running`) or the direct browser websocket bootstrap.
+Run this whenever you touch local Chrome launch or direct browser websocket bootstrap.
 
-1. Start or reuse a local signed-in Chrome with DevTools access available. If you want an explicit local endpoint, launch Chrome with `--remote-debugging-port=9222`.
-2. Run Oracle against the running browser:
-   ```bash
-   pnpm run oracle -- --engine browser \
-     --browser-attach-running \
-     --model gpt-5.5 \
-     --prompt "Give me two short markdown bullets about browser tabs"
-   ```
-   If the browser’s remote-debugging UI shows a different local port, rerun with `--remote-chrome <host:port>` in addition to `--browser-attach-running`.
-3. Verify Oracle opens a fresh tab in the existing browser, returns the answer, and closes only that Oracle-owned tab afterward.
-4. Reattach sanity check: repeat with a very short timeout if needed, then run `oracle session <id>` and confirm Oracle can reconnect to the saved tab/conversation.
+1. Use a disposable MacBox guest so the test cannot disturb the host desktop.
+2. Launch a dedicated Chrome profile with `open -g -j -n`, a fixed remote-debugging port, and `about:blank`.
+3. Verify the guest's frontmost app is unchanged and `/json/version` returns a CDP websocket URL.
+4. Verify `--browser-attach-running` fails with `background-browser-policy` before browser discovery.
+5. Stop Chrome and delete the disposable guest.
 
 ## Chrome DevTools / MCP Debugging
 

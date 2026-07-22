@@ -645,6 +645,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const fallbackSubmission = options.fallbackSubmission;
 
   let config = resolveBrowserConfig(options.config);
+  if (config.attachRunning) {
+    throw new BrowserAutomationError(
+      "--browser-attach-running is disabled by Oracle's background-only policy; use --remote-chrome with a dedicated background browser instead.",
+      { stage: "background-browser-policy" },
+    );
+  }
   const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
   if (config.researchMode === "deep" && followUpPrompts.length > 0) {
     throw new BrowserAutomationError(
@@ -2463,6 +2469,14 @@ async function runRemoteBrowserMode(
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM } = client;
     browserRuntime = Runtime;
+    const updateConversationHint = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
+      const conversationUrl = await waitForConversationUrl(Runtime, timeoutMs);
+      if (!conversationUrl) return false;
+      lastUrl = conversationUrl;
+      logger(`[browser] conversation url (${label}) = ${lastUrl}`);
+      await emitRuntimeHint();
+      return true;
+    };
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -2641,7 +2655,7 @@ async function runRemoteBrowserMode(
         Page,
         client,
       );
-      await emitRuntimeHint();
+      await updateConversationHint("post-deep-research", 15_000).catch(() => false);
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
@@ -2891,6 +2905,7 @@ async function runRemoteBrowserMode(
           throw error;
         }
       }
+      await updateConversationHint("post-response", 15_000).catch(() => false);
       const baselineNormalized = baselineAssistantText
         ? normalizeForComparison(baselineAssistantText)
         : "";
@@ -3480,6 +3495,23 @@ async function readConversationTurnCount(
     }
   }
   return null;
+}
+
+export async function waitForConversationUrl(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs = 10_000,
+  pollIntervalMs = 250,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  for (let attempt = 0; Date.now() < deadline || attempt === 0; attempt += 1) {
+    const conversationUrl = await readConversationUrl(Runtime).catch(() => null);
+    if (conversationUrl && isConversationUrl(conversationUrl)) {
+      return conversationUrl;
+    }
+    if (Date.now() >= deadline) break;
+    await delay(pollIntervalMs);
+  }
+  return undefined;
 }
 
 function isConversationUrl(url: string): boolean {

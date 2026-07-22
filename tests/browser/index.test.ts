@@ -14,9 +14,18 @@ import {
   runSubmissionWithRecoveryForTest,
   shouldPreferSystemTmpDirForTest,
   shouldPreserveBrowserOnErrorForTest,
+  waitForConversationUrl,
 } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+
+describe("background-only browser policy", () => {
+  test("rejects attach-running before browser discovery can touch the primary browser", async () => {
+    await expect(
+      runBrowserMode({ prompt: "review", config: { attachRunning: true } }),
+    ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
+  });
+});
 
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {
@@ -581,5 +590,23 @@ describe("resolveRemoteTabLeaseProfileDirForTest", () => {
       manualLoginProfileDir: "/tmp/oracle-profile",
     });
     expect(resolveRemoteTabLeaseProfileDirForTest(uncoordinated)).toBeNull();
+  });
+});
+
+describe("waitForConversationUrl", () => {
+  test("waits past the project landing page and returns the exact conversation URL", async () => {
+    const evaluate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: { value: "https://chatgpt.com/g/g-p-demo/project" },
+      })
+      .mockResolvedValueOnce({
+        result: { value: "https://chatgpt.com/g/g-p-demo/c/conversation-123" },
+      });
+
+    await expect(waitForConversationUrl({ evaluate } as never, 100, 1)).resolves.toBe(
+      "https://chatgpt.com/g/g-p-demo/c/conversation-123",
+    );
+    expect(evaluate).toHaveBeenCalledTimes(2);
   });
 });
