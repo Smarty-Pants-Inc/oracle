@@ -159,6 +159,7 @@ describe("archiveChatGptConversation", () => {
     expect(expression).toContain("hasUnarchiveMenuItem");
     expect(expression).toContain("PointerEvent");
     expect(expression).toContain("waitForArchiveConfirmation");
+    expect(expression).toContain("Date.now() + 10_000");
     expect(expression).toContain("archive-not-confirmed");
     expect(expression).toContain("archive");
     expect(expression).not.toContain("delete");

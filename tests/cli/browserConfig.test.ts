@@ -14,7 +14,7 @@ describe("buildBrowserConfig", () => {
       cookieSync: undefined,
       headless: undefined,
       keepBrowser: undefined,
-      hideWindow: undefined,
+      hideWindow: true,
       desiredModel: "Pro",
       debug: undefined,
       allowCookieErrors: true,

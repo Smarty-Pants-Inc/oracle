@@ -22,6 +22,7 @@ describe("resolveBrowserConfig", () => {
     expect(resolved.cookieSync).toBe(!isWindows);
     expect(resolved.cookieNames).toEqual(DEFAULT_CHATGPT_COOKIE_NAMES);
     expect(resolved.headless).toBe(false);
+    expect(resolved.hideWindow).toBe(true);
     expect(resolved.manualLogin).toBe(isWindows);
     expect(resolved.profileLockTimeoutMs).toBe(300_000);
     expect(resolved.maxConcurrentTabs).toBe(3);
@@ -50,6 +51,7 @@ describe("resolveBrowserConfig", () => {
     expect(resolved.inputTimeoutMs).toBe(456);
     expect(resolved.cookieSync).toBe(false);
     expect(resolved.headless).toBe(true);
+    expect(resolved.hideWindow).toBe(false);
     expect(resolved.desiredModel).toBe("Custom");
     expect(resolved.chromeProfile).toBe("Profile 1");
     expect(resolved.chromePath).toBe("/Applications/Chrome");
@@ -58,6 +60,16 @@ describe("resolveBrowserConfig", () => {
     expect(resolved.maxConcurrentTabs).toBe(5);
     expect(resolved.researchMode).toBe("deep");
     expect(resolved.archiveConversations).toBe("never");
+  });
+
+  test("forces local headful browser runs into hidden background mode", () => {
+    expect(resolveBrowserConfig({ hideWindow: false }).hideWindow).toBe(true);
+    expect(
+      resolveBrowserConfig({
+        hideWindow: true,
+        remoteChrome: { host: "127.0.0.1", port: 9222 },
+      }).hideWindow,
+    ).toBe(false);
   });
 
   test("allows temporary chat URLs when desiredModel is Pro", () => {

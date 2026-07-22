@@ -109,6 +109,7 @@ describe("summarizeModelRunsForConsult", () => {
       archiveConversations: "never",
       desiredModel: "GPT-5.2",
       cookieSync: false,
+      hideWindow: true,
     });
   });
 

@@ -225,7 +225,7 @@ function buildArchiveConversationExpression(): string {
 	      );
 	    };
 	    const waitForArchiveConfirmation = async () => {
-	      const deadline = Date.now() + 3000;
+	      const deadline = Date.now() + 10_000;
 	      while (Date.now() < deadline) {
 	        if (conversationUrl && location.href !== conversationUrl) return true;
 	        if (hasArchiveConfirmation()) return true;

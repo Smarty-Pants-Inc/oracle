@@ -7,39 +7,75 @@ import { promisify } from "node:util";
 import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
-import { cleanupStaleProfileState } from "./profileState.js";
+import {
+  cleanupStaleProfileState,
+  findRunningChromeDebugTargetForProfile,
+  terminateRecordedChromeForProfile,
+  writeChromePid,
+} from "./profileState.js";
 import { delay } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
+
+export interface ChromeLaunchDeps {
+  platform?: NodeJS.Platform;
+  standardLaunch?: typeof launch;
+  customHostLaunch?: typeof launchWithCustomHost;
+  hiddenMacLaunch?: typeof launchHiddenMacChrome;
+}
 
 export async function launchChrome(
   config: ResolvedBrowserConfig,
   userDataDir: string,
   logger: BrowserLogger,
+  deps: ChromeLaunchDeps = {},
 ) {
   const connectHost = resolveRemoteDebugHost();
   const debugBindAddress = connectHost && connectHost !== "127.0.0.1" ? "0.0.0.0" : connectHost;
   const debugPort = config.debugPort ?? parseDebugPortEnv();
   const chromeFlags = buildChromeFlags(config.headless ?? false, debugBindAddress);
-  const usePatchedLauncher = Boolean(connectHost && connectHost !== "127.0.0.1");
-  const launcher = usePatchedLauncher
-    ? await launchWithCustomHost({
-        chromeFlags,
-        chromePath: config.chromePath ?? undefined,
-        userDataDir,
-        host: connectHost ?? "127.0.0.1",
-        requestedPort: debugPort ?? undefined,
-      })
-    : await launch({
-        chromePath: config.chromePath ?? undefined,
-        chromeFlags,
-        userDataDir,
-        handleSIGINT: false,
-        port: debugPort ?? undefined,
-      });
+  const platform = deps.platform ?? process.platform;
+  const hiddenHeadfulLaunch = !config.headless;
+  let launcher: LaunchedChrome & { host?: string };
+
+  if (hiddenHeadfulLaunch) {
+    if (platform !== "darwin") {
+      throw new Error(
+        "Hidden background Chrome launch is only supported on macOS; use --remote-chrome instead of opening a visible browser.",
+      );
+    }
+    launcher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
+      chromeFlags,
+      chromePath: config.chromePath ?? undefined,
+      userDataDir,
+      requestedPort: debugPort ?? undefined,
+    });
+  } else {
+    const usePatchedLauncher = Boolean(connectHost && connectHost !== "127.0.0.1");
+    launcher = usePatchedLauncher
+      ? await (deps.customHostLaunch ?? launchWithCustomHost)({
+          chromeFlags,
+          chromePath: config.chromePath ?? undefined,
+          userDataDir,
+          host: connectHost ?? "127.0.0.1",
+          requestedPort: debugPort ?? undefined,
+        })
+      : Object.assign(
+          await (deps.standardLaunch ?? launch)({
+            chromePath: config.chromePath ?? undefined,
+            chromeFlags,
+            userDataDir,
+            handleSIGINT: false,
+            port: debugPort ?? undefined,
+          }),
+          { host: "127.0.0.1" },
+        );
+  }
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
-  logger(`Launched Chrome${pidLabel} on port ${launcher.port}${hostLabel}`);
+  logger(
+    `${hiddenHeadfulLaunch ? "Launched hidden background Chrome" : "Launched Chrome"}${pidLabel} on port ${launcher.port}${hostLabel}`,
+  );
   return Object.assign(launcher, { host: connectHost ?? "127.0.0.1" }) as LaunchedChrome & {
     host?: string;
   };
@@ -123,29 +159,10 @@ export function registerTerminationHooks(
 }
 
 export async function hideChromeWindow(
-  chrome: LaunchedChrome,
+  _chrome: LaunchedChrome,
   logger: BrowserLogger,
 ): Promise<void> {
-  if (process.platform !== "darwin") {
-    logger("Window hiding is only supported on macOS");
-    return;
-  }
-  if (!chrome.pid) {
-    logger("Unable to hide window: missing Chrome PID");
-    return;
-  }
-  const script = `tell application "System Events"
-    try
-      set visible of (first process whose unix id is ${chrome.pid}) to false
-    end try
-  end tell`;
-  try {
-    await execFileAsync("osascript", ["-e", script]);
-    logger("Chrome window hidden (Cmd-H)");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to hide Chrome window: ${message}`);
-  }
+  logger("Chrome is already running hidden in the background; no foreground window action needed.");
 }
 
 export async function connectToChrome(
@@ -598,6 +615,102 @@ function isBlankPageTarget(target: { type?: string; url?: string }): boolean {
   }
   const url = (target.url ?? "").trim().toLowerCase();
   return url === "about:blank" || url === "chrome://newtab/" || url === "chrome://new-tab-page/";
+}
+
+export function buildHiddenMacChromeOpenArgs(chromePath: string, chromeArgs: string[]): string[] {
+  const lower = chromePath.toLowerCase();
+  const bundleMarker = ".app/";
+  const bundleIndex = lower.indexOf(bundleMarker);
+  const appPath = bundleIndex >= 0 ? chromePath.slice(0, bundleIndex + 4) : chromePath;
+  if (!appPath.toLowerCase().endsWith(".app")) {
+    throw new Error(
+      `Cannot guarantee a hidden macOS launch for Chrome path ${chromePath}; use an .app bundle or --remote-chrome.`,
+    );
+  }
+  return ["-g", "-j", "-n", appPath, "--args", ...chromeArgs];
+}
+
+async function launchHiddenMacChrome({
+  chromeFlags,
+  chromePath,
+  userDataDir,
+  requestedPort,
+}: {
+  chromeFlags: string[];
+  chromePath?: string | null;
+  userDataDir: string;
+  requestedPort?: number;
+}): Promise<LaunchedChrome & { host?: string }> {
+  const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
+  if (!resolvedChromePath) {
+    throw new Error("Chrome is not installed.");
+  }
+  const port = requestedPort ?? (await reserveLoopbackPort());
+  const chromeArgs = [
+    ...Launcher.defaultFlags(),
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    ...chromeFlags,
+    "about:blank",
+  ];
+  await execFileAsync(
+    "/usr/bin/open",
+    buildHiddenMacChromeOpenArgs(resolvedChromePath, chromeArgs),
+  );
+  await waitForDebugPort(port);
+  const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
+  if (!discovered || discovered.port !== port) {
+    throw new Error(
+      `Hidden Chrome started on port ${port}, but its process could not be identified.`,
+    );
+  }
+  await writeChromePid(userDataDir, discovered.pid);
+  return {
+    pid: discovered.pid,
+    port,
+    process: undefined,
+    remoteDebuggingPipes: null,
+    kill: async () => {
+      await terminateRecordedChromeForProfile(userDataDir);
+    },
+    host: "127.0.0.1",
+  } as unknown as LaunchedChrome & { host?: string };
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close((error) => {
+        if (error) reject(error);
+        else if (port > 0) resolve(port);
+        else reject(new Error("Failed to reserve a Chrome debugging port."));
+      });
+    });
+  });
+}
+
+async function waitForDebugPort(port: number, timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await new Promise<boolean>((resolve) => {
+      const socket = net.createConnection({ host: "127.0.0.1", port });
+      socket.once("connect", () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once("error", () => {
+        socket.destroy();
+        resolve(false);
+      });
+    });
+    if (ready) return;
+    await delay(250);
+  }
+  throw new Error(`Timed out waiting for hidden Chrome on port ${port}.`);
 }
 
 function buildChromeFlags(headless: boolean, debugBindAddress?: string | null): string[] {

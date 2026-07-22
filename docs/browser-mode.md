@@ -42,40 +42,36 @@ oracle --engine browser \
 
 You can pass the same payload inline (`--browser-inline-cookies '<json or base64>'`) or via env (`ORACLE_BROWSER_COOKIES_JSON`, `ORACLE_BROWSER_COOKIES_FILE`). Cloudflare cookies (`cf_clearance`, `__cf_bm`, etc.) are only needed when you hit a challenge.
 
-## Quick example: attach to your running Chrome
+## Quick example: dedicated background Chrome CDP
 
-Use this when you already have a signed-in Chrome session running with DevTools access enabled and want Oracle to reuse that browser instead of launching its own copy.
+Use a separate Oracle-only profile and background app instance. Never point
+Oracle at the primary/user browser.
 
 ```bash
+open -g -j -n "/Applications/Google Chrome.app" --args \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.oracle/browser-profile-hidden" \
+  about:blank
+
 oracle --engine browser \
-  --browser-attach-running \
+  --remote-chrome 127.0.0.1:9222 \
   --model "GPT-5.6 Sol Pro" \
   -p "Summarize the last assistant response in one paragraph"
 ```
 
 Notes:
 
-- `--browser-attach-running` defaults to local attach discovery at `127.0.0.1:9222`.
-- If the browser UI shows a different local endpoint, you can point Oracle at it explicitly:
-  ```bash
-  oracle --engine browser \
-    --browser-attach-running \
-    --remote-chrome 127.0.0.1:63332 \
-    --model "GPT-5.6 Sol Pro" \
-    -p "Summarize the last assistant response in one paragraph"
-  ```
-- Oracle reads local `DevToolsActivePort` metadata, connects to the browser websocket directly, and then reuses the normal CDP automation flow.
-- If Chrome shows a remote-debugging approval prompt on first attach, Oracle issues one attach request and waits briefly for you to allow it before failing.
-- Attach mode always opens a fresh Oracle-owned tab and closes only that tab after a successful run.
-- Cookie sync, Chrome launch flags, and profile lifecycle flags are skipped because the browser is already running.
-- If Chrome is not exposing a classic `/json/version` endpoint, use `--browser-attach-running` instead of standalone `--remote-chrome`.
+- Local headful launches use the same `open -g -j -n` hidden/background mechanism automatically.
+- `--browser-attach-running` is disabled by this fork's background-only policy.
+- Remote mode opens a fresh Oracle-owned tab and closes only that tab after a successful run.
+- If a dedicated hidden launch cannot be guaranteed, Oracle fails closed instead of using a visible fallback.
 
 ## Current Pipeline
 
 1. **Prompt assembly** – we reuse the normal prompt builder (`buildPrompt`) and the markdown renderer. Browser mode pastes the system + user text (no special markers) into the ChatGPT composer and, by default, pastes resolved file contents inline until the total pasted content reaches ~60k characters (then switches to uploads).
 2. **Automation stack** – code lives under `src/browser/`:
-   - Launcher mode starts Chrome via `chrome-launcher` and connects with `chrome-remote-interface`.
-   - Attach-running mode reads local `DevToolsActivePort` metadata for the selected local port, connects to the browser websocket, opens a dedicated tab, and reuses the same DOM automation/capture flow against that attached browser.
+   - Launcher mode starts a separate hidden macOS Chrome app with `open -g -j -n` and connects with `chrome-remote-interface`.
+   - Remote mode connects only to an explicitly supplied dedicated Chrome CDP endpoint and opens an Oracle-owned tab.
    - Launcher mode can optionally copy cookies from the requested browser profile via Oracle’s built-in cookie reader (Keychain/DPAPI aware) so you stay signed in.
    - Navigates to `chatgpt.com`, switches the model to the requested GPT-5.6 Sol Pro / GPT-5.5 / GPT-5.4 / GPT-5.2 variant, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the markdown via the built-in “copy turn” button.
    - Immediately probes `/backend-api/me` in the ChatGPT tab to verify the session is authenticated; if the endpoint returns 401/403 we abort early with a login-specific error instead of timing out waiting for the composer.
@@ -89,7 +85,7 @@ Notes:
 - `--engine browser`: enables browser mode (legacy `--browser` remains as an alias for now). Without `--engine`, Oracle chooses API when `OPENAI_API_KEY` exists, otherwise browser.
 - `--browser-chrome-profile`, `--browser-chrome-path`: cookie source + binary override (defaults to the standard `"Default"` Chrome profile so existing ChatGPT logins carry over).
 - `--browser-cookie-path`: explicit path to the Chrome/Chromium/Edge `Cookies` SQLite DB. Handy when you launch a fork via `--browser-chrome-path` and want to copy its session cookies; see [docs/chromium-forks.md](chromium-forks.md) for examples.
-- `--browser-attach-running`: attach to a local already-running browser instead of launching Chrome directly. Defaults to `127.0.0.1:9222`; combine with `--remote-chrome <host:port>` to use a different local attach hint.
+- `--remote-chrome <host:port>`: connect to a dedicated background Chrome CDP endpoint. `--browser-attach-running` is rejected so Oracle cannot discover or control the primary browser.
 - `--chatgpt-url`: override the ChatGPT base URL. Works with the root homepage (`https://chatgpt.com/`), Temporary Chat (`https://chatgpt.com/?temporary-chat=true`), **or** a specific workspace/folder link such as `https://chatgpt.com/g/.../project`. `--browser-url` stays as a hidden alias.
 - `--browser-timeout`, `--browser-input-timeout`: `1200s (20m)`/`60s` defaults. Durations accept `ms`, `s`, `m`, or `h` and can be chained (`1h2m10s`).
 - `--browser-recheck-delay`, `--browser-recheck-timeout`: after an assistant timeout, wait the delay, revisit the conversation, and retry capture (default recheck timeout 120s). Useful for Pro runs that finish later.

@@ -70,7 +70,7 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 | `--chatgpt-url <url>`                                        | Target a ChatGPT workspace / project folder.                                     |
 | `--browser-model-strategy <select\|current\|ignore>`         | Control ChatGPT model picker.                                                    |
 | `--browser-manual-login`                                     | Use persistent profile + manual login (no Keychain).                             |
-| `--browser-attach-running`                                   | Attach to your already-running Chrome via DevTools.                              |
+| `--browser-attach-running`                                   | Disabled; use a dedicated `--remote-chrome` endpoint.                            |
 | `--browser-tab <ref>`                                        | Reuse an existing tab (`current`, id, URL, title substring).                     |
 | `--browser-thinking-time <light\|standard\|extended\|heavy>` | Pro / Thinking model intensity.                                                  |
 | `--browser-research deep`                                    | Activate Deep Research mode.                                                     |
