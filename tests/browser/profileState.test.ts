@@ -66,6 +66,58 @@ describe("profileState", () => {
     }
   });
 
+  test("waits for Chrome profile processes before returning from termination", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const profile = process.argv[1];
+          process.on("SIGTERM", () => process.send?.("sigterm"));
+          process.on("message", (message) => {
+            if (message !== "exit") return;
+            fs.mkdirSync(profile, { recursive: true });
+            fs.writeFileSync(path.join(profile, "late-write"), "late");
+            process.exit(0);
+          });
+          process.send?.("ready");
+        `,
+        dir,
+        "chrome",
+        `--user-data-dir=${dir}`,
+      ],
+      { stdio: ["ignore", "ignore", "ignore", "ipc"] },
+    );
+
+    try {
+      if (!child.pid) throw new Error("Failed to start Chrome fixture");
+      await once(child, "message");
+      await profileState.writeChromePid(dir, child.pid);
+
+      const signalReceived = once(child, "message").then(([message]) => {
+        expect(message).toBe("sigterm");
+        return "signal" as const;
+      });
+      const termination = profileState.terminateRecordedChromeForProfile(dir);
+      await expect(
+        Promise.race([termination.then(() => "terminated" as const), signalReceived]),
+      ).resolves.toBe("signal");
+
+      child.send("exit");
+      await expect(termination).resolves.toBe(true);
+      expect(profileState.isProcessAlive(child.pid)).toBe(false);
+
+      await rm(dir, { recursive: true, force: true });
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("skips manual-login cleanup when DevTools port is still reachable", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {

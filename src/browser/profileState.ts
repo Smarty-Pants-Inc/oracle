@@ -17,6 +17,9 @@ const CHROME_PID_FILENAME = "chrome.pid";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
 
 const execFileAsync = promisify(execFile);
+const CHROME_TERMINATION_TIMEOUT_MS = 5_000;
+const CHROME_FORCE_TERMINATION_TIMEOUT_MS = 2_000;
+const CHROME_TERMINATION_POLL_MS = 50;
 
 export function getDevToolsActivePortPaths(userDataDir: string): string[] {
   return DEVTOOLS_ACTIVE_PORT_RELATIVE_PATHS.map((relative) => path.join(userDataDir, relative));
@@ -140,13 +143,42 @@ export async function terminateRecordedChromeForProfile(
   }
   try {
     process.kill(pid, "SIGTERM");
-    logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
-    return true;
+    if (await waitForChromeProfileProcessesToExit(userDataDir, CHROME_TERMINATION_TIMEOUT_MS)) {
+      logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
+      return true;
+    }
+
+    const currentCommand = await readProcessCommand(pid);
+    if (!isChromeCommandForUserDataDir(currentCommand, userDataDir)) {
+      logger?.(`Chrome pid ${pid} changed before forced termination; skipping SIGKILL`);
+      return false;
+    }
+    process.kill(pid, "SIGKILL");
+    if (
+      await waitForChromeProfileProcessesToExit(userDataDir, CHROME_FORCE_TERMINATION_TIMEOUT_MS)
+    ) {
+      logger?.(`Force-terminated shared manual-login Chrome pid ${pid}`);
+      return true;
+    }
+    logger?.(`Chrome processes for ${userDataDir} did not exit after SIGKILL`);
+    return false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger?.(`Failed to terminate shared manual-login Chrome pid ${pid}: ${message}`);
     return false;
   }
+}
+
+async function waitForChromeProfileProcessesToExit(
+  userDataDir: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (await isChromeUsingUserDataDir(userDataDir)) {
+    if (Date.now() >= deadline) return false;
+    await delay(CHROME_TERMINATION_POLL_MS);
+  }
+  return true;
 }
 
 function isChromeCommandForUserDataDir(command: string | null, userDataDir: string): boolean {

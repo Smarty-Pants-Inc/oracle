@@ -2,6 +2,10 @@
 
 ## 0.17.1 — Unreleased
 
+### Fixed
+
+- Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
+
 ## 0.17.0 — 2026-08-02
 
 ### Added
