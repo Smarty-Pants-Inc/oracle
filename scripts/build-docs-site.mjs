@@ -621,7 +621,7 @@ function layout({ page, html, toc, prev, next, sectionName }) {
       <div class="sidebar-head">
         <a class="brand" href="${hrefToOutRel("index.html", page.outRel)}" aria-label="${productName} docs home">
           <span class="mark" aria-hidden="true"></span>
-          <span><strong>${escapeHtml(productName)}</strong><small>askoracle.dev</small></span>
+          <span><strong>${escapeHtml(productName)}</strong><small>askoracle.sh</small></span>
         </a>
         ${themeToggleHtml()}
       </div>

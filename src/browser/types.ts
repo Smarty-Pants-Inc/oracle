@@ -1,6 +1,10 @@
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
-import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type {
+  BrowserModelSelectionEvidence,
+  BrowserRunWarning,
+  BrowserRuntimeMetadata,
+} from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
@@ -19,6 +23,7 @@ export interface BrowserAttachment {
   path: string;
   displayPath: string;
   sizeBytes?: number;
+  generatedBundle?: boolean;
 }
 
 export interface BrowserGeneratedImage {
@@ -29,6 +34,15 @@ export interface BrowserGeneratedImage {
   fileId?: string;
 }
 
+export interface BrowserDownloadableFile {
+  url: string;
+  downloadUrl?: string;
+  sandboxUrl?: string;
+  filename?: string;
+  label?: string;
+  mimeType?: string;
+}
+
 export interface SavedBrowserImage extends SessionArtifact {
   kind: "image";
   url: string;
@@ -37,6 +51,14 @@ export interface SavedBrowserImage extends SessionArtifact {
   width?: number;
   height?: number;
   fileId?: string;
+}
+
+export interface SavedBrowserFile extends SessionArtifact {
+  kind: "file";
+  url: string;
+  finalUrl?: string;
+  sandboxUrl?: string;
+  filename?: string;
 }
 
 export interface BrowserAutomationConfig {
@@ -50,6 +72,8 @@ export interface BrowserAutomationConfig {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for attachment upload/readiness before clicking send. */
+  attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
   assistantRecheckDelayMs?: number;
   /** Time budget for the delayed recheck attempt. */
@@ -84,12 +108,16 @@ export interface BrowserAutomationConfig {
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
+  /** Copy this signed-in Chrome user-data dir to a throwaway profile and run against it (login-free). */
+  copyProfileSource?: string | null;
   /** Thinking time intensity level for Thinking/Pro models: light, standard, extended, heavy */
   thinkingTime?: ThinkingTimeLevel;
   /** Browser-only research mode. "deep" activates ChatGPT Deep Research. */
   researchMode?: BrowserResearchMode;
   /** Archive completed ChatGPT conversations after local artifacts are saved. */
   archiveConversations?: BrowserArchiveMode;
+  /** Existing ChatGPT conversation URL to open before submitting the prompt. */
+  resumeConversationUrl?: string | null;
 }
 
 export interface BrowserRunOptions {
@@ -112,8 +140,17 @@ export interface BrowserRunOptions {
   outputPath?: string;
   /** Additional prompts to submit in the same browser conversation after the initial answer. */
   followUpPrompts?: string[];
-  /** Optional hook to persist runtime info (port/url/target) as soon as Chrome is ready. */
-  runtimeHintCb?: (hint: BrowserRuntimeMetadata) => void | Promise<void>;
+  /**
+   * Close a newly-created completed run tab even when the owning Chrome process
+   * must remain alive. Used by long-lived shared browser services; incomplete
+   * and attached-existing tabs are still preserved for recovery/user ownership.
+   */
+  closeOwnedTabOnComplete?: boolean;
+  /** Optional hook to persist runtime info and current model evidence as soon as Chrome is ready. */
+  runtimeHintCb?: (
+    hint: BrowserRuntimeMetadata,
+    modelSelection?: BrowserModelSelectionEvidence,
+  ) => void | Promise<void>;
 }
 
 export interface BrowserArchiveResult {
@@ -132,7 +169,11 @@ export interface BrowserRunResult {
   artifacts?: SessionArtifact[];
   generatedImages?: BrowserGeneratedImage[];
   savedImages?: SavedBrowserImage[];
+  downloadableFiles?: BrowserDownloadableFile[];
+  savedFiles?: SavedBrowserFile[];
   archive?: BrowserArchiveResult;
+  modelSelection?: BrowserModelSelectionEvidence;
+  warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;
   answerChars: number;
@@ -146,6 +187,7 @@ export interface BrowserRunResult {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
+  promptSubmitted?: boolean;
   controllerPid?: number;
 }
 
@@ -163,6 +205,7 @@ export type ResolvedBrowserConfig = Required<
     | "modelStrategy"
     | "maxConcurrentTabs"
     | "researchMode"
+    | "copyProfileSource"
   >
 > & {
   chromeProfile?: string | null;
@@ -181,6 +224,7 @@ export type ResolvedBrowserConfig = Required<
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
+  copyProfileSource?: string | null;
   maxConcurrentTabs: number;
   researchMode: BrowserResearchMode;
   archiveConversations: BrowserArchiveMode;

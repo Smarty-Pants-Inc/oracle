@@ -1,5 +1,10 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
-import { CLOUDFLARE_SCRIPT_SELECTOR, CLOUDFLARE_TITLE, INPUT_SELECTORS } from "../constants.js";
+import {
+  CLOUDFLARE_SCRIPT_SELECTOR,
+  CLOUDFLARE_TITLE,
+  CONVERSATION_TURN_SELECTOR,
+  INPUT_SELECTORS,
+} from "../constants.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
@@ -227,6 +232,201 @@ export async function navigateToPromptReadyWithFallback(
   }
 }
 
+type ChatModeProbeResult = {
+  status:
+    | "chat-selected"
+    | "chat-conversation"
+    | "work-selected"
+    | "work-conversation"
+    | "conversation-unresolved"
+    | "controls-absent"
+    | "mode-unresolved";
+  chatPoint?: { x: number; y: number };
+};
+
+function buildChatModeProbeExpression(): string {
+  return `(() => {
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const isVisible = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    };
+    const isSelected = (node) =>
+      node?.getAttribute?.('aria-checked') === 'true' ||
+      node?.getAttribute?.('data-state') === 'on';
+    const conversationIdFromPath = (value) => {
+      const match = String(value || '').match(/\\/c\\/([a-zA-Z0-9-]+)/);
+      return match?.[1] || null;
+    };
+    const isStructuredWorkBadge = (node) =>
+      node instanceof HTMLElement &&
+      node.tagName === 'SPAN' &&
+      normalize(node.textContent) === 'work' &&
+      node.childElementCount === 0 &&
+      !node.hasAttribute('dir') &&
+      node.classList.contains('shrink-0') &&
+      node.parentElement?.matches('span.flex.items-center');
+
+    const pathname = typeof location?.pathname === 'string' ? location.pathname : '';
+    const conversationId = conversationIdFromPath(pathname);
+    if (conversationId) {
+      // Conversation messages can contain same-origin links to the current thread. Only sidebar
+      // history items use ChatGPT's renderer-owned menu-item anchor class.
+      const activeHistoryLinks = Array.from(
+        document.querySelectorAll('a.__menu-item[href*="/c/"]'),
+      ).filter((node) => {
+        try {
+          const candidateUrl = new URL(node.getAttribute('href') || '', location.origin);
+          return candidateUrl.origin === location.origin && conversationIdFromPath(candidateUrl.pathname) === conversationId;
+        } catch {
+          return false;
+        }
+      });
+      if (activeHistoryLinks.length > 0) {
+        const hasWorkBadge = activeHistoryLinks.some((link) =>
+          Array.from(link.querySelectorAll('span')).some(isStructuredWorkBadge),
+        );
+        if (hasWorkBadge) return { status: 'work-conversation' };
+
+        const ariaLabels = activeHistoryLinks
+          .map((link) => normalize(link.getAttribute('aria-label')))
+          .filter(Boolean);
+        if (ariaLabels.length === 0 || ariaLabels.some((aria) => /,\\s*work\\s*$/.test(aria))) {
+          return { status: 'conversation-unresolved' };
+        }
+        return { status: 'chat-conversation' };
+      }
+      return { status: 'conversation-unresolved' };
+    }
+
+    const radios = Array.from(document.querySelectorAll('button[role="radio"]')).filter(isVisible);
+    const chat = radios.find((node) => normalize(node.textContent) === 'chat');
+    const work = radios.find((node) => normalize(node.textContent) === 'work');
+    if (!chat && !work) return { status: 'controls-absent' };
+    if (!chat || !work) return { status: 'mode-unresolved' };
+    if (isSelected(chat)) return { status: 'chat-selected' };
+    if (isSelected(work)) {
+      const rect = chat.getBoundingClientRect();
+      return {
+        status: 'work-selected',
+        chatPoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+      };
+    }
+    return { status: 'mode-unresolved' };
+  })()`;
+}
+
+export async function ensureChatMode(
+  Runtime: ChromeClient["Runtime"],
+  Input: ChromeClient["Input"],
+  timeoutMs: number,
+  logger: BrowserLogger,
+  options: { pollMs?: number; resetWorkConversation?: () => Promise<void> } = {},
+): Promise<"chat" | "switched" | "unavailable"> {
+  const verificationWindowMs = Math.min(Math.max(0, timeoutMs), 10_000);
+  let deadline = Date.now() + verificationWindowMs;
+  const pollMs = Math.max(0, options.pollMs ?? 200);
+  let changedFromWork = false;
+  let clickedChat = false;
+
+  for (;;) {
+    const outcome = await Runtime.evaluate({
+      expression: buildChatModeProbeExpression(),
+      returnByValue: true,
+    });
+    const probe = outcome.result?.value as ChatModeProbeResult | undefined;
+    if (probe?.status === "chat-selected" || probe?.status === "chat-conversation") {
+      logger(changedFromWork ? "ChatGPT mode: Chat (switched from Work)" : "ChatGPT mode: Chat");
+      return changedFromWork ? "switched" : "chat";
+    }
+    if (probe?.status === "conversation-unresolved") {
+      if (Date.now() < deadline) {
+        await delay(pollMs);
+        continue;
+      }
+      if (changedFromWork) break;
+      if (options.resetWorkConversation) {
+        logger("ChatGPT conversation mode unresolved; opening a new Chat");
+        await options.resetWorkConversation();
+        changedFromWork = true;
+        deadline = Date.now() + verificationWindowMs;
+        await delay(pollMs);
+        continue;
+      }
+      throw new BrowserAutomationError(
+        "Oracle could not verify whether the selected ChatGPT conversation uses Chat or Work mode, so it cannot safely resume that conversation.",
+        { stage: "chat-mode-selection", details: { mode: "conversation-unresolved" } },
+      );
+    }
+    if (probe?.status === "controls-absent") {
+      if (changedFromWork) {
+        if (Date.now() < deadline) {
+          await delay(pollMs);
+          continue;
+        }
+        break;
+      }
+      return "unavailable";
+    }
+    if (probe?.status === "work-conversation") {
+      if (changedFromWork) break;
+      if (options.resetWorkConversation) {
+        logger("ChatGPT mode: Work conversation; opening a new Chat");
+        await options.resetWorkConversation();
+        changedFromWork = true;
+        deadline = Date.now() + verificationWindowMs;
+        await delay(pollMs);
+        continue;
+      }
+      throw new BrowserAutomationError(
+        "The selected ChatGPT tab is an existing Work conversation and cannot be resumed as an ordinary Chat conversation. Start a new Chat conversation instead.",
+        { stage: "chat-mode-selection", details: { mode: "work-conversation" } },
+      );
+    }
+    if (probe?.status === "work-selected" && !clickedChat && probe.chatPoint) {
+      logger("ChatGPT mode: Work; switching to Chat");
+      const { x, y } = probe.chatPoint;
+      await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+      await Input.dispatchMouseEvent({
+        type: "mousePressed",
+        x,
+        y,
+        button: "left",
+        clickCount: 1,
+      });
+      await Input.dispatchMouseEvent({
+        type: "mouseReleased",
+        x,
+        y,
+        button: "left",
+        clickCount: 1,
+      });
+      changedFromWork = true;
+      clickedChat = true;
+      deadline = Date.now() + verificationWindowMs;
+      await delay(pollMs);
+      continue;
+    }
+    if (Date.now() >= deadline) break;
+    await delay(pollMs);
+  }
+
+  await logDomFailure(Runtime, logger, "chat-mode-selection");
+  throw new BrowserAutomationError(
+    changedFromWork
+      ? "Oracle could not verify Chat mode after leaving Work."
+      : "ChatGPT exposed Chat/Work controls but Oracle could not verify the active mode.",
+    { stage: "chat-mode-selection", details: { changedFromWork, clickedChat } },
+  );
+}
+
+export function buildChatModeProbeExpressionForTest(): string {
+  return buildChatModeProbeExpression();
+}
+
 export async function ensureNotBlocked(
   Runtime: ChromeClient["Runtime"],
   headless: boolean,
@@ -248,6 +448,12 @@ export async function ensureNotBlocked(
 }
 
 const LOGIN_CHECK_TIMEOUT_MS = 5_000;
+const CHATGPT_ACCOUNT_EMAIL_ENV = "ORACLE_CHATGPT_ACCOUNT_EMAIL";
+
+function preferredChatGptAccountEmail(): string | null {
+  const email = process.env[CHATGPT_ACCOUNT_EMAIL_ENV]?.trim().toLowerCase();
+  return email ? email : null;
+}
 
 export async function ensureLoggedIn(
   Runtime: ChromeClient["Runtime"],
@@ -259,7 +465,7 @@ export async function ensureLoggedIn(
   } = {},
 ) {
   // Learned: ChatGPT can render the UI (project view) while auth silently failed.
-  // A backend-api probe plus DOM login CTA check catches both cases.
+  // Session state plus DOM login signals catch both valid and stale app shells.
   const outcome = await Runtime.evaluate({
     expression: buildLoginProbeExpression(LOGIN_CHECK_TIMEOUT_MS),
     awaitPromise: true,
@@ -268,32 +474,29 @@ export async function ensureLoggedIn(
   const probe = normalizeLoginProbe(outcome.result?.value);
   if (probe.ok) {
     logger(
-      `Login check passed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)})`,
+      `Login check passed (sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(probe.sessionAuthenticated)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(probe.domLoginCta)}, appAuthenticated=${Boolean(probe.appAuthenticated)})`,
     );
     return;
   }
-
-  if (options.failFastOnLoginCta && (probe.domLoginCta || probe.onAuthPage)) {
-    logger(
-      `Login probe failed fast (status=${probe.status}, domLoginCta=${Boolean(
-        probe.domLoginCta,
-      )}, onAuthPage=${Boolean(probe.onAuthPage)}, url=${probe.pageUrl ?? "n/a"})`,
-    );
+  if (options.failFastOnLoginCta && probe.domLoginCta) {
+    await logDomFailure(Runtime, logger, "login-required");
     throw new BrowserAutomationError(
-      "ChatGPT login UI is visible; ask the user to sign in and provide an active ChatGPT session/cookies before retrying hidden browser automation.",
+      "ChatGPT login UI is visible; sign in through the Oracle automation profile before retrying hidden browser automation.",
       {
         stage: "login-required",
         code: "login-required",
-        status: probe.status,
-        domLoginCta: Boolean(probe.domLoginCta),
-        onAuthPage: Boolean(probe.onAuthPage),
         pageUrl: probe.pageUrl ?? null,
+        status: probe.status ?? null,
       },
     );
   }
 
-  const accepted = await attemptWelcomeBackLogin(Runtime, logger);
-  if (accepted) {
+  const welcomeBack = await attemptWelcomeBackLogin(
+    Runtime,
+    logger,
+    preferredChatGptAccountEmail(),
+  );
+  if (welcomeBack.accepted) {
     // Learned: "Welcome back" account picker needs a click even when cookies are valid,
     // and the redirect can lag, so re-probe before failing hard.
     await delay(1500);
@@ -308,16 +511,22 @@ export async function ensureLoggedIn(
       return;
     }
     logger(
-      `Login retry after Welcome back failed (status=${retryProbe.status}, domLoginCta=${Boolean(
+      `Login retry after Welcome back failed (sessionStatus=${retryProbe.status}, sessionAuthenticated=${Boolean(
+        retryProbe.sessionAuthenticated,
+      )}, backendStatus=${retryProbe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
         retryProbe.domLoginCta,
-      )})`,
+      )}, appAuthenticated=${Boolean(retryProbe.appAuthenticated)})`,
     );
   }
 
   logger(
-    `Login probe failed (status=${probe.status}, domLoginCta=${Boolean(probe.domLoginCta)}, onAuthPage=${Boolean(
-      probe.onAuthPage,
-    )}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`,
+    `Login probe failed (sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(
+      probe.sessionAuthenticated,
+    )}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
+      probe.domLoginCta,
+    )}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(
+      probe.appAuthenticated,
+    )}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`,
   );
 
   const domLabel = probe.domLoginCta ? " Login button detected on page." : "";
@@ -327,41 +536,26 @@ export async function ensureLoggedIn(
       ? "No ChatGPT cookies were applied; sign in to chatgpt.com in Chrome or pass inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON)."
       : "ChatGPT login appears missing; open chatgpt.com in Chrome to refresh the session or provide inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON).";
 
-  throw new Error(`ChatGPT session not detected.${domLabel} ${cookieHint}`);
+  const accountHint = welcomeBack.hint ? ` ${welcomeBack.hint}` : "";
+  throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
+}
+
+interface WelcomeBackLoginAttempt {
+  accepted: boolean;
+  hint?: string;
 }
 
 async function attemptWelcomeBackLogin(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
-): Promise<boolean> {
+  preferredEmail: string | null = null,
+): Promise<WelcomeBackLoginAttempt> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     let outcome;
     try {
       outcome = await Runtime.evaluate({
-        expression: `(() => {
-          // Learned: "Welcome back" shows as a modal with account chips; click the email chip.
-          const getLabel = (node) =>
-            (node?.textContent || node?.getAttribute?.('aria-label') || '').trim();
-          const isAccount = (label) =>
-            Boolean(label) &&
-            label.includes('@') &&
-            !/log in|sign up|create account|another account/i.test(label);
-          const candidates = Array.from(document.querySelectorAll('[role="button"],button,a'));
-          const account = candidates.find((node) => isAccount(getLabel(node))) || null;
-          if (!account) {
-            return { clicked: false, reason: 'not-found' };
-          }
-          const label = getLabel(account);
-          setTimeout(() => {
-            try {
-              account.click();
-            } catch {
-              // ignore; caller will re-probe login state
-            }
-          }, 0);
-          return { clicked: true, label };
-        })()`,
+        expression: buildWelcomeBackAccountPickerExpression(preferredEmail),
         awaitPromise: false,
         returnByValue: true,
       });
@@ -369,10 +563,10 @@ async function attemptWelcomeBackLogin(
       const message = error instanceof Error ? error.message : String(error);
       if (/navigated or closed|context was destroyed|target closed/i.test(message)) {
         logger("Welcome back account click triggered navigation.");
-        return true;
+        return { accepted: true };
       }
       logger(`Welcome back auto-select probe failed: ${message}`);
-      return false;
+      return { accepted: false };
     }
     if (outcome.exceptionDetails) {
       const details = outcome.exceptionDetails;
@@ -383,31 +577,107 @@ async function attemptWelcomeBackLogin(
         details.text ||
         "unknown error";
       logger(`Welcome back auto-select probe failed: ${description}`);
-      return false;
+      return { accepted: false };
     }
     const result = outcome.result?.value as
-      | { clicked?: boolean; reason?: string; label?: string }
+      | {
+          clicked?: boolean;
+          reason?: string;
+          selection?: "preferred" | "only-account";
+          accountCount?: number;
+        }
       | undefined;
     if (!result) {
       logger("Welcome back auto-select probe returned no result.");
-      return false;
+      return { accepted: false };
     }
     if (!("clicked" in result) && !("reason" in result)) {
       logger("Welcome back auto-select probe returned an unexpected result.");
-      return false;
+      return { accepted: false };
     }
     if (result.clicked) {
-      logger(`Welcome back modal detected; selected account ${result.label ?? "(unknown)"}`);
-      return true;
+      logger(
+        result.selection === "preferred"
+          ? "Welcome back modal detected; selected configured account."
+          : "Welcome back modal detected; selected only saved account.",
+      );
+      return { accepted: true };
+    }
+    if (result.reason === "preferred-not-found") {
+      logger(
+        `Welcome back modal present but ${CHATGPT_ACCOUNT_EMAIL_ENV} did not match any saved account (${result.accountCount ?? 0} account chips found).`,
+      );
+      return {
+        accepted: false,
+        hint: `${CHATGPT_ACCOUNT_EMAIL_ENV} did not match a saved account. Set it to the exact account email on the browser host or sign in manually.`,
+      };
+    }
+    if (result.reason === "multiple-accounts") {
+      logger(
+        `Welcome back modal present with multiple saved accounts; refusing to select one without ${CHATGPT_ACCOUNT_EMAIL_ENV}.`,
+      );
+      return {
+        accepted: false,
+        hint: `Multiple saved ChatGPT accounts were found. Set ${CHATGPT_ACCOUNT_EMAIL_ENV} to the exact account email on the browser host.`,
+      };
     }
     if (result.reason && result.reason !== "not-found") {
       logger(`Welcome back modal present but auto-select failed (${result.reason}).`);
-      return false;
+      return { accepted: false };
     }
     await delay(500);
   }
   logger("Welcome back modal not detected after login probe failure.");
-  return false;
+  return { accepted: false };
+}
+
+function buildWelcomeBackAccountPickerExpression(preferredEmail: string | null = null): string {
+  const normalizedPreferredEmail = preferredEmail?.trim().toLowerCase() || null;
+  return `(() => {
+    // Learned: "Welcome back" can list several saved accounts; substring matching can select the wrong identity.
+    const preferredEmail = ${JSON.stringify(normalizedPreferredEmail)};
+    const getLabel = (node) =>
+      [node?.textContent, node?.getAttribute?.('aria-label')]
+        .filter((value) => typeof value === 'string' && value.trim())
+        .join(' ')
+        .trim();
+    const extractEmails = (label) =>
+      String(label || '')
+        .toLowerCase()
+        .match(/[a-z0-9.!#$%&'*+/=?^_{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*/g) || [];
+    const isAccount = (label) => !/log in|sign up|create account|another account/i.test(label);
+    const candidates = Array.from(document.querySelectorAll('[role="button"],button,a'));
+    const accounts = candidates
+      .map((node) => {
+        const label = getLabel(node);
+        return { node, emails: isAccount(label) ? extractEmails(label) : [] };
+      })
+      .filter((entry) => entry.emails.length > 0);
+    if (!accounts.length) {
+      return { clicked: false, reason: 'not-found' };
+    }
+    const savedEmails = Array.from(new Set(accounts.flatMap((entry) => entry.emails)));
+    if (!preferredEmail && savedEmails.length !== 1) {
+      return { clicked: false, reason: 'multiple-accounts', accountCount: savedEmails.length };
+    }
+    const selectedEmail = preferredEmail || savedEmails[0];
+    const account = accounts.find((entry) => entry.emails.includes(selectedEmail));
+    if (!account) {
+      return { clicked: false, reason: 'preferred-not-found', accountCount: savedEmails.length };
+    }
+    setTimeout(() => {
+      try {
+        account.node.click();
+      } catch {
+        // ignore; caller will re-probe login state
+      }
+    }, 0);
+    return {
+      clicked: true,
+      selection: preferredEmail ? 'preferred' : 'only-account',
+      accountCount: savedEmails.length,
+    };
+  })()`;
 }
 
 export async function ensurePromptReady(
@@ -430,6 +700,114 @@ export async function ensurePromptReady(
     await logDomFailure(Runtime, logger, "prompt-textarea");
     throw new Error("Prompt textarea did not appear before timeout");
   }
+}
+
+export interface ResumedConversationHydrationDeps {
+  ensurePromptReady?: typeof ensurePromptReady;
+  requirePriorTurns?: boolean;
+  requirePromptReady?: boolean;
+  expectedConversationUrl?: string;
+}
+
+function conversationIdFromUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * After navigating to a *resumed* ChatGPT conversation, its prior turns hydrate
+ * asynchronously and ChatGPT can reset the composer mid-hydration — wiping a
+ * freshly-typed prompt. A fresh chat has no history, so it never hits this race;
+ * a large resumed thread reliably does.
+ *
+ * Wait for the prior turns to render AND stop growing (a big thread keeps
+ * appending turns as it hydrates), let React settle, then re-confirm the
+ * composer is ready — before the caller types/submits. Shared by the local and
+ * remote browser execution paths so neither loses the submitted prompt.
+ *
+ * Returns the number of prior turns observed once hydration settled.
+ */
+export async function waitForResumedConversationHydration(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+  logger: BrowserLogger,
+  deps: ResumedConversationHydrationDeps = {},
+): Promise<number> {
+  const ensureReady = deps.ensurePromptReady ?? ensurePromptReady;
+  const hydrationDeadline = Date.now() + Math.min(timeoutMs || 30_000, 30_000);
+  let priorTurns = 0;
+  let stableChecks = 0;
+  let settled = false;
+  while (Date.now() < hydrationDeadline) {
+    let turns = 0;
+    try {
+      const { result } = await Runtime.evaluate({
+        expression: `document.querySelectorAll(${JSON.stringify(
+          CONVERSATION_TURN_SELECTOR,
+        )}).length`,
+        returnByValue: true,
+      });
+      turns = typeof result?.value === "number" ? result.value : 0;
+    } catch {
+      // keep polling until the conversation hydrates
+    }
+    if (turns > 0 && turns === priorTurns) {
+      stableChecks += 1;
+      if (stableChecks >= 3) {
+        settled = true;
+        break;
+      }
+    } else {
+      stableChecks = 0;
+    }
+    priorTurns = turns;
+    await delay(250);
+  }
+  const requirePromptReady = deps.requirePromptReady ?? true;
+  if (requirePromptReady) {
+    await delay(1_000); // final settle so React won't wipe the composer after we type
+    await ensureReady(Runtime, timeoutMs, logger);
+  }
+  if ((deps.requirePriorTurns ?? false) && (!settled || priorTurns <= 0)) {
+    throw new BrowserAutomationError(
+      "Saved ChatGPT conversation did not load stable prior turns; refusing to submit follow-up as a fresh chat.",
+      {
+        stage: "resume-conversation",
+        priorTurns,
+        settled,
+      },
+    );
+  }
+  if (deps.expectedConversationUrl) {
+    const { result } = await Runtime.evaluate({
+      expression: "location.href",
+      returnByValue: true,
+    });
+    const actualUrl = typeof result?.value === "string" ? result.value : undefined;
+    const expectedConversationId = conversationIdFromUrl(deps.expectedConversationUrl);
+    const actualConversationId = conversationIdFromUrl(actualUrl);
+    if (!expectedConversationId || actualConversationId !== expectedConversationId) {
+      throw new BrowserAutomationError(
+        "Saved ChatGPT conversation redirected to a different thread; refusing to submit follow-up.",
+        {
+          stage: "resume-conversation",
+          expectedConversationId,
+          actualConversationId,
+          actualUrl,
+        },
+      );
+    }
+  }
+  logger(
+    requirePromptReady
+      ? `[browser] Resumed conversation hydrated (${priorTurns} prior turns); composer settled.`
+      : `[browser] Resumed conversation hydrated (${priorTurns} prior turns).`,
+  );
+  return priorTurns;
 }
 
 async function waitForDocumentReady(Runtime: ChromeClient["Runtime"], timeoutMs: number) {
@@ -494,23 +872,83 @@ async function waitForPrompt(
   return false;
 }
 
-async function isCloudflareInterstitial(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
-  const { result: titleResult } = await Runtime.evaluate({
-    expression: "document.title",
-    returnByValue: true,
-  });
-  const title = typeof titleResult.value === "string" ? titleResult.value : "";
-  const challengeTitle = CLOUDFLARE_TITLE.toLowerCase();
-  if (title.toLowerCase().includes(challengeTitle)) {
-    return true;
-  }
-
-  const { result } = await Runtime.evaluate({
-    expression: `Boolean(document.querySelector('${CLOUDFLARE_SCRIPT_SELECTOR}'))`,
-    returnByValue: true,
-  });
-  return Boolean(result.value);
+// A single injected verdict. The old check flagged a challenge whenever the
+// '/challenge-platform/' script was present, but Cloudflare bot-management injects that script on
+// NORMAL ChatGPT pages too (including the new GPT-5.6 "Work" UI), so it false-flagged healthy pages
+// as challenges (which then aborted the run). Classification by evidence strength:
+//   strong - the "Just a moment"/"Attention Required" title, a challenge widget, or
+//            verification copy on a short page: a real interstitial, classify immediately.
+//   shell  - the ChatGPT app shell rendered: never a challenge, regardless of injected scripts.
+//   weak   - only the bot-management script on a short, shell-less page. This is INFERENCE, and
+//            right after navigation it also matches a healthy SPA load mid-hydration (readyState
+//            fires before React renders the shell), so weak evidence must PERSIST through a
+//            hydration grace window before it counts (see isCloudflareInterstitial).
+export function buildCloudflareVerdictExpression(): string {
+  return `(() => {
+    const title = String(document.title || '').toLowerCase();
+    const titleSaysChallenge =
+      title.includes(${JSON.stringify(CLOUDFLARE_TITLE.toLowerCase())}) ||
+      (title.includes('attention required') && title.includes('cloudflare'));
+    const hasAppShell = Boolean(document.querySelector(
+      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
+    ));
+    const bodyText = String((document.body && document.body.innerText) || '')
+      .toLowerCase().replace(/\\s+/g, ' ').trim();
+    const isShortPage = bodyText.length < 600;
+    const hasChallengeWidget = Boolean(document.querySelector(
+      '#challenge-form, #challenge-running, #cf-challenge-running, [class*="cf-challenge"], iframe[src*="challenges.cloudflare.com"], iframe[src*="/cdn-cgi/challenge-platform/"]'
+    ));
+    const saysVerifying = /verify(ing)? you are human|checking your browser|needs to review the security of your connection|just a moment/.test(bodyText);
+    const hasChallengeScript = Boolean(document.querySelector(${JSON.stringify(CLOUDFLARE_SCRIPT_SELECTOR)}));
+    return {
+      strong:
+        !hasAppShell &&
+        (titleSaysChallenge || hasChallengeWidget || (isShortPage && saysVerifying)),
+      shell: hasAppShell,
+      // A genuine interstitial is a SHORT page; the content-rich app never is. So the script
+      // only counts on a short page with no app shell.
+      weak: !hasAppShell && hasChallengeScript && isShortPage,
+    };
+  })()`;
 }
+
+// Boolean composition kept for tests/back-compat: what an instantaneous classifier would say.
+export function buildCloudflareInterstitialExpression(): string {
+  return `(() => { const v = ${buildCloudflareVerdictExpression()}; return v.strong || v.weak; })()`;
+}
+
+export const buildCloudflareInterstitialExpressionForTest = buildCloudflareInterstitialExpression;
+export const buildCloudflareVerdictExpressionForTest = buildCloudflareVerdictExpression;
+
+type CloudflareVerdict = { strong?: boolean; shell?: boolean; weak?: boolean };
+
+// Weak (script-only) evidence must persist through a hydration grace window: callers run this
+// right after navigation, when a healthy SPA load can briefly look exactly like the weak case
+// (script present, shell not yet rendered, short body). A real interstitial never grows an app
+// shell, so waiting converts the race into a correct answer at the cost of a few seconds only
+// on genuinely ambiguous pages. Strong evidence still classifies immediately.
+const CLOUDFLARE_HYDRATION_GRACE_MS = 12_000;
+
+async function isCloudflareInterstitial(
+  Runtime: ChromeClient["Runtime"],
+  graceMs: number = CLOUDFLARE_HYDRATION_GRACE_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, graceMs);
+  for (;;) {
+    const { result } = await Runtime.evaluate({
+      expression: buildCloudflareVerdictExpression(),
+      returnByValue: true,
+    });
+    const verdict = (result?.value ?? {}) as CloudflareVerdict;
+    if (verdict.strong) return true;
+    if (verdict.shell) return false;
+    if (!verdict.weak) return false;
+    if (Date.now() >= deadline) return true;
+    await delay(500);
+  }
+}
+
+export const isCloudflareInterstitialForTest = isCloudflareInterstitial;
 
 async function isChatGptAccountSecurityBlock(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
   try {
@@ -538,12 +976,17 @@ type LoginProbeResult = {
   pageUrl?: string | null;
   domLoginCta?: boolean;
   onAuthPage?: boolean;
+  appAuthenticated?: boolean;
+  backendStatus?: number | null;
+  cfBlocked?: boolean;
+  sessionAuthenticated?: boolean;
+  sessionResolved?: boolean;
 };
 
 function buildLoginProbeExpression(timeoutMs: number): string {
   return `(async () => {
-    // Learned: /backend-api/me is the most reliable "am I logged in" signal.
-    // Some UIs render without a session; use DOM + network for a robust answer.
+    // /api/auth/session remains cookie-authenticated and exposes user presence without
+    // requiring the bearer token used by /backend-api/*. Never return or log its token.
     const pageUrl = typeof location === 'object' && location?.href ? location.href : null;
     const onAuthPage =
       typeof location === 'object' &&
@@ -600,51 +1043,203 @@ function buildLoginProbeExpression(timeoutMs: number): string {
       return false;
     };
 
-    const readBackendStatus = async () => {
+    // Learned 2026-05-16: ChatGPT's /backend-api/* endpoints now sit behind Cloudflare bot
+    // mitigation. Programmatic fetch from the page can return 403 with cf-mitigated:challenge
+    // even when the user is logged in via cookies and the SPA renders normally. Detect that
+    // case via the response body shape (Cloudflare interstitial HTML) and fall back to a
+    // DOM-based logged-in signal instead of looping waitForLogin until the 20-min timeout.
+    const isCloudflareBody = (body) => {
+      if (typeof body !== 'string' || body.length === 0) return false;
+      const head = body.slice(0, 2000).toLowerCase();
+      return (
+        head.includes('cf-mitigated') ||
+        head.includes('cloudflare') ||
+        (head.includes('<style global>') && head.includes('scale-appear'))
+      );
+    };
+    const readSessionDetail = async () => {
       try {
-        if (typeof fetch === 'function') {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), ${timeoutMs});
-          try {
-            // Credentials included so we see a 200 only when cookies are valid.
-            const response = await fetch('/backend-api/me', {
-              cache: 'no-store',
-              credentials: 'include',
-              signal: controller.signal,
-            });
-            return { status: response.status || 0, error: null };
-          } finally {
-            clearTimeout(timeout);
+        if (typeof fetch !== 'function') {
+          return { status: 0, resolved: false, authenticated: false, cfBlocked: false, error: null };
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ${timeoutMs});
+        try {
+          const response = await fetch('/api/auth/session', {
+            cache: 'no-store',
+            credentials: 'include',
+            signal: controller.signal,
+          });
+          let cfBlocked = false;
+          if (response.status === 403 || response.status === 503 || response.status === 429) {
+            try {
+              const text = await response.clone().text();
+              cfBlocked = isCloudflareBody(text);
+            } catch {}
           }
+          if (response.status !== 200) {
+            return {
+              status: response.status || 0,
+              resolved: false,
+              authenticated: false,
+              cfBlocked,
+              error: null,
+            };
+          }
+          try {
+            const body = await response.json();
+            const resolved =
+              Boolean(body) && typeof body === 'object' && !Array.isArray(body);
+            return {
+              status: response.status || 0,
+              resolved,
+              authenticated: resolved && Boolean(body.user),
+              cfBlocked,
+              error: null,
+            };
+          } catch {
+            return {
+              status: response.status || 0,
+              resolved: false,
+              authenticated: false,
+              cfBlocked,
+              error: null,
+            };
+          }
+        } finally {
+          clearTimeout(timeout);
         }
       } catch (err) {
-        return { status: 0, error: err ? String(err) : 'unknown' };
+        return {
+          status: 0,
+          resolved: false,
+          authenticated: false,
+          cfBlocked: false,
+          error: err ? String(err) : 'unknown',
+        };
       }
-      return { status: 0, error: null };
+    };
+    const readBackendDetail = async () => {
+      try {
+        if (typeof fetch !== 'function') return { status: 0, cfBlocked: false, error: null };
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ${timeoutMs});
+        try {
+          const response = await fetch('/backend-api/me', {
+            cache: 'no-store',
+            credentials: 'include',
+            signal: controller.signal,
+          });
+          let cfBlocked = false;
+          if (response.status === 403 || response.status === 503 || response.status === 429) {
+            try {
+              const text = await response.clone().text();
+              cfBlocked = isCloudflareBody(text);
+            } catch {}
+          }
+          return { status: response.status || 0, cfBlocked, error: null };
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (err) {
+        return { status: 0, cfBlocked: false, error: err ? String(err) : 'unknown' };
+      }
+    };
+    const readAuthDetail = async () => {
+      const session = await readSessionDetail();
+      const sessionDenied =
+        !session.cfBlocked && (session.status === 401 || session.status === 403);
+      if (session.resolved || sessionDenied) {
+        return { session, backend: null };
+      }
+      return { session, backend: await readBackendDetail() };
     };
 
-    let { status, error } = await readBackendStatus();
+    const hasAppAuthSignal = () => {
+      // Composer must be present and visible — the auth/login page never renders one.
+      if (typeof document.querySelector !== 'function') return false;
+      const composerSelectors = [
+        '#prompt-textarea',
+        '.ProseMirror',
+        'textarea[data-id="prompt-textarea"]',
+        'textarea[name="prompt-textarea"]',
+        '[contenteditable="true"][role="textbox"]',
+      ];
+      const composer = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+      if (!composer) return false;
+      const rect = composer.getBoundingClientRect && composer.getBoundingClientRect();
+      const style = window.getComputedStyle(composer);
+      if (!rect || rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') {
+        return false;
+      }
+      // Logged-in users should have an account affordance or prior chat history. Generic
+      // composer/model pills also appear in guest sessions, so they are not auth proof.
+      const profileButton = document.querySelector('[data-testid="accounts-profile-button"]');
+      const historyItem = document.querySelector('[data-testid^="history-item-"]');
+      return Boolean(profileButton || historyItem);
+    };
+
+    const classifyAuth = (auth, appSignal) => {
+      const sessionResolved = auth.session.status === 200 && auth.session.resolved;
+      const sessionDenied =
+        !auth.session.cfBlocked &&
+        (auth.session.status === 401 || auth.session.status === 403);
+      const sessionUnavailable = !sessionResolved && !sessionDenied;
+      const backendStatus = auth.backend ? auth.backend.status : null;
+      const backendUnavailable =
+        Boolean(auth.backend) &&
+        (auth.backend.cfBlocked ||
+          backendStatus === 0 ||
+          backendStatus === 401 ||
+          backendStatus === 403 ||
+          backendStatus === 429 ||
+          backendStatus === 503);
+      return {
+        authenticated:
+          auth.session.authenticated ||
+          (sessionUnavailable &&
+            (backendStatus === 200 || (backendUnavailable && appSignal))),
+        sessionResolved,
+        sessionUnavailable,
+      };
+    };
+
+    let auth = await readAuthDetail();
     let domLoginCta = hasLoginCta();
+    let appAuthenticated = hasAppAuthSignal();
+    let classification = classifyAuth(auth, appAuthenticated);
     const settleDeadline = Date.now() + Math.min(${timeoutMs}, 2500);
-    while (!domLoginCta && Date.now() < settleDeadline) {
+    while (
+      !domLoginCta &&
+      !classification.authenticated &&
+      classification.sessionUnavailable &&
+      Date.now() < settleDeadline
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       domLoginCta = hasLoginCta();
-      if (status === 0 || status === 401 || status === 403) {
-        const next = await readBackendStatus();
-        status = next.status;
-        error = next.error;
-      }
+      appAuthenticated = hasAppAuthSignal();
+      auth = await readAuthDetail();
+      classification = classifyAuth(auth, appAuthenticated);
     }
 
     const loginSignals = domLoginCta || onAuthPage;
+    const backendStatus = auth.backend ? auth.backend.status : null;
+    const cfBlocked = auth.session.cfBlocked || Boolean(auth.backend?.cfBlocked);
+    const error = auth.session.error || auth.backend?.error || null;
+    const ok = !loginSignals && classification.authenticated;
     return {
-      ok: !loginSignals && status === 200,
-      status,
+      ok,
+      status: auth.session.status,
+      backendStatus,
       redirected: false,
       url: pageUrl,
       pageUrl,
       domLoginCta,
       onAuthPage,
+      appAuthenticated,
+      cfBlocked,
+      sessionAuthenticated: auth.session.authenticated,
+      sessionResolved: classification.sessionResolved,
       error,
     };
   })()`;
@@ -672,9 +1267,20 @@ function normalizeLoginProbe(raw: unknown): LoginProbeResult {
     pageUrl: typeof value.pageUrl === "string" ? value.pageUrl : null,
     domLoginCta: Boolean(value.domLoginCta),
     onAuthPage: Boolean(value.onAuthPage),
+    appAuthenticated: Boolean(value.appAuthenticated),
+    backendStatus: typeof value.backendStatus === "number" ? value.backendStatus : null,
+    cfBlocked: Boolean(value.cfBlocked),
+    sessionAuthenticated: Boolean(value.sessionAuthenticated),
+    sessionResolved: Boolean(value.sessionResolved),
   };
 }
 
 export function buildLoginProbeExpressionForTest(timeoutMs = LOGIN_CHECK_TIMEOUT_MS): string {
   return buildLoginProbeExpression(timeoutMs);
+}
+
+export function buildWelcomeBackAccountPickerExpressionForTest(
+  preferredEmail: string | null = null,
+): string {
+  return buildWelcomeBackAccountPickerExpression(preferredEmail);
 }

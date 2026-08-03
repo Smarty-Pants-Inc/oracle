@@ -74,6 +74,7 @@ export function describeBrowserControlPlan(config: BrowserControlConfig = {}): B
   }
 
   if (config.hideWindow) {
+    guidance.push("On macOS, Oracle launches Chrome off-screen while keeping the page rendered.");
     guidance.push(
       "Oracle launches a separate Chrome app instance hidden and backgrounded before its first window can activate.",
     );

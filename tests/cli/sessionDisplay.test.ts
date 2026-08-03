@@ -3,9 +3,11 @@ import type { SessionMetadata } from "../../src/sessionManager.ts";
 import {
   buildReattachLine,
   formatResponseMetadata,
+  formatBrowserEvidence,
   formatTransportMetadata,
   formatUserErrorMetadata,
   trimBeforeFirstAnswer,
+  isDeepResearchPlaceholderCapture,
   attachSession,
 } from "../../src/cli/sessionDisplay.ts";
 import chalk from "chalk";
@@ -16,6 +18,8 @@ const sessionStoreMock = vi.hoisted(() => ({
   readLog: vi.fn(),
   readModelLog: vi.fn(),
   readRequest: vi.fn(),
+  updateSession: vi.fn(),
+  updateModelRun: vi.fn(),
   listSessions: vi.fn(),
   filterSessions: vi.fn(),
   getPaths: vi.fn(),
@@ -50,6 +54,8 @@ const originalChalkLevel = chalk.level;
 
 beforeEach(() => {
   vi.useFakeTimers();
+  process.exitCode = undefined;
+  waitMock.mockClear();
   Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
   chalk.level = 1;
   vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -63,6 +69,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  process.exitCode = undefined;
   Object.defineProperty(process.stdout, "isTTY", { value: originalIsTty, configurable: true });
   chalk.level = originalChalkLevel;
   vi.restoreAllMocks();
@@ -108,6 +115,40 @@ describe("formatUserErrorMetadata", () => {
         details: { path: "foo.txt" },
       }),
     ).toBe('file-validation | message=Too big | details={"path":"foo.txt"}');
+  });
+});
+
+describe("formatBrowserEvidence", () => {
+  test("formats model selection and warning metadata", () => {
+    const metadata: SessionMetadata = {
+      id: "sess",
+      createdAt: new Date().toISOString(),
+      status: "completed",
+      options: {},
+      browser: {
+        modelSelection: {
+          requestedModel: "GPT-5.5 Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-05-13T00:00:00.000Z",
+        },
+        warnings: [
+          {
+            code: "browser-pro-fast-large-run",
+            severity: "warning",
+            message: "Large browser Pro run completed quickly.",
+          },
+        ],
+      },
+    };
+
+    expect(formatBrowserEvidence(metadata)).toEqual([
+      "model requestedKey=(none); target=GPT-5.5 Pro; resolvedLabel=Pro; status=already-selected; strategy=select; verified=yes; source=chatgpt-model-picker; capturedAt=2026-05-13T00:00:00.000Z",
+      "warning browser-pro-fast-large-run: Large browser Pro run completed quickly.",
+    ]);
   });
 });
 
@@ -159,6 +200,79 @@ describe("trimBeforeFirstAnswer", () => {
 
     expect(trimBeforeFirstAnswer(input)).toBe("Answer:\nRecovered report");
   });
+
+  test("skips a stale Deep Research App wrapper before a recovered answer", () => {
+    const input =
+      "Answer:\n" +
+      "Called tool\n" +
+      "Deep Research App\n" +
+      "Response { session_id: abc123 }\n" +
+      "[reattach] captured assistant response from existing Chrome tab\n" +
+      "Answer:\n" +
+      "# Recovered report";
+
+    expect(trimBeforeFirstAnswer(input)).toBe("Answer:\n# Recovered report");
+  });
+});
+
+describe("isDeepResearchPlaceholderCapture", () => {
+  const deepResearchMeta: SessionMetadata = {
+    id: "sess",
+    createdAt: new Date().toISOString(),
+    status: "completed",
+    options: {},
+  };
+
+  test("flags the bare tool-only stub", () => {
+    const log = "Launching browser mode\nAnswer:\nCalled tool\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(true);
+  });
+
+  test("flags the multi-line Deep Research App tool-call wrapper", () => {
+    const log =
+      "Launching browser mode\n" +
+      "Answer:\n" +
+      "Called tool\n" +
+      "Deep Research App\n" +
+      "Call tool\n" +
+      "Request { prompt: ... }\n" +
+      "Response { session_id: abc123 }\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(true);
+  });
+
+  test("flags Polish tool-call markers", () => {
+    const log = "Answer:\nUżyto narzędzia\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(true);
+  });
+
+  test("does not flag a real report answer", () => {
+    const log =
+      "Answer:\n" +
+      "# Research Report\n" +
+      "The findings show that the market grew 12% year over year.\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(false);
+  });
+
+  test("does not flag prose that happens to begin with a tool-call phrase", () => {
+    const log =
+      "Answer:\n" +
+      "Called tool adoption is accelerating across the market.\n" +
+      "The report analyzes the evidence in detail.\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(false);
+  });
+
+  test("does not re-flag a wrapper capture that was already recovered", () => {
+    const log =
+      "Answer:\n" +
+      "Called tool\n" +
+      "Deep Research App\n" +
+      "Response { session_id: abc123 }\n" +
+      "[reattach] captured assistant response from existing Chrome tab\n" +
+      "Answer:\n" +
+      "# Research Report\n" +
+      "The recovered findings.\n";
+    expect(isDeepResearchPlaceholderCapture(deepResearchMeta, log)).toBe(false);
+  });
 });
 
 describe("attachSession rendering", () => {
@@ -172,6 +286,238 @@ describe("attachSession rendering", () => {
   beforeEach(() => {
     renderMarkdownMock?.mockClear?.();
     readSessionRequestMock.mockReset();
+  });
+
+  test("prints persisted lifecycle metadata", async () => {
+    const lifecycleMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "completed",
+      lifecycle: {
+        engine: "api",
+        execution: "background",
+        attached: false,
+        detached: true,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValue(lifecycleMeta);
+    readSessionLogMock.mockResolvedValue("");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false });
+
+    expect(logSpy).toHaveBeenCalledWith("Execution: api/bg (detached)");
+    expect(logSpy).toHaveBeenCalledWith("Reattach: oracle session sess");
+  });
+
+  test("propagates a detached worker failure only when requested", async () => {
+    const failedMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      errorMessage: "browser failed",
+    };
+    readSessionMetadataMock.mockResolvedValue(failedMeta);
+    readSessionLogMock.mockResolvedValue("ERROR: browser failed");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false, suppressMetadata: true });
+    expect(process.exitCode).toBeUndefined();
+
+    await attachSession("sess", {
+      renderMarkdown: false,
+      suppressMetadata: true,
+      propagateFailure: true,
+    });
+
+    expect(process.exitCode).toBe(1);
+  });
+
+  test("stops waiting when a detached browser worker exits before completion", async () => {
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      browser: {
+        runtime: {
+          controllerPid: 2_147_483_647,
+          promptSubmitted: true,
+          tabUrl: "https://chatgpt.com/c/example",
+        },
+      },
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: 2_147_483_647,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock
+      .mockResolvedValueOnce({
+        ...runningMeta,
+        browser: {
+          ...runningMeta.browser,
+          runtime: {
+            ...runningMeta.browser?.runtime,
+            controllerPid: process.pid,
+          },
+        },
+        lifecycle: {
+          ...runningMeta.lifecycle,
+          workerPid: process.pid,
+        },
+      } as SessionMetadata)
+      .mockResolvedValue(runningMeta);
+    readSessionLogMock.mockResolvedValue("response streaming");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      renderMarkdown: false,
+      suppressMetadata: true,
+      propagateFailure: true,
+    });
+
+    expect(process.exitCode).toBe(1);
+    expect(waitMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Detached worker exited before the session reached a terminal state"),
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({
+        status: "error",
+        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      }),
+    );
+  });
+
+  test("does not reattach while the detached browser worker is alive", async () => {
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      browser: {
+        runtime: {
+          controllerPid: process.pid,
+          promptSubmitted: true,
+          tabUrl: "https://chatgpt.com/c/example",
+        },
+      },
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock
+      .mockResolvedValueOnce(runningMeta)
+      .mockResolvedValueOnce({ ...runningMeta, status: "completed" });
+    readSessionLogMock.mockResolvedValue("response streaming");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false, suppressMetadata: true });
+
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Attempting to reattach to the existing Chrome session"),
+    );
+  });
+
+  test("stops an ordinary attachment when its detached worker exits", async () => {
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      browser: {
+        runtime: {
+          controllerPid: process.pid,
+          promptSubmitted: true,
+          tabUrl: "https://chatgpt.com/c/example",
+        },
+      },
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    const deadMeta = {
+      ...runningMeta,
+      browser: {
+        ...runningMeta.browser,
+        runtime: {
+          ...runningMeta.browser?.runtime,
+          controllerPid: 2_147_483_647,
+        },
+      },
+      lifecycle: {
+        ...runningMeta.lifecycle,
+        workerPid: 2_147_483_647,
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValue(deadMeta);
+    readSessionLogMock.mockResolvedValue("response streaming");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false, suppressMetadata: true });
+
+    expect(process.exitCode).toBeUndefined();
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({ status: "error" }),
+    );
+  });
+
+  test("does not replace completion persisted as the worker exits", async () => {
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    const deadSnapshot = {
+      ...runningMeta,
+      lifecycle: {
+        ...runningMeta.lifecycle,
+        workerPid: 2_147_483_647,
+      },
+    } as SessionMetadata;
+    const completedMeta = { ...deadSnapshot, status: "completed" } as SessionMetadata;
+    readSessionMetadataMock
+      .mockResolvedValueOnce(runningMeta)
+      .mockResolvedValueOnce(deadSnapshot)
+      .mockResolvedValue(completedMeta);
+    readSessionLogMock.mockResolvedValue("Answer:\ncompleted");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      renderMarkdown: false,
+      suppressMetadata: true,
+      propagateFailure: true,
+    });
+
+    expect(process.exitCode).toBeUndefined();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
   });
 
   test("prints chain metadata for follow-up sessions", async () => {
@@ -380,6 +726,29 @@ describe("attachSession rendering", () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Δ"));
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("$1.23"));
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("slug=sess"));
+  });
+
+  test("treats partial sessions as terminal", async () => {
+    const partialMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "partial",
+      model: "gpt-5.1",
+      mode: "api",
+      elapsedMs: 1234,
+      usage: { inputTokens: 10, outputTokens: 20, reasoningTokens: 0, totalTokens: 30 },
+    } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValue(partialMeta);
+    sessionStoreMock.readSession.mockResolvedValue(partialMeta);
+    readSessionLogMock.mockResolvedValue("Answer:\npartial result");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const writeSpy = vi.spyOn(process.stdout, "write");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false });
+
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining("Answer:\npartial result"));
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("↑"));
+    expect(waitMock).not.toHaveBeenCalled();
   });
 
   test("falls back to metadata prompt when request is missing", async () => {

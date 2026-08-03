@@ -4,6 +4,8 @@ interface PromptCheckOptions {
   execSession?: string;
   status?: boolean;
   debugHelp?: boolean;
+  route?: boolean;
+  preflight?: boolean;
   renderMarkdown?: boolean;
   preview?: boolean | string;
   dryRun?: boolean;
@@ -22,6 +24,8 @@ export function shouldRequirePrompt(rawArgs: string[], options: PromptCheckOptio
     options.execSession ||
     options.status ||
     options.debugHelp ||
+    options.route ||
+    options.preflight ||
     firstArg === "status" ||
     firstArg === "session",
   );

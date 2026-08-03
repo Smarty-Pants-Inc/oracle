@@ -10,7 +10,7 @@ Oracle uses the official OpenAI Node.js SDK, which allows it to connect to any A
 ## Azure OpenAI
 
 Oracle uses Azure's v1 Responses endpoint when `--azure-endpoint` (or `azure.endpoint`) is set.
-Pass your resource endpoint, Azure key, and optionally a deployment name when it differs from Oracle's CLI model alias:
+Pass your resource endpoint, Azure key, and deployment name:
 
 ```bash
 export AZURE_OPENAI_ENDPOINT="https://your-resource-name.openai.azure.com/"
@@ -24,12 +24,33 @@ Key lookup for GPT-family models when an Azure endpoint is set:
 - Falls back to `OPENAI_API_KEY` if the Azure key is missing.
 
 Without an Azure endpoint, Oracle keeps using `OPENAI_API_KEY` as before.
+If Azure env/config is present but you want first-party OpenAI for one run, pass `--provider openai` or `--no-azure`.
 
 Notes:
 
 - Oracle calls Azure at `https://<resource>.openai.azure.com/openai/v1`.
-- For Responses API runs, Azure expects `model` to be your deployment name. Use `--azure-deployment` or `azure.deployment` when the deployment name does not exactly match the CLI model alias.
+- For Responses API runs, Azure expects `model` to be your deployment name. Oracle fails early when an Azure endpoint is active without a deployment, except for `gpt-5.5-pro` where the CLI model id is used as the implicit deployment.
+- API runs print the selected route without secrets, for example `Provider: Azure OpenAI | endpoint: your-resource.openai.azure.com | deployment: my-deployment | key: AZURE_OPENAI_API_KEY|OPENAI_API_KEY`.
 - `AZURE_OPENAI_API_VERSION` is still accepted for back-compat, but Azure's v1 Responses endpoint does not require it.
+
+## Provider diagnostics
+
+Check provider readiness before an API run:
+
+```bash
+oracle doctor --providers --models gpt-5.4,claude-4.6-sonnet,gemini-3-pro
+oracle --preflight --models gpt-5.4,gemini-3-pro
+oracle --route --model gpt-5.4
+```
+
+The output is redacted and local: provider, base host, key source, Azure status, and missing-route errors. These commands exit before sending a prompt or creating a session.
+
+When Azure env/config is present, GPT-family API models route through Azure unless you force first-party OpenAI:
+
+```bash
+oracle --provider openai --route --model gpt-5.4
+oracle --no-azure --route --model gpt-5.4
+```
 
 ### CLI Configuration
 
@@ -38,6 +59,50 @@ You can also pass the Azure settings via CLI flags (env for the key is still rec
 ```bash
 oracle --azure-endpoint https://... --azure-deployment my-deployment-name
 ```
+
+Force first-party OpenAI when Azure env vars are exported:
+
+```bash
+oracle --provider openai --engine api --model gpt-5.5-pro -p "Review this"
+oracle --no-azure --engine api --model gpt-5.5-pro -p "Review this"
+```
+
+## GPT-5.6 Pro reasoning mode
+
+GPT-5.6 Pro is a Responses API execution mode rather than a distinct on-wire
+model. This fork exposes `gpt-5.6-sol-pro` as a logical alias: API runs send
+`gpt-5.6-sol` with `reasoning.mode: "pro"` and the configured `xhigh` effort.
+
+```bash
+oracle --engine api \
+  --model gpt-5.6-sol-pro \
+  -p "Review this difficult architecture" \
+  --file "src/**"
+```
+
+For maximum reasoning, select the concrete Sol model and override the effort:
+
+```bash
+oracle --engine api \
+  --model gpt-5.6-sol \
+  --reasoning-mode pro \
+  --reasoning-effort max \
+  -p "Review this difficult architecture" \
+  --file "src/**"
+```
+
+Mode and effort are independent. GPT-5.6 supports `none`, `low`, `medium`,
+`high`, `xhigh`, and `max`; without an explicit effort, Oracle retains the
+model's configured effort. Pro-mode runs use Oracle's long-running API defaults:
+they detach unless `--wait` is supplied, default to a 60-minute timeout, and use
+Responses background mode when the selected route supports it.
+
+`--reasoning-mode` accepts `standard` or `pro`; `--reasoning-effort` accepts all
+six GPT-5.6 effort levels. Both are API-only and restricted to the GPT-5.6
+family. Oracle rejects reasoning mode for OpenRouter and custom `--base-url`
+routes because those routes currently use Oracle's Chat Completions adapter,
+which cannot represent Responses API reasoning mode. The fake slug
+`gpt-5.6-pro` is rejected; use `gpt-5.6-sol-pro` or the explicit flags above.
 
 ## Custom Base URLs (LiteLLM, Localhost)
 
@@ -54,6 +119,23 @@ Or via `config.json`:
   "apiBaseUrl": "http://localhost:4000"
 }
 ```
+
+If a gateway exposes a different on-wire model id, add an API-only override to the user config at `~/.oracle/config.json`:
+
+```json5
+{
+  apiBaseUrl: "http://localhost:4000",
+  model: "gpt-5.5",
+  modelOverrides: {
+    "gpt-5.5": {
+      apiModel: "gateway-model",
+      reasoning: { effort: "high" },
+    },
+  },
+}
+```
+
+Overrides accept existing built-in model keys only and are ignored in project `.oracle/config.json` files. See [Local configuration](configuration.md) for the full field list and precedence.
 
 ## Model aliases
 

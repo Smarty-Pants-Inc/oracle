@@ -13,7 +13,7 @@ Every Oracle run gets an id, a slug, and a folder. You can list runs, render the
 ├── prompt.md                # assembled bundle (what was sent)
 ├── response.md              # the model's answer (when complete)
 ├── log.jsonl                # per-event log
-└── artifacts/               # browser-only: transcript, generated images, deep-research-report.md
+└── artifacts/               # browser-only: transcript, generated images/files, deep-research-report.md
 ```
 
 Override the root with `ORACLE_HOME_DIR=/some/path`.
@@ -23,7 +23,6 @@ Override the root with `ORACLE_HOME_DIR=/some/path`.
 ```bash
 oracle status                  # last 20 sessions
 oracle status --hours 168      # last week
-oracle status --json           # for scripts
 ```
 
 `status` shows status, model, mode, timestamp, character count, cost, and slug — with a tree of `--followup` lineage:
@@ -42,7 +41,6 @@ pending   gpt-5.2-pro   api     03/01 09:25 AM       900        -  └─ risk-c
 ```bash
 oracle session <id>            # print metadata + answer
 oracle session <id> --render   # print the prompt that was sent
-oracle session <id> --json     # structured output
 ```
 
 Use the slug or a unique id prefix; Oracle resolves both.
@@ -56,11 +54,25 @@ oracle status                  # find the running one
 oracle session <id>            # blocks until done, then prints the answer
 ```
 
-To block in the original command, pass `--wait`:
+Every new run prints a lifecycle block so foreground and detached behavior is explicit:
+
+```text
+Session: 20260515-name-panel
+Mode: api background
+Models: 3 parallel
+Detach: yes, polling
+Reattach: oracle session 20260515-name-panel
+```
+
+`oracle status` uses compact mode labels such as `api/fg`, `api/bg`, `br/fg`, and `br/bg`; `oracle session <id>` shows the persisted execution state.
+
+To keep the original CLI attached until completion, pass `--wait`:
 
 ```bash
 oracle --wait --model gpt-5.6-sol-pro -p "Long architecture review" --file "src/**"
 ```
+
+For API runs, `--wait` executes the request in the foreground. Local Pro browser runs use a detached worker even with `--wait`, while the original CLI stays attached to the session log. This lets the browser worker capture and save the answer if the foreground CLI exits unexpectedly. Pressing Ctrl-C still cancels the worker and exits with code 130.
 
 For browser runs, ChatGPT sometimes redirects mid-page-load. The auto-reattach flags poll the existing tab without manual intervention:
 
@@ -85,14 +97,14 @@ Useful when a transient browser/API error truncated the answer. Restart copies t
 
 ## Follow up
 
-Continue an OpenAI / Azure Responses API session with new context:
+Continue a saved ChatGPT browser conversation or an OpenAI / Azure Responses API session with new context:
 
 ```bash
 oracle --followup <id> -p "Re-evaluate with these files" \
   --file "src/migrations/**"
 ```
 
-For multi-model parents, pick the lineage with `--followup-model`. See [Followup](followup.md) for the full flow and the formats `--followup` accepts (session ids, slugs, or `resp_…` response ids).
+Browser followup reopens the exact saved conversation and inherits its browser configuration and model. For multi-model API parents, pick the lineage with `--followup-model`. See [Followup](followup.md) for the full flow and the formats `--followup` accepts (session ids, slugs, or `resp_…` response ids).
 
 ## Background mode
 
@@ -109,7 +121,6 @@ GPT-5.x Pro defaults to background; non-Pro models block by default. Override pe
 
 ```bash
 oracle status --clear --hours 168   # delete sessions older than a week
-oracle status --clear --slug pattern   # delete by slug match
 ```
 
 `--clear` is destructive — preview without it first. Sessions are local files, so `rm -rf ~/.oracle/sessions/<id>` works too.

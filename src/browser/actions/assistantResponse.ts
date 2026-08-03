@@ -5,8 +5,10 @@ import {
   CONVERSATION_TURN_SELECTOR,
   COPY_BUTTON_SELECTOR,
   FINISHED_ACTIONS_SELECTOR,
-  STOP_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTORS,
 } from "../constants.js";
+import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import { buildThinkingActivePredicateJs, readThinkingActivity } from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
   logDomFailure,
@@ -16,9 +18,128 @@ import {
 import { buildClickDispatcher } from "./domEvents.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
+const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
+// Still used by the in-page settle heuristic's length buckets (see buildResponseObserverExpression).
+const MIN_CONFIDENT_ANSWER_LENGTH = 16;
 
-function isAnswerNowPlaceholderText(normalized: string): boolean {
-  const text = normalized.trim();
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+// Terminal-completion gate. A turn is finalized only on POSITIVE proof it is done — never on
+// the mere "stop control absent + text stable" inference, which a settled GPT-5.5 Pro preamble
+// satisfies during the brief gap before it enters its thinking/tool phase.
+// The finished-action bar must be present for barConfirmCycles consecutive stable cycles. This
+// debounces the transient mid-thinking action-bar flash, binds completion to the sampled turn,
+// and never treats elapsed quiet as proof: selector drift fails closed instead of finalizing a
+// stable preamble. Tunable via env for live calibration without a rebuild.
+export interface TerminalGateConfig {
+  barConfirmCycles: number;
+  minStableMs: number;
+}
+
+const TERMINAL_GATE_CONFIG: TerminalGateConfig = {
+  barConfirmCycles: readPositiveIntEnv("ORACLE_BAR_CONFIRM_CYCLES", 3),
+  minStableMs: readPositiveIntEnv("ORACLE_TERMINAL_MIN_STABLE_MS", 1_200),
+};
+
+export interface TerminalGateState {
+  lastKey: string;
+  lastChangeAt: number;
+  barStableCycles: number;
+  seen: boolean;
+}
+
+export interface TerminalSample {
+  now: number;
+  len: number;
+  // A fingerprint of the current answer (its text, ideally plus turn/message identity). ANY
+  // change (not just a length increase) is treated as the turn still moving: an equal-length
+  // or shorter rewrite, or a preamble replaced by the answer, resets the stability clocks.
+  contentKey: string;
+  stopVisible: boolean;
+  barVisible: boolean;
+  // Strong signals prove live work (stop/shimmer/aria-busy/status/progress). Weak activity is
+  // limited to a heuristic sidecar match that can linger after completion.
+  strongThinkingActive: boolean;
+}
+
+export function createTerminalGateState(now: number): TerminalGateState {
+  return {
+    lastKey: "",
+    lastChangeAt: now,
+    barStableCycles: 0,
+    seen: false,
+  };
+}
+
+// Pure, unit-testable per-cycle classifier. Feed it one sample every poll; when it returns
+// terminal:true the capture is proven complete and safe to finalize.
+export function classifyTurnTerminal(
+  state: TerminalGateState,
+  sample: TerminalSample,
+  config: TerminalGateConfig,
+): { state: TerminalGateState; terminal: boolean } {
+  const changed = !state.seen || sample.contentKey !== state.lastKey;
+  const lastChangeAt = changed ? sample.now : state.lastChangeAt;
+  // proofA debounce: weak/stale sidecar evidence may be overridden, but strong live activity
+  // must reset the debounce. It also resets on ANY content change so a bar that appears while
+  // the answer is still rendering (the transient-bar / first-tokens race) cannot finalize.
+  const barStableCycles =
+    sample.barVisible && !sample.stopVisible && !sample.strongThinkingActive && !changed
+      ? state.barStableCycles + 1
+      : 0;
+  const next: TerminalGateState = {
+    lastKey: sample.contentKey,
+    lastChangeAt,
+    barStableCycles,
+    seen: true,
+  };
+
+  let terminal = false;
+  if (!sample.stopVisible && sample.len > 0) {
+    const stableMs = sample.now - lastChangeAt;
+    // Debounced action bar AND content stable for a minimum time. The time-stability
+    // requirement guards the documented race where finished-action controls surface while only
+    // the first tokens have rendered. Weak sidecar evidence cannot hang a finished turn, but
+    // strong live activity vetoes this proof and restarts its debounce.
+    terminal =
+      sample.barVisible &&
+      !sample.strongThinkingActive &&
+      barStableCycles >= config.barConfirmCycles &&
+      stableMs >= config.minStableMs;
+  }
+  return { state: next, terminal };
+}
+const THINKING_STATUS_LABELS = [
+  "thinking",
+  "pro thinking",
+  "thinking longer for a better answer",
+  "reasoning",
+  "finalizing answer",
+  "finalizing",
+  "analyzing",
+  "researching",
+  "working on it",
+  "working",
+  "planning",
+  "searching the web",
+  "searching",
+  "reading",
+];
+
+function matchesThinkingStatusLabel(trimmed: string): boolean {
+  if (!trimmed) return false;
+  if (THINKING_STATUS_LABELS.includes(trimmed)) return true;
+  // includes, not startsWith: the completed summary can carry a heading prefix
+  // ("Reasoning Thought for 12s"); the length cap keeps real answers out.
+  if (trimmed.includes("thought for ") && trimmed.length <= 40) return true;
+  return trimmed.startsWith("pro thinking") && trimmed.length <= 40;
+}
+
+export function isAnswerNowPlaceholderText(value: string): boolean {
+  const text = value.toLowerCase().replace(/\s+/g, " ").trim();
   if (!text) return false;
   // Learned: "Pro thinking" shows a placeholder turn that contains "Answer now".
   // That is not the final answer and must be ignored in browser automation.
@@ -35,10 +156,28 @@ function isAnswerNowPlaceholderText(normalized: string): boolean {
   );
 }
 
-// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
-export const __test__ = {
-  isAnswerNowPlaceholderText,
-};
+function buildActiveThinkingStatusPredicateJs(fnName: string): string {
+  const labelsLiteral = JSON.stringify(THINKING_STATUS_LABELS);
+  return `${buildStopButtonVisibilityPredicateJs("isStopControlVisible")}
+  const ${fnName} = (snapshot) => {
+    const normalized = String(snapshot?.text ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    if (!normalized) return false;
+    const labels = ${labelsLiteral};
+    const matches =
+      labels.includes(normalized) ||
+      (normalized.includes('thought for ') && normalized.length <= 40) ||
+      (normalized.startsWith('pro thinking') && normalized.length <= 40);
+    return matches && isStopControlVisible();
+  };`;
+}
+
+export function matchesThinkingStatusLabelForTest(text: string): boolean {
+  return matchesThinkingStatusLabel(text.toLowerCase().replace(/\s+/g, " ").trim());
+}
+
+export function buildActiveThinkingStatusPredicateJsForTest(fnName: string): string {
+  return buildActiveThinkingStatusPredicateJs(fnName);
+}
 
 export async function waitForAssistantResponse(
   Runtime: ChromeClient["Runtime"],
@@ -116,7 +255,9 @@ export async function waitForAssistantResponse(
         error instanceof Error &&
         error.message === ASSISTANT_POLL_TIMEOUT_ERROR
       ) {
-        evaluation = await evaluationPromise;
+        evaluationPromise.catch(() => undefined);
+        await terminateRuntimeExecution(Runtime);
+        throw error;
       } else if (source === "poll") {
         throw error;
       } else if (source === "evaluation") {
@@ -184,31 +325,42 @@ export async function waitForAssistantResponse(
     logger("Captured assistant generated image response");
     return candidate;
   }
-  // The evaluation path can race ahead of completion. If ChatGPT is still streaming, wait for the watchdog poller.
+  // The observer/refresh path can race ahead of true completion: a settled GPT-5.5 Pro
+  // preamble (or any mid-stream capture) looks done for a moment before the reasoning/tool
+  // phase begins. Re-confirm EVERY captured text through the terminal-only poller, which
+  // finalizes only on positive proof (a debounced action bar, or a quiet window with no
+  // active thinking). We deliberately drop the old ">= candidate length" acceptance: the
+  // poller is turn-scoped (minTurnIndex), so whatever it proves terminal is the right turn,
+  // even when the real answer is shorter than a verbose preamble.
   const elapsedMs = Date.now() - start;
   const remainingMs = Math.max(0, timeoutMs - elapsedMs);
   if (remainingMs > 0) {
-    const [stopVisible, completionVisible] = await Promise.all([
-      isStopButtonVisible(Runtime),
-      isCompletionVisible(Runtime),
-    ]);
-    if (stopVisible) {
-      logger("Assistant still generating; waiting for completion");
-      const completed = await pollAssistantCompletion(
-        Runtime,
-        remainingMs,
-        minTurnIndex,
-        expectedConversationId,
-      );
-      if (completed) {
-        return completed;
-      }
-    } else if (completionVisible) {
-      // No-op: completion UI surfaced and stop button is gone.
+    logger("Confirming the capture is terminal (not a mid-stream/preamble capture)");
+    const completed = await pollAssistantCompletion(
+      Runtime,
+      remainingMs,
+      minTurnIndex,
+      expectedConversationId,
+    );
+    if (completed) {
+      return completed;
     }
+    // Could not prove completion within the budget: refuse rather than finalize a possibly
+    // incomplete capture. A clean, fast failure is recoverable (retry/salvage) and never
+    // ships a preamble as if it were the answer.
+    await logDomFailure(Runtime, logger, "assistant-response-unconfirmed");
+    throw new Error(
+      "assistant-response could not be confirmed complete before timeout; refusing to finalize a possibly-incomplete capture",
+    );
   }
 
-  return candidate;
+  // Budget already exhausted before we could confirm: refuse rather than fall through and ship
+  // an unconfirmed capture. A settled preamble that arrived near the deadline must not be
+  // finalized just because there was no time left to prove it terminal.
+  await logDomFailure(Runtime, logger, "assistant-response-unconfirmed");
+  throw new Error(
+    "assistant-response could not be confirmed complete before the deadline; refusing to finalize a possibly-incomplete capture",
+  );
 }
 
 export async function readAssistantSnapshot(
@@ -301,6 +453,7 @@ async function recoverAssistantResponse(
   if (recoveryTimeoutMs === 0) {
     return null;
   }
+  const recoveryStartedAt = Date.now();
   const recovered = await waitForCondition(
     async () => {
       const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
@@ -310,8 +463,30 @@ async function recoverAssistantResponse(
     400,
   );
   if (recovered) {
-    logger("Recovered assistant response via polling fallback");
-    return recovered;
+    // Route EVERY recovered snapshot through the terminal-only poller (not just short ones):
+    // a recovered long preamble is exactly the raw-return bug this gate exists to prevent.
+    logger("Recovered a candidate response; confirming it is terminal before finalizing");
+    const remainingMs = Math.max(0, recoveryTimeoutMs - (Date.now() - recoveryStartedAt));
+    if (remainingMs > 0) {
+      const confirmed = await pollAssistantCompletion(
+        Runtime,
+        remainingMs,
+        minTurnIndex,
+        expectedConversationId,
+      );
+      if (confirmed) {
+        logger("Recovered and confirmed assistant response via polling fallback");
+        return confirmed;
+      }
+      // Unconfirmable within budget: refuse (return null) so the caller fails fast instead
+      // of finalizing a possibly-incomplete recovered capture.
+      await logConversationSnapshot(Runtime, logger).catch(() => undefined);
+      return null;
+    }
+    // No confirmation time left: refuse rather than return the unconfirmed recovered snapshot
+    // (returning it raw would reopen the recovered-long-preamble leak this gate closes).
+    await logConversationSnapshot(Runtime, logger).catch(() => undefined);
+    return null;
   }
   await logConversationSnapshot(Runtime, logger).catch(() => undefined);
   return null;
@@ -449,9 +624,7 @@ async function pollAssistantCompletion(
   meta: { turnId?: string | null; messageId?: string | null };
 } | null> {
   const watchdogDeadline = Date.now() + timeoutMs;
-  let previousLength = 0;
-  let stableCycles = 0;
-  let lastChangeAt = Date.now();
+  let gate = createTerminalGateState(Date.now());
   while (Date.now() < watchdogDeadline) {
     // Check abort signal to stop polling when another path won the race
     if (abortSignal?.aborted) {
@@ -460,43 +633,37 @@ async function pollAssistantCompletion(
     const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
-      const currentLength = normalized.text.length;
-      if (currentLength > previousLength) {
-        previousLength = currentLength;
-        stableCycles = 0;
-        lastChangeAt = Date.now();
-      } else {
-        stableCycles += 1;
-      }
-      const [stopVisible, completionVisible] = await Promise.all([
-        isStopButtonVisible(Runtime),
-        isCompletionVisible(Runtime),
-      ]);
+      // Generated-image answers stream no text and mount no action bar; accept immediately.
       if (isGeneratedImageAssistantAnswer(normalized)) {
         return normalized;
       }
-      const shortAnswer = currentLength > 0 && currentLength < 16;
-      const mediumAnswer = currentLength >= 16 && currentLength < 40;
-      const longAnswer = currentLength >= 40 && currentLength < 500;
-      // Learned: short answers need a longer stability window or they truncate.
-      // Learned: long streaming responses (esp. thinking models) can pause mid-stream;
-      // use progressively longer windows to avoid truncation (#71).
-      const completionStableTarget = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 6 : 8;
-      const requiredStableCycles = shortAnswer ? 12 : mediumAnswer ? 8 : longAnswer ? 8 : 10;
-      const stableMs = Date.now() - lastChangeAt;
-      const minStableMs = shortAnswer ? 8000 : mediumAnswer ? 1200 : longAnswer ? 2000 : 3000;
-      // Require stop button to disappear before treating completion as final.
-      if (!stopVisible) {
-        const stableEnough = stableCycles >= requiredStableCycles && stableMs >= minStableMs;
-        const completionEnough =
-          completionVisible && stableCycles >= completionStableTarget && stableMs >= minStableMs;
-        if (completionEnough || stableEnough) {
-          return normalized;
-        }
+      const [stopVisible, barVisible, thinkingActivity] = await Promise.all([
+        isStopButtonVisible(Runtime),
+        isCompletionVisible(Runtime, normalized.meta, minTurnIndex),
+        readThinkingActivity(Runtime),
+      ]);
+      const decision = classifyTurnTerminal(
+        gate,
+        {
+          now: Date.now(),
+          len: normalized.text.length,
+          // Fingerprint = turn/message identity + the full text, so a same-length rewrite, a
+          // shorter final answer replacing a longer preamble, or a new turn all count as change.
+          contentKey: `${normalized.meta.messageId ?? normalized.meta.turnId ?? ""}::${normalized.text}`,
+          stopVisible,
+          barVisible,
+          strongThinkingActive: thinkingActivity.strong,
+        },
+        TERMINAL_GATE_CONFIG,
+      );
+      gate = decision.state;
+      if (decision.terminal) {
+        return normalized;
       }
     } else {
-      previousLength = 0;
-      stableCycles = 0;
+      // The turn disappeared/reset (navigation, re-render): restart the gate so a stale
+      // action-bar debounce cannot carry over onto a fresh turn.
+      gate = createTerminalGateState(Date.now());
     }
     await delay(400);
   }
@@ -506,7 +673,7 @@ async function pollAssistantCompletion(
 async function isStopButtonVisible(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
   try {
     const { result } = await Runtime.evaluate({
-      expression: `Boolean(document.querySelector('${STOP_BUTTON_SELECTOR}'))`,
+      expression: buildStopButtonVisibilityExpression(),
       returnByValue: true,
     });
     return Boolean(result?.value);
@@ -515,43 +682,109 @@ async function isStopButtonVisible(Runtime: ChromeClient["Runtime"]): Promise<bo
   }
 }
 
-async function isCompletionVisible(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
+function buildStopButtonVisibilityExpression(): string {
+  return `(() => {
+    ${buildStopButtonVisibilityPredicateJs("isStopControlVisible")}
+    return isStopControlVisible();
+  })()`;
+}
+
+function buildStopButtonVisibilityPredicateJs(fnName: string): string {
+  const selectorLiteral = JSON.stringify(STOP_CONTROL_SELECTOR);
+  return `const ${fnName} = () => {
+    const isVisible = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      return !(
+        style.display === 'none' ||
+        style.visibility === 'hidden' ||
+        (style.opacity !== '' && Number(style.opacity) === 0)
+      );
+    };
+    return Array.from(document.querySelectorAll(${selectorLiteral})).some((node) => isVisible(node));
+  };`;
+}
+
+export const buildStopButtonVisibilityExpressionForTest = buildStopButtonVisibilityExpression;
+
+function buildCompletionVisibilityExpression(
+  meta: { turnId?: string | null; messageId?: string | null },
+  minTurnIndex?: number,
+): string {
+  const expectedMessageId = meta.messageId ? JSON.stringify(meta.messageId) : "null";
+  const expectedTurnId = meta.turnId ? JSON.stringify(meta.turnId) : "null";
+  const minTurnLiteral =
+    typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
+      ? Math.floor(minTurnIndex)
+      : -1;
+  return `(() => {
+    const EXPECTED_MESSAGE_ID = ${expectedMessageId};
+    const EXPECTED_TURN_ID = ${expectedTurnId};
+    const MIN_TURN_INDEX = ${minTurnLiteral};
+    // Find the LAST assistant turn to check completion status. Must match the same logic as
+    // buildAssistantExtractor, then correlate the controls to the sampled response.
+    const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
+    const isAssistantTurn = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+      if (turnAttr === 'assistant') return true;
+      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      if (role === 'assistant') return true;
+      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+      if (testId.includes('assistant')) return true;
+      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
+    };
+
+    const turns = ${buildConversationTurnListExpression()};
+    let lastAssistantTurn = null;
+    let lastAssistantIndex = -1;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (isAssistantTurn(turns[i])) {
+        lastAssistantTurn = turns[i];
+        lastAssistantIndex = i;
+        break;
+      }
+    }
+    if (!lastAssistantTurn) return false;
+
+    const hasExpectedIdentity = Boolean(EXPECTED_MESSAGE_ID || EXPECTED_TURN_ID);
+    if (hasExpectedIdentity) {
+      const identityNodes = [
+        lastAssistantTurn,
+        ...Array.from(lastAssistantTurn.querySelectorAll('[data-message-id], [data-testid]')),
+      ];
+      const identityMatches = identityNodes.some((node) =>
+        (EXPECTED_MESSAGE_ID && node.getAttribute?.('data-message-id') === EXPECTED_MESSAGE_ID) ||
+        (EXPECTED_TURN_ID && node.getAttribute?.('data-testid') === EXPECTED_TURN_ID),
+      );
+      if (!identityMatches) return false;
+    } else if (MIN_TURN_INDEX < 0 || lastAssistantIndex < MIN_TURN_INDEX) {
+      // Fallback/project snapshots without an identity may use the new-turn baseline, but an
+      // uncorrelated persistent action bar from an older turn must never prove completion.
+      return false;
+    }
+
+    if (lastAssistantTurn.querySelector('${FINISHED_ACTIONS_SELECTOR}')) return true;
+    const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
+    return Array.from(markdowns).some((node) => (node.textContent || '').trim() === 'Done');
+  })()`;
+}
+
+async function isCompletionVisible(
+  Runtime: ChromeClient["Runtime"],
+  meta: {
+    turnId?: string | null;
+    messageId?: string | null;
+    completionVisible?: boolean;
+  },
+  minTurnIndex?: number,
+): Promise<boolean> {
+  if (hasScopedCompletionProof(meta)) return true;
   try {
     const { result } = await Runtime.evaluate({
-      expression: `(() => {
-        // Find the LAST assistant turn to check completion status
-        // Must match the same logic as buildAssistantExtractor for consistency
-        const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
-        const isAssistantTurn = (node) => {
-          if (!(node instanceof HTMLElement)) return false;
-          const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-          if (turnAttr === 'assistant') return true;
-          const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-          if (role === 'assistant') return true;
-          const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-          if (testId.includes('assistant')) return true;
-          return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-        };
-
-        const turns = Array.from(document.querySelectorAll('${CONVERSATION_TURN_SELECTOR}'));
-        let lastAssistantTurn = null;
-        for (let i = turns.length - 1; i >= 0; i--) {
-          if (isAssistantTurn(turns[i])) {
-            lastAssistantTurn = turns[i];
-            break;
-          }
-        }
-        if (!lastAssistantTurn) {
-          return false;
-        }
-        // Check if the last assistant turn has finished action buttons (copy, thumbs up/down, share)
-        if (lastAssistantTurn.querySelector('${FINISHED_ACTIONS_SELECTOR}')) {
-          return true;
-        }
-        // Also check for "Done" text in the last assistant turn's markdown
-        const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
-        return Array.from(markdowns).some((n) => (n.textContent || '').trim() === 'Done');
-      })()`,
+      expression: buildCompletionVisibilityExpression(meta, minTurnIndex),
       returnByValue: true,
     });
     return Boolean(result?.value);
@@ -559,11 +792,21 @@ async function isCompletionVisible(Runtime: ChromeClient["Runtime"]): Promise<bo
     return false;
   }
 }
+
+export function hasScopedCompletionProof(meta: { completionVisible?: boolean }): boolean {
+  return meta.completionVisible === true;
+}
+
+export const buildCompletionVisibilityExpressionForTest = buildCompletionVisibilityExpression;
 
 function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
   text: string;
   html?: string;
-  meta: { turnId?: string | null; messageId?: string | null };
+  meta: {
+    turnId?: string | null;
+    messageId?: string | null;
+    completionVisible?: boolean;
+  };
 } | null {
   const text = snapshot?.text ? cleanAssistantText(snapshot.text) : "";
   if (!text.trim()) {
@@ -582,7 +825,11 @@ function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
   return {
     text,
     html: snapshot?.html ?? undefined,
-    meta: { turnId: snapshot?.turnId ?? undefined, messageId: snapshot?.messageId ?? undefined },
+    meta: {
+      turnId: snapshot?.turnId ?? undefined,
+      messageId: snapshot?.messageId ?? undefined,
+      ...(snapshot?.completionVisible === true ? { completionVisible: true } : {}),
+    },
   };
 }
 
@@ -642,12 +889,22 @@ function buildAssistantSnapshotExpression(
       }
       return normalized.includes('answer now') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'));
     };
-    if (extracted && extracted.text && !isPlaceholder(extracted)) {
+    ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
+    if (
+      extracted &&
+      extracted.text &&
+      !isPlaceholder(extracted) &&
+      !isActiveThinkingStatus(extracted)
+    ) {
       return extracted;
     }
     // Fallback for ChatGPT project view: answers can live outside conversation turns.
-    const fallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
-    return fallback ?? extracted;
+    const extractFallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
+    const fallback = extractFallback();
+    if (fallback && !isPlaceholder(fallback) && !isActiveThinkingStatus(fallback)) {
+      return fallback;
+    }
+    return null;
   })()`;
 }
 
@@ -657,7 +914,6 @@ function buildResponseObserverExpression(
   expectedConversationId?: string,
 ): string {
   const selectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
-  const conversationLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -670,9 +926,8 @@ function buildResponseObserverExpression(
   return `(() => {
     ${buildClickDispatcher()}
     const SELECTORS = ${selectorsLiteral};
-    const STOP_SELECTOR = '${STOP_BUTTON_SELECTOR}';
+    const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
     const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
-    const CONVERSATION_SELECTOR = ${conversationLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     // Learned: settling avoids capturing mid-stream HTML; keep short.
@@ -695,6 +950,8 @@ function buildResponseObserverExpression(
       }
       return normalized.includes('answer now') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'));
     };
+    ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
+    ${buildThinkingActivePredicateJs("isThinkingActiveNow")}
 
     // Helper to detect assistant turns - must match buildAssistantExtractor logic for consistency.
     const isAssistantTurn = (node) => {
@@ -728,7 +985,6 @@ function buildResponseObserverExpression(
     const captureViaObserver = () =>
       new Promise((resolve, reject) => {
         const deadline = Date.now() + ${timeoutMs};
-        let stopInterval = null;
         let timeoutId = null;
         let cleanedUp = false;
         let observer = null;
@@ -737,10 +993,6 @@ function buildResponseObserverExpression(
         const cleanup = () => {
           if (cleanedUp) return;
           cleanedUp = true;
-          if (stopInterval) {
-            clearInterval(stopInterval);
-            stopInterval = null;
-          }
           if (timeoutId) {
             clearTimeout(timeoutId);
             timeoutId = null;
@@ -760,12 +1012,20 @@ function buildResponseObserverExpression(
           try {
             const extractedRaw = extractFromTurns();
             const extractedCandidate =
-              extractedRaw && !isAnswerNowPlaceholder(extractedRaw) ? extractedRaw : null;
+              extractedRaw &&
+              !isAnswerNowPlaceholder(extractedRaw) &&
+              !isActiveThinkingStatus(extractedRaw)
+                ? extractedRaw
+                : null;
             let extracted = acceptSnapshot(extractedCandidate);
             if (!extracted) {
               const fallbackRaw = extractFromMarkdownFallback();
               const fallbackCandidate =
-                fallbackRaw && !isAnswerNowPlaceholder(fallbackRaw) ? fallbackRaw : null;
+                fallbackRaw &&
+                !isAnswerNowPlaceholder(fallbackRaw) &&
+                !isActiveThinkingStatus(fallbackRaw)
+                  ? fallbackRaw
+                  : null;
               extracted = acceptSnapshot(fallbackCandidate);
             }
             if (extracted) {
@@ -784,20 +1044,6 @@ function buildResponseObserverExpression(
         observer = new MutationObserver(observerCallback);
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-        stopInterval = setInterval(() => {
-          if (cleanedUp) return;
-          const stop = document.querySelector(STOP_SELECTOR);
-          if (!stop) {
-            return;
-          }
-          const isStopButton =
-            stop.getAttribute('data-testid') === 'stop-button' || stop.getAttribute('aria-label')?.toLowerCase()?.includes('stop');
-          if (isStopButton) {
-            return;
-          }
-          dispatchClickSequence(stop);
-        }, 500);
-
         timeoutId = setTimeout(() => {
           cleanup();
           reject(new Error('Response timeout'));
@@ -806,7 +1052,7 @@ function buildResponseObserverExpression(
 
     // Check if the last assistant turn has finished (scoped to avoid detecting old turns).
     const isLastAssistantTurnFinished = () => {
-      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+      const turns = ${buildConversationTurnListExpression()};
       let lastAssistantTurn = null;
       for (let i = turns.length - 1; i >= 0; i--) {
         if (isAssistantTurn(turns[i])) {
@@ -830,8 +1076,8 @@ function buildResponseObserverExpression(
       // Learned: long streaming responses (esp. thinking models) can pause mid-stream;
       // use progressively longer windows to avoid truncation (#71).
       const initialLength = snapshot?.text?.length ?? 0;
-      const shortAnswer = initialLength > 0 && initialLength < 16;
-      const mediumAnswer = initialLength >= 16 && initialLength < 40;
+      const shortAnswer = initialLength > 0 && initialLength < ${MIN_CONFIDENT_ANSWER_LENGTH};
+      const mediumAnswer = initialLength >= ${MIN_CONFIDENT_ANSWER_LENGTH} && initialLength < 40;
       const longAnswer = initialLength >= 40 && initialLength < 500;
       const settleWindowMs = shortAnswer ? 12_000 : mediumAnswer ? 5_000 : longAnswer ? 8_000 : 10_000;
       const settleIntervalMs = 400;
@@ -844,12 +1090,20 @@ function buildResponseObserverExpression(
         await new Promise((resolve) => setTimeout(resolve, settleIntervalMs));
         const refreshedRaw = extractFromTurns();
         const refreshedCandidate =
-          refreshedRaw && !isAnswerNowPlaceholder(refreshedRaw) ? refreshedRaw : null;
+          refreshedRaw &&
+          !isAnswerNowPlaceholder(refreshedRaw) &&
+          !isActiveThinkingStatus(refreshedRaw)
+            ? refreshedRaw
+            : null;
         let refreshed = acceptSnapshot(refreshedCandidate);
         if (!refreshed) {
           const fallbackRaw = extractFromMarkdownFallback();
           const fallbackCandidate =
-            fallbackRaw && !isAnswerNowPlaceholder(fallbackRaw) ? fallbackRaw : null;
+            fallbackRaw &&
+            !isAnswerNowPlaceholder(fallbackRaw) &&
+            !isActiveThinkingStatus(fallbackRaw)
+              ? fallbackRaw
+              : null;
           refreshed = acceptSnapshot(fallbackCandidate);
         }
         const nextLength = refreshed?.text?.length ?? lastLength;
@@ -864,8 +1118,15 @@ function buildResponseObserverExpression(
         }
         const stopVisible = Boolean(document.querySelector(STOP_SELECTOR));
         const finishedVisible = isLastAssistantTurnFinished();
+        // Defense in depth (the node side re-confirms every capture): never settle on a
+        // stable-but-quiet candidate while the model is actively thinking/generating, so the
+        // observer does not hand a settled preamble to the node path during the reasoning gap.
+        const thinkingActiveNow = isThinkingActiveNow();
 
-        if (finishedVisible || (!stopVisible && stableCycles >= stableTarget)) {
+        if (
+          finishedVisible ||
+          (!stopVisible && !thinkingActiveNow && stableCycles >= stableTarget)
+        ) {
           break;
         }
       }
@@ -873,11 +1134,21 @@ function buildResponseObserverExpression(
     };
 
     const extractedRaw = extractFromTurns();
-    const extractedCandidate = extractedRaw && !isAnswerNowPlaceholder(extractedRaw) ? extractedRaw : null;
+    const extractedCandidate =
+      extractedRaw &&
+      !isAnswerNowPlaceholder(extractedRaw) &&
+      !isActiveThinkingStatus(extractedRaw)
+        ? extractedRaw
+        : null;
     let extracted = acceptSnapshot(extractedCandidate);
     if (!extracted) {
       const fallbackRaw = extractFromMarkdownFallback();
-      const fallbackCandidate = fallbackRaw && !isAnswerNowPlaceholder(fallbackRaw) ? fallbackRaw : null;
+      const fallbackCandidate =
+        fallbackRaw &&
+        !isAnswerNowPlaceholder(fallbackRaw) &&
+        !isActiveThinkingStatus(fallbackRaw)
+          ? fallbackRaw
+          : null;
       extracted = acceptSnapshot(fallbackCandidate);
     }
     if (extracted) {
@@ -888,11 +1159,9 @@ function buildResponseObserverExpression(
 }
 
 function buildAssistantExtractor(functionName: string): string {
-  const conversationLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   return `const ${functionName} = () => {
     ${buildClickDispatcher()}
-    const CONVERSATION_SELECTOR = ${conversationLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
@@ -928,7 +1197,7 @@ function buildAssistantExtractor(functionName: string): string {
       }
     };
 
-    const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+    const turns = ${buildConversationTurnListExpression()};
     for (let index = turns.length - 1; index >= 0; index -= 1) {
       const turn = turns[index];
       if (!isAssistantTurn(turn)) {
@@ -962,7 +1231,8 @@ function buildAssistantExtractor(functionName: string): string {
         !normalizedText ||
         normalizedText === 'edit' ||
         normalizedText === 'stopped thinking' ||
-        normalizedText === 'stopped thinking edit';
+        normalizedText === 'stopped thinking edit' ||
+        /^(?:reasoning\\s+|pro thinking\\s+)?thought for \\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\\s+edit$/.test(normalizedText);
       if (generatedImages.length > 0 && imageOnlyChrome) {
         const label = generatedImages.length === 1 ? 'Generated image.' : \`Generated \${generatedImages.length} images.\`;
         return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index };
@@ -1012,29 +1282,32 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       }
     }
     if (!root) return null;
-    const CONVERSATION_SELECTOR = '${CONVERSATION_TURN_SELECTOR}';
-    const turnNodes = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+    const turnNodes = ${buildConversationTurnListExpression()};
     const hasTurns = turnNodes.length > 0;
     const resolveTurnIndex = (node) => {
-      const turn = node?.closest?.(CONVERSATION_SELECTOR);
-      if (!turn) return null;
-      const idx = turnNodes.indexOf(turn);
+      const idx = turnNodes.findIndex((turn) => turn === node || turn.contains?.(node));
       return idx >= 0 ? idx : null;
+    };
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const collectLastUser = (scope) => {
+      if (!scope?.querySelectorAll) return null;
+      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
+      return userTurns[userTurns.length - 1] ?? null;
+    };
+    const lastUser = collectLastUser(root) || collectLastUser(document);
+    const userText = lastUser ? normalize(lastUser.innerText || lastUser.textContent || '') : '';
+    const isAfterCurrentUser = (node) => {
+      if (!lastUser || typeof lastUser.compareDocumentPosition !== 'function') return false;
+      // Node.DOCUMENT_POSITION_FOLLOWING = 4. Use the numeric bit so the injected expression
+      // also works in stripped browser test contexts without a global Node constructor.
+      return Boolean(lastUser.compareDocumentPosition(node) & 4);
     };
     const isAfterMinTurn = (node) => {
       if (__minTurn === null) return true;
-      if (!hasTurns) return true;
+      if (!hasTurns) return isAfterCurrentUser(node);
       const idx = resolveTurnIndex(node);
       return idx !== null && idx >= __minTurn;
     };
-    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-    const collectUserText = (scope) => {
-      if (!scope?.querySelectorAll) return '';
-      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
-      const lastUser = userTurns[userTurns.length - 1];
-      return lastUser ? normalize(lastUser.innerText || lastUser.textContent || '') : '';
-    };
-    const userText = collectUserText(root) || collectUserText(document);
     const isUserEcho = (text) => {
       if (!userText) return false;
       const normalized = normalize(text);
@@ -1105,7 +1378,14 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       if (isUserEcho(text)) continue;
       const html = node.innerHTML ?? '';
       const turnIndex = resolveTurnIndex(node);
-      return { text, html, messageId: null, turnId: null, turnIndex };
+      return {
+        text,
+        html,
+        messageId: null,
+        turnId: null,
+        turnIndex,
+        completionVisible: actionMarkdowns.includes(node),
+      };
     }
     return null;
   })`;
@@ -1147,7 +1427,7 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
         if (testId.includes('assistant')) return true;
         return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
       };
-      const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+      const turns = ${buildConversationTurnListExpression()};
       for (let i = turns.length - 1; i >= 0; i -= 1) {
         const turn = turns[i];
         if (!isAssistantTurn(turn)) continue;
@@ -1291,6 +1571,7 @@ interface AssistantSnapshot {
   messageId?: string | null;
   turnId?: string | null;
   turnIndex?: number | null;
+  completionVisible?: boolean;
 }
 
 const LANGUAGE_TAGS = new Set(

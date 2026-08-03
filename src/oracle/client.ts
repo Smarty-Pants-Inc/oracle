@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   ChatCompletionCreateParamsStreaming,
   ChatCompletionCreateParamsNonStreaming,
-} from "openai/resources/chat/completions";
+} from "openai/resources/chat";
 import path from "node:path";
 import { createRequire } from "node:module";
 import type {
@@ -19,30 +19,7 @@ import type {
 import { createGeminiClient } from "./gemini.js";
 import { createClaudeClient } from "./claude.js";
 import { isOpenRouterBaseUrl } from "./modelResolver.js";
-
-/**
- * Known native API base URLs that should still use their dedicated SDKs.
- * Any other custom base URL is treated as an OpenAI-compatible proxy and
- * all models are routed through the chat/completions adapter.
- */
-const NATIVE_API_HOSTS = [
-  "api.openai.com",
-  "api.anthropic.com",
-  "generativelanguage.googleapis.com",
-  "api.x.ai",
-];
-
-export function isCustomBaseUrl(baseUrl: string | undefined): boolean {
-  if (!baseUrl) return false;
-  try {
-    const url = new URL(baseUrl);
-    return !NATIVE_API_HOSTS.some(
-      (host) => url.hostname === host || url.hostname.endsWith(`.${host}`),
-    );
-  } catch {
-    return false;
-  }
-}
+import { isCustomBaseUrl } from "./baseUrl.js";
 
 export function buildAzureResponsesBaseUrl(endpoint: string): string {
   return `${endpoint.replace(/\/+$/, "")}/openai/v1`;
@@ -200,10 +177,12 @@ function buildOpenRouterCompletionClient(instance: OpenAI): ClientLike {
         content: textParts,
       });
     }
-    const base = {
+    const base: Omit<ChatCompletionCreateParamsNonStreaming, "stream"> = {
       model: body.model,
       messages,
       max_tokens: body.max_output_tokens,
+      // Custom gateways use Chat Completions, whose effort field differs from Responses.
+      ...(body.reasoning?.effort ? { reasoning_effort: body.reasoning.effort } : {}),
     };
     const streaming: ChatCompletionCreateParamsStreaming = { ...base, stream: true };
     const nonStreaming: ChatCompletionCreateParamsNonStreaming = { ...base, stream: false };

@@ -24,7 +24,30 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(resolvedEngine).toBe("api");
   });
 
-  it("defaults browser runs to the current ChatGPT Pro alias", () => {
+  it("does not treat a browser config default as explicit when API is requested", () => {
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "claude-4.6-sonnet",
+      engine: "api",
+      userConfig: { engine: "browser" },
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("claude-4.6-sonnet");
+  });
+
+  it("lets ORACLE_ENGINE=api override a browser config default for API-only models", () => {
+    const env = { ORACLE_ENGINE: "api" } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gemini-3.1-pro",
+      userConfig: { engine: "browser" },
+      env,
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("gemini-3.1-pro");
+  });
+
+  it("defaults to gpt-5.5-pro when model not provided", () => {
     const { runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
       env: {},
@@ -59,6 +82,47 @@ describe("resolveRunOptionsFromConfig", () => {
       userConfig: { model: "gpt-5.1" },
     });
     expect(runOptions.model).toBe("gpt-5.1");
+  });
+
+  it("threads modelOverrides and sets effectiveModelId from the override apiModel", () => {
+    const { runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      engine: "api",
+      model: "gpt-5.5",
+      userConfig: {
+        modelOverrides: {
+          "gpt-5.5": { apiModel: "gateway-model", reasoning: { effort: "xhigh" } },
+        },
+      },
+    });
+    // The override apiModel must become the on-wire model id (run.ts sets requestBody.model = effectiveModelId).
+    expect(runOptions.effectiveModelId).toBe("gateway-model");
+    expect(runOptions.modelOverrides?.["gpt-5.5"]?.apiModel).toBe("gateway-model");
+  });
+
+  it("lets modelOverrides.apiModel win over Gemini alias remapping", () => {
+    const { runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      engine: "api",
+      model: "gemini-3-pro",
+      userConfig: {
+        modelOverrides: { "gemini-3-pro": { apiModel: "gateway-model" } },
+      },
+    });
+    expect(runOptions.effectiveModelId).toBe("gateway-model");
+  });
+
+  it("ignores API model overrides in browser mode", () => {
+    const { runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      engine: "browser",
+      model: "gpt-5.5",
+      userConfig: {
+        modelOverrides: { "gpt-5.5": { apiModel: "gateway-model" } },
+      },
+    });
+    expect(runOptions.effectiveModelId).toBe("gpt-5.5");
+    expect(runOptions.modelOverrides).toBeUndefined();
   });
 
   it("appends prompt suffix from config", () => {
@@ -131,6 +195,118 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.baseUrl).toBe("https://env.example/v2");
   });
 
+  it("hydrates Azure options from env when Azure endpoint selects API mode", () => {
+    const env = {
+      AZURE_OPENAI_ENDPOINT: "https://example-resource.openai.azure.com/",
+      AZURE_OPENAI_DEPLOYMENT: "my-gpt",
+      AZURE_OPENAI_API_VERSION: "2024-10-21",
+    } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.1",
+      env,
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("gpt-5.1");
+    expect(runOptions.effectiveModelId).toBe("gpt-5.1");
+    expect(runOptions.azure).toEqual({
+      endpoint: "https://example-resource.openai.azure.com/",
+      deployment: "my-gpt",
+      apiVersion: "2024-10-21",
+    });
+  });
+
+  it("keeps browser-capable Gemini in browser mode when Azure endpoint is present", () => {
+    const env = {
+      AZURE_OPENAI_ENDPOINT: "https://example-resource.openai.azure.com/",
+    } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gemini-3-pro",
+      env,
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gemini-3-pro");
+  });
+
+  it("honors ORACLE_ENGINE=browser instead of auto-selecting Azure API", () => {
+    const env = {
+      AZURE_OPENAI_ENDPOINT: "https://example-resource.openai.azure.com/",
+      AZURE_OPENAI_DEPLOYMENT: "configured-gpt",
+      ORACLE_ENGINE: "browser",
+    } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.1",
+      env,
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gpt-5.2");
+  });
+
+  it("honors browser config instead of auto-selecting Azure API", () => {
+    const env = {
+      AZURE_OPENAI_ENDPOINT: "https://example-resource.openai.azure.com/",
+      AZURE_OPENAI_DEPLOYMENT: "configured-gpt",
+    } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.1",
+      userConfig: { engine: "browser" },
+      env,
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gpt-5.2");
+  });
+
+  it("keeps browser-capable Gemini in browser mode when Azure endpoint comes from config", () => {
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gemini-3-pro",
+      userConfig: {
+        azure: {
+          endpoint: "https://configured.openai.azure.com/",
+        },
+      },
+      env: {},
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gemini-3-pro");
+  });
+
+  it("does not select API mode for an Azure key without an endpoint", () => {
+    const env = { AZURE_OPENAI_API_KEY: "az-test" } as NodeJS.ProcessEnv;
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.1",
+      env,
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.azure).toBeUndefined();
+  });
+
+  it("hydrates Azure options from config and selects API mode", () => {
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.1",
+      userConfig: {
+        azure: {
+          endpoint: "https://configured.openai.azure.com/",
+          deployment: "configured-gpt",
+        },
+      },
+      env: {},
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("gpt-5.1");
+    expect(runOptions.effectiveModelId).toBe("gpt-5.1");
+    expect(runOptions.azure).toEqual({
+      endpoint: "https://configured.openai.azure.com/",
+      deployment: "configured-gpt",
+      apiVersion: undefined,
+    });
+  });
+
   it("keeps browser engine for gemini when auto-detected (no API key)", () => {
     const { runOptions, resolvedEngine, engineCoercedToApi } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
@@ -142,26 +318,45 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.model).toBe("gemini-3-pro");
   });
 
-  it("forces api engine for gemini-3.1-pro when browser would otherwise be auto-selected", () => {
+  it("keeps browser engine for gemini-3.1-pro when auto-detected without an API key", () => {
     const { runOptions, resolvedEngine, engineCoercedToApi } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
       model: "gemini-3.1-pro",
       env: {},
     });
-    expect(resolvedEngine).toBe("api");
-    expect(engineCoercedToApi).toBe(true);
+    expect(resolvedEngine).toBe("browser");
+    expect(engineCoercedToApi).toBe(false);
     expect(runOptions.model).toBe("gemini-3.1-pro");
     expect(runOptions.effectiveModelId).toBe("gemini-3.1-pro-preview");
   });
 
-  it("rejects browser engine explicitly set for gemini-3.1-pro", () => {
-    expect(() =>
-      resolveRunOptionsFromConfig({
+  it.each(["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.1-pro"])(
+    "accepts browser engine explicitly set for %s",
+    (model) => {
+      const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
         prompt: basePrompt,
-        model: "gemini-3.1-pro",
+        model,
         engine: "browser",
-      }),
-    ).toThrow("gemini-3.1-pro is API-only today");
+      });
+      expect(resolvedEngine).toBe("browser");
+      expect(runOptions.model).toBe(model);
+    },
+  );
+
+  it("uses the API model id for current Gemini API models", () => {
+    const flash = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gemini-3.5-flash",
+      engine: "api",
+    });
+    const lite = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gemini-3.1-flash-lite",
+      engine: "api",
+    });
+
+    expect(flash.runOptions.effectiveModelId).toBe("gemini-3.5-flash");
+    expect(lite.runOptions.effectiveModelId).toBe("gemini-3.1-flash-lite");
   });
 
   it("accepts browser engine explicitly set for gemini", () => {
@@ -194,7 +389,71 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(runOptions.model).toBe("gpt-5.2");
   });
 
-  it("maps browser engine Pro aliases to the current ChatGPT Pro target", () => {
+  it("keeps GPT-5.6 aliases in explicit browser runs", () => {
+    const family = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6",
+      engine: "browser",
+    });
+    expect(family.resolvedEngine).toBe("browser");
+    expect(family.runOptions.model).toBe("gpt-5.6");
+
+    const sol = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6-sol",
+      engine: "browser",
+    });
+    expect(sol.resolvedEngine).toBe("browser");
+    expect(sol.runOptions.model).toBe("gpt-5.6-sol");
+  });
+
+  it("keeps GPT-5.6 aliases in API and multi-model runs", () => {
+    const single = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6",
+      engine: "api",
+    });
+    expect(single.resolvedEngine).toBe("api");
+    expect(single.runOptions.model).toBe("gpt-5.6");
+
+    const multi = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      models: ["gpt-5.6-sol", "gpt-5.5"],
+      engine: "browser",
+    });
+    expect(multi.resolvedEngine).toBe("api");
+    expect(multi.runOptions.models).toEqual(["gpt-5.6-sol", "gpt-5.5"]);
+  });
+
+  it.each(["gpt-5.6", "gpt-5.6-sol"] as const)("caps %s at the flat-price boundary", (model) => {
+    expect(MODEL_CONFIGS[model]).toMatchObject({
+      provider: "openai",
+      inputLimit: 272_000,
+      pricing: {
+        inputPerToken: 5 / 1_000_000,
+        outputPerToken: 30 / 1_000_000,
+      },
+    });
+  });
+
+  it("preserves unrelated slashless 5.6 model ids in API runs", () => {
+    const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "vendor-5.6-large",
+      engine: "api",
+    });
+    expect(resolvedEngine).toBe("api");
+    expect(runOptions.model).toBe("vendor-5.6-large");
+
+    const officialSibling = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-5.6-luna",
+      engine: "api",
+    });
+    expect(officialSibling.runOptions.model).toBe("gpt-5.6-luna");
+  });
+
+  it("maps browser engine Pro aliases to gpt-5.5-pro", () => {
     const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
       model: "gpt-5.1-pro",
@@ -272,6 +531,17 @@ describe("resolveRunOptionsFromConfig", () => {
       engine: "browser",
     });
     expect(resolvedEngine).toBe("api");
+  });
+
+  it("rejects browser config defaults for multi-model non-browser runs", () => {
+    expect(() =>
+      resolveRunOptionsFromConfig({
+        prompt: basePrompt,
+        models: ["gpt-5.1", "claude-4.6-sonnet"],
+        userConfig: { engine: "browser" },
+        env: {},
+      }),
+    ).toThrow(/Browser engine only supports GPT and Gemini/);
   });
 
   it("normalizes shorthand multi-model entries", () => {

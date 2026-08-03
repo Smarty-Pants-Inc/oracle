@@ -1,136 +1,223 @@
 ---
 name: oracle
-description: Use the @steipete/oracle CLI to bundle a prompt plus the right files and get a second-model review (API or browser) for debugging, refactors, design checks, or cross-validation.
+description: "Oracle second-model review: bundle prompts/files, debug, refactor, design."
 ---
 
 # Oracle (CLI) — best use
 
-Oracle bundles your prompt + selected files into one “one-shot” request so another model can answer with real repo context (API or browser automation). Treat outputs as advisory: verify against the codebase + tests.
+Oracle bundles a prompt and selected files into a one-shot request so another
+model can answer with real repository context through the API or browser. A
+prompt is required; attach files only when they add necessary context. Treat
+responses as advisory and verify them against the codebase and tests.
 
-## Main use case (browser, GPT‑5.4 Pro)
+## Main use case (browser, GPT-5.6)
 
-Default workflow here: `--engine browser` with GPT‑5.4 Pro in ChatGPT. This is the “human in the loop” path: it can take ~10 minutes to ~1 hour; expect a stored session you can reattach to.
+Use browser mode with GPT-5.6 when the ChatGPT account exposes it. This fork's
+default logical model is `gpt-5.6-sol-pro`: browser runs select ChatGPT's Pro
+target, while API runs send `gpt-5.6-sol` with Pro reasoning. Base Sol remains
+available when a faster or cheaper answer is sufficient.
 
 Recommended defaults:
 
-- Engine: browser (`--engine browser`)
-- Model: GPT‑5.4 Pro (either `--model gpt-5.4-pro` or a ChatGPT picker label like `--model "5.4 Pro"`)
-- Attachments: directories/globs + excludes; avoid secrets.
+- Engine: browser (`--engine browser`) unless API use is explicit
+- Pro: `--model gpt-5.6-sol-pro`
+- Base Sol: `--model gpt-5.6-sol`
+- Base Sol maximum reasoning: `--browser-thinking-time heavy` (Extra High)
+- API Pro maximum reasoning: `--model gpt-5.6-sol --reasoning-mode pro --reasoning-effort max`
+- Fallback: explicitly use `--model gpt-5.5-pro` when GPT-5.6 is unavailable
+- Attachments: directories/globs plus excludes; never attach secrets by default
 
-## Golden path (fast + reliable)
+GPT-5.6 availability is account-dependent. Confirm the base Sol picker and
+retain model-selection evidence. A bare `Pro` picker label proves picker
+selection but does not, by itself, prove the server-side Pro generation.
 
-1. Pick a tight file set (fewest files that still contain the truth).
-2. Preview what you’re about to send (`--dry-run` + `--files-report` when needed).
-3. Run in browser mode for the usual GPT‑5.4 Pro ChatGPT workflow; use API only when you explicitly want it.
-4. If the run detaches/timeouts: reattach to the stored session (don’t re-run).
+## GPT-5.6 model selection
 
-## Commands (preferred)
+This fork supports GPT-5.6 on both surfaces with one stable logical Pro alias:
 
-- Show help (once/session):
-  - `npx -y @steipete/oracle --help`
+- `gpt-5.6`: follow the GPT-5.6 family default
+- `gpt-5.6-sol`: pin ChatGPT's `GPT-5.6 Sol` entry or the first-party API model
+- `gpt-5.6-sol-pro`: select ChatGPT's `Pro` target in browser mode; use
+  `gpt-5.6-sol` with `reasoning.mode: "pro"` in API mode
+- `gpt-5-pro`: select the older classic Pro tier explicitly
 
-- Preview (no tokens):
+For browser Pro, use:
+
+```bash
+oracle --engine browser --model gpt-5.6-sol-pro \
+  -p "<task>" --file "src/**"
+```
+
+For maximum GPT-5.6 Sol Pro reasoning through the Responses API, use:
+
+```bash
+oracle --engine api --model gpt-5.6-sol \
+  --reasoning-mode pro \
+  --reasoning-effort max \
+  -p "<task>" --file "src/**"
+```
+
+The logical alias `gpt-5.6-sol-pro` is also valid in API mode and uses the
+fork's configured Pro defaults. Browser label validation rejects unknown future
+variants such as `gpt-5.6-luna`; API runs preserve unrelated custom and
+provider-qualified model IDs unchanged.
+
+The GPT-5.6 browser support depends on the unified Intelligence picker. It
+recognizes the current English and Chinese effort labels, avoids matching
+`高` inside `极高`, and re-queries the composer pill after React replaces it so
+selection verification cannot rely on a detached stale node.
+
+## Compatibility with npm 0.15.2
+
+Do not pass `gpt-5.6` or `gpt-5.6-sol` to an unpatched npm 0.15.2 install. That
+release can normalize those labels to `gpt-5.2`. Use the explicit fallback:
+
+```bash
+npx -y @steipete/oracle@0.15.2 --engine browser --model gpt-5.5-pro \
+  -p "<task>" --file "src/**"
+```
+
+After upgrading to a release containing the GPT-5.6 model-selection and
+unified-picker changes, verify all of the following before removing the
+fallback guidance: `--help --verbose` exposes the new options, browser dry-run
+resolves both aliases to GPT-5.6 Sol, API routing selects first-party OpenAI,
+and a live browser run records strict GPT-5.6 selection evidence.
+
+## Golden path
+
+1. Pick the smallest file set that still contains the truth.
+2. Preview the bundle with `--dry-run` and `--files-report`.
+3. Use browser mode for GPT-5.6; use API only when explicitly intended.
+4. If a run detaches or times out, reattach to the stored session instead of
+   starting a duplicate.
+
+## Commands
+
+- Show help:
+  - `npx -y @steipete/oracle --help --verbose`
+
+- Preview without calling a model:
   - `npx -y @steipete/oracle --dry-run summary -p "<task>" --file "src/**" --file "!**/*.test.*"`
   - `npx -y @steipete/oracle --dry-run full -p "<task>" --file "src/**"`
 
-- Token/cost sanity:
+- Inspect token usage:
   - `npx -y @steipete/oracle --dry-run summary --files-report -p "<task>" --file "src/**"`
 
-- Browser run (main path; long-running is normal):
-  - `npx -y @steipete/oracle --engine browser --model gpt-5.4-pro -p "<task>" --file "src/**"`
+- Browser run:
+  - `oracle --engine browser --model gpt-5.6-sol --browser-thinking-time heavy -p "<task>" --file "src/**"`
 
-- Manual paste fallback (assemble bundle, copy to clipboard):
-  - `npx -y @steipete/oracle --render --copy -p "<task>" --file "src/**"`
-  - Note: `--copy` is a hidden alias for `--copy-markdown`.
+- Manual paste fallback:
+  - `npx -y @steipete/oracle --render-markdown --copy-markdown -p "<task>" --file "src/**"`
+  - `--render` is an alias for `--render-markdown`.
 
-## Attaching files (`--file`)
+- Performance trace:
+  - `npx -y @steipete/oracle --perf-trace --perf-trace-path /tmp/oracle-perf.json --dry-run summary -p "<task>" --file "src/**"`
 
-`--file` accepts files, directories, and globs. You can pass it multiple times; entries can be comma-separated.
+## Attaching files
 
-- Include:
-  - `--file "src/**"` (directory glob)
-  - `--file src/index.ts` (literal file)
-  - `--file docs --file README.md` (literal directory + file)
+`--file` accepts files, directories, and globs. Pass it multiple times or use
+comma-separated entries.
 
-- Exclude (prefix with `!`):
-  - `--file "src/**" --file "!src/**/*.test.ts" --file "!**/*.snap"`
+- Include: `--file "src/**"`, `--file src/index.ts`, `--file docs --file README.md`
+- Exclude: prefix a pattern with `!`, for example `--file "!src/**/*.test.ts"`
+- Default ignored directories: `node_modules`, `dist`, `coverage`, `.git`,
+  `.turbo`, `.next`, `build`, and `tmp`
+- Globs honor `.gitignore` and do not follow symlinks.
+- Dotfiles require an explicit dot-segment in the pattern, such as
+  `--file ".github/**"`.
+- Files over 1 MB are rejected by default; configure
+  `ORACLE_MAX_FILE_SIZE_BYTES` or `maxFileSizeBytes` when necessary.
 
-- Defaults (important behavior from the implementation):
-  - Default-ignored dirs: `node_modules`, `dist`, `coverage`, `.git`, `.turbo`, `.next`, `build`, `tmp` (skipped unless you explicitly pass them as literal dirs/files).
-  - Honors `.gitignore` when expanding globs.
-  - Does not follow symlinks (glob expansion uses `followSymbolicLinks: false`).
-  - Dotfiles are filtered unless you explicitly opt in with a pattern that includes a dot-segment (e.g. `--file ".github/**"`).
-  - Default cap: files > 512 MB are rejected unless you lower or raise `ORACLE_MAX_FILE_SIZE_BYTES` or `maxFileSizeBytes` in `~/.oracle/config.json`.
+Keep total input under roughly 196k tokens. Use `--files-report` or
+`--dry-run json` to identify oversized inputs. Never attach `.env` files,
+private keys, auth tokens, or other secrets unless they have been redacted and
+are essential to the question.
 
-## Budget + observability
+## Engines and browser controls
 
-- Target: keep total input under ~196k tokens.
-- Use `--files-report` (and/or `--dry-run json`) to spot the token hogs before spending.
-- If you need hidden/advanced knobs: `npx -y @steipete/oracle --debug-help`.
+- Auto-selection uses API when `OPENAI_API_KEY` is set and browser otherwise.
+- Browser supports GPT models through ChatGPT and Gemini models through Gemini
+  web. API-only models include `gpt-5.1-codex`.
+- Current model families include GPT-5.6/5.5/5.4/5.2/5.1, Gemini 3.x, and
+  Claude 4.x; availability depends on engine and provider.
+- API runs require explicit user consent because they may incur usage costs.
+- Browser attachments use `--browser-attachments auto|never|always`.
+- For many files, add `--browser-bundle-files --browser-bundle-format auto|zip`.
+- Local ChatGPT launches are hidden/background-only. `--browser-attach-running`
+  is rejected; use `--remote-chrome <host:port>` only with a dedicated Oracle browser.
+- Use `--browser-model-strategy select|current|ignore` to control picker
+  behavior.
+- Use `--browser-follow-up "<prompt>"` for another turn in the same browser
+  conversation, or `--followup <sessionId|responseId>` for a stored run.
+- Use `--browser-research deep` only when Deep Research is explicitly wanted.
 
-## Engines (API vs browser)
+## API preflight
 
-- Auto-pick: uses `api` when `OPENAI_API_KEY` is set, otherwise `browser`.
-- Browser engine supports GPT + Gemini only; use `--engine api` for Claude/Grok/Codex or multi-model runs.
-- **API runs require explicit user consent** before starting because they incur usage costs.
-- Browser attachments:
-  - `--browser-attachments auto|never|always` (auto pastes inline up to ~60k chars then uploads).
-- Remote browser host (signed-in machine runs automation):
-  - Host: `oracle serve --host 0.0.0.0 --port 9473 --token <secret>`
-  - Client: `oracle --engine browser --remote-host <host:port> --remote-token <secret> -p "<task>" --file "src/**"`
+Before an API run, check provider readiness without printing secrets:
 
-## Browser Failure Handling
+```bash
+oracle doctor --providers --models gpt-5.4,claude-4.6-sonnet,gemini-3-pro
+oracle --preflight --models gpt-5.4,gemini-3-pro
+oracle --route --model gpt-5.4
+```
 
-For browser-mode failures, inspect Oracle's structured session metadata before guessing from logs. Agent-facing blockers include:
+Use `--provider openai` or `--no-azure` when first-party OpenAI routing is
+required. For multi-model panels where partial success is useful, use
+`--allow-partial --write-output <path>` so successful outputs and the manifest
+can be recovered.
 
-- `login_required`: the browser profile is not signed into ChatGPT; ask the user to sign in through the Oracle automation profile or provide active cookies/session before retrying.
-- `scope_mismatch`: a requested ChatGPT project/thread URL redirected out of scope; repair the URL/account access and do not fall back to root ChatGPT.
-- `selector_drift`: ChatGPT likely changed DOM semantics/selectors; inspect the captured evidence and update the semantic probe.
-- `captcha`, `permission`, `rate_limit`, `browser_unavailable`, `timeout`, `model_unavailable`, `unsupported_endpoint`: fix the named blocker before rerunning.
+Set an explicit deadline for automation, for example `--timeout 10m`; Oracle
+derives the HTTP timeout unless `--http-timeout` is supplied.
 
-Prompt submission is not successful just because a click or Enter key was sent. Treat the prompt as accepted only after semantic UI evidence such as a new turn, stop control, thinking/status/progress/shimmer state, cleared/disabled composer, or assistant turn. If ChatGPT changes, extend these probes and preserve `BrowserAutomationError.details` (`stage`, `code`, `signals`, `blockers`, `evidence`) instead of adding blind waits.
+## Sessions and recovery
 
-When a browser run is intentionally pinned to a ChatGPT project (`/g/.../project`) or thread (`/c/...`), fail closed if ChatGPT redirects to root chat. Root fallback can pollute the user's main chat list and hides account/project-access regressions.
+- Sessions are stored under `~/.oracle/sessions`; override with
+  `ORACLE_HOME_DIR`.
+- Browser artifacts include `transcript.md` and, when available, research
+  reports and generated images.
+- List recent sessions with `oracle status --hours 72`.
+- Attach with `oracle session <id> --render`.
+- Use `--slug "<3-5 words>"` for readable session IDs.
+- If a run times out, reattach; do not re-run it. Use `--force` only when a
+  genuinely new identical run is intended.
+- Successful non-project browser one-shots are archived automatically by
+  default; override with `--browser-archive never|always`.
 
-Live ChatGPT browser smokes are opt-in: default to dry-runs, unit tests, and session metadata checks unless the user explicitly approves a live send. Project scoping alone is not a non-pollution proof. Approved live project smokes that send a prompt must also verify cleanup: use `--browser-archive auto` for one-shot smokes, use `--browser-archive always` only when intentionally forcing cleanup outside the default one-shot policy, and check session metadata for `browser.archive.archived: true` after any created `/c/...` conversation. If login/scope/model checks fail before a conversation exists, report the structured blocker instead of retrying. Never clean up previously created ChatGPT test conversations without explicit approval for the conversation ids/URLs.
+## Agent-facing failures
 
-## Sessions + slugs (don’t lose work)
+MCP consult failures can include `structuredContent.agentBlocker` with a typed
+kind, remediation, and resumability signal. If `resumable` is true, use the
+provided `resumeCommand` before starting another identical consult.
 
-- Stored under `~/.oracle/sessions` (override with `ORACLE_HOME_DIR`).
-- Browser runs save durable files under `~/.oracle/sessions/<id>/artifacts/`, including `transcript.md`, Deep Research reports, and downloaded ChatGPT-generated images when available.
-- Full approved ChatGPT thread export is a separate state-preserving command, not a prompt run:
-  - `oracle chatgpt-export --target-url "https://chatgpt.com/c/<conversation-id>"`
-  - It attaches to an existing approved tab and captures the page's own reload-time backend response for that exact conversation id.
-  - If the exact conversation is archived, it opens ChatGPT's Archived Chats control in a background tab, reuses ChatGPT's own authenticated archived-list request to unarchive only that exact id, exports it, then restores the archived state. It never records auth values or unrelated conversation payloads.
-  - Use `--no-recover-archived` to fail instead of recovering. Use `--archive-after-export` when an unarchived thread must be archived only after export succeeds.
-  - It does not send prompts, delete/share chats, read cookies/localStorage/profile stores, or browse unrelated conversation content.
-- Runs may detach or take a long time (browser Pro runs commonly take tens of minutes or longer). If the CLI times out: don’t re-run; reattach. A completed archived thread is retained, not lost; recover and export the exact conversation id instead of spending another model turn.
-  - List: `oracle status --hours 72`
-  - Attach: `oracle session <id> --render`
-- Use `--slug "<3-5 words>"` to keep session IDs readable.
-- Duplicate prompt guard exists; use `--force` only when you truly want a fresh run.
+## Exporting an approved ChatGPT conversation
 
-## Prompt template (high signal)
+Use `chatgpt-export` only for an exact conversation URL the user has approved:
 
-Oracle starts with **zero** project knowledge. Assume the model cannot infer your stack, build tooling, conventions, or “obvious” paths. Include:
+```bash
+oracle chatgpt-export \
+  --target-url "https://chatgpt.com/c/<conversation-id>" \
+  --remote-chrome 127.0.0.1:9222 \
+  --out ~/Documents/chatgpt-conversation-exports/review
+```
 
-- Project briefing (stack + build/test commands + platform constraints).
-- “Where things live” (key directories, entrypoints, config files, dependency boundaries).
-- Exact question + what you tried + the error text (verbatim).
-- Constraints (“don’t change X”, “must keep public API”, “perf budget”, etc).
-- Desired output (“return patch plan + tests”, “list risky assumptions”, “give 3 options with tradeoffs”).
+The exporter captures only that conversation's authenticated backend response
+during page load and writes raw JSON, normalized JSON, Markdown, a manifest,
+and SHA-256 checksums. It does not read cookies, local storage, browser profiles,
+or unrelated history. Exact archived conversations may be temporarily recovered
+and are re-archived after export; pass `--no-recover-archived` to disable that
+path. `--archive-after-export` intentionally archives an active conversation.
 
-### “Exhaustive prompt” pattern (for later restoration)
+## Prompt template
 
-When you know this will be a long investigation, write a prompt that can stand alone later:
+Oracle starts with zero project knowledge. Include:
 
-- Top: 6–30 sentence project briefing + current goal.
-- Middle: concrete repro steps + exact errors + what you already tried.
-- Bottom: attach _all_ context files needed so a fresh model can fully understand (entrypoints, configs, key modules, docs).
+- Project briefing: stack, services, build/test commands, and platform constraints
+- Where things live: entrypoints, configs, key modules, and dependency boundaries
+- Exact question, prior attempts, and verbatim error text
+- Constraints such as API compatibility, performance budgets, and files not to change
+- Desired output such as a patch plan, tests, risk list, or tradeoff comparison
 
-If you need to reproduce the same context later, re-run with the same prompt + `--file …` set (Oracle runs are one-shot; the model doesn’t remember prior runs).
-
-## Safety
-
-- Don’t attach secrets by default (`.env`, key files, auth tokens). Redact aggressively; share only what’s required.
-- Prefer “just enough context”: fewer files + better prompt beats whole-repo dumps.
+For a long investigation, make the prompt restorable: put a 6–30 sentence
+briefing at the top, concrete reproduction and errors in the middle, and attach
+all context files required by a fresh model at the bottom. Oracle runs are
+one-shot; the model does not remember prior runs.

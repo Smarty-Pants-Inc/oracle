@@ -5,12 +5,12 @@ import type { LaunchedChrome } from "chrome-launcher";
 import {
   closeTab,
   connectWithNewTab,
-  hideChromeWindow,
   launchChrome,
+  positionChromeWindowOffscreen,
   registerTerminationHooks,
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
-import { syncCookies } from "./cookies.js";
+import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import {
   installJavaScriptDialogAutoDismissal,
   navigateToChatGPT,
@@ -154,9 +154,10 @@ export async function runBrowserProjectSources(
     );
 
     const strictTabIsolation = Boolean(manualLogin && reusedChrome);
+    const devtoolsRetries = manualLogin ? 6 : 0;
     const connection = await connectWithNewTab(chrome.port, logger, "about:blank", chromeHost, {
       fallbackToDefault: !strictTabIsolation,
-      retries: strictTabIsolation ? 3 : 0,
+      retries: devtoolsRetries,
       retryDelayMs: 500,
     });
     client = connection.client;
@@ -179,15 +180,15 @@ export async function runBrowserProjectSources(
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
 
-    const { Network, Page, Runtime, Input, DOM } = client;
-    if (!config.headless && config.hideWindow) {
-      await hideChromeWindow(chrome, logger);
-    }
+    const { Network, Page, Runtime, Input, DOM, Target } = client;
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
+    if (!config.headless && config.hideWindow) {
+      await positionChromeWindowOffscreen(client, logger);
+    }
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     if (!manualLogin) {
       await Network.clearBrowserCookies();
@@ -199,6 +200,7 @@ export async function runBrowserProjectSources(
       manualLogin,
       logger,
     });
+    await clearStaleChatGptConversationCookies(Network, Target, logger);
 
     await raceWithDisconnect(navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger));
     await raceWithDisconnect(
@@ -457,7 +459,7 @@ async function acquireManualLoginChromeForProjectSources(
 async function maybeReuseProjectSourcesChrome(
   userDataDir: string,
   logger: BrowserLogger,
-  options: { waitForPortMs?: number } = {},
+  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
 ): Promise<LaunchedChrome | null> {
   const waitForPortMs = Math.max(0, options.waitForPortMs ?? 0);
   let port = await readDevToolsPort(userDataDir);
@@ -473,13 +475,24 @@ async function maybeReuseProjectSourcesChrome(
   if (!port) {
     const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
     if (!discovered) {
+      if (pid) {
+        logger(
+          `No reachable Chrome DevTools target found for ${userDataDir}; clearing stale profile state before launching new Chrome.`,
+        );
+        await cleanupStaleProfileState(userDataDir, logger, {
+          lockRemovalMode: "if_oracle_pid_dead",
+        });
+      }
       return null;
     }
-    const probe = await verifyDevToolsReachable({ port: discovered.port });
+    const probe = await (options.probe ?? verifyDevToolsReachable)({ port: discovered.port });
     if (!probe.ok) {
       logger(
         `Discovered Chrome for ${userDataDir} on port ${discovered.port} but it was unreachable (${probe.error}); launching new Chrome.`,
       );
+      await cleanupStaleProfileState(userDataDir, logger, {
+        lockRemovalMode: "if_oracle_pid_dead",
+      });
       return null;
     }
     await writeDevToolsActivePort(userDataDir, discovered.port);
@@ -491,7 +504,7 @@ async function maybeReuseProjectSourcesChrome(
     );
     return { port, pid, kill: async () => {}, process: undefined } as unknown as LaunchedChrome;
   }
-  const probe = await verifyDevToolsReachable({ port });
+  const probe = await (options.probe ?? verifyDevToolsReachable)({ port });
   if (!probe.ok) {
     logger(
       `Recorded Chrome DevTools port ${port} is stale (${probe.error}); launching new Chrome.`,
@@ -506,4 +519,12 @@ async function maybeReuseProjectSourcesChrome(
     kill: async () => {},
     process: undefined,
   } as unknown as LaunchedChrome;
+}
+
+export async function maybeReuseProjectSourcesChromeForTest(
+  userDataDir: string,
+  logger: BrowserLogger,
+  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
+): Promise<LaunchedChrome | null> {
+  return maybeReuseProjectSourcesChrome(userDataDir, logger, options);
 }

@@ -1,6 +1,7 @@
 import http from "node:http";
 import net from "node:net";
 import { parseHostPort } from "../bridge/connection.js";
+import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactCapabilities } from "./types.js";
 
 export interface RemoteHealthResult {
   ok: boolean;
@@ -8,6 +9,7 @@ export interface RemoteHealthResult {
   error?: string;
   version?: string;
   uptimeSeconds?: number;
+  capabilities?: RemoteArtifactCapabilities;
 }
 
 export async function checkTcpConnection(
@@ -68,11 +70,15 @@ export async function checkRemoteHealth({
       const ok = (response.json as { ok?: unknown }).ok === true;
       const version = (response.json as { version?: unknown }).version;
       const uptimeSeconds = (response.json as { uptimeSeconds?: unknown }).uptimeSeconds;
+      const capabilities = parseCapabilities(
+        (response.json as { capabilities?: unknown }).capabilities,
+      );
       return {
         ok,
         statusCode: response.statusCode,
         version: typeof version === "string" ? version : undefined,
         uptimeSeconds: typeof uptimeSeconds === "number" ? uptimeSeconds : undefined,
+        capabilities,
       };
     }
     if (response.statusCode === 404) {
@@ -88,6 +94,37 @@ export async function checkRemoteHealth({
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+function parseCapabilities(value: unknown): RemoteArtifactCapabilities | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const raw = value as {
+    artifactTransfer?: unknown;
+    artifactProtocolVersion?: unknown;
+    maxArtifactBytes?: unknown;
+  };
+  if (raw.artifactTransfer !== true) {
+    return undefined;
+  }
+  const artifactProtocolVersion = raw.artifactProtocolVersion;
+  const maxArtifactBytes = raw.maxArtifactBytes;
+  if (
+    typeof artifactProtocolVersion !== "number" ||
+    !Number.isSafeInteger(artifactProtocolVersion) ||
+    artifactProtocolVersion <= 0 ||
+    typeof maxArtifactBytes !== "number" ||
+    !Number.isSafeInteger(maxArtifactBytes) ||
+    maxArtifactBytes <= 0
+  ) {
+    return undefined;
+  }
+  return {
+    artifactTransfer: true,
+    artifactProtocolVersion,
+    maxArtifactBytes: Math.min(maxArtifactBytes, MAX_REMOTE_ARTIFACT_BYTES),
+  };
 }
 
 function extractErrorMessage(json: unknown, bodyText: string): string | null {

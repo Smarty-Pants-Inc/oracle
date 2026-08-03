@@ -1,10 +1,15 @@
 import { isProModel } from "../oracle/modelResolver.js";
+import type { ReasoningMode } from "../oracle/types.js";
 
 export type EngineMode = "api" | "browser";
 
-export function defaultWaitPreference(model: string, engine: EngineMode): boolean {
+export function defaultWaitPreference(
+  model: string,
+  engine: EngineMode,
+  reasoningMode?: ReasoningMode,
+): boolean {
   // Pro-class API runs can take a long time; prefer non-blocking unless explicitly overridden.
-  if (engine === "api" && isProModel(model)) {
+  if (engine === "api" && (isProModel(model) || reasoningMode === "pro")) {
     return false;
   }
   return true; // browser or non-pro models are fast enough to block by default
@@ -16,16 +21,22 @@ export function defaultWaitPreference(model: string, engine: EngineMode): boolea
  * Precedence:
  * 1) Legacy --browser flag forces browser.
  * 2) Explicit --engine value.
- * 3) ORACLE_ENGINE environment override (api|browser).
- * 4) OPENAI_API_KEY decides: api when set, otherwise browser.
+ * 3) Explicit API provider routing flags force API.
+ * 4) ORACLE_ENGINE environment override (api|browser).
+ * 5) Config engine value.
+ * 6) API environment decides: api when set, otherwise browser.
  */
 export function resolveEngine({
   engine,
+  configEngine,
   browserFlag,
+  apiProviderRequested,
   env,
 }: {
   engine?: EngineMode;
+  configEngine?: EngineMode;
   browserFlag?: boolean;
+  apiProviderRequested?: boolean;
   env: NodeJS.ProcessEnv;
 }): EngineMode {
   if (browserFlag) {
@@ -34,11 +45,21 @@ export function resolveEngine({
   if (engine) {
     return engine;
   }
+  if (apiProviderRequested) {
+    return "api";
+  }
   const envEngine = normalizeEngineMode(env.ORACLE_ENGINE);
   if (envEngine) {
     return envEngine;
   }
-  return env.OPENAI_API_KEY ? "api" : "browser";
+  if (configEngine) {
+    return configEngine;
+  }
+  return hasApiEnvironment(env) ? "api" : "browser";
+}
+
+function hasApiEnvironment(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.OPENAI_API_KEY || env.OPENROUTER_API_KEY);
 }
 
 function normalizeEngineMode(raw: unknown): EngineMode | null {

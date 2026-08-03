@@ -10,18 +10,20 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  waitForResumedConversationHydration,
 } from "./pageActions.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import {
   launchChrome,
   connectToChrome,
-  hideChromeWindow,
+  positionChromeWindowOffscreen,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
-import { syncCookies } from "./cookies.js";
-import { CHATGPT_URL, CONVERSATION_TURN_SELECTOR } from "./constants.js";
+import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
+import { CHATGPT_URL } from "./constants.js";
+import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { cleanupStaleProfileState } from "./profileState.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
@@ -46,6 +48,7 @@ export interface ReattachDeps {
   waitForAssistantResponse?: typeof waitForAssistantResponse;
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
+  waitForConversationHydration?: typeof waitForResumedConversationHydration;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
@@ -68,6 +71,12 @@ export async function resumeBrowserSession(
     deps.recoverSession ??
     (async (runtimeMeta, configMeta) =>
       resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps));
+  let closeAttachedConnection: (() => Promise<void>) | null = null;
+  const closeAttached = async (): Promise<void> => {
+    const close = closeAttachedConnection;
+    closeAttachedConnection = null;
+    await close?.().catch(() => undefined);
+  };
 
   if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
     logger("No running Chrome detected; reopening browser to locate the session.");
@@ -97,8 +106,10 @@ export async function resumeBrowserSession(
             targetId: target?.targetId ?? target?.id,
             closeTargetOnDispose: false,
           })
-        : ({
-            client: (await (deps.connect ?? ((options?: unknown) => CDP(options as CDP.Options)))(
+        : await (async () => {
+            const client = (await (
+              deps.connect ?? ((options?: unknown) => CDP(options as CDP.Options))
+            )(
               browserWSEndpoint
                 ? {
                     target: browserWSEndpoint,
@@ -110,9 +121,11 @@ export async function resumeBrowserSession(
                     port,
                     target: target?.targetId ?? target?.id,
                   },
-            )) as unknown as ChromeClient,
-            close: async () => undefined,
-          } as const);
+            )) as unknown as ChromeClient;
+            return { client, close: () => client.close() };
+          })();
+    closeAttachedConnection = () => connection.close();
+
     const client: ChromeClient = connection.client;
     const { Runtime, DOM, Page } = client;
     if (Runtime?.enable) {
@@ -163,6 +176,17 @@ export async function resumeBrowserSession(
       "Reattach target did not respond",
     );
     await ensureConversationOpen();
+    const waitForHydration =
+      deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+    const expectedConversationUrl = buildConversationUrl(
+      runtime,
+      resolveBrowserConfig(config ?? {}).url,
+    );
+    await waitForHydration(Runtime, timeoutMs, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: expectedConversationUrl ?? undefined,
+    });
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
@@ -170,11 +194,13 @@ export async function resumeBrowserSession(
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
       const researchResult = await withTimeout(
-        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client),
+        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
+          requireScopedTargetOwner: true,
+        }),
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
-      await connection.close().catch(() => undefined);
+      await closeAttached();
       return {
         answerText: researchResult.text,
         answerMarkdown: researchResult.text,
@@ -202,10 +228,10 @@ export async function resumeBrowserSession(
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
-    await connection.close().catch(() => undefined);
-
+    await closeAttached();
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
+    await closeAttached();
     const message = error instanceof Error ? error.message : String(error);
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
@@ -268,7 +294,7 @@ async function resumeBrowserSessionViaNewChrome(
   const chrome = await launchChrome(resolved, userDataDir, logger);
   const chromeHost = (chrome as unknown as { host?: string }).host ?? "127.0.0.1";
   const client = await connectToChrome(chrome.port, logger, chromeHost);
-  const { Network, Page, Runtime, DOM } = client;
+  const { Network, Page, Runtime, DOM, Target } = client;
 
   if (Runtime?.enable) {
     await Runtime.enable();
@@ -277,9 +303,8 @@ async function resumeBrowserSessionViaNewChrome(
     await DOM.enable();
   }
   if (!resolved.headless && resolved.hideWindow) {
-    await hideChromeWindow(chrome, logger);
+    await positionChromeWindowOffscreen(client, logger);
   }
-
   let appliedCookies = 0;
   if (!manualLogin && resolved.cookieSync) {
     appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
@@ -290,6 +315,14 @@ async function resumeBrowserSessionViaNewChrome(
       waitMs: resolved.cookieSyncWaitMs ?? 0,
     });
   }
+
+  await clearStaleChatGptConversationCookies(Network, Target, logger, {
+    preserveConversationIds: [
+      runtime.conversationId,
+      extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+      extractConversationIdFromUrl(resolved.url),
+    ],
+  });
 
   await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
   await ensureNotBlocked(Runtime, resolved.headless, logger);
@@ -327,6 +360,12 @@ async function resumeBrowserSessionViaNewChrome(
     await waitForLocationChange(Runtime, 15_000);
   }
 
+  const waitForHydration = deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+  await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
+    requirePriorTurns: true,
+    requirePromptReady: false,
+    expectedConversationUrl: conversationUrl ?? undefined,
+  });
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
   const timeoutMs = resolved.timeoutMs ?? 120_000;
@@ -365,6 +404,9 @@ async function resumeBrowserSessionViaNewChrome(
       minTurnIndex ?? undefined,
       Page,
       client,
+      {
+        requireScopedTargetOwner: true,
+      },
     );
     await cleanup();
     return {
@@ -403,7 +445,7 @@ async function readPromptPreviewTurnIndex(
       const needle = ${JSON.stringify(preview.toLowerCase().replace(/\s+/g, " ").slice(0, 120))};
       if (!needle) return null;
       const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-      const turns = Array.from(document.querySelectorAll(${JSON.stringify(CONVERSATION_TURN_SELECTOR)}));
+      const turns = ${buildConversationTurnListExpression()};
       let matched = null;
       for (const [index, node] of turns.entries()) {
         const attr = (node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();

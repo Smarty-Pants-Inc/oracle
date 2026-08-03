@@ -89,15 +89,19 @@ if (!ENABLE_LIVE || !LIVE_API_KEY) {
     );
 
     test(
-      "gpt-5.2-pro background flow eventually completes",
+      "gpt-5.6-sol Pro reasoning mode background flow eventually completes",
       async () => {
         const result = await runOracle(
           {
-            prompt: 'Reply with "live 5.2 pro smoke test" on a single line.',
-            model: "gpt-5.2-pro",
+            prompt: 'Reply with "live 5.6 sol pro smoke test" on a single line.',
+            model: "gpt-5.6-sol",
+            reasoningEffort: "max",
+            reasoningMode: "pro",
             silent: true,
             heartbeatIntervalMs: 2000,
-            maxOutput: 64,
+            // Reasoning tokens count toward max_output_tokens. Keep enough headroom
+            // for Pro + max to complete and still return the requested visible text.
+            maxOutput: 25_000,
           },
           sharedDeps,
         );
@@ -105,7 +109,7 @@ if (!ENABLE_LIVE || !LIVE_API_KEY) {
           throw new Error("Expected live result");
         }
         const text = extractTextOutput(result.response);
-        expect(text.toLowerCase()).toContain("live 5.2 pro smoke test");
+        expect(text.toLowerCase()).toContain("live 5.6 sol pro smoke test");
         expect(result.response.status ?? "completed").toBe("completed");
       },
       30 * 60 * 1000,

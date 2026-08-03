@@ -4,6 +4,8 @@ export {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  ensureChatMode,
+  waitForResumedConversationHydration,
   ensureChatGptScopeRetained,
   installJavaScriptDialogAutoDismissal,
 } from "./actions/navigation.js";

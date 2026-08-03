@@ -5,7 +5,7 @@ import { describe, expect, test, afterEach } from "vitest";
 import { buildBrowserConfig } from "../../src/cli/browserConfig.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 
-const model = "gpt-5.1" as const;
+const model = "gpt-5.4" as const;
 
 describe("buildBrowserConfig inline cookies", () => {
   afterEach(() => {

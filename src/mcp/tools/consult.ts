@@ -1,9 +1,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getCliVersion } from "../../version.js";
-import { LoggingMessageNotificationParamsSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  LoggingMessageNotificationParamsSchema,
+  type CallToolResult,
+} from "@modelcontextprotocol/sdk/types.js";
 import { ensureBrowserAvailable, mapConsultToRunOptions } from "../utils.js";
-import type { BrowserSessionConfig, SessionModelRun } from "../../sessionStore.js";
+import type { RunOracleOptions } from "../../oracle.js";
+import type { EngineMode } from "../../cli/engine.js";
+import type { BrowserSessionConfig, SessionArtifact, SessionModelRun } from "../../sessionStore.js";
 import { sessionStore } from "../../sessionStore.js";
 import { resolveRemoteServiceConfig } from "../../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../../remote/client.js";
@@ -27,12 +32,13 @@ async function readSessionLogTail(sessionId: string, maxBytes: number): Promise<
 import { performSessionRun } from "../../cli/sessionRunner.js";
 import { runDryRunSummary } from "../../cli/dryRun.js";
 import { CHATGPT_URL } from "../../browser/constants.js";
-import { CONSULT_PRESETS, consultInputSchema } from "../types.js";
+import { CONSULT_PRESETS, browserThinkingTimeRawSchema, consultInputSchema } from "../types.js";
 import { applyConsultPreset } from "../consultPresets.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveNotificationSettings } from "../../cli/notifier.js";
 import { mapModelToBrowserLabel, resolveBrowserModelLabel } from "../../cli/browserConfig.js";
 import type { BrowserModelStrategy } from "../../browser/types.js";
+import { normalizeThinkingTimeLevel } from "../../oracle/thinkingTime.js";
 
 // Use raw shapes so the MCP SDK (with its bundled Zod) wraps them and emits valid JSON Schema.
 const consultInputShape = {
@@ -81,8 +87,13 @@ const consultInputShape = {
     .boolean()
     .optional()
     .describe("Browser-only: bundle many files into a single upload (helps with upload limits)."),
-  browserThinkingTime: z
-    .enum(["light", "standard", "extended", "heavy"])
+  browserBundleFormat: z
+    .enum(["auto", "text", "zip"])
+    .optional()
+    .describe(
+      'Browser-only: bundle upload format when browserBundleFiles is true or auto-bundling is needed. Defaults to "auto"; "auto" uses ZIP when bundled inputs include raw/binary files.',
+    ),
+  browserThinkingTime: browserThinkingTimeRawSchema
     .optional()
     .describe("Browser-only: set ChatGPT thinking time when supported by the chosen model."),
   browserModelStrategy: z
@@ -111,6 +122,18 @@ const consultInputShape = {
     .boolean()
     .optional()
     .describe("Browser-only: keep Chrome running after completion (useful for debugging)."),
+  generateImage: z
+    .string()
+    .optional()
+    .describe(
+      "Browser-only: save generated image(s) to this file path. For ChatGPT browser mode this enables the image-aware wait/download path used by CLI --generate-image.",
+    ),
+  outputPath: z
+    .string()
+    .optional()
+    .describe(
+      "Browser-only image output fallback path, mirroring the CLI --output option for image operations.",
+    ),
   dryRun: z
     .boolean()
     .optional()
@@ -157,6 +180,56 @@ const consultModelSummaryShape = z.object({
   logPath: z.string().optional(),
 });
 
+const consultArtifactSummaryShape = z.object({
+  kind: z.enum(["transcript", "deep-research-report", "image", "file"]),
+  path: z.string(),
+  label: z.string().optional(),
+  mimeType: z.string().optional(),
+  sizeBytes: z.number().optional(),
+});
+
+const consultImageSummaryShape = consultArtifactSummaryShape.extend({
+  kind: z.literal("image"),
+  alt: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  fileId: z.string().optional(),
+});
+const consultAgentBlockerShape = z.object({
+  kind: z.enum([
+    "login_required",
+    "captcha",
+    "permission",
+    "rate_limit",
+    "selector_drift",
+    "scope_mismatch",
+    "browser_unavailable",
+    "timeout",
+    "model_unavailable",
+    "unsupported_endpoint",
+    "unknown",
+  ]),
+  severity: z.enum(["action_required", "retryable", "fatal", "unknown"]),
+  message: z.string(),
+  remediation: z.string(),
+  resumable: z.boolean(),
+  resumeCommand: z.string().optional(),
+  evidence: z.object({
+    sessionId: z.string().optional(),
+    status: z.string().optional(),
+    mode: z.string().optional(),
+    incompleteReason: z.string().nullable().optional(),
+    transportReason: z.string().optional(),
+    errorCategory: z.string().optional(),
+    errorStage: z.string().optional(),
+    errorCode: z.string().optional(),
+    expectedUrl: z.string().optional(),
+    actualUrl: z.string().optional(),
+    errorSignals: z.array(z.string()).optional(),
+    errorBlockers: z.array(z.string()).optional(),
+  }),
+});
+
 const consultDryRunResolvedShape = z.object({
   resolvedEngine: z.enum(["api", "browser"]),
   model: z.string(),
@@ -171,51 +244,32 @@ const consultDryRunResolvedShape = z.object({
       researchMode: z.string().nullable().optional(),
       attachments: z.string().optional(),
       bundleFiles: z.boolean().optional(),
+      bundleFormat: z.enum(["auto", "text", "zip"]).optional(),
       keepBrowser: z.boolean().optional(),
       manualLogin: z.boolean().optional(),
       profileDir: z.string().nullable().optional(),
       chatgptUrl: z.string().nullable().optional(),
+      imageOutputPath: z.string().nullable().optional(),
     })
     .optional(),
   guidance: z.array(z.string()),
 });
 
-const consultAgentBlockerShape = z.object({
-  kind: z.string(),
-  severity: z.string(),
-  message: z.string(),
-  remediation: z.string(),
-  resumable: z.boolean(),
-  resumeCommand: z.string().optional(),
-  evidence: z
-    .object({
-      sessionId: z.string().optional(),
-      status: z.string().optional(),
-      mode: z.string().optional(),
-      incompleteReason: z.string().nullable().optional(),
-      transportReason: z.string().optional(),
-      errorCategory: z.string().optional(),
-      errorStage: z.string().optional(),
-      errorCode: z.string().optional(),
-      expectedUrl: z.string().optional(),
-      actualUrl: z.string().optional(),
-      errorSignals: z.array(z.string()).optional(),
-      errorBlockers: z.array(z.string()).optional(),
-    })
-    .optional(),
-});
-
-const consultOutputShape = {
+export const consultOutputShape = {
   sessionId: z.string().optional(),
   status: z.string(),
   output: z.string(),
   dryRun: z.boolean().optional(),
   resolved: consultDryRunResolvedShape.optional(),
   models: z.array(consultModelSummaryShape).optional(),
+  artifacts: z.array(consultArtifactSummaryShape).optional(),
+  images: z.array(consultImageSummaryShape).optional(),
   agentBlocker: consultAgentBlockerShape.optional(),
 } satisfies z.ZodRawShape;
 
 export type ConsultModelSummary = z.infer<typeof consultModelSummaryShape>;
+export type ConsultArtifactSummary = z.infer<typeof consultArtifactSummaryShape>;
+export type ConsultImageSummary = z.infer<typeof consultImageSummaryShape>;
 export type ConsultDryRunResolved = z.infer<typeof consultDryRunResolvedShape>;
 export type ConsultAgentBlocker = OracleAgentBlocker;
 
@@ -250,6 +304,51 @@ export function summarizeModelRunsForConsult(
       logPath: run.log?.path,
     };
   });
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export function summarizeArtifactsForConsult(
+  artifacts?: SessionArtifact[] | null,
+): ConsultArtifactSummary[] | undefined {
+  if (!artifacts || artifacts.length === 0) {
+    return undefined;
+  }
+  return artifacts.map((artifact) => ({
+    kind: artifact.kind,
+    path: artifact.path,
+    label: artifact.label,
+    mimeType: artifact.mimeType,
+    sizeBytes: artifact.sizeBytes,
+  }));
+}
+
+export function summarizeImageArtifactsForConsult(
+  artifacts?: SessionArtifact[] | null,
+): ConsultImageSummary[] | undefined {
+  const images = (artifacts ?? [])
+    .filter((artifact) => artifact.kind === "image")
+    .map((artifact) => {
+      const image = artifact as SessionArtifact & Record<string, unknown>;
+      return {
+        kind: "image" as const,
+        path: artifact.path,
+        label: artifact.label,
+        mimeType: artifact.mimeType,
+        sizeBytes: artifact.sizeBytes,
+        alt: optionalString(image.alt),
+        width: optionalNumber(image.width),
+        height: optionalNumber(image.height),
+        fileId: optionalString(image.fileId),
+      };
+    });
+  return images.length > 0 ? images : undefined;
 }
 
 export function buildConsultBrowserConfig({
@@ -287,6 +386,7 @@ export function buildConsultBrowserConfig({
   const manualLogin = hasProfileDir
     ? true
     : (configuredBrowser.manualLogin ?? process.platform === "win32");
+  const configuredThinkingTime = normalizeThinkingTimeLevel(configuredBrowser.thinkingTime);
 
   return {
     ...configuredBrowser,
@@ -300,7 +400,7 @@ export function buildConsultBrowserConfig({
     manualLoginProfileDir: manualLogin
       ? ((envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null)
       : null,
-    thinkingTime: browserThinkingTime ?? configuredBrowser.thinkingTime,
+    thinkingTime: browserThinkingTime ?? configuredThinkingTime ?? undefined,
     modelStrategy: browserModelStrategy ?? configuredBrowser.modelStrategy,
     researchMode: browserResearchMode ?? configuredBrowser.researchMode,
     archiveConversations: browserArchive ?? configuredBrowser.archiveConversations,
@@ -359,6 +459,12 @@ export function buildConsultDryRunResolved({
       "This is a multi-turn browser consult; all follow-ups stay in one ChatGPT conversation.",
     );
   }
+  const imageOutputPath = runOptions.generateImage ?? runOptions.outputPath ?? null;
+  if (resolvedEngine === "browser" && imageOutputPath) {
+    guidance.push(
+      "ChatGPT generated images will use the image-aware wait/download path and return saved files in structuredContent.images.",
+    );
+  }
   return {
     resolvedEngine,
     model: runOptions.model,
@@ -374,10 +480,12 @@ export function buildConsultDryRunResolved({
             researchMode: browserConfig?.researchMode ?? null,
             attachments: runOptions.browserAttachments,
             bundleFiles: runOptions.browserBundleFiles,
+            bundleFormat: runOptions.browserBundleFormat,
             keepBrowser: browserConfig?.keepBrowser,
             manualLogin: browserConfig?.manualLogin,
             profileDir: browserConfig?.manualLoginProfileDir ?? null,
             chatgptUrl,
+            imageOutputPath,
           }
         : undefined,
     guidance,
@@ -401,6 +509,7 @@ export function formatConsultDryRunResolved(details: ConsultDryRunResolved): str
     lines.push(`  browser research mode: ${details.browser.researchMode ?? "off"}`);
     lines.push(`  browser attachments: ${details.browser.attachments ?? "auto"}`);
     lines.push(`  browser bundle files: ${details.browser.bundleFiles ? "yes" : "no"}`);
+    lines.push(`  browser bundle format: ${details.browser.bundleFormat ?? "auto"}`);
     lines.push(`  browser keep browser: ${details.browser.keepBrowser ? "yes" : "no"}`);
     lines.push(`  browser manual login: ${details.browser.manualLogin ? "yes" : "no"}`);
     if (details.browser.profileDir) {
@@ -408,6 +517,9 @@ export function formatConsultDryRunResolved(details: ConsultDryRunResolved): str
     }
     if (details.browser.chatgptUrl) {
       lines.push(`  ChatGPT URL: ${details.browser.chatgptUrl}`);
+    }
+    if (details.browser.imageOutputPath) {
+      lines.push(`  image output: ${details.browser.imageOutputPath}`);
     }
   }
   lines.push(`  follow-ups: ${details.followUpCount}`);
@@ -417,250 +529,283 @@ export function formatConsultDryRunResolved(details: ConsultDryRunResolved): str
   return lines;
 }
 
+type McpLoggingServer = Pick<McpServer["server"], "sendLoggingMessage">;
+
+export async function runConsultTool(
+  input: unknown,
+  { server }: { server: McpLoggingServer },
+): Promise<CallToolResult> {
+  const textContent = (text: string) => [{ type: "text" as const, text }];
+  let parsedInput;
+  try {
+    parsedInput = applyConsultPreset(consultInputSchema.parse(input));
+  } catch (error) {
+    return {
+      isError: true,
+      content: textContent(error instanceof Error ? error.message : String(error)),
+    };
+  }
+  const {
+    prompt,
+    files,
+    model,
+    models,
+    engine,
+    search,
+    browserModelLabel,
+    browserAttachments,
+    browserBundleFiles,
+    browserBundleFormat,
+    browserThinkingTime,
+    browserModelStrategy,
+    browserResearchMode,
+    browserArchive,
+    browserFollowUps,
+    browserKeepBrowser,
+    generateImage,
+    outputPath,
+    dryRun,
+    slug,
+  } = parsedInput;
+  const { config: userConfig } = await loadUserConfig();
+  let runOptions: RunOracleOptions;
+  let resolvedEngine: EngineMode;
+  try {
+    ({ runOptions, resolvedEngine } = mapConsultToRunOptions({
+      prompt,
+      files: files ?? [],
+      model,
+      models,
+      engine,
+      search,
+      browserAttachments,
+      browserBundleFiles,
+      browserBundleFormat,
+      browserFollowUps,
+      generateImage,
+      outputPath,
+      userConfig,
+      env: process.env,
+    }));
+  } catch (error) {
+    return {
+      isError: true,
+      content: textContent(error instanceof Error ? error.message : String(error)),
+    };
+  }
+  const cwd = process.cwd();
+  const sendLog = (text: string, level: "info" | "debug" = "info") =>
+    server
+      .sendLoggingMessage(
+        LoggingMessageNotificationParamsSchema.parse({
+          level,
+          data: { text, bytes: Buffer.byteLength(text, "utf8") },
+        }),
+      )
+      .catch(() => {});
+
+  const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
+  const imageOutputPath = runOptions.generateImage ?? runOptions.outputPath;
+  if (resolvedEngine === "browser" && resolvedRemote.host && imageOutputPath) {
+    return {
+      isError: true,
+      content: textContent(
+        "ChatGPT image output is not supported with a remote browser service: generated files are not transferred back to the MCP caller. Unset ORACLE_REMOTE_HOST to generate images locally, or omit generateImage/outputPath.",
+      ),
+    };
+  }
+
+  let browserConfig: BrowserSessionConfig | undefined;
+  if (resolvedEngine === "browser") {
+    browserConfig = buildConsultBrowserConfig({
+      userConfig,
+      env: process.env,
+      runModel: runOptions.model,
+      inputModel: model,
+      browserModelLabel,
+      browserThinkingTime,
+      browserModelStrategy,
+      browserResearchMode,
+      browserArchive,
+      browserKeepBrowser,
+    });
+  }
+
+  if (dryRun) {
+    const lines: string[] = [];
+    const log = (line: string): void => {
+      lines.push(line);
+      sendLog(line);
+    };
+    const resolved = buildConsultDryRunResolved({
+      resolvedEngine,
+      runOptions,
+      browserConfig,
+    });
+    await runDryRunSummary({
+      engine: resolvedEngine,
+      runOptions,
+      cwd,
+      version: getCliVersion(),
+      log,
+      browserConfig,
+    });
+    for (const line of formatConsultDryRunResolved(resolved)) {
+      log(line);
+    }
+    const output = lines.join("\n").trim();
+    return {
+      content: textContent(output),
+      structuredContent: {
+        status: "dry-run",
+        output,
+        dryRun: true,
+        resolved,
+      },
+    };
+  }
+
+  const browserGuard = ensureBrowserAvailable(resolvedEngine, {
+    remoteHost: resolvedRemote.host,
+  });
+  if (resolvedEngine === "browser" && browserGuard) {
+    return {
+      isError: true,
+      content: textContent(browserGuard),
+    };
+  }
+
+  let browserDeps: BrowserSessionRunnerDeps | undefined;
+  if (resolvedEngine === "browser" && resolvedRemote.host) {
+    if (!resolvedRemote.token) {
+      return {
+        isError: true,
+        content: textContent(
+          `Remote host configured (${resolvedRemote.host}) but remote token is missing. Run \`oracle bridge client --connect <...>\` or set ORACLE_REMOTE_TOKEN.`,
+        ),
+      };
+    }
+    browserDeps = {
+      executeBrowser: createRemoteBrowserExecutor({
+        host: resolvedRemote.host,
+        token: resolvedRemote.token,
+      }),
+    };
+  }
+
+  const notifications = resolveNotificationSettings({
+    cliNotify: undefined,
+    cliNotifySound: undefined,
+    env: process.env,
+    config: userConfig.notify,
+  });
+
+  const sessionMeta = await sessionStore.createSession(
+    {
+      ...runOptions,
+      mode: resolvedEngine,
+      slug,
+      browserConfig,
+      waitPreference: true,
+    },
+    cwd,
+    notifications,
+  );
+
+  const logWriter = sessionStore.createLogWriter(sessionMeta.id);
+  // Stream logs to both the session log and MCP logging notifications, but avoid buffering in memory
+  const log = (line?: string): void => {
+    logWriter.logLine(line);
+    if (line !== undefined) {
+      sendLog(line);
+    }
+  };
+  const write = (chunk: string): boolean => {
+    logWriter.writeChunk(chunk);
+    sendLog(chunk, "debug");
+    return true;
+  };
+
+  try {
+    await performSessionRun({
+      sessionMeta,
+      runOptions,
+      mode: resolvedEngine,
+      browserConfig,
+      cwd,
+      log,
+      write,
+      version: getCliVersion(),
+      notifications,
+      muteStdout: true,
+      browserDeps,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`Run failed: ${message}`);
+    const finalMeta =
+      (await sessionStore.readSession(sessionMeta.id).catch(() => null)) ?? sessionMeta;
+    const logTail = await readSessionLogTail(sessionMeta.id, 4000);
+    const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
+    const artifacts = summarizeArtifactsForConsult(finalMeta.artifacts);
+    const images = summarizeImageArtifactsForConsult(finalMeta.artifacts);
+    const agentBlocker = buildAgentBlockerFromSession(finalMeta, { logTail });
+    return {
+      isError: true,
+      content: textContent(`Session ${sessionMeta.id} failed: ${message}`),
+      structuredContent: {
+        sessionId: sessionMeta.id,
+        status: finalMeta.status === "running" ? "error" : finalMeta.status,
+        output: logTail || message,
+        models: modelsSummary,
+        artifacts,
+        images,
+        agentBlocker,
+      },
+    };
+  } finally {
+    logWriter.stream.end();
+  }
+
+  try {
+    const finalMeta = (await sessionStore.readSession(sessionMeta.id)) ?? sessionMeta;
+    const summary = `Session ${sessionMeta.id} (${finalMeta.status})`;
+    const logTail = await readSessionLogTail(sessionMeta.id, 4000);
+    const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
+    const artifacts = summarizeArtifactsForConsult(finalMeta.artifacts);
+    const images = summarizeImageArtifactsForConsult(finalMeta.artifacts);
+    return {
+      content: textContent([summary, logTail || "(log empty)"].join("\n").trim()),
+      structuredContent: {
+        sessionId: sessionMeta.id,
+        status: finalMeta.status,
+        output: logTail ?? "",
+        models: modelsSummary,
+        artifacts,
+        images,
+      },
+    };
+  } catch (error) {
+    return {
+      isError: true,
+      content: textContent(
+        `Session completed but metadata fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    };
+  }
+}
+
 export function registerConsultTool(server: McpServer): void {
   server.registerTool(
     "consult",
     {
       title: "Run an oracle session",
       description:
-        'Run an Oracle session (API or ChatGPT browser automation). Use `files` to attach project context. If `engine` is omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then API when OPENAI_API_KEY is set, otherwise browser. Browser GPT-5.6 Sol Pro consults can take many minutes; use `dryRun:true` first when configuring an agent and inspect `sessions`/`oracle status` before retrying. Browser manual-login uses a private Oracle Chrome profile separate from the user\'s normal Chrome; dry-run output includes first-time setup guidance when that path is active. For browser-based image/file uploads, set `browserAttachments:"always"`. Browser consults can include `browserFollowUps` for a multi-turn ChatGPT review in one conversation. Sessions are stored under `ORACLE_HOME_DIR` (shared with the CLI).',
+        'Run an Oracle session (API or ChatGPT browser automation). Use `files` to attach project context. If `engine` is omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then API when OPENAI_API_KEY is set, otherwise browser. Browser GPT-5.5 Pro consults can take many minutes; use `dryRun:true` first when configuring an agent and inspect `sessions`/`oracle status` before retrying. Browser manual-login uses a private Oracle Chrome profile separate from the user\'s normal Chrome; dry-run output includes first-time setup guidance when that path is active. For browser-based image/file uploads, set `browserAttachments:"always"`. For ChatGPT image generation, set `generateImage` to enable the same image wait/download path as CLI --generate-image and read returned paths from `images`. Browser consults can include `browserFollowUps` for a multi-turn ChatGPT review in one conversation. Sessions are stored under `ORACLE_HOME_DIR` (shared with the CLI).',
       // Cast to any to satisfy SDK typings across differing Zod versions.
       inputSchema: consultInputShape,
       outputSchema: consultOutputShape,
     },
-    async (input: unknown) => {
-      const textContent = (text: string) => [{ type: "text" as const, text }];
-      let parsedInput;
-      try {
-        parsedInput = applyConsultPreset(consultInputSchema.parse(input));
-      } catch (error) {
-        return {
-          isError: true,
-          content: textContent(error instanceof Error ? error.message : String(error)),
-        };
-      }
-      const {
-        prompt,
-        files,
-        model,
-        models,
-        engine,
-        search,
-        browserModelLabel,
-        browserAttachments,
-        browserBundleFiles,
-        browserThinkingTime,
-        browserModelStrategy,
-        browserResearchMode,
-        browserArchive,
-        browserFollowUps,
-        browserKeepBrowser,
-        dryRun,
-        slug,
-      } = parsedInput;
-      const { config: userConfig } = await loadUserConfig();
-      const { runOptions, resolvedEngine } = mapConsultToRunOptions({
-        prompt,
-        files: files ?? [],
-        model,
-        models,
-        engine,
-        search,
-        browserAttachments,
-        browserBundleFiles,
-        browserFollowUps,
-        userConfig,
-        env: process.env,
-      });
-      const cwd = process.cwd();
-      const sendLog = (text: string, level: "info" | "debug" = "info") =>
-        server.server
-          .sendLoggingMessage(
-            LoggingMessageNotificationParamsSchema.parse({
-              level,
-              data: { text, bytes: Buffer.byteLength(text, "utf8") },
-            }),
-          )
-          .catch(() => {});
-
-      const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
-
-      let browserConfig: BrowserSessionConfig | undefined;
-      if (resolvedEngine === "browser") {
-        browserConfig = buildConsultBrowserConfig({
-          userConfig,
-          env: process.env,
-          runModel: runOptions.model,
-          inputModel: model,
-          browserModelLabel,
-          browserThinkingTime,
-          browserModelStrategy,
-          browserResearchMode,
-          browserArchive,
-          browserKeepBrowser,
-        });
-      }
-
-      if (dryRun) {
-        const lines: string[] = [];
-        const log = (line: string): void => {
-          lines.push(line);
-          sendLog(line);
-        };
-        const resolved = buildConsultDryRunResolved({
-          resolvedEngine,
-          runOptions,
-          browserConfig,
-        });
-        await runDryRunSummary({
-          engine: resolvedEngine,
-          runOptions,
-          cwd,
-          version: getCliVersion(),
-          log,
-          browserConfig,
-        });
-        for (const line of formatConsultDryRunResolved(resolved)) {
-          log(line);
-        }
-        const output = lines.join("\n").trim();
-        return {
-          content: textContent(output),
-          structuredContent: {
-            status: "dry-run",
-            output,
-            dryRun: true,
-            resolved,
-          },
-        };
-      }
-
-      const browserGuard = ensureBrowserAvailable(resolvedEngine, {
-        remoteHost: resolvedRemote.host,
-      });
-      if (resolvedEngine === "browser" && browserGuard) {
-        return {
-          isError: true,
-          content: textContent(browserGuard),
-        };
-      }
-
-      let browserDeps: BrowserSessionRunnerDeps | undefined;
-      if (resolvedEngine === "browser" && resolvedRemote.host) {
-        if (!resolvedRemote.token) {
-          return {
-            isError: true,
-            content: textContent(
-              `Remote host configured (${resolvedRemote.host}) but remote token is missing. Run \`oracle bridge client --connect <...>\` or set ORACLE_REMOTE_TOKEN.`,
-            ),
-          };
-        }
-        browserDeps = {
-          executeBrowser: createRemoteBrowserExecutor({
-            host: resolvedRemote.host,
-            token: resolvedRemote.token,
-          }),
-        };
-      }
-
-      const notifications = resolveNotificationSettings({
-        cliNotify: undefined,
-        cliNotifySound: undefined,
-        env: process.env,
-        config: userConfig.notify,
-      });
-
-      const sessionMeta = await sessionStore.createSession(
-        {
-          ...runOptions,
-          mode: resolvedEngine,
-          slug,
-          browserConfig,
-          waitPreference: true,
-        },
-        cwd,
-        notifications,
-      );
-
-      const logWriter = sessionStore.createLogWriter(sessionMeta.id);
-      // Stream logs to both the session log and MCP logging notifications, but avoid buffering in memory
-      const log = (line?: string): void => {
-        logWriter.logLine(line);
-        if (line !== undefined) {
-          sendLog(line);
-        }
-      };
-      const write = (chunk: string): boolean => {
-        logWriter.writeChunk(chunk);
-        sendLog(chunk, "debug");
-        return true;
-      };
-
-      try {
-        await performSessionRun({
-          sessionMeta,
-          runOptions,
-          mode: resolvedEngine,
-          browserConfig,
-          cwd,
-          log,
-          write,
-          version: getCliVersion(),
-          notifications,
-          muteStdout: true,
-          browserDeps,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log(`Run failed: ${message}`);
-        let finalMeta = sessionMeta;
-        try {
-          finalMeta = (await sessionStore.readSession(sessionMeta.id)) ?? sessionMeta;
-        } catch {
-          finalMeta = sessionMeta;
-        }
-        const logTail = await readSessionLogTail(sessionMeta.id, 4000);
-        const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
-        const agentBlocker = buildAgentBlockerFromSession(finalMeta, { logTail });
-        return {
-          isError: true,
-          content: textContent(`Session ${sessionMeta.id} failed: ${message}`),
-          structuredContent: {
-            sessionId: sessionMeta.id,
-            status: finalMeta.status,
-            output: logTail ?? "",
-            models: modelsSummary,
-            agentBlocker,
-          },
-        };
-      } finally {
-        logWriter.stream.end();
-      }
-
-      try {
-        const finalMeta = (await sessionStore.readSession(sessionMeta.id)) ?? sessionMeta;
-        const summary = `Session ${sessionMeta.id} (${finalMeta.status})`;
-        const logTail = await readSessionLogTail(sessionMeta.id, 4000);
-        const modelsSummary = summarizeModelRunsForConsult(finalMeta.models);
-        const agentBlocker = buildAgentBlockerFromSession(finalMeta, { logTail });
-        return {
-          content: textContent([summary, logTail || "(log empty)"].join("\n").trim()),
-          structuredContent: {
-            sessionId: sessionMeta.id,
-            status: finalMeta.status,
-            output: logTail ?? "",
-            models: modelsSummary,
-            agentBlocker,
-          },
-        };
-      } catch (error) {
-        return {
-          isError: true,
-          content: textContent(
-            `Session completed but metadata fetch failed: ${error instanceof Error ? error.message : String(error)}`,
-          ),
-        };
-      }
-    },
+    async (input: unknown) => runConsultTool(input, { server: server.server }),
   );
 }

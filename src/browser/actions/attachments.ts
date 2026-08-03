@@ -1,11 +1,7 @@
 import path from "node:path";
 import type { ChromeClient, BrowserAttachment, BrowserLogger } from "../types.js";
-import {
-  CONVERSATION_TURN_SELECTOR,
-  INPUT_SELECTORS,
-  SEND_BUTTON_SELECTORS,
-  UPLOAD_STATUS_SELECTORS,
-} from "../constants.js";
+import { INPUT_SELECTORS, SEND_BUTTON_SELECTORS, UPLOAD_STATUS_SELECTORS } from "../constants.js";
+import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { transferAttachmentViaDataTransfer } from "./attachmentDataTransfer.js";
@@ -1335,8 +1331,15 @@ export async function waitForAttachmentCompletion(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
-  const stableThresholdMs = 1500;
+  const expectedInputBasenames = expectedNormalized
+    .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
+    .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const expectedInputSignature = expectedInputBasenames.slice().sort().join("\0");
   let inputMatchSince: number | null = null;
+  let inputOnlyReadySince: number | null = null;
+  let inputOnlySignature = "";
+  let sawInputMatch = false;
   let attachmentMatchSince: number | null = null;
   let lastVerboseLog = 0;
   const expression = `(() => {
@@ -1451,18 +1454,10 @@ export async function waitForAttachmentCompletion(
     const inputScope = composerScope ? Array.from(composerScope.querySelectorAll('input[type="file"]')) : [];
     const inputNodes = [];
     const inputSeen = new Set();
-    for (const el of inputScope) {
+    for (const el of [...inputScope, ...Array.from(document.querySelectorAll('input[type="file"]'))]) {
       if (!inputSeen.has(el)) {
         inputSeen.add(el);
         inputNodes.push(el);
-      }
-    }
-    if (inputNodes.length === 0) {
-      for (const el of Array.from(document.querySelectorAll('input[type="file"]'))) {
-        if (!inputSeen.has(el)) {
-          inputSeen.add(el);
-          inputNodes.push(el);
-        }
       }
     }
     for (const input of inputNodes) {
@@ -1602,97 +1597,107 @@ export async function waitForAttachmentCompletion(
         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
         .filter(Boolean);
       const fileCount = typeof value.fileCount === "number" ? value.fileCount : 0;
-      const normalizeRenderedToken = (raw: string): string =>
-        raw
-          .toLowerCase()
-          .replace(/\s+/g, " ")
-          .trim()
-          .replace(/^(?:remove|delete)\s+(?:file|attachment)\s*[:-]?\s*/i, "")
-          .replace(/\s+\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb)$/i, "")
-          .trim();
-      const renderedTokens = attachedNames
-        .flatMap((raw) => raw.split(/\r?\n/))
-        .map(normalizeRenderedToken)
-        .filter(Boolean);
-      const isGenericAttachmentToken = (token: string): boolean =>
-        /^(?:file|attachment|document|image|pdf|spreadsheet|presentation|text|code)$/i.test(
-          token,
-        ) ||
-        /^\d+\s+(?:files?|attachments?)$/i.test(token) ||
-        /^\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb)$/i.test(token) ||
-        /^(?:uploading|processing|uploaded|ready)$/i.test(token);
-      const numberedRenameMatch = (token: string, expected: string): boolean => {
-        // ChatGPT dedupes repeat uploads as "name(2).ext"; accept the numbered rename.
-        const dot = expected.lastIndexOf(".");
-        const stem = dot > 0 ? expected.slice(0, dot) : expected;
-        const ext = dot > 0 ? expected.slice(dot) : "";
-        if (!token.startsWith(stem) || (ext && !token.endsWith(ext))) return false;
-        const middle = token.slice(stem.length, token.length - ext.length);
-        return /^\(\d+\)$/.test(middle);
-      };
-      const tokenMatchesExpected = (token: string, expected: string): boolean => {
+      const fileCountSatisfied =
+        expectedNormalized.length > 0 && fileCount >= expectedNormalized.length;
+      const matchesExpected = (expected: string): boolean => {
         const baseName = expected.split("/").pop()?.split("\\").pop() ?? expected;
         const normalizedExpected = baseName.toLowerCase().replace(/\s+/g, " ").trim();
-        if (token === normalizedExpected) return true;
-        if (numberedRenameMatch(token, normalizedExpected)) return true;
-        if (token.includes("…") || token.includes("...")) {
-          const marker = token.includes("…") ? "…" : "...";
-          const [prefixRaw, suffixRaw] = token.split(marker);
-          const prefix = prefixRaw.trim();
-          const suffix = suffixRaw.trim();
-          return (
-            Boolean(prefix || suffix) &&
-            normalizedExpected.startsWith(prefix) &&
-            normalizedExpected.endsWith(suffix)
-          );
-        }
-        return false;
+        const expectedNoExt = normalizedExpected.replace(/\.[a-z0-9]{1,10}$/i, "");
+        return attachedNames.some((raw) => {
+          if (raw.includes(normalizedExpected)) return true;
+          if (expectedNoExt.length >= 6 && raw.includes(expectedNoExt)) return true;
+          if (raw.includes("…") || raw.includes("...")) {
+            const marker = raw.includes("…") ? "…" : "...";
+            const [prefixRaw, suffixRaw] = raw.split(marker);
+            const prefix = prefixRaw.trim();
+            const suffix = suffixRaw.trim();
+            const target = expectedNoExt.length >= 6 ? expectedNoExt : normalizedExpected;
+            const matchesPrefix = !prefix || target.includes(prefix);
+            const matchesSuffix = !suffix || target.includes(suffix);
+            return matchesPrefix && matchesSuffix;
+          }
+          return false;
+        });
       };
-      const matchesExpected = (expected: string): boolean =>
-        renderedTokens.some((token) => tokenMatchesExpected(token, expected));
-      const hasContradictoryName = renderedTokens.some(
-        (token) =>
-          !isGenericAttachmentToken(token) &&
-          !expectedNormalized.some((expected) => tokenMatchesExpected(token, expected)),
-      );
-      const fileCountSatisfied =
-        expectedNormalized.length > 0 &&
-        fileCount >= expectedNormalized.length &&
-        !hasContradictoryName;
       const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
-      const renderedEvidence =
-        expectedNormalized.length > 0
-          ? missing.length === 0 || fileCountSatisfied
-          : Boolean(value.filesAttached || fileCount > 0);
-
-      // A disabled pre-prompt send button is normal. Only stable attachment evidence after
-      // explicit upload progress clears proves the upload is ready.
-      if (value.uploading || !renderedEvidence) {
-        attachmentMatchSince = null;
-      } else {
-        attachmentMatchSince ??= Date.now();
-        if (Date.now() - attachmentMatchSince > stableThresholdMs) {
+      if (missing.length === 0 || fileCountSatisfied) {
+        const stableThresholdMs = value.uploading ? 3000 : 1500;
+        if (attachmentMatchSince === null) {
+          attachmentMatchSince = Date.now();
+        }
+        const stable = Date.now() - attachmentMatchSince > stableThresholdMs;
+        if (stable && value.state === "ready") {
           return;
         }
+        // Don't treat disabled button as complete - wait for it to become 'ready'.
+        // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
+        if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
+          return;
+        }
+        // If files are attached but button isn't ready yet, give it more time but don't fail immediately.
+        if (value.filesAttached || fileCountSatisfied) {
+          await delay(500);
+          continue;
+        }
+      } else {
+        attachmentMatchSince = null;
       }
 
-      // Fallback: some ChatGPT surfaces retain the selected file only in the input.
+      const inputOnlySignatureNow = inputNames.slice().sort().join("\0");
+      const inputOnlyNamesSatisfied =
+        expectedInputBasenames.length > 0 && inputOnlySignatureNow === expectedInputSignature;
+      const inputOnlyReady =
+        inputOnlyNamesSatisfied &&
+        value.state === "ready" &&
+        value.uploading === false &&
+        !value.filesAttached &&
+        fileCount === 0;
+      if (inputOnlyReady) {
+        if (inputOnlyReadySince === null || inputOnlySignature !== inputOnlySignatureNow) {
+          inputOnlyReadySince = Date.now();
+          inputOnlySignature = inputOnlySignatureNow;
+        }
+        if (Date.now() - inputOnlyReadySince > 1500) {
+          return;
+        }
+      } else {
+        inputOnlyReadySince = null;
+        inputOnlySignature = "";
+      }
+
+      // Fallback: if the file input has the expected names, allow progress once that condition is stable.
+      // Some ChatGPT surfaces only render the filename after sending the message.
       const inputMissing = expectedNormalized.filter((expected) => {
         const baseName = expected.split("/").pop()?.split("\\").pop() ?? expected;
         const normalizedExpected = baseName.toLowerCase().replace(/\s+/g, " ").trim();
+        const expectedNoExt = normalizedExpected.replace(/\.[a-z0-9]{1,10}$/i, "");
         return !inputNames.some(
-          (raw) => raw.toLowerCase().replace(/\s+/g, " ").trim() === normalizedExpected,
+          (raw) =>
+            raw.includes(normalizedExpected) ||
+            (expectedNoExt.length >= 6 && raw.includes(expectedNoExt)),
         );
       });
-      const inputEvidence =
-        expectedNormalized.length > 0 ? inputMissing.length === 0 : inputNames.length > 0;
-      if (value.uploading || !inputEvidence) {
-        inputMatchSince = null;
-      } else {
-        inputMatchSince ??= Date.now();
-        if (Date.now() - inputMatchSince > stableThresholdMs) {
-          return;
+      // Don't include 'disabled' - a disabled button likely means upload is still in progress.
+      const inputStateOk = value.state === "ready" || value.state === "missing";
+      const inputSeenNow = inputMissing.length === 0 || fileCountSatisfied;
+      const inputEvidenceOk = Boolean(value.filesAttached) || fileCountSatisfied;
+      const stableThresholdMs = value.uploading ? 3000 : 1500;
+      if (inputSeenNow && inputStateOk && inputEvidenceOk) {
+        if (inputMatchSince === null) {
+          inputMatchSince = Date.now();
         }
+        sawInputMatch = true;
+      }
+      if (
+        inputMatchSince !== null &&
+        inputStateOk &&
+        inputEvidenceOk &&
+        Date.now() - inputMatchSince > stableThresholdMs
+      ) {
+        return;
+      }
+      if (!inputSeenNow && !sawInputMatch) {
+        inputMatchSince = null;
       }
     }
     await delay(250);
@@ -1801,14 +1806,12 @@ function buildUserTurnAttachmentExpression(options: {
   expectedPromptPrefix: string;
   expectedConversationId: string | null;
 }): string {
-  const conversationSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   const minTurnLiteral = options.minTurnIndex === null ? "null" : String(options.minTurnIndex);
   const expectedPromptLiteral = JSON.stringify(options.expectedPromptPrefix);
   const expectedConversationLiteral = options.expectedConversationId
     ? JSON.stringify(options.expectedConversationId)
     : "null";
   return `(() => {
-    const CONVERSATION_SELECTOR = ${conversationSelectorLiteral};
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const EXPECTED_PROMPT_PREFIX = ${expectedPromptLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
@@ -1821,7 +1824,7 @@ function buildUserTurnAttachmentExpression(options: {
     ) {
       return { ok: false, conversationMismatch: true };
     }
-    const turns = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+    const turns = ${buildConversationTurnListExpression()};
     const userTurns = turns.map((node, index) => ({ node, index })).filter(({ node }) => {
       const attr = (node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (attr === 'user') return true;

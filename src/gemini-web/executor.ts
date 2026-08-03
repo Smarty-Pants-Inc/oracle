@@ -10,7 +10,7 @@ import { runProviderDomFlow } from "../browser/providerDomFlow.js";
 import { delay } from "../browser/utils.js";
 import { runGeminiWebWithFallback, saveFirstGeminiImageFromOutput } from "./client.js";
 import { geminiDeepThinkDomProvider } from "../browser/providers/index.js";
-import type { GeminiWebModelId } from "./client.js";
+import { resolveGeminiWebModel, type GeminiWebModelId } from "./models.js";
 import type { GeminiWebOptions, GeminiWebResponse } from "./types.js";
 import { openGeminiBrowserSession } from "./browserSessionManager.js";
 import { selectGeminiExecutionMode } from "./executionMode.js";
@@ -53,36 +53,6 @@ function resolveInvocationPath(value: string | undefined): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return path.isAbsolute(trimmed) ? trimmed : path.resolve(process.cwd(), trimmed);
-}
-
-function resolveGeminiWebModel(
-  desiredModel: string | null | undefined,
-  log?: BrowserLogger,
-): GeminiWebModelId {
-  const desired = typeof desiredModel === "string" ? desiredModel.trim() : "";
-  if (!desired) return "gemini-3-pro";
-  const normalized = desired.toLowerCase().replace(/[_\s]+/g, "-");
-
-  switch (normalized) {
-    case "gemini-3-pro":
-    case "gemini-3.0-pro":
-      return "gemini-3-pro";
-    case "gemini-3-deep-think":
-    case "gemini-3-pro-deep-think":
-    case "gemini-3-pro-deepthink":
-      return "gemini-3-pro-deep-think";
-    case "gemini-2.5-pro":
-      return "gemini-2.5-pro";
-    case "gemini-2.5-flash":
-      return "gemini-2.5-flash";
-    default:
-      if (normalized.startsWith("gemini-") || normalized.includes("gemini")) {
-        log?.(
-          `[gemini-web] Unsupported Gemini web model "${desired}". Falling back to gemini-3-pro.`,
-        );
-      }
-      return "gemini-3-pro";
-  }
 }
 
 function resolveCookieDomain(cookie: { domain?: string; url?: string }): string | null {

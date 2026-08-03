@@ -174,16 +174,20 @@ export async function handleSessionCommand(
       process.exitCode = 1;
       return;
     }
+    // Commander sets `recover: false` when --no-recover is passed; default is `true`.
+    const recoverIfMissing = sessionOptions.recover !== false;
     if (harvestRequested) {
       await deps.harvestSessionBrowserOutput(sessionId, {
         writeOutputPath,
         browserTabRef,
+        recoverIfMissing,
       });
       return;
     }
     await deps.liveTailSessionBrowserOutput(sessionId, {
       writeOutputPath,
       browserTabRef,
+      recoverIfMissing,
     });
     return;
   }

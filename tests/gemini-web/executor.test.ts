@@ -35,7 +35,7 @@ const runGeminiWebWithFallback = vi.fn<(...args: unknown[]) => Promise<unknown>>
   thoughts: "thinking",
   metadata: { cid: "1" },
   images: [],
-  effectiveModel: "gemini-3-pro",
+  effectiveModel: "gemini-3.1-pro",
 }));
 
 const saveFirstGeminiImageFromOutput = vi.fn<(...args: unknown[]) => Promise<unknown>>(
@@ -222,7 +222,7 @@ describe("gemini-web executor", () => {
 
     expect(runGeminiWebWithFallback).toHaveBeenCalledWith(
       expect.objectContaining({
-        model: "gemini-3-pro",
+        model: "gemini-3.1-pro",
         prompt: "Generate an image: a cute robot holding a banana (aspect ratio: 1:1)",
         files: ["/tmp/attach.txt"],
       }),
@@ -250,7 +250,7 @@ describe("gemini-web executor", () => {
         thoughts: null,
         metadata: { chat: "meta" },
         images: [],
-        effectiveModel: "gemini-3-pro",
+        effectiveModel: "gemini-3.1-pro",
       })
       .mockResolvedValueOnce({
         rawResponseText: "",
@@ -258,7 +258,7 @@ describe("gemini-web executor", () => {
         thoughts: null,
         metadata: null,
         images: [],
-        effectiveModel: "gemini-3-pro",
+        effectiveModel: "gemini-3.1-pro",
       });
 
     const exec = createGeminiWebExecutor({ editImage: inPath, outputPath: outPath });

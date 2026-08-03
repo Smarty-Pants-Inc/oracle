@@ -5,6 +5,71 @@ import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 
 export class ChromeCookieSyncError extends Error {}
 
+export async function clearStaleChatGptConversationCookies(
+  Network: ChromeClient["Network"],
+  Target: ChromeClient["Target"],
+  logger: BrowserLogger,
+  options: { preserveConversationIds?: readonly (string | null | undefined)[] } = {},
+): Promise<number> {
+  try {
+    const preservedNames = new Set(
+      (options.preserveConversationIds ?? [])
+        .filter((id): id is string => Boolean(id))
+        .map((id) => `conv_key_${id}`),
+    );
+    try {
+      const { targetInfos = [] } = await Target.getTargets();
+      for (const target of targetInfos) {
+        const conversationId = extractChatGptConversationId(target.url ?? "");
+        if (conversationId) {
+          preservedNames.add(`conv_key_${conversationId}`);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(
+        `[cookies] Failed to inspect active ChatGPT conversations; skipping stale cookie cleanup: ${message}`,
+      );
+      return 0;
+    }
+
+    const { cookies = [] } = await Network.getAllCookies();
+    const targets = cookies.filter(
+      (cookie) =>
+        isChatGptConversationCookie(cookie) && !preservedNames.has(String(cookie.name ?? "")),
+    );
+    if (targets.length === 0) {
+      return 0;
+    }
+
+    let deleted = 0;
+    for (const cookie of targets) {
+      try {
+        await Network.deleteCookies({
+          name: cookie.name,
+          domain: cookie.domain,
+          path: cookie.path ?? "/",
+        });
+        deleted += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger(`[cookies] Failed to clear a stale ChatGPT conversation cookie: ${message}`);
+      }
+    }
+
+    if (deleted > 0) {
+      logger(
+        `[cookies] Cleared ${deleted} stale ChatGPT conversation cookie${deleted === 1 ? "" : "s"}.`,
+      );
+    }
+    return deleted;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`[cookies] Failed to inspect ChatGPT conversation cookies: ${message}`);
+    return 0;
+  }
+}
+
 export async function syncCookies(
   Network: ChromeClient["Network"],
   url: string,
@@ -132,6 +197,29 @@ async function readChromeCookies(
   return Array.from(merged.values());
 }
 
+function isChatGptConversationCookie(cookie: { name?: string; domain?: string }): boolean {
+  if (!cookie.name?.startsWith("conv_key_")) {
+    return false;
+  }
+  const domain = String(cookie.domain ?? "")
+    .replace(/^\./, "")
+    .toLowerCase();
+  return domain === "chatgpt.com" || domain === "chat.openai.com";
+}
+
+function extractChatGptConversationId(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    const domain = parsed.hostname.toLowerCase();
+    if (domain !== "chatgpt.com" && domain !== "chat.openai.com") {
+      return undefined;
+    }
+    return parsed.pathname.match(/\/c\/([a-zA-Z0-9-]+)/)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeInlineCookies(rawCookies: CookieParam[], fallbackHost: string): CookieParam[] {
   const merged = new Map<string, CookieParam>();
   for (const cookie of rawCookies) {
@@ -209,12 +297,14 @@ function normalizeExpiration(expires?: number): number | undefined {
   if (value <= 0) {
     return undefined;
   }
-  if (value > 1_000_000_000_000) {
-    // Learned: Chrome may store WebKit microseconds since 1601; convert to Unix seconds.
+  // Units by magnitude (do not treat Unix seconds ~1.7e9 as milliseconds):
+  // - >= 1e15: Chrome/WebKit FILETIME microseconds since 1601
+  // - >= 1e12: Unix milliseconds
+  // - else: Unix seconds (sweet-cookie / Chromium Cookie.expires)
+  if (value >= 1_000_000_000_000_000) {
     return Math.round(value / 1_000_000 - 11644473600);
   }
-  if (value > 1_000_000_000) {
-    // Likely milliseconds; normalize to seconds for CDP.
+  if (value >= 1_000_000_000_000) {
     return Math.round(value / 1000);
   }
   return Math.round(value);

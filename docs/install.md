@@ -33,19 +33,19 @@ npx -y @steipete/oracle --help
 pnpx @steipete/oracle --help
 ```
 
-`npx` is fine for CI, ad-hoc scripts, or when you don't want a global binary on the box. Cache the package in CI by pinning the version (`@steipete/oracle@0.11.1`) so you don't re-download on every job.
+`npx` is fine for CI, ad-hoc scripts, or when you don't want a global binary on the box. Cache the package in CI by pinning the version (`@steipete/oracle@0.12.1`) so you don't re-download on every job.
 
 ## API keys (optional)
 
 API mode is opt-in and reads keys from the environment. Set whichever providers you'll use:
 
-| Provider     | Env var                                                           | Models                                        |
-| ------------ | ----------------------------------------------------------------- | --------------------------------------------- |
-| OpenAI       | `OPENAI_API_KEY`                                                  | GPT-5.x, GPT-5.x Pro, GPT-5.1 Codex           |
-| Azure OpenAI | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `..._DEPLOYMENT` | Same models, hosted on Azure                  |
-| Google       | `GEMINI_API_KEY`                                                  | Gemini 3.1 Pro (API-only), Gemini 3 Pro       |
-| Anthropic    | `ANTHROPIC_API_KEY`                                               | Claude Sonnet 4.6, Claude Opus 4.1            |
-| OpenRouter   | `OPENROUTER_API_KEY`                                              | Any OpenRouter id (e.g. `minimax/minimax-m2`) |
+| Provider     | Env var                                                           | Models                                                  |
+| ------------ | ----------------------------------------------------------------- | ------------------------------------------------------- |
+| OpenAI       | `OPENAI_API_KEY`                                                  | GPT-5.x, GPT-5.x Pro, GPT-5.1 Codex                     |
+| Azure OpenAI | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `..._DEPLOYMENT` | Same models, hosted on Azure                            |
+| Google       | `GEMINI_API_KEY`                                                  | Gemini 3.1 Pro, Gemini 3.5 Flash, Gemini 3.1 Flash-Lite |
+| Anthropic    | `ANTHROPIC_API_KEY`                                               | Claude Sonnet 4.6, Claude Opus 4.1                      |
+| OpenRouter   | `OPENROUTER_API_KEY`                                              | Any OpenRouter id (e.g. `minimax/minimax-m2`)           |
 
 If no key is set, Oracle defaults to **browser mode** and drives ChatGPT directly — see [Browser Mode](browser-mode.md) for the manual-login flow.
 

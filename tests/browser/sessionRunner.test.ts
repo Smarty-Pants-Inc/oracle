@@ -1,7 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
-import { runBrowserSessionExecution } from "../../src/browser/sessionRunner.js";
+import {
+  buildBrowserRunWarningsForTest,
+  runBrowserSessionExecution,
+} from "../../src/browser/sessionRunner.js";
 
 const baseRunOptions: RunOracleOptions = {
   prompt: "Hello world",
@@ -17,13 +20,24 @@ describe("runBrowserSessionExecution", () => {
     const log = vi.fn();
     const persistRuntimeHint = vi.fn();
     const executeBrowser = vi.fn(async (options) => {
-      await options.runtimeHintCb?.({
-        chromePort: 9999,
-        chromeHost: "127.0.0.1",
-        chromeTargetId: "t-1",
-        tabUrl: "https://chatgpt.com/c/foo",
-        conversationId: "foo",
-      });
+      await options.runtimeHintCb?.(
+        {
+          chromePort: 9999,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "t-1",
+          tabUrl: "https://chatgpt.com/c/foo",
+          conversationId: "foo",
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
       return {
         answerText: "ok",
         answerMarkdown: "ok",
@@ -67,8 +81,173 @@ describe("runBrowserSessionExecution", () => {
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
+      expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
     );
     expect(log).toHaveBeenCalled();
+  });
+
+  test("passes browser resume conversation URL to executeBrowser", async () => {
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "ok",
+      answerMarkdown: "ok",
+      tookMs: 1000,
+      answerTokens: 12,
+      answerChars: 20,
+    }));
+
+    await runBrowserSessionExecution(
+      {
+        runOptions: {
+          ...baseRunOptions,
+          browserResumeConversationUrl: "https://chatgpt.com/c/resume-me",
+        },
+        browserConfig: {},
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          resumeConversationUrl: "https://chatgpt.com/c/resume-me",
+        }),
+      }),
+    );
+  });
+
+  test("logs and returns browser model selection evidence", async () => {
+    const log = vi.fn();
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { desiredModel: "GPT-5.5 Pro", modelStrategy: "select" },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: "ok",
+          answerMarkdown: "ok",
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 20,
+          modelSelection: {
+            requestedModel: "GPT-5.5 Pro",
+            resolvedLabel: "Pro",
+            strategy: "select" as const,
+            status: "already-selected" as const,
+            verified: true,
+            source: "chatgpt-model-picker" as const,
+            capturedAt: "2026-05-13T00:00:00.000Z",
+          },
+        })),
+      },
+    );
+
+    expect(result.modelSelection).toMatchObject({
+      requestedModel: "GPT-5.5 Pro",
+      resolvedLabel: "Pro",
+      verified: true,
+    });
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Launching browser mode (target=GPT-5.5 Pro; requested=gpt-5.2-pro)"),
+    );
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "[browser] Model selection evidence: requestedKey=gpt-5.2-pro; target=GPT-5.5 Pro; resolvedLabel=Pro",
+      ),
+    );
+  });
+
+  test("prints model-picker diagnostics without verbose mode", async () => {
+    const log = vi.fn();
+
+    await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async ({ log: browserLog }) => {
+          browserLog('[browser] Model picker diagnostic: {"targetLevel":"extended"}');
+          return {
+            answerText: "ok",
+            answerMarkdown: "ok",
+            tookMs: 1000,
+            answerTokens: 1,
+            answerChars: 2,
+          };
+        }),
+      },
+    );
+
+    expect(log).toHaveBeenCalledWith(
+      '[browser] Model picker diagnostic: {"targetLevel":"extended"}',
+    );
+  });
+
+  test("warns when a large browser Pro run finishes suspiciously quickly", () => {
+    const warnings = buildBrowserRunWarningsForTest({
+      runOptions: { ...baseRunOptions, model: "gpt-5.5-pro" },
+      browserConfig: { desiredModel: "GPT-5.5 Pro" },
+      inputTokens: 42_641,
+      elapsedMs: 53_000,
+      modelSelection: {
+        requestedModel: "GPT-5.5 Pro",
+        resolvedLabel: null,
+        strategy: "select",
+        status: "unavailable",
+        verified: false,
+        source: "config",
+        capturedAt: "2026-05-13T00:00:00.000Z",
+      },
+    });
+
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-pro-fast-large-run",
+        message: expect.stringContaining("Large browser Pro run completed quickly"),
+      }),
+    ]);
   });
 
   test("passes ChatGPT image output paths into the browser runner", async () => {
@@ -633,6 +812,100 @@ describe("runBrowserSessionExecution", () => {
     expect(finishedLine).toContain("[browser]");
     expect(finishedLine).not.toContain("tok(");
     expect(finishedLine).not.toContain("tokens (");
+  });
+
+  test("uses a verified picker label in the live browser finish line", async () => {
+    const log = vi.fn();
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, model: "gpt-5.5-pro" },
+        browserConfig: { desiredModel: "Pro", modelStrategy: "select" },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 10,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: async () => ({
+          answerText: "text",
+          answerMarkdown: "markdown",
+          tookMs: 100,
+          answerTokens: 5,
+          answerChars: 10,
+          modelSelection: {
+            requestedModel: "Pro",
+            resolvedLabel: "Pro",
+            strategy: "select",
+            status: "already-selected",
+            verified: true,
+            source: "chatgpt-model-picker",
+            capturedAt: "2026-07-12T00:00:00.000Z",
+          },
+        }),
+      },
+    );
+
+    const finishedLine = log.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes("↑") && line.includes("↓") && line.includes("Δ"));
+    expect(finishedLine).toContain("Pro[browser]");
+    expect(finishedLine).not.toContain("gpt-5.5-pro[browser]");
+  });
+
+  test("keeps the requested key in the live finish line when picker evidence is unverified", async () => {
+    const log = vi.fn();
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, model: "gpt-5.5-pro" },
+        browserConfig: { desiredModel: "Pro", modelStrategy: "current" },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 10,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: async () => ({
+          answerText: "text",
+          answerMarkdown: "markdown",
+          tookMs: 100,
+          answerTokens: 5,
+          answerChars: 10,
+          modelSelection: {
+            requestedModel: "Pro",
+            resolvedLabel: "Thinking 5.5 Heavy",
+            strategy: "current",
+            status: "already-selected",
+            verified: false,
+            source: "chatgpt-model-picker",
+            capturedAt: "2026-07-12T00:00:00.000Z",
+          },
+        }),
+      },
+    );
+
+    const finishedLine = log.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes("↑") && line.includes("↓") && line.includes("Δ"));
+    expect(finishedLine).toContain("gpt-5.5-pro[browser]");
+    expect(finishedLine).not.toContain("Thinking 5.5 Heavy[browser]");
   });
 
   test("passes heartbeat interval through to browser runner", async () => {

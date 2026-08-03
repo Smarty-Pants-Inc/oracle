@@ -12,8 +12,14 @@ export interface BridgeDoctorCliOptions {
 }
 
 export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise<void> {
-  const { config: userConfig, path: configPath, loaded } = await loadUserConfig();
+  const {
+    config: userConfig,
+    path: configPath,
+    paths: configPaths,
+    loaded: userConfigLoaded,
+  } = await loadUserConfig();
   const version = getCliVersion();
+  const projectConfigPaths = configPaths.filter((entry) => entry !== configPath);
 
   const resolvedRemote = resolveRemoteServiceConfig({
     cliHost: undefined,
@@ -30,7 +36,11 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
   lines.push(chalk.dim(`OS: ${process.platform} ${os.release()} (${process.arch})`));
   lines.push(chalk.dim(`Node: ${process.version}`));
   lines.push(chalk.dim(`Oracle: ${version}`));
-  lines.push(chalk.dim(`Config: ${loaded ? configPath : "(missing)"}`));
+  lines.push(chalk.dim(`Config: ${userConfigLoaded ? configPath : `${configPath} (missing)`}`));
+  if (projectConfigPaths.length > 0) {
+    const label = projectConfigPaths.length === 1 ? "Project config" : "Project configs";
+    lines.push(chalk.dim(`${label}: ${projectConfigPaths.join(", ")}`));
+  }
   if (userConfig.engine) {
     lines.push(chalk.dim(`Default engine: ${userConfig.engine}`));
   }
@@ -73,6 +83,18 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
       if (health.ok) {
         const meta = health.version ? `oracle ${health.version}` : "ok";
         lines.push(chalk.dim(`Auth (/health): ${chalk.green(meta)}`));
+        if (health.capabilities?.artifactTransfer) {
+          lines.push(
+            chalk.dim(
+              `Artifact transfer: ${chalk.green(`bridge v${health.capabilities.artifactProtocolVersion}`)} (${formatBytes(health.capabilities.maxArtifactBytes)} max)`,
+            ),
+          );
+        } else {
+          warn.push(
+            "Remote host does not advertise bridge artifact transfer; ChatGPT-generated files may need manual copy from the browser host.",
+          );
+          lines.push(chalk.dim(`Artifact transfer: ${chalk.yellow("manual fallback")}`));
+        }
       } else {
         const detail = health.error ?? "unknown error";
         fail.push(`Remote auth failed: ${detail}`);
@@ -138,4 +160,16 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
   console.log(lines.join("\n"));
 
   process.exitCode = fail.length ? 1 : 0;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "unknown";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
 }

@@ -1,5 +1,5 @@
-import type { RunOracleOptions, ModelName } from "../oracle.js";
-import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, MODEL_CONFIGS } from "../oracle.js";
+import type { RunOracleOptions, ModelName, AzureOptions, ModelOverridesConfig } from "../oracle.js";
+import { DEFAULT_MODEL, MODEL_CONFIGS } from "../oracle.js";
 import type { UserConfig } from "../config.js";
 import type { EngineMode } from "./engine.js";
 import { resolveEngine } from "./engine.js";
@@ -10,9 +10,11 @@ import {
   normalizeBaseUrl,
 } from "./options.js";
 import { resolveGeminiModelId } from "../oracle/gemini.js";
+import { resolveOverriddenApiModel } from "../oracle/modelResolver.js";
 import { PromptValidationError } from "../oracle/errors.js";
 import { normalizeChatGptModelForBrowser } from "./browserConfig.js";
 import { resolveConfiguredMaxFileSizeBytes } from "./fileSize.js";
+import { isAzureOpenAICandidateModel } from "../oracle/providerRouting.js";
 
 export interface ResolveRunOptionsInput {
   prompt: string;
@@ -39,48 +41,45 @@ export function resolveRunOptionsFromConfig({
   userConfig,
   env = process.env,
 }: ResolveRunOptionsInput): ResolvedRunOptions {
-  const resolvedEngine = resolveEngineWithConfig({ engine, configEngine: userConfig?.engine, env });
+  const resolvedEngine = resolveEngine({
+    engine,
+    configEngine: userConfig?.engine,
+    env,
+  });
+  const envEnginePreference = (env.ORACLE_ENGINE ?? "").trim().toLowerCase();
   const browserRequested = engine === "browser";
-  const browserConfigured = userConfig?.engine === "browser";
+  const explicitApiEngineRequested = engine === "api" || (!engine && envEnginePreference === "api");
+  const browserConfigured = userConfig?.engine === "browser" && !explicitApiEngineRequested;
+  const envBrowserConfigured = !engine && envEnginePreference === "browser";
+  const browserEngineRequested = browserRequested || browserConfigured || envBrowserConfigured;
   const requestedModelList = Array.isArray(models) ? models : [];
   const normalizedRequestedModels = requestedModelList
     .map((entry) => normalizeModelOption(entry))
     .filter(Boolean);
 
-  const defaultModel =
-    normalizedRequestedModels.length > 0
-      ? DEFAULT_API_MODEL
-      : resolvedEngine === "browser"
-        ? DEFAULT_BROWSER_MODEL
-        : DEFAULT_API_MODEL;
-  const cliModelArg = normalizeModelOption(model ?? userConfig?.model) || defaultModel;
-  const inferredModel =
-    resolvedEngine === "browser" && normalizedRequestedModels.length === 0
-      ? inferModelFromLabel(cliModelArg)
-      : resolveApiModel(cliModelArg);
-  // Browser engine maps Pro/legacy aliases to the latest ChatGPT picker targets.
-  const resolvedModel =
-    resolvedEngine === "browser" ? normalizeChatGptModelForBrowser(inferredModel) : inferredModel;
-  const isCodex = resolvedModel.startsWith("gpt-5.1-codex");
-  const isClaude = resolvedModel.startsWith("claude");
-  const isGrok = resolvedModel.startsWith("grok");
-  const isGeminiApiOnly = resolvedModel === "gemini-3.1-pro";
+  const cliModelArg = normalizeModelOption(model ?? userConfig?.model) || DEFAULT_MODEL;
+  const apiModel = resolveApiModel(cliModelArg);
+  // Browser label inference is intentionally engine-scoped: API model ids such as
+  // gpt-5.6-luna must remain provider values even though browser mode rejects
+  // unrecognized GPT-5.6 picker variants.
+  const browserModel =
+    resolvedEngine === "browser"
+      ? normalizeChatGptModelForBrowser(inferModelFromLabel(cliModelArg))
+      : apiModel;
+  const isCodex = apiModel.startsWith("gpt-5.1-codex");
+  const isClaude = apiModel.startsWith("claude");
+  const isGrok = apiModel.startsWith("grok");
 
   const engineWasBrowser = resolvedEngine === "browser";
   const allModels: ModelName[] =
     normalizedRequestedModels.length > 0
       ? Array.from(new Set(normalizedRequestedModels.map((entry) => resolveApiModel(entry))))
-      : [resolvedModel];
-  const includesGeminiApiOnly = allModels.some((m) => m === "gemini-3.1-pro");
-  if ((browserRequested || browserConfigured) && includesGeminiApiOnly) {
-    throw new PromptValidationError(
-      "gemini-3.1-pro is API-only today. Use --engine api or switch to gemini-3-pro for Gemini web.",
-      { engine: "browser", models: allModels },
-    );
-  }
+      : [apiModel];
+  const browserCompatibilityModels: ModelName[] =
+    normalizedRequestedModels.length > 0 ? allModels : [browserModel];
   const isBrowserCompatible = (m: string) => m.startsWith("gpt-") || m.startsWith("gemini");
   const hasNonBrowserCompatibleTarget =
-    (browserRequested || browserConfigured) && allModels.some((m) => !isBrowserCompatible(m));
+    browserEngineRequested && browserCompatibilityModels.some((m) => !isBrowserCompatible(m));
   if (hasNonBrowserCompatibleTarget) {
     throw new PromptValidationError(
       "Browser engine only supports GPT and Gemini models. Re-run with --engine api for Grok, Claude, or other models.",
@@ -88,11 +87,18 @@ export function resolveRunOptionsFromConfig({
     );
   }
 
-  const engineCoercedToApi = engineWasBrowser && (isCodex || isClaude || isGrok || isGeminiApiOnly);
+  const azure = resolveAzureOptions(userConfig, env);
+  const azureAutoApi =
+    Boolean(azure?.endpoint) &&
+    !browserEngineRequested &&
+    allModels.some(isAzureOpenAICandidateModel);
+  const engineCoercedToApi = engineWasBrowser && (isCodex || isClaude || isGrok || azureAutoApi);
   const fixedEngine: EngineMode =
-    isCodex || isClaude || isGrok || isGeminiApiOnly || normalizedRequestedModels.length > 0
+    isCodex || isClaude || isGrok || azureAutoApi || normalizedRequestedModels.length > 0
       ? "api"
       : resolvedEngine;
+  // Browser runs use ChatGPT picker labels/aliases; API runs must keep API model ids intact.
+  const resolvedModel = fixedEngine === "browser" ? browserModel : apiModel;
 
   const promptWithSuffix =
     userConfig?.promptSuffix && userConfig.promptSuffix.trim().length > 0
@@ -118,7 +124,8 @@ export function resolveRunOptionsFromConfig({
   }
 
   const chosenModel: ModelName = uniqueMultiModels[0] ?? resolvedModel;
-  const effectiveModelId = resolveEffectiveModelId(chosenModel);
+  const apiModelOverrides = fixedEngine === "api" ? userConfig?.modelOverrides : undefined;
+  const effectiveModelId = resolveEffectiveModelId(chosenModel, apiModelOverrides);
 
   const runOptions: RunOracleOptions = {
     prompt: promptWithSuffix,
@@ -131,31 +138,36 @@ export function resolveRunOptionsFromConfig({
     filesReport: userConfig?.filesReport,
     background: userConfig?.background,
     baseUrl,
+    azure,
     effectiveModelId,
+    modelOverrides: apiModelOverrides,
   };
 
   return { runOptions, resolvedEngine: fixedEngine, engineCoercedToApi };
 }
 
-function resolveEngineWithConfig({
-  engine,
-  configEngine,
-  env,
-}: {
-  engine?: EngineMode;
-  configEngine?: EngineMode;
-  env: NodeJS.ProcessEnv;
-}): EngineMode {
-  if (engine) return engine;
-  const envOverride = (env.ORACLE_ENGINE ?? "").trim().toLowerCase();
-  if (envOverride === "api" || envOverride === "browser") {
-    return envOverride as EngineMode;
+function resolveAzureOptions(
+  userConfig: UserConfig | undefined,
+  env: NodeJS.ProcessEnv,
+): AzureOptions | undefined {
+  const endpoint = env.AZURE_OPENAI_ENDPOINT ?? userConfig?.azure?.endpoint;
+  if (!endpoint?.trim()) {
+    return undefined;
   }
-  if (configEngine) return configEngine;
-  return resolveEngine({ engine: undefined, env });
+  return {
+    endpoint,
+    deployment: env.AZURE_OPENAI_DEPLOYMENT ?? userConfig?.azure?.deployment,
+    apiVersion: env.AZURE_OPENAI_API_VERSION ?? userConfig?.azure?.apiVersion,
+  };
 }
 
-function resolveEffectiveModelId(model: ModelName): string {
+function resolveEffectiveModelId(model: ModelName, modelOverrides?: ModelOverridesConfig): string {
+  // A user-config override of a known model's apiModel must win, since this id
+  // becomes the on-wire request model id in run.ts (including for Gemini aliases).
+  const overridden = resolveOverriddenApiModel(model, modelOverrides);
+  if (overridden) {
+    return overridden;
+  }
   if (typeof model === "string" && model.startsWith("gemini")) {
     return resolveGeminiModelId(model);
   }

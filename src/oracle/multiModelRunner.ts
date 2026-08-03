@@ -9,9 +9,11 @@ import {
   extractResponseMetadata,
   asOracleUserError,
   extractTextOutput,
+  classifyProviderFailure,
 } from "../oracle.js";
 import type { SessionStore } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
+import { resolveOverriddenApiModel } from "./modelResolver.js";
 import { findOscProgressSequences, OSC_PROGRESS_PREFIX } from "osc-progress";
 
 export interface MultiModelRunParams {
@@ -153,7 +155,9 @@ function startModelExecution({
     const result = await runOracleImpl(
       {
         ...perModelOptions,
-        effectiveModelId: model,
+        // Respect a user-config apiModel override for this known model; falls back
+        // to the canonical model id (unchanged behavior) when no override applies.
+        effectiveModelId: resolveOverriddenApiModel(model, runOptions.modelOverrides) ?? model,
         // Drop per-model preamble; the aggregate runner prints the shared header and tips once.
         suppressHeader: true,
         suppressAnswerHeader: true,
@@ -187,6 +191,13 @@ function startModelExecution({
   })()
     .catch(async (error) => {
       const userError = asOracleUserError(error);
+      const providerFailure = classifyProviderFailure(error, {
+        model,
+        providerMode: runOptions.provider,
+        azure: runOptions.azure,
+        baseUrl: runOptions.baseUrl,
+        apiKey: runOptions.apiKey,
+      });
       const responseMetadata = error instanceof OracleResponseError ? error.metadata : undefined;
       const transportMetadata =
         error instanceof OracleTransportError ? { reason: error.reason } : undefined;
@@ -201,7 +212,18 @@ function startModelExecution({
               message: userError.message,
               details: userError.details,
             }
-          : undefined,
+          : providerFailure
+            ? {
+                category: providerFailure.category,
+                message: providerFailure.label,
+                details: {
+                  provider: providerFailure.provider,
+                  keyEnv: providerFailure.keyEnv,
+                  providerMessage: providerFailure.providerMessage,
+                  fix: providerFailure.fix,
+                },
+              }
+            : undefined,
         log: await describeLog(sessionMeta.id, logWriter.logPath, store),
       });
       throw error;

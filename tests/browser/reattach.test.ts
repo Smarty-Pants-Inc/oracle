@@ -43,6 +43,7 @@ describe("resumeBrowserSession", () => {
       }
       return { result: { value: null } };
     });
+    const close = vi.fn(async () => {});
     const connect = vi.fn(
       async () =>
         ({
@@ -50,7 +51,7 @@ describe("resumeBrowserSession", () => {
           Runtime: { enable: vi.fn(), evaluate },
           // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
           DOM: { enable: vi.fn() },
-          close: vi.fn(async () => {}),
+          close,
         }) satisfies FakeClient,
     ) as unknown as (options?: unknown) => Promise<ChromeClient>;
     const waitForAssistantResponse = vi.fn(async () => ({
@@ -59,6 +60,7 @@ describe("resumeBrowserSession", () => {
       meta: { messageId: "m1", turnId: "conversation-turn-1" },
     }));
     const captureAssistantMarkdown = vi.fn(async () => "markdown response");
+    const waitForConversationHydration = vi.fn(async () => 2);
     const logger = vi.fn() as BrowserLogger;
     logger.verbose = true;
 
@@ -67,6 +69,7 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      waitForConversationHydration,
     });
 
     expect(result.answerMarkdown).toBe("markdown response");
@@ -75,6 +78,15 @@ describe("resumeBrowserSession", () => {
     );
     expect(waitForAssistantResponse).toHaveBeenCalled();
     expect(captureAssistantMarkdown).toHaveBeenCalled();
+    expect(waitForConversationHydration).toHaveBeenCalledWith(expect.anything(), 2000, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: runtime.tabUrl,
+    });
+    expect(waitForConversationHydration.mock.invocationCallOrder[0]).toBeLessThan(
+      waitForAssistantResponse.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(close).toHaveBeenCalledOnce();
   });
 
   test("uses prompt preview turn index when reattaching to an already-open answer", async () => {
@@ -123,6 +135,7 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      waitForConversationHydration: vi.fn(async () => 2),
       promptPreview: "live reattach pro 123",
     });
 
@@ -187,6 +200,7 @@ describe("resumeBrowserSession", () => {
         waitForAssistantResponse,
         captureAssistantMarkdown,
         waitForDeepResearchCompletion,
+        waitForConversationHydration: vi.fn(async () => 2),
       },
     );
 
@@ -198,6 +212,9 @@ describe("resumeBrowserSession", () => {
       2,
       expect.any(Object),
       expect.any(Object),
+      {
+        requireScopedTargetOwner: true,
+      },
     );
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();
@@ -266,6 +283,7 @@ describe("resumeBrowserSession", () => {
         connect,
         waitForAssistantResponse,
         captureAssistantMarkdown,
+        waitForConversationHydration: vi.fn(async () => 2),
       },
     );
 
@@ -279,23 +297,59 @@ describe("resumeBrowserSession", () => {
     );
   });
 
-  test("falls back to recovery when existing chrome attach fails", async () => {
+  test("closes the attached client before falling back to recovery", async () => {
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/abc",
     };
     const listTargets = vi.fn(async () => {
-      throw new Error("no targets");
+      return [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[];
     }) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        return { result: { value: runtime.tabUrl } };
+      }
+      if (expression === "1+1") {
+        return { result: { value: 2 } };
+      }
+      return { result: { value: null } };
+    });
+    const close = vi.fn(async () => {});
+    const connect = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          close,
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "must not be captured from an unhydrated shell",
+      html: "",
+      meta: { messageId: "m1", turnId: "conversation-turn-1" },
+    }));
+    const waitForConversationHydration = vi.fn(async () => {
+      throw new Error("saved conversation did not hydrate");
+    });
     const recoverSession = vi.fn(async () => ({
       answerText: "fallback",
       answerMarkdown: "fallback-md",
     }));
     const logger = vi.fn() as BrowserLogger;
 
-    const result = await resumeBrowserSession(runtime, {}, logger, { listTargets, recoverSession });
+    const result = await resumeBrowserSession(runtime, {}, logger, {
+      listTargets,
+      connect,
+      waitForAssistantResponse,
+      waitForConversationHydration,
+      recoverSession,
+    });
 
     expect(result.answerText).toBe("fallback");
+    expect(close).toHaveBeenCalledOnce();
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(recoverSession).toHaveBeenCalled();
   });
 });
@@ -312,6 +366,11 @@ describe("reattach helpers", () => {
 
   test("extracts conversation id from a chat URL", () => {
     expect(extractConversationIdFromUrl("https://chatgpt.com/c/abc-123")).toBe("abc-123");
+    expect(
+      extractConversationIdFromUrl(
+        "https://chatgpt.com/c/WEB:32229414-5afa-4478-890c-9ca80aa82430",
+      ),
+    ).toBeUndefined();
     expect(extractConversationIdFromUrl("")).toBeUndefined();
   });
 
@@ -327,15 +386,36 @@ describe("reattach helpers", () => {
     );
   });
 
-  test("pickTarget prefers chromeTargetId, then tabUrl, then first page", () => {
+  test("pickTarget prefers a saved conversation over a stale target id", () => {
     const targets = [
       { targetId: "t-1", type: "page", url: "https://chatgpt.com/c/first" },
       { targetId: "t-2", type: "page", url: "https://chatgpt.com/c/second" },
       { targetId: "t-3", type: "page", url: "about:blank" },
     ];
     expect(pickTarget(targets, { chromeTargetId: "t-2" })).toEqual(targets[1]);
+    expect(
+      pickTarget(targets, {
+        chromeTargetId: "t-2",
+        tabUrl: "https://chatgpt.com/c/first",
+        conversationId: "first",
+      }),
+    ).toEqual(targets[0]);
     expect(pickTarget(targets, { tabUrl: "https://chatgpt.com/c/first" })).toEqual(targets[0]);
     expect(pickTarget(targets, {})).toEqual(targets[0]);
+  });
+
+  test("pickTarget keeps the saved target among duplicate conversation tabs", () => {
+    const targets = [
+      { targetId: "duplicate", type: "page", url: "https://chatgpt.com/c/same" },
+      { targetId: "submitted", type: "page", url: "https://chatgpt.com/c/same" },
+    ];
+
+    expect(
+      pickTarget(targets, {
+        chromeTargetId: "submitted",
+        conversationId: "same",
+      }),
+    ).toEqual(targets[1]);
   });
 
   test("pickTarget understands CDP list ids", () => {

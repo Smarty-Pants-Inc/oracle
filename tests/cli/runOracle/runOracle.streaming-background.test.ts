@@ -145,7 +145,10 @@ describe("runOracle streaming output", () => {
 });
 
 describe("runOracle background mode", () => {
-  test("uses background mode for GPT-5 Pro by default", async () => {
+  test.each([
+    { model: "gpt-5.2-pro" as const, reasoningMode: undefined },
+    { model: "gpt-5.6-sol" as const, reasoningMode: "pro" as const },
+  ])("uses background mode for $model Pro runs by default", async ({ model, reasoningMode }) => {
     const finalResponse = buildResponse();
     const initialResponse = { ...finalResponse, status: "in_progress", output: [] };
     const client = new MockBackgroundClient([initialResponse, finalResponse]);
@@ -158,7 +161,8 @@ describe("runOracle background mode", () => {
     const result = await runOracle(
       {
         prompt: "Background run",
-        model: "gpt-5.2-pro",
+        model,
+        reasoningMode,
       },
       {
         apiKey: "sk-test",
@@ -171,6 +175,9 @@ describe("runOracle background mode", () => {
     expect(result.mode).toBe("live");
     expect(client.createdBodies[0]?.background).toBe(true);
     expect(client.createdBodies[0]?.store).toBe(true);
+    if (reasoningMode) {
+      expect(client.createdBodies[0]?.reasoning).toEqual({ effort: "xhigh", mode: "pro" });
+    }
     expect(logs.some((line) => line.includes("background response status"))).toBe(true);
   });
 

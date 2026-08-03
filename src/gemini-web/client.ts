@@ -1,11 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  buildGeminiWebModelHeader,
+  FALLBACK_GEMINI_WEB_MODEL,
+  type GeminiWebModelId,
+} from "./models.js";
 
-export type GeminiWebModelId =
-  | "gemini-3-pro"
-  | "gemini-3-pro-deep-think"
-  | "gemini-2.5-pro"
-  | "gemini-2.5-flash";
+export type { GeminiWebModelId } from "./models.js";
 
 export interface GeminiWebRunInput {
   prompt: string;
@@ -37,12 +38,6 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const MODEL_HEADER_NAME = "x-goog-ext-525001261-jspb";
-const MODEL_HEADERS: Record<GeminiWebModelId, string> = {
-  "gemini-3-pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
-  "gemini-3-pro-deep-think": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,3]',
-  "gemini-2.5-pro": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]',
-  "gemini-2.5-flash": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]',
-};
 
 const GEMINI_APP_URL = "https://gemini.google.com/app";
 const GEMINI_STREAM_GENERATE_URL =
@@ -54,11 +49,32 @@ const GEMINI_UPLOAD_MIME_TYPES: Record<string, string> = {
   ".gif": "image/gif",
   ".jpeg": "image/jpeg",
   ".jpg": "image/jpeg",
+  ".mov": "video/quicktime",
+  ".mp4": "video/mp4",
   ".pdf": "application/pdf",
   ".png": "image/png",
   ".svg": "image/svg+xml",
+  ".webm": "video/webm",
   ".webp": "image/webp",
 };
+
+/**
+ * Resolve the MIME type Gemini should be told an upload carries.
+ *
+ * Gemini silently discards uploads it cannot type: the run still reports the file as
+ * attached, but the model never receives it and answers as though nothing was sent.
+ * Anything falling back to `application/octet-stream` is therefore invisible to the model.
+ *
+ * Only formats confirmed to work against the Gemini web upload endpoint are listed. The
+ * endpoint also gates on the file extension, not just the declared type — an `.m4v` byte
+ * for byte identical to a working `.mp4`, and declared `video/mp4`, is still dropped — so
+ * entries here cannot be extrapolated from what the Gemini API documents.
+ */
+export function resolveGeminiUploadMimeType(filePath: string): string {
+  return (
+    GEMINI_UPLOAD_MIME_TYPES[path.extname(filePath).toLowerCase()] ?? "application/octet-stream"
+  );
+}
 
 function getNestedValue<T>(value: unknown, pathParts: Array<string | number>, fallback: T): T {
   let current: unknown = value;
@@ -192,8 +208,7 @@ async function uploadGeminiFile(
   const absPath = path.resolve(process.cwd(), filePath);
   const data = await readFile(absPath);
   const fileName = path.basename(absPath);
-  const mimeType =
-    GEMINI_UPLOAD_MIME_TYPES[path.extname(absPath).toLowerCase()] ?? "application/octet-stream";
+  const mimeType = resolveGeminiUploadMimeType(absPath);
 
   const form = new FormData();
   form.append("file", new Blob([data], { type: mimeType }), fileName);
@@ -361,7 +376,7 @@ export async function runGeminiWebOnce(input: GeminiWebRunInput): Promise<Gemini
       "x-same-domain": "1",
       "user-agent": USER_AGENT,
       cookie: cookieHeader,
-      [MODEL_HEADER_NAME]: MODEL_HEADERS[input.model],
+      [MODEL_HEADER_NAME]: buildGeminiWebModelHeader(input.model),
     },
     body: params.toString(),
   });
@@ -413,9 +428,9 @@ export async function runGeminiWebWithFallback(
   input: Omit<GeminiWebRunInput, "model"> & { model: GeminiWebModelId },
 ): Promise<GeminiWebRunOutput & { effectiveModel: GeminiWebModelId }> {
   const attempt = await runGeminiWebOnce(input);
-  if (isGeminiModelUnavailable(attempt.errorCode) && input.model !== "gemini-2.5-flash") {
-    const fallback = await runGeminiWebOnce({ ...input, model: "gemini-2.5-flash" });
-    return { ...fallback, effectiveModel: "gemini-2.5-flash" };
+  if (isGeminiModelUnavailable(attempt.errorCode) && input.model !== FALLBACK_GEMINI_WEB_MODEL) {
+    const fallback = await runGeminiWebOnce({ ...input, model: FALLBACK_GEMINI_WEB_MODEL });
+    return { ...fallback, effectiveModel: FALLBACK_GEMINI_WEB_MODEL };
   }
   return { ...attempt, effectiveModel: input.model };
 }

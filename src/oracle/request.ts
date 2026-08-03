@@ -9,7 +9,7 @@ import type {
 } from "./types.js";
 import { DEFAULT_SYSTEM_PROMPT } from "./config.js";
 import { createFileSections, readFiles } from "./files.js";
-import { formatFileSection } from "./markdown.js";
+import { formatFileSections } from "./markdown.js";
 import { createFsAdapter } from "./fsAdapter.js";
 
 export function buildPrompt(basePrompt: string, files: FileContent[], cwd = process.cwd()): string {
@@ -17,12 +17,14 @@ export function buildPrompt(basePrompt: string, files: FileContent[], cwd = proc
     return basePrompt;
   }
   const sections = createFileSections(files, cwd);
-  const sectionText = sections.map((section) => section.sectionText).join("\n\n");
+  const sectionText = formatFileSections(sections, { includeFileIndex: true });
   return `${basePrompt.trim()}\n\n${sectionText}`;
 }
 
 export function buildRequestBody({
   modelConfig,
+  reasoningEffort,
+  reasoningMode,
   systemPrompt,
   userPrompt,
   searchEnabled,
@@ -32,6 +34,14 @@ export function buildRequestBody({
   previousResponseId,
 }: BuildRequestBodyParams): OracleRequestBody {
   const searchToolType: ToolConfig["type"] = modelConfig.searchToolType ?? "web_search_preview";
+  const reasoning =
+    modelConfig.reasoning || reasoningEffort || reasoningMode
+      ? {
+          ...(modelConfig.reasoning ?? {}),
+          ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+          ...(reasoningMode ? { mode: reasoningMode } : {}),
+        }
+      : undefined;
   return {
     model: modelConfig.apiModel ?? modelConfig.model,
     previous_response_id: previousResponseId ? previousResponseId : undefined,
@@ -48,7 +58,7 @@ export function buildRequestBody({
       },
     ],
     tools: searchEnabled ? [{ type: searchToolType }] : undefined,
-    reasoning: modelConfig.reasoning || undefined,
+    reasoning,
     max_output_tokens: maxOutputTokens,
     background: background ? true : undefined,
     store: storeResponse ? true : undefined,
@@ -71,9 +81,7 @@ export async function renderPromptMarkdown(
   const userPrompt = (options.prompt ?? "").trim();
   const lines = ["[SYSTEM]", systemPrompt, ""];
   lines.push("[USER]", userPrompt, "");
-  sections.forEach((section) => {
-    lines.push(formatFileSection(section.displayPath, section.content));
-  });
+  lines.push(formatFileSections(sections));
   return lines
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")

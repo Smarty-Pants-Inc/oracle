@@ -4,199 +4,12 @@ import {
   clearPromptComposer,
   submitPrompt,
 } from "../../src/browser/actions/promptComposer.js";
-import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import {
+  CONVERSATION_TURN_CONTAINER_SELECTOR,
+  CONVERSATION_TURN_SELECTOR,
+} from "../../src/browser/constants.js";
 
 describe("promptComposer", () => {
-  test("builds a syntactically valid prompt acceptance probe", () => {
-    const expression = promptComposer.buildPromptAcceptanceProbeExpression(0);
-
-    expect(() => new Function(`return ${expression}`)).not.toThrow();
-  });
-
-  test("fails in the short post-submit gate when ChatGPT never starts running", async () => {
-    vi.useFakeTimers();
-    try {
-      const prompt = "hello acceptance gate";
-      const runtime = {
-        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-          if (expression.includes("document.readyState === 'complete'")) {
-            return { result: { value: { ready: true, composer: true, fileInput: false } } };
-          }
-          if (expression.includes("const focusNode")) {
-            return { result: { value: { focused: true } } };
-          }
-          if (
-            expression.includes("editorText") &&
-            expression.includes("fallbackValue") &&
-            expression.includes("activeValue")
-          ) {
-            return {
-              result: {
-                value: { editorText: prompt, fallbackValue: "", activeValue: prompt },
-              },
-            };
-          }
-          if (expression.includes("dispatchClickSequence(button)")) {
-            return { result: { value: "clicked" } };
-          }
-          return {
-            result: {
-              value: {
-                baseline: 0,
-                turnsCount: 0,
-                userMatched: false,
-                prefixMatched: false,
-                lastMatched: false,
-                hasNewTurn: false,
-                stopVisible: false,
-                assistantVisible: false,
-                composerCleared: false,
-                inConversation: false,
-                href: "https://chatgpt.com/g/g-p-test/project",
-                fallbackValue: prompt,
-                editorValue: prompt,
-                lastTurn: "",
-              },
-            },
-          };
-        }),
-      };
-      const input = {
-        insertText: vi.fn().mockResolvedValue(undefined),
-        dispatchKeyEvent: vi.fn().mockResolvedValue(undefined),
-      };
-      const logger = Object.assign(vi.fn(), { verbose: false });
-      let rejection: unknown;
-      let settled = false;
-      const pending = submitPrompt(
-        {
-          runtime: runtime as never,
-          input: input as never,
-          baselineTurns: 0,
-          inputTimeoutMs: 1_000,
-        },
-        prompt,
-        logger as never,
-      ).then(
-        () => {
-          settled = true;
-        },
-        (error) => {
-          settled = true;
-          rejection = error;
-        },
-      );
-
-      await vi.advanceTimersByTimeAsync(5_600);
-
-      expect(settled).toBe(true);
-      expect(rejection).toBeInstanceOf(BrowserAutomationError);
-      expect((rejection as BrowserAutomationError).details).toMatchObject({
-        stage: "submit-prompt",
-        code: "prompt-not-accepted",
-      });
-      await pending;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  test("reports a login dialog during the post-submit gate as login-required", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            accepted: false,
-            blockedBy: "login-required",
-            signals: [],
-            blockers: ["login-required"],
-            evidence: {
-              url: "https://chatgpt.com/",
-              title: "ChatGPT",
-              buttonLabels: ["Log in", "Sign up"],
-              bodySnippet: "Log in to get answers tailored to you",
-            },
-          },
-        },
-      }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
-    const logger = Object.assign(vi.fn(), { verbose: false });
-
-    await expect(
-      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 0),
-    ).rejects.toMatchObject({
-      details: {
-        stage: "submit-prompt",
-        code: "login-required",
-        blockers: ["login-required"],
-      },
-    });
-  });
-
-  test("accepts a thinking/status signal before waiting for the committed turn", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: {
-          value: {
-            accepted: true,
-            signals: ["thinking-status"],
-            blockers: [],
-            evidence: {
-              statusText: "Thinking",
-              turnsCount: 10,
-              baseline: 10,
-            },
-          },
-        },
-      }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
-    const logger = Object.assign(vi.fn(), { verbose: false });
-
-    await expect(
-      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 10),
-    ).resolves.toMatchObject({
-      accepted: true,
-      signals: ["thinking-status"],
-    });
-  });
-
-  test("retries through transient navigation while checking prompt acceptance", async () => {
-    const runtime = {
-      evaluate: vi
-        .fn()
-        .mockRejectedValueOnce(
-          new Error("Execution context was destroyed, probably because of a navigation."),
-        )
-        .mockResolvedValueOnce({
-          result: {
-            value: {
-              accepted: true,
-              signals: ["new-turn"],
-              blockers: [],
-              evidence: {
-                turnsCount: 11,
-                baseline: 10,
-              },
-            },
-          },
-        }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
-    const logger = Object.assign(vi.fn(), { verbose: false });
-
-    await expect(
-      promptComposer.waitForPromptAccepted(runtime as never, 5_000, logger as never, 10),
-    ).resolves.toMatchObject({
-      accepted: true,
-      signals: ["new-turn"],
-    });
-  });
-
   test("fails composer clearing when stale text remains", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({
@@ -212,7 +25,7 @@ describe("promptComposer", () => {
     );
   });
 
-  test("does not treat cleared composer + stop button as committed without a new turn", async () => {
+  test("does not treat historical assistant content as committed without a new turn", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -231,7 +44,7 @@ describe("promptComposer", () => {
                 lastMatched: false,
                 hasNewTurn: false,
                 stopVisible: true,
-                assistantVisible: false,
+                assistantVisible: true,
                 composerCleared: true,
                 inConversation: false,
               },
@@ -246,6 +59,117 @@ describe("promptComposer", () => {
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not count nested broad-selector matches as new turns in a reused conversation", async () => {
+    vi.useFakeTimers();
+    try {
+      const topLevelTurns = [{ innerText: "old user" }, { innerText: "old assistant" }];
+      const nestedMatches = [
+        topLevelTurns[0],
+        { innerText: "old user" },
+        topLevelTurns[1],
+        { innerText: "old assistant" },
+      ];
+      const document = {
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => {
+          if (selector === CONVERSATION_TURN_CONTAINER_SELECTOR) return topLevelTurns;
+          if (selector === CONVERSATION_TURN_SELECTOR) return nestedMatches;
+          return [];
+        },
+      };
+      class FakeTextArea {}
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: Function(
+              "document",
+              "HTMLTextAreaElement",
+              "location",
+              `return ${expression};`,
+            )(document, FakeTextArea, { href: "https://chatgpt.com/c/reused" }),
+          },
+        })),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("commit timeout throws a structured error with probe diagnostics", async () => {
+    vi.useFakeTimers();
+    try {
+      const probe = {
+        baseline: 10,
+        turnsCount: 10,
+        userMatched: false,
+        prefixMatched: false,
+        lastMatched: false,
+        hasNewTurn: false,
+        stopVisible: false,
+        assistantVisible: false,
+        composerCleared: true,
+        inConversation: false,
+        editorValue: "",
+        lastTurn: "previous turn text",
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          // Baseline read (turn count)
+          .mockResolvedValueOnce({ result: { value: 10 } })
+          // Polls + final diagnostic probe
+          .mockResolvedValue({ result: { value: probe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const assertion = promise.then(
+        () => {
+          throw new Error("expected verifyPromptCommitted to reject");
+        },
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(250);
+      const error = (await assertion) as {
+        name?: string;
+        details?: Record<string, unknown>;
+        message?: string;
+      };
+      expect(error.message).toMatch(/prompt did not appear/i);
+      expect(error.name).toBe("BrowserAutomationError");
+      expect(error.details).toMatchObject({
+        stage: "submit-prompt",
+        code: "prompt-commit-timeout",
+        commitProbe: expect.objectContaining({
+          hasNewTurn: false,
+          composerCleared: true,
+          turnsCount: 10,
+          lastTurnLength: "previous turn text".length,
+        }),
+      });
+      // Free text must not leak into the structured details.
+      const commitProbe = error.details?.commitProbe as Record<string, unknown>;
+      expect(commitProbe).not.toHaveProperty("lastTurn");
+      expect(commitProbe).not.toHaveProperty("editorValue");
     } finally {
       vi.useRealTimers();
     }
@@ -289,7 +213,7 @@ describe("promptComposer", () => {
       const runtime = {
         evaluate: vi.fn(async ({ expression }: { expression: string }) => {
           if (expression.includes("dispatchClickSequence")) {
-            return { result: { value: "disabled" } };
+            return { result: { value: { status: "disabled" } } };
           }
           return { result: { value: true } };
         }),
@@ -300,94 +224,102 @@ describe("promptComposer", () => {
       const promise = promptComposer.attemptSendButton(
         runtime as never,
         (() => undefined) as never,
+        undefined,
         ["oracle-attach-verify.txt"],
       );
-      const assertion = expect(promise).rejects.toThrow(/clickable send button/i);
-      await vi.advanceTimersByTimeAsync(301_000);
+      const assertion = expect(promise).rejects.toThrow(/after 45s/i);
+      await vi.advanceTimersByTimeAsync(46_000);
       await assertion;
     } finally {
       vi.useRealTimers();
     }
   });
 
-  test("attachment sends keep waiting through a disabled send button until it enables", async () => {
+  test("only attachment sends get the longer send-button deadline", () => {
+    expect(promptComposer.sendButtonTimeoutMs()).toBe(20_000);
+    expect(promptComposer.sendButtonTimeoutMs([])).toBe(20_000);
+    expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"])).toBe(45_000);
+    expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
+  });
+
+  test("marks prompt submitted before commit verification finishes", async () => {
+    const onPromptSubmitted = vi.fn();
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("document.readyState")) {
+          return { result: { value: { ready: true, composer: true, fileInput: false } } };
+        }
+        if (expression.includes("focused: true")) {
+          return { result: { value: { focused: true } } };
+        }
+        if (expression.includes("editorText")) {
+          return {
+            result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
+          };
+        }
+        if (expression.includes("button.scrollIntoView")) {
+          return { result: { value: { status: "clicked" } } };
+        }
+        return {
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 1,
+              userMatched: true,
+              prefixMatched: false,
+              lastMatched: true,
+              hasNewTurn: true,
+              stopVisible: true,
+              assistantVisible: false,
+              composerCleared: true,
+              inConversation: true,
+            },
+          },
+        };
+      }),
+    };
+    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await submitPrompt(
+      {
+        runtime: runtime as never,
+        input: input as never,
+        baselineTurns: 0,
+        onPromptSubmitted,
+      },
+      "hello",
+      logger as never,
+    );
+
+    expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+  });
+
+  test("waits for a delayed trusted click without issuing a second send", async () => {
     vi.useFakeTimers();
     try {
-      let clickAttempts = 0;
-      const runtime = {
-        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-          if (expression.includes("dispatchClickSequence")) {
-            clickAttempts += 1;
-            // Send stays disabled for ~90s of server-side processing, then enables.
-            return { result: { value: clickAttempts < 180 ? "disabled" : "clicked" } };
+      const evaluate = vi.fn().mockResolvedValue({
+        result: { value: { status: "point", x: 10, y: 20 } },
+      });
+      const input = {
+        dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+          if (type === "mouseReleased") {
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
           }
-          return { result: { value: true } };
         }),
-      } as unknown as {
-        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.attemptSendButton(
-        runtime as never,
-        (() => undefined) as never,
-        ["oracle-attach-verify.txt"],
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        undefined,
       );
-      const assertion = expect(promise).resolves.toBe(true);
-      await vi.advanceTimersByTimeAsync(120_000);
-      await assertion;
-      expect(clickAttempts).toBeGreaterThanOrEqual(180);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  test("attachment sends keep waiting when the send button is briefly missing", async () => {
-    vi.useFakeTimers();
-    try {
-      let clickAttempts = 0;
-      const runtime = {
-        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-          if (expression.includes("dispatchClickSequence")) {
-            clickAttempts += 1;
-            // The button node can be swapped out mid-processing; 'missing' must not abort.
-            return { result: { value: clickAttempts < 5 ? "missing" : "clicked" } };
-          }
-          return { result: { value: true } };
-        }),
-      } as unknown as {
-        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-      };
-
-      const promise = promptComposer.attemptSendButton(
-        runtime as never,
-        (() => undefined) as never,
-        ["oracle-attach-verify.txt"],
-      );
-      const assertion = expect(promise).resolves.toBe(true);
-      await vi.advanceTimersByTimeAsync(10_000);
-      await assertion;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  test("no-attachment sends still bail out fast to the Enter fallback", async () => {
-    vi.useFakeTimers();
-    try {
-      const runtime = {
-        evaluate: vi.fn(async () => ({ result: { value: "missing" } })),
-      } as unknown as {
-        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-      };
-
-      const promise = promptComposer.attemptSendButton(
-        runtime as never,
-        (() => undefined) as never,
-        [],
-      );
-      const assertion = expect(promise).resolves.toBe(false);
       await vi.advanceTimersByTimeAsync(1_000);
-      await assertion;
+
+      await expect(result).resolves.toBe(true);
+      expect(evaluate).toHaveBeenCalledTimes(1);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }

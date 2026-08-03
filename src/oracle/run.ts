@@ -13,7 +13,7 @@ import type {
   RunOracleResult,
   ModelName,
 } from "./types.js";
-import { DEFAULT_SYSTEM_PROMPT, MODEL_CONFIGS, TOKENIZER_OPTIONS } from "./config.js";
+import { DEFAULT_SYSTEM_PROMPT, TOKENIZER_OPTIONS } from "./config.js";
 import { readFiles } from "./files.js";
 import { buildPrompt, buildRequestBody } from "./request.js";
 import { estimateRequestTokens } from "./tokenEstimate.js";
@@ -27,8 +27,9 @@ import {
   describeTransportError,
   toTransportError,
 } from "./errors.js";
-import { createDefaultClientFactory, isCustomBaseUrl } from "./client.js";
-import { formatBaseUrlForLog, maskApiKey } from "./logging.js";
+import { isCustomBaseUrl } from "./baseUrl.js";
+import { createDefaultClientFactory } from "./client.js";
+import { maskApiKey } from "./logging.js";
 import { startHeartbeat } from "../heartbeat.js";
 import { startOscProgress } from "./oscProgress.js";
 import { createFsAdapter } from "./fsAdapter.js";
@@ -40,13 +41,17 @@ import { executeBackgroundResponse } from "./background.js";
 import { formatTokenEstimate, formatTokenValue, resolvePreviewMode } from "./runUtils.js";
 import { estimateUsdCost } from "tokentally";
 import {
-  defaultOpenRouterBaseUrl,
-  isKnownModel,
   isOpenRouterBaseUrl,
   isProModel,
   resolveModelConfig,
-  normalizeOpenRouterBaseUrl,
+  resolveOverriddenApiModel,
 } from "./modelResolver.js";
+import { validateProviderRouting } from "./providerRouting.js";
+import {
+  formatRouteTargetForLog,
+  resolveProviderRoute,
+  type ResolvedProviderRoute,
+} from "./providerRoutePlan.js";
 
 type MarkdownStreamer = ReturnType<typeof createMarkdownStreamer>;
 
@@ -55,11 +60,97 @@ const dim = (text: string): string => (isStdoutTty ? kleur.dim(text) : text);
 // Default timeout for non-pro API runs (fast models) — give them up to 120s.
 const DEFAULT_TIMEOUT_NON_PRO_MS = 120_000;
 const DEFAULT_TIMEOUT_PRO_MS = 60 * 60 * 1000;
+const GPT_5_6_API_MODELS = new Set(["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
+const REASONING_MODES = new Set(["standard", "pro"]);
 
 const defaultWait = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+
+function formatProviderRouteLogLine(route: ResolvedProviderRoute, keySource: string): string {
+  if (route.isAzureOpenAI) {
+    return `Provider: Azure OpenAI | endpoint: ${formatRouteTargetForLog(route.azureEndpoint)} | deployment: ${route.azureDeploymentName || "none"} | key: ${keySource}`;
+  }
+
+  return `Provider: ${route.providerLabel} | base: ${route.base} | key: ${keySource}`;
+}
+
+function runtimeKeySource({
+  route,
+  providerMode,
+  optionsApiKey,
+}: {
+  route: ResolvedProviderRoute;
+  providerMode: string;
+  optionsApiKey?: string;
+}): string {
+  if (
+    optionsApiKey &&
+    (route.isAzureOpenAI ||
+      providerMode === "openai" ||
+      route.provider === "openai" ||
+      route.providerLabel === "OpenAI-compatible")
+  ) {
+    return "apiKey option";
+  }
+  if (route.isAzureOpenAI) {
+    return "AZURE_OPENAI_API_KEY|OPENAI_API_KEY";
+  }
+  if (providerMode === "openai") {
+    return "OPENAI_API_KEY";
+  }
+  if (isOpenRouterBaseUrl(route.baseUrl) || route.openRouterFallback || route.model.includes("/")) {
+    return "OPENROUTER_API_KEY";
+  }
+  if (route.model.startsWith("gpt")) return "OPENAI_API_KEY";
+  if (route.model.startsWith("gemini")) return "GEMINI_API_KEY";
+  if (route.model.startsWith("claude")) return "ANTHROPIC_API_KEY";
+  if (route.model.startsWith("grok")) return "XAI_API_KEY";
+  return optionsApiKey ? "apiKey option" : route.keySource;
+}
+
+function validateReasoningOptions(options: RunOracleOptions, route: ResolvedProviderRoute): void {
+  const { reasoningEffort, reasoningMode } = options;
+  if (!reasoningEffort && !reasoningMode) return;
+  if (reasoningEffort && !REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new PromptValidationError(
+      `Invalid reasoning effort "${reasoningEffort}". Expected none, low, medium, high, xhigh, or max.`,
+      { model: options.model, reasoningEffort },
+    );
+  }
+  if (reasoningMode && !REASONING_MODES.has(reasoningMode)) {
+    throw new PromptValidationError(
+      `Invalid reasoning mode "${reasoningMode}". Expected standard or pro.`,
+      { model: options.model, reasoningMode },
+    );
+  }
+  if (!GPT_5_6_API_MODELS.has(options.model)) {
+    const option = reasoningMode
+      ? `Reasoning mode "${reasoningMode}"`
+      : `Reasoning effort "${reasoningEffort}"`;
+    const guidance = reasoningMode
+      ? `Use --model gpt-5.6-sol --reasoning-mode ${reasoningMode}.`
+      : `Use --model gpt-5.6-sol --reasoning-effort ${reasoningEffort}.`;
+    throw new PromptValidationError(
+      `${option} is available only for GPT-5.6 API models. ${guidance}`,
+      { model: options.model, reasoningEffort, reasoningMode },
+    );
+  }
+  if (
+    reasoningMode &&
+    !route.isAzureOpenAI &&
+    (route.openRouterFallback ||
+      isOpenRouterBaseUrl(route.baseUrl) ||
+      isCustomBaseUrl(route.baseUrl))
+  ) {
+    throw new PromptValidationError(
+      "--reasoning-mode requires the OpenAI or Azure OpenAI Responses API; OpenRouter and custom --base-url routes use the Chat Completions adapter.",
+      { model: options.model, reasoningMode },
+    );
+  }
+}
 
 export async function runOracle(
   options: RunOracleOptions,
@@ -82,46 +173,42 @@ export async function runOracle(
     ? (stdoutWriteDep ?? process.stdout.write.bind(process.stdout))
     : () => true;
   const isTty = allowStdout && isStdoutTty;
-  const resolvedXaiBaseUrl = process.env.XAI_BASE_URL?.trim() || "https://api.x.ai/v1";
-  const openRouterApiKey = process.env.OPENROUTER_API_KEY?.trim();
-  const defaultOpenRouterBase = defaultOpenRouterBaseUrl();
+  const previewMode = resolvePreviewMode(options.previewMode ?? options.preview);
+  const isPreview = Boolean(previewMode);
 
-  const knownModelConfig = isKnownModel(options.model) ? MODEL_CONFIGS[options.model] : undefined;
-  const provider = knownModelConfig?.provider ?? "other";
-
-  const hasOpenAIKey =
-    Boolean(optionsApiKey) ||
-    Boolean(process.env.OPENAI_API_KEY) ||
-    Boolean(process.env.AZURE_OPENAI_API_KEY && options.azure?.endpoint);
-  const hasAnthropicKey = Boolean(optionsApiKey) || Boolean(process.env.ANTHROPIC_API_KEY);
-  const hasGeminiKey = Boolean(optionsApiKey) || Boolean(process.env.GEMINI_API_KEY);
-  const hasXaiKey = Boolean(optionsApiKey) || Boolean(process.env.XAI_API_KEY);
-
-  let baseUrl = options.baseUrl?.trim();
-  if (!baseUrl) {
-    if (options.model.startsWith("grok")) {
-      baseUrl = resolvedXaiBaseUrl;
-    } else if (provider === "anthropic") {
-      baseUrl = process.env.ANTHROPIC_BASE_URL?.trim();
-    } else {
-      baseUrl = process.env.OPENAI_BASE_URL?.trim();
-    }
-  }
-  const providerKeyMissing =
-    (provider === "openai" && !hasOpenAIKey) ||
-    (provider === "anthropic" && !hasAnthropicKey) ||
-    (provider === "google" && !hasGeminiKey) ||
-    (provider === "xai" && !hasXaiKey) ||
-    provider === "other";
-  const openRouterFallback = providerKeyMissing && Boolean(openRouterApiKey);
-  if (!baseUrl || openRouterFallback) {
-    if (openRouterFallback) {
-      baseUrl = defaultOpenRouterBase;
-    }
-  }
-  if (baseUrl && isOpenRouterBaseUrl(baseUrl)) {
-    baseUrl = normalizeOpenRouterBaseUrl(baseUrl);
-  }
+  const providerMode = options.provider ?? "auto";
+  validateProviderRouting(
+    {
+      model: options.model,
+      providerMode,
+      azure: options.azure,
+    },
+    {
+      onAzureDeploymentMissing: (state) => {
+        if (!isPreview && !options.suppressHeader) {
+          log(
+            dim(
+              `Provider: Azure OpenAI | endpoint: ${formatRouteTargetForLog(state.azureEndpoint)} | deployment: none | key: ${
+                optionsApiKey ? "apiKey option" : "AZURE_OPENAI_API_KEY|OPENAI_API_KEY"
+              }`,
+            ),
+          );
+        }
+      },
+    },
+  );
+  const route = resolveProviderRoute({
+    model: options.model,
+    providerMode,
+    azure: options.azure,
+    baseUrl: options.baseUrl,
+    apiKey: optionsApiKey,
+    env: process.env,
+  });
+  const { isAzureOpenAI, azureDeploymentName } = route;
+  const baseUrl = route.baseUrl;
+  const openRouterFallback = route.openRouterFallback;
+  validateReasoningOptions(options, route);
 
   const logVerbose = (message: string): void => {
     if (options.verbose) {
@@ -129,55 +216,15 @@ export async function runOracle(
     }
   };
 
-  const previewMode = resolvePreviewMode(options.previewMode ?? options.preview);
-  const isPreview = Boolean(previewMode);
-
-  const isAzureOpenAI = Boolean(options.azure?.endpoint);
-
-  const getApiKeyForModel = (model: ModelName): { key?: string; source: string } => {
-    if (isOpenRouterBaseUrl(baseUrl) || openRouterFallback) {
-      return { key: optionsApiKey ?? openRouterApiKey, source: "OPENROUTER_API_KEY" };
-    }
-    if (typeof model === "string" && model.startsWith("gpt")) {
-      if (optionsApiKey) return { key: optionsApiKey, source: "apiKey option" };
-      if (isAzureOpenAI) {
-        const key = process.env.AZURE_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY;
-        return { key, source: "AZURE_OPENAI_API_KEY|OPENAI_API_KEY" };
-      }
-      return { key: process.env.OPENAI_API_KEY, source: "OPENAI_API_KEY" };
-    }
-    if (typeof model === "string" && model.startsWith("gemini")) {
-      return { key: optionsApiKey ?? process.env.GEMINI_API_KEY, source: "GEMINI_API_KEY" };
-    }
-    if (typeof model === "string" && model.startsWith("claude")) {
-      return { key: optionsApiKey ?? process.env.ANTHROPIC_API_KEY, source: "ANTHROPIC_API_KEY" };
-    }
-    if (typeof model === "string" && model.startsWith("grok")) {
-      return { key: optionsApiKey ?? process.env.XAI_API_KEY, source: "XAI_API_KEY" };
-    }
-    return {
-      key: optionsApiKey ?? openRouterApiKey,
-      source: optionsApiKey ? "apiKey option" : "OPENROUTER_API_KEY",
-    };
-  };
-
-  const apiKeyResult = getApiKeyForModel(options.model);
-  const apiKey = apiKeyResult.key;
+  const apiKey = route.apiKey;
   if (!apiKey) {
-    const envVar =
-      isOpenRouterBaseUrl(baseUrl) || openRouterFallback
-        ? "OPENROUTER_API_KEY"
-        : options.model.startsWith("gpt")
-          ? isAzureOpenAI
-            ? "AZURE_OPENAI_API_KEY (or OPENAI_API_KEY)"
-            : "OPENAI_API_KEY"
-          : options.model.startsWith("gemini")
-            ? "GEMINI_API_KEY"
-            : options.model.startsWith("claude")
-              ? "ANTHROPIC_API_KEY"
-              : options.model.startsWith("grok")
-                ? "XAI_API_KEY"
-                : "OPENROUTER_API_KEY";
+    const envVar = isAzureOpenAI
+      ? "AZURE_OPENAI_API_KEY (or OPENAI_API_KEY)"
+      : providerMode === "openai"
+        ? "OPENAI_API_KEY"
+        : isOpenRouterBaseUrl(baseUrl) || openRouterFallback
+          ? "OPENROUTER_API_KEY"
+          : route.keySource;
     const browserModeHint = options.model.startsWith("gpt")
       ? ' If you have a ChatGPT Pro subscription, retry with --engine browser (or MCP engine:"browser" / preset:"chatgpt-pro-heavy"); browser mode uses your signed-in ChatGPT session instead of an API key.'
       : "";
@@ -189,12 +236,12 @@ export async function runOracle(
     );
   }
 
-  const envVar = apiKeyResult.source;
+  const envVar = runtimeKeySource({ route, providerMode, optionsApiKey });
 
   const minPromptLength = Number.parseInt(process.env.ORACLE_MIN_PROMPT_CHARS ?? "10", 10);
   const promptLength = options.prompt?.trim().length ?? 0;
   // Enforce the short-prompt guardrail on pro-tier models because they're costly; cheaper models can run short prompts without blocking.
-  const isProTierModel = isProModel(options.model);
+  const isProTierModel = isProModel(options.model) || options.reasoningMode === "pro";
   if (isProTierModel && !Number.isNaN(minPromptLength) && promptLength < minPromptLength) {
     throw new PromptValidationError(
       `Prompt is too short (<${minPromptLength} chars). This was likely accidental; please provide more detail.`,
@@ -203,10 +250,11 @@ export async function runOracle(
   }
 
   const resolverOpenRouterApiKey =
-    openRouterFallback || isOpenRouterBaseUrl(baseUrl) ? (openRouterApiKey ?? apiKey) : undefined;
+    openRouterFallback || isOpenRouterBaseUrl(baseUrl) ? apiKey : undefined;
   const modelConfig = await resolveModelConfig(options.model, {
     baseUrl,
     openRouterApiKey: resolverOpenRouterApiKey,
+    modelOverrides: options.modelOverrides,
   });
   const isLongRunningModel = isProTierModel;
   const supportsBackground = modelConfig.supportsBackground !== false;
@@ -262,20 +310,28 @@ export async function runOracle(
         : DEFAULT_TIMEOUT_NON_PRO_MS / 1000
       : options.timeoutSeconds;
   const timeoutMs = timeoutSeconds * 1000;
-  const azureDeploymentName = isAzureOpenAI ? options.azure?.deployment?.trim() : undefined;
+  const httpTimeoutMs =
+    typeof options.httpTimeoutMs === "number" &&
+    Number.isFinite(options.httpTimeoutMs) &&
+    options.httpTimeoutMs > 0
+      ? options.httpTimeoutMs
+      : timeoutMs;
   // Track the concrete model id we dispatch to (especially for Gemini preview aliases)
   const effectiveModelId =
+    azureDeploymentName ??
     options.effectiveModelId ??
-    (azureDeploymentName
-      ? azureDeploymentName
-      : options.model.startsWith("gemini")
-        ? resolveGeminiModelId(options.model)
-        : (modelConfig.apiModel ?? modelConfig.model));
+    // A user-config apiModel override (known models only) wins over Gemini alias remapping.
+    resolveOverriddenApiModel(options.model, options.modelOverrides) ??
+    (options.model.startsWith("gemini")
+      ? resolveGeminiModelId(options.model)
+      : (modelConfig.apiModel ?? modelConfig.model));
   if (!isPreview && options.previousResponseId) {
     log(dim(`Continuing from response ${options.previousResponseId}`));
   }
   const requestBody = buildRequestBody({
     modelConfig,
+    reasoningEffort: options.reasoningEffort,
+    reasoningMode: options.reasoningMode,
     systemPrompt,
     userPrompt: promptWithFiles,
     searchEnabled,
@@ -306,6 +362,7 @@ export async function runOracle(
   if (!isPreview) {
     if (!options.suppressHeader) {
       log(headerLine);
+      log(dim(formatProviderRouteLogLine(route, envVar)));
     }
     const maskedKey = maskApiKey(apiKey);
     if (maskedKey && options.verbose) {
@@ -326,9 +383,6 @@ export async function runOracle(
         ),
       );
     }
-    if (baseUrl) {
-      log(dim(`Base URL: ${formatBaseUrlForLog(baseUrl)}`));
-    }
     if (effectiveModelId !== modelConfig.model) {
       log(dim(`Resolved model: ${modelConfig.model} → ${effectiveModelId}`));
     }
@@ -336,6 +390,12 @@ export async function runOracle(
       log(
         dim("Background runs are not supported for this model; streaming in foreground instead."),
       );
+    }
+    if (options.reasoningMode) {
+      log(dim(`Reasoning mode: ${options.reasoningMode}`));
+    }
+    if (options.reasoningEffort) {
+      log(dim(`Reasoning effort: ${options.reasoningEffort}`));
     }
     if (!options.suppressTips) {
       if (pendingNoFilesTip) {
@@ -347,6 +407,12 @@ export async function runOracle(
     }
     if (isLongRunningModel) {
       log(dim("This model can take up to 60 minutes (usually replies much faster)."));
+    }
+    if (options.verbose || isLongRunningModel || httpTimeoutMs < timeoutMs) {
+      const timeoutLine = `Timeouts | overall: ${formatElapsed(timeoutMs)} | transport: ${formatElapsed(httpTimeoutMs)}`;
+      const timeoutNote =
+        httpTimeoutMs < timeoutMs ? " | note: transport can fail before overall timeout" : "";
+      log(dim(`${timeoutLine}${timeoutNote}`));
     }
     if (options.verbose || isLongRunningModel) {
       log(dim("Press Ctrl+C to cancel."));
@@ -388,26 +454,30 @@ export async function runOracle(
   }
 
   const proxyCompatibleBaseUrl =
-    baseUrl && (isOpenRouterBaseUrl(baseUrl) || isCustomBaseUrl(baseUrl)) ? baseUrl : undefined;
-  const apiEndpoint = modelConfig.model.startsWith("gemini")
-    ? proxyCompatibleBaseUrl
-    : proxyCompatibleBaseUrl
+    !isAzureOpenAI && baseUrl && (isOpenRouterBaseUrl(baseUrl) || isCustomBaseUrl(baseUrl))
+      ? baseUrl
+      : undefined;
+  const apiEndpoint = isAzureOpenAI
+    ? undefined
+    : modelConfig.model.startsWith("gemini")
       ? proxyCompatibleBaseUrl
-      : modelConfig.model.startsWith("claude")
-        ? (process.env.ANTHROPIC_BASE_URL ?? baseUrl)
-        : baseUrl;
+      : proxyCompatibleBaseUrl
+        ? proxyCompatibleBaseUrl
+        : modelConfig.model.startsWith("claude")
+          ? baseUrl
+          : baseUrl;
   const clientInstance: ClientLike =
     client ??
     clientFactory(apiKey, {
       baseUrl: apiEndpoint,
-      azure: options.azure,
+      azure: isAzureOpenAI ? options.azure : undefined,
       model: options.model,
       resolvedModelId: modelConfig.model.startsWith("claude")
         ? resolveClaudeModelId(effectiveModelId)
         : modelConfig.model.startsWith("gemini")
           ? resolveGeminiModelId(effectiveModelId as ModelName)
           : effectiveModelId,
-      httpTimeoutMs: options.httpTimeoutMs,
+      httpTimeoutMs,
     });
   logVerbose("Dispatching request to API...");
   if (options.verbose) {
@@ -655,9 +725,8 @@ export async function runOracle(
       })?.totalUsd
     : undefined;
 
-  const reasoningLabel = [modelConfig.reasoning?.mode, modelConfig.reasoning?.effort]
-    .filter(Boolean)
-    .join("/");
+  const effortLabel = options.reasoningEffort ?? modelConfig.reasoning?.effort;
+  const reasoningLabel = [options.reasoningMode, effortLabel].filter(Boolean).join("/");
   const modelLabel = reasoningLabel ? `${modelConfig.model}[${reasoningLabel}]` : modelConfig.model;
   const sessionIdContainsModel =
     typeof options.sessionId === "string" &&

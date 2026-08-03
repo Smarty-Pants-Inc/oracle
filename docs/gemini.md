@@ -16,13 +16,17 @@ Oracle supports Gemini in two distinct ways:
    ```bash
    oracle --engine api --model gemini --prompt "Explain quantum entanglement"
    ```
-   You can also use the explicit model ID:
+   Use an explicit current model ID:
    ```bash
-   oracle --engine api --model gemini-3-pro --prompt "..."
+   oracle --engine api --model gemini-3.5-flash --prompt "..."
    ```
-   Or the 3.1 alias, which Oracle dispatches to Google's preview model id:
+   Gemini 3.1 Pro is also available; Oracle dispatches it to Google's preview model id:
    ```bash
    oracle --engine api --model gemini-3.1-pro --prompt "..."
+   ```
+   For the lowest-cost current model:
+   ```bash
+   oracle --engine api --model gemini-3.1-flash-lite --prompt "..."
    ```
 
 ## Usage (Gemini web / cookies)
@@ -38,7 +42,7 @@ Examples:
 
 ```bash
 # Text run
-oracle --engine browser --model gemini-3-pro --prompt "Say OK."
+oracle --engine browser --model gemini-3.5-flash --prompt "Say OK."
 
 # Deep Think browser run (manual-login profile recommended on macOS)
 oracle --engine browser --browser-manual-login \
@@ -46,22 +50,25 @@ oracle --engine browser --browser-manual-login \
   --prompt "Think carefully, then answer in one paragraph."
 
 # Generate an image (writes an output file)
-oracle --engine browser --model gemini-3-pro \
+oracle --engine browser --model gemini-3.1-pro \
   --prompt "a cute robot holding a banana" \
   --generate-image out.jpg --aspect 1:1
 
 # Edit an image (input via --edit-image, output via --output)
-oracle --engine browser --model gemini-3-pro \
+oracle --engine browser --model gemini-3.1-pro \
   --prompt "add sunglasses" \
   --edit-image in.png --output out.jpg
 ```
 
 Notes:
 
-- If your logged-in Gemini account can’t access “Pro”, Oracle will auto-fallback to a supported model for web runs (and logs the fallback in verbose mode).
+- Current explicit IDs are `gemini-3.1-flash-lite`, `gemini-3.5-flash`, and `gemini-3.1-pro`.
+- Legacy `gemini-3-pro`, `gemini-2.5-pro`, and `gemini-2.5-flash` browser names remain accepted and map to current Gemini web models.
+- If your logged-in Gemini account can’t access the requested model, Oracle auto-falls back to Gemini 3.1 Flash-Lite and logs the fallback in verbose mode.
 - This path runs fully in Node/TypeScript (no Python/venv dependency).
 - `--browser-model-strategy` only affects ChatGPT automation; Gemini web always uses the explicit Gemini model ID.
 - `gemini-3-deep-think` is browser-only for now. `--engine api` rejects it instead of silently falling back to regular Gemini Pro.
+- Oracle intentionally does not expose generic `low` / `medium` / `high` Gemini aliases. Explicit IDs keep model choice, billing, and thinking-effort configuration distinct.
 - If Chrome cookie extraction fails, the missing-cookie error now includes any cookie-reader warnings plus `--browser-manual-login` / `--browser-inline-cookies-file` guidance.
 
 ## Implementation details
@@ -69,7 +76,7 @@ Notes:
 ### Gemini API adapter
 
 - `src/oracle/gemini.ts` — adapter using `@google/genai` that returns a `ClientLike`.
-  - Model IDs: `gemini-3-pro` maps to `gemini-3-pro-preview`; `gemini-3.1-pro` maps to `gemini-3.1-pro-preview`.
+  - Model IDs: `gemini-3.1-flash-lite` and `gemini-3.5-flash` use their stable API IDs; `gemini-3.1-pro` maps to `gemini-3.1-pro-preview`; legacy `gemini-3-pro` maps to `gemini-3-pro-preview`.
   - Request mapping: `OracleRequestBody` → Gemini request; `web_search_preview` maps to Gemini search tooling.
   - Response mapping: Gemini responses → `OracleResponse`.
   - Streaming: wraps Gemini’s async iterator as `ResponseStreamLike`.
@@ -78,6 +85,7 @@ Notes:
 
 ### Gemini web client (cookie-based)
 
+- `src/gemini-web/models.ts` — centralizes current private web model headers, legacy aliases, and fallback selection.
 - `src/gemini-web/client.ts` — talks to `gemini.google.com` and downloads generated images via authenticated `gg-dl` redirects.
 - `src/gemini-web/executor.ts` — browser-engine executor for Gemini (loads Chrome cookies and runs the web client).
 

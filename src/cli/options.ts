@@ -1,9 +1,11 @@
 import { InvalidArgumentError, type Command } from "commander";
-import { parseDuration } from "../browserMode.js";
+import { parseDuration } from "../duration.js";
 import path from "node:path";
 import fg from "fast-glob";
 import type { ModelName, PreviewMode } from "../oracle.js";
-import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, MODEL_CONFIGS } from "../oracle.js";
+import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, MODEL_CONFIGS } from "../oracle/config.js";
+import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
+import type { ThinkingTimeLevel } from "../oracle/types.js";
 
 export function collectPaths(
   value: string | string[] | undefined,
@@ -156,6 +158,16 @@ export function parseSearchOption(value: string): boolean {
   throw new InvalidArgumentError('Search mode must be "on" or "off".');
 }
 
+export function parseThinkingTimeOption(value: string): ThinkingTimeLevel {
+  const normalized = normalizeThinkingTimeLevel(value);
+  if (normalized) {
+    return normalized;
+  }
+  throw new InvalidArgumentError(
+    'Thinking time must be one of "light", "standard", "extended", "heavy", or a ChatGPT UI alias like "instant", "medium", "high", or "extra-high".',
+  );
+}
+
 export function normalizeModelOption(value: string | undefined): string {
   return (value ?? "").trim();
 }
@@ -169,11 +181,19 @@ export function parseTimeoutOption(value: string | undefined): number | "auto" |
   if (value == null) return undefined;
   const normalized = value.trim().toLowerCase();
   if (normalized === "auto") return "auto";
-  const parsed = Number.parseFloat(normalized);
-  if (Number.isNaN(parsed) || parsed <= 0) {
-    throw new InvalidArgumentError('Timeout must be a positive number of seconds or "auto".');
+  if (/^[0-9]+(?:\.[0-9]+)?$/.test(normalized)) {
+    const parsed = Number.parseFloat(normalized);
+    if (parsed > 0) {
+      return parsed;
+    }
   }
-  return parsed;
+  const parsedMs = parseDuration(normalized, Number.NaN);
+  if (!Number.isFinite(parsedMs) || parsedMs <= 0) {
+    throw new InvalidArgumentError(
+      'Timeout must be a positive number of seconds, a duration like "10m", or "auto".',
+    );
+  }
+  return parsedMs / 1000;
 }
 
 export function parseDurationOption(value: string | undefined, label: string): number | undefined {
@@ -201,11 +221,27 @@ function isGeminiDeepThinkAlias(normalized: string): boolean {
 }
 
 export function resolveApiModel(modelValue: string): ModelName {
-  const normalized = normalizeModelOption(modelValue).toLowerCase();
-  if (normalized in MODEL_CONFIGS) {
+  const raw = normalizeModelOption(modelValue);
+  const normalized = raw.toLowerCase();
+  if (normalized in MODEL_CONFIGS && !(normalized === "gpt-5.6" && raw !== normalized)) {
     return normalized as ModelName;
   }
   if (normalized.includes("/")) {
+    return normalized as ModelName;
+  }
+  const gpt56Label = parseBrowserGpt56Label(normalized);
+  if (gpt56Label) {
+    if (!gpt56Label.variant || gpt56Label.variant === "sol") {
+      return "gpt-5.6-sol";
+    }
+    if (gpt56Label.variant === "sol pro") {
+      return DEFAULT_API_MODEL;
+    }
+    if (gpt56Label.variant === "pro") {
+      throw new InvalidArgumentError(
+        "GPT-5.6 Pro is an API reasoning mode, not a model slug. Use --model gpt-5.6-sol --reasoning-mode pro.",
+      );
+    }
     return normalized as ModelName;
   }
   if (normalized.includes("grok")) {
@@ -216,15 +252,6 @@ export function resolveApiModel(modelValue: string): ModelName {
   }
   if (normalized.includes("claude") && normalized.includes("opus")) {
     return "claude-4.1-opus";
-  }
-  if (
-    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
-    normalized.includes("pro")
-  ) {
-    return "gpt-5.6-sol-pro";
-  }
-  if (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) {
-    return "gpt-5.6-sol";
   }
   if (normalized.includes("5.5") && normalized.includes("pro")) {
     return "gpt-5.5-pro";
@@ -270,6 +297,16 @@ export function resolveApiModel(modelValue: string): ModelName {
     );
   }
   if (normalized.includes("gemini")) {
+    if (normalized.includes("3.5") && normalized.includes("flash")) {
+      return "gemini-3.5-flash";
+    }
+    if (
+      (normalized.includes("3.1") || normalized.includes("3_1")) &&
+      normalized.includes("flash") &&
+      normalized.includes("lite")
+    ) {
+      return "gemini-3.1-flash-lite";
+    }
     if (normalized.includes("3.1") || normalized.includes("3_1")) {
       return "gemini-3.1-pro";
     }
@@ -282,8 +319,23 @@ export function resolveApiModel(modelValue: string): ModelName {
   return normalized as ModelName;
 }
 
-export function inferModelFromLabel(modelValue: string): ModelName {
+function parseBrowserGpt56Label(modelValue: string): { variant: string } | null {
   const normalized = normalizeModelOption(modelValue).toLowerCase();
+  if (!normalized || normalized.includes("/")) return null;
+  const match = normalized.match(/^(?:(?:chatgpt|gpt)[\s._-]*)?5[._-]6(?:[\s._-]+(.+))?$/);
+  if (!match) return null;
+  return {
+    variant: (match[1] ?? "").replace(/[^a-z0-9]+/g, " ").trim(),
+  };
+}
+
+export function isGpt56BrowserLabel(modelValue: string): boolean {
+  return parseBrowserGpt56Label(modelValue) !== null;
+}
+
+export function inferModelFromLabel(modelValue: string): ModelName {
+  const raw = normalizeModelOption(modelValue);
+  const normalized = raw.toLowerCase();
   if (!normalized) {
     return DEFAULT_BROWSER_MODEL;
   }
@@ -309,6 +361,16 @@ export function inferModelFromLabel(modelValue: string): ModelName {
     return "gemini-3-pro-deep-think" as ModelName;
   }
   if (normalized.includes("gemini")) {
+    if (normalized.includes("3.5") && normalized.includes("flash")) {
+      return "gemini-3.5-flash";
+    }
+    if (
+      (normalized.includes("3.1") || normalized.includes("3_1")) &&
+      normalized.includes("flash") &&
+      normalized.includes("lite")
+    ) {
+      return "gemini-3.1-flash-lite";
+    }
     if (normalized.includes("3.1") || normalized.includes("3_1")) {
       return "gemini-3.1-pro";
     }
@@ -317,20 +379,32 @@ export function inferModelFromLabel(modelValue: string): ModelName {
   if (normalized.includes("classic")) {
     return "gpt-5-pro";
   }
+  // Browser labels without an explicit variant target the fork's current Pro alias.
+  const gpt56Label = parseBrowserGpt56Label(normalized);
+  if (gpt56Label) {
+    const { variant } = gpt56Label;
+    if (!variant) {
+      return normalized.includes("5_6") ? ("gpt-5.6" as ModelName) : DEFAULT_BROWSER_MODEL;
+    }
+    if (variant === "sol") return "gpt-5.6-sol" as ModelName;
+    if (variant === "sol pro" || (variant === "pro" && !normalized.startsWith("gpt-5.6-"))) {
+      return DEFAULT_BROWSER_MODEL;
+    }
+    throw new InvalidArgumentError(
+      `Unknown GPT-5.6 browser variant "${variant}". Use gpt-5.6, gpt-5.6-sol, or gpt-5.6-sol-pro.`,
+    );
+  }
   if (normalized.includes("thinking") && normalized.includes("heavy")) {
     return "gpt-5.5";
   }
-  if (
-    (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) &&
-    normalized.includes("pro")
-  ) {
-    return DEFAULT_BROWSER_MODEL;
-  }
-  if (normalized.includes("5.6") || normalized.includes("5_6") || normalized.includes("5-6")) {
-    return DEFAULT_BROWSER_MODEL;
-  }
   if ((normalized.includes("5.5") || normalized.includes("5_5")) && normalized.includes("pro")) {
     return "gpt-5.5-pro";
+  }
+  if (
+    (normalized.includes("5.5") || normalized.includes("5_5")) &&
+    (normalized.includes("instant") || normalized.includes("fast"))
+  ) {
+    return "gpt-5.5-instant";
   }
   if (normalized.includes("5.5") || normalized.includes("5_5")) {
     return "gpt-5.5";

@@ -38,6 +38,7 @@ export const CONVERSATION_TURN_SELECTOR =
   'article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], section[data-testid^="conversation-turn"], ' +
   "article[data-message-author-role], div[data-message-author-role], section[data-message-author-role], " +
   "article[data-turn], div[data-turn], section[data-turn]";
+export const CONVERSATION_TURN_CONTAINER_SELECTOR = '[data-testid^="conversation-turn"]';
 export const ASSISTANT_ROLE_SELECTOR =
   '[data-message-author-role="assistant"], [data-turn="assistant"]';
 export const CLOUDFLARE_SCRIPT_SELECTOR = 'script[src*="/challenge-platform/"]';
@@ -72,6 +73,15 @@ export const UPLOAD_STATUS_SELECTORS = [
 ];
 
 export const STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
+// The aria-label fallback exists for data-testid drift, but a document-wide match makes ANY
+// visible "stop" control (read-aloud, voice/dictation) read as "still generating", which blocks
+// completion until the response timeout. Scope it to the composer form and exclude the known
+// non-generation stop controls that legitimately live there.
+export const STOP_BUTTON_SELECTORS = [
+  STOP_BUTTON_SELECTOR,
+  '[data-testid="composer-stop-button"]',
+  'form button[aria-label*="stop" i]:not([aria-label*="dictat" i]):not([aria-label*="voice" i]):not([aria-label*="read" i])',
+];
 export const SEND_BUTTON_SELECTORS = [
   'button[data-testid="send-button"]',
   'button[data-testid*="composer-send"]',

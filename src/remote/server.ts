@@ -1,18 +1,27 @@
 import http from "node:http";
+import { createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
-import type { RemoteRunPayload, RemoteRunEvent } from "./types.js";
+import type {
+  RemoteArtifactCapabilities,
+  RemoteArtifactDescriptor,
+  RemoteRunPayload,
+  RemoteRunEvent,
+} from "./types.js";
+import { MAX_REMOTE_ARTIFACT_BYTES } from "./types.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
+import { getOracleHomeDir } from "../oracleHome.js";
 import {
   cleanupStaleProfileState,
   readDevToolsPort,
@@ -21,6 +30,13 @@ import {
   writeDevToolsActivePort,
 } from "../browser/profileState.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
+import {
+  computeFileSha256,
+  sanitizeArtifactFilename,
+  sanitizeArtifactMimeType,
+  validateArtifactFile,
+} from "../browser/artifacts.js";
+import type { BrowserRunWarning, SessionArtifact } from "../sessionManager.js";
 
 export interface RemoteServerOptions {
   host?: string;
@@ -40,6 +56,21 @@ interface RemoteServerInstance {
   token: string;
   close(): Promise<void>;
 }
+
+interface RegisteredRemoteArtifact {
+  descriptor: RemoteArtifactDescriptor;
+  filePath: string;
+  expiresAt: number;
+}
+
+const ARTIFACT_PROTOCOL_VERSION = 1;
+const REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
+
+const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
+  artifactTransfer: true,
+  artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
+  maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
+};
 
 async function findAvailablePort(): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
@@ -72,6 +103,7 @@ export async function createRemoteServer(
     : (_formatter: (msg: string) => string, msg: string) => msg;
   // Single-flight guard: remote Chrome can only host one run at a time, so we serialize requests.
   let busy = false;
+  const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -106,10 +138,26 @@ export async function createRemoteServer(
           ok: true,
           version: getCliVersion(),
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+          capabilities: ARTIFACT_CAPABILITIES,
         }),
       );
       return;
     }
+    const artifactMatch = matchArtifactRequest(req);
+    if (artifactMatch) {
+      await serveRemoteArtifact({
+        req,
+        res,
+        authToken,
+        artifactRegistry,
+        logger,
+        verbose,
+        runId: artifactMatch.runId,
+        artifactId: artifactMatch.artifactId,
+      });
+      return;
+    }
+
     if (req.method !== "POST" || req.url !== "/runs") {
       res.statusCode = 404;
       res.end();
@@ -220,6 +268,10 @@ export async function createRemoteServer(
       }) as BrowserLogger;
       automationLogger.verbose = Boolean(payload.options.verbose);
 
+      // Preserve an explicit request to leave the completed conversation tab
+      // open before the service forces `keepBrowser` for process lifetime.
+      const clientRequestedKeepBrowser = payload.browserConfig?.keepBrowser === true;
+
       // Remote runs always rely on the host's own Chrome profile; ignore any inline cookie transfer.
       if (payload.browserConfig) {
         payload.browserConfig.inlineCookies = null;
@@ -246,6 +298,11 @@ export async function createRemoteServer(
         attachments,
         fallbackSubmission,
         config: payload.browserConfig,
+        // `keepBrowser` above preserves the authenticated shared Chrome
+        // process. This separate service policy closes only a successfully
+        // captured tab owned by this run, preventing one renderer leak per
+        // request while incomplete/reattachable tabs remain untouched.
+        closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser),
         log: automationLogger,
         heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
         verbose: payload.options.verbose,
@@ -253,8 +310,35 @@ export async function createRemoteServer(
         followUpPrompts: payload.options.followUpPrompts,
       });
 
-      sendEvent({ type: "result", result: sanitizeResult(result) });
-      logger(`[serve] Run ${runId} completed in ${Date.now() - runStartedAt}ms`);
+      const artifactRegistration = await registerRemoteArtifacts({
+        runId,
+        result,
+        artifactRegistry,
+        logger,
+      });
+      const artifactDescriptors = artifactRegistration.descriptors;
+      if (artifactDescriptors.length > 0) {
+        sendEvent({
+          type: "log",
+          message:
+            `[browser] ${artifactDescriptors.length} artifact(s) ready for bridge transfer. ` +
+            "If no cloud-local artifact path appears, upgrade both Oracle bridge endpoints or copy the file manually from the Windows browser host.",
+        });
+      }
+      for (const artifact of artifactDescriptors) {
+        sendEvent({ type: "artifact-ready", runId, artifact });
+      }
+      sendEvent({
+        type: "result",
+        result: sanitizeResult(result, artifactRegistration.warnings),
+      });
+      logger(
+        `[serve] Run ${runId} completed in ${Date.now() - runStartedAt}ms${
+          artifactDescriptors.length > 0
+            ? `; ${artifactDescriptors.length} artifact(s) ready for bridge transfer`
+            : ""
+        }`,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendEvent({ type: "error", message });
@@ -388,6 +472,236 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
   });
 }
 
+function matchArtifactRequest(
+  req: http.IncomingMessage,
+): { runId: string; artifactId: string } | null {
+  if (req.method !== "GET" || !req.url) {
+    return null;
+  }
+  let url: URL;
+  try {
+    url = new URL(req.url, "http://oracle.local");
+  } catch {
+    return null;
+  }
+  const match = /^\/runs\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
+  if (!match) {
+    return null;
+  }
+  try {
+    return {
+      runId: decodeURIComponent(match[1] ?? ""),
+      artifactId: decodeURIComponent(match[2] ?? ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function serveRemoteArtifact(params: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  authToken: string;
+  artifactRegistry: Map<string, RegisteredRemoteArtifact>;
+  logger: (message: string) => void;
+  verbose: boolean;
+  runId: string;
+  artifactId: string;
+}): Promise<void> {
+  const authHeader = params.req.headers.authorization ?? "";
+  if (authHeader !== `Bearer ${params.authToken}`) {
+    if (params.verbose) {
+      params.logger(
+        `[serve] Unauthorized artifact transfer attempt from ${formatSocket(params.req)} (missing/invalid token)`,
+      );
+    }
+    params.res.writeHead(401, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  pruneExpiredArtifacts(params.artifactRegistry);
+  const key = remoteArtifactKey(params.runId, params.artifactId);
+  const artifact = params.artifactRegistry.get(key);
+  if (!artifact) {
+    params.res.writeHead(404, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify({ error: "artifact_not_found" }));
+    return;
+  }
+  if (Date.now() > artifact.expiresAt) {
+    params.artifactRegistry.delete(key);
+    params.res.writeHead(410, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify({ error: "artifact_expired" }));
+    return;
+  }
+
+  const fileStat = await stat(artifact.filePath).catch(() => null);
+  if (!fileStat?.isFile() || fileStat.size <= 0) {
+    params.res.writeHead(410, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify({ error: "artifact_unavailable" }));
+    return;
+  }
+  if (fileStat.size > MAX_REMOTE_ARTIFACT_BYTES) {
+    params.res.writeHead(413, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify({ error: "artifact_too_large" }));
+    return;
+  }
+
+  const filename = sanitizeArtifactFilename(artifact.descriptor.filename, "artifact.bin");
+  params.res.writeHead(200, {
+    "Content-Type":
+      sanitizeArtifactMimeType(artifact.descriptor.mimeType) ?? "application/octet-stream",
+    "Content-Length": fileStat.size,
+    "Content-Disposition": `attachment; filename="${filename.replace(/"/g, "")}"`,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Oracle-Artifact-Id": artifact.descriptor.artifactId,
+    "X-Oracle-Artifact-Sha256": artifact.descriptor.sha256,
+  });
+
+  await pipeline(createReadStream(artifact.filePath), params.res).catch((error) => {
+    params.logger(
+      `[serve] Artifact transfer failed for ${artifact.descriptor.artifactId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+}
+
+function pruneExpiredArtifacts(artifactRegistry: Map<string, RegisteredRemoteArtifact>): void {
+  const now = Date.now();
+  for (const [key, artifact] of artifactRegistry) {
+    if (artifact.expiresAt <= now) {
+      artifactRegistry.delete(key);
+    }
+  }
+}
+
+function remoteArtifactKey(runId: string, artifactId: string): string {
+  return `${runId}:${artifactId}`;
+}
+
+async function registerRemoteArtifacts(params: {
+  runId: string;
+  result: BrowserRunResult;
+  artifactRegistry: Map<string, RegisteredRemoteArtifact>;
+  logger: (message: string) => void;
+}): Promise<{ descriptors: RemoteArtifactDescriptor[]; warnings: BrowserRunWarning[] }> {
+  pruneExpiredArtifacts(params.artifactRegistry);
+  const seen = new Set<string>();
+  const fileArtifacts: SessionArtifact[] = [
+    ...(params.result.savedFiles ?? []),
+    ...(params.result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+  ];
+  const descriptors: RemoteArtifactDescriptor[] = [];
+  const warnings: BrowserRunWarning[] = [];
+  for (const artifact of fileArtifacts) {
+    if (!artifact?.path || seen.has(artifact.path)) {
+      continue;
+    }
+    seen.add(artifact.path);
+    const registration = await buildRemoteArtifactRegistration(params.runId, artifact).catch(
+      (error) => {
+        const filename = sanitizeArtifactFilename(path.basename(artifact.path), "artifact.bin");
+        params.logger(
+          `[serve] Skipping remote artifact descriptor: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        warnings.push({
+          code: "remote-artifact-registration-failed",
+          severity: "warning",
+          message:
+            `Oracle captured the browser text response, but the bridge host could not prepare ${filename} for transfer. ` +
+            "Open the ChatGPT browser on the bridge host, download the ZIP/file shown in the current response, and copy it to a cloud-readable path.",
+        });
+        return null;
+      },
+    );
+    if (!registration) {
+      continue;
+    }
+    params.artifactRegistry.set(
+      remoteArtifactKey(params.runId, registration.descriptor.artifactId),
+      {
+        descriptor: registration.descriptor,
+        filePath: registration.filePath,
+        expiresAt: Date.now() + REMOTE_ARTIFACT_TTL_MS,
+      },
+    );
+    descriptors.push(registration.descriptor);
+  }
+  return { descriptors, warnings };
+}
+
+async function buildRemoteArtifactRegistration(
+  runId: string,
+  artifact: SessionArtifact,
+): Promise<{ descriptor: RemoteArtifactDescriptor; filePath: string }> {
+  if (artifact.path.endsWith(".crdownload")) {
+    throw new Error("artifact is still a Chrome partial download");
+  }
+  const filePath = await resolveRegisteredArtifactPath(artifact.path);
+  const fileStat = await stat(filePath);
+  if (!fileStat.isFile() || fileStat.size <= 0) {
+    throw new Error("artifact is not a completed non-empty file");
+  }
+  if (fileStat.size > MAX_REMOTE_ARTIFACT_BYTES) {
+    throw new Error("artifact exceeds bridge transfer size limit");
+  }
+  const filename = sanitizeArtifactFilename(path.basename(filePath), "artifact.bin");
+  const mimeType = sanitizeArtifactMimeType(artifact.mimeType);
+  // Recompute security metadata from the exact file registered for transfer.
+  const validation = await validateArtifactFile({
+    path: filePath,
+    filename,
+    mimeType,
+  });
+  const sha256 = await computeFileSha256(filePath);
+  return {
+    filePath,
+    descriptor: {
+      artifactId: randomUUID(),
+      runId,
+      kind: "file",
+      filename,
+      mimeType,
+      byteSize: fileStat.size,
+      sha256,
+      validation,
+      sourceUrlKind: classifySourceUrlKind(artifact.sourceUrl),
+      transferStatus: "ready",
+    },
+  };
+}
+
+async function resolveRegisteredArtifactPath(filePath: string): Promise<string> {
+  const [resolvedFile, sessionsRoot] = await Promise.all([
+    realpath(filePath),
+    realpath(path.join(getOracleHomeDir(), "sessions")),
+  ]);
+  const relative = path.relative(sessionsRoot, resolvedFile);
+  const segments = relative.split(path.sep);
+  if (
+    !relative ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative) ||
+    segments.length < 3 ||
+    segments[1] !== "artifacts"
+  ) {
+    throw new Error("artifact is outside Oracle's session artifact boundary");
+  }
+  return resolvedFile;
+}
+
+function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["sourceUrlKind"] {
+  if (sourceUrl?.startsWith("sandbox:")) {
+    return "sandbox";
+  }
+  if (sourceUrl === "browser-download") {
+    return "browser-download";
+  }
+  return "chatgpt-file-endpoint";
+}
+
 async function readRequestBody(req: http.IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -400,7 +714,10 @@ function sanitizeName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function sanitizeResult(result: BrowserRunResult): BrowserRunResult {
+function sanitizeResult(
+  result: BrowserRunResult,
+  warnings: BrowserRunWarning[] = [],
+): BrowserRunResult {
   return {
     answerText: result.answerText,
     answerMarkdown: result.answerMarkdown,
@@ -408,6 +725,7 @@ function sanitizeResult(result: BrowserRunResult): BrowserRunResult {
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
+    warnings: warnings.length > 0 ? warnings : undefined,
     chromePid: undefined,
     chromePort: undefined,
     userDataDir: undefined,

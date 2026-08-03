@@ -29,6 +29,7 @@ describe("gemini-web uploads", () => {
 
     const uploadBodies: Array<{ name: string; type: string }> = [];
     let requestPayload: unknown[] | null = null;
+    let modelHeader: string | null = null;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "https://gemini.google.com/app") {
@@ -45,6 +46,7 @@ describe("gemini-web uploads", () => {
         return new Response(`upload-${uploadBodies.length}`, { status: 200 });
       }
       if (url.includes("/StreamGenerate")) {
+        modelHeader = new Headers(init?.headers).get("x-goog-ext-525001261-jspb");
         const params = new URLSearchParams(String(init?.body ?? ""));
         const fReq = params.get("f.req");
         expect(fReq).toBeTruthy();
@@ -65,7 +67,7 @@ describe("gemini-web uploads", () => {
       const result = await runGeminiWebOnce({
         prompt: "Describe the attachments.",
         files: [imagePath, textPath],
-        model: "gemini-3-pro",
+        model: "gemini-3.5-flash",
         cookieMap: { sid: "cookie" },
       });
 
@@ -86,6 +88,25 @@ describe("gemini-web uploads", () => {
         ],
         null,
         null,
+      ]);
+      expect(JSON.parse(modelHeader ?? "null")).toEqual([
+        1,
+        null,
+        null,
+        null,
+        "56fdd199312815e2",
+        null,
+        null,
+        1,
+        [4, 5, 6, 8],
+        null,
+        null,
+        3,
+        null,
+        null,
+        1,
+        1,
+        expect.stringMatching(/^[0-9A-F-]{36}$/),
       ]);
       expect(fetchMock).toHaveBeenCalledTimes(4);
     } finally {

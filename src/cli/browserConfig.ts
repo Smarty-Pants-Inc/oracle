@@ -1,14 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import chalk from "chalk";
 import type { BrowserSessionConfig } from "../sessionStore.js";
-import type { ModelName, ThinkingTimeLevel } from "../oracle.js";
-import {
-  CHATGPT_URL,
-  DEFAULT_MODEL_STRATEGY,
-  DEFAULT_MODEL_TARGET,
-  normalizeChatgptUrl,
-  parseDuration,
-} from "../browserMode.js";
+import type { ModelName, ThinkingTimeLevel } from "../oracle/types.js";
+import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
+import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "../browser/constants.js";
+import { normalizeChatgptUrl } from "../browser/utils.js";
+import { parseDuration } from "../duration.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type {
   BrowserArchiveMode,
@@ -20,6 +18,7 @@ import { getOracleHomeDir } from "../oracleHome.js";
 
 const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
 const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
+const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
 const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
 const DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS = 120_000;
 const DEFAULT_CHROME_PROFILE = "Default";
@@ -28,8 +27,10 @@ const DEFAULT_CHROME_PROFILE = "Default";
 // The browser label is passed to the model picker which fuzzy-matches against ChatGPT's UI.
 const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   // Most specific first (e.g., "gpt-5.2-thinking" before "gpt-5.2")
-  ["gpt-5.6-sol-pro", "Pro"],
+  ["gpt-5.6-sol", "GPT-5.6 Sol"],
+  ["gpt-5.6", "GPT-5.6 Sol"],
   ["gpt-5.5-pro", "Pro"],
+  ["gpt-5.5-instant", "GPT-5.5 Instant"],
   ["gpt-5.5", "Thinking 5.5"],
   ["gpt-5.4-pro", "Pro"],
   ["gpt-5.2-thinking", "GPT-5.2 Thinking"],
@@ -41,7 +42,10 @@ const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   ["gpt-5.4", "Thinking 5.4"],
   ["gpt-5.2", "GPT-5.2"], // Selects "Auto" in ChatGPT UI
   ["gpt-5.1", "GPT-5.2"], // Legacy alias → Auto
-  ["gemini-3-pro", "Gemini 3 Pro"],
+  ["gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite"],
+  ["gemini-3.5-flash", "Gemini 3.5 Flash"],
+  ["gemini-3.1-pro", "Gemini 3.1 Pro"],
+  ["gemini-3-pro", "Gemini 3.1 Pro"],
   ["gemini-3-pro-deep-think", "gemini-3-deep-think"],
 ];
 
@@ -55,6 +59,7 @@ export interface BrowserFlagOptions {
   browserUrl?: string;
   browserTimeout?: string;
   browserInputTimeout?: string;
+  browserAttachmentTimeout?: string;
   browserRecheckDelay?: string;
   browserRecheckTimeout?: string;
   browserReuseWait?: string;
@@ -73,6 +78,8 @@ export interface BrowserFlagOptions {
   browserKeepBrowser?: boolean;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
+  copyProfile?: string;
+  remoteHost?: string;
   /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
@@ -93,14 +100,19 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
     return model;
   }
 
-  if (normalized === "gpt-5.6-sol-pro" || normalized === "gpt-5.5" || normalized === "gpt-5.4") {
-    return normalized;
-  }
-
-  // Pro variants: resolve to the latest Pro model in ChatGPT.
   if (
     normalized === "gpt-5.6-sol" ||
     normalized === "gpt-5.6" ||
+    normalized === "gpt-5.5-instant" ||
+    normalized === "gpt-5.5" ||
+    normalized === "gpt-5.4"
+  ) {
+    return normalized;
+  }
+
+  // Pro variants resolve to the fork's current logical Pro target.
+  if (
+    normalized === "gpt-5.6-sol-pro" ||
     normalized === "gpt-5.5-pro" ||
     normalized === "gpt-5-pro" ||
     normalized === "gpt-5.1-pro" ||
@@ -126,6 +138,26 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
 export async function buildBrowserConfig(
   options: BrowserFlagOptions,
 ): Promise<BrowserSessionConfig> {
+  if (options.copyProfile && options.browserKeepBrowser) {
+    throw new Error(
+      "--copy-profile cannot be combined with --browser-keep-browser: the copied profile is a throwaway that is deleted after the run, so it must not be retained.",
+    );
+  }
+  if (options.copyProfile && options.browserManualLogin) {
+    throw new Error(
+      "--copy-profile cannot be combined with --browser-manual-login: choose either a throwaway copied profile or the persistent manual-login profile.",
+    );
+  }
+  if (options.copyProfile && options.remoteChrome) {
+    throw new Error(
+      "--copy-profile cannot be combined with --remote-chrome: copied profiles require a locally launched Chrome instance.",
+    );
+  }
+  if (options.copyProfile && options.remoteHost) {
+    throw new Error(
+      "--copy-profile cannot be combined with --remote-host: the local profile source is not available to the remote browser service.",
+    );
+  }
   const desiredModelOverride = options.browserModelLabel?.trim();
   const normalizedOverride = desiredModelOverride?.toLowerCase() ?? "";
   const baseModel = options.model.toLowerCase();
@@ -134,6 +166,7 @@ export async function buildBrowserConfig(
     !isChatGptModel && normalizedOverride.length > 0 && normalizedOverride !== baseModel;
   const modelStrategy =
     normalizeBrowserModelStrategy(options.browserModelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  assertBrowserModelAvailable(options.model, modelStrategy);
   const cookieNames = parseCookieNames(
     options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES,
   );
@@ -157,6 +190,11 @@ export async function buildBrowserConfig(
     attachRunning,
     hasInlineCookies: Boolean(inline?.cookies),
   });
+  if (attachRunning) {
+    throw new Error(
+      "--browser-attach-running is disabled by Oracle's background-only policy; use --remote-chrome with a dedicated background browser instead.",
+    );
+  }
   const rawUrl = options.chatgptUrl ?? options.browserUrl;
   const url = rawUrl ? normalizeChatgptUrl(rawUrl, CHATGPT_URL) : undefined;
 
@@ -167,42 +205,71 @@ export async function buildBrowserConfig(
       : mapModelToBrowserLabel(options.model);
 
   return {
-    chromeProfile: options.browserChromeProfile ?? DEFAULT_CHROME_PROFILE,
+    chromeProfile: options.copyProfile
+      ? (options.browserChromeProfile ?? null)
+      : (options.browserChromeProfile ?? DEFAULT_CHROME_PROFILE),
     chromePath: options.browserChromePath ?? null,
     chromeCookiePath: options.browserCookiePath ?? null,
     attachRunning,
     url,
     debugPort: selectBrowserPort(options),
     timeoutMs: options.browserTimeout
-      ? parseDuration(options.browserTimeout, DEFAULT_BROWSER_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserTimeout,
+          "--browser-timeout",
+          DEFAULT_BROWSER_TIMEOUT_MS,
+        )
       : undefined,
     inputTimeoutMs: options.browserInputTimeout
-      ? parseDuration(options.browserInputTimeout, DEFAULT_BROWSER_INPUT_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserInputTimeout,
+          "--browser-input-timeout",
+          DEFAULT_BROWSER_INPUT_TIMEOUT_MS,
+        )
+      : undefined,
+    attachmentTimeoutMs: options.browserAttachmentTimeout
+      ? parseBrowserDuration(
+          options.browserAttachmentTimeout,
+          "--browser-attachment-timeout",
+          DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS,
+        )
       : undefined,
     assistantRecheckDelayMs: options.browserRecheckDelay
-      ? parseDuration(options.browserRecheckDelay, 0)
+      ? parseBrowserDuration(options.browserRecheckDelay, "--browser-recheck-delay", 0)
       : undefined,
     assistantRecheckTimeoutMs: options.browserRecheckTimeout
-      ? parseDuration(options.browserRecheckTimeout, DEFAULT_BROWSER_RECHECK_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserRecheckTimeout,
+          "--browser-recheck-timeout",
+          DEFAULT_BROWSER_RECHECK_TIMEOUT_MS,
+        )
       : undefined,
     reuseChromeWaitMs: options.browserReuseWait
-      ? parseDuration(options.browserReuseWait, 0)
+      ? parseBrowserDuration(options.browserReuseWait, "--browser-reuse-wait", 0)
       : undefined,
     profileLockTimeoutMs: options.browserProfileLockTimeout
-      ? parseDuration(options.browserProfileLockTimeout, 0)
+      ? parseBrowserDuration(options.browserProfileLockTimeout, "--browser-profile-lock-timeout", 0)
       : undefined,
     maxConcurrentTabs: parseMaxConcurrentTabs(options.browserMaxConcurrentTabs),
     autoReattachDelayMs: options.browserAutoReattachDelay
-      ? parseDuration(options.browserAutoReattachDelay, 0)
+      ? parseBrowserDuration(options.browserAutoReattachDelay, "--browser-auto-reattach-delay", 0)
       : undefined,
     autoReattachIntervalMs: options.browserAutoReattachInterval
-      ? parseDuration(options.browserAutoReattachInterval, 0)
+      ? parseBrowserDuration(
+          options.browserAutoReattachInterval,
+          "--browser-auto-reattach-interval",
+          0,
+        )
       : undefined,
     autoReattachTimeoutMs: options.browserAutoReattachTimeout
-      ? parseDuration(options.browserAutoReattachTimeout, DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserAutoReattachTimeout,
+          "--browser-auto-reattach-timeout",
+          DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS,
+        )
       : undefined,
     cookieSyncWaitMs: options.browserCookieWait
-      ? parseDuration(options.browserCookieWait, 0)
+      ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
       : undefined,
     cookieSync: options.browserNoCookieSync ? false : undefined,
     cookieNames,
@@ -212,7 +279,8 @@ export async function buildBrowserConfig(
     keepBrowser: options.browserKeepBrowser ? true : undefined,
     manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
     manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
-    hideWindow: true,
+    copyProfileSource: options.copyProfile ?? undefined,
+    hideWindow: remoteChrome ? undefined : true,
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,
@@ -220,10 +288,25 @@ export async function buildBrowserConfig(
     allowCookieErrors: options.browserAllowCookieErrors ?? true,
     remoteChrome,
     browserTabRef: options.browserTab ?? undefined,
-    thinkingTime: options.browserThinkingTime,
+    thinkingTime: normalizeThinkingTimeLevel(options.browserThinkingTime) ?? undefined,
     researchMode: options.browserResearch === "deep" ? "deep" : "off",
     archiveConversations: options.browserArchive,
   };
+}
+
+function assertBrowserModelAvailable(model: ModelName, modelStrategy: BrowserModelStrategy): void {
+  if (modelStrategy !== "select") return;
+  const normalized = normalizeChatGptModelForBrowser(model);
+  if (
+    normalized !== "gpt-5.2" &&
+    normalized !== "gpt-5.2-instant" &&
+    normalized !== "gpt-5.2-thinking"
+  ) {
+    return;
+  }
+  throw new Error(
+    `Browser model "${model}" is retired because ChatGPT no longer offers GPT-5.2 base, Instant, or Thinking. Choose a current GPT-5.5/GPT-5.6 browser model, use --browser-model-strategy current to keep ChatGPT's active model, or use --engine api to retain the GPT-5.2 API alias.`,
+  );
 }
 
 function validateAttachRunningOptions(
@@ -247,6 +330,7 @@ function validateAttachRunningOptions(
     options.browserKeepBrowser ? "--browser-keep-browser" : null,
     options.browserManualLogin ? "--browser-manual-login" : null,
     options.browserManualLoginProfileDir ? "--browser-manual-login-profile-dir" : null,
+    options.copyProfile ? "--copy-profile" : null,
     hasInlineCookies ? "--browser-inline-cookies/--browser-inline-cookies-file" : null,
     options.browserPort != null || options.browserDebugPort != null
       ? "--browser-port/--browser-debug-port"
@@ -276,6 +360,17 @@ function parseMaxConcurrentTabs(raw?: string): number | undefined {
     throw new Error(`Invalid browser max concurrent tabs: ${raw}. Expected a positive integer.`);
   }
   return Math.trunc(value);
+}
+
+function parseBrowserDuration(raw: string, optionName: string, fallbackMs: number): number {
+  const parsed = parseDuration(raw, Number.NaN);
+  if (Number.isFinite(parsed)) return parsed;
+  console.log(
+    chalk.yellow(
+      `Warning: invalid ${optionName} duration "${raw}"; using fallback ${fallbackMs}ms.`,
+    ),
+  );
+  return fallbackMs;
 }
 
 export function mapModelToBrowserLabel(model: ModelName): string {

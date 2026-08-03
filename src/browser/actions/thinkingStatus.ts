@@ -1,6 +1,10 @@
 import type { BrowserLogger, ChromeClient } from "../types.js";
 import { formatElapsed } from "../../oracle/format.js";
-import { ASSISTANT_ROLE_SELECTOR, CONVERSATION_TURN_SELECTOR } from "../constants.js";
+import {
+  ASSISTANT_ROLE_SELECTOR,
+  CONVERSATION_TURN_SELECTOR,
+  STOP_BUTTON_SELECTORS,
+} from "../constants.js";
 
 const THINKING_STALE_HINT_MS = 10 * 60_000;
 
@@ -162,6 +166,7 @@ async function readThinkingStatus(
 
 const SAFE_THINKING_STATUS_MESSAGES = new Set([
   "active",
+  "response streaming",
   "thinking sidecar active",
   "thinking sidecar opened",
 ]);
@@ -194,13 +199,16 @@ function buildThinkingStatusExpression(): string {
     '[aria-live="polite"]',
   ];
   const keywords = ["pro thinking", "thinking", "reasoning"];
+  const stopSelector = STOP_BUTTON_SELECTORS.join(", ");
   const selectorLiteral = JSON.stringify(selectors);
   const keywordsLiteral = JSON.stringify(keywords);
+  const stopSelectorLiteral = JSON.stringify(stopSelector);
   return `(async () => {
     const CONVERSATION_SELECTOR = ${conversationLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const selectors = ${selectorLiteral};
     const keywords = ${keywordsLiteral};
+    const stopSelector = ${stopSelectorLiteral};
     const normalize = (value) =>
       String(value || '')
         .normalize('NFD')
@@ -420,10 +428,265 @@ function buildThinkingStatusExpression(): string {
         };
       }
     }
+    // Last-resort liveness fallback: selector drift can hide every thinking
+    // indicator while a response is still generating, and returning null here
+    // reads as "dead" downstream. The stop/interrupt control is a stable,
+    // language-independent signal that generation is active; it lives in the
+    // composer, so isComposerAdjacent must not filter it.
+    const stopVisible = Array.from(document.querySelectorAll(stopSelector)).some((node) =>
+      isVisible(node),
+    );
+    if (stopVisible) {
+      return {
+        message: 'response streaming',
+        source: 'inline',
+      };
+    }
     return null;
   })()`;
+}
+
+// Present-tense/gerund status labels that mean the model is ACTIVELY working. The
+// past-tense "thought for Xs" summary is deliberately excluded: it persists in the DOM
+// on every completed reasoning turn (and on reattach), so treating its mere presence as
+// "still thinking" would veto completion forever and hang the call. Kept in sync with
+// THINKING_STATUS_LABELS in assistantResponse.ts (the connector phases "searching the
+// web"/"reading"/"finalizing answer" are exactly the GPT-5.5 Pro gaps that produce the
+// preamble->answer window this predicate must cover).
+const ACTIVE_THINKING_LABELS = [
+  "thinking",
+  "pro thinking",
+  "thinking longer for a better answer",
+  "reasoning",
+  "finalizing answer",
+  "finalizing",
+  "analyzing",
+  "researching",
+  "working on it",
+  "working",
+  "planning",
+  "searching the web",
+  "searching",
+  "reading",
+];
+
+// buildThinkingActivePredicateJs: a SIDE-EFFECT-FREE injected predicate `${fnName}()` that
+// returns true iff the model is ACTIVELY generating/thinking right now. Unlike
+// buildThinkingStatusExpression it never clicks a disclosure and never keys on the mere
+// PRESENCE of a reasoning container ([data-testid*="reasoning"] persists after completion);
+// it keys only on ACTIVITY signals: a visible stop/interrupt control, a visible animated
+// loading-shimmer skeleton, aria-busy, a visible thinking sidecar panel with live progress,
+// or a visible ACTIVE (present-tense) thinking status label. Used as a completion VETO so a
+// settled preamble is never finalized while the reasoning/tool phase is still running.
+function buildThinkingActivityPredicateJs(fnName: string, detailed: boolean): string {
+  const stopLiteral = JSON.stringify(STOP_BUTTON_SELECTORS.join(", "));
+  const activeLabelsLiteral = JSON.stringify(ACTIVE_THINKING_LABELS);
+  const conversationLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
+  const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
+  const strong = detailed ? "{ active: true, strong: true }" : "true";
+  const weak = detailed ? "{ active: true, strong: false }" : "true";
+  const idle = detailed ? "{ active: false, strong: false }" : "false";
+  return `const ${fnName} = () => {
+    const STOP_SELECTOR = ${stopLiteral};
+    const ACTIVE_LABELS = ${activeLabelsLiteral};
+    const CONVERSATION_SELECTOR = ${conversationLiteral};
+    const ASSISTANT_SELECTOR = ${assistantLiteral};
+    const isVisible = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      if (
+        style.display === 'none' ||
+        style.visibility === 'hidden' ||
+        (style.opacity !== '' && Number(style.opacity) === 0)
+      ) {
+        return false;
+      }
+      return true;
+    };
+    const some = (selector, pred) => {
+      let nodes;
+      try { nodes = document.querySelectorAll(selector); } catch { return false; }
+      return Array.from(nodes).some((node) => pred(node));
+    };
+    // 1) Stop/interrupt control visible -> generation is active (language-independent).
+    if (some(STOP_SELECTOR, isVisible)) return ${strong};
+    // 2-3) Shimmer/aria-busy are checked only inside the current turn or verified thinking
+    // panel below. Page-global busy UI (history/sidebar/upload) is not model activity.
+    const hasBusyIndicator = (scope) => {
+      let nodes;
+      try {
+        nodes = scope.querySelectorAll(
+          'span.loading-shimmer, .loading-shimmer, [class*="loading-shimmer"], [aria-busy="true"]',
+        );
+      } catch { return false; }
+      return Array.from(nodes).some((node) => isVisible(node));
+    };
+    // 4) Active (present-tense) thinking status label near a status/reasoning node.
+    const norm = (value) =>
+      String(value || '')
+        .normalize('NFD')
+        .replace(/[\\u0300-\\u036f]/g, '')
+        .toLowerCase()
+        .replace(/\\s+/g, ' ')
+        .trim();
+    // Completed reasoning summary: the whole visible label must be a duration summary. Anchoring
+    // prevents an early live trace such as "Thought for 2s: Searching the web" from being
+    // mistaken for completion before the trace grows beyond an arbitrary length threshold.
+    const isCompletedSummary = (text) =>
+      /^(?:(?:reasoning|pro thinking)\\s*)?thought for (?:\\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)(?:\\s+\\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours))*|(?:a|an) [a-z]+(?: [a-z]+){0,2})(?: edit)?$/.test(text);
+    const isActiveLabel = (raw) => {
+      const text = norm(raw);
+      if (!text || text.length > 60) return false;
+      if (isCompletedSummary(text)) return false;
+      return ACTIVE_LABELS.some((label) => text === label || text.startsWith(label + ' '));
+    };
+    const statusNodes = (() => {
+      try {
+        return Array.from(
+          document.querySelectorAll(
+            '[data-testid*="thinking"], [data-testid*="reasoning"]',
+          ),
+        );
+      } catch {
+        return [];
+      }
+    })();
+    for (const node of statusNodes) {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+      const testId = norm(node.getAttribute('data-testid'));
+      const verifiedThinkingChrome = testId.includes('thinking') || testId.includes('reasoning');
+      const matches =
+        verifiedThinkingChrome &&
+        (isActiveLabel(node.textContent) || isActiveLabel(node.getAttribute('aria-label')));
+      if (matches) return ${strong};
+    }
+    // 5) A live progress bar (determinate or indeterminate) is active generation, even when no
+    //    label or shimmer is present (some connector/tool phases surface only a progress bar).
+    const hasLiveProgress = (scope) => {
+      let nodes;
+      // Only genuine progress indicators — NOT generic [aria-valuenow] range widgets (sliders,
+      // spinbuttons), which are not liveness signals and would falsely veto completion forever.
+      try {
+        nodes = scope.querySelectorAll('progress, [role="progressbar"]');
+      } catch { return false; }
+      return Array.from(nodes).some((n) => {
+        if (!(n instanceof HTMLElement) || !isVisible(n)) return false;
+        if (n instanceof HTMLProgressElement) {
+          // Determinate <progress> is active only while it has not reached its max.
+          if (Number.isFinite(n.value) && Number.isFinite(n.max) && n.max > 0) return n.value < n.max;
+          return true; // indeterminate
+        }
+        const rawNow = n.getAttribute('aria-valuenow');
+        if (rawNow != null) {
+          const now = Number(rawNow);
+          const rawMax = n.getAttribute('aria-valuemax');
+          const max = rawMax != null && Number.isFinite(Number(rawMax)) ? Number(rawMax) : 100;
+          return Number.isFinite(now) ? now < max : true;
+        }
+        return true; // role=progressbar with no value -> indeterminate -> active
+      });
+    };
+    // Scoped to the CURRENT assistant turn, not the whole document: unrelated page UI can keep
+    // a visible progress bar mounted indefinitely (review P1), and a document-wide veto would
+    // then hold thinkingActive true until the watchdog timeout on a completed response. The
+    // sidecar check below covers verified reasoning panels; here only the latest turn counts.
+    const turns = (() => {
+      try { return document.querySelectorAll(CONVERSATION_SELECTOR); } catch { return []; }
+    })();
+    const lastTurn = turns.length ? turns[turns.length - 1] : null;
+    if (
+      lastTurn instanceof HTMLElement &&
+      (hasBusyIndicator(lastTurn) || hasLiveProgress(lastTurn))
+    ) return ${strong};
+    // 6) A visible thinking/reasoning sidecar panel (the connector/reasoning phase is often
+    //    exposed ONLY through a right-side panel with no inline label). Match the existing
+    //    thinking-monitor heuristic: a right-side panel that looks like thinking, or any such
+    //    container that carries a live progress bar. Presence alone is NOT enough (a collapsed
+    //    reasoning summary persists post-completion); require the thinking cue or live progress.
+    const looksLikeThinking = (node) => {
+      // Judge completion on the panel's VISIBLE text only: data-testid values like
+      // "reasoning-panel" would otherwise taint the completed-summary check, and a live trace
+      // is judged by its full rendered length, not by fragments of it.
+      const visible = norm(node.textContent) || norm(node.getAttribute?.('aria-label'));
+      if (isCompletedSummary(visible)) return false;
+      if (visible.includes('thought for ')) return true;
+      const label = norm([
+        node.textContent,
+        node.getAttribute?.('aria-label'),
+        node.getAttribute?.('data-testid'),
+      ].filter(Boolean).join(' '));
+      return label.includes('thinking') || label.includes('reasoning') || label.includes('pro thinking');
+    };
+    let panels;
+    try {
+      panels = document.querySelectorAll(
+        'aside, [role="complementary"], [role="dialog"], [data-testid*="thinking"], [data-testid*="reasoning"], [class*="sidecar"], [class*="sidebar"]',
+      );
+    } catch { panels = []; }
+    for (const node of Array.from(panels)) {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+      const rect = node.getBoundingClientRect();
+      const rightSide = rect.left >= window.innerWidth * 0.35 && rect.width >= 180 && rect.height >= 120;
+      const panelLabel = norm([
+        node.getAttribute?.('aria-label'),
+        node.getAttribute?.('data-testid'),
+        node.className,
+      ].filter(Boolean).join(' '));
+      const verifiedThinkingPanel =
+        panelLabel.includes('thinking') ||
+        panelLabel.includes('reasoning') ||
+        panelLabel.includes('sidecar');
+      if ((hasBusyIndicator(node) || hasLiveProgress(node)) && verifiedThinkingPanel) return ${strong};
+      // A text-only sidecar match is intentionally weak: completed turns can retain a mounted
+      // reasoning panel whose shape/text heuristics still look active. The terminal gate may
+      // override only this weak evidence after a stable, debounced finished-action bar.
+      if (rightSide && looksLikeThinking(node)) return ${weak};
+    }
+    return ${idle};
+  };`;
+}
+
+export function buildThinkingActivePredicateJs(fnName: string): string {
+  return buildThinkingActivityPredicateJs(fnName, false);
+}
+
+export interface ThinkingActivity {
+  active: boolean;
+  strong: boolean;
+}
+
+export function buildThinkingActivityDetailsPredicateJs(fnName: string): string {
+  return buildThinkingActivityPredicateJs(fnName, true);
+}
+
+export async function readThinkingActivity(
+  Runtime: ChromeClient["Runtime"],
+): Promise<ThinkingActivity> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `(() => {
+        ${buildThinkingActivityDetailsPredicateJs("readThinkingActivity")}
+        return readThinkingActivity();
+      })()`,
+      returnByValue: true,
+    });
+    const value = result?.value as Partial<ThinkingActivity> | undefined;
+    return { active: Boolean(value?.active), strong: Boolean(value?.strong) };
+  } catch {
+    return { active: false, strong: false };
+  }
+}
+
+export async function isThinkingActive(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
+  return (await readThinkingActivity(Runtime)).active;
 }
 
 export const startThinkingStatusMonitorForTest = startThinkingStatusMonitor;
 export const readThinkingStatusForTest = readThinkingStatus;
 export const buildThinkingStatusExpressionForTest = buildThinkingStatusExpression;
+export const buildThinkingActivePredicateJsForTest = buildThinkingActivePredicateJs;
+export const buildThinkingActivityDetailsPredicateJsForTest =
+  buildThinkingActivityDetailsPredicateJs;
+export { ACTIVE_THINKING_LABELS };

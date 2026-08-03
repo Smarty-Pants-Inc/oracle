@@ -6,6 +6,7 @@ import {
   __test__,
   classifyPreservedBrowserErrorForTest,
   formatBrowserTurnTranscript,
+  isLocalChromeHostForTest,
   maybeArchiveCompletedConversationForTest,
   maybeArchiveInterruptedConversationForTest,
   redactBrowserConfigForDebugLogForTest,
@@ -14,7 +15,6 @@ import {
   runSubmissionWithRecoveryForTest,
   shouldPreferSystemTmpDirForTest,
   shouldPreserveBrowserOnErrorForTest,
-  waitForConversationUrl,
 } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
@@ -82,7 +82,42 @@ describe("shouldPreserveBrowserOnErrorForTest", () => {
   });
 });
 
+describe("authenticated model-selection errors", () => {
+  test("preserves picker diagnostics without adding cookie guidance", () => {
+    const error = new BrowserAutomationError(
+      'Unable to find model option matching "GPT-5.2 Instant". Available: GPT-5.6 Sol.',
+      { stage: "model-selection" },
+    );
+
+    const normalized = __test__.normalizeAuthenticatedModelSelectionError(error);
+
+    expect(normalized).toBe(error);
+    expect(normalized.message).toContain("Available: GPT-5.6 Sol");
+    expect(normalized.message).not.toMatch(/cookies|log in/i);
+  });
+});
+
 describe("browser run target cleanup", () => {
+  test("never retains a copied profile after a preserved browser error", () => {
+    expect(
+      __test__.shouldKeepLocalBrowserOpen({
+        effectiveKeepBrowser: false,
+        preserveBrowserOnError: true,
+        usingCopiedProfile: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("keeps existing retention semantics for ordinary profiles", () => {
+    expect(
+      __test__.shouldKeepLocalBrowserOpen({
+        effectiveKeepBrowser: false,
+        preserveBrowserOnError: true,
+        usingCopiedProfile: false,
+      }),
+    ).toBe(true);
+  });
+
   test("keeps the completed conversation tab when keepBrowser is enabled", () => {
     expect(
       __test__.shouldCloseOwnedRunTargetAfterRun({
@@ -103,12 +138,24 @@ describe("browser run target cleanup", () => {
     ).toBe(true);
   });
 
+  test("closes a completed service-owned tab while keeping shared Chrome alive", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "complete",
+        ownsTarget: true,
+        keepBrowser: true,
+        closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(true);
+  });
+
   test("does not close attached or incomplete targets", () => {
     expect(
       __test__.shouldCloseOwnedRunTargetAfterRun({
         runStatus: "complete",
         ownsTarget: false,
         keepBrowser: false,
+        closeOwnedTabOnComplete: true,
       }),
     ).toBe(false);
     expect(
@@ -116,6 +163,60 @@ describe("browser run target cleanup", () => {
         runStatus: "attempted",
         ownsTarget: true,
         keepBrowser: false,
+        closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("schedules final blank cleanup for retained manual-login Chrome", () => {
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(true);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: false,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "attempted",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: false,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: true,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
       }),
     ).toBe(false);
   });
@@ -253,7 +354,270 @@ describe("formatBrowserTurnTranscript", () => {
   });
 });
 
+describe("ChatGPT UI warning detection", () => {
+  test("classifies request-speed warnings as rate limits", () => {
+    expect(
+      __test__.classifyChatGptUiWarningText(
+        "You are sending too many requests too quickly. Please try again later.",
+      ),
+    ).toBe("rate_limit");
+  });
+
+  test("classifies visually mangled request-speed modal text as rate limits", () => {
+    expect(
+      __test__.classifyChatGptUiWarningText(
+        "Too many reque t. You’re making reque t too quickly. We’ve temporarily limited access to your conversations. Please wait a few minutes before trying again.",
+      ),
+    ).toBe("rate_limit");
+  });
+
+  test("classifies bare retry-later warnings as temporary unavailability", () => {
+    expect(__test__.classifyChatGptUiWarningText("Try again later.")).toBe("temporary_unavailable");
+  });
+
+  test("collects visible warning candidates from the browser DOM", async () => {
+    const Runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: [
+            {
+              text: "You are sending too many requests too quickly. Please try again later.",
+              source: "selector",
+              role: "alert",
+              ariaLive: "assertive",
+              selector: '[role="alert"]',
+            },
+            {
+              text: "ordinary page text",
+              source: "visible-warning-text",
+            },
+          ],
+        },
+      }),
+    };
+
+    await expect(__test__.collectChatGptUiWarnings(Runtime as never)).resolves.toEqual([
+      {
+        type: "rate_limit",
+        message: "You are sending too many requests too quickly. Please try again later.",
+        source: "selector",
+        role: "alert",
+        ariaLive: "assertive",
+        selector: '[role="alert"]',
+      },
+    ]);
+    const expression = Runtime.evaluate.mock.calls[0]?.[0]?.expression;
+    expect(expression).not.toContain("createTreeWalker");
+    expect(expression).not.toContain('[class*="error" i]');
+    expect(expression).not.toContain('[class*="warning" i]');
+    expect(expression).toContain("current = current.parentElement");
+    expect(expression).toContain("Number.parseFloat(currentStyle.opacity || '1') === 0");
+  });
+
+  test("redacts account and token-like values from warning details", async () => {
+    const Runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: [
+            {
+              text: "Sign in as private@example.test with session_token=secret-session-value",
+              source: "selector",
+              role: "dialog",
+              selector: '[role="dialog"]',
+            },
+          ],
+        },
+      }),
+    };
+
+    const warnings = await __test__.collectChatGptUiWarnings(Runtime as never);
+    expect(warnings).toEqual([
+      {
+        type: "auth_or_challenge",
+        message: "Sign in as [redacted-email] with session_token=[redacted]",
+        source: "selector",
+        role: "dialog",
+        ariaLive: null,
+        selector: '[role="dialog"]',
+      },
+    ]);
+    expect(JSON.stringify(warnings)).not.toContain("private@example.test");
+    expect(JSON.stringify(warnings)).not.toContain("secret-session-value");
+  });
+
+  test("builds a structured timeout error when ChatGPT shows a blocking warning", async () => {
+    const Runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: [
+            {
+              text: "You are sending too many requests too quickly. Please try again later.",
+              source: "selector",
+              role: "alert",
+              ariaLive: "assertive",
+              selector: '[role="alert"]',
+            },
+          ],
+        },
+      }),
+    };
+    const logger = vi.fn<(message: string) => void>();
+
+    const error = await __test__.createAssistantTimeoutError({
+      Runtime: Runtime as never,
+      logger: logger as never,
+      runtime: { chromePort: 9222 },
+      diagnostics: { domPath: "/tmp/assistant-timeout.dom.json" },
+      cause: new Error("timeout"),
+    });
+
+    expect(error.message).toContain("rate-limit warning");
+    expect(error.details).toMatchObject({
+      stage: "assistant-timeout",
+      code: "chatgpt-ui-warning",
+      runtime: { chromePort: 9222 },
+      diagnostics: { domPath: "/tmp/assistant-timeout.dom.json" },
+      uiWarning: {
+        type: "rate_limit",
+        message: "You are sending too many requests too quickly. Please try again later.",
+      },
+    });
+    expect(logger).toHaveBeenCalledWith(
+      "[browser] ChatGPT UI warning detected (rate_limit): You are sending too many requests too quickly. Please try again later.",
+    );
+  });
+
+  test("keeps the generic timeout error when no blocking warning is visible", async () => {
+    const Runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: [] } }),
+    };
+
+    const error = await __test__.createAssistantTimeoutError({
+      Runtime: Runtime as never,
+      logger: vi.fn() as never,
+      runtime: { chromePort: 9222 },
+      cause: new Error("timeout"),
+    });
+
+    expect(error.message).toBe(
+      "Assistant response timed out before completion; reattach later to capture the answer.",
+    );
+    expect(error.details).toMatchObject({
+      stage: "assistant-timeout",
+      runtime: { chromePort: 9222 },
+    });
+    expect(error.details).not.toHaveProperty("uiWarning");
+  });
+
+  test("routes plain response observer timeouts through assistant timeout handling", () => {
+    expect(__test__.isAssistantResponseTimeoutError(new Error("Response timeout"))).toBe(true);
+    expect(__test__.isAssistantResponseTimeoutError(new Error("Navigation timeout"))).toBe(false);
+  });
+
+  test("waits for prior turns to hydrate before retrying capture after a stall reload", async () => {
+    vi.useFakeTimers();
+    try {
+      let reloaded = false;
+      let hydrated = false;
+      const responseProbeHydrationStates: boolean[] = [];
+      const partial = { text: "Synthetic preamble.", messageId: "mid", turnId: "tid" };
+      const complete = {
+        text: "Synthetic complete answer after safe reload.",
+        messageId: "mid",
+        turnId: "tid",
+      };
+      const Runtime = {
+        evaluate: vi.fn(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          const expression = String(params.expression ?? "");
+          if (expression === "location.href") {
+            return { result: { value: "https://chatgpt.com/c/synthetic-recovery" } };
+          }
+          if (expression.startsWith("document.querySelectorAll(")) {
+            return { result: { value: hydrated ? 2 : 0 } };
+          }
+          if (expression.includes("const selectors =")) {
+            return { result: { value: true } };
+          }
+          if (params.awaitPromise) {
+            responseProbeHydrationStates.push(hydrated);
+            if (!reloaded) {
+              return new Promise(() => undefined);
+            }
+            return { result: { type: "object", value: complete } };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: reloaded ? complete : partial } };
+          }
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: reloaded } };
+          }
+          return { result: { value: false } };
+        }),
+        terminateExecution: vi.fn().mockResolvedValue(undefined),
+      };
+      const Page = {
+        navigate: vi.fn(async () => {
+          reloaded = true;
+          setTimeout(() => {
+            hydrated = true;
+          }, 250);
+          return {};
+        }),
+      };
+
+      const promise = __test__.waitForAssistantResponseWithReload(
+        Runtime as never,
+        Page as never,
+        3_000,
+        vi.fn() as never,
+        undefined,
+        "synthetic-recovery",
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(promise).resolves.toMatchObject({ text: complete.text });
+      expect(Page.navigate).toHaveBeenCalledOnce();
+      expect(responseProbeHydrationStates).toEqual([false, true]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("browser follow-ups", () => {
+  test("rejects copy-profile with manual-login before launching Chrome", async () => {
+    await expect(
+      runBrowserMode({
+        prompt: "test",
+        config: {
+          manualLogin: true,
+          copyProfileSource: "/tmp/source-profile",
+        },
+      }),
+    ).rejects.toThrow(/cannot be combined.*browser-manual-login/i);
+  });
+
+  test("rejects copy-profile with existing-browser modes before connecting", async () => {
+    await expect(
+      runBrowserMode({
+        prompt: "test",
+        config: {
+          attachRunning: true,
+          copyProfileSource: "/tmp/source-profile",
+        },
+      }),
+    ).rejects.toThrow(/cannot be combined.*remote Chrome/i);
+    await expect(
+      runBrowserMode({
+        prompt: "test",
+        config: {
+          remoteChrome: { host: "127.0.0.1", port: 9222 },
+          copyProfileSource: "/tmp/source-profile",
+        },
+      }),
+    ).rejects.toThrow(/cannot be combined.*remote Chrome/i);
+  });
+
   test("rejects Deep Research follow-ups before launching Chrome", async () => {
     await expect(
       runBrowserMode({
@@ -445,6 +809,9 @@ describe("image-only assistant turn detection", () => {
   test("treats ChatGPT image-only chrome text as non-answer UI", () => {
     expect(__test__.isImageOnlyUiChromeText("Stopped thinking\nEdit")).toBe(true);
     expect(__test__.isImageOnlyUiChromeText("Edit")).toBe(true);
+    expect(__test__.isImageOnlyUiChromeText("Thought for 12s Edit")).toBe(true);
+    expect(__test__.isImageOnlyUiChromeText("Reasoning Thought for 12s Edit")).toBe(true);
+    expect(__test__.isImageOnlyUiChromeText("Pro thinking Thought for 3.5s Edit")).toBe(true);
     expect(__test__.isImageOnlyUiChromeText("PR169_IMAGE_OK")).toBe(false);
   });
 });
@@ -593,20 +960,18 @@ describe("resolveRemoteTabLeaseProfileDirForTest", () => {
   });
 });
 
-describe("waitForConversationUrl", () => {
-  test("waits past the project landing page and returns the exact conversation URL", async () => {
-    const evaluate = vi
-      .fn()
-      .mockResolvedValueOnce({
-        result: { value: "https://chatgpt.com/g/g-p-demo/project" },
-      })
-      .mockResolvedValueOnce({
-        result: { value: "https://chatgpt.com/g/g-p-demo/c/conversation-123" },
-      });
+describe("isLocalChromeHostForTest", () => {
+  test.each(["localhost", "LOCALHOST", "127.0.0.1", "127.12.34.56", "::1", "[::1]"])(
+    "accepts loopback host %s",
+    (host) => {
+      expect(isLocalChromeHostForTest(host)).toBe(true);
+    },
+  );
 
-    await expect(waitForConversationUrl({ evaluate } as never, 100, 1)).resolves.toBe(
-      "https://chatgpt.com/g/g-p-demo/c/conversation-123",
-    );
-    expect(evaluate).toHaveBeenCalledTimes(2);
-  });
+  test.each(["remote-host", "192.168.1.5", "10.0.0.2", "2001:db8::1"])(
+    "rejects remote host %s",
+    (host) => {
+      expect(isLocalChromeHostForTest(host)).toBe(false);
+    },
+  );
 });

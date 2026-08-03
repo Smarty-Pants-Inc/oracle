@@ -1,4 +1,4 @@
-import type { GeminiWebModelId } from "./client.js";
+import type { GeminiWebModelId } from "./models.js";
 
 export type GeminiExecutionMode = "dom" | "http";
 

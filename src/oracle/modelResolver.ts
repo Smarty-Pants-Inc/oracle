@@ -1,12 +1,30 @@
-import type { ModelConfig, ModelName, KnownModelName, TokenizerFn, ProModelName } from "./types.js";
+import { createRequire } from "node:module";
+import type {
+  ModelConfig,
+  ModelName,
+  KnownModelName,
+  TokenizerFn,
+  ProModelName,
+  ModelOverridesConfig,
+  ReasoningEffort,
+} from "./types.js";
 import { MODEL_CONFIGS, PRO_MODELS } from "./config.js";
-import { countTokens as countTokensGpt5Pro } from "gpt-tokenizer/model/gpt-5-pro";
-import { pricingFromUsdPerMillion } from "tokentally";
+import { pricingFromUsdPerToken } from "tokentally";
 
 const OPENROUTER_DEFAULT_BASE = "https://openrouter.ai/api/v1";
 const OPENROUTER_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models";
+const require = createRequire(import.meta.url);
+let countTokensGpt5ProImpl: TokenizerFn | undefined;
 
 type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+const countTokensGpt5Pro: TokenizerFn = (
+  input: unknown,
+  options?: Record<string, unknown>,
+): number => {
+  countTokensGpt5ProImpl ??= require("gpt-tokenizer/model/gpt-5-pro").countTokens as TokenizerFn;
+  return countTokensGpt5ProImpl(input, options);
+};
 
 export function isKnownModel(model: string): model is KnownModelName {
   return Object.hasOwn(MODEL_CONFIGS, model);
@@ -47,8 +65,30 @@ interface OpenRouterModelInfo {
   id: string;
   context_length?: number;
   pricing?: {
-    prompt?: number;
-    completion?: number;
+    prompt?: string | number;
+    completion?: string | number;
+  };
+}
+
+function openRouterPricing(pricing: OpenRouterModelInfo["pricing"]): ModelConfig["pricing"] {
+  const parsePrice = (value: string | number | undefined): number | null => {
+    const parsed =
+      typeof value === "number"
+        ? value
+        : typeof value === "string" && value.trim() !== ""
+          ? Number(value)
+          : NaN;
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  };
+
+  const inputUsdPerToken = parsePrice(pricing?.prompt);
+  const outputUsdPerToken = parsePrice(pricing?.completion);
+  if (inputUsdPerToken === null || outputUsdPerToken === null) return null;
+
+  const normalized = pricingFromUsdPerToken({ inputUsdPerToken, outputUsdPerToken });
+  return {
+    inputPerToken: normalized.inputUsdPerToken,
+    outputPerToken: normalized.outputUsdPerToken,
   };
 }
 
@@ -124,6 +164,21 @@ export async function resolveModelConfig(
     baseUrl?: string;
     openRouterApiKey?: string;
     fetcher?: FetchFn;
+    modelOverrides?: ModelOverridesConfig;
+  } = {},
+): Promise<ModelConfig> {
+  const base = await resolveBaseModelConfig(model, options);
+  // Apply user-config per-model overrides last, after known/OpenRouter/synthesized
+  // resolution, so an explicit override always wins.
+  return applyModelOverride(base, model, options.modelOverrides);
+}
+
+async function resolveBaseModelConfig(
+  model: ModelName,
+  options: {
+    baseUrl?: string;
+    openRouterApiKey?: string;
+    fetcher?: FetchFn;
   } = {},
 ): Promise<ModelConfig> {
   const known = isKnownModel(model) ? (MODEL_CONFIGS[model] as ModelConfig) : null;
@@ -157,19 +212,7 @@ export async function resolveModelConfig(
           openRouterId: targetId,
           provider: known?.provider ?? "other",
           inputLimit: info.context_length ?? known?.inputLimit ?? 200_000,
-          pricing:
-            info.pricing && info.pricing.prompt != null && info.pricing.completion != null
-              ? (() => {
-                  const pricing = pricingFromUsdPerMillion({
-                    inputUsdPerMillion: info.pricing.prompt,
-                    outputUsdPerMillion: info.pricing.completion,
-                  });
-                  return {
-                    inputPerToken: pricing.inputUsdPerToken,
-                    outputPerToken: pricing.outputUsdPerToken,
-                  };
-                })()
-              : (known?.pricing ?? null),
+          pricing: openRouterPricing(info.pricing) ?? known?.pricing ?? null,
           supportsBackground: known?.supportsBackground ?? true,
           supportsSearch: known?.supportsSearch ?? true,
         };
@@ -211,6 +254,109 @@ export async function resolveModelConfig(
 
 export function isProModel(model: ModelName): boolean {
   return isKnownModel(model) && PRO_MODELS.has(model as KnownModelName & ProModelName);
+}
+
+const VALID_REASONING_EFFORTS: readonly ReasoningEffort[] = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Returns the override's `apiModel` for a *known* model when present and non-empty,
+ * otherwise `undefined`. Single source of truth for the override apiModel rule,
+ * shared by {@link applyModelOverride} and the CLI's `effectiveModelId` resolution.
+ */
+export function resolveOverriddenApiModel(
+  model: ModelName,
+  overrides?: ModelOverridesConfig,
+): string | undefined {
+  if (!overrides || !isKnownModel(model)) return undefined;
+  const override: unknown = overrides[model];
+  if (!isRecord(override)) return undefined;
+  if (typeof override.apiModel === "string" && override.apiModel.trim() !== "") {
+    return override.apiModel.trim();
+  }
+  return undefined;
+}
+
+/**
+ * Apply a user-config per-model override on top of a resolved config.
+ *
+ * Scope is intentionally narrow: only *known* models can be overridden, so the
+ * tokenizer (a function, not expressible in JSON) and any unspecified fields are
+ * inherited from the base config. Override fields are validated defensively
+ * because they come from user-authored JSON5.
+ */
+export function applyModelOverride(
+  base: ModelConfig,
+  model: ModelName,
+  overrides?: ModelOverridesConfig,
+): ModelConfig {
+  if (!overrides || !isKnownModel(model)) return base;
+  const override: unknown = overrides[model];
+  if (!isRecord(override)) return base;
+
+  const result: ModelConfig = { ...base };
+
+  const apiModel = resolveOverriddenApiModel(model, overrides);
+  if (apiModel) {
+    result.apiModel = apiModel;
+  }
+
+  if (Object.hasOwn(override, "reasoning")) {
+    const reasoning = override.reasoning;
+    if (reasoning === null) {
+      // Explicit null clears the known model's reasoning effort.
+      result.reasoning = null;
+    } else if (
+      isRecord(reasoning) &&
+      typeof reasoning.effort === "string" &&
+      VALID_REASONING_EFFORTS.includes(reasoning.effort as ReasoningEffort)
+    ) {
+      result.reasoning = { effort: reasoning.effort as ReasoningEffort };
+    }
+    // Malformed reasoning override is ignored (base value preserved).
+  }
+
+  if (
+    typeof override.inputLimit === "number" &&
+    Number.isSafeInteger(override.inputLimit) &&
+    override.inputLimit > 0
+  ) {
+    result.inputLimit = override.inputLimit;
+  }
+  // Non-positive or non-integer inputLimit (e.g. 0, 0.5, NaN, Infinity) is ignored.
+
+  if (Object.hasOwn(override, "pricing")) {
+    const pricing = override.pricing;
+    if (pricing === null) {
+      result.pricing = null;
+    } else if (
+      isRecord(pricing) &&
+      typeof pricing.inputPerToken === "number" &&
+      Number.isFinite(pricing.inputPerToken) &&
+      pricing.inputPerToken >= 0 &&
+      typeof pricing.outputPerToken === "number" &&
+      Number.isFinite(pricing.outputPerToken) &&
+      pricing.outputPerToken >= 0
+    ) {
+      result.pricing = {
+        inputPerToken: pricing.inputPerToken,
+        outputPerToken: pricing.outputPerToken,
+      };
+    }
+    // Malformed pricing override is ignored (base value preserved).
+  }
+
+  return result;
 }
 
 export function resetOpenRouterCatalogCacheForTest(): void {

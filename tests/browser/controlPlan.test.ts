@@ -32,11 +32,10 @@ describe("browser control plan", () => {
     );
   });
 
-  test("describes hidden and remote modes as background-safe", () => {
-    expect(describeBrowserControlPlan({ hideWindow: true })).toMatchObject({
-      mode: "hidden-window",
-      mayFocusWindow: false,
-    });
+  test("describes hidden and remote modes distinctly", () => {
+    const hidden = describeBrowserControlPlan({ hideWindow: true });
+    expect(hidden).toMatchObject({ mode: "hidden-window", mayFocusWindow: false });
+    expect(hidden.guidance.join(" ")).toContain("off-screen");
     expect(
       describeBrowserControlPlan({ remoteChrome: { host: "127.0.0.1", port: 9222 } }).mode,
     ).toBe("remote-chrome");

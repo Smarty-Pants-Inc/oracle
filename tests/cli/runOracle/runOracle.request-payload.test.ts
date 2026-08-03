@@ -101,6 +101,181 @@ describe("runOracle request payload", () => {
     }
   });
 
+  test("sends GPT-5.6 Pro + max as reasoning options instead of a model slug", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await runOracle(
+      {
+        prompt: "Review this difficult architecture",
+        model: "gpt-5.6-sol",
+        reasoningEffort: "max",
+        reasoningMode: "pro",
+        background: false,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: (msg: string) => logs.push(msg),
+      },
+    );
+    expect(client.lastRequest?.model).toBe("gpt-5.6-sol");
+    expect(client.lastRequest?.reasoning).toEqual({ effort: "max", mode: "pro" });
+    expect(logs.join("\n")).toContain("Reasoning mode: pro");
+    expect(logs.join("\n")).toContain("Reasoning effort: max");
+    expect(logs.join("\n")).toContain("gpt-5.6-sol[pro/max]");
+  });
+
+  test.each(["none", "low", "medium", "high", "xhigh", "max"] as const)(
+    "forwards GPT-5.6 reasoning effort %s",
+    async (reasoningEffort) => {
+      const stream = new MockStream([], buildResponse());
+      const client = new MockClient(stream);
+      await runOracle(
+        {
+          prompt: "Verify reasoning effort forwarding",
+          model: "gpt-5.6-sol",
+          reasoningEffort,
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      );
+      expect(client.lastRequest?.reasoning).toEqual({ effort: reasoningEffort });
+    },
+  );
+
+  test.each(["standard", "pro"] as const)(
+    "forwards GPT-5.6 reasoning mode %s",
+    async (reasoningMode) => {
+      const stream = new MockStream([], buildResponse());
+      const client = new MockClient(stream);
+      await runOracle(
+        {
+          prompt: "Verify reasoning mode forwarding",
+          model: "gpt-5.6-sol",
+          reasoningMode,
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      );
+      expect(client.lastRequest?.reasoning).toEqual({ effort: "xhigh", mode: reasoningMode });
+    },
+  );
+
+  test("rejects reasoning mode for non-GPT-5.6 models", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await expect(
+      runOracle(
+        {
+          prompt: "Invalid reasoning mode target",
+          model: "gpt-5.5",
+          reasoningMode: "pro",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      ),
+    ).rejects.toThrow("Use --model gpt-5.6-sol --reasoning-mode pro");
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects invalid programmatic reasoning mode values", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await expect(
+      runOracle(
+        {
+          prompt: "Invalid reasoning mode value",
+          model: "gpt-5.6-sol",
+          reasoningMode: "turbo" as "pro",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      ),
+    ).rejects.toThrow('Invalid reasoning mode "turbo"');
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects invalid programmatic reasoning effort values", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await expect(
+      runOracle(
+        {
+          prompt: "Invalid reasoning effort value",
+          model: "gpt-5.6-sol",
+          reasoningEffort: "extreme" as "max",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      ),
+    ).rejects.toThrow('Invalid reasoning effort "extreme"');
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects reasoning effort for non-GPT-5.6 models", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await expect(
+      runOracle(
+        {
+          prompt: "Invalid reasoning effort target",
+          model: "gpt-5.5",
+          reasoningEffort: "max",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      ),
+    ).rejects.toThrow("Use --model gpt-5.6-sol --reasoning-effort max");
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects reasoning mode on Chat Completions proxy routes", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    await expect(
+      runOracle(
+        {
+          prompt: "Invalid proxy reasoning mode",
+          model: "gpt-5.6-sol",
+          reasoningMode: "pro",
+          baseUrl: "https://litellm.test/v1",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: () => {},
+        },
+      ),
+    ).rejects.toThrow("requires the OpenAI or Azure OpenAI Responses API");
+    expect(client.lastRequest).toBeNull();
+  });
+
   test("search enabled by default", async () => {
     const stream = new MockStream([], buildResponse());
     const client = new MockClient(stream);
@@ -141,6 +316,62 @@ describe("runOracle request payload", () => {
       },
     );
     expect(captured).toEqual([{ apiKey: "sk-test", baseUrl: "https://litellm.test/v1" }]);
+  });
+
+  test("does not fallback to OpenRouter for first-party models with explicit proxy baseUrl", async () => {
+    const originalOpenai = process.env.OPENAI_API_KEY;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await expect(
+        runOracle(
+          {
+            prompt: "Custom endpoint route",
+            model: "gpt-5.4",
+            baseUrl: "https://litellm.test/v1",
+            background: false,
+          },
+          {
+            log: () => {},
+            write: () => true,
+          },
+        ),
+      ).rejects.toThrow(/Missing OPENAI_API_KEY/);
+    } finally {
+      if (originalOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenai;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+  });
+
+  test("logs the first-party OpenAI route", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await runOracle(
+      {
+        prompt: "Route check",
+        model: "gpt-5.1",
+        background: false,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: (message: string) => logs.push(message),
+      },
+    );
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenAI | base: api.openai.com | key: apiKey option",
+    );
   });
 
   test("passes gemini custom baseUrl through to clientFactory", async () => {
@@ -206,10 +437,491 @@ describe("runOracle request payload", () => {
     }
   });
 
-  test("passes azure config to clientFactory and sends the deployment name as the Azure model", async () => {
+  test("does not auto-fallback to OpenRouter when provider is forced to OpenAI", async () => {
+    const originalOpenai = process.env.OPENAI_API_KEY;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    process.env.OPENROUTER_API_KEY = "or-test";
+
+    try {
+      await expect(
+        runOracle(
+          {
+            prompt: "Forced OpenAI should require OpenAI key",
+            model: "gpt-5.1",
+            provider: "openai",
+            background: false,
+          },
+          {
+            clientFactory: () => {
+              throw new Error("clientFactory should not be called");
+            },
+            log: () => {},
+            write: () => true,
+          },
+        ),
+      ).rejects.toThrow(/Missing OPENAI_API_KEY/);
+    } finally {
+      if (originalOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenai;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+  });
+
+  test("uses OpenAI credentials for forced OpenAI custom model ids", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalOpenai = process.env.OPENAI_API_KEY;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; baseUrl?: string }> = [];
+    const logs: string[] = [];
+    process.env.OPENAI_API_KEY = "sk-openai";
+    process.env.OPENROUTER_API_KEY = "or-test";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Forced OpenAI custom model",
+          model: "o3-mini",
+          provider: "openai",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({ apiKey, baseUrl: options?.baseUrl });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenai;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([{ apiKey: "sk-openai", baseUrl: undefined }]);
+    expect(client.lastRequest?.model).toBe("o3-mini");
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenAI | base: api.openai.com | key: OPENAI_API_KEY",
+    );
+  });
+
+  test("logs explicit key source for forced OpenAI custom model ids", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+
+    await runOracle(
+      {
+        prompt: "Forced OpenAI custom model",
+        model: "o3-mini",
+        provider: "openai",
+        background: false,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: (message: string) => logs.push(message),
+        write: () => true,
+      },
+    );
+
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenAI | base: api.openai.com | key: apiKey option",
+    );
+  });
+
+  test("routes provider-qualified model ids through OpenRouter even when native keys exist", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAnthropic = process.env.ANTHROPIC_API_KEY;
+    const originalAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; baseUrl?: string; model?: string }> = [];
+    const logs: string[] = [];
+    process.env.ANTHROPIC_API_KEY = "ak-native";
+    delete process.env.ANTHROPIC_BASE_URL;
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Provider qualified route",
+          model: "anthropic/claude-sonnet-4.5",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({ apiKey, baseUrl: options?.baseUrl, model: options?.model });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAnthropic === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAnthropic;
+      }
+      if (originalAnthropicBaseUrl === undefined) {
+        delete process.env.ANTHROPIC_BASE_URL;
+      } else {
+        process.env.ANTHROPIC_BASE_URL = originalAnthropicBaseUrl;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([
+      {
+        apiKey: "or-route-key",
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "anthropic/claude-sonnet-4.5",
+      },
+    ]);
+    expect(client.lastRequest?.model).toBe("anthropic/claude-sonnet-4.5");
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenRouter | base: openrouter.ai/api/... | key: OPENROUTER_API_KEY",
+    );
+  });
+
+  test("routes provider-qualified ids through OpenRouter even when native base env exists", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAnthropic = process.env.ANTHROPIC_API_KEY;
+    const originalAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; baseUrl?: string; model?: string }> = [];
+    process.env.ANTHROPIC_API_KEY = "ak-native";
+    process.env.ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Provider qualified route",
+          model: "anthropic/claude-sonnet-4.5",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({ apiKey, baseUrl: options?.baseUrl, model: options?.model });
+            return client;
+          },
+          log: () => {},
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAnthropic === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAnthropic;
+      }
+      if (originalAnthropicBaseUrl === undefined) {
+        delete process.env.ANTHROPIC_BASE_URL;
+      } else {
+        process.env.ANTHROPIC_BASE_URL = originalAnthropicBaseUrl;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([
+      {
+        apiKey: "or-route-key",
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "anthropic/claude-sonnet-4.5",
+      },
+    ]);
+  });
+
+  test("preserves explicit baseUrl for provider-qualified model ids", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAnthropic = process.env.ANTHROPIC_API_KEY;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; baseUrl?: string; model?: string }> = [];
+    const logs: string[] = [];
+    delete process.env.ANTHROPIC_API_KEY;
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Provider qualified proxy route",
+          model: "anthropic/claude-sonnet-4.5",
+          baseUrl: "https://litellm.test/v1",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({ apiKey, baseUrl: options?.baseUrl, model: options?.model });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAnthropic === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAnthropic;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([
+      {
+        apiKey: "or-route-key",
+        baseUrl: "https://litellm.test/v1",
+        model: "anthropic/claude-sonnet-4.5",
+      },
+    ]);
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenAI-compatible | base: litellm.test/v1 | key: OPENROUTER_API_KEY",
+    );
+  });
+
+  test("logs explicit key source for provider-qualified custom proxy routes", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+
+    await runOracle(
+      {
+        prompt: "Provider qualified proxy route",
+        model: "anthropic/claude-sonnet-4.5",
+        baseUrl: "https://litellm.test/v1",
+        background: false,
+      },
+      {
+        apiKey: "proxy-test-key",
+        client,
+        log: (message: string) => logs.push(message),
+        write: () => true,
+      },
+    );
+
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenAI-compatible | base: litellm.test/v1 | key: apiKey option",
+    );
+  });
+
+  test("routes provider-qualified ids through OpenRouter instead of native base URLs", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalOpenai = process.env.OPENAI_API_KEY;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; baseUrl?: string; model?: string }> = [];
+    const logs: string[] = [];
+    process.env.OPENAI_API_KEY = "sk-native";
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Provider qualified native base route",
+          model: "openai/gpt-4o-mini",
+          baseUrl: "https://api.openai.com/v1",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({ apiKey, baseUrl: options?.baseUrl, model: options?.model });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenai;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([
+      {
+        apiKey: "or-route-key",
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-4o-mini",
+      },
+    ]);
+    expect(logs.join("\n")).toContain(
+      "Provider: OpenRouter | base: openrouter.ai/api/... | key: OPENROUTER_API_KEY",
+    );
+  });
+
+  test("routes provider-qualified ids to OpenRouter before auto Azure env routing", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    const originalOpenaiBaseUrl = process.env.OPENAI_BASE_URL;
+    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{ apiKey: string; azure?: unknown; baseUrl?: string; model?: string }> =
+      [];
+    process.env.AZURE_OPENAI_API_KEY = "az-route-key";
+    delete process.env.OPENAI_BASE_URL;
+    process.env.OPENROUTER_API_KEY = "or-route-key";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Provider qualified OpenAI route",
+          model: "openai/gpt-4o-mini",
+          azure: {
+            endpoint: "https://example-resource.openai.azure.com/",
+            deployment: "gpt-prod",
+          },
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({
+              apiKey,
+              azure: options?.azure,
+              baseUrl: options?.baseUrl,
+              model: options?.model,
+            });
+            return client;
+          },
+          log: () => {},
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAzureKey === undefined) {
+        delete process.env.AZURE_OPENAI_API_KEY;
+      } else {
+        process.env.AZURE_OPENAI_API_KEY = originalAzureKey;
+      }
+      if (originalOpenaiBaseUrl === undefined) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalOpenaiBaseUrl;
+      }
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    }
+
+    expect(captured).toEqual([
+      {
+        apiKey: "or-route-key",
+        azure: undefined,
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-4o-mini",
+      },
+    ]);
+  });
+
+  test("rejects forced OpenAI provider mode for known non-OpenAI models", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Claude should not run through OpenAI",
+          model: "claude-4.6-sonnet",
+          provider: "openai",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/OpenAI provider cannot run claude-4\.6-sonnet/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects forced OpenAI provider mode for native-looking custom model ids", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Custom Claude should not run through OpenAI",
+          model: "claude-3-haiku",
+          provider: "openai",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/OpenAI provider cannot run claude-3-haiku/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects forced OpenAI provider mode for provider-qualified non-OpenAI ids", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Provider-qualified Claude should not run through OpenAI",
+          model: "anthropic/claude-sonnet-4.5",
+          provider: "openai",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/OpenAI provider cannot run anthropic\/claude-sonnet-4\.5/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("passes azure config to clientFactory, logs the route, and sends the deployment name as the Azure model", async () => {
     const stream = new MockStream([], buildResponse());
     const client = new MockClient(stream);
     const captured: Array<{ apiKey: string; azure?: unknown; resolvedModelId?: string }> = [];
+    const logs: string[] = [];
     const azureOptions = {
       endpoint: "https://my-azure.com/",
       deployment: "gpt-4-test",
@@ -233,7 +945,7 @@ describe("runOracle request payload", () => {
           });
           return client;
         },
-        log: () => {},
+        log: (message: string) => logs.push(message),
         write: () => true,
       },
     );
@@ -241,6 +953,443 @@ describe("runOracle request payload", () => {
       { apiKey: "sk-test", azure: azureOptions, resolvedModelId: "gpt-4-test" },
     ]);
     expect(client.lastRequest?.model).toBe("gpt-4-test");
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: gpt-4-test | key: apiKey option",
+    );
+  });
+
+  test("treats custom GPT model ids with an Azure endpoint as Azure OpenAI", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    const captured: Array<{ apiKey: string; azure?: unknown; resolvedModelId?: string }> = [];
+    const logs: string[] = [];
+    const azureOptions = {
+      endpoint: "https://my-azure.com/",
+      deployment: "custom-gpt4o",
+    };
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Azure custom GPT",
+          model: "gpt-4o",
+          azure: azureOptions,
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({
+              apiKey,
+              azure: options?.azure,
+              resolvedModelId: options?.resolvedModelId,
+            });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAzureKey === undefined) {
+        delete process.env.AZURE_OPENAI_API_KEY;
+      } else {
+        process.env.AZURE_OPENAI_API_KEY = originalAzureKey;
+      }
+    }
+
+    expect(captured).toEqual([
+      { apiKey: "az-test", azure: azureOptions, resolvedModelId: "custom-gpt4o" },
+    ]);
+    expect(client.lastRequest?.model).toBe("custom-gpt4o");
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: custom-gpt4o | key: AZURE_OPENAI_API_KEY|OPENAI_API_KEY",
+    );
+  });
+
+  test("treats explicit Azure provider runs with custom non-GPT model ids as Azure OpenAI", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    const captured: Array<{ apiKey: string; azure?: unknown; resolvedModelId?: string }> = [];
+    const logs: string[] = [];
+    const azureOptions = {
+      endpoint: "https://my-azure.com/",
+      deployment: "my-o3",
+    };
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Azure custom O-series deployment",
+          model: "o3-mini",
+          provider: "azure",
+          azure: azureOptions,
+          effectiveModelId: "o3-mini",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({
+              apiKey,
+              azure: options?.azure,
+              resolvedModelId: options?.resolvedModelId,
+            });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAzureKey === undefined) {
+        delete process.env.AZURE_OPENAI_API_KEY;
+      } else {
+        process.env.AZURE_OPENAI_API_KEY = originalAzureKey;
+      }
+    }
+
+    expect(captured).toEqual([
+      { apiKey: "az-test", azure: azureOptions, resolvedModelId: "my-o3" },
+    ]);
+    expect(client.lastRequest?.model).toBe("my-o3");
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: my-o3 | key: AZURE_OPENAI_API_KEY|OPENAI_API_KEY",
+    );
+  });
+
+  test("rejects explicit Azure provider mode without an endpoint", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Azure provider needs endpoint",
+          model: "gpt-5.1",
+          provider: "azure",
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/--provider azure requires --azure-endpoint/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("keeps explicit Azure provider routing ahead of OpenRouter base URLs", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
+    const captured: Array<{
+      apiKey: string;
+      azure?: unknown;
+      baseUrl?: string;
+      resolvedModelId?: string;
+    }> = [];
+    const azureOptions = {
+      endpoint: "https://my-azure.com/",
+      deployment: "my-o3",
+    };
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+    process.env.OPENROUTER_API_KEY = "or-test";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Azure should win over OpenRouter",
+          model: "o3-mini",
+          provider: "azure",
+          azure: azureOptions,
+          baseUrl: "https://openrouter.ai/api/v1",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({
+              apiKey,
+              azure: options?.azure,
+              baseUrl: options?.baseUrl,
+              resolvedModelId: options?.resolvedModelId,
+            });
+            return client;
+          },
+          log: () => {},
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAzureKey === undefined) {
+        delete process.env.AZURE_OPENAI_API_KEY;
+      } else {
+        process.env.AZURE_OPENAI_API_KEY = originalAzureKey;
+      }
+      if (originalOpenRouterKey === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
+      }
+    }
+
+    expect(captured).toEqual([
+      { apiKey: "az-test", azure: azureOptions, baseUrl: undefined, resolvedModelId: "my-o3" },
+    ]);
+    expect(client.lastRequest?.model).toBe("my-o3");
+  });
+
+  test("treats auto-mode Azure deployments for custom non-GPT model ids as Azure OpenAI", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const originalAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    const captured: Array<{ apiKey: string; azure?: unknown; resolvedModelId?: string }> = [];
+    const logs: string[] = [];
+    const azureOptions = {
+      endpoint: "https://my-azure.com/",
+      deployment: "my-o3",
+    };
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+
+    try {
+      await runOracle(
+        {
+          prompt: "Azure custom O-series auto route",
+          model: "o3-mini",
+          azure: azureOptions,
+          effectiveModelId: "o3-mini",
+          background: false,
+        },
+        {
+          clientFactory: (apiKey, options) => {
+            captured.push({
+              apiKey,
+              azure: options?.azure,
+              resolvedModelId: options?.resolvedModelId,
+            });
+            return client;
+          },
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      );
+    } finally {
+      if (originalAzureKey === undefined) {
+        delete process.env.AZURE_OPENAI_API_KEY;
+      } else {
+        process.env.AZURE_OPENAI_API_KEY = originalAzureKey;
+      }
+    }
+
+    expect(captured).toEqual([
+      { apiKey: "az-test", azure: azureOptions, resolvedModelId: "my-o3" },
+    ]);
+    expect(client.lastRequest?.model).toBe("my-o3");
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: my-o3 | key: AZURE_OPENAI_API_KEY|OPENAI_API_KEY",
+    );
+  });
+
+  test("rejects explicit Azure provider mode for known non-OpenAI models", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Claude should not run through Azure OpenAI",
+          model: "claude-4.6-sonnet",
+          provider: "azure",
+          azure: { endpoint: "https://my-azure.com/", deployment: "my-claude" },
+          background: false,
+        },
+        {
+          apiKey: "az-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/Azure OpenAI provider cannot run claude-4\.6-sonnet/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects explicit Azure provider mode for native-looking custom model ids", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Custom Gemini should not run through Azure OpenAI",
+          model: "gemini-3-pro-preview",
+          provider: "azure",
+          azure: { endpoint: "https://my-azure.com/", deployment: "my-gemini" },
+          background: false,
+        },
+        {
+          apiKey: "az-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/Azure OpenAI provider cannot run gemini-3-pro-preview/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("rejects explicit Azure provider mode for provider-qualified non-OpenAI ids", async () => {
+    const client = new MockClient(new MockStream([], buildResponse()));
+    await expect(
+      runOracle(
+        {
+          prompt: "Provider-qualified Gemini should not run through Azure OpenAI",
+          model: "google/gemini-3-pro-preview",
+          provider: "azure",
+          azure: { endpoint: "https://my-azure.com/", deployment: "my-gemini" },
+          background: false,
+        },
+        {
+          apiKey: "az-test",
+          clientFactory: () => client,
+          log: () => {},
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(/Azure OpenAI provider cannot run google\/gemini-3-pro-preview/);
+    expect(client.lastRequest).toBeNull();
+  });
+
+  test("allows Azure without deployment when the implicit deployment is gpt-5.5-pro", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await runOracle(
+      {
+        prompt: "Azure implicit deployment",
+        model: "gpt-5.5-pro",
+        azure: { endpoint: "https://my-azure.com/" },
+        background: false,
+      },
+      {
+        apiKey: "sk-test",
+        client,
+        log: (message: string) => logs.push(message),
+        write: () => true,
+      },
+    );
+    expect(client.lastRequest?.model).toBe("gpt-5.5-pro");
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: gpt-5.5-pro | key: apiKey option",
+    );
+  });
+
+  test("fails early when Azure endpoint is set without a deployment", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await expect(
+      runOracle(
+        {
+          prompt: "Azure missing deployment",
+          model: "gpt-5.1",
+          azure: { endpoint: "https://my-azure.com/" },
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(
+      /Azure mode requires --azure-deployment unless your deployment is literally gpt-5\.5-pro/,
+    );
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: none | key: apiKey option",
+    );
+  });
+
+  test("fails early for custom Azure model ids without a deployment", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await expect(
+      runOracle(
+        {
+          prompt: "Azure custom missing deployment",
+          model: "o3-mini",
+          azure: { endpoint: "https://my-azure.com/" },
+          background: false,
+        },
+        {
+          apiKey: "sk-test",
+          client,
+          log: (message: string) => logs.push(message),
+          write: () => true,
+        },
+      ),
+    ).rejects.toThrow(
+      /Azure mode requires --azure-deployment unless your deployment is literally gpt-5\.5-pro/,
+    );
+    expect(client.lastRequest).toBeNull();
+    expect(logs.join("\n")).toContain(
+      "Provider: Azure OpenAI | endpoint: my-azure.com | deployment: none | key: apiKey option",
+    );
+  });
+
+  test("does not require an Azure deployment for non-OpenAI providers", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const logs: string[] = [];
+    await runOracle(
+      {
+        prompt: "Claude with unrelated Azure env",
+        model: "claude-4.6-sonnet",
+        azure: { endpoint: "https://my-azure.com/" },
+        background: false,
+      },
+      {
+        apiKey: "ak-test",
+        clientFactory: () => client,
+        log: (message: string) => logs.push(message),
+        write: () => true,
+      },
+    );
+    expect(logs.join("\n")).toContain(
+      "Provider: Anthropic | base: api.anthropic.com | key: ANTHROPIC_API_KEY",
+    );
+    expect(logs.join("\n")).not.toContain("Provider: Azure OpenAI");
+  });
+
+  test("does not pass Azure client config to non-OpenAI OpenAI-compatible routes", async () => {
+    const stream = new MockStream([], buildResponse());
+    const client = new MockClient(stream);
+    const captured: Array<{ apiKey: string; azure?: unknown; baseUrl?: string }> = [];
+    const logs: string[] = [];
+    await runOracle(
+      {
+        prompt: "Grok with unrelated Azure env",
+        model: "grok-4.1",
+        azure: { endpoint: "https://my-azure.com/" },
+        background: false,
+      },
+      {
+        apiKey: "xai-test",
+        clientFactory: (apiKey, options) => {
+          captured.push({ apiKey, azure: options?.azure, baseUrl: options?.baseUrl });
+          return client;
+        },
+        log: (message: string) => logs.push(message),
+        write: () => true,
+      },
+    );
+
+    expect(captured).toEqual([
+      { apiKey: "xai-test", azure: undefined, baseUrl: "https://api.x.ai/v1" },
+    ]);
+    expect(logs.join("\n")).toContain("Provider: xAI | base: api.x.ai/v1 | key: XAI_API_KEY");
+    expect(logs.join("\n")).not.toContain("Provider: Azure OpenAI");
   });
 
   test("uses grok search tool shape", async () => {

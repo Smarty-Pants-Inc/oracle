@@ -4,10 +4,13 @@ import {
   PROMPT_PRIMARY_SELECTOR,
   PROMPT_FALLBACK_SELECTOR,
   SEND_BUTTON_SELECTORS,
-  CONVERSATION_TURN_SELECTOR,
   STOP_BUTTON_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
+import {
+  buildConversationTurnCountExpression,
+  buildConversationTurnListExpression,
+} from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -20,24 +23,23 @@ const ENTER_KEY_EVENT = {
   nativeVirtualKeyCode: 13,
 } as const;
 const ENTER_KEY_TEXT = "\r";
-const PROMPT_ACCEPTANCE_TIMEOUT_MS = 5_000;
-const PROMPT_ACCEPTANCE_POLL_MS = 100;
 
-type PromptAcceptanceProbe = {
-  accepted?: boolean;
-  blockedBy?: string | null;
-  signals?: string[];
-  blockers?: string[];
-  evidence?: Record<string, unknown>;
-};
+export interface AttachmentReadyExpectation {
+  name: string;
+  generatedBundle?: boolean;
+}
+
+type AttachmentReadyInput = string | AttachmentReadyExpectation;
 
 export async function submitPrompt(
   deps: {
     runtime: ChromeClient["Runtime"];
     input: ChromeClient["Input"];
-    attachmentNames?: string[];
+    attachmentNames?: AttachmentReadyInput[];
     baselineTurns?: number | null;
     inputTimeoutMs?: number | null;
+    attachmentTimeoutMs?: number | null;
+    onPromptSubmitted?: () => Promise<void> | void;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -211,7 +213,13 @@ export async function submitPrompt(
     );
   }
 
-  const clicked = await attemptSendButton(runtime, logger, deps?.attachmentNames);
+  const clicked = await attemptSendButton(
+    runtime,
+    input,
+    logger,
+    deps?.attachmentNames,
+    deps?.attachmentTimeoutMs,
+  );
   if (!clicked) {
     await input.dispatchKeyEvent({
       type: "keyDown",
@@ -227,13 +235,7 @@ export async function submitPrompt(
   } else {
     logger("Clicked send button");
   }
-
-  await waitForPromptAccepted(
-    runtime,
-    PROMPT_ACCEPTANCE_TIMEOUT_MS,
-    logger,
-    deps.baselineTurns ?? undefined,
-  );
+  await deps.onPromptSubmitted?.();
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
@@ -348,56 +350,123 @@ async function waitForDomReady(
   logger?.(`Page did not reach ready/composer state within ${timeoutMs}ms; continuing cautiously.`);
 }
 
-function buildAttachmentReadyExpression(attachmentNames: string[]): string {
-  const namesLiteral = JSON.stringify(attachmentNames.map((name) => name.toLowerCase()));
-  return `(() => {
-    const names = ${namesLiteral};
-    const composer =
-      document.querySelector('[data-testid*="composer"]') ||
-      document.querySelector('form') ||
-      document.body ||
-      document;
-    const renderedTokens = (node) =>
-      [node?.textContent, node?.getAttribute?.('aria-label'), node?.getAttribute?.('title')]
-        .filter(Boolean)
-        .flatMap((value) => String(value).toLowerCase().split(/\\r?\\n/))
-        .map((raw) =>
-          raw
-            .replace(/\\s+/g, ' ')
-            .trim()
-            .replace(/^(?:remove|delete)\\s+(?:file|attachment)\\s*[:\\-]?\\s*/i, '')
-            .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:b|kb|mb|gb|tb)$/i, '')
-            .trim(),
-        )
-        .filter(Boolean);
-    const numberedRenameMatch = (token, name) => {
-      // ChatGPT dedupes repeat uploads as "name(2).ext"; accept the numbered rename.
-      const dot = name.lastIndexOf('.');
-      const stem = dot > 0 ? name.slice(0, dot) : name;
-      const ext = dot > 0 ? name.slice(dot) : '';
-      if (!token.startsWith(stem) || (ext && !token.endsWith(ext))) return false;
-      const middle = token.slice(stem.length, token.length - ext.length);
-      return /^\\(\\d+\\)$/.test(middle);
+function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[]): string {
+  const attachmentExpectations = attachmentNames.map((attachment) => {
+    const name = typeof attachment === "string" ? attachment : attachment.name;
+    const normalized = name.toLowerCase().replace(/\s+/g, " ").trim();
+    return {
+      name: normalized,
+      stem: normalized.replace(/\.[a-z0-9]{1,10}$/i, ""),
+      extension: normalized.match(/(\.[a-z0-9]{1,10})$/i)?.[1] ?? "",
+      generatedBundle: typeof attachment === "object" && attachment.generatedBundle === true,
     };
-    const match = (node, name) =>
-      renderedTokens(node).some((token) => {
-        if (token === name) return true;
-        if (numberedRenameMatch(token, name)) return true;
-        if (token.includes('…') || token.includes('...')) {
-          const marker = token.includes('…') ? '…' : '...';
-          const [prefixRaw, suffixRaw] = token.split(marker);
-          const prefix = prefixRaw.trim();
-          const suffix = suffixRaw.trim();
-          return Boolean(prefix || suffix) && name.startsWith(prefix) && name.endsWith(suffix);
-        }
-        return false;
-      });
-    const fileNameMatches = (fileName, expectedName) =>
-      String(fileName || '').toLowerCase().replace(/\\s+/g, ' ').trim() ===
-      String(expectedName || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-
+  });
+  const namesLiteral = JSON.stringify(attachmentExpectations);
+  return `(() => {
+    const expected = ${namesLiteral};
+    const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const hasNameBoundary = (text, name) => {
+      if (!name) return false;
+      let from = 0;
+      while (from < text.length) {
+        const index = text.indexOf(name, from);
+        if (index === -1) return false;
+        const previous = text[index - 1] || '';
+        const next = text[index + name.length] || '';
+        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
+        const nextOk = !next || !/[a-z0-9._-]/.test(next);
+        if (previousOk && nextOk) return true;
+        from = index + name.length;
+      }
+      return false;
+    };
+    const hasStemFileBoundary = (text, stem) => {
+      if (!stem) return false;
+      let from = 0;
+      while (from < text.length) {
+        const index = text.indexOf(stem, from);
+        if (index === -1) return false;
+        const previous = text[index - 1] || '';
+        const next = text[index + stem.length] || '';
+        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
+        const nextOk = !next || !/[a-z0-9._-]/.test(next);
+        if (previousOk && nextOk) return true;
+        from = index + stem.length;
+      }
+      return false;
+    };
+    const hasBareStemBoundary = (text, stem) => {
+      if (!stem) return false;
+      let from = 0;
+      while (from < text.length) {
+        const index = text.indexOf(stem, from);
+        if (index === -1) return false;
+        const previous = text[index - 1] || '';
+        const next = text[index + stem.length] || '';
+        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
+        const nextOk = !next || !/[a-z0-9._(-]/.test(next);
+        if (previousOk && nextOk) return true;
+        from = index + stem.length;
+      }
+      return false;
+    };
+    const hasExtensionBoundary = (text, extension) => {
+      if (!extension) return false;
+      let from = 0;
+      while (from < text.length) {
+        const index = text.indexOf(extension, from);
+        if (index === -1) return false;
+        const next = text[index + extension.length] || '';
+        if (!next || !/[a-z0-9]/.test(next)) return true;
+        from = index + extension.length;
+      }
+      return false;
+    };
+    const matchesExpected = (value, item) => {
+      const text = normalize(value);
+      if (!text) return false;
+      if (hasNameBoundary(text, item.name)) return true;
+      if (item.generatedBundle && hasBareStemBoundary(text, item.stem)) return true;
+      if (
+        item.stem &&
+        item.stem.length >= 4 &&
+        item.extension &&
+        text.includes(item.stem + '(') &&
+        hasExtensionBoundary(text, item.extension)
+      ) {
+        return true;
+      }
+      if (text.includes('…') || text.includes('...')) {
+        const marker = text.includes('…') ? '…' : '...';
+        const [prefixRaw, suffixRaw] = text.split(marker);
+        const prefix = normalize(prefixRaw);
+        const suffix = normalize(suffixRaw);
+        const prefixParts = prefix.split(' ').filter(Boolean);
+        const suffixParts = suffix.split(' ').filter(Boolean);
+        const prefixCandidates = prefixParts.map((_, index) => prefixParts.slice(index).join(' '));
+        const suffixCandidates = suffixParts.map((_, index) =>
+          suffixParts.slice(0, suffixParts.length - index).join(' '),
+        );
+        if (prefixCandidates.length === 0 || suffixCandidates.length === 0) return false;
+        const targets = [item.name, item.stem && item.stem.length >= 4 ? item.stem : ''].filter(Boolean);
+        return targets.some((target) => {
+          return prefixCandidates.some((prefixPart) =>
+            suffixCandidates.some((suffixPart) => {
+              const strongEnough =
+                suffixPart.length >= 2 &&
+                (prefixPart.length >= 3 || (prefixPart.length >= 2 && suffixPart.length >= 4));
+              return strongEnough && target.startsWith(prefixPart) && target.endsWith(suffixPart);
+            }),
+          );
+        });
+      }
+      return false;
+    };
     // Restrict to attachment affordances; never scan generic div/span nodes (prompt text can contain the file name).
     const attachmentSelectors = [
+      // Current ChatGPT file tiles expose the filename through a role-group aria label.
+      '[role="group"][aria-label]',
       '[data-testid*="chip"]',
       '[data-testid*="attachment"]',
       '[data-testid*="upload"]',
@@ -406,46 +475,184 @@ function buildAttachmentReadyExpression(attachmentNames: string[]): string {
       'button[aria-label*="Remove file"]',
       '[aria-label*="remove file"]',
       'button[aria-label*="remove file"]',
+      '[aria-label*="Remove attachment"]',
+      'button[aria-label*="Remove attachment"]',
+      '[aria-label*="remove attachment"]',
+      'button[aria-label*="remove attachment"]',
     ];
-    const composerAttachments = Array.from(
-      composer.querySelectorAll(attachmentSelectors.join(',')),
+    const sendButton = sendSelectors
+      .map((selector) => document.querySelector(selector))
+      .find(Boolean);
+    const isUsableComposerRoot = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      if (String(node.tagName || '').toLowerCase() === 'button') return false;
+      const testId = String(node.getAttribute?.('data-testid') || '').toLowerCase();
+      if (!testId.includes('composer')) return false;
+      return !(
+        testId.includes('footer') ||
+        testId.includes('action') ||
+        testId.includes('plus') ||
+        testId.includes('send')
+      );
+    };
+    const closestComposerRoot = (node) => {
+      let current = node instanceof HTMLElement ? node : null;
+      while (current) {
+        if (isUsableComposerRoot(current)) return current;
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const firstComposerRoot = () =>
+      Array.from(document.querySelectorAll('[data-testid*="composer"]')).find(isUsableComposerRoot) || null;
+    const composer =
+      closestComposerRoot(sendButton) ||
+      sendButton?.closest?.('form') ||
+      firstComposerRoot() ||
+      document.querySelector('form') ||
+      document.body ||
+      document;
+    // Walk node + ancestors (up to grandparent) + descendants to gather every textual hint.
+    // ChatGPT's current chip DOM nests the filename inside truncated child spans, so checking
+    // only the node's own textContent/aria/title misses the match.
+    const collectOwnLabelHaystack = (node) => {
+      if (!node) return '';
+      const pieces = [];
+      const pushAttrs = (el) => {
+        if (!el || typeof el.getAttribute !== 'function') return;
+        for (const attr of ['aria-label', 'title', 'data-testid', 'data-tooltip', 'data-tooltip-content']) {
+          const v = el.getAttribute(attr);
+          if (v) pieces.push(v);
+        }
+      };
+      const pushText = (el) => {
+        if (!el) return;
+        const text = (el.innerText ?? el.textContent ?? '').trim();
+        if (text) pieces.push(text);
+      };
+      pushAttrs(node);
+      pushText(node);
+      return pieces.join(' ').toLowerCase();
+    };
+    const collectLabelHaystack = (node) => {
+      if (!node) return '';
+      const pieces = [collectOwnLabelHaystack(node)];
+      const push = (el) => {
+        const text = collectOwnLabelHaystack(el);
+        if (text) pieces.push(text);
+      };
+      const parent = node.parentElement;
+      push(parent);
+      const grandparent = parent?.parentElement;
+      push(grandparent);
+      return pieces.join(' ').toLowerCase();
+    };
+    const attachmentRoots = Array.from(new Set([composer])).filter(Boolean);
+    const collectChipNodes = () => {
+      const seen = new Set();
+      const collected = [];
+      for (const root of attachmentRoots) {
+        for (const node of Array.from(root.querySelectorAll(attachmentSelectors.join(',')))) {
+          if (!(node instanceof HTMLElement)) continue;
+          // Skip elements clearly inside the editable input (composer textarea may contain
+          // filename text in the user's prompt — avoid mistaking that for a chip).
+          if (node.closest('textarea,[contenteditable="true"]')) continue;
+          if (seen.has(node)) continue;
+          seen.add(node);
+          collected.push(node);
+        }
+      }
+      return collected;
+    };
+    const chipNodes = collectChipNodes();
+    const chipLabels = chipNodes.map((node) => collectLabelHaystack(node));
+    const chipOwnLabels = chipNodes.map((node) => collectOwnLabelHaystack(node));
+    const hasEllipsisSuffix = (label) => {
+      const marker = label.includes('…') ? '…' : label.includes('...') ? '...' : '';
+      if (!marker) return false;
+      return normalize(label.split(marker)[1] || '').length > 0;
+    };
+    const chipOwnLabelsWithVisibleNames = chipOwnLabels.filter((label) =>
+      /\\.[a-z][a-z0-9]{0,9}(?:\\b|$)/i.test(label) ||
+      hasEllipsisSuffix(label),
     );
-    const attachmentNodes = composerAttachments.length > 0
-      ? composerAttachments
-      : Array.from(document.querySelectorAll(attachmentSelectors.join(',')));
-
-    const chipsReady = names.every((name) => attachmentNodes.some((node) => match(node, name)));
-    const composerInputs = Array.from(composer.querySelectorAll('input[type="file"]'));
-    const inputNodes = composerInputs.length > 0
-      ? composerInputs
-      : Array.from(document.querySelectorAll('input[type="file"]'));
-    const inputsReady = names.every((name) =>
-      inputNodes.some((el) =>
-        Array.from((el instanceof HTMLInputElement ? el.files : []) || []).some((file) =>
-          fileNameMatches(file?.name, name),
-        ),
+    const visibleExtensionLabelsMatchExpected = chipOwnLabelsWithVisibleNames.every((label) =>
+      expected.some((item) => matchesExpected(label, item)),
+    );
+    const visibleStemOnlyMismatch = chipOwnLabels.some((label) =>
+      expected.some(
+        (item) =>
+          !item.generatedBundle &&
+          item.stem &&
+          hasStemFileBoundary(label, item.stem) &&
+          !matchesExpected(label, item),
       ),
     );
 
-    return chipsReady || inputsReady;
+    const chipsReady = (() => {
+      const used = new Set();
+      return expected.every((item) => {
+        const index = chipLabels.findIndex((label, candidateIndex) =>
+          !used.has(candidateIndex) && matchesExpected(label, item),
+        );
+        if (index === -1) return false;
+        used.add(index);
+        return true;
+      });
+    })();
+    const inputsReady = expected.every((item) =>
+      attachmentRoots.some((root) =>
+        Array.from(root.querySelectorAll('input[type="file"]')).some((el) =>
+          Array.from((el instanceof HTMLInputElement ? el.files : []) || []).some((file) =>
+            matchesExpected(file?.name, item),
+          ),
+        ),
+      ),
+    );
+    // Count-based fallback: if we cannot match names individually (ChatGPT may strip
+    // the filename out of attribute-readable text into a deeply nested span), but we
+    // do see at least as many distinct "Remove" affordances as attachments we
+    // uploaded, trust the upload without double-counting nested chip/remove nodes.
+    const removeAffordances = [];
+    const removeSeen = new Set();
+    for (const root of attachmentRoots) {
+      for (const node of Array.from(root.querySelectorAll(
+        '[aria-label*="Remove" i], [aria-label*="remove" i], button[aria-label*="Remove" i], button[aria-label*="remove" i]',
+      ))) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.closest('textarea,[contenteditable="true"]')) continue;
+        const aria = (node.getAttribute?.('aria-label') ?? '').toLowerCase();
+        const fileSpecific = aria.includes('remove file') || aria.includes('remove attachment');
+        const attachmentOwner = node.closest(
+          '[data-testid*="chip"], [data-testid*="attachment"], [data-testid*="upload"], [data-testid*="file"]',
+        );
+        if (!fileSpecific && !attachmentOwner) continue;
+        if (removeSeen.has(node)) continue;
+        removeSeen.add(node);
+        removeAffordances.push(node);
+      }
+    }
+    const countReady =
+      !visibleStemOnlyMismatch &&
+      visibleExtensionLabelsMatchExpected &&
+      removeAffordances.length >= expected.length;
+
+    return chipsReady || inputsReady || countReady;
   })()`;
 }
 
-export function buildAttachmentReadyExpressionForTest(attachmentNames: string[]) {
+export function buildAttachmentReadyExpressionForTest(attachmentNames: AttachmentReadyInput[]) {
   return buildAttachmentReadyExpression(attachmentNames);
 }
 
-const SEND_BUTTON_TIMEOUT_MS = 20_000;
-// Server-side attachment processing keeps the send button disabled for minutes after
-// upload evidence stabilizes (observed >2m for a ~25MB text bundle), so wait generously.
-const ATTACHMENT_SEND_READY_TIMEOUT_MS = 300_000;
-
 async function attemptSendButton(
   Runtime: ChromeClient["Runtime"],
-  logger?: BrowserLogger,
-  attachmentNames?: string[],
-  timeoutMs?: number,
+  Input: ChromeClient["Input"],
+  _logger?: BrowserLogger,
+  attachmentNames?: AttachmentReadyInput[],
+  attachmentTimeoutMs?: number | null,
 ): Promise<boolean> {
+  const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
   const script = `(() => {
     ${buildClickDispatcher()}
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
@@ -472,26 +679,23 @@ async function attemptSendButton(
     for (const selector of selectors) {
       candidates.push(...Array.from(document.querySelectorAll(selector)));
     }
-    const visible = candidates.filter((node) => isVisible(node));
-    const button = visible.find((node) => isEnabled(node)) || null;
-    if (button) {
-      // Use unified pointer/mouse sequence to satisfy React handlers.
-      dispatchClickSequence(button);
-      return 'clicked';
+    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
+    if (!button) return { status: 'missing' };
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = button.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }
-    // A visible-but-disabled send button means the composer is still processing; keep waiting.
-    return visible.length > 0 ? 'disabled' : 'missing';
+    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
+    dispatchClickSequence(button);
+    return { status: 'clicked' };
   })()`;
 
-  const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
-  const effectiveTimeoutMs =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? timeoutMs
-      : needAttachment
-        ? ATTACHMENT_SEND_READY_TIMEOUT_MS
-        : SEND_BUTTON_TIMEOUT_MS;
-  const deadline = Date.now() + effectiveTimeoutMs;
-  let loggedDisabledWait = false;
+  // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
+  // settle slowly for multi-file uploads, but plain text sends should keep the
+  // shorter historical deadline.
+  const timeoutMs = sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs);
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (needAttachment) {
       const ready = await Runtime.evaluate({
@@ -504,324 +708,77 @@ async function attemptSendButton(
       }
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
-    if (result.value === "clicked") {
+    const value = result.value as
+      | { status?: "clicked" | "missing" | "point"; x?: number; y?: number }
+      | string
+      | undefined;
+    const status = typeof value === "string" ? value : value?.status;
+    if (
+      status === "point" &&
+      typeof value === "object" &&
+      typeof value.x === "number" &&
+      typeof value.y === "number"
+    ) {
+      await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }
-    if (result.value === "missing" && !needAttachment) {
-      // Without attachments the Enter-key fallback is safe; bail out quickly.
+    if (status === "clicked") {
+      return true;
+    }
+    if (status === "missing") {
       break;
     }
-    if (result.value === "disabled" && needAttachment && !loggedDisabledWait) {
-      loggedDisabledWait = true;
-      logger?.("Send button visible but disabled; waiting for attachment processing to finish.");
-    }
-    await delay(needAttachment ? 500 : 100);
+    await delay(100);
   }
-  if (needAttachment) {
+  if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
     throw new BrowserAutomationError(
-      "Attachments never reached a clickable send button before timeout.",
+      `Attachments never reached a clickable send button after ${Math.ceil(
+        timeoutMs / 1000,
+      )}s; tune --browser-attachment-timeout.`,
       {
         stage: "submit-prompt",
         code: "attachment-send-not-ready",
         attachmentNames,
-        timeoutMs: effectiveTimeoutMs,
+        timeoutMs,
       },
     );
   }
   return false;
 }
 
-function buildPromptAcceptanceProbeExpression(baselineTurns?: number): string {
-  const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
-  const sendSelectorsLiteral = JSON.stringify(SEND_BUTTON_SELECTORS);
-  const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
-  const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  const turnSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
-  const baselineLiteral =
-    typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
-      ? Math.floor(baselineTurns)
-      : -1;
-  return `(() => {
-    const INPUT_SELECTORS = ${inputSelectorsLiteral};
-    const SEND_SELECTORS = ${sendSelectorsLiteral};
-    const STOP_SELECTOR = ${stopSelectorLiteral};
-    const ASSISTANT_SELECTOR = ${assistantSelectorLiteral};
-    const TURN_SELECTOR = ${turnSelectorLiteral};
-    const baseline = ${baselineLiteral};
-    const normalize = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
-    const isVisible = (node) => {
-      if (!(node instanceof Element)) return false;
-      const rect = node.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return false;
-      const style = window.getComputedStyle(node);
-      if (!style) return false;
-      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-    };
-    const labelFor = (node) =>
-      normalize(node?.textContent || node?.getAttribute?.('aria-label') || node?.getAttribute?.('title') || node?.getAttribute?.('data-testid'));
-    const visibleFrom = (selector) => {
-      try {
-        return Array.from(document.querySelectorAll(selector)).filter((node) => isVisible(node));
-      } catch {
-        return [];
-      }
-    };
-    const visibleButtons = Array.from(document.querySelectorAll('button,a,[role="button"]')).filter((node) => isVisible(node));
-    const buttonLabels = visibleButtons.map(labelFor).filter(Boolean).slice(0, 16);
-    const bodyText = normalize(document.body?.innerText || '');
-    const bodyLower = bodyText.toLowerCase();
-    const url = typeof location === 'object' && location.href ? location.href : '';
-    const path = typeof location === 'object' && location.pathname ? location.pathname : '';
-    const title = normalize(document.title);
-    const loginPattern = /\\b(log in|login|sign in|signin|sign up|continue with google|continue with microsoft|continue with email)\\b/i;
-    const loginVisible =
-      /auth\\.openai\\.com/i.test(url) ||
-      /^\\/(auth|login|signin)/i.test(path) ||
-      visibleButtons.some((node) => loginPattern.test(labelFor(node))) ||
-      /log in to get answers|get responses tailored to you|welcome back/i.test(bodyText);
-    const cloudflare =
-      /just a moment/i.test(title) ||
-      Boolean(document.querySelector('script[src*="/challenge-platform/"]')) ||
-      /checking your browser|verify you are human|cf-challenge|cloudflare/i.test(bodyLower);
-    const accountBlocked =
-      /suspicious activity detected|secure your account|regain access/.test(bodyLower);
-    const permissionGate =
-      /does not have access|access denied|permission denied|workspace access|you don't have access/.test(bodyLower);
-
-    const inputs = INPUT_SELECTORS.flatMap((selector) => visibleFrom(selector));
-    const uniqueInputs = Array.from(new Set(inputs));
-    const readValue = (node) => {
-      if (!node) return '';
-      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-        return node.value ?? '';
-      }
-      return node.innerText ?? node.textContent ?? '';
-    };
-    const inputValues = uniqueInputs.map((node) => normalize(readValue(node))).filter(Boolean);
-    const composerCleared = uniqueInputs.length > 0 && inputValues.length === 0;
-    const composerDisabled =
-      uniqueInputs.length > 0 &&
-      uniqueInputs.every((node) => {
-        const element = node;
-        return (
-          element.hasAttribute('disabled') ||
-          element.getAttribute('aria-disabled') === 'true' ||
-          element.getAttribute('contenteditable') === 'false'
-        );
-      });
-    const inputSelectorsFound = INPUT_SELECTORS.filter((selector) => visibleFrom(selector).length > 0);
-
-    const sendButtons = SEND_SELECTORS.flatMap((selector) => visibleFrom(selector));
-    const sendVisible = sendButtons.length > 0;
-    const sendEnabled = sendButtons.some((node) => {
-      const style = window.getComputedStyle(node);
-      return !(
-        node.hasAttribute('disabled') ||
-        node.getAttribute('aria-disabled') === 'true' ||
-        node.getAttribute('data-disabled') === 'true' ||
-        style.pointerEvents === 'none'
-      );
-    });
-    const sendDisabled = sendVisible && !sendEnabled;
-    const stopVisible = [
-      ...visibleFrom(STOP_SELECTOR),
-      ...visibleFrom('button[aria-label*="Stop"]'),
-      ...visibleFrom('button[data-testid*="stop"]'),
-    ].length > 0 || visibleButtons.some((node) => /\\bstop\\b/i.test(labelFor(node)));
-    const turnsCount = document.querySelectorAll(TURN_SELECTOR).length;
-    const hasNewTurn = baseline >= 0 && turnsCount > baseline;
-    const assistantVisible = Boolean(
-      document.querySelector(ASSISTANT_SELECTOR) ||
-      document.querySelector('[data-testid*="assistant"]'),
-    );
-    const inConversation = /\\/c\\//.test(url);
-    const statusNodes = [
-      ...visibleFrom('[aria-live]:not([aria-live="off"])'),
-      ...visibleFrom('[role="status"]'),
-      ...visibleFrom('[role="progressbar"]'),
-      ...visibleFrom('[aria-busy="true"]'),
-      ...visibleFrom('[data-testid*="loading"]'),
-      ...visibleFrom('[data-testid*="progress"]'),
-      ...visibleFrom('[data-testid*="thinking"]'),
-      ...visibleFrom('[data-testid*="reason"]'),
-      ...visibleFrom('[data-testid*="shimmer"]'),
-    ];
-    const statusText = normalize(statusNodes.map(labelFor).filter(Boolean).join(' '));
-    const thinkingVisible = /\\b(thinking|reasoning|working|analyzing|searching|reading|running|responding|generating|loading)\\b/i.test(statusText);
-
-    const signals = [];
-    if (hasNewTurn) signals.push('new-turn');
-    if (stopVisible) signals.push('stop-control');
-    if (thinkingVisible) signals.push('thinking-status');
-    if (assistantVisible && hasNewTurn) signals.push('assistant-turn');
-    if (composerCleared && (hasNewTurn || stopVisible || thinkingVisible || inConversation)) {
-      signals.push('composer-cleared-after-send');
-    }
-    if (composerDisabled && (hasNewTurn || stopVisible || thinkingVisible)) {
-      signals.push('composer-disabled-after-send');
-    }
-    if (sendDisabled && composerCleared && (hasNewTurn || stopVisible || thinkingVisible)) {
-      signals.push('send-disabled-after-send');
-    }
-
-    const blockers = [];
-    if (cloudflare) blockers.push('cloudflare-challenge');
-    if (accountBlocked) blockers.push('chatgpt-account-blocked');
-    if (loginVisible) blockers.push('login-required');
-    if (permissionGate) blockers.push('permission-required');
-    const blockedBy = blockers[0] || null;
-    return {
-      accepted: blockers.length === 0 && signals.length > 0,
-      blockedBy,
-      signals,
-      blockers,
-      evidence: {
-        url,
-        title,
-        baseline,
-        turnsCount,
-        hasNewTurn,
-        stopVisible,
-        sendVisible,
-        sendEnabled,
-        sendDisabled,
-        composerCleared,
-        composerDisabled,
-        inputCount: uniqueInputs.length,
-        inputSelectorsFound,
-        assistantVisible,
-        inConversation,
-        statusText: statusText.slice(0, 240),
-        buttonLabels,
-        bodySnippet: bodyText.slice(0, 500),
-      },
-    };
-  })()`;
-}
-
-async function readPromptAcceptanceState(
+async function clickTrustedPoint(
   Runtime: ChromeClient["Runtime"],
-  baselineTurns?: number,
-): Promise<PromptAcceptanceProbe> {
-  const { result } = await Runtime.evaluate({
-    expression: buildPromptAcceptanceProbeExpression(baselineTurns),
+  Input: ChromeClient["Input"],
+  x: number,
+  y: number,
+): Promise<void> {
+  if (Input && typeof Input.dispatchMouseEvent === "function") {
+    await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+    await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    return;
+  }
+  await Runtime.evaluate({
+    expression: `(() => {
+      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+      if (!(el instanceof HTMLElement)) return false;
+      el.click();
+      return true;
+    })()`,
     returnByValue: true,
   });
-  return (result?.value ?? {}) as PromptAcceptanceProbe;
 }
 
-function buildPromptAcceptanceError(
-  probe: PromptAcceptanceProbe | null,
-  timeoutMs: number,
-): BrowserAutomationError {
-  const code = probe?.blockedBy || "prompt-not-accepted";
-  const details = {
-    stage: "submit-prompt",
-    code,
-    timeoutMs,
-    signals: probe?.signals ?? [],
-    blockers: probe?.blockers ?? [],
-    evidence: probe?.evidence ?? {},
-  };
-  if (code === "login-required") {
-    return new BrowserAutomationError(
-      "ChatGPT login dialog detected after prompt submission; the prompt was not accepted.",
-      details,
-    );
+function sendButtonTimeoutMs(
+  attachmentNames?: AttachmentReadyInput[],
+  attachmentTimeoutMs?: number | null,
+): number {
+  if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
+    return 20_000;
   }
-  if (code === "cloudflare-challenge") {
-    return new BrowserAutomationError(
-      "ChatGPT browser challenge detected after prompt submission; the prompt was not accepted.",
-      details,
-    );
-  }
-  if (code === "chatgpt-account-blocked") {
-    return new BrowserAutomationError(
-      "ChatGPT account security block detected after prompt submission; the prompt was not accepted.",
-      details,
-    );
-  }
-  if (code === "permission-required") {
-    return new BrowserAutomationError(
-      "ChatGPT reported a permission or workspace access blocker after prompt submission.",
-      details,
-    );
-  }
-  return new BrowserAutomationError(
-    "ChatGPT did not enter a visible thinking/running state after the prompt was submitted.",
-    details,
-  );
-}
-
-function promptProbeErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isTransientPromptProbeError(error: unknown): boolean {
-  return /execution context was destroyed|context was destroyed|cannot find context|navigat|frame was detached/i.test(
-    promptProbeErrorMessage(error),
-  );
-}
-
-async function waitForPromptAccepted(
-  Runtime: ChromeClient["Runtime"],
-  timeoutMs: number,
-  logger?: BrowserLogger,
-  baselineTurns?: number,
-): Promise<PromptAcceptanceProbe> {
-  const deadline = Date.now() + timeoutMs;
-  let latest: PromptAcceptanceProbe | null = null;
-  while (Date.now() < deadline) {
-    try {
-      latest = await readPromptAcceptanceState(Runtime, baselineTurns);
-    } catch (error) {
-      if (isTransientPromptProbeError(error)) {
-        latest = {
-          accepted: false,
-          signals: [],
-          blockers: [],
-          evidence: { probeError: promptProbeErrorMessage(error) },
-        };
-        await delay(PROMPT_ACCEPTANCE_POLL_MS);
-        continue;
-      }
-      throw new BrowserAutomationError(
-        "Failed to inspect ChatGPT prompt acceptance state after submission.",
-        {
-          stage: "submit-prompt",
-          code: "prompt-acceptance-probe-failed",
-          timeoutMs,
-          error: promptProbeErrorMessage(error),
-        },
-        error,
-      );
-    }
-    if (latest.blockedBy) {
-      logger?.(
-        `Prompt acceptance blocked (${latest.blockedBy}); evidence: ${JSON.stringify(
-          latest.evidence ?? {},
-        )}`,
-      );
-      await logDomFailure(Runtime, logger as BrowserLogger, "prompt-acceptance").catch(
-        () => undefined,
-      );
-      throw buildPromptAcceptanceError(latest, timeoutMs);
-    }
-    if (latest.accepted) {
-      logger?.(
-        `Prompt accepted by ChatGPT (${(latest.signals ?? []).join(", ") || "signal detected"})`,
-      );
-      return latest;
-    }
-    await delay(PROMPT_ACCEPTANCE_POLL_MS);
-  }
-  if (logger) {
-    logger(
-      `Prompt acceptance check failed; latest state: ${latest ? JSON.stringify(latest) : "unavailable"}`,
-    );
-    await logDomFailure(Runtime, logger, "prompt-acceptance");
-  }
-  throw buildPromptAcceptanceError(latest, timeoutMs);
+  return typeof attachmentTimeoutMs === "number" && Number.isFinite(attachmentTimeoutMs)
+    ? Math.max(1_000, attachmentTimeoutMs)
+    : 45_000;
 }
 
 async function verifyPromptCommitted(
@@ -838,7 +795,6 @@ async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  const turnSelectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   let baseline: number | null =
     typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
       ? Math.floor(baselineTurns)
@@ -846,7 +802,7 @@ async function verifyPromptCommitted(
   if (baseline === null) {
     try {
       const { result } = await Runtime.evaluate({
-        expression: `document.querySelectorAll(${turnSelectorLiteral}).length`,
+        expression: buildConversationTurnCountExpression(),
         returnByValue: true,
       });
       const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
@@ -873,8 +829,7 @@ async function verifyPromptCommitted(
 	    };
 	    const normalizedPrompt = normalize(${encodedPrompt});
 	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
-	    const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
-	    const articles = Array.from(document.querySelectorAll(CONVERSATION_SELECTOR));
+	    const articles = ${buildConversationTurnListExpression()};
 	    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
 	    const readValue = (node) => {
 	      if (!node) return '';
@@ -934,20 +889,13 @@ async function verifyPromptCommitted(
     };
   })()`;
 
+  let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
-    const info = result.value as {
-      baseline?: number;
-      userMatched?: boolean;
-      prefixMatched?: boolean;
-      lastMatched?: boolean;
-      hasNewTurn?: boolean;
-      stopVisible?: boolean;
-      assistantVisible?: boolean;
-      composerCleared?: boolean;
-      inConversation?: boolean;
-      turnsCount?: number;
-    };
+    const info = result.value as CommitProbeState | undefined;
+    if (info && typeof info === "object") {
+      lastProbe = info;
+    }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
     const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
     const baselineUnknown =
@@ -964,14 +912,13 @@ async function verifyPromptCommitted(
     }
     await delay(100);
   }
+  const finalProbe = await Runtime.evaluate({ expression: script, returnByValue: true })
+    .then((res) => res?.result?.value as CommitProbeState | undefined)
+    .catch(() => undefined);
+  const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
   if (logger) {
     logger(
-      `Prompt commit check failed; latest state: ${await Runtime.evaluate({
-        expression: script,
-        returnByValue: true,
-      })
-        .then((res) => JSON.stringify(res?.result?.value))
-        .catch(() => "unavailable")}`,
+      `Prompt commit check failed; latest state: ${probe ? JSON.stringify(probe) : "unavailable"}`,
     );
     await logDomFailure(Runtime, logger, "prompt-commit");
   }
@@ -986,13 +933,56 @@ async function verifyPromptCommitted(
       },
     );
   }
-  throw new Error("Prompt did not appear in conversation before timeout (send may have failed)");
+  throw new BrowserAutomationError(
+    "Prompt did not appear in conversation before timeout (send may have failed)",
+    {
+      stage: "submit-prompt",
+      code: "prompt-commit-timeout",
+      promptLength: prompt.trim().length,
+      timeoutMs,
+      commitProbe: probe ? summarizeCommitProbe(probe) : undefined,
+    },
+  );
+}
+
+interface CommitProbeState {
+  baseline?: number;
+  userMatched?: boolean;
+  prefixMatched?: boolean;
+  lastMatched?: boolean;
+  hasNewTurn?: boolean;
+  stopVisible?: boolean;
+  assistantVisible?: boolean;
+  composerCleared?: boolean;
+  inConversation?: boolean;
+  turnsCount?: number;
+  href?: string;
+  editorValue?: string;
+  fallbackValue?: string;
+  lastTurn?: string;
+}
+
+// Keep booleans/counts but replace free text with lengths so session metadata stays lean.
+function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> {
+  return {
+    baseline: probe.baseline,
+    turnsCount: probe.turnsCount,
+    userMatched: probe.userMatched,
+    prefixMatched: probe.prefixMatched,
+    lastMatched: probe.lastMatched,
+    hasNewTurn: probe.hasNewTurn,
+    stopVisible: probe.stopVisible,
+    assistantVisible: probe.assistantVisible,
+    composerCleared: probe.composerCleared,
+    inConversation: probe.inConversation,
+    editorLength: typeof probe.editorValue === "string" ? probe.editorValue.length : undefined,
+    lastTurnLength: typeof probe.lastTurn === "string" ? probe.lastTurn.length : undefined,
+  };
 }
 
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   attemptSendButton,
-  buildPromptAcceptanceProbeExpression,
-  waitForPromptAccepted,
+  sendButtonTimeoutMs,
   verifyPromptCommitted,
 };

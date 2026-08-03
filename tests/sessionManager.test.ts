@@ -1,7 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
-import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
+import { mkdtemp, rm, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { setOracleHomeDirOverrideForTest } from "../src/oracleHome.js";
@@ -80,6 +78,9 @@ describe("session lifecycle", () => {
         maxOutput: 456,
         silent: false,
         filesReport: true,
+        modelOverrides: {
+          "gpt-5.2-pro": { apiModel: "gateway-model", reasoning: { effort: "high" } },
+        },
       },
       "/tmp/cwd",
     );
@@ -91,6 +92,9 @@ describe("session lifecycle", () => {
     expect(storedMeta.options.previousResponseId).toBe("resp-parent-123");
     expect(storedMeta.options.followupSessionId).toBe("parent-session");
     expect(storedMeta.options.followupModel).toBe("gpt-5.1");
+    expect(storedMeta.options.modelOverrides).toEqual({
+      "gpt-5.2-pro": { apiModel: "gateway-model", reasoning: { effort: "high" } },
+    });
     expect(storedMeta.options.browserFollowUps).toEqual([
       "challenge the plan",
       "summarize final recommendation",
@@ -104,6 +108,9 @@ describe("session lifecycle", () => {
     expect(perModelLog).toBe("");
     const logContent = await readFile(path.join(baseDir, "output.log"), "utf8");
     expect(logContent).toBe("");
+    if (process.platform !== "win32") {
+      expect((await stat(path.join(baseDir, "meta.json"))).mode & 0o777).toBe(0o600);
+    }
   });
 
   test("readSessionMetadata returns null for missing sessions and updateSessionMetadata persists changes", async () => {
@@ -119,6 +126,8 @@ describe("session lifecycle", () => {
     const updated = await sessionModule.readSessionMetadata(meta.id);
     expect(updated?.status).toBe("complete");
     expect(updated?.promptPreview).toBe("value");
+    const sessionFiles = await readdir(path.join(sessionModule.getSessionsDir(), meta.id));
+    expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
   test("createSessionLogWriter appends logs and supports chunk writes", async () => {
@@ -136,6 +145,23 @@ describe("session lifecycle", () => {
     expect(logText).toContain("Second chunk");
   });
 
+  test("createSessionLogWriter recreates missing per-model log directory", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Model log history", model: "gpt-5.2-pro" },
+      "/tmp/cwd",
+    );
+    await rm(path.join(sessionModule.getSessionsDir(), meta.id, "models"), {
+      recursive: true,
+      force: true,
+    });
+    const writer = sessionModule.createSessionLogWriter(meta.id, "gemini-3-pro");
+    writer.logLine("Gemini line");
+    writer.stream.end();
+    await new Promise<void>((resolve) => writer.stream.once("close", () => resolve()));
+    const logText = await sessionModule.readModelLog(meta.id, "gemini-3-pro");
+    expect(logText).toContain("Gemini line");
+  });
+
   test("readSessionLog falls back to empty string when no log exists", async () => {
     expect(await sessionModule.readSessionLog("missing")).toBe("");
   });
@@ -151,6 +177,25 @@ describe("session lifecycle", () => {
     );
     expect(first.id).toBe("alpha-beta-gamma");
     expect(second.id).toBe("alpha-beta-gamma-2");
+  });
+
+  test("initializeSession atomically allocates unique ids under parallel same-slug creation", async () => {
+    const sessions = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        sessionModule.initializeSession(
+          {
+            prompt: `Parallel slug ${index}`,
+            model: "gpt-5.2-pro",
+            slug: "parallel slug race",
+          },
+          "/tmp/cwd",
+        ),
+      ),
+    );
+    const ids = sessions.map((session) => session.id).sort();
+    expect(new Set(ids).size).toBe(sessions.length);
+    expect(ids).toContain("parallel-slug-race");
+    expect(ids).toContain("parallel-slug-race-8");
   });
 
   test("initializeSession can restart from a base slug override and appends suffix on conflict", async () => {
@@ -185,12 +230,14 @@ describe("session lifecycle", () => {
     expect(zombie?.errorMessage).toMatch(/zombie/i);
     const persisted = await sessionModule.readSessionMetadata(meta.id);
     expect(persisted?.status).toBe("error");
+    const storedRaw = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"), "utf8"),
+    );
+    expect(storedRaw.status).toBe("error");
+    expect(storedRaw.errorMessage).toMatch(/zombie/i);
   });
 
   test("keeps running browser sessions when Chrome runtime is reachable", async () => {
-    const server = createServer();
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const port = (server.address() as AddressInfo).port;
     const meta = await sessionModule.initializeSession(
       { prompt: "Browser live", model: "gpt-5.2-pro", mode: "browser" },
       "/tmp/cwd",
@@ -201,14 +248,46 @@ describe("session lifecycle", () => {
       browser: {
         runtime: {
           chromePid: process.pid,
-          chromePort: port,
+        },
+      },
+    });
+    const refreshed = await sessionModule.readSessionMetadata(meta.id);
+    expect(refreshed?.status).toBe("running");
+  });
+
+  test("keeps running browser sessions while their detached worker is alive", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Browser worker live", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      status: "running",
+      startedAt: "2000-01-01T00:00:00.000Z",
+      mode: "browser",
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: `oracle session ${meta.id}`,
+      },
+      browser: {
+        runtime: {
+          chromePid: 999999,
+          chromePort: 1,
           chromeHost: "127.0.0.1",
         },
       },
     });
     const refreshed = await sessionModule.readSessionMetadata(meta.id);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
     expect(refreshed?.status).toBe("running");
+    const listed = await sessionModule.listSessionsMetadata();
+    expect(listed.find((entry) => entry.id === meta.id)?.status).toBe("running");
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"), "utf8"),
+    );
+    expect(stored.status).toBe("running");
   });
 
   test("marks running browser sessions as error when Chrome runtime is gone", async () => {
@@ -230,6 +309,16 @@ describe("session lifecycle", () => {
     const refreshed = await sessionModule.readSessionMetadata(meta.id);
     expect(refreshed?.status).toBe("error");
     expect(refreshed?.errorMessage).toMatch(/chrome/i);
+    const rawBeforeList = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"), "utf8"),
+    );
+    expect(rawBeforeList.status).toBe("running");
+    await sessionModule.listSessionsMetadata();
+    const rawAfterList = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"), "utf8"),
+    );
+    expect(rawAfterList.status).toBe("error");
+    expect(rawAfterList.errorMessage).toMatch(/chrome/i);
   });
 });
 

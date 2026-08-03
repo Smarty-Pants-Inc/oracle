@@ -92,6 +92,33 @@ const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
 const originalPlatform = process.platform;
 
+async function withExactEnv<T>(
+  updates: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const originals = new Map<string, string | undefined>();
+  for (const name of Object.keys(updates)) {
+    originals.set(name, process.env[name]);
+    const value = updates[name];
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of originals) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+}
+
 beforeAll(() => {
   // Force macOS platform so browser-mode paths are reachable in Linux/Windows CI
   Object.defineProperty(process, "platform", { value: "darwin" });
@@ -110,6 +137,8 @@ beforeEach(() => {
     }
   });
   vi.mocked(runMultiModelApiSession).mockReset();
+  vi.mocked(resumeBrowserSession).mockReset();
+  vi.mocked(runBrowserSessionExecution).mockReset();
   vi.mocked(ensureSessionArtifacts).mockReset();
   vi.mocked(ensureSessionArtifacts).mockImplementation(
     async ({ existingArtifacts }) => existingArtifacts,
@@ -169,6 +198,9 @@ describe("performSessionRun", () => {
       expect.objectContaining({ status: "completed" }),
     );
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
+    );
   });
 
   test("writes final assistant output to disk for single-model runs", async () => {
@@ -202,6 +234,9 @@ describe("performSessionRun", () => {
       expect.stringContaining("Saved text\n"),
       "utf8",
     ]);
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      vi.mocked(fsPromises.writeFile).mock.invocationCallOrder.at(-1) ?? 0,
+    );
     const logLines = log.mock.calls.map((c) => c[0]).join("\n");
     expect(logLines).toContain("Saved assistant output");
   });
@@ -417,6 +452,7 @@ describe("performSessionRun", () => {
       .calls;
     const expectedProPath = path.resolve("/tmp/out.gpt-5.2-pro.md");
     const expectedGeminiPath = path.resolve("/tmp/out.gemini-3-pro.md");
+    const expectedManifestPath = path.resolve("/tmp/out.oracle.json");
     expect(writeCalls).toContainEqual([
       expectedProPath,
       expect.stringContaining("pro answer\n"),
@@ -427,9 +463,37 @@ describe("performSessionRun", () => {
       expect.stringContaining("gemini answer\n"),
       "utf8",
     ]);
+    const manifestCall = writeCalls.find((call) => call[0] === expectedManifestPath);
+    expect(manifestCall).toBeDefined();
+    const manifest = JSON.parse(manifestCall?.[1] as string);
+    expect(manifest).toMatchObject({
+      version: 1,
+      sessionId: "sess-1",
+      status: "completed",
+      outputBasePath: path.resolve("/tmp/out.md"),
+      models: [
+        {
+          model: "gpt-5.2-pro",
+          status: "completed",
+          outputPath: expectedProPath,
+          logPath: "log-pro",
+          usage: { totalTokens: 3 },
+        },
+        {
+          model: "gemini-3-pro",
+          status: "completed",
+          outputPath: expectedGeminiPath,
+          logPath: "log-gemini",
+          usage: { totalTokens: 3 },
+        },
+      ],
+    });
     const logLines = log.mock.calls.map((c) => c[0]).join("\n");
     expect(logLines).toContain("Saved outputs:");
     expect(logLines).toContain(`gpt-5.2-pro -> ${expectedProPath}`);
+    expect(logLines).toContain(`Output manifest: ${expectedManifestPath}`);
+    expect(logLines).toContain("Run logs:");
+    expect(logLines).toContain("gemini-3-pro -> log-gemini");
   });
 
   test("prints one aggregate header and colored summary for multi-model runs", async () => {
@@ -563,6 +627,9 @@ describe("performSessionRun", () => {
     const logsCombined = logSpy.mock.calls.map((c) => c[0]).join("\n");
     expect(logsCombined).toContain("Calling gpt-5.1, gemini-3-pro");
     expect(logsCombined).toContain("1/2 models");
+    expect(logsCombined).toContain("Multi-model result: partial success, 1/2 succeeded");
+    expect(logsCombined).toContain("Failures:");
+    expect(logsCombined).toContain("gemini-3-pro: boom");
 
     writeSpy.mockRestore();
     logSpy.mockRestore();
@@ -572,6 +639,245 @@ describe("performSessionRun", () => {
     } else {
       (process.stdout as { isTTY?: boolean }).isTTY = originalTty;
     }
+  });
+
+  test("allows partial multi-model success when requested", async () => {
+    const sessionMeta = {
+      ...baseSessionMeta,
+      models: [
+        { model: "gpt-5.1", status: "running" },
+        { model: "gemini-3-pro", status: "running" },
+      ],
+    } as SessionMetadata;
+
+    sessionStoreMock.readSession.mockResolvedValue(sessionMeta);
+    sessionStoreMock.readModelLog.mockResolvedValue("Answer:\npartial");
+
+    const summary: MultiModelRunSummary = {
+      fulfilled: [
+        {
+          model: "gpt-5.1" as ModelName,
+          usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2, cost: 0 },
+          answerText: "ok",
+          logPath: "log-ok",
+        },
+      ],
+      rejected: [{ model: "gemini-3-pro" as ModelName, reason: new Error("boom") }],
+      elapsedMs: 500,
+    };
+    vi.mocked(runMultiModelApiSession).mockResolvedValue(summary);
+
+    await performSessionRun({
+      sessionMeta,
+      runOptions: {
+        ...baseRunOptions,
+        models: ["gpt-5.1", "gemini-3-pro"],
+        partialMode: "ok",
+      },
+      mode: "api",
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({ status: "partial" });
+    const logsCombined = log.mock.calls.map((c) => c[0]).join("\n");
+    expect(logsCombined).toContain("Multi-model result: partial success, 1/2 succeeded");
+    expect(logsCombined).toContain("Failures:");
+  });
+
+  test("prints classified provider failures with recovery hints", async () => {
+    const sessionMeta = {
+      ...baseSessionMeta,
+      models: [
+        { model: "gpt-5.1", status: "running" },
+        { model: "claude-4.6-sonnet", status: "running" },
+      ],
+    } as SessionMetadata;
+
+    sessionStoreMock.readSession.mockResolvedValue(sessionMeta);
+    sessionStoreMock.readModelLog.mockResolvedValue("Answer:\npartial");
+    const providerError = new Error("invalid x-api-key: sk-ant-secret123456789");
+
+    const summary: MultiModelRunSummary = {
+      fulfilled: [
+        {
+          model: "gpt-5.1" as ModelName,
+          usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2, cost: 0 },
+          answerText: "ok",
+          logPath: "log-ok",
+        },
+      ],
+      rejected: [
+        {
+          model: "claude-4.6-sonnet" as ModelName,
+          reason: providerError,
+        },
+      ],
+      elapsedMs: 500,
+    };
+    vi.mocked(runMultiModelApiSession).mockResolvedValue(summary);
+
+    await withExactEnv(
+      {
+        ANTHROPIC_API_KEY: "ak-native-test-key",
+        OPENROUTER_API_KEY: undefined,
+      },
+      () =>
+        performSessionRun({
+          sessionMeta,
+          runOptions: {
+            ...baseRunOptions,
+            models: ["gpt-5.1", "claude-4.6-sonnet"],
+            partialMode: "ok",
+          },
+          mode: "api",
+          cwd: "/tmp",
+          log,
+          write,
+          version: cliVersion,
+        }),
+    );
+
+    const logsCombined = log.mock.calls.map((c) => c[0]).join("\n");
+    expect(logsCombined).toContain("claude-4.6-sonnet: auth failed");
+    expect(logsCombined).toContain("key: ANTHROPIC_API_KEY");
+    expect(logsCombined).toContain("provider said: invalid x-api-key: [redacted]");
+    expect(logsCombined).toContain("fix: refresh ANTHROPIC_API_KEY");
+    expect(logsCombined).toContain("oracle doctor --providers --models claude-4.6-sonnet");
+    expect(logsCombined).not.toContain("sk-ant-secret123456789");
+  });
+
+  test("sanitizes rethrown provider failures when partial success is not allowed", async () => {
+    const sessionMeta = {
+      ...baseSessionMeta,
+      models: [
+        { model: "gpt-5.1", status: "running" },
+        { model: "claude-4.6-sonnet", status: "running" },
+      ],
+    } as SessionMetadata;
+
+    sessionStoreMock.readSession.mockResolvedValue(sessionMeta);
+    sessionStoreMock.readModelLog.mockResolvedValue("Answer:\npartial");
+    const providerError = new Error("invalid x-api-key: sk-ant-secret123456789");
+
+    const summary: MultiModelRunSummary = {
+      fulfilled: [
+        {
+          model: "gpt-5.1" as ModelName,
+          usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2, cost: 0 },
+          answerText: "ok",
+          logPath: "log-ok",
+        },
+      ],
+      rejected: [
+        {
+          model: "claude-4.6-sonnet" as ModelName,
+          reason: providerError,
+        },
+      ],
+      elapsedMs: 500,
+    };
+    vi.mocked(runMultiModelApiSession).mockResolvedValue(summary);
+
+    let thrown: unknown;
+    try {
+      await withExactEnv(
+        {
+          ANTHROPIC_API_KEY: "ak-native-test-key",
+          OPENROUTER_API_KEY: undefined,
+        },
+        () =>
+          performSessionRun({
+            sessionMeta,
+            runOptions: {
+              ...baseRunOptions,
+              models: ["gpt-5.1", "claude-4.6-sonnet"],
+            },
+            mode: "api",
+            cwd: "/tmp",
+            log,
+            write,
+            version: cliVersion,
+          }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("claude-4.6-sonnet: auth failed");
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+
+    const logsCombined = log.mock.calls.map((c) => c[0]).join("\n");
+    expect(logsCombined).toContain("ERROR: claude-4.6-sonnet: auth failed");
+    expect(logsCombined).toContain("provider said: invalid x-api-key: [redacted]");
+    expect(logsCombined).not.toContain("sk-ant-secret123456789");
+    expect(providerError.message).toBe("invalid x-api-key: sk-ant-secret123456789");
+  });
+
+  test("preserves transport metadata when sanitizing rethrown provider failures", async () => {
+    const sessionMeta = {
+      ...baseSessionMeta,
+      models: [{ model: "gpt-5.2-pro", status: "running" }],
+    } as SessionMetadata;
+
+    sessionStoreMock.readSession.mockResolvedValue(sessionMeta);
+    sessionStoreMock.readModelLog.mockResolvedValue("");
+    const transportError = new OracleTransportError(
+      "model-unavailable",
+      "The requested model does not exist for sk-secret123456789",
+    );
+
+    const summary: MultiModelRunSummary = {
+      fulfilled: [],
+      rejected: [
+        {
+          model: "gpt-5.2-pro" as ModelName,
+          reason: transportError,
+        },
+      ],
+      elapsedMs: 500,
+    };
+    vi.mocked(runMultiModelApiSession).mockResolvedValue(summary);
+
+    let thrown: unknown;
+    try {
+      await performSessionRun({
+        sessionMeta,
+        runOptions: {
+          ...baseRunOptions,
+          models: ["gpt-5.2-pro", "gpt-5.1"],
+        },
+        mode: "api",
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({
+      reason: "model-unavailable",
+      message: expect.stringContaining("gpt-5.2-pro: model unavailable"),
+    });
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      transport: { reason: "model-unavailable" },
+    });
+    expect(finalUpdate?.errorMessage).toContain("gpt-5.2-pro: model unavailable");
+    expect(finalUpdate?.errorMessage).not.toContain("sk-secret123456789");
+    const logsCombined = log.mock.calls.map((c) => c[0]).join("\n");
+    expect(logsCombined).toContain("Transport: model-unavailable");
+    expect(logsCombined).not.toContain("sk-secret123456789");
+    expect(transportError.message).toBe(
+      "The requested model does not exist for sk-secret123456789",
+    );
   });
 
   test("prints tips before the first model heading in multi-model TTY streaming", async () => {
@@ -725,13 +1031,29 @@ describe("performSessionRun", () => {
       usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 },
       elapsedMs: 2000,
       runtime: { chromePid: 123, chromePort: 9222, userDataDir: "/tmp/profile" },
+      modelSelection: {
+        requestedModel: "GPT-5.5 Pro",
+        resolvedLabel: "Pro",
+        strategy: "select",
+        status: "already-selected",
+        verified: true,
+        source: "chatgpt-model-picker",
+        capturedAt: "2026-05-13T00:00:00.000Z",
+      },
+      warnings: [
+        {
+          code: "browser-pro-fast-large-run",
+          severity: "warning",
+          message: "Large browser Pro run completed quickly.",
+        },
+      ],
       answerText: "Answer",
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
     });
 
     await performSessionRun({
       sessionMeta: baseSessionMeta,
-      runOptions: baseRunOptions,
+      runOptions: { ...baseRunOptions, writeOutputPath: "/tmp/browser-output.md" },
       mode: "browser",
       browserConfig: { chromePath: null },
       cwd: "/tmp",
@@ -745,7 +1067,11 @@ describe("performSessionRun", () => {
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
       status: "completed",
-      browser: expect.objectContaining({ runtime: expect.objectContaining({ chromePid: 123 }) }),
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining({ chromePid: 123 }),
+        modelSelection: expect.objectContaining({ resolvedLabel: "Pro" }),
+        warnings: [expect.objectContaining({ code: "browser-pro-fast-large-run" })],
+      }),
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
     });
     expect(finalUpdate).toHaveProperty("errorMessage", undefined);
@@ -758,6 +1084,14 @@ describe("performSessionRun", () => {
       baseSessionMeta.id,
       "gpt-5.2-pro",
       expect.objectContaining({ status: "completed" }),
+    );
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
+    );
+    expect(vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      (
+        fsPromises.writeFile as unknown as { mock: { invocationCallOrder: number[] } }
+      ).mock.invocationCallOrder.at(-1) ?? 0,
     );
   });
 
@@ -872,10 +1206,26 @@ describe("performSessionRun", () => {
       stage: "execute-browser",
     });
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+    const staleSessionMeta = {
+      ...baseSessionMeta,
+      browser: {
+        config: { desiredModel: "Old Pro" },
+        runtime: { promptSubmitted: true, tabUrl: "https://chatgpt.com/c/old" },
+        modelSelection: {
+          requestedModel: "Old Pro",
+          resolvedLabel: "Old Pro",
+          strategy: "select" as const,
+          status: "already-selected" as const,
+          verified: true,
+          source: "chatgpt-model-picker" as const,
+          capturedAt: "2026-07-02T00:00:00.000Z",
+        },
+      },
+    };
 
     await expect(
       performSessionRun({
-        sessionMeta: baseSessionMeta,
+        sessionMeta: staleSessionMeta,
         runOptions: baseRunOptions,
         mode: "browser",
         browserConfig: { chromePath: null },
@@ -892,6 +1242,8 @@ describe("performSessionRun", () => {
       errorMessage: "automation failed",
       browser: expect.objectContaining({ config: expect.any(Object) }),
     });
+    expect(finalUpdate?.browser?.runtime).toBeUndefined();
+    expect(finalUpdate?.browser).not.toHaveProperty("modelSelection");
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,
       "gpt-5.2-pro",
@@ -900,9 +1252,294 @@ describe("performSessionRun", () => {
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).not.toContain("Next steps (browser fallback)");
     expect(logLines).not.toContain("--engine api");
+    expect(logLines).not.toContain("This run did not return cleanly");
+  });
+
+  test("preserves persisted runtime hints when browser automation fails without runtime details", async () => {
+    const automationError = new BrowserAutomationError(
+      "Prompt did not appear in conversation before timeout (send may have failed)",
+      { stage: "submit-prompt", code: "prompt-commit-timeout" },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      // Simulate the runtime hint emitted right after the send click,
+      // before commit verification fails.
+      await (
+        deps as {
+          persistRuntimeHint?: (
+            runtime: Record<string, unknown>,
+            modelSelection?: Record<string, unknown>,
+          ) => Promise<void>;
+        }
+      ).persistRuntimeHint?.(
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
+      throw automationError;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: { ...baseSessionMeta },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/prompt did not appear/i);
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: expect.objectContaining({
+        config: expect.any(Object),
+        runtime: expect.objectContaining({
+          promptSubmitted: true,
+          tabUrl: "https://chatgpt.com/c/demo",
+        }),
+        modelSelection: expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
+      }),
+      error: expect.objectContaining({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      }),
+    });
   });
 
   test("keeps session running when browser connection is lost", async () => {
+    const automationError = new BrowserAutomationError(
+      "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",
+      {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        disconnectCause: "cdp-client-disconnect",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
+      throw automationError;
+    });
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(new Error("target not ready"));
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "running",
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining({ chromePort: 9222 }),
+        modelSelection: expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
+      }),
+    });
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({ status: "running" }),
+    );
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain(
+      "Chrome disconnected before completion; keeping session running for reattach.",
+    );
+    expect(logLines).toContain("oracle session sess-1 --render");
+    expect(logLines).toContain("Auto-reattach attempt 1");
+  });
+
+  test("skips auto-reattach when disconnect is classified non-recoverable", async () => {
+    const automationError = new BrowserAutomationError(
+      "Chrome window closed before oracle finished. Please keep it open until completion.",
+      {
+        stage: "connection-lost",
+        recoverableDisconnect: false,
+        disconnectCause: "chrome-closed",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async () => {
+      throw automationError;
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain("Skipping auto-reattach: disconnect classified as non-recoverable.");
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "running",
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+    });
+  });
+
+  test("connection-loss recovery is one-shot by default (no infinite retry loop)", async () => {
+    const automationError = new BrowserAutomationError(
+      "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",
+      {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        disconnectCause: "cdp-client-disconnect",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          chromeTargetId: "TARGET-1",
+          promptSubmitted: true,
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async () => {
+      throw automationError;
+    });
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(new Error("target not ready yet"));
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain("Auto-reattach will try up to 1 attempt(s).");
+    expect(logLines).toContain("Auto-reattach stopped after 1 attempt(s)");
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "running",
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+    });
+  });
+
+  test("auto-reattaches after connection loss and marks session completed", async () => {
+    const automationError = new BrowserAutomationError(
+      "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",
+      {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        disconnectCause: "cdp-client-disconnect",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          chromeTargetId: "TARGET-1",
+          promptSubmitted: true,
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          chromeTargetId: "TARGET-1",
+          promptSubmitted: true,
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
+      throw automationError;
+    });
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
+      answerText: "recovered answer",
+      answerMarkdown: "recovered **answer**",
+    });
+    vi.mocked(ensureSessionArtifacts).mockResolvedValueOnce([
+      { kind: "transcript", path: "/tmp/transcript.md" },
+    ]);
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "completed",
+      response: { status: "completed" },
+    });
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain("Auto-reattach succeeded; session marked completed.");
+  });
+
+  test("marks copied-profile connection loss as non-reattachable", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome window closed before oracle finished.",
       {
@@ -916,44 +1553,121 @@ describe("performSessionRun", () => {
     );
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
 
-    await performSessionRun({
-      sessionMeta: baseSessionMeta,
-      runOptions: baseRunOptions,
-      mode: "browser",
-      browserConfig: { chromePath: null },
-      cwd: "/tmp",
-      log,
-      write,
-      version: cliVersion,
-    });
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, copyProfileSource: "/tmp/source-profile" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Chrome window closed");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({ status: "error" });
+    expect(finalUpdate?.browser?.runtime).toBeUndefined();
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({ status: "error" }),
+    );
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).not.toContain("keeping session running for reattach");
+    expect(logLines).not.toContain("oracle session sess-1 --render");
+  });
+
+  test("marks early browser disconnect as error before a conversation exists", async () => {
+    const automationError = new BrowserAutomationError(
+      "Chrome window closed before oracle reached the composer.",
+      {
+        stage: "connection-lost",
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/",
+        },
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/Chrome window closed/);
 
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
-      status: "running",
-      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      status: "error",
+      response: { status: "error", incompleteReason: "chrome-disconnected" },
       browser: expect.objectContaining({ runtime: expect.objectContaining({ chromePort: 9222 }) }),
     });
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,
       "gpt-5.2-pro",
-      expect.objectContaining({ status: "running" }),
+      expect.objectContaining({
+        status: "error",
+        response: { status: "error", incompleteReason: "chrome-disconnected" },
+      }),
     );
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain(
-      "Chrome disconnected before completion; keeping session running for reattach.",
+      "Chrome disconnected before a ChatGPT conversation was created; marking session error.",
     );
+    expect(logLines).not.toContain("oracle session sess-1 --render");
   });
 
   test("marks browser capture incomplete when assistant response times out", async () => {
-    const automationError = new BrowserAutomationError("assistant timed out", {
-      stage: "assistant-timeout",
-      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
-      diagnostics: {
-        domPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.dom.json",
-        screenshotPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.png",
+    const automationError = new BrowserAutomationError(
+      "ChatGPT displayed a rate-limit warning while waiting for the assistant: Too many requests.",
+      {
+        stage: "assistant-timeout",
+        code: "chatgpt-ui-warning",
+        uiWarning: {
+          type: "rate_limit",
+          message: "Too many requests.",
+        },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+        },
+        diagnostics: {
+          domPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.dom.json",
+          screenshotPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.png",
+        },
       },
+    );
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
+      throw automationError;
     });
-    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
 
     await performSessionRun({
       sessionMeta: baseSessionMeta,
@@ -970,9 +1684,17 @@ describe("performSessionRun", () => {
     expect(finalUpdate).toMatchObject({
       status: "error",
       response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-      browser: expect.objectContaining({ runtime: expect.objectContaining({ chromePort: 9222 }) }),
+      browser: expect.objectContaining({
+        runtime: expect.objectContaining({ chromePort: 9222 }),
+        modelSelection: expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
+      }),
       error: expect.objectContaining({
         details: expect.objectContaining({
+          code: "chatgpt-ui-warning",
+          uiWarning: {
+            type: "rate_limit",
+            message: "Too many requests.",
+          },
           diagnostics: expect.objectContaining({
             domPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.dom.json",
             screenshotPath: "/tmp/.oracle/sessions/sess-1/artifacts/assistant-timeout.png",
@@ -998,8 +1720,12 @@ describe("performSessionRun", () => {
     );
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain(
+      "ERROR: ChatGPT displayed a rate-limit warning while waiting for the assistant: Too many requests.",
+    );
+    expect(logLines).toContain(
       "Assistant response timed out; marking capture incomplete for reattach.",
     );
+    expect(logLines).toContain("oracle session sess-1 --render");
   });
 
   test("records runtime and guidance when cloudflare challenge is detected", async () => {
@@ -1053,6 +1779,70 @@ describe("performSessionRun", () => {
     expect(logLines).toContain(
       "Reuse this browser profile with: oracle --engine browser --browser-manual-login",
     );
+    expect(logLines).not.toContain("oracle session sess-1 --render");
+  });
+
+  test("does not advertise reattach for a removed copied profile after Cloudflare", async () => {
+    const automationError = new BrowserAutomationError(
+      "Cloudflare challenge detected. Copy-profile runs cannot be retained.",
+      {
+        stage: "cloudflare-challenge",
+        reattachable: false,
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, copyProfileSource: "/tmp/source-profile" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Copy-profile runs cannot be retained");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime).toBeUndefined();
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).toContain("Cloudflare challenge detected; copied profile closed and removed.");
+    expect(logLines).not.toContain("browser left running");
+    expect(logLines).not.toContain("oracle session sess-1 --render");
+  });
+
+  test("does not auto-reattach after a copied-profile assistant timeout", async () => {
+    const automationError = new BrowserAutomationError("assistant timed out", {
+      stage: "assistant-timeout",
+      reattachable: false,
+    });
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          chromePath: null,
+          copyProfileSource: "/tmp/source-profile",
+          autoReattachIntervalMs: 100,
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("assistant timed out");
+
+    expect(resumeBrowserSession).not.toHaveBeenCalled();
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime).toBeUndefined();
+    const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logLines).not.toContain("capture incomplete for reattach");
+    expect(logLines).not.toContain("oracle session sess-1 --render");
   });
 
   test("auto-reattaches after assistant timeout when configured", async () => {
@@ -1060,7 +1850,26 @@ describe("performSessionRun", () => {
       stage: "assistant-timeout",
       runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
     });
-    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+        {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-03T00:00:00.000Z",
+        },
+      );
+      throw automationError;
+    });
     vi.mocked(resumeBrowserSession).mockResolvedValue({
       answerText: "ok text",
       answerMarkdown: "ok markdown",
@@ -1103,8 +1912,68 @@ describe("performSessionRun", () => {
         { kind: "deep-research-report", path: "/tmp/deep-research-report.md" },
       ],
       response: { status: "completed" },
+      browser: expect.objectContaining({
+        modelSelection: expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
+      }),
     });
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls).toContainEqual([
+      baseSessionMeta.id,
+      expect.objectContaining({
+        status: "running",
+        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      }),
+    ]);
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
+    );
+  });
+
+  test("does not repeat completion side effects when auto-reattach persistence fails", async () => {
+    const automationError = new BrowserAutomationError("assistant timed out", {
+      stage: "assistant-timeout",
+      runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
+    });
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+    vi.mocked(resumeBrowserSession).mockResolvedValue({
+      answerText: "ok text",
+      answerMarkdown: "ok markdown",
+    });
+    sessionStoreMock.updateSession.mockImplementation(
+      async (_sessionId: string, updates: Partial<SessionMetadata>) => {
+        if (updates.status === "completed") {
+          throw new Error("metadata write failed");
+        }
+        return { ...baseSessionMeta, ...updates };
+      },
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          chromePath: null,
+          autoReattachDelayMs: 0,
+          autoReattachIntervalMs: 1,
+          autoReattachTimeoutMs: 1000,
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("metadata write failed");
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendSessionNotification)).toHaveBeenCalledTimes(1);
+    expect(sessionStoreMock.createLogWriter).toHaveBeenCalledTimes(1);
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      errorMessage: "metadata write failed",
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+    });
   });
 
   test("auto-reattach stops after a hard cap when it cannot capture an answer", async () => {
@@ -1148,7 +2017,12 @@ describe("performSessionRun", () => {
       });
       const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
       expect(logLines).toContain("Auto-reattach stopped");
-      expect(logLines).toContain("Reattach later with: oracle session");
+      expect(logLines).toContain(
+        "This run did not return cleanly, but it may still be alive. Reattach:",
+      );
+      expect(logLines).toContain("oracle session sess-1 --render");
+      expect(logLines).toContain("oracle session sess-1 --live");
+      expect(logLines).toContain("oracle session sess-1 --harvest");
     } finally {
       vi.useRealTimers();
     }

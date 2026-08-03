@@ -43,6 +43,24 @@ function mockClientFactory() {
         if (process.env.ORACLE_TEST_REQUIRE_PREV === "1" && !body.previous_response_id) {
           throw new Error("MISSING_PREVIOUS_RESPONSE_ID");
         }
+        if (
+          process.env.ORACLE_TEST_REQUIRE_MODEL &&
+          body.model !== process.env.ORACLE_TEST_REQUIRE_MODEL
+        ) {
+          throw new Error(`UNEXPECTED_MODEL:${body.model}`);
+        }
+        if (
+          process.env.ORACLE_TEST_REQUIRE_REASONING_EFFORT &&
+          body.reasoning?.effort !== process.env.ORACLE_TEST_REQUIRE_REASONING_EFFORT
+        ) {
+          throw new Error(`UNEXPECTED_REASONING_EFFORT:${body.reasoning?.effort}`);
+        }
+        if (
+          process.env.ORACLE_TEST_REQUIRE_REASONING_MODE &&
+          body.reasoning?.mode !== process.env.ORACLE_TEST_REQUIRE_REASONING_MODE
+        ) {
+          throw new Error(`UNEXPECTED_REASONING_MODE:${body.reasoning?.mode}`);
+        }
         responseCounter += 1;
         const response = {
           id: `resp_mock${Date.now()}${responseCounter}`,

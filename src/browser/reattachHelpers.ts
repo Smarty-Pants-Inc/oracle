@@ -1,5 +1,7 @@
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import { CONVERSATION_TURN_SELECTOR } from "./constants.js";
+import { buildConversationTurnCountExpression } from "./conversationTurns.js";
+import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import { readAssistantSnapshot } from "./pageActions.js";
 
@@ -21,15 +23,26 @@ type PromptEchoMatcher = { isEcho: (text: string) => boolean };
 
 export function pickTarget(
   targets: TargetInfoLite[],
-  runtime: { chromeTargetId?: string; tabUrl?: string },
+  runtime: { chromeTargetId?: string; tabUrl?: string; conversationId?: string },
 ): TargetInfoLite | undefined {
   if (!Array.isArray(targets) || targets.length === 0) {
     return undefined;
   }
-  if (runtime.chromeTargetId) {
-    const byId = targets.find((t) => (t.targetId ?? t.id) === runtime.chromeTargetId);
-    if (byId) return byId;
+  const conversationId =
+    runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? "");
+  const byId = runtime.chromeTargetId
+    ? targets.find((target) => (target.targetId ?? target.id) === runtime.chromeTargetId)
+    : undefined;
+  if (conversationId) {
+    if (byId && extractConversationIdFromUrl(byId.url ?? "") === conversationId) {
+      return byId;
+    }
+    const byConversation = targets.find(
+      (target) => extractConversationIdFromUrl(target.url ?? "") === conversationId,
+    );
+    if (byConversation) return byConversation;
   }
+  if (byId) return byId;
   if (runtime.tabUrl) {
     const byUrl =
       targets.find((t) => t.url?.startsWith(runtime.tabUrl as string)) ||
@@ -40,9 +53,7 @@ export function pickTarget(
 }
 
 export function extractConversationIdFromUrl(url: string): string | undefined {
-  if (!url) return undefined;
-  const match = url.match(/\/c\/([a-zA-Z0-9-]+)/);
-  return match?.[1];
+  return extractStableConversationIdFromUrl(url);
 }
 
 export function buildConversationUrl(
@@ -50,7 +61,7 @@ export function buildConversationUrl(
   baseUrl: string,
 ): string | null {
   if (runtime.tabUrl) {
-    if (runtime.tabUrl.includes("/c/")) {
+    if (extractConversationIdFromUrl(runtime.tabUrl)) {
       return runtime.tabUrl;
     }
     return null;
@@ -297,10 +308,9 @@ export async function readConversationTurnIndex(
   Runtime: ChromeClient["Runtime"],
   logger?: BrowserLogger,
 ): Promise<number | null> {
-  const selectorLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   try {
     const { result } = await Runtime.evaluate({
-      expression: `document.querySelectorAll(${selectorLiteral}).length`,
+      expression: buildConversationTurnCountExpression(),
       returnByValue: true,
     });
     const raw = typeof result?.value === "number" ? result.value : Number(result?.value);

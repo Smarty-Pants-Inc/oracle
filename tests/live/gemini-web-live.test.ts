@@ -38,25 +38,23 @@ function looksLikeJpeg(bytes: Uint8Array): boolean {
 }
 
 (live ? describe : describe.skip)("Gemini web (cookie) live smoke", () => {
-  it("returns a short text answer (no image ops)", async () => {
-    if (!(await assertHasGeminiChromeCookies())) return;
+  it.each(["Gemini 3.1 Flash-Lite", "Gemini 3.5 Flash", "Gemini 3.1 Pro"])(
+    "returns a short text answer with %s",
+    async (desiredModel) => {
+      if (!(await assertHasGeminiChromeCookies())) return;
 
-    const exec = createGeminiWebExecutor({});
-    try {
+      const exec = createGeminiWebExecutor({});
       const result = await exec({
         prompt: "Say OK.",
-        config: { chromeProfile: "Default", desiredModel: "Gemini 3 Pro", timeoutMs: 120_000 },
+        config: { chromeProfile: "Default", desiredModel, timeoutMs: 120_000 },
         log: () => {},
       });
 
       expect(result.answerText.toLowerCase()).toContain("ok");
       expect(result.answerChars).toBeGreaterThan(1);
-    } catch (error) {
-      console.warn(
-        `Skipping Gemini web text test due to transient error: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }, 120_000);
+    },
+    120_000,
+  );
 
   it("accepts an attachment upload (image) without failing", async () => {
     if (!(await assertHasGeminiChromeCookies())) return;

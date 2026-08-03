@@ -1,6 +1,7 @@
 export type TokenizerFn = (input: unknown, options?: Record<string, unknown>) => number;
 
 export type KnownModelName =
+  | "gpt-5.6"
   | "gpt-5.6-sol"
   | "gpt-5.6-sol-pro"
   | "gpt-5.5"
@@ -14,7 +15,9 @@ export type KnownModelName =
   | "gpt-5.2"
   | "gpt-5.2-instant"
   | "gpt-5.2-pro"
+  | "gemini-3.1-flash-lite"
   | "gemini-3.1-pro"
+  | "gemini-3.5-flash"
   | "gemini-3-pro"
   | "claude-4.6-sonnet"
   | "claude-4.1-opus"
@@ -33,9 +36,8 @@ export type ProModelName =
   | "claude-4.6-sonnet"
   | "claude-4.1-opus";
 
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
-export type ReasoningMode = "pro";
-
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningMode = "standard" | "pro";
 export interface ReasoningConfig {
   effort?: ReasoningEffort;
   mode?: ReasoningMode;
@@ -43,11 +45,16 @@ export interface ReasoningConfig {
 
 export type ThinkingTimeLevel = "light" | "standard" | "extended" | "heavy";
 
+export type BrowserBundleFormat = "auto" | "text" | "zip";
+
 export interface AzureOptions {
   endpoint?: string;
   apiVersion?: string;
   deployment?: string;
 }
+
+export type ApiProviderMode = "auto" | "openai" | "azure";
+export type PartialMode = "fail" | "ok";
 
 export type ClientFactory = (
   apiKey: string,
@@ -85,15 +92,44 @@ export interface ModelConfig {
   searchToolType?: ToolConfig["type"];
 }
 
+/**
+ * API-only user-config override for a single known model entry. Lets users running against
+ * custom OpenAI-compatible gateways (e.g. a LiteLLM proxy) remap the on-wire model
+ * id and reasoning effort without editing bundled model configs. Applied on top of
+ * an existing {@link MODEL_CONFIGS} entry, so the tokenizer and other fields are
+ * inherited from the known model.
+ */
+export interface ModelConfigOverride {
+  /** On-wire model id sent to the API (overrides the known entry's apiModel/model). */
+  apiModel?: string;
+  /** Reasoning effort override; `null` explicitly clears the known model's reasoning. */
+  reasoning?: { effort: ReasoningEffort } | null;
+  /** Context window override (positive integer). */
+  inputLimit?: number;
+  /** Pricing override; `null` clears the known entry's pricing. */
+  pricing?: {
+    inputPerToken: number;
+    outputPerToken: number;
+  } | null;
+}
+
+/** Map of known model name -> override, sourced from user config only. */
+export type ModelOverridesConfig = Record<string, ModelConfigOverride>;
+
 export interface FileContent {
   path: string;
   content: string;
 }
 
 export interface FileSection {
+  /** Legacy 1-based file number retained for callers that inspect createFileSections() output. */
   index: number;
   absolutePath: string;
   displayPath: string;
+  /**
+   * Legacy raw fenced section text using the historical `### File N:` heading.
+   * Generated model prompt context should render from displayPath/content instead.
+   */
   sectionText: string;
   content: string;
 }
@@ -146,6 +182,10 @@ export interface RunOracleOptions {
   prompt: string;
   model: ModelName;
   models?: ModelName[];
+  /** Reasoning effort override. GPT-5.6 API models only. */
+  reasoningEffort?: ReasoningEffort;
+  /** Responses API reasoning execution mode. GPT-5.6 API models only. */
+  reasoningMode?: ReasoningMode;
   /**
    * Continue an OpenAI Responses API conversation by chaining from a prior response id.
    * This maps to the Responses API field `previous_response_id`.
@@ -167,9 +207,12 @@ export interface RunOracleOptions {
   preview?: boolean | string;
   previewMode?: PreviewMode;
   apiKey?: string;
+  provider?: ApiProviderMode;
   baseUrl?: string;
   azure?: AzureOptions;
   sessionId?: string;
+  /** User-config per-model overrides (apiModel/reasoning/inputLimit/pricing) applied over known model configs. */
+  modelOverrides?: ModelOverridesConfig;
   effectiveModelId?: string;
   verbose?: boolean;
   heartbeatIntervalMs?: number;
@@ -180,6 +223,7 @@ export interface RunOracleOptions {
   browserAttachments?: "auto" | "never" | "always";
   browserInlineFiles?: boolean;
   browserBundleFiles?: boolean;
+  browserBundleFormat?: BrowserBundleFormat;
   /** Browser image generation output path. */
   generateImage?: string;
   /** Optional output path used by browser image operations. */
@@ -189,9 +233,13 @@ export interface RunOracleOptions {
    * the same ChatGPT conversation.
    */
   browserFollowUps?: string[];
+  /** Browser-only: open this existing ChatGPT conversation before submitting the prompt. */
+  browserResumeConversationUrl?: string;
   background?: boolean;
   /** Optional absolute path to save only the assistant's final text output. */
   writeOutputPath?: string;
+  /** Multi-model failure policy: fail the command or accept partial success. */
+  partialMode?: PartialMode;
   /** Number of seconds to wait before timing out, or 'auto' to use model defaults. */
   timeoutSeconds?: number | "auto";
   /** Override HTTP client timeout (milliseconds). */
@@ -251,6 +299,8 @@ export interface RunOracleDeps {
 
 export interface BuildRequestBodyParams {
   modelConfig: ModelConfig;
+  reasoningEffort?: ReasoningEffort;
+  reasoningMode?: ReasoningMode;
   systemPrompt: string;
   userPrompt: string;
   searchEnabled: boolean;
@@ -276,7 +326,7 @@ export interface OracleRequestBody {
     }>;
   }>;
   tools?: ToolConfig[];
-  reasoning?: ReasoningConfig;
+  reasoning?: { effort?: ReasoningEffort; mode?: ReasoningMode };
   max_output_tokens?: number;
   background?: boolean;
   store?: boolean;

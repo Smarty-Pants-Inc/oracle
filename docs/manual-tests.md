@@ -68,6 +68,20 @@ Run this when touching session serialization, file IO helpers, or CLI flag plumb
 3. Multi-model spot-check: `oracle --models "gpt-5.1-pro,gemini-3-pro" --prompt "two files" --write-output /tmp/out.md --wait`
    - Confirm `/tmp/out.gpt-5.1-pro.md` and `/tmp/out.gemini-3-pro.md` exist with distinct content.
 
+### CLI guardrails and perf traces
+
+Run this when touching top-level CLI startup, option parsing, signal handling, or trace output.
+
+1. Missing prompt:
+   `pnpm run oracle -- --engine api`
+   - Expect help plus a nonzero exit code.
+2. Preview conflict:
+   `pnpm run oracle -- --dry-run summary --render --prompt "conflict"`
+   - Expect a clear conflict error and nonzero exit.
+3. Perf trace:
+   `pnpm run oracle -- --perf-trace --perf-trace-path /tmp/oracle-perf.json --dry-run summary --prompt "trace smoke"`
+   - Confirm the JSON contains `cli-module-ready`, `root-command-start`, `first-output`, and `exit`, and prompt/key-like argv values are redacted.
+
 ### Lightweight Browser CLI (manual exploration)
 
 Before running any agent-driven debugging, you can rely on the TypeScript CLI in `scripts/browser-tools.ts`:
@@ -155,6 +169,10 @@ Run these four smoke tests whenever we touch browser automation:
 2. **GPT-5.5 simple prompt**
    `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "List two reasons Markdown is handy"`
    Confirm the answer arrives (and only once) even if it takes ~2–3 minutes.
+
+2b. **GPT-5.5 Instant smoke**
+`pnpm run oracle -- --engine browser --model gpt-5.5-instant --prompt "Give me two short markdown bullet points about tables"`
+Expect a near-instant response (no Thinking spinner) and confirm the composer pill shows the "Instant" row, not "Thinking 5.5" or "Pro". Run after any change to the 5.5 picker tokens.
 
 3. **GPT-5.5 + attachment**
    Prepare `/tmp/browser-md.txt` with a short note, then run
@@ -259,7 +277,7 @@ Use this when you need to inspect the live ChatGPT composer (DOM state, markdown
      }
      ```
    - Once the server prints `chrome-devtools-mcp exposes…`, you can list/call tools via `mcporter`.
-   - Oracle’s attach-running mode no longer depends on MCP at runtime; `mcporter` remains useful here for manual inspection only.
+   - This fork rejects attach-running before browser discovery; `mcporter` remains useful here for manual inspection only.
 
 4. **Interact & capture**
    - Use MCP tools (`click`, `evaluate_js`, `screenshot`, etc.) to debug the composer contents.
@@ -282,9 +300,9 @@ These Vitest cases hit the real OpenAI API to exercise both transports:
    pnpm vitest run tests/live/openai-live.test.ts
    ```
 2. The first two tests target the standard GPT-5 (`gpt-5.1` / `gpt-5.2`) foreground
-   streaming paths. The later background tests send `gpt-5.6-sol-pro` and `gpt-5.2-pro`
-   prompts and expect the CLI to stay in background mode until OpenAI finishes
-   (up to 30 minutes).
+   streaming paths. The later background tests send `gpt-5.5-pro` and GPT-5.6 Sol
+   with Pro mode and max reasoning effort prompts and expect the CLI to stay in
+   background mode until OpenAI finishes (up to 30 minutes).
 3. Watch the console for `Reconnected to OpenAI background response...` if
    you're debugging transport flakiness; the test will fail if the response
    status isn't `completed` or if the text doesn't contain the hard-coded

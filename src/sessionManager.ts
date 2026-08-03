@@ -1,7 +1,8 @@
 import path from "node:path";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdirSync } from "node:fs";
 import type { WriteStream } from "node:fs";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import type {
   BrowserArchiveMode,
@@ -12,11 +13,18 @@ import type {
 } from "./browser/types.js";
 import type {
   TransportFailureReason,
+  ApiProviderMode,
   AzureOptions,
+  BrowserBundleFormat,
   ModelName,
+  ModelOverridesConfig,
+  PartialMode,
+  ReasoningEffort,
+  ReasoningMode,
   ThinkingTimeLevel,
 } from "./oracle.js";
-import { DEFAULT_API_MODEL, DEFAULT_BROWSER_MODEL, formatElapsed } from "./oracle.js";
+import { DEFAULT_MODEL } from "./oracle/config.js";
+import { formatElapsed } from "./oracle/format.js";
 import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
 
@@ -33,6 +41,8 @@ export interface BrowserSessionConfig {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for attachment upload/readiness before clicking send. */
+  attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
   assistantRecheckDelayMs?: number;
   /** Time budget for the delayed recheck attempt. */
@@ -65,12 +75,16 @@ export interface BrowserSessionConfig {
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;
+  /** Copy this signed-in Chrome user-data dir to a throwaway profile and run against it (login-free). */
+  copyProfileSource?: string | null;
   /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
   thinkingTime?: ThinkingTimeLevel;
   /** Browser-only research mode. "deep" activates ChatGPT Deep Research. */
   researchMode?: BrowserResearchMode;
   /** Archive completed ChatGPT conversations after local artifacts are saved. */
   archiveConversations?: BrowserArchiveMode;
+  /** Browser-only: existing ChatGPT conversation URL to resume before submitting. */
+  resumeConversationUrl?: string | null;
 }
 
 export interface BrowserRuntimeMetadata {
@@ -84,6 +98,8 @@ export interface BrowserRuntimeMetadata {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
+  /** True after Oracle has submitted the prompt to ChatGPT. */
+  promptSubmitted?: boolean;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }
@@ -108,20 +124,76 @@ export interface BrowserHarvestMetadata {
   runtimeRepaired?: boolean;
 }
 
+export type BrowserModelSelectionEvidenceStatus =
+  | "already-selected"
+  | "switched"
+  | "switched-best-effort"
+  | "skipped"
+  | "unavailable";
+
+export interface BrowserModelSelectionEvidence {
+  requestedModel?: string | null;
+  resolvedLabel?: string | null;
+  strategy?: BrowserModelStrategy;
+  status: BrowserModelSelectionEvidenceStatus;
+  verified: boolean;
+  source: "chatgpt-model-picker" | "config";
+  capturedAt: string;
+}
+
+export interface BrowserRunWarning {
+  code: string;
+  severity: "warning";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
 export interface BrowserMetadata {
   config?: BrowserSessionConfig;
   runtime?: BrowserRuntimeMetadata;
   harvest?: BrowserHarvestMetadata;
   archive?: BrowserArchiveResult;
+  modelSelection?: BrowserModelSelectionEvidence;
+  warnings?: BrowserRunWarning[];
+}
+
+export type SessionArtifactValidationType = "generic" | "zip";
+export type SessionArtifactTransferStatus =
+  | "not-needed"
+  | "ready"
+  | "streaming"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+export interface SessionArtifactValidation {
+  type: SessionArtifactValidationType;
+  ok: boolean;
+  error?: string;
+}
+
+export interface SessionArtifactTransfer {
+  status: SessionArtifactTransferStatus;
+  bytes?: number;
+  error?: string;
+}
+
+export interface SessionArtifactOrigin {
+  mode: "local" | "bridge";
+  host?: string;
 }
 
 export interface SessionArtifact {
-  kind: "transcript" | "deep-research-report" | "image";
+  kind: "transcript" | "deep-research-report" | "image" | "file";
   path: string;
   label?: string;
   mimeType?: string;
   sizeBytes?: number;
   sourceUrl?: string;
+  sha256?: string;
+  validation?: SessionArtifactValidation;
+  transfer?: SessionArtifactTransfer;
+  origin?: SessionArtifactOrigin;
 }
 
 export interface SessionResponseMetadata {
@@ -147,9 +219,11 @@ export interface StoredRunOptions {
   maxFileSizeBytes?: number;
   model?: string;
   models?: ModelName[];
+  reasoningEffort?: ReasoningEffort;
+  reasoningMode?: ReasoningMode;
   /** Responses API chaining (maps to `previous_response_id`). */
   previousResponseId?: string;
-  /** Optional session slug that provided the parent response when using `--followup <sessionId>`. */
+  /** Optional parent session slug when using `--followup <sessionId>`. */
   followupSessionId?: string;
   /** Optional model selector used with --followup-model for multi-model parent sessions. */
   followupModel?: string;
@@ -166,13 +240,17 @@ export interface StoredRunOptions {
   browserAttachments?: "auto" | "never" | "always";
   browserInlineFiles?: boolean;
   browserBundleFiles?: boolean;
+  browserBundleFormat?: BrowserBundleFormat;
   background?: boolean;
   search?: boolean;
+  provider?: ApiProviderMode;
   baseUrl?: string;
   azure?: AzureOptions;
   effectiveModelId?: string;
+  modelOverrides?: ModelOverridesConfig;
   renderPlain?: boolean;
   writeOutputPath?: string;
+  partialMode?: PartialMode;
   timeoutSeconds?: number | "auto";
   httpTimeoutMs?: number;
   zombieTimeoutMs?: number;
@@ -184,6 +262,7 @@ export interface StoredRunOptions {
   editImage?: string;
   outputPath?: string;
   browserFollowUps?: string[];
+  browserResumeConversationUrl?: string;
   aspectRatio?: string;
   geminiShowThoughts?: boolean;
 }
@@ -215,9 +294,19 @@ export interface SessionMetadata {
   response?: SessionResponseMetadata;
   transport?: SessionTransportMetadata;
   error?: SessionUserErrorMetadata;
+  lifecycle?: SessionLifecycleMetadata;
 }
 
-export type SessionStatus = "pending" | "running" | "completed" | "error" | "cancelled";
+export type SessionStatus = "pending" | "running" | "completed" | "partial" | "error" | "cancelled";
+
+export interface SessionLifecycleMetadata {
+  engine: "api" | "browser";
+  execution: "foreground" | "background";
+  attached: boolean;
+  detached: boolean;
+  workerPid?: number;
+  reattachCommand: string;
+}
 
 export interface SessionModelRun {
   model: string;
@@ -320,6 +409,23 @@ function metaPath(id: string): string {
   return path.join(sessionDir(id), METADATA_FILENAME);
 }
 
+async function writeSessionMetadataFile(
+  sessionId: string,
+  metadata: SessionMetadata,
+): Promise<void> {
+  const targetPath = metaPath(sessionId);
+  const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await fs.rename(temporaryPath, targetPath);
+  } finally {
+    await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
 function requestPath(id: string): string {
   return path.join(sessionDir(id), LEGACY_REQUEST_FILENAME);
 }
@@ -355,14 +461,26 @@ async function fileExists(targetPath: string): Promise<boolean> {
   }
 }
 
-async function ensureUniqueSessionId(baseSlug: string): Promise<string> {
+function isFileExistsError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
+async function reserveUniqueSessionDir(baseSlug: string): Promise<string> {
   let candidate = baseSlug;
   let suffix = 2;
-  while (await fileExists(sessionDir(candidate))) {
+  for (;;) {
+    const dir = sessionDir(candidate);
+    try {
+      await fs.mkdir(dir, { recursive: false });
+      return candidate;
+    } catch (error) {
+      if (!isFileExistsError(error)) {
+        throw error;
+      }
+    }
     candidate = `${baseSlug}-${suffix}`;
     suffix += 1;
   }
-  return candidate;
 }
 
 async function listModelRunFiles(sessionId: string): Promise<SessionModelRun[]> {
@@ -440,9 +558,7 @@ export async function initializeSession(
   await ensureSessionStorage();
   const baseSlug =
     baseSlugOverride || createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
-  const sessionId = await ensureUniqueSessionId(baseSlug);
-  const dir = sessionDir(sessionId);
-  await ensureDir(dir);
+  const sessionId = await reserveUniqueSessionDir(baseSlug);
   const mode = options.mode ?? "api";
   const browserConfig = options.browserConfig;
   const modelList: ModelName[] =
@@ -472,10 +588,13 @@ export async function initializeSession(
       maxFileSizeBytes: options.maxFileSizeBytes,
       model: options.model,
       models: modelList,
+      reasoningEffort: options.reasoningEffort,
+      reasoningMode: options.reasoningMode,
       previousResponseId: options.previousResponseId,
       followupSessionId: options.followupSessionId,
       followupModel: options.followupModel,
       effectiveModelId: options.effectiveModelId,
+      modelOverrides: options.modelOverrides,
       maxInput: options.maxInput,
       system: options.system,
       maxOutput: options.maxOutput,
@@ -489,8 +608,10 @@ export async function initializeSession(
       browserAttachments: options.browserAttachments,
       browserInlineFiles: options.browserInlineFiles,
       browserBundleFiles: options.browserBundleFiles,
+      browserBundleFormat: options.browserBundleFormat,
       background: options.background,
       search: options.search,
+      provider: options.provider,
       baseUrl: options.baseUrl,
       azure: options.azure,
       timeoutSeconds: options.timeoutSeconds,
@@ -498,42 +619,45 @@ export async function initializeSession(
       zombieTimeoutMs: options.zombieTimeoutMs,
       zombieUseLastActivity: options.zombieUseLastActivity,
       writeOutputPath: options.writeOutputPath,
+      partialMode: options.partialMode,
       waitPreference: options.waitPreference,
       youtube: options.youtube,
       generateImage: options.generateImage,
       editImage: options.editImage,
       outputPath: options.outputPath,
       browserFollowUps: options.browserFollowUps,
+      browserResumeConversationUrl: options.browserResumeConversationUrl,
       aspectRatio: options.aspectRatio,
       geminiShowThoughts: options.geminiShowThoughts,
     },
   };
   await ensureDir(modelsDir(sessionId));
-  await fs.writeFile(metaPath(sessionId), JSON.stringify(metadata, null, 2), "utf8");
-  const defaultModel = metadata.mode === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL;
+  await writeSessionMetadataFile(sessionId, metadata);
   await Promise.all(
-    (modelList.length > 0 ? modelList : [metadata.model ?? defaultModel]).map(async (modelName) => {
-      const jsonPath = modelJsonPath(sessionId, modelName);
-      const logFilePath = modelLogPath(sessionId, modelName);
-      const modelRecord: SessionModelRun = {
-        model: modelName,
-        status: "pending",
-        log: { path: path.relative(sessionDir(sessionId), logFilePath) },
-      };
-      await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), "utf8");
-      await fs.writeFile(logFilePath, "", "utf8");
-    }),
+    (modelList.length > 0 ? modelList : [metadata.model ?? DEFAULT_MODEL]).map(
+      async (modelName) => {
+        const jsonPath = modelJsonPath(sessionId, modelName);
+        const logFilePath = modelLogPath(sessionId, modelName);
+        const modelRecord: SessionModelRun = {
+          model: modelName,
+          status: "pending",
+          log: { path: path.relative(sessionDir(sessionId), logFilePath) },
+        };
+        await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), "utf8");
+        await fs.writeFile(logFilePath, "", "utf8");
+      },
+    ),
   );
   await fs.writeFile(logPath(sessionId), "", "utf8");
   return metadata;
 }
 
 export async function readSessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
-  const modern = await readModernSessionMetadata(sessionId);
+  const modern = await readModernSessionMetadata(sessionId, { reconcile: true, persist: false });
   if (modern) {
     return modern;
   }
-  const legacy = await readLegacySessionMetadata(sessionId);
+  const legacy = await readLegacySessionMetadata(sessionId, { reconcile: true, persist: false });
   if (legacy) {
     return legacy;
   }
@@ -545,15 +669,23 @@ export async function updateSessionMetadata(
   updates: Partial<SessionMetadata>,
 ): Promise<SessionMetadata> {
   const existing =
-    (await readModernSessionMetadata(sessionId)) ??
-    (await readLegacySessionMetadata(sessionId)) ??
+    (await readModernSessionMetadata(sessionId, { reconcile: false, persist: false })) ??
+    (await readLegacySessionMetadata(sessionId, { reconcile: false, persist: false })) ??
     ({ id: sessionId } as SessionMetadata);
   const next = { ...existing, ...updates };
-  await fs.writeFile(metaPath(sessionId), JSON.stringify(next, null, 2), "utf8");
+  await writeSessionMetadataFile(sessionId, next);
   return next;
 }
 
-async function readModernSessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
+interface ReadSessionMetadataOptions {
+  reconcile: boolean;
+  persist: boolean;
+}
+
+async function readModernSessionMetadata(
+  sessionId: string,
+  options: ReadSessionMetadataOptions,
+): Promise<SessionMetadata | null> {
   try {
     const raw = await fs.readFile(metaPath(sessionId), "utf8");
     const parsed = JSON.parse(raw) as SessionMetadata | StoredRunOptions;
@@ -561,23 +693,57 @@ async function readModernSessionMetadata(sessionId: string): Promise<SessionMeta
       return null;
     }
     const enriched = await attachModelRuns(parsed, sessionId);
-    const runtimeChecked = await markDeadBrowser(enriched, { persist: false });
-    return await markZombie(runtimeChecked, { persist: false });
+    return options.reconcile ? reconcileSessionMetadata(enriched, options) : enriched;
   } catch {
     return null;
   }
 }
 
-async function readLegacySessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
+async function readLegacySessionMetadata(
+  sessionId: string,
+  options: ReadSessionMetadataOptions,
+): Promise<SessionMetadata | null> {
   try {
     const raw = await fs.readFile(legacySessionPath(sessionId), "utf8");
     const parsed = JSON.parse(raw) as SessionMetadata;
     const enriched = await attachModelRuns(parsed, sessionId);
-    const runtimeChecked = await markDeadBrowser(enriched, { persist: false });
-    return await markZombie(runtimeChecked, { persist: false });
+    return options.reconcile ? reconcileSessionMetadata(enriched, options) : enriched;
   } catch {
     return null;
   }
+}
+
+async function readRawSessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
+  return (
+    (await readModernSessionMetadata(sessionId, { reconcile: false, persist: false })) ??
+    (await readLegacySessionMetadata(sessionId, { reconcile: false, persist: false }))
+  );
+}
+
+async function reconcileSessionMetadata(
+  meta: SessionMetadata,
+  { persist }: { persist: boolean },
+): Promise<SessionMetadata> {
+  let current = meta;
+  const workerPid = current.lifecycle?.workerPid;
+  if (workerPid) {
+    if (isProcessAlive(workerPid)) {
+      return current;
+    }
+    current = (await readRawSessionMetadata(current.id)) ?? current;
+    if (current.status !== "running") {
+      return current;
+    }
+    if (current.lifecycle?.workerPid && isProcessAlive(current.lifecycle.workerPid)) {
+      return current;
+    }
+  }
+  const runtimeChecked = await markDeadBrowser(current);
+  const reconciled = await markZombie(runtimeChecked);
+  if (persist && reconciled !== current) {
+    await writeSessionMetadataFile(current.id, reconciled);
+  }
+  return reconciled;
 }
 
 function isSessionMetadataRecord(value: unknown): value is SessionMetadata {
@@ -597,7 +763,7 @@ async function attachModelRuns(meta: SessionMetadata, sessionId: string): Promis
 export function createSessionLogWriter(sessionId: string, model?: string): SessionLogWriter {
   const targetPath = model ? modelLogPath(sessionId, model) : logPath(sessionId);
   if (model) {
-    void ensureDir(modelsDir(sessionId));
+    mkdirSync(modelsDir(sessionId), { recursive: true });
   }
   const stream = createWriteStream(targetPath, { flags: "a" });
   const logLine = (line = ""): void => {
@@ -615,10 +781,10 @@ export async function listSessionsMetadata(): Promise<SessionMetadata[]> {
   const entries = await fs.readdir(getSessionsDir()).catch(() => []);
   const metas: SessionMetadata[] = [];
   for (const entry of entries) {
-    let meta = await readSessionMetadata(entry);
+    let meta = await readRawSessionMetadata(entry);
     if (meta) {
-      meta = await markDeadBrowser(meta, { persist: true });
-      meta = await markZombie(meta, { persist: true }); // keep stored metadata consistent with zombie detection
+      // Keep stored metadata consistent with status reconciliation done by `oracle status`.
+      meta = await reconcileSessionMetadata(meta, { persist: true });
       metas.push(meta);
     }
   }
@@ -698,7 +864,7 @@ export async function readModelLog(sessionId: string, model: string): Promise<st
 }
 
 export async function readSessionRequest(sessionId: string): Promise<StoredRunOptions | null> {
-  const modern = await readModernSessionMetadata(sessionId);
+  const modern = await readModernSessionMetadata(sessionId, { reconcile: false, persist: false });
   if (modern?.options) {
     return modern.options;
   }
@@ -786,10 +952,7 @@ export async function getSessionPaths(sessionId: string): Promise<{
   return { dir, metadata, log, request };
 }
 
-async function markZombie(
-  meta: SessionMetadata,
-  { persist }: { persist: boolean },
-): Promise<SessionMetadata> {
+async function markZombie(meta: SessionMetadata): Promise<SessionMetadata> {
   if (!(await isZombie(meta))) {
     return meta;
   }
@@ -816,16 +979,10 @@ async function markZombie(
     errorMessage: `Session marked as zombie (> ${formatElapsed(maxAgeMs)} stale)`,
     completedAt: new Date().toISOString(),
   };
-  if (persist) {
-    await fs.writeFile(metaPath(meta.id), JSON.stringify(updated, null, 2), "utf8");
-  }
   return updated;
 }
 
-async function markDeadBrowser(
-  meta: SessionMetadata,
-  { persist }: { persist: boolean },
-): Promise<SessionMetadata> {
+async function markDeadBrowser(meta: SessionMetadata): Promise<SessionMetadata> {
   if (meta.status !== "running" || meta.mode !== "browser") {
     return meta;
   }
@@ -858,9 +1015,6 @@ async function markDeadBrowser(
     completedAt: new Date().toISOString(),
     response,
   };
-  if (persist) {
-    await fs.writeFile(metaPath(meta.id), JSON.stringify(updated, null, 2), "utf8");
-  }
   return updated;
 }
 

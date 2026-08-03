@@ -60,6 +60,11 @@ describe("Gemini Client", () => {
     expect(resolveGeminiModelId("gemini-3.1-pro")).toBe("gemini-3.1-pro-preview");
   });
 
+  it("keeps current stable Flash model ids", () => {
+    expect(resolveGeminiModelId("gemini-3.5-flash")).toBe("gemini-3.5-flash");
+    expect(resolveGeminiModelId("gemini-3.1-flash-lite")).toBe("gemini-3.1-flash-lite");
+  });
+
   it("adapts create request correctly", async () => {
     const client = createGeminiClient("fake-key");
     const mockResponse = {

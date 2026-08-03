@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { Command, Option } from "commander";
 import {
   applyBrowserDefaultsFromConfig,
   type BrowserDefaultsOptions,
@@ -56,6 +57,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
         chromeCookiePath: "/tmp/cookies",
         timeoutMs: 120_000,
         inputTimeoutMs: 15_000,
+        attachmentTimeoutMs: 90_000,
         profileLockTimeoutMs: 90_000,
         maxConcurrentTabs: 4,
         cookieSyncWaitMs: 4_000,
@@ -72,6 +74,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
     expect(options.browserCookiePath).toBe("/tmp/cookies");
     expect(options.browserTimeout).toBe("120000");
     expect(options.browserInputTimeout).toBe("15000");
+    expect(options.browserAttachmentTimeout).toBe("90000");
     expect(options.browserProfileLockTimeout).toBe("90000");
     expect(options.browserMaxConcurrentTabs).toBe("4");
     expect(options.browserCookieWait).toBe("4000");
@@ -134,6 +137,98 @@ describe("applyBrowserDefaultsFromConfig", () => {
     applyBrowserDefaultsFromConfig(options, config, source);
 
     expect(options.browserThinkingTime).toBe("light");
+  });
+
+  test("does not inherit thinking time when CLI requests the current model", () => {
+    const options: BrowserDefaultsOptions = { browserModelStrategy: "current" };
+    const config: UserConfig = {
+      browser: {
+        thinkingTime: "extended",
+      },
+    };
+
+    const source = (key: keyof BrowserDefaultsOptions) =>
+      key === "browserModelStrategy" ? "cli" : "default";
+    applyBrowserDefaultsFromConfig(options, config, source);
+
+    expect(options.browserThinkingTime).toBeUndefined();
+  });
+
+  test("keeps explicit thinking time when CLI requests the current model", () => {
+    const options: BrowserDefaultsOptions = {
+      browserModelStrategy: "current",
+      browserThinkingTime: "extended",
+    };
+    const config: UserConfig = {
+      browser: {
+        thinkingTime: "heavy",
+      },
+    };
+
+    const source = (key: keyof BrowserDefaultsOptions) =>
+      key === "browserModelStrategy" || key === "browserThinkingTime" ? "cli" : "default";
+    applyBrowserDefaultsFromConfig(options, config, source);
+
+    expect(options.browserThinkingTime).toBe("extended");
+  });
+
+  test("preserves config-defined current strategy with its thinking time", () => {
+    const options: BrowserDefaultsOptions = {};
+    const config: UserConfig = {
+      browser: {
+        modelStrategy: "current",
+        thinkingTime: "extended",
+      },
+    };
+
+    applyBrowserDefaultsFromConfig(options, config, (_key) => "default");
+
+    expect(options.browserModelStrategy).toBe("current");
+    expect(options.browserThinkingTime).toBe("extended");
+  });
+
+  test.each(["select", "ignore"] as const)(
+    "inherits thinking time when CLI requests %s strategy",
+    (strategy) => {
+      const options: BrowserDefaultsOptions = { browserModelStrategy: strategy };
+      const config: UserConfig = { browser: { thinkingTime: "extended" } };
+      const source = (key: keyof BrowserDefaultsOptions) =>
+        key === "browserModelStrategy" ? "cli" : undefined;
+
+      applyBrowserDefaultsFromConfig(options, config, source);
+
+      expect(options.browserThinkingTime).toBe("extended");
+    },
+  );
+
+  test.each([
+    { args: ["--browser-model-strategy", "current"], expectedThinkingTime: undefined },
+    {
+      args: ["--browser-model-strategy", "current", "--browser-thinking-time", "extended"],
+      expectedThinkingTime: "extended",
+    },
+  ])("honors Commander CLI option sources for $args", ({ args, expectedThinkingTime }) => {
+    const program = new Command()
+      .exitOverride()
+      .addOption(
+        new Option("--browser-model-strategy <mode>").choices(["select", "current", "ignore"]),
+      )
+      .addOption(
+        new Option("--browser-thinking-time <level>").choices([
+          "light",
+          "standard",
+          "extended",
+          "heavy",
+        ]),
+      );
+    program.parse(args, { from: "user" });
+    const options = program.opts<BrowserDefaultsOptions>();
+    const config: UserConfig = { browser: { thinkingTime: "heavy" } };
+
+    applyBrowserDefaultsFromConfig(options, config, (key) => program.getOptionValueSource(key));
+
+    expect(program.getOptionValueSource("browserModelStrategy")).toBe("cli");
+    expect(options.browserThinkingTime).toBe(expectedThinkingTime);
   });
 
   test("applies manual-login defaults from config when CLI flags are untouched", () => {

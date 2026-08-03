@@ -6,9 +6,11 @@ import type {
   SessionMode,
   BrowserSessionConfig,
   BrowserRuntimeMetadata,
+  BrowserModelSelectionEvidence,
   SessionArtifact,
+  SessionModelRun,
 } from "../sessionStore.js";
-import type { RunOracleOptions, UsageSummary } from "../oracle.js";
+import type { ProviderFailureContext, RunOracleOptions, UsageSummary } from "../oracle.js";
 import {
   runOracle,
   OracleResponseError,
@@ -16,6 +18,7 @@ import {
   extractResponseMetadata,
   asOracleUserError,
   extractTextOutput,
+  classifyProviderFailure,
 } from "../oracle.js";
 import {
   ensureSessionArtifacts,
@@ -32,7 +35,7 @@ import {
 } from "./notifier.js";
 import { sessionStore } from "../sessionStore.js";
 import { wait } from "../sessionManager.js";
-import { runMultiModelApiSession } from "../oracle/multiModelRunner.js";
+import { runMultiModelApiSession, type MultiModelRunSummary } from "../oracle/multiModelRunner.js";
 import { MODEL_CONFIGS, DEFAULT_SYSTEM_PROMPT } from "../oracle/config.js";
 import { isKnownModel } from "../oracle/modelResolver.js";
 import { resolveModelConfig } from "../oracle/modelResolver.js";
@@ -44,9 +47,11 @@ import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
+import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -83,6 +88,9 @@ export async function performSessionRun({
     write(chunk);
     return muteStdout ? true : process.stdout.write(chunk);
   };
+  let currentBrowser: SessionMetadata["browser"] = browserConfig
+    ? { config: browserConfig }
+    : sessionMeta.browser;
   await sessionStore.updateSession(sessionMeta.id, {
     status: "running",
     startedAt: new Date().toISOString(),
@@ -105,11 +113,22 @@ export async function performSessionRun({
       }
       const runnerDeps = {
         ...browserDeps,
-        persistRuntimeHint: async (runtime: BrowserRuntimeMetadata) => {
+        persistRuntimeHint: async (
+          runtime: BrowserRuntimeMetadata,
+          modelSelection?: BrowserModelSelectionEvidence,
+        ) => {
+          const browser = {
+            config: browserConfig,
+            runtime,
+            ...(modelSelection ? { modelSelection } : {}),
+          };
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
-            browser: { config: browserConfig, runtime },
+            browser,
           });
+          // Keep this attempt's copy fresh so error paths fall back to the
+          // latest persisted browser evidence instead of stale session input.
+          currentBrowser = browser;
         },
       };
       const result = await runBrowserSessionExecution(
@@ -120,6 +139,20 @@ export async function performSessionRun({
           log,
         },
         runnerDeps,
+      );
+      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
+      await sendSessionNotification(
+        {
+          sessionId: sessionMeta.id,
+          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
+          mode,
+          model: sessionMeta.model,
+          usage: result.usage,
+          characters: result.answerText?.length,
+        },
+        notificationSettings,
+        log,
+        result.answerText?.slice(0, 140),
       );
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -138,26 +171,14 @@ export async function performSessionRun({
           config: browserConfig,
           runtime: result.runtime,
           archive: result.archive,
+          modelSelection: result.modelSelection,
+          warnings: result.warnings,
         },
         artifacts: mergeArtifacts(sessionMeta.artifacts, result.artifacts),
         response: undefined,
         transport: undefined,
         error: undefined,
       });
-      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
-      await sendSessionNotification(
-        {
-          sessionId: sessionMeta.id,
-          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-          mode,
-          model: sessionMeta.model,
-          usage: result.usage,
-          characters: result.answerText?.length,
-        },
-        notificationSettings,
-        log,
-        result.answerText?.slice(0, 140),
-      );
       return;
     }
     const multiModels = Array.isArray(runOptions.models) ? runOptions.models.filter(Boolean) : [];
@@ -169,6 +190,7 @@ export async function performSessionRun({
       const modelConfig = await resolveModelConfig(primaryModel, {
         baseUrl: runOptions.baseUrl,
         openRouterApiKey: process.env.OPENROUTER_API_KEY,
+        modelOverrides: runOptions.modelOverrides,
       });
       const files = await readFiles(runOptions.file ?? [], {
         cwd,
@@ -335,8 +357,17 @@ export async function performSessionRun({
       log(statusColor(line1));
 
       const hasFailure = summary.rejected.length > 0;
+      const allowPartial = runOptions.partialMode === "ok" && summary.fulfilled.length > 0;
+      if (hasFailure) {
+        const resultLabel = summary.fulfilled.length > 0 ? "partial success" : "failed";
+        log(
+          statusColor(
+            `Multi-model result: ${resultLabel}, ${summary.fulfilled.length}/${multiModels.length} succeeded`,
+          ),
+        );
+      }
       await sessionStore.updateSession(sessionMeta.id, {
-        status: hasFailure ? "error" : "completed",
+        status: hasFailure ? (allowPartial ? "partial" : "error") : "completed",
         completedAt: new Date().toISOString(),
         usage: aggregateUsage,
         elapsedMs: summary.elapsedMs,
@@ -370,15 +401,59 @@ export async function performSessionRun({
             savedOutputs.push({ model: entry.model, path: savedPath });
           }
         }
+        const sessionWithRuns = (await readSessionForManifest(sessionMeta.id)) ?? {
+          ...sessionMeta,
+          models: sessionMeta.models,
+        };
+        const runLogs = await collectMultiModelRunLogs(
+          sessionMeta.id,
+          sessionWithRuns.models,
+          summary,
+        );
+        const manifestPath = await writeMultiModelOutputManifest({
+          baseOutputPath: runOptions.writeOutputPath,
+          sessionId: sessionMeta.id,
+          status: hasFailure ? (allowPartial ? "partial" : "error") : "completed",
+          summary,
+          savedOutputs,
+          modelRuns: sessionWithRuns.models,
+          runLogs,
+          runOptions,
+          log,
+        });
         if (savedOutputs.length > 0) {
           log(dim("Saved outputs:"));
           for (const item of savedOutputs) {
             log(dim(`- ${item.model} -> ${item.path}`));
           }
         }
+        if (manifestPath) {
+          log(dim(`Output manifest: ${manifestPath}`));
+        }
+        if (runLogs.length > 0) {
+          log(dim(""));
+          log(dim("Run logs:"));
+          for (const item of runLogs) {
+            log(dim(`- ${item.model} -> ${item.path}`));
+          }
+        }
       }
       if (hasFailure) {
-        throw summary.rejected[0].reason;
+        log(dim("Failures:"));
+        for (const item of summary.rejected) {
+          const providerContext = providerFailureContextForModel(item.model, runOptions);
+          log(dim(`- ${item.model}: ${formatMultiModelFailure(item.reason, providerContext)}`));
+          for (const line of formatMultiModelFailureDetails(item.reason, providerContext)) {
+            log(dim(line));
+          }
+        }
+      }
+      if (hasFailure && !allowPartial) {
+        const firstFailure = summary.rejected[0];
+        throw sanitizeMultiModelFailureForThrow(
+          firstFailure.reason,
+          providerFailureContextForModel(firstFailure.model, runOptions),
+        );
       }
       return;
     }
@@ -401,16 +476,6 @@ export async function performSessionRun({
     if (result.mode !== "live") {
       throw new Error("Unexpected preview result while running a session.");
     }
-    await sessionStore.updateSession(sessionMeta.id, {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      usage: result.usage,
-      elapsedMs: result.elapsedMs,
-      errorMessage: undefined,
-      response: extractResponseMetadata(result.response),
-      transport: undefined,
-      error: undefined,
-    });
     if (modelForStatus && singleModelOverride == null) {
       await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
         status: "completed",
@@ -433,6 +498,16 @@ export async function performSessionRun({
       log,
       answerText.slice(0, 140),
     );
+    await sessionStore.updateSession(sessionMeta.id, {
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      usage: result.usage,
+      elapsedMs: result.elapsedMs,
+      errorMessage: undefined,
+      response: extractResponseMetadata(result.response),
+      transport: undefined,
+      error: undefined,
+    });
   } catch (error: unknown) {
     const message = formatError(error);
     log(`ERROR: ${message}`);
@@ -447,9 +522,62 @@ export async function performSessionRun({
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
-    if (connectionLost && mode === "browser") {
+    const browserCanReattach = !browserConfig?.copyProfileSource;
+    let reattachGuidanceLogged = false;
+    const logBrowserReattachGuidance = (
+      runtime: BrowserRuntimeMetadata | null | undefined,
+    ): void => {
+      if (reattachGuidanceLogged || mode !== "browser") return;
+      if (!hasRecoverableChatGptConversation(runtime) && runtime?.promptSubmitted !== true) {
+        return;
+      }
+      reattachGuidanceLogged = true;
+      log(formatBrowserReattachGuidance(sessionMeta.id));
+    };
+    if (connectionLost && mode === "browser" && browserCanReattach) {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
+      const recoverableRuntime = runtime ?? currentBrowser?.runtime;
+      if (
+        !hasRecoverableChatGptConversation(recoverableRuntime) &&
+        recoverableRuntime?.promptSubmitted !== true
+      ) {
+        log(
+          dim(
+            "Chrome disconnected before a ChatGPT conversation was created; marking session error.",
+          ),
+        );
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "error",
+            completedAt: new Date().toISOString(),
+            response: { status: "error", incompleteReason: "chrome-disconnected" },
+            error: {
+              category: userError.category,
+              message: userError.message,
+              details: userError.details,
+            },
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+          mode,
+          browser: {
+            ...currentBrowser,
+            config: browserConfig,
+            runtime: recoverableRuntime,
+          },
+          response: { status: "error", incompleteReason: "chrome-disconnected" },
+          error: {
+            category: userError.category,
+            message: userError.message,
+            details: userError.details,
+          },
+        });
+        throw error;
+      }
       log(dim("Chrome disconnected before completion; keeping session running for reattach."));
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -462,52 +590,96 @@ export async function performSessionRun({
         errorMessage: message,
         mode,
         browser: {
+          ...currentBrowser,
           config: browserConfig,
-          runtime: runtime ?? sessionMeta.browser?.runtime,
+          runtime: runtime ?? currentBrowser?.runtime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
       });
+      logBrowserReattachGuidance(recoverableRuntime);
+      // Only auto-reattach when liveness classified the target as still alive.
+      // Closed-Chrome disconnects stay running + guidance but must not enter a
+      // futile resume loop (fail closed on availability).
+      const recoverableDisconnect =
+        (userError.details as { recoverableDisconnect?: boolean } | undefined)
+          ?.recoverableDisconnect === true;
+      if (!recoverableDisconnect) {
+        log(dim("Skipping auto-reattach: disconnect classified as non-recoverable."));
+        return;
+      }
+      // Connection-lost should attempt the same recovery path as assistant-timeout.
+      // When auto-reattach interval is unset, still try a single resume so a live
+      // Chrome/target can be harvested instead of leaving the session permanently running.
+      const configuredIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
+      const connectionLostIntervalMs =
+        configuredIntervalMs > 0
+          ? configuredIntervalMs
+          : Math.max(1_000, Math.min(browserConfig?.timeoutMs ?? 30_000, 30_000));
+      const success = await autoReattachUntilComplete({
+        sessionMeta,
+        runtime: recoverableRuntime ?? undefined,
+        browserConfig: {
+          ...browserConfig,
+          autoReattachIntervalMs: connectionLostIntervalMs,
+          autoReattachDelayMs: browserConfig?.autoReattachDelayMs ?? 0,
+          autoReattachTimeoutMs:
+            browserConfig?.autoReattachTimeoutMs ?? browserConfig?.timeoutMs ?? 120_000,
+        },
+        browserMetadata: currentBrowser,
+        runOptions,
+        modelForStatus,
+        notificationSettings,
+        log,
+        maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
+      });
+      if (success) {
+        return;
+      }
       return;
     }
-    if (assistantTimeout && mode === "browser") {
+    if (assistantTimeout && mode === "browser" && browserCanReattach) {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
       log(dim("Assistant response timed out; marking capture incomplete for reattach."));
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-          error: {
-            category: userError.category,
-            message: userError.message,
-            details: userError.details,
-          },
-        });
-      }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "error",
-        completedAt: new Date().toISOString(),
-        errorMessage: message,
-        mode,
-        browser: {
-          config: browserConfig,
-          runtime: runtime ?? sessionMeta.browser?.runtime,
-        },
-        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-        error: {
-          category: userError.category,
-          message: userError.message,
-          details: userError.details,
-        },
-      });
+      const timeoutResponse = {
+        status: "incomplete",
+        incompleteReason: "incomplete-capture",
+      } as const;
+      const timeoutError = {
+        category: userError.category,
+        message: userError.message,
+        details: userError.details,
+      };
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
-      if (autoReattachIntervalMs > 0) {
-        const autoRuntime = runtime ?? sessionMeta.browser?.runtime;
+      const autoRuntime = runtime ?? currentBrowser?.runtime;
+      const willAutoReattach = autoReattachIntervalMs > 0 && Boolean(autoRuntime);
+      if (willAutoReattach) {
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "running",
+            completedAt: undefined,
+            response: timeoutResponse,
+            error: timeoutError,
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "running",
+          completedAt: undefined,
+          errorMessage: message,
+          mode,
+          browser: {
+            ...currentBrowser,
+            config: browserConfig,
+            runtime: autoRuntime,
+          },
+          response: timeoutResponse,
+          error: timeoutError,
+        });
         const success = await autoReattachUntilComplete({
           sessionMeta,
-          runtime: autoRuntime ?? undefined,
+          runtime: autoRuntime,
           browserConfig,
+          browserMetadata: currentBrowser,
           runOptions,
           modelForStatus,
           notificationSettings,
@@ -517,16 +689,41 @@ export async function performSessionRun({
           return;
         }
       }
-      log(dim(`Reattach later with: oracle session ${sessionMeta.id}`));
+      if (modelForStatus) {
+        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          response: timeoutResponse,
+          error: timeoutError,
+        });
+      }
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "error",
+        completedAt: new Date().toISOString(),
+        errorMessage: message,
+        mode,
+        browser: {
+          ...currentBrowser,
+          config: browserConfig,
+          runtime: runtime ?? currentBrowser?.runtime,
+        },
+        response: timeoutResponse,
+        error: timeoutError,
+      });
+      logBrowserReattachGuidance(runtime ?? currentBrowser?.runtime);
       return;
     }
     if (cloudflareChallenge && mode === "browser") {
       const details = userError.details as { reuseProfileHint?: string } | undefined;
-      log(
-        dim("Cloudflare challenge detected; browser left running so you can complete the check."),
-      );
-      if (details?.reuseProfileHint) {
-        log(dim(`Reuse this browser profile with: ${details.reuseProfileHint}`));
+      if (browserCanReattach) {
+        log(
+          dim("Cloudflare challenge detected; browser left running so you can complete the check."),
+        );
+        if (details?.reuseProfileHint) {
+          log(dim(`Reuse this browser profile with: ${details.reuseProfileHint}`));
+        }
+      } else {
+        log(dim("Cloudflare challenge detected; copied profile closed and removed."));
       }
     }
     if (userError) {
@@ -544,9 +741,12 @@ export async function performSessionRun({
       log(dim(`Transport: ${transportLine}`));
     }
     const browserRuntime =
-      mode === "browser"
+      mode === "browser" && browserCanReattach
         ? (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime
         : undefined;
+    if (!cloudflareChallenge && browserCanReattach) {
+      logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
+    }
     await sessionStore.updateSession(sessionMeta.id, {
       status: "error",
       completedAt: new Date().toISOString(),
@@ -554,8 +754,9 @@ export async function performSessionRun({
       mode,
       browser: browserConfig
         ? {
+            ...currentBrowser,
             config: browserConfig,
-            runtime: browserRuntime ?? undefined,
+            runtime: browserRuntime ?? currentBrowser?.runtime,
           }
         : undefined,
       response: responseMetadata,
@@ -595,6 +796,289 @@ function mergeArtifacts(
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function providerFailureContextForModel(
+  model: string,
+  runOptions: RunOracleOptions,
+): ProviderFailureContext {
+  return {
+    model,
+    providerMode: runOptions.provider,
+    azure: runOptions.azure,
+    baseUrl: runOptions.baseUrl,
+    apiKey: runOptions.apiKey,
+  };
+}
+
+function formatMultiModelFailure(
+  error: unknown,
+  context?: string | ProviderFailureContext,
+): string {
+  const userError = asOracleUserError(error);
+  if (userError) {
+    return `${userError.category}, ${userError.message}`;
+  }
+  const providerFailure = classifyProviderFailure(error, context);
+  if (providerFailure) {
+    return providerFailure.label;
+  }
+  if (error instanceof OracleTransportError) {
+    return `${error.reason}, ${error.message}`;
+  }
+  if (error instanceof OracleResponseError) {
+    return error.message;
+  }
+  return formatError(error);
+}
+
+function formatMultiModelFailureDetails(
+  error: unknown,
+  context?: string | ProviderFailureContext,
+): string[] {
+  const providerFailure = classifyProviderFailure(error, context);
+  if (!providerFailure) {
+    return [];
+  }
+  const lines: string[] = [];
+  if (providerFailure.keyEnv) {
+    lines.push(`  key: ${providerFailure.keyEnv}`);
+  }
+  lines.push(`  provider said: ${providerFailure.providerMessage}`);
+  lines.push(`  fix: ${providerFailure.fix}`);
+  return lines;
+}
+
+function sanitizeMultiModelFailureForThrow(
+  error: unknown,
+  context?: string | ProviderFailureContext,
+): unknown {
+  const providerFailure = classifyProviderFailure(error, context);
+  if (!providerFailure) {
+    return error;
+  }
+  const modelPrefix = typeof context === "object" && context?.model ? `${context.model}: ` : "";
+  const message = `${modelPrefix}${providerFailure.label}: ${providerFailure.providerMessage}`;
+  if (!(error instanceof Error)) {
+    return new Error(message);
+  }
+  let sanitized: Error;
+  if (error instanceof OracleTransportError) {
+    sanitized = new OracleTransportError(error.reason, message);
+  } else if (error instanceof OracleResponseError) {
+    sanitized = new OracleResponseError(message, error.response);
+  } else {
+    sanitized = new Error(message);
+    sanitized.name = error.name;
+  }
+  if (error.stack) {
+    const [, ...rest] = error.stack.split("\n");
+    sanitized.stack = [sanitized.name ? `${sanitized.name}: ${message}` : message, ...rest].join(
+      "\n",
+    );
+  }
+  return sanitized;
+}
+
+interface MultiModelManifestRunLog {
+  model: string;
+  path: string;
+}
+
+interface MultiModelOutputManifest {
+  version: 1;
+  sessionId: string;
+  status: "completed" | "partial" | "error";
+  outputBasePath: string;
+  createdAt: string;
+  models: Array<{
+    model: string;
+    status: string;
+    outputPath?: string;
+    logPath?: string;
+    errorCategory?: string;
+    errorMessage?: string;
+    elapsedMs?: number;
+    usage?: UsageSummary;
+  }>;
+}
+
+export function deriveOutputManifestPath(basePath: string): string {
+  const ext = path.extname(basePath);
+  const stem = path.basename(basePath, ext);
+  const dir = path.dirname(basePath);
+  return path.join(dir, `${stem}.oracle.json`);
+}
+
+async function collectMultiModelRunLogs(
+  sessionId: string,
+  modelRuns: SessionModelRun[] | undefined,
+  summary: MultiModelRunSummary,
+): Promise<MultiModelManifestRunLog[]> {
+  const sessionDir = await resolveSessionDir(sessionId);
+  const logsByModel = new Map<string, string>();
+  for (const run of modelRuns ?? []) {
+    if (run.log?.path) {
+      logsByModel.set(run.model, resolveSessionPath(sessionDir, run.log.path));
+    }
+  }
+  for (const entry of summary.fulfilled) {
+    if (!logsByModel.has(entry.model)) {
+      logsByModel.set(entry.model, entry.logPath);
+    }
+  }
+  return [...logsByModel.entries()].map(([model, logPath]) => ({ model, path: logPath }));
+}
+
+async function writeMultiModelOutputManifest({
+  baseOutputPath,
+  sessionId,
+  status,
+  summary,
+  savedOutputs,
+  modelRuns,
+  runLogs,
+  runOptions,
+  log,
+}: {
+  baseOutputPath: string;
+  sessionId: string;
+  status: "completed" | "partial" | "error";
+  summary: MultiModelRunSummary;
+  savedOutputs: Array<{ model: string; path: string }>;
+  modelRuns?: SessionModelRun[];
+  runLogs: MultiModelManifestRunLog[];
+  runOptions: RunOracleOptions;
+  log: (message: string) => void;
+}): Promise<string | undefined> {
+  const manifestPath = deriveOutputManifestPath(baseOutputPath);
+  const normalizedTarget = path.resolve(manifestPath);
+  const normalizedSessionsDir = path.resolve(sessionStore.sessionsDir());
+  if (
+    normalizedTarget === normalizedSessionsDir ||
+    normalizedTarget.startsWith(`${normalizedSessionsDir}${path.sep}`)
+  ) {
+    log(
+      dim(
+        `output manifest skipped: refusing to write inside session storage (${normalizedSessionsDir}).`,
+      ),
+    );
+    return undefined;
+  }
+  const manifest = buildMultiModelOutputManifest({
+    baseOutputPath,
+    sessionId,
+    status,
+    summary,
+    savedOutputs,
+    modelRuns,
+    runLogs,
+    runOptions,
+  });
+  try {
+    await fs.mkdir(path.dirname(normalizedTarget), { recursive: true });
+    await fs.writeFile(normalizedTarget, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    return normalizedTarget;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    log(dim(`output manifest failed (${reason}); session completed anyway.`));
+    return undefined;
+  }
+}
+
+function buildMultiModelOutputManifest({
+  baseOutputPath,
+  sessionId,
+  status,
+  summary,
+  savedOutputs,
+  modelRuns,
+  runLogs,
+  runOptions,
+}: {
+  baseOutputPath: string;
+  sessionId: string;
+  status: "completed" | "partial" | "error";
+  summary: MultiModelRunSummary;
+  savedOutputs: Array<{ model: string; path: string }>;
+  modelRuns?: SessionModelRun[];
+  runLogs: MultiModelManifestRunLog[];
+  runOptions: RunOracleOptions;
+}): MultiModelOutputManifest {
+  const outputByModel = new Map(savedOutputs.map((entry) => [entry.model, entry.path]));
+  const logsByModel = new Map(runLogs.map((entry) => [entry.model, entry.path]));
+  const runsByModel = new Map((modelRuns ?? []).map((run) => [run.model, run]));
+  const fulfilledByModel = new Map(summary.fulfilled.map((entry) => [entry.model, entry]));
+  const rejectedByModel = new Map(summary.rejected.map((entry) => [entry.model, entry.reason]));
+  const orderedModels = [
+    ...summary.fulfilled.map((entry) => entry.model),
+    ...summary.rejected.map((entry) => entry.model),
+  ];
+  return {
+    version: 1,
+    sessionId,
+    status,
+    outputBasePath: path.resolve(baseOutputPath),
+    createdAt: new Date().toISOString(),
+    models: orderedModels.map((model) => {
+      const run = runsByModel.get(model);
+      const fulfilled = fulfilledByModel.get(model);
+      const reason = rejectedByModel.get(model);
+      const userError = reason ? asOracleUserError(reason) : undefined;
+      const providerFailure = reason
+        ? classifyProviderFailure(reason, providerFailureContextForModel(model, runOptions))
+        : undefined;
+      return {
+        model,
+        status: fulfilled ? "completed" : reason ? "error" : (run?.status ?? "error"),
+        outputPath: outputByModel.get(model),
+        logPath: logsByModel.get(model),
+        errorCategory: run?.error?.category ?? userError?.category ?? providerFailure?.category,
+        errorMessage:
+          run?.error?.message ??
+          userError?.message ??
+          providerFailure?.label ??
+          (reason ? formatError(reason) : undefined),
+        elapsedMs: calculateModelElapsedMs(run),
+        usage: run?.usage ?? fulfilled?.usage,
+      };
+    }),
+  };
+}
+
+function calculateModelElapsedMs(run?: SessionModelRun): number | undefined {
+  if (!run?.startedAt || !run.completedAt) {
+    return undefined;
+  }
+  const startedMs = Date.parse(run.startedAt);
+  const completedMs = Date.parse(run.completedAt);
+  if (!Number.isFinite(startedMs) || !Number.isFinite(completedMs) || completedMs < startedMs) {
+    return undefined;
+  }
+  return completedMs - startedMs;
+}
+
+async function readSessionForManifest(sessionId: string): Promise<SessionMetadata | null> {
+  try {
+    return (await sessionStore.readSession(sessionId)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveSessionDir(sessionId: string): Promise<string | null> {
+  try {
+    return (await sessionStore.getPaths(sessionId)).dir;
+  } catch {
+    return null;
+  }
+}
+
+function resolveSessionPath(sessionDir: string | null, targetPath: string): string {
+  if (path.isAbsolute(targetPath) || !sessionDir) {
+    return targetPath;
+  }
+  return path.join(sessionDir, targetPath);
 }
 
 async function writeAssistantOutput(
@@ -656,18 +1140,22 @@ async function autoReattachUntilComplete({
   sessionMeta,
   runtime,
   browserConfig,
+  browserMetadata,
   runOptions,
   modelForStatus,
   notificationSettings,
   log,
+  maxAttempts,
 }: {
   sessionMeta: SessionMetadata;
   runtime?: BrowserRuntimeMetadata;
   browserConfig?: BrowserSessionConfig;
+  browserMetadata?: SessionMetadata["browser"];
   runOptions: RunOracleOptions;
   modelForStatus?: string;
   notificationSettings: NotificationSettings;
   log: (message?: string) => void;
+  maxAttempts?: number;
 }): Promise<boolean> {
   if (!runtime || !browserConfig) {
     log(dim("Auto-reattach disabled: missing runtime or browser config."));
@@ -684,12 +1172,22 @@ async function autoReattachUntilComplete({
     120_000;
   const maxTotalMs = 2 * 60 * 60 * 1000; // 2h hard cap; avoid infinite polling by default.
   const maxDeadline = Date.now() + maxTotalMs;
+  const attemptLimit =
+    typeof maxAttempts === "number" && maxAttempts > 0
+      ? Math.floor(maxAttempts)
+      : Number.POSITIVE_INFINITY;
 
   if (delayMs > 0) {
     log(dim(`Auto-reattach starting in ${formatElapsed(delayMs)}...`));
     await wait(delayMs);
   }
-  log(dim(`Auto-reattach will stop after ${formatElapsed(maxTotalMs)} if no answer is captured.`));
+  if (Number.isFinite(attemptLimit)) {
+    log(dim(`Auto-reattach will try up to ${attemptLimit} attempt(s).`));
+  } else {
+    log(
+      dim(`Auto-reattach will stop after ${formatElapsed(maxTotalMs)} if no answer is captured.`),
+    );
+  }
 
   const logger: BrowserLogger = ((message?: string) => {
     if (message) {
@@ -711,6 +1209,7 @@ async function autoReattachUntilComplete({
     }
     attempt += 1;
     log(dim(`Auto-reattach attempt ${attempt}...`));
+    let captureSucceeded = false;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
@@ -719,6 +1218,7 @@ async function autoReattachUntilComplete({
       const result = await resumeBrowserSession(runtime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
       });
+      captureSucceeded = true;
       const answerText = result.answerMarkdown || result.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const artifacts = await ensureSessionArtifacts({
@@ -747,25 +1247,6 @@ async function autoReattachUntilComplete({
           },
         });
       }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage: {
-          inputTokens: 0,
-          outputTokens,
-          reasoningTokens: 0,
-          totalTokens: outputTokens,
-        },
-        errorMessage: undefined,
-        browser: {
-          config: browserConfig,
-          runtime,
-        },
-        artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
-        response: { status: "completed" },
-        error: undefined,
-        transport: undefined,
-      });
       await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
       await sendSessionNotification(
         {
@@ -783,11 +1264,60 @@ async function autoReattachUntilComplete({
         log,
         answerText.slice(0, 140),
       );
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        usage: {
+          inputTokens: 0,
+          outputTokens,
+          reasoningTokens: 0,
+          totalTokens: outputTokens,
+        },
+        errorMessage: undefined,
+        browser: {
+          ...browserMetadata,
+          config: browserConfig,
+          runtime,
+        },
+        artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
+        response: { status: "completed" },
+        error: undefined,
+        transport: undefined,
+      });
       log(kleur.green("Auto-reattach succeeded; session marked completed."));
       return true;
     } catch (error) {
+      if (captureSucceeded) {
+        const message = formatError(error);
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "error",
+            completedAt: new Date().toISOString(),
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+          browser: {
+            ...browserMetadata,
+            config: browserConfig,
+            runtime,
+          },
+          response: { status: "error", incompleteReason: "incomplete-capture" },
+          error: {
+            category: "internal",
+            message,
+          },
+        });
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
+    }
+    if (attempt >= attemptLimit) {
+      log(dim(`Auto-reattach stopped after ${attempt} attempt(s) without capturing an answer.`));
+      return false;
     }
     const remainingAfterAttemptMs = maxDeadline - Date.now();
     if (remainingAfterAttemptMs <= 0) {

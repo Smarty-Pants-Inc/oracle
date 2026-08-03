@@ -1,6 +1,4 @@
 import { rm } from "node:fs/promises";
-import { readFileSync } from "node:fs";
-import os from "node:os";
 import net from "node:net";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,7 +12,7 @@ import {
   writeChromePid,
 } from "./profileState.js";
 import { delay } from "./utils.js";
-
+import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
 
 export interface ChromeLaunchDeps {
@@ -30,46 +28,60 @@ export async function launchChrome(
   logger: BrowserLogger,
   deps: ChromeLaunchDeps = {},
 ) {
-  const connectHost = resolveRemoteDebugHost();
-  const debugBindAddress = connectHost && connectHost !== "127.0.0.1" ? "0.0.0.0" : connectHost;
+  const { connectHost, debugBindAddress, usePatchedLauncher } = resolveWslChromeLaunchRoute();
   const debugPort = config.debugPort ?? parseDebugPortEnv();
-  const chromeFlags = buildChromeFlags(config.headless ?? false, debugBindAddress);
+  const chromeFlags = buildChromeFlags(
+    config.headless ?? false,
+    debugBindAddress,
+    config.hideWindow ?? false,
+  );
+  // copy-profile reuses a copied signed-in profile whose cookies are
+  // Keychain-encrypted, so it must launch with the real Keychain (not mocked):
+  // strip the keychain-mocking flags from both chrome-launcher's defaults and
+  // Oracle's set, and ignore the defaults so they aren't re-added.
+  const usingCopiedProfile = Boolean(config.copyProfileSource);
+  if (usingCopiedProfile && config.chromeProfile) {
+    chromeFlags.push(`--profile-directory=${config.chromeProfile}`);
+  }
+  const launchOptions = resolveChromeLaunchOptions(chromeFlags, usingCopiedProfile);
   const platform = deps.platform ?? process.platform;
-  const hiddenHeadfulLaunch = !config.headless;
-  let launcher: LaunchedChrome & { host?: string };
+  const hiddenHeadfulLaunch = Boolean(config.hideWindow && !config.headless);
+  if (hiddenHeadfulLaunch && platform !== "darwin") {
+    throw new Error(
+      "Hidden background Chrome launch is only supported on macOS; use --remote-chrome with a dedicated background browser.",
+    );
+  }
 
+  let launcher: LaunchedChrome & { host?: string };
   if (hiddenHeadfulLaunch) {
-    if (platform !== "darwin") {
-      throw new Error(
-        "Hidden background Chrome launch is only supported on macOS; use --remote-chrome instead of opening a visible browser.",
-      );
-    }
     launcher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
-      chromeFlags,
+      chromeFlags: launchOptions.chromeFlags,
       chromePath: config.chromePath ?? undefined,
       userDataDir,
       requestedPort: debugPort ?? undefined,
+      ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+    });
+  } else if (usePatchedLauncher) {
+    launcher = await (deps.customHostLaunch ?? launchWithCustomHost)({
+      chromeFlags: launchOptions.chromeFlags,
+      chromePath: config.chromePath ?? undefined,
+      userDataDir,
+      host: connectHost ?? "127.0.0.1",
+      requestedPort: debugPort ?? undefined,
+      ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
     });
   } else {
-    const usePatchedLauncher = Boolean(connectHost && connectHost !== "127.0.0.1");
-    launcher = usePatchedLauncher
-      ? await (deps.customHostLaunch ?? launchWithCustomHost)({
-          chromeFlags,
-          chromePath: config.chromePath ?? undefined,
-          userDataDir,
-          host: connectHost ?? "127.0.0.1",
-          requestedPort: debugPort ?? undefined,
-        })
-      : Object.assign(
-          await (deps.standardLaunch ?? launch)({
-            chromePath: config.chromePath ?? undefined,
-            chromeFlags,
-            userDataDir,
-            handleSIGINT: false,
-            port: debugPort ?? undefined,
-          }),
-          { host: "127.0.0.1" },
-        );
+    launcher = Object.assign(
+      await (deps.standardLaunch ?? launch)({
+        chromePath: config.chromePath ?? undefined,
+        chromeFlags: launchOptions.chromeFlags,
+        userDataDir,
+        handleSIGINT: false,
+        port: debugPort ?? undefined,
+        ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+      }),
+      { host: "127.0.0.1" },
+    );
   }
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
@@ -79,6 +91,27 @@ export async function launchChrome(
   return Object.assign(launcher, { host: connectHost ?? "127.0.0.1" }) as LaunchedChrome & {
     host?: string;
   };
+}
+
+export async function positionChromeWindowOffscreen(
+  client: ChromeClient,
+  logger: BrowserLogger,
+): Promise<void> {
+  if (process.platform !== "darwin") {
+    logger("Window hiding is only supported on macOS");
+    return;
+  }
+  try {
+    const { windowId } = await client.Browser.getWindowForTarget();
+    await client.Browser.setWindowBounds({
+      windowId,
+      bounds: { left: -32_000, top: -32_000, windowState: "normal" },
+    });
+    logger("Chrome window positioned off-screen");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to position Chrome window off-screen: ${message}`);
+  }
 }
 
 export function registerTerminationHooks(
@@ -93,6 +126,12 @@ export function registerTerminationHooks(
     emitRuntimeHint?: () => Promise<void>;
     /** Preserve the profile directory even when Chrome is terminated. */
     preserveUserDataDir?: boolean;
+    /**
+     * Always terminate Chrome and delete `userDataDir` on signal, even when the run is
+     * in-flight — for throwaway copied profiles (`--copy-profile`) that must not be left
+     * on disk. Overrides the in-flight "leave running" behavior.
+     */
+    forceProfileCleanup?: boolean;
   },
 ): () => void {
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGQUIT"];
@@ -104,10 +143,15 @@ export function registerTerminationHooks(
     }
     handling = true;
     const inFlight = opts?.isInFlight?.() ?? false;
-    const leaveRunning = keepBrowser || inFlight;
+    const forceCleanup = opts?.forceProfileCleanup ?? false;
+    const leaveRunning = (keepBrowser || inFlight) && !forceCleanup;
     if (leaveRunning) {
       logger(
         `Received ${signal}; leaving Chrome running${inFlight ? " (assistant response pending)" : ""}`,
+      );
+    } else if (forceCleanup && (keepBrowser || inFlight)) {
+      logger(
+        `Received ${signal}; terminating Chrome and removing the copied profile (copy-profile is not retained)`,
       );
     } else {
       logger(`Received ${signal}; terminating Chrome process`);
@@ -156,13 +200,6 @@ export function registerTerminationHooks(
       process.removeListener(signal, handleSignal);
     }
   };
-}
-
-export async function hideChromeWindow(
-  _chrome: LaunchedChrome,
-  logger: BrowserLogger,
-): Promise<void> {
-  logger("Chrome is already running hidden in the background; no foreground window action needed.");
 }
 
 export async function connectToChrome(
@@ -488,11 +525,19 @@ function createSessionBoundChromeClient(browser: ChromeClient, sessionId: string
 
   return {
     ...browser,
+    // Raw `send` here is the browser-level send (not session-bound), so callers
+    // that issue Target.* via `send` must pass this page session id explicitly to
+    // stay scoped to this tab (e.g. Deep Research OOPIF auto-attach).
+    // chrome-remote-interface defines `send` on the client prototype, so object
+    // spread does not preserve it. Bind it explicitly for raw session commands.
+    send: typeof browser.send === "function" ? browser.send.bind(browser) : undefined,
+    oraclePageSessionId: sessionId,
     Network: bindDomain("Network"),
     Page: bindDomain("Page"),
     Runtime: bindDomain("Runtime"),
     Input: bindDomain("Input"),
     DOM: bindDomain("DOM"),
+    Emulation: bindDomain("Emulation"),
     on: browserWithEvents.on.bind(browserWithEvents),
     once: browserWithEvents.once.bind(browserWithEvents),
     off:
@@ -553,22 +598,108 @@ export async function closeTab(
   targetId: string,
   logger: BrowserLogger,
   host?: string,
-): Promise<void> {
+): Promise<boolean> {
   const effectiveHost = host ?? "127.0.0.1";
   try {
     await CDP.Close({ host: effectiveHost, port, id: targetId });
-    logger(`Closed isolated browser tab (target=${targetId})`);
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await delay(25);
+      let targets: Array<{ id?: string; targetId?: string }>;
+      try {
+        targets = (await CDP.List({ host: effectiveHost, port })) as Array<{
+          id?: string;
+          targetId?: string;
+        }>;
+      } catch {
+        continue;
+      }
+      if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
+        logger(`Closed isolated browser tab (target=${targetId})`);
+        return true;
+      }
+    }
+    logger(`Browser tab close was not confirmed (target=${targetId})`);
+    return false;
   } catch (error) {
+    try {
+      const targets = (await CDP.List({ host: effectiveHost, port })) as Array<{
+        id?: string;
+        targetId?: string;
+      }>;
+      if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
+        logger(`Closed isolated browser tab (target=${targetId})`);
+        return true;
+      }
+    } catch {
+      // Preserve the original close error below.
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger(`Failed to close browser tab ${targetId}: ${message}`);
+    return false;
   }
+}
+
+export async function createChromePageTarget(
+  port: number,
+  logger: BrowserLogger,
+  host?: string,
+): Promise<string | undefined> {
+  const effectiveHost = host ?? "127.0.0.1";
+  try {
+    const created = (await CDP.New({
+      host: effectiveHost,
+      port,
+      url: "about:blank",
+    })) as { id?: string; targetId?: string };
+    const createdTargetId = created.targetId ?? created.id;
+    if (!createdTargetId) {
+      logger("Failed to create a replacement Chrome tab.");
+      return undefined;
+    }
+    logger(`Opened replacement Chrome tab (target=${createdTargetId})`);
+    return createdTargetId;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to create a replacement Chrome tab: ${message}`);
+    return undefined;
+  }
+}
+
+export async function ensureChromePageTargetAfterClose(
+  port: number,
+  closingTargetId: string,
+  logger: BrowserLogger,
+  host?: string,
+): Promise<string | undefined> {
+  const effectiveHost = host ?? "127.0.0.1";
+  try {
+    const targets = (await CDP.List({ host: effectiveHost, port })) as Array<{
+      id?: string;
+      targetId?: string;
+      type?: string;
+    }>;
+    const existingPageTargetId = targets
+      .filter((target) => target.type === "page")
+      .map((target) => target.targetId ?? target.id)
+      .find((targetId): targetId is string => Boolean(targetId) && targetId !== closingTargetId);
+    if (existingPageTargetId) {
+      return existingPageTargetId;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to inspect Chrome tabs before closing ${closingTargetId}: ${message}`);
+  }
+  return await createChromePageTarget(port, logger, host);
 }
 
 export async function closeBlankChromeTabs(
   port: number,
   logger: BrowserLogger,
   host?: string,
-  options?: { excludeTargetIds?: Iterable<string | null | undefined> },
+  options?: {
+    excludeTargetIds?: Iterable<string | null | undefined>;
+    preserveOneBlank?: boolean;
+  },
 ): Promise<void> {
   const effectiveHost = host ?? "127.0.0.1";
   const excluded = new Set(
@@ -590,10 +721,22 @@ export async function closeBlankChromeTabs(
     return;
   }
 
+  const preservedBlankTargetId = options?.preserveOneBlank
+    ? targets
+        .filter(isBlankPageTarget)
+        .map((target) => target.targetId ?? target.id)
+        .filter((targetId): targetId is string => Boolean(targetId))
+        .sort()[0]
+    : undefined;
   let closed = 0;
   for (const target of targets) {
     const targetId = target.targetId ?? target.id;
-    if (!targetId || excluded.has(targetId) || !isBlankPageTarget(target)) {
+    if (
+      !targetId ||
+      targetId === preservedBlankTargetId ||
+      excluded.has(targetId) ||
+      !isBlankPageTarget(target)
+    ) {
       continue;
     }
     try {
@@ -635,22 +778,26 @@ async function launchHiddenMacChrome({
   chromePath,
   userDataDir,
   requestedPort,
+  ignoreDefaultFlags,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
   userDataDir: string;
   requestedPort?: number;
+  ignoreDefaultFlags?: boolean;
 }): Promise<LaunchedChrome & { host?: string }> {
   const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
   if (!resolvedChromePath) {
     throw new Error("Chrome is not installed.");
   }
   const port = requestedPort ?? (await reserveLoopbackPort());
+  const effectiveFlags = ignoreDefaultFlags
+    ? chromeFlags
+    : [...Launcher.defaultFlags(), ...chromeFlags];
   const chromeArgs = [
-    ...Launcher.defaultFlags(),
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${userDataDir}`,
-    ...chromeFlags,
+    ...effectiveFlags,
     "about:blank",
   ];
   await execFileAsync(
@@ -713,7 +860,11 @@ async function waitForDebugPort(port: number, timeoutMs = 30_000): Promise<void>
   throw new Error(`Timed out waiting for hidden Chrome on port ${port}.`);
 }
 
-function buildChromeFlags(headless: boolean, debugBindAddress?: string | null): string[] {
+function buildChromeFlags(
+  headless: boolean,
+  debugBindAddress?: string | null,
+  hideWindow = false,
+): string[] {
   const flags = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -745,9 +896,50 @@ function buildChromeFlags(headless: boolean, debugBindAddress?: string | null): 
 
   if (headless) {
     flags.push("--headless=new");
+  } else if (hideWindow && process.platform === "darwin") {
+    // Cmd-H stops macOS Chrome from compositing the page, which can swallow
+    // trusted CDP clicks and retain the prompt as a draft. Keeping the window
+    // off-screen avoids desktop disruption while preserving normal rendering.
+    flags.push("--window-position=-32000,-32000");
+  }
+
+  // Opt-in only: container/CI Chromium often cannot use the sandbox. Callers must
+  // set ORACLE_CHROME_NO_SANDBOX=1 explicitly (never default this on).
+  if (process.env.ORACLE_CHROME_NO_SANDBOX === "1") {
+    flags.push("--no-sandbox", "--disable-dev-shm-usage");
   }
 
   return flags;
+}
+
+export function buildChromeFlagsForTest(
+  headless: boolean,
+  debugBindAddress?: string | null,
+  hideWindow = false,
+): string[] {
+  return buildChromeFlags(headless, debugBindAddress, hideWindow);
+}
+
+function resolveChromeLaunchOptions(
+  chromeFlags: string[],
+  usingCopiedProfile: boolean,
+): { chromeFlags: string[]; ignoreDefaultFlags: boolean } {
+  if (!usingCopiedProfile) {
+    return { chromeFlags, ignoreDefaultFlags: false };
+  }
+  return {
+    chromeFlags: [...Launcher.defaultFlags(), ...chromeFlags].filter(
+      (flag) => flag !== "--use-mock-keychain" && flag !== "--password-store=basic",
+    ),
+    ignoreDefaultFlags: true,
+  };
+}
+
+export function resolveChromeLaunchOptionsForTest(
+  chromeFlags: string[],
+  usingCopiedProfile: boolean,
+): { chromeFlags: string[]; ignoreDefaultFlags: boolean } {
+  return resolveChromeLaunchOptions(chromeFlags, usingCopiedProfile);
 }
 
 function parseDebugPortEnv(): number | null {
@@ -760,52 +952,20 @@ function parseDebugPortEnv(): number | null {
   return value;
 }
 
-function resolveRemoteDebugHost(): string | null {
-  const override =
-    process.env.ORACLE_BROWSER_REMOTE_DEBUG_HOST?.trim() || process.env.WSL_HOST_IP?.trim();
-  if (override) {
-    return override;
-  }
-  if (!isWsl()) {
-    return null;
-  }
-  try {
-    const resolv = readFileSync("/etc/resolv.conf", "utf8");
-    for (const line of resolv.split("\n")) {
-      const match = line.match(/^nameserver\s+([0-9.]+)/);
-      if (match?.[1]) {
-        return match[1];
-      }
-    }
-  } catch {
-    // ignore; fall back to localhost
-  }
-  return null;
-}
-
-function isWsl(): boolean {
-  if (process.platform !== "linux") {
-    return false;
-  }
-  if (process.env.WSL_DISTRO_NAME) {
-    return true;
-  }
-  const release = os.release();
-  return release.toLowerCase().includes("microsoft");
-}
-
 async function launchWithCustomHost({
   chromeFlags,
   chromePath,
   userDataDir,
   host,
   requestedPort,
+  ignoreDefaultFlags,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
   userDataDir: string;
   host: string | null;
   requestedPort?: number;
+  ignoreDefaultFlags?: boolean;
 }): Promise<LaunchedChrome & { host?: string }> {
   const launcher = new Launcher({
     chromePath: chromePath ?? undefined,
@@ -813,6 +973,7 @@ async function launchWithCustomHost({
     userDataDir,
     handleSIGINT: false,
     port: requestedPort ?? undefined,
+    ignoreDefaultFlags,
   });
 
   if (host) {

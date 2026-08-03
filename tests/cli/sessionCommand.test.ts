@@ -212,6 +212,7 @@ describe("handleSessionCommand", () => {
     expect(deps.harvestSessionBrowserOutput).toHaveBeenCalledWith("abc", {
       writeOutputPath: "/tmp/out.md",
       browserTabRef: "current",
+      recoverIfMissing: true,
     });
     expect(deps.liveTailSessionBrowserOutput).not.toHaveBeenCalled();
   });
@@ -231,6 +232,7 @@ describe("handleSessionCommand", () => {
     expect(deps.liveTailSessionBrowserOutput).toHaveBeenCalledWith("abc", {
       writeOutputPath: undefined,
       browserTabRef: "tab-123",
+      recoverIfMissing: true,
     });
     expect(deps.harvestSessionBrowserOutput).not.toHaveBeenCalled();
   });

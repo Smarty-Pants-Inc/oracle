@@ -101,6 +101,42 @@ describe("sessionDisplay helpers", () => {
     log.mockRestore();
   }, 15_000);
 
+  it("shows browser follow-up lineage without a Responses API id", async () => {
+    const parent = {
+      id: "browser-parent",
+      status: "completed",
+      createdAt: "2025-11-20T00:00:00.000Z",
+      model: "gpt-5.5-pro",
+      mode: "browser",
+      options: { prompt: "parent" },
+    };
+    const child = {
+      id: "browser-child",
+      status: "completed",
+      createdAt: "2025-11-20T00:01:00.000Z",
+      model: "gpt-5.5-pro",
+      mode: "browser",
+      options: {
+        prompt: "child",
+        followupSessionId: "browser-parent",
+      },
+    };
+    mockSessionStore.listSessions.mockResolvedValue([child, parent]);
+    mockSessionStore.filterSessions.mockReturnValue({
+      entries: [child, parent],
+      truncated: false,
+      total: 2,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const { showStatus } = await import("../../src/cli/sessionDisplay.js");
+    await showStatus({ hours: 24, includeAll: false, limit: 5 });
+
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/browser-parent/));
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/└─ browser-child/));
+    log.mockRestore();
+  }, 15_000);
+
   it("renders nested follow-up branches with stable tree connectors", async () => {
     const parent = {
       id: "parent-session",
@@ -210,5 +246,43 @@ describe("sessionDisplay helpers", () => {
     const summary = formatCompletionSummary(summaryMeta, { includeSlug: true });
     expect(summary).toContain("↑10 ↓20 ↻0 Δ30");
     expect(summary).toContain("slug=s2");
+
+    const browserSummary = formatCompletionSummary({
+      ...summaryMeta,
+      mode: "browser",
+      model: "gpt-5.5-pro",
+      browser: {
+        modelSelection: {
+          requestedModel: "Pro",
+          resolvedLabel: "Pro",
+          strategy: "select",
+          status: "already-selected",
+          verified: true,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-12T00:00:00.000Z",
+        },
+      },
+    });
+    expect(browserSummary).toContain("Pro[browser]");
+    expect(browserSummary).not.toContain("GPT-5.6 Pro");
+
+    const unverifiedSummary = formatCompletionSummary({
+      ...summaryMeta,
+      mode: "browser",
+      model: "gpt-5.5-pro",
+      browser: {
+        modelSelection: {
+          requestedModel: "gpt-5.5-pro",
+          resolvedLabel: "Thinking 5.5 Heavy",
+          strategy: "current",
+          status: "already-selected",
+          verified: false,
+          source: "chatgpt-model-picker",
+          capturedAt: "2026-07-12T00:00:00.000Z",
+        },
+      },
+    });
+    expect(unverifiedSummary).toContain("gpt-5.5-pro[browser]");
+    expect(unverifiedSummary).not.toContain("Thinking 5.5 Heavy[browser]");
   });
 });
