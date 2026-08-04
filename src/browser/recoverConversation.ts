@@ -1,12 +1,15 @@
-import type { LaunchedChrome } from "chrome-launcher";
+import type { BrowserChrome } from "./manualChromeOwner.js";
 import type { SessionMetadata } from "../sessionStore.js";
-import type { BrowserLogger } from "./types.js";
+import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
+import { closeChromeTarget } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { isImageOnlyUiChromeText } from "./index.js";
 import { acquireManualChromeOwner } from "./manualChromeOwner.js";
+import { isSafeChromeTerminationOutcome } from "./profileState.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
-import { harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
+import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
+import { extractConversationIdFromUrl, harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
@@ -16,7 +19,7 @@ export interface RecoveredConversation {
   port: number;
   url: string;
   ref: string;
-  chrome: LaunchedChrome | null;
+  cleanup: () => Promise<void>;
 }
 
 export interface RecoveryEndpoint {
@@ -27,23 +30,32 @@ export interface RecoveryEndpoint {
 /**
  * Picks the URL to navigate the recovered Chrome tab to.
  *
- * Preference order matches `resolveSessionTabRef`: `harvest.url` (post-harvest,
- * always a ChatGPT conversation URL when present) wins over `runtime.tabUrl`
- * (the URL the original run last navigated to, which can be stale).
- *
- * Both candidates are gated by `isRecoverableChatGptConversationUrl` so a stale
- * home / project shell URL or an unrelated external URL stored in metadata
- * cannot navigate the persistent signed-in profile to the wrong page.
+ * A committed prompt epoch is the durable conversation authority: every
+ * recoverable harvest/runtime URL must name its exact conversation. Epoch-less
+ * legacy sessions retain URL-only recovery; a pending epoch has no committed
+ * conversation authority and therefore cannot authorize a recovery target.
  */
 export function resolveRecoveryUrl(meta: SessionMetadata): string | null {
   const harvest = meta?.browser?.harvest ?? {};
   const runtime = meta?.browser?.runtime ?? {};
+  const promptEpoch = runtime.promptEpoch;
+  if (promptEpoch && promptEpoch.status !== "committed") return null;
+  const committedConversationId =
+    promptEpoch?.status === "committed" ? promptEpoch.conversationId.trim() : null;
+  if (promptEpoch && !committedConversationId) return null;
+  let recoveryUrl: string | null = null;
   for (const candidate of [harvest.url, runtime.tabUrl]) {
-    if (isRecoverableChatGptConversationUrl(candidate)) {
-      return candidate as string;
+    if (!isRecoverableChatGptConversationUrl(candidate)) continue;
+    const recoverableUrl = candidate as string;
+    if (
+      committedConversationId &&
+      extractConversationIdFromUrl(recoverableUrl) !== committedConversationId
+    ) {
+      return null;
     }
+    recoveryUrl ??= recoverableUrl;
   }
-  return null;
+  return recoveryUrl;
 }
 
 export function resolveRecoveryProfileDir(meta: SessionMetadata): string {
@@ -120,6 +132,67 @@ export function isRecoveredConversationHarvestReady(harvested: {
   );
 }
 
+async function releaseRecoveredConversationLease({
+  lease,
+  launchedChrome,
+  config,
+  logger,
+}: {
+  lease: BrowserTabLease;
+  launchedChrome: BrowserChrome | null;
+  config: ResolvedBrowserConfig;
+  logger: BrowserLogger;
+}): Promise<void> {
+  await lease.release({
+    onRelease: async ({ isLastLease }) => {
+      if (!isLastLease || !launchedChrome || config.keepBrowser) return;
+      try {
+        const outcome = await launchedChrome.kill();
+        if (!isSafeChromeTerminationOutcome(outcome)) {
+          logger(
+            `[browser] Recovered Chrome termination was unsafe; preserving profile state: ${outcome.reason}`,
+          );
+        }
+      } catch (error) {
+        logger(
+          `[browser] Recovered Chrome termination failed; preserving profile state: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    },
+  });
+}
+
+function createRecoveredConversationCleanup({
+  host,
+  port,
+  targetId,
+  lease,
+  launchedChrome,
+  config,
+  logger,
+}: {
+  host: string;
+  port: number;
+  targetId: string;
+  lease: BrowserTabLease;
+  launchedChrome: BrowserChrome | null;
+  config: ResolvedBrowserConfig;
+  logger: BrowserLogger;
+}): () => Promise<void> {
+  let cleanupPromise: Promise<void> | null = null;
+  return () => {
+    cleanupPromise ??= (async () => {
+      try {
+        const closed = await closeChromeTarget({ host, port, targetId, logger });
+        if (!closed) logger(`[browser] Failed to close recovered target ${targetId}.`);
+      } finally {
+        await releaseRecoveredConversationLease({ lease, launchedChrome, config, logger });
+      }
+    })();
+    return cleanupPromise;
+  };
+}
+
 /**
  * Re-open a previously-harvested ChatGPT conversation by acquiring the canonical Chrome owner
  * for the session's persistent profile and navigating a tab to the saved URL.
@@ -146,54 +219,111 @@ export async function recoverConversationTab(
         "(expected browser.harvest.url or browser.runtime.tabUrl to be a chatgpt.com/c/<id> URL).",
     );
   }
-  const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
-  const waitForReady = options.waitForReady !== false;
-  if (options.existingEndpoint) {
-    try {
-      logger(
-        `[browser] Recovery: opening saved conversation in existing Chrome at ` +
-          `${options.existingEndpoint.host}:${options.existingEndpoint.port}`,
-      );
-      const targetId = await openChatGptTarget({ ...options.existingEndpoint, url });
-      if (waitForReady) {
-        await waitForRecoveredConversationReady(options.existingEndpoint, targetId, readyTimeoutMs);
-      }
-      return { ...options.existingEndpoint, url, ref: targetId, chrome: null };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`[browser] Recovery: existing Chrome could not reopen the conversation (${message}).`);
-    }
-  }
-
   const userDataDir = resolveRecoveryProfileDir(meta);
   const config = resolveBrowserConfig(meta.browser?.config);
-
-  logger(
-    `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
-  );
-
-  const owner = await acquireManualChromeOwner(userDataDir, config, logger, meta.id);
-  const { chrome } = owner;
-  const launchedChrome = owner.source === "launched" ? chrome : null;
-  const host = chrome.host ?? "127.0.0.1";
-  const port = chrome.port;
+  const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+  const waitForReady = options.waitForReady !== false;
+  const lease = await acquireBrowserTabLease(userDataDir, {
+    maxConcurrentTabs: config.maxConcurrentTabs,
+    timeoutMs: config.timeoutMs,
+    logger,
+    sessionId: meta.id,
+  });
+  let recoveredCleanup: (() => Promise<void>) | null = null;
+  let launchedChrome: BrowserChrome | null = null;
 
   try {
+    if (options.existingEndpoint) {
+      let targetId: string | null = null;
+      try {
+        logger(
+          `[browser] Recovery: opening saved conversation in existing Chrome at ` +
+            `${options.existingEndpoint.host}:${options.existingEndpoint.port}`,
+        );
+        targetId = await openChatGptTarget({ ...options.existingEndpoint, url });
+        if (waitForReady) {
+          await waitForRecoveredConversationReady(
+            options.existingEndpoint,
+            targetId,
+            readyTimeoutMs,
+          );
+        }
+        await lease.update({
+          chromeHost: options.existingEndpoint.host,
+          chromePort: options.existingEndpoint.port,
+          chromeTargetId: targetId,
+          tabUrl: url,
+        });
+        recoveredCleanup = createRecoveredConversationCleanup({
+          host: options.existingEndpoint.host,
+          port: options.existingEndpoint.port,
+          targetId,
+          lease,
+          launchedChrome: null,
+          config,
+          logger,
+        });
+        return { ...options.existingEndpoint, url, ref: targetId, cleanup: recoveredCleanup };
+      } catch (error) {
+        if (targetId) {
+          const closed = await closeChromeTarget({
+            host: options.existingEndpoint.host,
+            port: options.existingEndpoint.port,
+            targetId,
+            logger,
+          });
+          if (!closed) logger(`[browser] Failed to close unused recovered target ${targetId}.`);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        logger(
+          `[browser] Recovery: existing Chrome could not reopen the conversation (${message}).`,
+        );
+      }
+    }
+
+    logger(
+      `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
+    );
+    const owner = await acquireManualChromeOwner(userDataDir, config, logger, meta.id);
+    const { chrome } = owner;
+    launchedChrome = owner.source === "launched" ? chrome : null;
+    const host = chrome.host ?? "127.0.0.1";
+    const port = chrome.port;
     const targetId = await openChatGptTarget({ host, port, url });
+    recoveredCleanup = createRecoveredConversationCleanup({
+      host,
+      port,
+      targetId,
+      lease,
+      launchedChrome,
+      config,
+      logger,
+    });
     if (waitForReady) {
       await waitForRecoveredConversationReady({ host, port }, targetId, readyTimeoutMs);
     }
-
+    await lease.update({
+      chromeHost: host,
+      chromePort: port,
+      chromeTargetId: targetId,
+      tabUrl: url,
+    });
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
-
-    return { host, port, url, ref: targetId, chrome: launchedChrome };
+    return { host, port, url, ref: targetId, cleanup: recoveredCleanup };
   } catch (error) {
-    if (launchedChrome) {
-      try {
-        await launchedChrome.kill();
-      } catch {
-        // Preserve the recovery error; cleanup is best effort here.
-      }
+    await recoveredCleanup?.().catch((cleanupError) => {
+      logger(
+        `[browser] Recovery cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+      );
+    });
+    if (!recoveredCleanup) {
+      await releaseRecoveredConversationLease({ lease, launchedChrome, config, logger }).catch(
+        (releaseError) => {
+          logger(
+            `[browser] Recovery lease release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
+          );
+        },
+      );
     }
     throw error;
   }

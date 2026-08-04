@@ -202,11 +202,16 @@ export type BrowserCaptureFinalizationResult =
   | { status: "pending"; runtime: BrowserRuntimeMetadata; error: string };
 
 export interface BrowserRunTransaction extends BrowserRunResult {
-  /** Canonical locator and cleanup authority persisted before resource retirement. */
+  /** Complete serializable locator and cleanup authority persisted before this transaction is returned. */
   runtime: BrowserRuntimeMetadata;
-  /** Retire resources after the caller has durably stored the capture and pending authority. */
+  /**
+   * Acknowledge durable answer/session publication, then retire resources. A pending result may be
+   * retried by calling finalize again; implementations must not convert transport failure to success.
+   */
   finalize: () => Promise<BrowserCaptureFinalizationResult>;
-  /** Dispose newly owned resources when capture persistence fails before finalization. */
+  /**
+   * Dispose newly owned resources when capture publication fails. A pending result remains retryable.
+   */
   abort: () => Promise<BrowserCaptureFinalizationResult>;
 }
 

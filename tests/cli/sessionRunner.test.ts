@@ -55,6 +55,7 @@ vi.mock("../../src/sessionStore.ts", () => ({
 
 import type {
   BrowserRuntimeMetadata,
+  SessionArtifact,
   SessionMetadata,
   SessionModelRun,
 } from "../../src/sessionManager.ts";
@@ -1215,7 +1216,64 @@ describe("performSessionRun", () => {
     );
   });
 
-  test("retains cleanup authority when terminal persistence fails before finalize", async () => {
+  test("persists retryable cleanup authority when browser finalization throws", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      chromeTargetId: "remote-finalize-target",
+      recoveryCleanup: {
+        transport: "remote",
+        ownsTarget: true,
+        profileKind: "none",
+        keepBrowser: false,
+      },
+      recoveryCleanupResult: { status: "pending" },
+      remoteRecovery: {
+        protocolVersion: 2,
+        host: "bridge.example:9443",
+        transactionToken: "a".repeat(64),
+        state: "pending",
+      },
+    };
+    const finalize = vi.fn(async () => {
+      throw new Error("bridge temporarily unavailable");
+    });
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 100,
+      runtime,
+      answerText: "durable remote answer",
+      finalize,
+      abort,
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {},
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      browser: {
+        runtime: {
+          chromeTargetId: "remote-finalize-target",
+          remoteRecovery: { transactionToken: "a".repeat(64), state: "pending" },
+          recoveryCleanupResult: {
+            status: "failed",
+            error: expect.stringContaining("bridge temporarily unavailable"),
+          },
+        },
+      },
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("cleanup remains pending"));
+  });
+  test("retains the answer receipt when terminal metadata publication fails", async () => {
     const pendingRuntime: BrowserRuntimeMetadata = {
       chromePort: 9222,
       chromeTargetId: "fallback-target",
@@ -1228,16 +1286,8 @@ describe("performSessionRun", () => {
       },
       recoveryCleanupResult: { status: "pending" },
     };
-    const retainedRuntime: BrowserRuntimeMetadata = {
-      ...pendingRuntime,
-      recoveryCleanupResult: { status: "failed", error: "target close was not confirmed" },
-    };
     const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
-    const abort = vi.fn(async () => ({
-      status: "pending" as const,
-      runtime: retainedRuntime,
-      error: "target close was not confirmed",
-    }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
     vi.mocked(runBrowserSessionExecution).mockResolvedValue({
       usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
       elapsedMs: 500,
@@ -1269,17 +1319,15 @@ describe("performSessionRun", () => {
     ).rejects.toThrow("terminal metadata disk full");
 
     expect(finalize).not.toHaveBeenCalled();
-    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).not.toHaveBeenCalled();
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
       (call) => call[1]?.status === "completed",
     );
-    expect(abort.mock.invocationCallOrder[0]).toBeGreaterThan(
-      sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
+    const errorCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      (call) => call[1]?.status === "error",
     );
-    let errorUpdate: unknown;
-    for (const call of sessionStoreMock.updateSession.mock.calls) {
-      if (call[1]?.status === "error") errorUpdate = call[1];
-    }
+    expect(errorCallIndex).toBeGreaterThan(completedCallIndex);
+    const errorUpdate = sessionStoreMock.updateSession.mock.calls[errorCallIndex]?.[1];
     expect(errorUpdate).toMatchObject({
       status: "error",
       browser: {
@@ -1287,13 +1335,77 @@ describe("performSessionRun", () => {
           chromeTargetId: "fallback-target",
           tabUrl: "https://chatgpt.com/c/fallback-answer",
           recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
-          recoveryCleanupResult: {
-            status: "failed",
-            error: "target close was not confirmed",
-          },
+          recoveryCleanupResult: { status: "pending" },
         },
       },
+      artifacts: [
+        expect.objectContaining({
+          path: "/tmp/durable-browser-answer.md",
+          sha256: "answer-sha256",
+        }),
+      ],
     });
+  });
+
+  test("publishes the answer receipt before optional model-run completion fails", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      chromeTargetId: "model-run-target",
+      tabUrl: "https://chatgpt.com/c/model-run-answer",
+    };
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText: "captured answer",
+      finalize,
+      abort,
+    });
+    sessionStoreMock.updateModelRun.mockImplementation(async (_sessionId, _model, patch) => {
+      if (patch.status === "completed") {
+        throw new Error("model run metadata disk full");
+      }
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("model run metadata disk full");
+
+    const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      (call) => call[1]?.status === "completed",
+    );
+    const completedModelRunIndex = sessionStoreMock.updateModelRun.mock.calls.findIndex(
+      (call) => call[2]?.status === "completed",
+    );
+    const errorUpdate = sessionStoreMock.updateSession.mock.calls.find(
+      (call) => call[1]?.status === "error",
+    )?.[1];
+    expect(
+      sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex],
+    ).toBeLessThan(
+      sessionStoreMock.updateModelRun.mock.invocationCallOrder[completedModelRunIndex] ?? 0,
+    );
+    expect(errorUpdate).toMatchObject({
+      artifacts: [
+        expect.objectContaining({
+          path: "/tmp/durable-browser-answer.md",
+          sha256: "answer-sha256",
+        }),
+      ],
+    });
+    expect(finalize).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
   });
 
   test("aborts and preserves browser authority when durable answer persistence fails", async () => {
@@ -2274,7 +2386,11 @@ describe("performSessionRun", () => {
       }),
     );
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
-      ([, updates]) => updates.status === "completed",
+      ([, updates]) =>
+        updates.status === "completed" &&
+        updates.artifacts?.some(
+          (artifact: SessionArtifact) => artifact.kind === "deep-research-report",
+        ),
     );
     const completedUpdate = sessionStoreMock.updateSession.mock.calls[completedCallIndex]?.[1];
     expect(completedUpdate).toMatchObject({

@@ -31,24 +31,6 @@ function isRecoverableMissingTabError(message: string): boolean {
   );
 }
 
-function finishRecoveredChrome(
-  recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null,
-  closeAfterRecover: boolean | undefined,
-): void {
-  if (!recoveredChrome) {
-    return;
-  }
-  try {
-    if (closeAfterRecover) {
-      recoveredChrome.kill();
-    } else {
-      recoveredChrome.process?.unref?.();
-    }
-  } catch {
-    // best-effort cleanup
-  }
-}
-
 export interface BrowserHarvestOptions {
   writeOutputPath?: string;
   browserTabRef?: string;
@@ -60,11 +42,6 @@ export interface BrowserHarvestOptions {
    * Default: true.
    */
   recoverIfMissing?: boolean;
-  /**
-   * After a successful recovery harvest, close the relaunched Chrome.
-   * Default: false (leave the recovered tab visible for the user).
-   */
-  closeAfterRecover?: boolean;
 }
 
 export interface BrowserLiveTailOptions {
@@ -77,11 +54,6 @@ export interface BrowserLiveTailOptions {
    * Default: true.
    */
   recoverIfMissing?: boolean;
-  /**
-   * After completion, close the relaunched Chrome.
-   * Default: false (leave the recovered tab visible).
-   */
-  closeAfterRecover?: boolean;
 }
 
 function sessionBrowserEndpoint(
@@ -363,7 +335,7 @@ export async function harvestSessionBrowserOutput(
   const ref = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
 
-  let recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null = null;
+  let recoveredCleanup: (() => Promise<void>) | null = null;
   try {
     let harvested: ChatGptTabSummary;
     try {
@@ -386,7 +358,7 @@ export async function harvestSessionBrowserOutput(
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
         existingEndpoint: recordedEndpoint ?? undefined,
       });
-      recoveredChrome = recovered.chrome;
+      recoveredCleanup = recovered.cleanup;
       harvested = await harvestChatGptTab({
         host: recovered.host,
         port: recovered.port,
@@ -406,7 +378,7 @@ export async function harvestSessionBrowserOutput(
     }
     return harvested;
   } finally {
-    finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
+    await recoveredCleanup?.();
   }
 }
 
@@ -425,7 +397,7 @@ export async function liveTailSessionBrowserOutput(
   };
   let browserTabRef = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
-  let recoveredChrome: { kill: () => void; process?: { unref?: () => void } } | null = null;
+  let recoveredCleanup: (() => Promise<void>) | null = null;
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
   let lastHash: string | null = null;
   let unchangedSince = Date.now();
@@ -454,7 +426,7 @@ export async function liveTailSessionBrowserOutput(
         existingEndpoint: recordedEndpoint ?? undefined,
         waitForReady: false,
       });
-      recoveredChrome = recovered.chrome;
+      recoveredCleanup = recovered.cleanup;
       endpoint = { host: recovered.host, port: recovered.port };
       browserTabRef = recovered.ref;
       requireRecoveredContent = true;
@@ -520,6 +492,6 @@ export async function liveTailSessionBrowserOutput(
       await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
     }
   } finally {
-    finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
+    await recoveredCleanup?.();
   }
 }

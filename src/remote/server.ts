@@ -1,34 +1,56 @@
 import http from "node:http";
-import { createReadStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import os from "node:os";
 import path from "node:path";
-import net from "node:net";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
+import {
+  mkdtemp,
+  rm,
+  mkdir,
+  chmod,
+  writeFile,
+  stat,
+  realpath,
+  open,
+  readFile,
+  rename,
+  type FileHandle,
+} from "node:fs/promises";
 import chalk from "chalk";
-import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
+import { z } from "zod";
+import type {
+  BrowserAttachment,
+  BrowserCaptureFinalizationResult,
+  BrowserLogger,
+  CookieParam,
+} from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../browserMode.js";
 import type {
   RemoteArtifactCapabilities,
   RemoteArtifactDescriptor,
+  RemoteBrowserAutomationErrorPayload,
+  RemoteBrowserRunConfig,
   RemoteRunPayload,
   RemoteRunEvent,
+  RemoteRunTransactionPayload,
+  RemoteTransactionRetryResponse,
+  RemoteTransactionSettlementResponse,
 } from "./types.js";
-import { MAX_REMOTE_ARTIFACT_BYTES } from "./types.js";
+import {
+  MAX_REMOTE_ARTIFACT_BYTES,
+  MAX_REMOTE_ATTACHMENT_BYTES,
+  MAX_REMOTE_ATTACHMENTS,
+  MAX_REMOTE_PROMPT_CHARS,
+  MAX_REMOTE_REQUEST_BYTES,
+  MAX_REMOTE_TOTAL_ATTACHMENT_BYTES,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+} from "./types.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { getOracleHomeDir } from "../oracleHome.js";
-import {
-  cleanupStaleProfileState,
-  readDevToolsPort,
-  verifyDevToolsReachable,
-  writeChromePid,
-  writeDevToolsActivePort,
-} from "../browser/profileState.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import {
   computeFileSha256,
@@ -36,7 +58,16 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
-import type { BrowserRunWarning, SessionArtifact } from "../sessionManager.js";
+import type {
+  BrowserRuntimeMetadata,
+  BrowserRunWarning,
+  BrowserSessionConfig,
+  SessionArtifact,
+} from "../sessionManager.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import { retryBrowserRecoveryCleanup } from "../browser/reattach.js";
+import { acquireManualChromeOwner } from "../browser/manualChromeOwner.js";
+import { resolveBrowserConfig } from "../browser/config.js";
 
 export interface RemoteServerOptions {
   host?: string;
@@ -48,9 +79,9 @@ export interface RemoteServerOptions {
 }
 
 interface RemoteServerDeps {
-  runBrowser?: (
-    options: Parameters<typeof runBrowserMode>[0],
-  ) => Promise<BrowserRunResult | BrowserRunTransaction>;
+  runBrowser?: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  transactionStoreDir?: string;
+  retryCleanup?: typeof retryBrowserRecoveryCleanup;
 }
 
 interface RemoteServerInstance {
@@ -62,39 +93,71 @@ interface RemoteServerInstance {
 interface RegisteredRemoteArtifact {
   descriptor: RemoteArtifactDescriptor;
   filePath: string;
+  device: number;
+  inode: number;
   expiresAt: number;
+}
+
+type RemoteTransactionState =
+  | "running"
+  | "pending"
+  | "finalized"
+  | "aborted"
+  | "recoverable-error"
+  | "failed";
+
+interface RemoteTransactionRecord {
+  protocolVersion: typeof REMOTE_TRANSACTION_PROTOCOL_VERSION;
+  transactionToken: string;
+  runId: string;
+  createdAt: string;
+  updatedAt: string;
+  state: RemoteTransactionState;
+  result?: BrowserRunResult;
+  runtime?: BrowserRuntimeMetadata;
+  artifacts?: RemoteArtifactDescriptor[];
+  error?: RemoteBrowserAutomationErrorPayload;
+  settlementMode?: "finalize" | "abort";
+  publicationAcknowledgedAt?: string;
+  finalization?: BrowserCaptureFinalizationResult;
+}
+
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 const ARTIFACT_PROTOCOL_VERSION = 1;
 const REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
+const REMOTE_TRANSACTION_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 
 const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
   artifactTransfer: true,
   artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
+  transactionProtocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
   maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
+  maxRequestBytes: MAX_REMOTE_REQUEST_BYTES,
+  maxAttachmentBytes: MAX_REMOTE_ATTACHMENT_BYTES,
+  maxTotalAttachmentBytes: MAX_REMOTE_TOTAL_ATTACHMENT_BYTES,
+  maxAttachments: MAX_REMOTE_ATTACHMENTS,
+  maxPromptChars: MAX_REMOTE_PROMPT_CHARS,
 };
-
-async function findAvailablePort(): Promise<number> {
-  return await new Promise<number>((resolve, reject) => {
-    const srv = net.createServer();
-    srv.on("error", (err) => reject(err));
-    srv.listen(0, () => {
-      const address = srv.address();
-      if (typeof address === "object" && address?.port) {
-        const port = address.port;
-        srv.close(() => resolve(port));
-      } else {
-        srv.close(() => reject(new Error("Unable to allocate port")));
-      }
-    });
-  });
-}
 
 export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
 ): Promise<RemoteServerInstance> {
   const runBrowser = deps.runBrowser ?? runBrowserMode;
+  const retryCleanup = deps.retryCleanup ?? retryBrowserRecoveryCleanup;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
   const authToken = options.token ?? randomBytes(16).toString("hex");
@@ -103,9 +166,17 @@ export async function createRemoteServer(
   const color = process.stdout.isTTY
     ? (formatter: (msg: string) => string, msg: string) => formatter(msg)
     : (_formatter: (msg: string) => string, msg: string) => msg;
-  // Single-flight guard: remote Chrome can only host one run at a time, so we serialize requests.
+  const transactionStoreDir =
+    deps.transactionStoreDir ?? path.join(getOracleHomeDir(), "remote-transactions");
+  await mkdir(transactionStoreDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(transactionStoreDir, 0o700);
+  await syncDirectory(transactionStoreDir);
+
+  // Remote Chrome is single-flight, while captured transactions remain independently settleable.
   let busy = false;
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
+  const activeTransactions = new Map<string, BrowserRunTransaction>();
+  const transactionLocks = new Map<string, Promise<void>>();
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -116,273 +187,124 @@ export async function createRemoteServer(
   }
 
   server.on("request", async (req, res) => {
-    if (req.method === "GET" && req.url === "/status") {
-      logger("[serve] Health check /status");
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-    if (req.method === "GET" && req.url === "/health") {
-      const authHeader = req.headers.authorization ?? "";
-      if (authHeader !== `Bearer ${authToken}`) {
-        if (verbose) {
-          logger(
-            `[serve] Unauthorized /health attempt from ${formatSocket(req)} (missing/invalid token)`,
-          );
-        }
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
+    try {
+      if (req.method === "GET" && req.url === "/status") {
+        logger("[serve] Health check /status");
+        sendJson(res, 200, { ok: true });
         return;
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
+      if (req.method === "GET" && req.url === "/health") {
+        if (!authenticateRemoteRequest(req, res, authToken, logger, verbose, "/health")) return;
+        sendJson(res, 200, {
           ok: true,
           version: getCliVersion(),
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
           capabilities: ARTIFACT_CAPABILITIES,
-        }),
-      );
-      return;
-    }
-    const artifactMatch = matchArtifactRequest(req);
-    if (artifactMatch) {
-      await serveRemoteArtifact({
-        req,
-        res,
-        authToken,
-        artifactRegistry,
-        logger,
-        verbose,
-        runId: artifactMatch.runId,
-        artifactId: artifactMatch.artifactId,
-      });
-      return;
-    }
-
-    if (req.method !== "POST" || req.url !== "/runs") {
-      res.statusCode = 404;
-      res.end();
-      return;
-    }
-
-    const authHeader = req.headers.authorization ?? "";
-    if (authHeader !== `Bearer ${authToken}`) {
-      if (verbose) {
-        logger(
-          `[serve] Unauthorized /runs attempt from ${formatSocket(req)} (missing/invalid token)`,
-        );
-      }
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "unauthorized" }));
-      return;
-    }
-    if (busy) {
-      if (verbose) {
-        logger(
-          `[serve] Busy: rejecting new run from ${formatSocket(req)} while another run is active`,
-        );
-      }
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "busy" }));
-      return;
-    }
-    busy = true;
-    const runStartedAt = Date.now();
-
-    let payload: RemoteRunPayload | null = null;
-    try {
-      const body = await readRequestBody(req);
-      payload = JSON.parse(body) as RemoteRunPayload;
-      if (payload?.browserConfig) {
-        payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
-      }
-    } catch {
-      busy = false;
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "invalid_request" }));
-      return;
-    }
-
-    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-
-    const runId = randomUUID();
-    logger(
-      `[serve] Accepted run ${runId} from ${formatSocket(req)} (prompt ${payload?.prompt?.length ?? 0} chars)`,
-    );
-    // Each run gets an isolated temp dir so attachments/logs don't collide.
-    const runDir = await mkdtemp(path.join(os.tmpdir(), `oracle-serve-${runId}-`));
-    const attachmentDir = path.join(runDir, "attachments");
-    await mkdir(attachmentDir, { recursive: true });
-
-    const sendEvent = (event: RemoteRunEvent) => {
-      res.write(`${JSON.stringify(event)}\n`);
-    };
-
-    const attachments: BrowserAttachment[] = [];
-    let fallbackSubmission:
-      | {
-          prompt: string;
-          attachments: BrowserAttachment[];
-        }
-      | undefined;
-    let browserTransaction: BrowserRunTransaction | null = null;
-    let capturePublished = false;
-    try {
-      const attachmentsPayload = Array.isArray(payload.attachments) ? payload.attachments : [];
-      for (const [index, attachment] of attachmentsPayload.entries()) {
-        const safeName = sanitizeName(attachment.fileName ?? `attachment-${index + 1}`);
-        const filePath = path.join(attachmentDir, safeName);
-        await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-        attachments.push({
-          path: filePath,
-          displayPath: attachment.displayPath,
-          sizeBytes: attachment.sizeBytes,
         });
+        return;
       }
 
-      if (payload.fallbackSubmission) {
-        const fallbackAttachmentDir = path.join(runDir, "fallback-attachments");
-        await mkdir(fallbackAttachmentDir, { recursive: true });
-        const fallbackAttachments: BrowserAttachment[] = [];
-        const fallbackPayload = Array.isArray(payload.fallbackSubmission.attachments)
-          ? payload.fallbackSubmission.attachments
-          : [];
-        for (const [index, attachment] of fallbackPayload.entries()) {
-          const safeName = sanitizeName(attachment.fileName ?? `fallback-attachment-${index + 1}`);
-          const filePath = path.join(fallbackAttachmentDir, safeName);
-          await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-          fallbackAttachments.push({
-            path: filePath,
-            displayPath: attachment.displayPath,
-            sizeBytes: attachment.sizeBytes,
+      const artifactMatch = matchArtifactRequest(req);
+      if (artifactMatch) {
+        await serveRemoteArtifact({
+          req,
+          res,
+          authToken,
+          artifactRegistry,
+          logger,
+          verbose,
+          runId: artifactMatch.runId,
+          artifactId: artifactMatch.artifactId,
+        });
+        return;
+      }
+
+      const transactionMatch = matchTransactionRequest(req);
+      if (transactionMatch) {
+        if (
+          !authenticateRemoteRequest(
+            req,
+            res,
+            authToken,
+            logger,
+            verbose,
+            `/transactions/${transactionMatch.action}`,
+          )
+        ) {
+          return;
+        }
+        if (transactionMatch.action === "retry") {
+          await serveRemoteTransactionRetry({
+            res,
+            transactionStoreDir,
+            transactionToken: transactionMatch.transactionToken,
           });
+          return;
         }
-        fallbackSubmission = {
-          prompt: payload.fallbackSubmission.prompt,
-          attachments: fallbackAttachments,
-        };
+        await serveRemoteTransactionSettlement({
+          req,
+          res,
+          logger,
+          transactionStoreDir,
+          transactionToken: transactionMatch.transactionToken,
+          mode: transactionMatch.action,
+          activeTransactions,
+          transactionLocks,
+          retryCleanup,
+        });
+        return;
       }
 
-      // Reuse the existing browser logger surface so clients see the same log stream.
-      const automationLogger: BrowserLogger = ((message?: string) => {
-        if (typeof message === "string") {
-          sendEvent({ type: "log", message });
-        }
-      }) as BrowserLogger;
-      automationLogger.verbose = Boolean(payload.options.verbose);
-
-      // Preserve an explicit request to leave the completed conversation tab
-      // open before the service forces `keepBrowser` for process lifetime.
-      const clientRequestedKeepBrowser = payload.browserConfig?.keepBrowser === true;
-
-      // Remote runs always rely on the host's own Chrome profile; ignore any inline cookie transfer.
-      if (payload.browserConfig) {
-        payload.browserConfig.inlineCookies = null;
-        payload.browserConfig.inlineCookiesSource = null;
-        payload.browserConfig.cookieSync = true;
-      } else {
-        payload.browserConfig = {} as typeof payload.browserConfig;
+      if (req.method !== "POST" || req.url !== "/runs") {
+        res.statusCode = 404;
+        res.end();
+        return;
       }
-
-      // Enforce manual-login profile when cookie sync is unavailable (e.g., Windows/WSL).
-      if (options.manualLoginDefault) {
-        payload.browserConfig.manualLogin = true;
-        payload.browserConfig.manualLoginProfileDir = options.manualLoginProfileDir;
-        payload.browserConfig.keepBrowser = true;
+      if (!authenticateRemoteRequest(req, res, authToken, logger, verbose, "/runs")) return;
+      if (busy) {
         if (verbose) {
           logger(
-            `[serve] Enforcing manual-login profile at ${options.manualLoginProfileDir ?? "default"} for remote run ${runId}`,
+            `[serve] Busy: rejecting new run from ${formatSocket(req)} while another run is active`,
           );
         }
+        sendJson(res, 409, { error: "busy" });
+        return;
       }
 
-      const capture = await runBrowser({
-        prompt: payload.prompt,
-        attachments,
-        fallbackSubmission,
-        config: payload.browserConfig,
-        // `keepBrowser` above preserves the authenticated shared Chrome
-        // process. This separate service policy closes only a successfully
-        // captured tab owned by this run, preventing one renderer leak per
-        // request while incomplete/reattachable tabs remain untouched.
-        closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser),
-        log: automationLogger,
-        heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
-        verbose: payload.options.verbose,
-        sessionId: payload.options.sessionId,
-        followUpPrompts: payload.options.followUpPrompts,
-      });
-      const result: BrowserRunResult = capture;
-      if (
-        "runtime" in capture &&
-        typeof capture.finalize === "function" &&
-        typeof capture.abort === "function"
-      ) {
-        browserTransaction = capture;
-      }
-
-      const artifactRegistration = await registerRemoteArtifacts({
-        runId,
-        result,
-        artifactRegistry,
-        logger,
-      });
-      const artifactDescriptors = artifactRegistration.descriptors;
-      if (artifactDescriptors.length > 0) {
-        sendEvent({
-          type: "log",
-          message:
-            `[browser] ${artifactDescriptors.length} artifact(s) ready for bridge transfer. ` +
-            "If no cloud-local artifact path appears, upgrade both Oracle bridge endpoints or copy the file manually from the Windows browser host.",
-        });
-      }
-      for (const artifact of artifactDescriptors) {
-        sendEvent({ type: "artifact-ready", runId, artifact });
-      }
-      sendEvent({
-        type: "result",
-        result: sanitizeResult(result, artifactRegistration.warnings),
-      });
-      capturePublished = true;
-      if (browserTransaction) {
-        const finalization = await browserTransaction.finalize().catch((error) => ({
-          status: "pending" as const,
-          runtime: browserTransaction?.runtime ?? {},
-          error: error instanceof Error ? error.message : String(error),
-        }));
-        if (finalization.status === "pending") {
-          logger(`[serve] Browser cleanup remains pending for run ${runId}: ${finalization.error}`);
-        }
-      }
-      logger(
-        `[serve] Run ${runId} completed in ${Date.now() - runStartedAt}ms${
-          artifactDescriptors.length > 0
-            ? `; ${artifactDescriptors.length} artifact(s) ready for bridge transfer`
-            : ""
-        }`,
-      );
-    } catch (error) {
-      if (browserTransaction && !capturePublished) {
-        await browserTransaction.abort().catch(() => undefined);
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      sendEvent({ type: "error", message });
-      logger(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${message}`);
-    } finally {
-      busy = false;
-      res.end();
+      busy = true;
       try {
-        await rm(runDir, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup errors
+        await handleRemoteRunRequest({
+          req,
+          res,
+          options,
+          runBrowser,
+          logger,
+          verbose,
+          transactionStoreDir,
+          artifactRegistry,
+          activeTransactions,
+        });
+      } finally {
+        busy = false;
+      }
+    } catch (error) {
+      logger(`[serve] Request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "internal_error" });
+      } else if (!res.destroyed) {
+        res.end();
       }
     }
   });
 
-  await new Promise<void>((resolve) => {
-    server.listen(options.port ?? 0, options.host ?? "0.0.0.0", () => resolve());
+  const listenDeferred = createDeferred<void>();
+  const rejectListen = (error: Error) => listenDeferred.reject(error);
+  server.once("error", rejectListen);
+  server.listen(options.port ?? 0, options.host ?? "0.0.0.0", () => {
+    server.off("error", rejectListen);
+    listenDeferred.resolve();
   });
+  await listenDeferred.promise;
 
   const address = server.address();
   if (!address || typeof address === "string") {
@@ -400,11 +322,865 @@ export async function createRemoteServer(
     port: address.port,
     token: authToken,
     async close() {
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      });
+      const closeDeferred = createDeferred<void>();
+      server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
+      await closeDeferred.promise;
     },
   };
+}
+
+class RemoteRequestError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RemoteRequestError";
+  }
+}
+
+const RemoteAttachmentPayloadSchema = z
+  .object({
+    fileName: z.string().min(1).max(255),
+    displayPath: z.string().min(1).max(4096),
+    sizeBytes: z.number().int().positive().max(MAX_REMOTE_ATTACHMENT_BYTES).optional(),
+    contentBase64: z
+      .string()
+      .min(1)
+      .max(Math.ceil((MAX_REMOTE_ATTACHMENT_BYTES * 4) / 3) + 4),
+  })
+  .strict()
+  .superRefine((attachment, context) => {
+    const encoded = attachment.contentBase64;
+    if (
+      encoded.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) ||
+      encoded.slice(0, -2).includes("=")
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "attachment is not canonical base64",
+      });
+      return;
+    }
+    const decodedSize = Buffer.from(encoded, "base64").byteLength;
+    if (decodedSize <= 0 || decodedSize > MAX_REMOTE_ATTACHMENT_BYTES) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "attachment exceeds size limit" });
+    } else if (attachment.sizeBytes !== undefined && attachment.sizeBytes !== decodedSize) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "attachment size does not match payload",
+      });
+    }
+  })
+  .transform((attachment) => ({
+    ...attachment,
+    sizeBytes: Buffer.from(attachment.contentBase64, "base64").byteLength,
+  }));
+
+function isTrustedChatGptUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      !url.port &&
+      !url.username &&
+      !url.password &&
+      (url.hostname === "chatgpt.com" || url.hostname === "chat.openai.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+const RemoteBrowserRunConfigSchema = z
+  .object({
+    chatgptUrl: z
+      .string()
+      .min(1)
+      .max(2048)
+      .refine(isTrustedChatGptUrl, "chatgptUrl must be an HTTPS ChatGPT origin")
+      .nullable()
+      .optional(),
+    timeoutMs: z.number().int().positive().max(86_400_000).optional(),
+    inputTimeoutMs: z.number().int().positive().max(3_600_000).optional(),
+    attachmentTimeoutMs: z.number().int().positive().max(3_600_000).optional(),
+    assistantRecheckDelayMs: z.number().int().nonnegative().max(3_600_000).optional(),
+    assistantRecheckTimeoutMs: z.number().int().positive().max(3_600_000).optional(),
+    desiredModel: z.string().min(1).max(128).nullable().optional(),
+    modelStrategy: z.enum(["select", "current", "ignore"]).optional(),
+    thinkingTime: z.enum(["light", "standard", "extended", "heavy"]).optional(),
+    researchMode: z.enum(["off", "deep"]).optional(),
+    archiveConversations: z.enum(["auto", "always", "never"]).optional(),
+    resumeConversationUrl: z
+      .string()
+      .min(1)
+      .max(2048)
+      .refine(isTrustedChatGptUrl, "resumeConversationUrl must be an HTTPS ChatGPT origin")
+      .nullable()
+      .optional(),
+  })
+  .strict();
+
+const RemoteRunOptionsSchema = z
+  .object({
+    heartbeatIntervalMs: z.number().int().positive().max(3_600_000).optional(),
+    verbose: z.boolean().optional(),
+    sessionId: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/)
+      .optional(),
+    followUpPrompts: z.array(z.string().min(1).max(MAX_REMOTE_PROMPT_CHARS)).max(32).optional(),
+    keepConversationTab: z.boolean().optional(),
+  })
+  .strict();
+const RemoteRunPayloadSchema = z
+  .object({
+    protocolVersion: z.literal(REMOTE_TRANSACTION_PROTOCOL_VERSION),
+    transactionToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
+    prompt: z.string().min(1).max(MAX_REMOTE_PROMPT_CHARS),
+    attachments: z.array(RemoteAttachmentPayloadSchema).max(MAX_REMOTE_ATTACHMENTS),
+    fallbackSubmission: z
+      .object({
+        prompt: z.string().min(1).max(MAX_REMOTE_PROMPT_CHARS),
+        attachments: z.array(RemoteAttachmentPayloadSchema).max(MAX_REMOTE_ATTACHMENTS),
+      })
+      .strict()
+      .optional(),
+    browserConfig: RemoteBrowserRunConfigSchema,
+    options: RemoteRunOptionsSchema,
+  })
+  .strict()
+  .superRefine((payload, context) => {
+    const attachments = [
+      ...payload.attachments,
+      ...(payload.fallbackSubmission?.attachments ?? []),
+    ];
+    if (attachments.length > MAX_REMOTE_ATTACHMENTS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "remote attachment count exceeds limit",
+      });
+    }
+    const totalBytes = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
+    if (totalBytes > MAX_REMOTE_TOTAL_ATTACHMENT_BYTES) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "remote attachments exceed aggregate size limit",
+      });
+    }
+  });
+
+async function handleRemoteRunRequest(params: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  options: RemoteServerOptions;
+  runBrowser: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  logger: (message: string) => void;
+  verbose: boolean;
+  transactionStoreDir: string;
+  artifactRegistry: Map<string, RegisteredRemoteArtifact>;
+  activeTransactions: Map<string, BrowserRunTransaction>;
+}): Promise<void> {
+  let payload: RemoteRunPayload;
+  try {
+    const body = await readRequestBody(params.req, MAX_REMOTE_REQUEST_BYTES);
+    payload = validateRemoteRunPayload(JSON.parse(body));
+  } catch (error) {
+    const requestError =
+      error instanceof RemoteRequestError
+        ? error
+        : new RemoteRequestError(400, "invalid_request", "Invalid remote run request");
+    sendJson(params.res, requestError.statusCode, {
+      error: requestError.code,
+      message: requestError.message,
+    });
+    return;
+  }
+
+  const existing = await readRemoteTransactionRecord(
+    params.transactionStoreDir,
+    payload.transactionToken,
+  );
+  if (existing) {
+    sendJson(params.res, 409, {
+      error: "transaction_exists",
+      state: existing.state,
+      transactionToken: payload.transactionToken,
+    });
+    return;
+  }
+
+  const runId = randomUUID();
+  const now = new Date().toISOString();
+  await createRemoteTransactionRecord(params.transactionStoreDir, {
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    transactionToken: payload.transactionToken,
+    runId,
+    createdAt: now,
+    updatedAt: now,
+    state: "running",
+  });
+
+  params.logger(
+    `[serve] Accepted run ${runId} from ${formatSocket(params.req)} (prompt ${payload.prompt.length} chars)`,
+  );
+  const runStartedAt = Date.now();
+  let runDir: string | null = null;
+  params.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+
+  const sendEvent = (event: RemoteRunEvent): boolean => {
+    if (params.res.destroyed || params.res.writableEnded) return false;
+    return params.res.write(`${JSON.stringify(event)}\n`);
+  };
+  const automationLogger: BrowserLogger = ((message?: string) => {
+    if (typeof message === "string") sendEvent({ type: "log", message });
+  }) as BrowserLogger;
+  automationLogger.verbose = Boolean(payload.options.verbose);
+
+  let capture: BrowserRunTransaction | null = null;
+  let durableCapture = false;
+  try {
+    runDir = await mkdtemp(path.join(os.tmpdir(), `oracle-serve-${runId}-`));
+    const attachmentDir = path.join(runDir, "attachments");
+    await mkdir(attachmentDir, { recursive: true });
+    const attachments = await materializeRemoteAttachments(
+      payload.attachments,
+      attachmentDir,
+      "attachment",
+    );
+    let fallbackSubmission:
+      | {
+          prompt: string;
+          attachments: BrowserAttachment[];
+        }
+      | undefined;
+    if (payload.fallbackSubmission) {
+      const fallbackDir = path.join(runDir, "fallback-attachments");
+      await mkdir(fallbackDir, { recursive: true });
+      fallbackSubmission = {
+        prompt: payload.fallbackSubmission.prompt,
+        attachments: await materializeRemoteAttachments(
+          payload.fallbackSubmission.attachments,
+          fallbackDir,
+          "fallback-attachment",
+        ),
+      };
+    }
+
+    const effectiveBrowserConfig = buildEffectiveRemoteBrowserConfig(
+      payload.browserConfig,
+      params.options,
+    );
+    if (params.verbose && params.options.manualLoginDefault) {
+      params.logger(
+        `[serve] Enforcing manual-login profile at ${params.options.manualLoginProfileDir ?? "default"} for remote run ${runId}`,
+      );
+    }
+
+    capture = await params.runBrowser({
+      prompt: payload.prompt,
+      attachments,
+      fallbackSubmission,
+      config: effectiveBrowserConfig,
+      closeOwnedTabOnComplete: Boolean(
+        params.options.manualLoginDefault && !payload.options.keepConversationTab,
+      ),
+      log: automationLogger,
+      heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
+      verbose: payload.options.verbose,
+      sessionId: payload.options.sessionId,
+      followUpPrompts: payload.options.followUpPrompts,
+    });
+    assertBrowserRunTransaction(capture);
+    const result = browserRunResultFromTransaction(capture);
+    const artifactRegistration = await registerRemoteArtifacts({
+      runId,
+      result,
+      artifactRegistry: params.artifactRegistry,
+      logger: params.logger,
+    });
+    const sanitizedResult = sanitizeResult(result, artifactRegistration.warnings);
+    const record: RemoteTransactionRecord = {
+      protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+      transactionToken: payload.transactionToken,
+      runId,
+      createdAt: now,
+      updatedAt: new Date().toISOString(),
+      state: "pending",
+      result: sanitizedResult,
+      runtime: capture.runtime,
+      artifacts: artifactRegistration.descriptors,
+    };
+    params.activeTransactions.set(payload.transactionToken, capture);
+    await writeRemoteTransactionRecord(params.transactionStoreDir, record);
+    durableCapture = true;
+
+    if (artifactRegistration.descriptors.length > 0) {
+      sendEvent({
+        type: "log",
+        message:
+          `[browser] ${artifactRegistration.descriptors.length} artifact(s) ready for bridge transfer. ` +
+          "If no cloud-local artifact path appears, copy the file manually from the browser host.",
+      });
+    }
+    sendEvent({ type: "transaction", transaction: remoteTransactionPayload(record) });
+    params.logger(
+      `[serve] Run ${runId} captured durably in ${Date.now() - runStartedAt}ms; awaiting client publication acknowledgement`,
+    );
+  } catch (rawError) {
+    let failedCleanup: BrowserCaptureFinalizationResult | null = null;
+    const failedCapture = capture;
+    if (failedCapture && !durableCapture) {
+      failedCleanup = await failedCapture
+        .abort()
+        .catch((abortError) => pendingFinalization(failedCapture.runtime, abortError));
+      params.activeTransactions.delete(payload.transactionToken);
+    }
+    const error =
+      rawError instanceof BrowserAutomationError
+        ? rawError
+        : new BrowserAutomationError(
+            rawError instanceof Error ? rawError.message : "Remote browser automation failed",
+            { stage: "execute-browser" },
+            rawError,
+          );
+    const remoteError = serializeRemoteBrowserAutomationError(error, payload.transactionToken);
+    if (failedCleanup?.status === "pending") {
+      remoteError.runtime = failedCleanup.runtime;
+      remoteError.recoverableDisconnect = true;
+      remoteError.recoveryToken = payload.transactionToken;
+      remoteError.details = {
+        ...(remoteError.details ?? {}),
+        capturePublicationFailed: true,
+        cleanupError: failedCleanup.error,
+      };
+    }
+    const runtime = remoteError.runtime;
+    const recoverable = remoteError.recoverableDisconnect && Boolean(runtime);
+    const failedRecord: RemoteTransactionRecord = {
+      protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+      transactionToken: payload.transactionToken,
+      runId,
+      createdAt: now,
+      updatedAt: new Date().toISOString(),
+      state: recoverable ? "recoverable-error" : "failed",
+      runtime,
+      error: remoteError,
+    };
+    await writeRemoteTransactionRecord(params.transactionStoreDir, failedRecord);
+    sendEvent({ type: "error", error: remoteError });
+    params.logger(
+      `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
+    );
+  } finally {
+    if (!params.res.destroyed && !params.res.writableEnded) params.res.end();
+    if (runDir) await rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+function authenticateRemoteRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  authToken: string,
+  logger: (message: string) => void,
+  verbose: boolean,
+  endpoint: string,
+): boolean {
+  if ((req.headers.authorization ?? "") === `Bearer ${authToken}`) return true;
+  if (verbose) {
+    logger(
+      `[serve] Unauthorized ${endpoint} attempt from ${formatSocket(req)} (missing/invalid token)`,
+    );
+  }
+  sendJson(res, 401, { error: "unauthorized" });
+  return false;
+}
+
+function sendJson(res: http.ServerResponse, statusCode: number, value: unknown): void {
+  if (res.destroyed || res.writableEnded) return;
+  res.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(value));
+}
+
+function matchTransactionRequest(
+  req: http.IncomingMessage,
+): { transactionToken: string; action: "finalize" | "abort" | "retry" } | null {
+  if (req.method !== "POST" || !req.url) return null;
+  let pathname: string;
+  try {
+    pathname = new URL(req.url, "http://oracle.local").pathname;
+  } catch {
+    return null;
+  }
+  const match = /^\/transactions\/([^/]+)\/(finalize|abort|retry)$/.exec(pathname);
+  if (!match) return null;
+  let transactionToken: string;
+  try {
+    transactionToken = decodeURIComponent(match[1] ?? "");
+  } catch {
+    return null;
+  }
+  if (!REMOTE_TRANSACTION_TOKEN_PATTERN.test(transactionToken)) return null;
+  return {
+    transactionToken,
+    action: match[2] as "finalize" | "abort" | "retry",
+  };
+}
+
+async function serveRemoteTransactionRetry(params: {
+  res: http.ServerResponse;
+  transactionStoreDir: string;
+  transactionToken: string;
+}): Promise<void> {
+  const record = await readRemoteTransactionRecord(
+    params.transactionStoreDir,
+    params.transactionToken,
+  );
+  if (!record) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
+  let response: RemoteTransactionRetryResponse;
+  if (record.state === "running") {
+    response = { status: "running" };
+    sendJson(params.res, 202, response);
+    return;
+  }
+  if (!record.result) {
+    if (!record.error) throw new Error("Remote error transaction is missing error metadata");
+    const retryable = record.state === "recoverable-error" || record.state === "pending";
+    response = {
+      status: "error",
+      error: {
+        ...record.error,
+        details: { ...(record.error.details ?? {}), remoteCleanupState: record.state },
+        recoverableDisconnect: retryable,
+        recoveryToken: retryable ? record.transactionToken : undefined,
+        runtime: record.runtime,
+      },
+    };
+    sendJson(params.res, 200, response);
+    return;
+  }
+  response = { status: "transaction", transaction: remoteTransactionPayload(record) };
+  sendJson(params.res, 200, response);
+}
+
+async function serveRemoteTransactionSettlement(params: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  logger: (message: string) => void;
+  transactionStoreDir: string;
+  transactionToken: string;
+  mode: "finalize" | "abort";
+  activeTransactions: Map<string, BrowserRunTransaction>;
+  transactionLocks: Map<string, Promise<void>>;
+  retryCleanup: typeof retryBrowserRecoveryCleanup;
+}): Promise<void> {
+  let body: Record<string, unknown> = {};
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_settlement_request" });
+    return;
+  }
+  if (params.mode === "finalize" && body.durablePublication !== true) {
+    sendJson(params.res, 409, { error: "durable_publication_ack_required" });
+    return;
+  }
+
+  const outcome = await withRemoteTransactionLock(
+    params.transactionToken,
+    params.transactionLocks,
+    async () => {
+      const record = await readRemoteTransactionRecord(
+        params.transactionStoreDir,
+        params.transactionToken,
+      );
+      if (!record)
+        throw new RemoteRequestError(404, "transaction_not_found", "Transaction not found");
+      if (record.state === "running") {
+        throw new RemoteRequestError(409, "transaction_running", "Transaction is still running");
+      }
+      if (record.state === "failed") {
+        throw new RemoteRequestError(
+          409,
+          "transaction_failed",
+          "Transaction did not capture an answer",
+        );
+      }
+      if (record.state === "recoverable-error" && params.mode === "finalize") {
+        throw new RemoteRequestError(
+          409,
+          "transaction_has_no_capture",
+          "Recoverable disconnect has no durably captured answer to finalize",
+        );
+      }
+      if (record.state === "finalized" || record.state === "aborted") {
+        const terminalMode = record.state === "finalized" ? "finalize" : "abort";
+        if (terminalMode !== params.mode) {
+          throw new RemoteRequestError(
+            409,
+            "transaction_already_settled",
+            `Transaction was already ${record.state}`,
+          );
+        }
+        if (!record.finalization) throw new Error("Terminal transaction lacks finalization state");
+        return settlementResponse(record);
+      }
+      const runtime = record.runtime;
+      if (!runtime) throw new Error("Pending transaction lacks runtime authority");
+      if (record.settlementMode && record.settlementMode !== params.mode) {
+        throw new RemoteRequestError(
+          409,
+          "transaction_settlement_conflict",
+          `Transaction is already bound to ${record.settlementMode}`,
+        );
+      }
+
+      record.settlementMode = params.mode;
+      if (params.mode === "finalize" && !record.publicationAcknowledgedAt) {
+        record.publicationAcknowledgedAt = new Date().toISOString();
+      }
+      record.updatedAt = new Date().toISOString();
+      await writeRemoteTransactionRecord(params.transactionStoreDir, record);
+
+      const active = params.activeTransactions.get(params.transactionToken);
+      let finalization: BrowserCaptureFinalizationResult;
+      if (active) {
+        params.activeTransactions.delete(params.transactionToken);
+        finalization = await active[params.mode]().catch((error) =>
+          pendingFinalization(runtime, error),
+        );
+      } else {
+        const cleanupLogger = ((message?: string) => {
+          if (typeof message === "string") params.logger(`[serve] ${message}`);
+        }) as BrowserLogger;
+        finalization = await params
+          .retryCleanup(runtime, cleanupLogger)
+          .catch((error) => pendingFinalization(runtime, error));
+      }
+
+      record.runtime = finalization.runtime;
+      record.finalization = finalization;
+      record.state =
+        finalization.status === "completed"
+          ? params.mode === "finalize"
+            ? "finalized"
+            : "aborted"
+          : "pending";
+      if (record.error && !record.result) {
+        const retryable = record.state === "pending";
+        record.error = {
+          ...record.error,
+          details: { ...(record.error.details ?? {}), remoteCleanupState: record.state },
+          recoverableDisconnect: retryable,
+          recoveryToken: retryable ? record.transactionToken : undefined,
+          runtime: finalization.runtime,
+        };
+      }
+      record.updatedAt = new Date().toISOString();
+      await writeRemoteTransactionRecord(params.transactionStoreDir, record);
+      return settlementResponse(record);
+    },
+  ).catch((error) => error);
+
+  if (outcome instanceof RemoteRequestError) {
+    sendJson(params.res, outcome.statusCode, { error: outcome.code, message: outcome.message });
+    return;
+  }
+  if (outcome instanceof Error) throw outcome;
+  sendJson(params.res, 200, outcome);
+}
+
+async function withRemoteTransactionLock<T>(
+  transactionToken: string,
+  locks: Map<string, Promise<void>>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const prior = locks.get(transactionToken) ?? Promise.resolve();
+  const gate = createDeferred<void>();
+  const current = prior.then(() => gate.promise);
+  locks.set(transactionToken, current);
+  await prior;
+  try {
+    return await operation();
+  } finally {
+    gate.resolve();
+    if (locks.get(transactionToken) === current) locks.delete(transactionToken);
+  }
+}
+
+function settlementResponse(record: RemoteTransactionRecord): RemoteTransactionSettlementResponse {
+  if (
+    !record.finalization ||
+    (record.state !== "pending" && record.state !== "finalized" && record.state !== "aborted")
+  ) {
+    throw new Error("Transaction settlement response is incomplete");
+  }
+  return {
+    transactionToken: record.transactionToken,
+    state: record.state,
+    finalization: record.finalization,
+  };
+}
+
+function pendingFinalization(
+  runtime: BrowserRuntimeMetadata,
+  error: unknown,
+): BrowserCaptureFinalizationResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    status: "pending",
+    runtime: {
+      ...runtime,
+      recoveryCleanupResult: { status: "failed", error: message },
+    },
+    error: message,
+  };
+}
+
+function remoteTransactionPayload(record: RemoteTransactionRecord): RemoteRunTransactionPayload {
+  if (
+    !record.result ||
+    !record.runtime ||
+    (record.state !== "pending" && record.state !== "finalized" && record.state !== "aborted")
+  ) {
+    throw new Error("Remote transaction record is not publishable");
+  }
+  return {
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    transactionToken: record.transactionToken,
+    runId: record.runId,
+    result: record.result,
+    runtime: record.runtime,
+    artifacts: record.artifacts ?? [],
+    state: record.state,
+    finalization: record.finalization,
+  };
+}
+
+async function createRemoteTransactionRecord(
+  transactionStoreDir: string,
+  record: RemoteTransactionRecord,
+): Promise<void> {
+  const targetPath = remoteTransactionRecordPath(transactionStoreDir, record.transactionToken);
+  const handle = await open(targetPath, "wx", 0o600).catch((error) => {
+    if (readErrorCode(error) === "EEXIST") {
+      throw new RemoteRequestError(409, "transaction_exists", "Transaction token already exists");
+    }
+    throw error;
+  });
+  try {
+    await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(transactionStoreDir);
+}
+
+async function writeRemoteTransactionRecord(
+  transactionStoreDir: string,
+  record: RemoteTransactionRecord,
+): Promise<void> {
+  record.updatedAt = new Date().toISOString();
+  const targetPath = remoteTransactionRecordPath(transactionStoreDir, record.transactionToken);
+  const tempPath = path.join(
+    transactionStoreDir,
+    `.${record.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    const handle = await open(tempPath, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(tempPath, targetPath);
+    await syncDirectory(transactionStoreDir);
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function readRemoteTransactionRecord(
+  transactionStoreDir: string,
+  transactionToken: string,
+): Promise<RemoteTransactionRecord | null> {
+  const targetPath = remoteTransactionRecordPath(transactionStoreDir, transactionToken);
+  try {
+    const parsed = JSON.parse(await readFile(targetPath, "utf8")) as RemoteTransactionRecord;
+    if (
+      parsed.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
+      parsed.transactionToken !== transactionToken
+    ) {
+      throw new Error(`Invalid remote transaction record: ${targetPath}`);
+    }
+    return parsed;
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function remoteTransactionRecordPath(
+  transactionStoreDir: string,
+  transactionToken: string,
+): string {
+  if (!REMOTE_TRANSACTION_TOKEN_PATTERN.test(transactionToken)) {
+    throw new RemoteRequestError(400, "invalid_transaction_token", "Invalid transaction token");
+  }
+  return path.join(transactionStoreDir, `${transactionToken}.json`);
+}
+
+function validateRemoteRunPayload(value: unknown): RemoteRunPayload {
+  const parsed = RemoteRunPayloadSchema.safeParse(value);
+  if (parsed.success) return parsed.data as RemoteRunPayload;
+  const issue = parsed.error.issues[0];
+  const authorityIssue = parsed.error.issues.find(
+    (candidate) => candidate.code === "unrecognized_keys",
+  );
+  if (authorityIssue) {
+    const keys = "keys" in authorityIssue ? authorityIssue.keys.join(", ") : "unknown";
+    throw new RemoteRequestError(
+      400,
+      "authority_fields_rejected",
+      `Remote request contains unsupported or authority-bearing field(s): ${keys}`,
+    );
+  }
+  const message = issue?.message ?? "Invalid remote run request";
+  const statusCode = /exceed|too big|maximum/i.test(message) ? 413 : 400;
+  throw new RemoteRequestError(statusCode, "invalid_request", message);
+}
+
+function buildEffectiveRemoteBrowserConfig(
+  config: RemoteBrowserRunConfig,
+  options: RemoteServerOptions,
+): BrowserSessionConfig {
+  const chatgptUrl = normalizeChatgptUrl(config.chatgptUrl ?? CHATGPT_URL, CHATGPT_URL);
+  return {
+    ...config,
+    chatgptUrl,
+    url: chatgptUrl,
+    chromeProfile: null,
+    chromePath: null,
+    chromeCookiePath: null,
+    attachRunning: false,
+    browserTabRef: null,
+    debugPort: null,
+    cookieSync: true,
+    inlineCookies: null,
+    inlineCookiesSource: null,
+    remoteChrome: null,
+    copyProfileSource: null,
+    manualLogin: Boolean(options.manualLoginDefault),
+    manualLoginProfileDir: options.manualLoginDefault ? options.manualLoginProfileDir : null,
+    manualLoginCookieSync: false,
+    keepBrowser: Boolean(options.manualLoginDefault),
+  };
+}
+
+async function materializeRemoteAttachments(
+  attachments: RemoteRunPayload["attachments"],
+  directory: string,
+  fallbackName: string,
+): Promise<BrowserAttachment[]> {
+  const materialized: BrowserAttachment[] = [];
+  for (const [index, attachment] of attachments.entries()) {
+    const safeName = sanitizeName(attachment.fileName || `${fallbackName}-${index + 1}`);
+    const filePath = path.join(directory, `${index + 1}-${safeName}`);
+    const payload = Buffer.from(attachment.contentBase64, "base64");
+    await writeFile(filePath, payload, { mode: 0o600 });
+    materialized.push({
+      path: filePath,
+      displayPath: attachment.displayPath,
+      sizeBytes: payload.byteLength,
+    });
+  }
+  return materialized;
+}
+
+function assertBrowserRunTransaction(value: unknown): asserts value is BrowserRunTransaction {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("runtime" in value) ||
+    typeof value.runtime !== "object" ||
+    value.runtime === null ||
+    !("finalize" in value) ||
+    typeof value.finalize !== "function" ||
+    !("abort" in value) ||
+    typeof value.abort !== "function"
+  ) {
+    throw new BrowserAutomationError(
+      "Remote browser host returned a legacy bare result instead of a capture transaction.",
+      { stage: "remote-transaction-protocol", code: "legacy-result-rejected" },
+    );
+  }
+}
+
+function browserRunResultFromTransaction(transaction: BrowserRunTransaction): BrowserRunResult {
+  const { runtime: _runtime, finalize: _finalize, abort: _abort, ...result } = transaction;
+  return result;
+}
+
+function serializeRemoteBrowserAutomationError(
+  error: BrowserAutomationError,
+  transactionToken: string,
+): RemoteBrowserAutomationErrorPayload {
+  const rawDetails = error.details ?? {};
+  const runtimeCandidate = rawDetails.runtime;
+  const runtime =
+    typeof runtimeCandidate === "object" && runtimeCandidate !== null
+      ? (runtimeCandidate as BrowserRuntimeMetadata)
+      : undefined;
+  const details = serializableRecord(
+    Object.fromEntries(Object.entries(rawDetails).filter(([key]) => key !== "runtime")),
+  );
+  const stage = typeof rawDetails.stage === "string" ? rawDetails.stage : undefined;
+  const recoverableDisconnect = rawDetails.recoverableDisconnect === true && Boolean(runtime);
+  return {
+    name: "BrowserAutomationError",
+    category: "browser-automation",
+    message: error.message,
+    details,
+    stage,
+    recoverableDisconnect,
+    recoveryToken: recoverableDisconnect && runtime ? transactionToken : undefined,
+    runtime,
+  };
+}
+
+function serializableRecord(value: Record<string, unknown>): Record<string, unknown> {
+  try {
+    return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function readErrorCode(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
@@ -441,25 +1217,25 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
       console.log(
         `Cookie extraction is unavailable on this platform. Using manual-login Chrome profile at ${manualProfileDir}. Remote runs will reuse this profile; sign in once when the browser opens.`,
       );
-      const existingPort = await readDevToolsPort(manualProfileDir);
-      if (existingPort) {
-        const reachable = await verifyDevToolsReachable({ port: existingPort });
-        if (reachable.ok) {
-          console.log(
-            "Detected an existing automation Chrome session; will reuse it for manual login.",
-          );
-        } else {
-          console.log(
-            `Found stale DevToolsActivePort (port ${existingPort}, ${reachable.error}); launching a fresh manual-login Chrome.`,
-          );
-          await cleanupStaleProfileState(manualProfileDir, console.log, {
-            lockRemovalMode: "never",
-          });
-          void launchManualLoginChrome(manualProfileDir, CHATGPT_URL, console.log);
-        }
-      } else {
-        void launchManualLoginChrome(manualProfileDir, CHATGPT_URL, console.log);
-      }
+      const bootstrapLogger = ((message?: string) => {
+        if (typeof message === "string") console.log(message);
+      }) as BrowserLogger;
+      const owner = await acquireManualChromeOwner(
+        manualProfileDir,
+        resolveBrowserConfig({
+          manualLogin: true,
+          manualLoginProfileDir: manualProfileDir,
+          manualLoginCookieSync: false,
+          cookieSync: false,
+          keepBrowser: true,
+          url: CHATGPT_URL,
+        }),
+        bootstrapLogger,
+        "remote-serve-bootstrap",
+      );
+      console.log(
+        `${owner.source === "launched" ? "Launched" : "Reusing"} canonical manual-login Chrome owner on DevTools port ${owner.chrome.port} (pid ${owner.processIdentity.pid}).`,
+      );
     } else if (opened) {
       console.log(
         "Opened chatgpt.com for login. Sign in, then restart `oracle serve` to continue.",
@@ -485,17 +1261,17 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
     manualLoginDefault: preferManualLogin,
     manualLoginProfileDir: manualProfileDir,
   });
-  await new Promise<void>((resolve) => {
-    const shutdown = () => {
-      console.log("Shutting down remote service...");
-      server
-        .close()
-        .catch((error) => console.error("Failed to close remote server:", error))
-        .finally(() => resolve());
-    };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-  });
+  const shutdownDeferred = createDeferred<void>();
+  const shutdown = () => {
+    console.log("Shutting down remote service...");
+    server
+      .close()
+      .catch((error) => console.error("Failed to close remote server:", error))
+      .finally(() => shutdownDeferred.resolve());
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  await shutdownDeferred.promise;
 }
 
 function matchArtifactRequest(
@@ -534,15 +1310,16 @@ async function serveRemoteArtifact(params: {
   runId: string;
   artifactId: string;
 }): Promise<void> {
-  const authHeader = params.req.headers.authorization ?? "";
-  if (authHeader !== `Bearer ${params.authToken}`) {
-    if (params.verbose) {
-      params.logger(
-        `[serve] Unauthorized artifact transfer attempt from ${formatSocket(params.req)} (missing/invalid token)`,
-      );
-    }
-    params.res.writeHead(401, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "unauthorized" }));
+  if (
+    !authenticateRemoteRequest(
+      params.req,
+      params.res,
+      params.authToken,
+      params.logger,
+      params.verbose,
+      "/runs/.../artifacts/...",
+    )
+  ) {
     return;
   }
 
@@ -550,48 +1327,70 @@ async function serveRemoteArtifact(params: {
   const key = remoteArtifactKey(params.runId, params.artifactId);
   const artifact = params.artifactRegistry.get(key);
   if (!artifact) {
-    params.res.writeHead(404, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "artifact_not_found" }));
+    sendJson(params.res, 404, { error: "artifact_not_found" });
     return;
   }
   if (Date.now() > artifact.expiresAt) {
     params.artifactRegistry.delete(key);
-    params.res.writeHead(410, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "artifact_expired" }));
+    sendJson(params.res, 410, { error: "artifact_expired" });
     return;
   }
 
-  const fileStat = await stat(artifact.filePath).catch(() => null);
-  if (!fileStat?.isFile() || fileStat.size <= 0) {
-    params.res.writeHead(410, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "artifact_unavailable" }));
+  const handle = await open(artifact.filePath, "r").catch(() => null);
+  if (!handle) {
+    sendJson(params.res, 410, { error: "artifact_unavailable" });
     return;
   }
-  if (fileStat.size > MAX_REMOTE_ARTIFACT_BYTES) {
-    params.res.writeHead(413, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "artifact_too_large" }));
-    return;
-  }
+  try {
+    const fileStat = await handle.stat();
+    const stableIdentity =
+      fileStat.isFile() &&
+      fileStat.size === artifact.descriptor.byteSize &&
+      fileStat.size > 0 &&
+      fileStat.size <= MAX_REMOTE_ARTIFACT_BYTES &&
+      (artifact.device === 0 || fileStat.dev === artifact.device) &&
+      (artifact.inode === 0 || fileStat.ino === artifact.inode);
+    if (!stableIdentity) {
+      sendJson(params.res, 410, { error: "artifact_identity_changed" });
+      return;
+    }
+    const sha256 = await computeOpenFileSha256(handle);
+    if (sha256 !== artifact.descriptor.sha256) {
+      sendJson(params.res, 410, { error: "artifact_content_changed" });
+      return;
+    }
 
-  const filename = sanitizeArtifactFilename(artifact.descriptor.filename, "artifact.bin");
-  params.res.writeHead(200, {
-    "Content-Type":
-      sanitizeArtifactMimeType(artifact.descriptor.mimeType) ?? "application/octet-stream",
-    "Content-Length": fileStat.size,
-    "Content-Disposition": `attachment; filename="${filename.replace(/"/g, "")}"`,
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "X-Oracle-Artifact-Id": artifact.descriptor.artifactId,
-    "X-Oracle-Artifact-Sha256": artifact.descriptor.sha256,
-  });
-
-  await pipeline(createReadStream(artifact.filePath), params.res).catch((error) => {
-    params.logger(
-      `[serve] Artifact transfer failed for ${artifact.descriptor.artifactId}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+    const filename = sanitizeArtifactFilename(artifact.descriptor.filename, "artifact.bin");
+    params.res.writeHead(200, {
+      "Content-Type":
+        sanitizeArtifactMimeType(artifact.descriptor.mimeType) ?? "application/octet-stream",
+      "Content-Length": fileStat.size,
+      "Content-Disposition": `attachment; filename="${filename.replace(/"/g, "")}"`,
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "X-Oracle-Artifact-Id": artifact.descriptor.artifactId,
+      "X-Oracle-Artifact-Sha256": artifact.descriptor.sha256,
+    });
+    await pipeline(handle.createReadStream({ start: 0, autoClose: false }), params.res).catch(
+      (error) => {
+        params.logger(
+          `[serve] Artifact transfer failed for ${artifact.descriptor.artifactId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      },
     );
-  });
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function computeOpenFileSha256(handle: FileHandle): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of handle.createReadStream({ start: 0, autoClose: false })) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
 }
 
 function pruneExpiredArtifacts(artifactRegistry: Map<string, RegisteredRemoteArtifact>): void {
@@ -650,6 +1449,8 @@ async function registerRemoteArtifacts(params: {
       {
         descriptor: registration.descriptor,
         filePath: registration.filePath,
+        device: registration.device,
+        inode: registration.inode,
         expiresAt: Date.now() + REMOTE_ARTIFACT_TTL_MS,
       },
     );
@@ -661,7 +1462,12 @@ async function registerRemoteArtifacts(params: {
 async function buildRemoteArtifactRegistration(
   runId: string,
   artifact: SessionArtifact,
-): Promise<{ descriptor: RemoteArtifactDescriptor; filePath: string }> {
+): Promise<{
+  descriptor: RemoteArtifactDescriptor;
+  filePath: string;
+  device: number;
+  inode: number;
+}> {
   if (artifact.path.endsWith(".crdownload")) {
     throw new Error("artifact is still a Chrome partial download");
   }
@@ -684,6 +1490,8 @@ async function buildRemoteArtifactRegistration(
   const sha256 = await computeFileSha256(filePath);
   return {
     filePath,
+    device: fileStat.dev,
+    inode: fileStat.ino,
     descriptor: {
       artifactId: randomUUID(),
       runId,
@@ -728,12 +1536,35 @@ function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["so
   return "chatgpt-file-endpoint";
 }
 
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+async function readRequestBody(req: http.IncomingMessage, maximumBytes: number): Promise<string> {
+  const contentLengthHeader = req.headers["content-length"];
+  const contentLength =
+    typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : undefined;
+  if (
+    contentLength !== undefined &&
+    (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maximumBytes)
+  ) {
+    throw new RemoteRequestError(
+      413,
+      "request_too_large",
+      "Remote request body exceeds size limit",
+    );
   }
-  return Buffer.concat(chunks).toString("utf8");
+  const chunks: Buffer[] = [];
+  let receivedBytes = 0;
+  for await (const chunk of req) {
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    receivedBytes += buffer.byteLength;
+    if (receivedBytes > maximumBytes) {
+      throw new RemoteRequestError(
+        413,
+        "request_too_large",
+        "Remote request body exceeds size limit",
+      );
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, receivedBytes).toString("utf8");
 }
 
 function sanitizeName(raw: string): string {
@@ -745,16 +1576,14 @@ function sanitizeResult(
   warnings: BrowserRunWarning[] = [],
 ): BrowserRunResult {
   return {
-    answerText: result.answerText,
-    answerMarkdown: result.answerMarkdown,
-    answerHtml: result.answerHtml,
-    tookMs: result.tookMs,
-    answerTokens: result.answerTokens,
-    answerChars: result.answerChars,
+    ...result,
+    // Host-local artifact paths are replaced by authenticated bridge descriptors.
+    artifacts: undefined,
+    generatedImages: undefined,
+    savedImages: undefined,
+    downloadableFiles: undefined,
+    savedFiles: undefined,
     warnings: warnings.length > 0 ? warnings : undefined,
-    chromePid: undefined,
-    chromePort: undefined,
-    userDataDir: undefined,
   };
 }
 
@@ -950,71 +1779,5 @@ function canSpawn(cmd: string): boolean {
     return whichResult.status === 0;
   } catch {
     return false;
-  }
-}
-
-async function launchManualLoginChrome(
-  profileDir: string,
-  url: string,
-  logger: (msg: string) => void,
-): Promise<void> {
-  const timeoutMs = 7000;
-  let finished = false;
-  const timeout = setTimeout(() => {
-    if (!finished) {
-      logger(
-        `Timed out launching Chrome for manual login. Launch Chrome manually with --user-data-dir=${profileDir} and log in to ${url}.`,
-      );
-    }
-  }, timeoutMs);
-
-  try {
-    const chromeLauncher = await import("chrome-launcher");
-    const { launch } = chromeLauncher;
-    const debugPort = await findAvailablePort();
-    logger(`Planned manual-login Chrome DevTools port: ${debugPort}`);
-    const chrome = await launch({
-      // Expose DevTools so later runs can attach instead of spawning a second Chrome.
-      // Use a per-serve free port so the login window stays stable for all runs.
-      port: debugPort,
-      userDataDir: profileDir,
-      startingUrl: url,
-      chromeFlags: [
-        "--no-first-run",
-        "--no-default-browser-check",
-        `--user-data-dir=${profileDir}`,
-        "--remote-allow-origins=*",
-        `--remote-debugging-port=${debugPort}`, // ensure DevToolsActivePort is written even on Windows
-      ],
-    });
-
-    const chosenPort = chrome?.port ?? debugPort ?? null;
-    if (chosenPort) {
-      // Persist DevToolsActivePort eagerly so future runs can attach/reuse this Chrome.
-      await writeDevToolsActivePort(profileDir, chosenPort);
-      if (chrome?.pid) {
-        await writeChromePid(profileDir, chrome.pid);
-      }
-      logger(`Manual-login Chrome DevTools port: ${chosenPort}`);
-      logger(`If needed, DevTools JSON at http://127.0.0.1:${chosenPort}/json/version`);
-    } else {
-      logger(
-        "Warning: unable to determine manual-login Chrome DevTools port. Remote runs may fail to attach.",
-      );
-    }
-
-    finished = true;
-    clearTimeout(timeout);
-    const portInfo = chosenPort ? ` (DevTools port ${chosenPort})` : "";
-    logger(
-      `Opened Chrome with manual-login profile at ${profileDir}${portInfo}. Complete login, then rerun remote sessions.`,
-    );
-  } catch (error) {
-    finished = true;
-    clearTimeout(timeout);
-    const message = error instanceof Error ? error.message : String(error);
-    logger(
-      `Unable to open Chrome for manual login (${message}). Launch Chrome manually with --user-data-dir=${profileDir} and log in to ${url}.`,
-    );
   }
 }

@@ -1,7 +1,11 @@
 import http from "node:http";
 import net from "node:net";
 import { parseHostPort } from "../bridge/connection.js";
-import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactCapabilities } from "./types.js";
+import {
+  MAX_REMOTE_ARTIFACT_BYTES,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+  type RemoteArtifactCapabilities,
+} from "./types.js";
 
 export interface RemoteHealthResult {
   ok: boolean;
@@ -103,28 +107,42 @@ function parseCapabilities(value: unknown): RemoteArtifactCapabilities | undefin
   const raw = value as {
     artifactTransfer?: unknown;
     artifactProtocolVersion?: unknown;
+    transactionProtocolVersion?: unknown;
     maxArtifactBytes?: unknown;
+    maxRequestBytes?: unknown;
+    maxAttachmentBytes?: unknown;
+    maxTotalAttachmentBytes?: unknown;
+    maxAttachments?: unknown;
+    maxPromptChars?: unknown;
   };
-  if (raw.artifactTransfer !== true) {
-    return undefined;
-  }
-  const artifactProtocolVersion = raw.artifactProtocolVersion;
-  const maxArtifactBytes = raw.maxArtifactBytes;
   if (
-    typeof artifactProtocolVersion !== "number" ||
-    !Number.isSafeInteger(artifactProtocolVersion) ||
-    artifactProtocolVersion <= 0 ||
-    typeof maxArtifactBytes !== "number" ||
-    !Number.isSafeInteger(maxArtifactBytes) ||
-    maxArtifactBytes <= 0
+    raw.artifactTransfer !== true ||
+    !isPositiveSafeInteger(raw.artifactProtocolVersion) ||
+    raw.transactionProtocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
+    !isPositiveSafeInteger(raw.maxArtifactBytes) ||
+    !isPositiveSafeInteger(raw.maxRequestBytes) ||
+    !isPositiveSafeInteger(raw.maxAttachmentBytes) ||
+    !isPositiveSafeInteger(raw.maxTotalAttachmentBytes) ||
+    !isPositiveSafeInteger(raw.maxAttachments) ||
+    !isPositiveSafeInteger(raw.maxPromptChars)
   ) {
     return undefined;
   }
   return {
     artifactTransfer: true,
-    artifactProtocolVersion,
-    maxArtifactBytes: Math.min(maxArtifactBytes, MAX_REMOTE_ARTIFACT_BYTES),
+    artifactProtocolVersion: raw.artifactProtocolVersion,
+    transactionProtocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    maxArtifactBytes: Math.min(raw.maxArtifactBytes, MAX_REMOTE_ARTIFACT_BYTES),
+    maxRequestBytes: raw.maxRequestBytes,
+    maxAttachmentBytes: raw.maxAttachmentBytes,
+    maxTotalAttachmentBytes: raw.maxTotalAttachmentBytes,
+    maxAttachments: raw.maxAttachments,
+    maxPromptChars: raw.maxPromptChars,
   };
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function extractErrorMessage(json: unknown, bodyText: string): string | null {

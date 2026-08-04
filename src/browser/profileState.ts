@@ -1,11 +1,31 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { delay } from "./utils.js";
+import {
+  acquireCrashRecoverableFilesystemLock,
+  type CrashRecoverableFilesystemLock,
+  FilesystemLockBusyError,
+} from "./filesystemLock.js";
 
 export type ProfileStateLogger = (message: string) => void;
+
+interface PlatformPath {
+  isAbsolute(candidate: string): boolean;
+  resolve(...pathSegments: string[]): string;
+}
 
 const DEVTOOLS_ACTIVE_PORT_FILENAME = "DevToolsActivePort";
 const DEVTOOLS_ACTIVE_PORT_RELATIVE_PATHS = [
@@ -29,9 +49,15 @@ const executeProcessCommand: ProcessCommandExecutor = async (file, args) => {
   });
   return { stdout: String(stdout ?? "") };
 };
-const CHROME_TERMINATION_TIMEOUT_MS = 5_000;
-const CHROME_FORCE_TERMINATION_TIMEOUT_MS = 2_000;
-const CHROME_TERMINATION_POLL_MS = 50;
+const PHYSICAL_PROFILE_IDENTITY_VERSION = 1 as const;
+
+export interface ProfileDirectoryIdentity {
+  readonly version: typeof PHYSICAL_PROFILE_IDENTITY_VERSION;
+  readonly platform: NodeJS.Platform;
+  readonly canonicalPath: string;
+  readonly device: string;
+  readonly inode: string;
+}
 
 export interface ChromeProcessIdentity {
   readonly pid: number;
@@ -39,6 +65,7 @@ export interface ChromeProcessIdentity {
   readonly executablePath: string;
   readonly normalizedUserDataDir: string;
   readonly launchNonce: string;
+  readonly profileDirectory: ProfileDirectoryIdentity;
 }
 
 interface ChromeProcessSnapshot {
@@ -53,6 +80,128 @@ interface ChromeProcessIdentityDeps {
   execute?: ProcessCommandExecutor;
   readIdentity?: (userDataDir: string) => Promise<ChromeProcessIdentity | null>;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
+  captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
+  verifyProfileIdentity?: (
+    userDataDir: string,
+    identity: ProfileDirectoryIdentity,
+  ) => Promise<boolean>;
+}
+
+export async function captureProfileDirectoryIdentity(
+  userDataDir: string,
+  options: { create?: boolean } = {},
+): Promise<ProfileDirectoryIdentity> {
+  const resolvedPath = path.resolve(userDataDir);
+  if (options.create) {
+    await rejectProfileSymlinkTraversal(resolvedPath, { allowMissing: true });
+    await mkdir(resolvedPath, { recursive: true });
+  }
+  await rejectProfileSymlinkTraversal(resolvedPath);
+  const canonicalPath = await realpath(resolvedPath);
+  const physical = await stat(canonicalPath, { bigint: true });
+  if (!physical.isDirectory()) {
+    throw new Error(`Profile path is not a directory: ${userDataDir}`);
+  }
+  return Object.freeze({
+    version: PHYSICAL_PROFILE_IDENTITY_VERSION,
+    platform: process.platform,
+    canonicalPath,
+    device: physical.dev.toString(),
+    inode: physical.ino.toString(),
+  });
+}
+
+export async function verifyProfileDirectoryIdentity(
+  userDataDir: string,
+  expected: ProfileDirectoryIdentity,
+): Promise<boolean> {
+  const parsed = parseProfileDirectoryIdentity(expected, expected.platform);
+  if (!parsed || expected.platform !== process.platform) return false;
+  try {
+    const current = await captureProfileDirectoryIdentity(userDataDir);
+    return sameProfileDirectoryIdentity(current, parsed);
+  } catch {
+    return false;
+  }
+}
+export async function assertProfileDirectoryIdentity(
+  userDataDir: string,
+  expected: ProfileDirectoryIdentity,
+  operation: string,
+): Promise<void> {
+  if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) {
+    throw new Error(
+      `${operation} refused because the physical profile directory changed: ${userDataDir}`,
+    );
+  }
+}
+
+export function sameProfileDirectoryIdentity(
+  left: ProfileDirectoryIdentity,
+  right: ProfileDirectoryIdentity,
+): boolean {
+  return (
+    left.version === right.version &&
+    left.platform === right.platform &&
+    samePlatformPath(left.canonicalPath, right.canonicalPath, left.platform) &&
+    left.device === right.device &&
+    left.inode === right.inode
+  );
+}
+
+export async function removeProfileDirectoryIfIdentityMatches(
+  userDataDir: string,
+  expected: ProfileDirectoryIdentity,
+): Promise<boolean> {
+  if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
+  if (await isChromeUsingUserDataDir(expected.canonicalPath)) return false;
+  if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
+  await rm(expected.canonicalPath, { recursive: true, force: true });
+  return !(await pathExists(expected.canonicalPath));
+}
+
+async function rejectProfileSymlinkTraversal(
+  resolvedPath: string,
+  options: { allowMissing?: boolean } = {},
+): Promise<void> {
+  const root = path.parse(resolvedPath).root;
+  const relative = path.relative(root, resolvedPath);
+  let current = root;
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let entry: Stats;
+    try {
+      entry = await lstat(current);
+    } catch (error) {
+      if (options.allowMissing && readErrorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    if (!entry.isSymbolicLink()) continue;
+    const isDarwinSystemRootAlias =
+      process.platform === "darwin" && ["/etc", "/tmp", "/var"].includes(current);
+    if (!isDarwinSystemRootAlias) {
+      throw new Error(`Profile directory traverses a symlink or reparse point: ${current}`);
+    }
+  }
+}
+
+function samePlatformPath(left: string, right: string, platform: NodeJS.Platform): boolean {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const normalizedLeft = pathApi.resolve(left);
+  const normalizedRight = pathApi.resolve(right);
+  return platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate);
+    return true;
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export function getDevToolsActivePortPaths(userDataDir: string): string[] {
@@ -60,56 +209,73 @@ export function getDevToolsActivePortPaths(userDataDir: string): string[] {
 }
 
 export async function readDevToolsPort(userDataDir: string): Promise<number | null> {
-  for (const candidate of getDevToolsActivePortPaths(userDataDir)) {
+  let profile: ProfileDirectoryIdentity;
+  try {
+    profile = await captureProfileDirectoryIdentity(userDataDir);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
     try {
       const raw = await readFile(candidate, "utf8");
+      await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
       const firstLine = raw.split(/\r?\n/u)[0]?.trim();
       const port = Number.parseInt(firstLine ?? "", 10);
       if (Number.isFinite(port)) {
         return port;
       }
-    } catch {
-      // ignore missing/unreadable candidates
+    } catch (error) {
+      if (readErrorCode(error) !== "ENOENT") throw error;
+      await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
     }
   }
+  await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
   return null;
 }
 
 export async function writeDevToolsActivePort(userDataDir: string, port: number): Promise<void> {
+  const profile = await captureProfileDirectoryIdentity(userDataDir, { create: true });
   const contents = `${port}\n/devtools/browser`;
-  for (const candidate of getDevToolsActivePortPaths(userDataDir)) {
-    try {
-      await mkdir(path.dirname(candidate), { recursive: true });
-      await writeFile(candidate, contents, "utf8");
-    } catch {
-      // best effort
-    }
+  for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
+    await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority persistence");
+    await mkdir(path.dirname(candidate), { recursive: true });
+    await writeFile(candidate, contents, "utf8");
   }
+  await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority persistence");
 }
 
 export async function readChromePid(userDataDir: string): Promise<number | null> {
-  const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
+  let profile: ProfileDirectoryIdentity;
+  try {
+    profile = await captureProfileDirectoryIdentity(userDataDir);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  const pidPath = path.join(profile.canonicalPath, CHROME_PID_FILENAME);
   try {
     const raw = (await readFile(pidPath, "utf8")).trim();
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid authority read");
     const pid = Number.parseInt(raw, 10);
-    if (!Number.isFinite(pid) || pid <= 0) {
-      return null;
-    }
+    if (!Number.isFinite(pid) || pid <= 0) return null;
     return pid;
-  } catch {
+  } catch (error) {
+    if (readErrorCode(error) !== "ENOENT") throw error;
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid authority read");
     return null;
   }
 }
 
 export async function writeChromePid(userDataDir: string, pid: number): Promise<void> {
   if (!Number.isFinite(pid) || pid <= 0) return;
-  const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
-  try {
-    await mkdir(path.dirname(pidPath), { recursive: true });
-    await writeFile(pidPath, `${Math.trunc(pid)}\n`, "utf8");
-  } catch {
-    // best effort
-  }
+  const profile = await captureProfileDirectoryIdentity(userDataDir, { create: true });
+  await writeFile(
+    path.join(profile.canonicalPath, CHROME_PID_FILENAME),
+    `${Math.trunc(pid)}\n`,
+    "utf8",
+  );
+  await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid persistence");
 }
 
 export async function captureChromeProcessIdentity(
@@ -133,7 +299,10 @@ async function captureChromeProcessIdentityWithDeps(
   deps: ChromeProcessIdentityDeps,
 ): Promise<ChromeProcessIdentity> {
   const platform = deps.platform ?? process.platform;
-  const normalizedUserDataDir = normalizeProfileArgument(userDataDir, platform);
+  const profileDirectory = await (deps.captureProfileIdentity
+    ? deps.captureProfileIdentity(userDataDir)
+    : captureProfileDirectoryIdentity(userDataDir));
+  const normalizedUserDataDir = normalizeProfileArgument(profileDirectory.canonicalPath, platform);
   if (!Number.isInteger(pid) || pid <= 0 || !normalizedUserDataDir) {
     throw new Error(`Cannot capture Chrome process identity for ${userDataDir}`);
   }
@@ -149,7 +318,7 @@ async function captureChromeProcessIdentityWithDeps(
     !snapshot.processStartTime.trim() ||
     !executablePath ||
     !isChromeExecutablePath(executablePath, platform) ||
-    !isChromeCommandForUserDataDir(snapshot.commandLine, userDataDir, platform)
+    !isChromeCommandForUserDataDir(snapshot.commandLine, profileDirectory.canonicalPath, platform)
   ) {
     throw new Error(`Chrome pid ${pid} does not have a stable identity for ${userDataDir}`);
   }
@@ -159,19 +328,28 @@ async function captureChromeProcessIdentityWithDeps(
     executablePath,
     normalizedUserDataDir,
     launchNonce: randomUUID(),
+    profileDirectory,
   });
 }
 
 export async function readChromeProcessIdentity(
   userDataDir: string,
 ): Promise<ChromeProcessIdentity | null> {
-  const identityPath = path.join(userDataDir, CHROME_PROCESS_IDENTITY_FILENAME);
+  let profile: ProfileDirectoryIdentity;
+  try {
+    profile = await captureProfileDirectoryIdentity(userDataDir);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  const identityPath = path.join(profile.canonicalPath, CHROME_PROCESS_IDENTITY_FILENAME);
   let raw: string;
   try {
     raw = await readFile(identityPath, "utf8");
   } catch (error) {
-    if (readErrorCode(error) === "ENOENT") return null;
-    throw error;
+    if (readErrorCode(error) !== "ENOENT") throw error;
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome process authority read");
+    return null;
   }
   let parsed: unknown;
   try {
@@ -180,9 +358,10 @@ export async function readChromeProcessIdentity(
     throw new Error(`Chrome process identity is malformed: ${identityPath}`);
   }
   const identity = parseChromeProcessIdentity(parsed, process.platform);
-  if (!identity) {
-    throw new Error(`Chrome process identity is invalid: ${identityPath}`);
+  if (!identity || !sameProfileDirectoryIdentity(identity.profileDirectory, profile)) {
+    throw new Error(`Chrome process identity is invalid or stale: ${identityPath}`);
   }
+  await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome process authority read");
   return identity;
 }
 
@@ -190,19 +369,21 @@ export async function writeChromeProcessIdentity(
   userDataDir: string,
   identity: ChromeProcessIdentity,
 ): Promise<void> {
-  const normalizedUserDataDir = normalizeProfileArgument(userDataDir, process.platform);
   const validated = parseChromeProcessIdentity(identity, process.platform);
   if (
-    !normalizedUserDataDir ||
     !validated ||
-    validated.normalizedUserDataDir !== normalizedUserDataDir
+    !(await verifyProfileDirectoryIdentity(userDataDir, validated.profileDirectory)) ||
+    validated.normalizedUserDataDir !==
+      normalizeProfileArgument(validated.profileDirectory.canonicalPath, process.platform)
   ) {
     throw new Error(`Chrome process identity does not belong to ${userDataDir}`);
   }
-  await mkdir(userDataDir, { recursive: true });
-  const identityPath = path.join(userDataDir, CHROME_PROCESS_IDENTITY_FILENAME);
+  const identityPath = path.join(
+    validated.profileDirectory.canonicalPath,
+    CHROME_PROCESS_IDENTITY_FILENAME,
+  );
   const temporaryPath = path.join(
-    userDataDir,
+    validated.profileDirectory.canonicalPath,
     `.${CHROME_PROCESS_IDENTITY_FILENAME}.tmp-${process.pid}-${randomUUID()}`,
   );
   try {
@@ -213,10 +394,22 @@ export async function writeChromeProcessIdentity(
     } finally {
       await handle.close();
     }
+    await assertProfileDirectoryIdentity(
+      userDataDir,
+      validated.profileDirectory,
+      "Chrome process authority persistence",
+    );
     await rename(temporaryPath, identityPath);
-    await syncProfileDirectory(userDataDir);
+    await syncProfileDirectory(validated.profileDirectory.canonicalPath);
+    await assertProfileDirectoryIdentity(
+      userDataDir,
+      validated.profileDirectory,
+      "Chrome process authority persistence",
+    );
   } finally {
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    if (await verifyProfileDirectoryIdentity(userDataDir, validated.profileDirectory)) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -241,7 +434,19 @@ async function verifyChromeProcessIdentityWithDeps(
   deps: ChromeProcessIdentityDeps,
 ): Promise<boolean> {
   const platform = deps.platform ?? process.platform;
-  if (!identityMatchesProfile(identity, userDataDir, platform)) return false;
+  const validated = parseChromeProcessIdentity(identity, platform);
+  if (!validated || !sameChromeProcessIdentity(validated, identity)) return false;
+  const physicalProfileMatches = await (deps.verifyProfileIdentity
+    ? deps.verifyProfileIdentity(userDataDir, identity.profileDirectory)
+    : verifyProfileDirectoryIdentity(userDataDir, identity.profileDirectory));
+  if (!physicalProfileMatches) return false;
+  const normalizedUserDataDir = normalizeProfileArgument(
+    identity.profileDirectory.canonicalPath,
+    platform,
+  );
+  if (!normalizedUserDataDir || identity.normalizedUserDataDir !== normalizedUserDataDir) {
+    return false;
+  }
   let persisted: ChromeProcessIdentity | null;
   try {
     persisted = await (deps.readIdentity
@@ -260,7 +465,11 @@ async function verifyChromeProcessIdentityWithDeps(
     snapshot.pid === identity.pid &&
     snapshot.processStartTime.trim() === identity.processStartTime &&
     executablePath === identity.executablePath &&
-    isChromeCommandForUserDataDir(snapshot.commandLine, userDataDir, platform)
+    isChromeCommandForUserDataDir(
+      snapshot.commandLine,
+      identity.profileDirectory.canonicalPath,
+      platform,
+    )
   );
 }
 
@@ -273,17 +482,9 @@ export function sameChromeProcessIdentity(
     left.processStartTime === right.processStartTime &&
     left.executablePath === right.executablePath &&
     left.normalizedUserDataDir === right.normalizedUserDataDir &&
-    left.launchNonce === right.launchNonce
+    left.launchNonce === right.launchNonce &&
+    sameProfileDirectoryIdentity(left.profileDirectory, right.profileDirectory)
   );
-}
-
-function identityMatchesProfile(
-  identity: ChromeProcessIdentity,
-  userDataDir: string,
-  platform: NodeJS.Platform,
-): boolean {
-  const normalizedUserDataDir = normalizeProfileArgument(userDataDir, platform);
-  return normalizedUserDataDir !== null && identity.normalizedUserDataDir === normalizedUserDataDir;
 }
 
 function parseChromeProcessIdentity(
@@ -308,11 +509,14 @@ function parseChromeProcessIdentity(
   }
   const executablePath = normalizeExecutablePath(record.executablePath, platform);
   const normalizedUserDataDir = normalizeProfileArgument(record.normalizedUserDataDir, platform);
+  const profileDirectory = parseProfileDirectoryIdentity(record.profileDirectory, platform);
   if (
     !executablePath ||
     !normalizedUserDataDir ||
     normalizedUserDataDir !== record.normalizedUserDataDir ||
-    executablePath !== record.executablePath
+    executablePath !== record.executablePath ||
+    !profileDirectory ||
+    normalizedUserDataDir !== normalizeProfileArgument(profileDirectory.canonicalPath, platform)
   ) {
     return null;
   }
@@ -322,7 +526,39 @@ function parseChromeProcessIdentity(
     executablePath,
     normalizedUserDataDir,
     launchNonce: record.launchNonce,
+    profileDirectory,
   });
+}
+
+function parseProfileDirectoryIdentity(
+  value: unknown,
+  platform: NodeJS.Platform,
+): ProfileDirectoryIdentity | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== PHYSICAL_PROFILE_IDENTITY_VERSION ||
+    record.platform !== platform ||
+    typeof record.canonicalPath !== "string" ||
+    !pathForPlatform(platform).isAbsolute(record.canonicalPath) ||
+    typeof record.device !== "string" ||
+    !/^\d+$/u.test(record.device) ||
+    typeof record.inode !== "string" ||
+    !/^\d+$/u.test(record.inode)
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    version: PHYSICAL_PROFILE_IDENTITY_VERSION,
+    platform,
+    canonicalPath: pathForPlatform(platform).resolve(record.canonicalPath),
+    device: record.device,
+    inode: record.inode,
+  });
+}
+
+function pathForPlatform(platform: NodeJS.Platform): PlatformPath {
+  return platform === "win32" ? path.win32 : path.posix;
 }
 
 async function syncProfileDirectory(userDataDir: string): Promise<void> {
@@ -389,7 +625,11 @@ export function findChromeDebugTargetForProfileFromProcessListForTest(
   return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir);
 }
 export type RecordedChromeTerminationOutcome =
-  | { status: "stopped"; pid: number; signal: "SIGTERM" | "SIGKILL" }
+  | {
+      status: "stopped";
+      pid?: number;
+      signal: "SIGTERM" | "SIGKILL" | "CONTROL_CHANNEL";
+    }
   | { status: "already-stopped"; pid?: number }
   | { status: "unsafe"; reason: string; pid?: number };
 
@@ -402,11 +642,6 @@ export function isSafeChromeTerminationOutcome(
 interface RecordedChromeTerminationDeps extends ChromeProcessIdentityDeps {
   isProcessAlive?: (pid: number) => boolean;
   isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
-  waitForChromeProfileProcessesToExit?: (
-    userDataDir: string,
-    timeoutMs: number,
-    pid: number,
-  ) => Promise<boolean>;
 }
 
 async function terminateRecordedChromeForProfileWithDeps(
@@ -416,18 +651,17 @@ async function terminateRecordedChromeForProfileWithDeps(
   deps: RecordedChromeTerminationDeps,
 ): Promise<RecordedChromeTerminationOutcome> {
   const platform = deps.platform ?? process.platform;
-  const execute = deps.execute ?? executeProcessCommand;
-  const processAlive = deps.isProcessAlive ?? isProcessAlive;
-  const profileInUse = deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir;
-  const waitForExit =
-    deps.waitForChromeProfileProcessesToExit ?? waitForChromeProfileProcessesToExit;
   const validatedIdentity = parseChromeProcessIdentity(identity, platform);
-  if (
-    !validatedIdentity ||
-    !sameChromeProcessIdentity(validatedIdentity, identity) ||
-    !identityMatchesProfile(identity, userDataDir, platform)
-  ) {
+  if (!validatedIdentity || !sameChromeProcessIdentity(validatedIdentity, identity)) {
     return { status: "unsafe", reason: `Chrome process identity is invalid for ${userDataDir}` };
+  }
+  const physicalProfileMatches = await (deps.verifyProfileIdentity
+    ? deps.verifyProfileIdentity(userDataDir, identity.profileDirectory)
+    : verifyProfileDirectoryIdentity(userDataDir, identity.profileDirectory));
+  if (!physicalProfileMatches) {
+    const reason = `Physical Chrome profile authority changed for ${userDataDir}`;
+    logger?.(`${reason}; preserving cleanup state`);
+    return { status: "unsafe", reason, pid: identity.pid };
   }
   let persistedIdentity: ChromeProcessIdentity | null;
   try {
@@ -443,57 +677,22 @@ async function terminateRecordedChromeForProfileWithDeps(
   }
   if (!persistedIdentity || !sameChromeProcessIdentity(persistedIdentity, identity)) {
     const reason = `Chrome cleanup authority is stale for ${userDataDir}`;
-    logger?.(`${reason}; skipping termination`);
+    logger?.(`${reason}; preserving cleanup state`);
     return { status: "unsafe", reason, pid: identity.pid };
   }
 
   const pid = identity.pid;
-  if (!processAlive(pid)) {
-    if (await profileInUse(userDataDir)) {
+  if (!(deps.isProcessAlive ?? isProcessAlive)(pid)) {
+    if (await (deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir)(userDataDir)) {
       return { status: "unsafe", reason: "another Chrome process is using the profile", pid };
     }
     return { status: "already-stopped", pid };
   }
-  if (!(await verifyChromeProcessIdentityWithDeps(userDataDir, identity, deps))) {
-    const reason = `Recorded Chrome process identity does not match pid ${pid}`;
-    logger?.(`${reason}; skipping termination`);
-    return { status: "unsafe", reason, pid };
-  }
 
-  const gracefulError = await terminateChromeProcess(pid, false, platform, execute).then(
-    () => null,
-    (error: unknown) => error,
-  );
-  if (!gracefulError && (await waitForExit(userDataDir, CHROME_TERMINATION_TIMEOUT_MS, pid))) {
-    logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
-    return { status: "stopped", pid, signal: "SIGTERM" };
-  }
-  if (!processAlive(pid) && !(await profileInUse(userDataDir))) {
-    return { status: "already-stopped", pid };
-  }
-
-  if (!(await verifyChromeProcessIdentityWithDeps(userDataDir, identity, deps))) {
-    const reason = `Chrome pid ${pid} changed before forced termination`;
-    logger?.(`${reason}; skipping forced termination`);
-    return { status: "unsafe", reason, pid };
-  }
-  const forceError = await terminateChromeProcess(pid, true, platform, execute).then(
-    () => null,
-    (error: unknown) => error,
-  );
-  if (!forceError && (await waitForExit(userDataDir, CHROME_FORCE_TERMINATION_TIMEOUT_MS, pid))) {
-    logger?.(`Force-terminated shared manual-login Chrome pid ${pid}`);
-    return { status: "stopped", pid, signal: "SIGKILL" };
-  }
-  if (!processAlive(pid) && !(await profileInUse(userDataDir))) {
-    return { status: "already-stopped", pid };
-  }
-  const reason = forceError
-    ? forceError instanceof Error
-      ? forceError.message
-      : String(forceError)
-    : `Chrome processes for ${userDataDir} did not exit after forced termination`;
-  logger?.(`Failed to terminate shared manual-login Chrome pid ${pid}: ${reason}`);
+  const reason =
+    `Chrome pid ${pid} is still alive, but this recovered session has no retained stable process ` +
+    "handle or authenticated exact Chrome control channel";
+  logger?.(`${reason}; refusing PID-based termination and preserving cleanup state`);
   return { status: "unsafe", reason, pid };
 }
 
@@ -512,46 +711,6 @@ export function terminateRecordedChromeForProfileForTest(
   deps: RecordedChromeTerminationDeps,
 ): Promise<RecordedChromeTerminationOutcome> {
   return terminateRecordedChromeForProfileWithDeps(userDataDir, identity, logger, deps);
-}
-
-async function waitForChromeProfileProcessesToExit(
-  userDataDir: string,
-  timeoutMs: number,
-  pid: number,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (isProcessAlive(pid) || (await isChromeUsingUserDataDir(userDataDir))) {
-    if (Date.now() >= deadline) return false;
-    await delay(CHROME_TERMINATION_POLL_MS);
-  }
-  return true;
-}
-
-async function terminateChromeProcess(
-  pid: number,
-  force: boolean,
-  platform: NodeJS.Platform = process.platform,
-  execute: ProcessCommandExecutor = executeProcessCommand,
-): Promise<void> {
-  if (platform === "win32") {
-    await execute("taskkill.exe", [
-      "/PID",
-      String(Math.trunc(pid)),
-      "/T",
-      ...(force ? ["/F"] : []),
-    ]);
-    return;
-  }
-  process.kill(pid, force ? "SIGKILL" : "SIGTERM");
-}
-
-export function terminateChromeProcessForTest(
-  pid: number,
-  force: boolean,
-  platform: NodeJS.Platform,
-  execute: ProcessCommandExecutor,
-): Promise<void> {
-  return terminateChromeProcess(pid, force, platform, execute);
 }
 
 function tokenizeCommandLine(command: string): string[] | null {
@@ -728,28 +887,10 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 export interface ProfileRunLock {
-  path: string;
-  lockId: string;
+  readonly path: string;
+  readonly lockId: string;
+  readonly profileDirectory: ProfileDirectoryIdentity;
   release: () => Promise<void>;
-}
-
-interface ProfileRunLockRecord {
-  pid: number;
-  lockId: string;
-  createdAt: string;
-  sessionId?: string;
-}
-
-function parseProfileRunLock(payload: string | null): ProfileRunLockRecord | null {
-  if (!payload) return null;
-  try {
-    const parsed = JSON.parse(payload) as ProfileRunLockRecord;
-    if (!Number.isFinite(parsed.pid) || parsed.pid <= 0) return null;
-    if (!parsed.lockId || typeof parsed.lockId !== "string") return null;
-    return parsed;
-  } catch {
-    return null;
-  }
 }
 
 export async function acquireProfileRunLock(
@@ -762,87 +903,58 @@ export async function acquireProfileRunLock(
   },
 ): Promise<ProfileRunLock | null> {
   const timeoutMs = options.timeoutMs;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return null;
-  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
   const pollMs =
     typeof options.pollMs === "number" && Number.isFinite(options.pollMs) && options.pollMs > 0
       ? options.pollMs
       : 1000;
-  const lockPath = path.join(userDataDir, ORACLE_PROFILE_LOCK_FILENAME);
-  const lockId = randomUUID();
-  const startedAt = Date.now();
-  let warned = false;
-
-  for (;;) {
-    try {
-      const payload: ProfileRunLockRecord = {
-        pid: process.pid,
-        lockId,
-        createdAt: new Date().toISOString(),
-        sessionId: options.sessionId,
-      };
-      await mkdir(path.dirname(lockPath), { recursive: true });
-      await writeFile(lockPath, JSON.stringify(payload), { encoding: "utf8", flag: "wx" });
-      options.logger?.(`Acquired Oracle profile lock at ${lockPath}`);
-      return {
-        path: lockPath,
-        lockId,
-        release: async () => releaseProfileRunLock(lockPath, lockId, options.logger),
-      };
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "EEXIST") {
-        throw error;
-      }
-      let existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
-      if (!existing) {
-        // Likely partial write / corruption; re-read once, then delete (user preference: delete unreadable lockfiles).
-        await delay(200);
-        existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
-        if (!existing) {
-          options.logger?.("Oracle profile lock unreadable; deleting lockfile.");
-          await rm(lockPath, { force: true }).catch(() => undefined);
-          continue;
-        }
-      }
-      if (!existing || !isProcessAlive(existing.pid)) {
-        await rm(lockPath, { force: true }).catch(() => undefined);
-        continue;
-      }
-      if (!warned) {
-        const waited = Math.round(timeoutMs / 1000);
-        options.logger?.(
-          `Oracle profile lock held by pid ${existing.pid}; waiting up to ${waited}s.`,
-        );
-        warned = true;
-      }
-      const elapsed = Date.now() - startedAt;
-      if (elapsed >= timeoutMs) {
-        throw new Error(
-          `Oracle profile lock still held by pid ${existing.pid} after ${Math.round(elapsed / 1000)}s`,
-        );
-      }
-      await delay(Math.min(pollMs, timeoutMs - elapsed));
-    }
+  const profileDirectory = await captureProfileDirectoryIdentity(userDataDir, { create: true });
+  if (!(await verifyProfileDirectoryIdentity(userDataDir, profileDirectory))) {
+    throw new Error(`Profile directory identity changed before acquiring its lock: ${userDataDir}`);
   }
-}
+  const lockPath = path.join(profileDirectory.canonicalPath, ORACLE_PROFILE_LOCK_FILENAME);
 
-export async function releaseProfileRunLock(
-  lockPath: string,
-  lockId: string,
-  logger?: ProfileStateLogger,
-): Promise<void> {
+  let filesystemLock: CrashRecoverableFilesystemLock;
   try {
-    const existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
-    if (!existing || existing.lockId !== lockId) {
-      return;
+    filesystemLock = await acquireCrashRecoverableFilesystemLock(lockPath, {
+      timeoutMs,
+      pollMs,
+      createParent: false,
+      sessionId: options.sessionId,
+    });
+  } catch (error) {
+    if (error instanceof FilesystemLockBusyError) {
+      const owner = error.owner ? ` by pid ${error.owner.pid}` : "";
+      throw new Error(
+        `Oracle profile lock at ${lockPath} remained held${owner} after ${Math.round(timeoutMs / 1000)}s`,
+        { cause: error },
+      );
     }
-    await rm(lockPath, { force: true });
-    logger?.(`Released Oracle profile lock ${lockPath}`);
-  } catch {
-    // best effort
+    throw error;
   }
+
+  if (!(await verifyProfileDirectoryIdentity(userDataDir, profileDirectory))) {
+    await filesystemLock.release();
+    throw new Error(`Profile directory identity changed while acquiring its lock: ${userDataDir}`);
+  }
+
+  options.logger?.(`Acquired Oracle profile lock at ${lockPath}`);
+  let releasePromise: Promise<void> | undefined;
+  return {
+    path: lockPath,
+    lockId: filesystemLock.owner.ownerNonce,
+    profileDirectory,
+    release: () =>
+      (releasePromise ??= (async () => {
+        if (!(await verifyProfileDirectoryIdentity(userDataDir, profileDirectory))) {
+          throw new Error(
+            `Profile directory identity changed before releasing Oracle profile lock at ${lockPath}`,
+          );
+        }
+        await filesystemLock.release();
+        options.logger?.(`Released Oracle profile lock ${lockPath}`);
+      })()),
+  };
 }
 
 export async function verifyDevToolsReachable({
@@ -901,13 +1013,75 @@ export async function shouldCleanupManualLoginProfileState(
   return true;
 }
 
+interface CleanupStaleProfileStateDeps {
+  captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
+  verifyProfileIdentity?: typeof verifyProfileDirectoryIdentity;
+  beforeDestructiveCleanup?: () => void | Promise<void>;
+}
+
 export async function cleanupStaleProfileState(
   userDataDir: string,
   logger?: ProfileStateLogger,
-  options: { lockRemovalMode?: "never" | "if_oracle_pid_dead" } = {},
+  options: {
+    lockRemovalMode?: "never" | "if_oracle_pid_dead";
+    expectedProfileIdentity?: ProfileDirectoryIdentity;
+  } = {},
 ): Promise<boolean> {
+  return cleanupStaleProfileStateWithDeps(userDataDir, logger, options, {});
+}
+
+export async function cleanupStaleProfileStateForTest(
+  userDataDir: string,
+  logger: ProfileStateLogger | undefined,
+  options: {
+    lockRemovalMode?: "never" | "if_oracle_pid_dead";
+    expectedProfileIdentity?: ProfileDirectoryIdentity;
+  },
+  deps: CleanupStaleProfileStateDeps,
+): Promise<boolean> {
+  return cleanupStaleProfileStateWithDeps(userDataDir, logger, options, deps);
+}
+
+async function cleanupStaleProfileStateWithDeps(
+  userDataDir: string,
+  logger: ProfileStateLogger | undefined,
+  options: {
+    lockRemovalMode?: "never" | "if_oracle_pid_dead";
+    expectedProfileIdentity?: ProfileDirectoryIdentity;
+  },
+  deps: CleanupStaleProfileStateDeps,
+): Promise<boolean> {
+  const captureProfile = deps.captureProfileIdentity ?? captureProfileDirectoryIdentity;
+  const verifyProfile = deps.verifyProfileIdentity ?? verifyProfileDirectoryIdentity;
+  let profile: ProfileDirectoryIdentity;
+  try {
+    profile = options.expectedProfileIdentity ?? (await captureProfile(userDataDir));
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return true;
+    logger?.(`Refusing stale profile cleanup: ${error instanceof Error ? error.message : error}`);
+    return false;
+  }
+  if (!(await verifyProfile(userDataDir, profile))) {
+    logger?.(`Refusing stale profile cleanup because physical authority changed: ${userDataDir}`);
+    return false;
+  }
+  const lockRemovalMode = options.lockRemovalMode ?? "never";
+  if (lockRemovalMode === "if_oracle_pid_dead") {
+    const pid = await readChromePid(profile.canonicalPath);
+    if (pid && isProcessAlive(pid)) {
+      logger?.(`Chrome pid ${pid} still alive; preserving profile state`);
+      return false;
+    }
+  }
+  if (await isChromeUsingUserDataDir(profile.canonicalPath)) {
+    logger?.("Detected running Chrome using this profile; preserving profile state");
+    return false;
+  }
+  await deps.beforeDestructiveCleanup?.();
+
   let cleaned = true;
-  for (const candidate of getDevToolsActivePortPaths(userDataDir)) {
+  for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
+    if (!(await verifyProfile(userDataDir, profile))) return false;
     try {
       await rm(candidate, { force: true });
       logger?.(`Removed stale DevToolsActivePort: ${candidate}`);
@@ -915,45 +1089,27 @@ export async function cleanupStaleProfileState(
       cleaned = false;
     }
   }
-
-  const lockRemovalMode = options.lockRemovalMode ?? "never";
   if (lockRemovalMode === "never") {
-    return cleaned;
+    return cleaned && (await verifyProfile(userDataDir, profile));
   }
 
-  const pid = await readChromePid(userDataDir);
-  if (pid && isProcessAlive(pid)) {
-    logger?.(`Chrome pid ${pid} still alive; skipping profile lock cleanup`);
-    return false;
-  }
-
-  // Extra safety: if Chrome is running with this profile (but with a different PID, e.g. user relaunched
-  // without remote debugging), never delete lock files.
-  if (await isChromeUsingUserDataDir(userDataDir)) {
-    logger?.("Detected running Chrome using this profile; skipping profile lock cleanup");
-    return false;
-  }
-
-  const lockFiles = [
-    path.join(userDataDir, "lockfile"),
-    path.join(userDataDir, "SingletonLock"),
-    path.join(userDataDir, "SingletonSocket"),
-    path.join(userDataDir, "SingletonCookie"),
+  const staleFiles = [
+    "lockfile",
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    CHROME_PID_FILENAME,
+    CHROME_PROCESS_IDENTITY_FILENAME,
   ];
-  for (const lock of lockFiles) {
+  for (const staleFile of staleFiles) {
+    if (!(await verifyProfile(userDataDir, profile))) return false;
     try {
-      await rm(lock, { force: true });
+      await rm(path.join(profile.canonicalPath, staleFile), { force: true });
     } catch {
       cleaned = false;
     }
   }
-  for (const authorityFile of [CHROME_PID_FILENAME, CHROME_PROCESS_IDENTITY_FILENAME]) {
-    try {
-      await rm(path.join(userDataDir, authorityFile), { force: true });
-    } catch {
-      cleaned = false;
-    }
-  }
+  if (!(await verifyProfile(userDataDir, profile))) return false;
   logger?.("Cleaned up stale Chrome profile locks and owner authority");
   return cleaned;
 }

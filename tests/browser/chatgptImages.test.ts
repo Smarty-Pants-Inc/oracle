@@ -469,10 +469,12 @@ describe("collectGeneratedImageArtifacts", () => {
     const png = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00,
     ]);
-    const buttonAvailableAt = Date.now() + 10_000;
+    const buttonAvailableAt = Date.now() + 20_000;
+    const buttonProbeTimes: number[] = [];
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("behavior-btn")) {
+          buttonProbeTimes.push(Date.now());
           if (Date.now() < buttonAvailableAt) {
             return { result: { value: [] } };
           }
@@ -506,16 +508,32 @@ describe("collectGeneratedImageArtifacts", () => {
         answerText: "Working on it.",
         waitTimeoutMs: 15_000,
       });
-      let settled = false;
-      void resultPromise.finally(() => {
-        settled = true;
-      });
-      for (let index = 0; index < 60 && !settled; index += 1) {
-        await vi.advanceTimersByTimeAsync(500);
-        await fs.readdir(tmpDir);
-      }
-      const result = await resultPromise;
+      let completion:
+        | { status: "fulfilled"; value: Awaited<typeof resultPromise> }
+        | { status: "rejected"; reason: unknown }
+        | undefined;
+      void resultPromise.then(
+        (value) => {
+          completion = { status: "fulfilled", value };
+        },
+        (reason: unknown) => {
+          completion = { status: "rejected", reason };
+        },
+      );
 
+      while (!completion) {
+        if (vi.getTimerCount() > 0) {
+          await vi.advanceTimersToNextTimerAsync();
+        } else {
+          await fs.readdir(tmpDir);
+        }
+      }
+      if (completion.status === "rejected") {
+        throw completion.reason;
+      }
+      const result = completion.value;
+
+      expect(buttonProbeTimes.some((time) => time >= buttonAvailableAt)).toBe(true);
       expect(result.imageCount).toBe(1);
       expect(result.savedImages[0]).toMatchObject({
         path: outputPath,

@@ -8,7 +8,14 @@ import { delay } from "./utils.js";
 const LOCK_OWNER_FILENAME = "owner.json";
 const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
+const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
+const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
+const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
 const execFileAsync = promisify(execFile);
+let currentProcessStartIdentity: string | undefined;
+let currentProcessStartIdentityPromise: Promise<string | null> | undefined;
+let currentProcessStartIdentityRetryAfterMs = 0;
 export type ProcessLiveness = "alive" | "dead" | "unknown";
 
 export interface FilesystemLockOwnerRecord {
@@ -17,6 +24,7 @@ export interface FilesystemLockOwnerRecord {
   processStartIdentity: string | null;
   ownerNonce: string;
   createdAt: string;
+  sessionId?: string;
 }
 
 export interface CrashRecoverableFilesystemLock {
@@ -29,6 +37,8 @@ export interface CrashRecoverableFilesystemLockOptions {
   timeoutMs?: number;
   pollMs?: number;
   incompleteLockStaleMs?: number;
+  createParent?: boolean;
+  sessionId?: string;
 }
 
 export interface CrashRecoverableFilesystemLockDeps {
@@ -38,6 +48,14 @@ export interface CrashRecoverableFilesystemLockDeps {
   readProcessStartIdentity?: (pid: number) => Promise<string | null>;
   randomUUID?: () => string;
 }
+interface FilesystemLockGeneration {
+  ownerRaw: string | null;
+  lastMutationMs?: number;
+}
+
+type FilesystemLockInspection =
+  | { status: "active"; owner?: FilesystemLockOwnerRecord }
+  | { status: "stale"; generation: FilesystemLockGeneration };
 
 export class FilesystemLockBusyError extends Error {
   readonly lockPath: string;
@@ -76,18 +94,21 @@ export async function acquireCrashRecoverableFilesystemLock(
     pid,
     processStartIdentity: await readProcessIdentity(pid),
     ownerNonce: createNonce(),
+    sessionId: options.sessionId,
     createdAt: new Date(now()).toISOString(),
   };
   const startedAt = now();
 
-  await mkdir(path.dirname(lockPath), { recursive: true });
+  if (options.createParent !== false) {
+    await mkdir(path.dirname(lockPath), { recursive: true });
+  }
   for (;;) {
     try {
       await mkdir(lockPath, { recursive: false });
       try {
         await writeLockOwner(lockPath, owner);
       } catch (error) {
-        await rm(lockPath, { recursive: true, force: true });
+        await removeLockPath(lockPath);
         await syncDirectory(path.dirname(lockPath));
         throw error;
       }
@@ -115,7 +136,7 @@ export async function acquireCrashRecoverableFilesystemLock(
         readProcessIdentity,
       });
       if (inspection.status === "stale") {
-        await quarantineStaleLock(lockPath, createNonce());
+        await quarantineStaleLock(lockPath, createNonce(), inspection.generation);
         continue;
       }
     }
@@ -146,6 +167,30 @@ export function readProcessLiveness(pid: number): ProcessLiveness {
 
 export async function readProcessStartIdentity(pid: number): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  // This process cannot be replaced while this module is running. Foreign PIDs stay uncached so
+  // stale-owner checks still observe PID reuse; failed current-process lookups retry after a bounded backoff.
+  if (pid !== process.pid) return readProcessStartIdentityUncached(pid);
+  if (currentProcessStartIdentity !== undefined) return currentProcessStartIdentity;
+  if (Date.now() < currentProcessStartIdentityRetryAfterMs) return null;
+
+  const inFlight = (currentProcessStartIdentityPromise ??= readProcessStartIdentityUncached(pid));
+  try {
+    const identity = await inFlight;
+    if (identity === null) {
+      currentProcessStartIdentityRetryAfterMs = Date.now() + CURRENT_PROCESS_IDENTITY_RETRY_MS;
+    } else {
+      currentProcessStartIdentity = identity;
+      currentProcessStartIdentityRetryAfterMs = 0;
+    }
+    return identity;
+  } finally {
+    if (currentProcessStartIdentityPromise === inFlight) {
+      currentProcessStartIdentityPromise = undefined;
+    }
+  }
+}
+
+async function readProcessStartIdentityUncached(pid: number): Promise<string | null> {
   try {
     if (process.platform === "linux") {
       const processStat = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -165,7 +210,7 @@ export async function readProcessStartIdentity(pid: number): Promise<string | nu
       const { stdout } = await execFileAsync(
         "powershell.exe",
         ["-NoProfile", "-NonInteractive", "-Command", command],
-        { encoding: "utf8" },
+        { encoding: "utf8", windowsHide: true, timeout: WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS },
       );
       const startTicks = String(stdout).trim();
       return startTicks ? `win32:${startTicks}` : null;
@@ -186,17 +231,13 @@ async function releaseCrashRecoverableFilesystemLock(
 ): Promise<void> {
   const owner = await readLockOwnerForRelease(lockPath);
   if (owner === null) return;
-  if (
-    owner.pid !== expectedOwner.pid ||
-    owner.processStartIdentity !== expectedOwner.processStartIdentity ||
-    owner.ownerNonce !== expectedOwner.ownerNonce
-  ) {
+  if (!sameLockOwner(owner, expectedOwner)) {
     throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
   }
 
   const releasedPath = `${lockPath}.released-${expectedOwner.ownerNonce}`;
   try {
-    await rename(lockPath, releasedPath);
+    await renameLockPath(lockPath, releasedPath);
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return;
     throw error;
@@ -207,13 +248,9 @@ async function releaseCrashRecoverableFilesystemLock(
     await syncDirectoryIfPresent(path.dirname(lockPath));
     return;
   }
-  if (
-    releasedOwner.pid !== expectedOwner.pid ||
-    releasedOwner.processStartIdentity !== expectedOwner.processStartIdentity ||
-    releasedOwner.ownerNonce !== expectedOwner.ownerNonce
-  ) {
+  if (!sameLockOwner(releasedOwner, expectedOwner)) {
     try {
-      await rename(releasedPath, lockPath);
+      await renameLockPath(releasedPath, lockPath);
       await syncDirectory(path.dirname(lockPath));
     } catch (restoreError) {
       throw new Error(
@@ -225,7 +262,7 @@ async function releaseCrashRecoverableFilesystemLock(
   }
 
   await syncDirectoryIfPresent(path.dirname(lockPath));
-  await rm(releasedPath, { recursive: true, force: true });
+  await removeLockPath(releasedPath);
   await syncDirectoryIfPresent(path.dirname(lockPath));
 }
 
@@ -237,19 +274,29 @@ async function inspectExistingLock(
     readLiveness: (pid: number) => ProcessLiveness;
     readProcessIdentity: (pid: number) => Promise<string | null>;
   },
-): Promise<{ status: "active"; owner?: FilesystemLockOwnerRecord } | { status: "stale" }> {
+): Promise<FilesystemLockInspection> {
+  // A file-shaped legacy/corrupt lock has no generation nonce to verify after a move.
+  // Preserve it instead of deleting an unreadable or replacement generation by pathname.
+  try {
+    if (!(await stat(lockPath)).isDirectory()) return { status: "active" };
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") {
+      return { status: "stale", generation: { ownerRaw: null, lastMutationMs: 0 } };
+    }
+    throw error;
+  }
   let raw: string | null = null;
   try {
     raw = await readFile(path.join(lockPath, LOCK_OWNER_FILENAME), "utf8");
   } catch (error) {
-    if (readErrorCode(error) !== "ENOENT") raw = null;
+    if (readErrorCode(error) !== "ENOENT") return { status: "active" };
   }
 
   if (raw !== null) {
     const owner = parseLockOwner(raw);
     if (owner) {
       const liveness = options.readLiveness(owner.pid);
-      if (liveness === "dead") return { status: "stale" };
+      if (liveness === "dead") return { status: "stale", generation: { ownerRaw: raw } };
       if (liveness === "unknown") return { status: "active", owner };
       const observedIdentity = await options.readProcessIdentity(owner.pid);
       if (
@@ -257,7 +304,7 @@ async function inspectExistingLock(
         observedIdentity !== null &&
         owner.processStartIdentity !== observedIdentity
       ) {
-        return { status: "stale" };
+        return { status: "stale", generation: { ownerRaw: raw } };
       }
       return { status: "active", owner };
     }
@@ -282,7 +329,7 @@ async function inspectExistingLock(
 
   const lastMutationMs = await readLockLastMutationMs(lockPath);
   return options.nowMs - lastMutationMs >= options.incompleteLockStaleMs
-    ? { status: "stale" }
+    ? { status: "stale", generation: { ownerRaw: raw, lastMutationMs } }
     : { status: "active" };
 }
 
@@ -299,18 +346,86 @@ async function readLockLastMutationMs(lockPath: string): Promise<number> {
   }
 }
 
-async function quarantineStaleLock(lockPath: string, nonce: string): Promise<boolean> {
+async function quarantineStaleLock(
+  lockPath: string,
+  nonce: string,
+  expectedGeneration: FilesystemLockGeneration,
+): Promise<boolean> {
   const stalePath = `${lockPath}.stale-${nonce}`;
   try {
-    await rename(lockPath, stalePath);
+    await renameLockPath(lockPath, stalePath);
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return false;
     throw error;
   }
   await syncDirectory(path.dirname(lockPath));
-  await rm(stalePath, { recursive: true, force: true });
+
+  let generationMatches: boolean;
+  try {
+    generationMatches = await lockGenerationMatches(stalePath, expectedGeneration);
+  } catch (error) {
+    await restoreUnexpectedLockGeneration(lockPath, stalePath);
+    throw error;
+  }
+  if (!generationMatches) {
+    await restoreUnexpectedLockGeneration(lockPath, stalePath);
+    return false;
+  }
+
+  await removeLockPath(stalePath);
   await syncDirectory(path.dirname(lockPath));
   return true;
+}
+
+async function lockGenerationMatches(
+  lockPath: string,
+  expectedGeneration: FilesystemLockGeneration,
+): Promise<boolean> {
+  let ownerRaw: string | null = null;
+  try {
+    ownerRaw = await readFile(path.join(lockPath, LOCK_OWNER_FILENAME), "utf8");
+  } catch (error) {
+    if (readErrorCode(error) !== "ENOENT") throw error;
+  }
+
+  const expectedOwner =
+    expectedGeneration.ownerRaw === null ? null : parseLockOwner(expectedGeneration.ownerRaw);
+  const observedOwner = ownerRaw === null ? null : parseLockOwner(ownerRaw);
+  if (expectedOwner || observedOwner) {
+    return (
+      expectedOwner !== null &&
+      observedOwner !== null &&
+      sameLockOwner(expectedOwner, observedOwner)
+    );
+  }
+  if (ownerRaw !== expectedGeneration.ownerRaw) return false;
+  if (expectedGeneration.lastMutationMs === undefined) return true;
+  return (await readLockLastMutationMs(lockPath)) === expectedGeneration.lastMutationMs;
+}
+
+async function restoreUnexpectedLockGeneration(
+  lockPath: string,
+  quarantinedPath: string,
+): Promise<void> {
+  try {
+    await renameLockPath(quarantinedPath, lockPath);
+    await syncDirectory(path.dirname(lockPath));
+  } catch (error) {
+    throw new Error(
+      `Filesystem lock generation changed at ${lockPath}; unexpected lock preserved at ${quarantinedPath}`,
+      { cause: error },
+    );
+  }
+}
+
+function sameLockOwner(left: FilesystemLockOwnerRecord, right: FilesystemLockOwnerRecord): boolean {
+  return (
+    left.pid === right.pid &&
+    left.processStartIdentity === right.processStartIdentity &&
+    left.ownerNonce === right.ownerNonce &&
+    left.createdAt === right.createdAt &&
+    left.sessionId === right.sessionId
+  );
 }
 
 async function writeLockOwner(lockPath: string, owner: FilesystemLockOwnerRecord): Promise<void> {
@@ -362,6 +477,7 @@ function parseLockOwner(raw: string): FilesystemLockOwnerRecord | null {
     ) {
       return null;
     }
+    if (parsed.sessionId !== undefined && typeof parsed.sessionId !== "string") return null;
     if (typeof parsed.ownerNonce !== "string" || parsed.ownerNonce.length === 0) return null;
     if (typeof parsed.createdAt !== "string" || !Number.isFinite(Date.parse(parsed.createdAt))) {
       return null;
@@ -411,6 +527,34 @@ function parsePartialLockOwner(
       return { pid };
     }
   }
+}
+
+async function renameLockPath(sourcePath: string, destinationPath: string): Promise<void> {
+  const deadline = Date.now() + WINDOWS_LOCK_MUTATION_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await rename(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      if (!isRetryableWindowsLockMutationError(error) || Date.now() >= deadline) throw error;
+    }
+    await delay(Math.min(WINDOWS_LOCK_MUTATION_RETRY_MS, Math.max(1, deadline - Date.now())));
+  }
+}
+
+async function removeLockPath(lockPath: string): Promise<void> {
+  await rm(lockPath, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: WINDOWS_LOCK_MUTATION_RETRY_MS,
+  });
+}
+
+function isRetryableWindowsLockMutationError(error: unknown): boolean {
+  if (process.platform !== "win32") return false;
+  const code = readErrorCode(error);
+  return code === "EACCES" || code === "EBUSY" || code === "EPERM";
 }
 
 async function syncDirectoryIfPresent(directory: string): Promise<void> {

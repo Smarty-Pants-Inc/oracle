@@ -75,6 +75,79 @@ describe("resolveRecoveryUrl", () => {
     ).toBe("https://chatgpt.com/c/runtime-only");
   });
 
+  test("accepts recovered URLs only when they match the committed prompt epoch", () => {
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          {
+            tabUrl: "https://chatgpt.com/c/committed-id",
+            promptEpoch: {
+              status: "committed",
+              epochId: "epoch-1",
+              promptSha256: "a".repeat(64),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+              verifiedUserTurnIndex: 0,
+              conversationId: "committed-id",
+            },
+          },
+          { url: "https://chatgpt.com/c/committed-id" },
+        ),
+      ),
+    ).toBe("https://chatgpt.com/c/committed-id");
+  });
+
+  test("rejects conflicting harvest or runtime URLs for a committed prompt epoch", () => {
+    const epoch = {
+      status: "committed" as const,
+      epochId: "epoch-1",
+      promptSha256: "a".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      conversationId: "committed-id",
+    };
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          { tabUrl: "https://chatgpt.com/c/committed-id", promptEpoch: epoch },
+          { url: "https://chatgpt.com/c/wrong-harvest" },
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          { tabUrl: "https://chatgpt.com/c/wrong-runtime", promptEpoch: epoch },
+          { url: "https://chatgpt.com/c/committed-id" },
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  test("rejects URL-only recovery while a prompt epoch is pending", () => {
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          {
+            tabUrl: "https://chatgpt.com/c/pending-id",
+            promptEpoch: {
+              status: "pending",
+              epochId: "epoch-pending",
+              promptSha256: "a".repeat(64),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+            },
+          },
+          undefined,
+        ),
+      ),
+    ).toBeNull();
+  });
+
   test("returns null when neither candidate is a valid conversation URL", () => {
     expect(
       resolveRecoveryUrl(

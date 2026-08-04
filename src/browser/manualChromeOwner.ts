@@ -5,17 +5,21 @@ import {
   captureChromeProcessIdentity,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
+  isSafeChromeTerminationOutcome,
   isProcessAlive,
   readChromePid,
   readChromeProcessIdentity,
   readDevToolsPort,
   sameChromeProcessIdentity,
+  sameProfileDirectoryIdentity,
   verifyChromeProcessIdentity,
   verifyDevToolsReachable,
+  verifyProfileDirectoryIdentity,
   writeChromePid,
   writeChromeProcessIdentity,
   writeDevToolsActivePort,
   type ChromeProcessIdentity,
+  type ProfileDirectoryIdentity,
 } from "./profileState.js";
 import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
 import { delay } from "./utils.js";
@@ -69,57 +73,140 @@ export async function acquireManualChromeOwner(
     throw new Error(`Unable to acquire canonical Chrome owner lock for ${profileDir}`);
   }
 
+  let acquiredOwner: ManualChromeOwner | null = null;
+  let acquisitionFailed = false;
+  let acquisitionError: unknown;
   try {
     const existing = await findExistingManualChromeOwner(
       profileDir,
       config.reuseChromeWaitMs,
       logger,
+      launchLock.profileDirectory,
       deps,
     );
-    if (existing) return existing;
-
-    const launch = deps.launch ?? launchChrome;
-    const chrome = await launch(
-      {
-        ...config,
-        remoteChrome: config.remoteChrome,
-      },
-      profileDir,
-      logger,
-    );
-    let pid: number;
-    let port: number;
-    let processIdentity: ChromeProcessIdentity;
-    try {
-      pid = requirePositiveInteger(chrome.pid, "pid", profileDir);
-      port = requirePositiveInteger(chrome.port, "DevTools port", profileDir);
-      processIdentity = requireProcessIdentity(chrome.processIdentity, pid, profileDir);
-      await persistCanonicalOwner(profileDir, { pid, port, processIdentity }, deps);
-    } catch (error) {
-      try {
-        await chrome.kill();
-      } catch {
-        // Best effort: preserve the original authority-persistence error.
+    if (existing) {
+      acquiredOwner = existing;
+    } else {
+      if (!(await verifyProfileDirectoryIdentity(profileDir, launchLock.profileDirectory))) {
+        throw new Error(
+          `Physical profile authority changed before launching canonical Chrome owner for ${profileDir}`,
+        );
       }
-      await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
-        lockRemovalMode: "if_oracle_pid_dead",
-      }).catch(() => false);
-      throw error;
-    }
+      const launch = deps.launch ?? launchChrome;
+      const chrome = await launch(
+        {
+          ...config,
+          remoteChrome: config.remoteChrome,
+        },
+        profileDir,
+        logger,
+      );
+      if (
+        !sameProfileDirectoryIdentity(
+          chrome.processIdentity.profileDirectory,
+          launchLock.profileDirectory,
+        )
+      ) {
+        const mismatch = new Error(
+          `Physical profile authority changed while launching canonical Chrome owner for ${profileDir}`,
+        );
+        const termination = await chrome.kill().catch((error: unknown) => ({
+          status: "unsafe" as const,
+          pid: chrome.pid,
+          reason: error instanceof Error ? error.message : String(error),
+        }));
+        if (!isSafeChromeTerminationOutcome(termination)) {
+          throw new AggregateError(
+            [mismatch, new Error(termination.reason)],
+            `Physical profile authority changed during launch, and safe rollback was unavailable.`,
+          );
+        }
+        throw mismatch;
+      }
+      let pid: number;
+      let port: number;
+      let processIdentity: ChromeProcessIdentity;
+      try {
+        pid = requirePositiveInteger(chrome.pid, "pid", profileDir);
+        port = requirePositiveInteger(chrome.port, "DevTools port", profileDir);
+        processIdentity = requireProcessIdentity(chrome.processIdentity, pid, profileDir);
+        await persistCanonicalOwner(profileDir, { pid, port, processIdentity }, deps);
+      } catch (error) {
+        const termination = await chrome.kill().catch(() => ({
+          status: "unsafe" as const,
+          pid: chrome.pid,
+          reason: "Stable Chrome launch rollback failed",
+        }));
+        if (isSafeChromeTerminationOutcome(termination)) {
+          await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
+            lockRemovalMode: "if_oracle_pid_dead",
+            expectedProfileIdentity: chrome.processIdentity.profileDirectory,
+          }).catch(() => false);
+        }
+        throw error;
+      }
 
-    logger(`Launched canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
-    return { chrome, processIdentity, source: "launched" };
-  } finally {
-    await launchLock.release().catch(() => undefined);
+      logger(
+        `Launched canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`,
+      );
+      acquiredOwner = { chrome, processIdentity, source: "launched" };
+    }
+  } catch (error) {
+    acquisitionFailed = true;
+    acquisitionError = error;
   }
+
+  try {
+    await launchLock.release();
+  } catch (releaseError) {
+    const failures: Error[] = [];
+    if (acquisitionFailed) {
+      failures.push(
+        acquisitionError instanceof Error ? acquisitionError : new Error(String(acquisitionError)),
+      );
+    }
+    failures.push(releaseError instanceof Error ? releaseError : new Error(String(releaseError)));
+    if (acquiredOwner?.source === "launched") {
+      const termination = await acquiredOwner.chrome.kill().catch((terminationError: unknown) => ({
+        status: "unsafe" as const,
+        pid: acquiredOwner?.chrome.pid,
+        reason:
+          terminationError instanceof Error ? terminationError.message : String(terminationError),
+      }));
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        failures.push(new Error(termination.reason));
+      }
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        `Canonical Chrome owner acquisition or lock release did not settle safely.`,
+      );
+    }
+    throw releaseError;
+  }
+
+  if (acquisitionFailed) throw acquisitionError;
+  if (!acquiredOwner) {
+    throw new Error(
+      `Canonical Chrome owner acquisition completed without an owner for ${profileDir}`,
+    );
+  }
+  return acquiredOwner;
 }
 
 async function findExistingManualChromeOwner(
   profileDir: string,
   waitForPortMs: number | undefined,
   logger: BrowserLogger,
+  expectedProfileDirectory: ProfileDirectoryIdentity,
   deps: ManualChromeOwnerDeps,
 ): Promise<ManualChromeOwner | null> {
+  if (!(await verifyProfileDirectoryIdentity(profileDir, expectedProfileDirectory))) {
+    throw new Error(
+      `Physical profile authority changed while acquiring Chrome owner for ${profileDir}`,
+    );
+  }
   const readPort = deps.readPort ?? readDevToolsPort;
   const readPid = deps.readPid ?? readChromePid;
   const readIdentity = deps.readIdentity ?? readChromeProcessIdentity;
@@ -142,7 +229,9 @@ async function findExistingManualChromeOwner(
   const recordedPid = await readPid(profileDir);
   const recordedIdentity = await readIdentity(profileDir);
   const recordedIdentityVerified = Boolean(
-    recordedIdentity && (await verifyIdentity(profileDir, recordedIdentity)),
+    recordedIdentity &&
+    sameProfileDirectoryIdentity(recordedIdentity.profileDirectory, expectedProfileDirectory) &&
+    (await verifyIdentity(profileDir, recordedIdentity)),
   );
   if (
     activePort &&
@@ -182,6 +271,11 @@ async function findExistingManualChromeOwner(
         ? recordedIdentity
         : await (deps.captureIdentity ?? captureChromeProcessIdentity)(profileDir, pid);
     requireProcessIdentity(processIdentity, pid, profileDir);
+    if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, expectedProfileDirectory)) {
+      throw new Error(
+        `Rediscovered Chrome owner belongs to a different physical profile generation.`,
+      );
+    }
     await persistCanonicalOwner(profileDir, { pid, port, processIdentity }, deps);
     logger(`Rediscovered exact Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
     return {
@@ -210,7 +304,10 @@ async function findExistingManualChromeOwner(
     const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(
       profileDir,
       logger,
-      { lockRemovalMode: "if_oracle_pid_dead" },
+      {
+        lockRemovalMode: "if_oracle_pid_dead",
+        expectedProfileIdentity: expectedProfileDirectory,
+      },
     );
     if (!cleaned) {
       throw new Error(
@@ -262,7 +359,12 @@ function reusableChrome(
     port,
     pid,
     processIdentity,
-    kill: async () => undefined,
+    kill: async () => ({
+      status: "unsafe",
+      pid,
+      reason:
+        "Reused Chrome has no retained stable process handle or authenticated exact control channel",
+    }),
     process: undefined,
   } as unknown as BrowserChrome;
 }
@@ -278,7 +380,8 @@ function requireProcessIdentity(
     !identity.processStartTime ||
     !identity.executablePath ||
     !identity.normalizedUserDataDir ||
-    !identity.launchNonce
+    !identity.launchNonce ||
+    !identity.profileDirectory
   ) {
     throw new Error(
       `Canonical Chrome owner for ${profileDir} has no valid immutable process identity for pid ${pid}`,

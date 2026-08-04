@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
+import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
 
 vi.mock("../../src/browser/reattach.js", () => ({
   resumeBrowserSession: vi.fn(),
@@ -45,6 +46,13 @@ function chromeProcessIdentity(userDataDir: string, pid: number) {
     executablePath: "/usr/bin/google-chrome",
     normalizedUserDataDir: path.resolve(userDataDir),
     launchNonce: "44444444-4444-4444-8444-444444444444",
+    profileDirectory: {
+      version: 1 as const,
+      platform: process.platform,
+      canonicalPath: path.resolve(userDataDir),
+      device: "1",
+      inode: "2",
+    },
   };
 }
 
@@ -636,11 +644,11 @@ describe("browser reattach end-to-end (simulated)", () => {
         pid: 4242,
         port: 51559,
         processIdentity,
-        kill: vi.fn().mockResolvedValue(undefined),
+        kill: vi.fn().mockResolvedValue({ status: "stopped", pid: 4242, signal: "SIGTERM" }),
       };
       const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
       const removeHooks = registerTerminationHooks(
-        chrome as unknown as import("chrome-launcher").LaunchedChrome,
+        chrome as unknown as ChromeLaunchResult,
         profileDir,
         false,
         () => {},

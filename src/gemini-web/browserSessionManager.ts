@@ -1,22 +1,23 @@
 import path from "node:path";
 import os from "node:os";
-import { mkdir } from "node:fs/promises";
 import type { BrowserRunOptions, BrowserLogger, ChromeClient } from "../browser/types.js";
-import { launchChrome, connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
+import { connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
+import { acquireManualChromeOwner, type ManualChromeOwner } from "../browser/manualChromeOwner.js";
 import {
-  readDevToolsPort,
-  writeDevToolsActivePort,
-  writeChromePid,
   cleanupStaleProfileState,
-  verifyDevToolsReachable,
+  isSafeChromeTerminationOutcome,
+  type ChromeProcessIdentity,
+  type RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";
+import { acquireBrowserTabLease } from "../browser/tabLeaseRegistry.js";
 
 export interface GeminiBrowserSession {
   profileDir: string;
   port: number;
   client: ChromeClient;
-  targetId?: string;
+  targetId: string;
+  processIdentity: ChromeProcessIdentity;
   close: () => Promise<void>;
 }
 
@@ -31,6 +32,7 @@ export async function openGeminiBrowserSession(
   input: OpenGeminiBrowserSessionInput,
 ): Promise<GeminiBrowserSession> {
   const { browserConfig, keepBrowserDefault, purpose, log } = input;
+  const logger = log ?? (() => {});
   const resolvedConfig = resolveBrowserConfig({
     ...browserConfig,
     manualLogin: true,
@@ -38,75 +40,122 @@ export async function openGeminiBrowserSession(
   });
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
-  await mkdir(profileDir, { recursive: true });
   const keepBrowser = Boolean(resolvedConfig.keepBrowser);
+  const tabLease = await acquireBrowserTabLease(profileDir, {
+    maxConcurrentTabs: resolvedConfig.maxConcurrentTabs,
+    timeoutMs: resolvedConfig.timeoutMs,
+    logger,
+    sessionId: purpose,
+  });
 
-  let port = await readDevToolsPort(profileDir);
-  let launchedChrome: Awaited<ReturnType<typeof launchChrome>> | null = null;
-  let chromeWasLaunched = false;
-
-  if (port) {
-    const probe = await verifyDevToolsReachable({ port });
-    if (!probe.ok) {
-      log?.(`[gemini-web] Stale DevTools port ${port}; launching fresh Chrome for ${purpose}.`);
-      await cleanupStaleProfileState(profileDir, log, { lockRemovalMode: "if_oracle_pid_dead" });
-      port = null;
-    }
+  let owner: ManualChromeOwner;
+  try {
+    owner = await acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose);
+  } catch (error) {
+    await tabLease.release().catch(() => undefined);
+    throw error;
   }
 
-  if (!port) {
-    log?.(`[gemini-web] Launching Chrome for ${purpose}.`);
-    launchedChrome = await launchChrome(resolvedConfig, profileDir, log ?? (() => {}));
-    port = launchedChrome.port;
-    chromeWasLaunched = true;
-    await writeDevToolsActivePort(profileDir, port);
-    if (launchedChrome.pid) {
-      await writeChromePid(profileDir, launchedChrome.pid);
-    }
-  } else {
-    log?.(`[gemini-web] Reusing Chrome on port ${port} for ${purpose}.`);
-  }
+  const { chrome, processIdentity } = owner;
+  const port = chrome.port;
+  const host = chrome.host ?? "127.0.0.1";
 
-  const connection = await connectWithNewTab(port, log ?? (() => {}), undefined);
-  const client = connection.client;
-  const targetId = connection.targetId;
+  let targetId: string | null = null;
+  let client: ChromeClient | null = null;
+  let closePromise: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    closePromise ??= (async () => {
+      const failures: Error[] = [];
+      const recordFailure = (error: unknown, action: string): void => {
+        const message = error instanceof Error ? error.message : String(error);
+        failures.push(new Error(`Gemini browser session ${action}: ${message}`));
+      };
 
-  const close = async (): Promise<void> => {
-    if (keepBrowser) {
-      try {
-        await client.close();
-      } catch {
-        /* ignore */
+      if (targetId) {
+        try {
+          if (!(await closeTab(port, targetId, logger, host))) {
+            failures.push(new Error(`Gemini browser session could not close target ${targetId}.`));
+          }
+        } catch (error) {
+          recordFailure(error, `could not close target ${targetId}`);
+        }
       }
-      return;
-    }
-
-    if (targetId && port) {
-      await closeTab(port, targetId, log ?? (() => {})).catch(() => undefined);
-    }
-    try {
-      await client.close();
-    } catch {
-      /* ignore */
-    }
-
-    if (chromeWasLaunched && launchedChrome) {
-      try {
-        launchedChrome.kill();
-      } catch {
-        /* ignore */
+      if (client) {
+        try {
+          await client.close();
+        } catch (error) {
+          recordFailure(error, "could not close its CDP client");
+        }
       }
-      await cleanupStaleProfileState(profileDir, log, { lockRemovalMode: "never" }).catch(
-        () => undefined,
-      );
-    }
+      try {
+        await tabLease.release({
+          onRelease: async ({ isLastLease }) => {
+            if (keepBrowser || !isLastLease || owner.source !== "launched") return;
+            let termination: RecordedChromeTerminationOutcome;
+            try {
+              termination = await chrome.kill();
+            } catch (error) {
+              recordFailure(error, "could not terminate its launched Chrome owner");
+              return;
+            }
+            if (!isSafeChromeTerminationOutcome(termination)) {
+              failures.push(
+                new Error(
+                  `Gemini browser session could not safely terminate Chrome: ${termination.reason}`,
+                ),
+              );
+              return;
+            }
+            try {
+              const cleaned = await cleanupStaleProfileState(profileDir, log, {
+                lockRemovalMode: "never",
+                expectedProfileIdentity: processIdentity.profileDirectory,
+              });
+              if (!cleaned) {
+                failures.push(
+                  new Error("Gemini browser session could not confirm profile cleanup."),
+                );
+              }
+            } catch (error) {
+              recordFailure(error, "could not clean up its terminated Chrome profile");
+            }
+          },
+        });
+      } catch (error) {
+        recordFailure(error, "could not release its browser tab lease");
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Gemini browser session did not settle cleanly.");
+      }
+    })();
+    return closePromise;
   };
+
+  try {
+    await tabLease.update({ chromeHost: host, chromePort: port });
+    const connection = await connectWithNewTab(port, logger, "about:blank", host, {
+      fallbackToDefault: false,
+      retries: 6,
+    });
+    if (!connection.targetId) {
+      throw new Error("Failed to create an isolated Gemini browser tab.");
+    }
+    client = connection.client;
+    targetId = connection.targetId;
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  if (!client || !targetId) {
+    throw new Error("Failed to establish an isolated Gemini browser session.");
+  }
 
   return {
     profileDir,
     port,
+    processIdentity,
     client,
-    targetId: targetId ?? undefined,
+    targetId,
     close,
   };
 }

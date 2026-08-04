@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
+import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
 import {
   buildBrowserRunWarningsForTest,
   runBrowserSessionExecution,
@@ -15,8 +16,20 @@ const baseRunOptions: RunOracleOptions = {
 
 const baseConfig: BrowserSessionConfig = {};
 
+function browserTransaction(
+  result: BrowserRunResult,
+  runtime: BrowserRunTransaction["runtime"] = {},
+): BrowserRunTransaction {
+  return {
+    ...result,
+    runtime,
+    finalize: async () => ({ status: "completed", runtime }),
+    abort: async () => ({ status: "completed", runtime }),
+  };
+}
+
 describe("runBrowserSessionExecution", () => {
-  test("logs stats and returns usage/runtime", async () => {
+  test("returns transaction runtime without materializing absent optional metadata", async () => {
     const log = vi.fn();
     const persistRuntimeHint = vi.fn();
     const executeBrowser = vi.fn(async (options) => {
@@ -38,15 +51,18 @@ describe("runBrowserSessionExecution", () => {
           capturedAt: "2026-07-03T00:00:00.000Z",
         },
       );
-      return {
-        answerText: "ok",
-        answerMarkdown: "ok",
-        artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
-        tookMs: 1000,
-        answerTokens: 12,
-        answerChars: 20,
-        conversationId: "foo",
-      };
+      return browserTransaction(
+        {
+          answerText: "ok",
+          answerMarkdown: "ok",
+          artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 20,
+          conversationId: "foo",
+        },
+        { conversationId: "foo" },
+      );
     });
     const result = await runBrowserSessionExecution(
       {
@@ -77,7 +93,8 @@ describe("runBrowserSessionExecution", () => {
       reasoningTokens: 0,
       totalTokens: 54,
     });
-    expect(result.runtime).toMatchObject({ chromePid: undefined, conversationId: "foo" });
+    expect(result.runtime).toEqual({ conversationId: "foo" });
+    expect(result.runtime).not.toHaveProperty("chromePid");
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
@@ -87,13 +104,15 @@ describe("runBrowserSessionExecution", () => {
   });
 
   test("passes browser resume conversation URL to executeBrowser", async () => {
-    const executeBrowser = vi.fn(async () => ({
-      answerText: "ok",
-      answerMarkdown: "ok",
-      tookMs: 1000,
-      answerTokens: 12,
-      answerChars: 20,
-    }));
+    const executeBrowser = vi.fn(async () =>
+      browserTransaction({
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 1000,
+        answerTokens: 12,
+        answerChars: 20,
+      }),
+    );
 
     await runBrowserSessionExecution(
       {
@@ -151,22 +170,24 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "inline",
           fallback: null,
         }),
-        executeBrowser: vi.fn(async () => ({
-          answerText: "ok",
-          answerMarkdown: "ok",
-          tookMs: 1000,
-          answerTokens: 12,
-          answerChars: 20,
-          modelSelection: {
-            requestedModel: "GPT-5.5 Pro",
-            resolvedLabel: "Pro",
-            strategy: "select" as const,
-            status: "already-selected" as const,
-            verified: true,
-            source: "chatgpt-model-picker" as const,
-            capturedAt: "2026-05-13T00:00:00.000Z",
-          },
-        })),
+        executeBrowser: vi.fn(async () =>
+          browserTransaction({
+            answerText: "ok",
+            answerMarkdown: "ok",
+            tookMs: 1000,
+            answerTokens: 12,
+            answerChars: 20,
+            modelSelection: {
+              requestedModel: "GPT-5.5 Pro",
+              resolvedLabel: "Pro",
+              strategy: "select" as const,
+              status: "already-selected" as const,
+              verified: true,
+              source: "chatgpt-model-picker" as const,
+              capturedAt: "2026-05-13T00:00:00.000Z",
+            },
+          }),
+        ),
       },
     );
 
@@ -209,13 +230,13 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: vi.fn(async ({ log: browserLog }) => {
           browserLog('[browser] Model picker diagnostic: {"targetLevel":"extended"}');
-          return {
+          return browserTransaction({
             answerText: "ok",
             answerMarkdown: "ok",
             tookMs: 1000,
             answerTokens: 1,
             answerChars: 2,
-          };
+          });
         }),
       },
     );
@@ -251,14 +272,16 @@ describe("runBrowserSessionExecution", () => {
   });
 
   test("passes ChatGPT image output paths into the browser runner", async () => {
-    const executeBrowser = vi.fn(async () => ({
-      answerText: "ok",
-      answerMarkdown: "ok",
-      artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
-      tookMs: 1000,
-      answerTokens: 1,
-      answerChars: 2,
-    }));
+    const executeBrowser = vi.fn(async () =>
+      browserTransaction({
+        answerText: "ok",
+        answerMarkdown: "ok",
+        artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
+        tookMs: 1000,
+        answerTokens: 1,
+        answerChars: 2,
+      }),
+    );
 
     await runBrowserSessionExecution(
       {
@@ -298,13 +321,15 @@ describe("runBrowserSessionExecution", () => {
   });
 
   test("passes browser follow-up prompts into the browser runner", async () => {
-    const executeBrowser = vi.fn(async () => ({
-      answerText: "ok",
-      answerMarkdown: "ok",
-      tookMs: 1000,
-      answerTokens: 1,
-      answerChars: 2,
-    }));
+    const executeBrowser = vi.fn(async () =>
+      browserTransaction({
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 1000,
+        answerTokens: 1,
+        answerChars: 2,
+      }),
+    );
 
     await runBrowserSessionExecution(
       {
@@ -350,18 +375,22 @@ describe("runBrowserSessionExecution", () => {
         chromeTargetId: "target-2",
         tabUrl: "https://chatgpt.com/c/attached",
       });
-      return {
-        answerText: "ok",
-        answerMarkdown: "ok",
-        tookMs: 100,
-        answerTokens: 2,
-        answerChars: 2,
-        browserTransport: "cdp" as const,
-        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
-        chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
-        chromeTargetId: "target-2",
-        tabUrl: "https://chatgpt.com/c/attached",
-      };
+      return browserTransaction(
+        {
+          answerText: "ok",
+          answerMarkdown: "ok",
+          tookMs: 100,
+          answerTokens: 2,
+          answerChars: 2,
+        },
+        {
+          browserTransport: "cdp",
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          chromeProfileRoot: "/Users/peter/Library/Application Support/Google/Chrome",
+          chromeTargetId: "target-2",
+          tabUrl: "https://chatgpt.com/c/attached",
+        },
+      );
     });
 
     const result = await runBrowserSessionExecution(
@@ -431,13 +460,13 @@ describe("runBrowserSessionExecution", () => {
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("Prompt textarea ready");
           noisyLogger();
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
             answerTokens: 1,
             answerChars: 4,
-          };
+          });
         },
       },
     );
@@ -473,13 +502,13 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("[browser] Inline prompt too large; retrying with file uploads.");
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
             answerTokens: 1,
             answerChars: 4,
-          };
+          });
         },
       },
     );
@@ -511,13 +540,13 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("[browser] ChatGPT thinking - 30s elapsed; status=planning");
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
             answerTokens: 1,
             answerChars: 4,
-          };
+          });
         },
       },
     );
@@ -547,13 +576,13 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("[browser] Sending follow-up 1/1");
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
             answerTokens: 1,
             answerChars: 4,
-          };
+          });
         },
       },
     );
@@ -583,7 +612,7 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("[browser] Archived ChatGPT conversation after saving local artifacts.");
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
@@ -595,7 +624,7 @@ describe("runBrowserSessionExecution", () => {
               archived: true,
               conversationUrl: "https://chatgpt.com/c/abc",
             },
-          };
+          });
         },
       },
     );
@@ -636,13 +665,13 @@ describe("runBrowserSessionExecution", () => {
             "[browser] Browser guidance: Use --browser-attach-running to reduce desktop disruption.",
           );
           automationLog?.("[browser] Prompt textarea ready");
-          return {
+          return browserTransaction({
             answerText: "text",
             answerMarkdown: "markdown",
             tookMs: 1,
             answerTokens: 1,
             answerChars: 4,
-          };
+          });
         },
       },
     );
@@ -656,13 +685,15 @@ describe("runBrowserSessionExecution", () => {
 
   test("passes fallback submission through to browser runner", async () => {
     const log = vi.fn();
-    const executeBrowser = vi.fn(async () => ({
-      answerText: "text",
-      answerMarkdown: "markdown",
-      tookMs: 1,
-      answerTokens: 1,
-      answerChars: 4,
-    }));
+    const executeBrowser = vi.fn(async () =>
+      browserTransaction({
+        answerText: "text",
+        answerMarkdown: "markdown",
+        tookMs: 1,
+        answerTokens: 1,
+        answerChars: 4,
+      }),
+    );
     await runBrowserSessionExecution(
       {
         runOptions: { ...baseRunOptions, verbose: false },
@@ -720,13 +751,14 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "upload",
           fallback: null,
         }),
-        executeBrowser: async () => ({
-          answerText: "text",
-          answerMarkdown: "markdown",
-          tookMs: 10,
-          answerTokens: 1,
-          answerChars: 5,
-        }),
+        executeBrowser: async () =>
+          browserTransaction({
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 10,
+            answerTokens: 1,
+            answerChars: 5,
+          }),
       },
     );
     expect(log.mock.calls.some((call) => String(call[0]).includes("Browser attachments"))).toBe(
@@ -755,13 +787,14 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "inline",
           fallback: null,
         }),
-        executeBrowser: async () => ({
-          answerText: "text",
-          answerMarkdown: "markdown",
-          tookMs: 100,
-          answerTokens: 5,
-          answerChars: 10,
-        }),
+        executeBrowser: async () =>
+          browserTransaction({
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 100,
+            answerTokens: 5,
+            answerChars: 10,
+          }),
       },
     );
 
@@ -795,13 +828,14 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "inline",
           fallback: null,
         }),
-        executeBrowser: async () => ({
-          answerText: "text",
-          answerMarkdown: "markdown",
-          tookMs: 100,
-          answerTokens: 5,
-          answerChars: 10,
-        }),
+        executeBrowser: async () =>
+          browserTransaction({
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 100,
+            answerTokens: 5,
+            answerChars: 10,
+          }),
       },
     );
 
@@ -835,22 +869,23 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "inline",
           fallback: null,
         }),
-        executeBrowser: async () => ({
-          answerText: "text",
-          answerMarkdown: "markdown",
-          tookMs: 100,
-          answerTokens: 5,
-          answerChars: 10,
-          modelSelection: {
-            requestedModel: "Pro",
-            resolvedLabel: "Pro",
-            strategy: "select",
-            status: "already-selected",
-            verified: true,
-            source: "chatgpt-model-picker",
-            capturedAt: "2026-07-12T00:00:00.000Z",
-          },
-        }),
+        executeBrowser: async () =>
+          browserTransaction({
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 100,
+            answerTokens: 5,
+            answerChars: 10,
+            modelSelection: {
+              requestedModel: "Pro",
+              resolvedLabel: "Pro",
+              strategy: "select",
+              status: "already-selected",
+              verified: true,
+              source: "chatgpt-model-picker",
+              capturedAt: "2026-07-12T00:00:00.000Z",
+            },
+          }),
       },
     );
 
@@ -882,22 +917,23 @@ describe("runBrowserSessionExecution", () => {
           attachmentMode: "inline",
           fallback: null,
         }),
-        executeBrowser: async () => ({
-          answerText: "text",
-          answerMarkdown: "markdown",
-          tookMs: 100,
-          answerTokens: 5,
-          answerChars: 10,
-          modelSelection: {
-            requestedModel: "Pro",
-            resolvedLabel: "Thinking 5.5 Heavy",
-            strategy: "current",
-            status: "already-selected",
-            verified: false,
-            source: "chatgpt-model-picker",
-            capturedAt: "2026-07-12T00:00:00.000Z",
-          },
-        }),
+        executeBrowser: async () =>
+          browserTransaction({
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 100,
+            answerTokens: 5,
+            answerChars: 10,
+            modelSelection: {
+              requestedModel: "Pro",
+              resolvedLabel: "Thinking 5.5 Heavy",
+              strategy: "current",
+              status: "already-selected",
+              verified: false,
+              source: "chatgpt-model-picker",
+              capturedAt: "2026-07-12T00:00:00.000Z",
+            },
+          }),
       },
     );
 
@@ -910,13 +946,15 @@ describe("runBrowserSessionExecution", () => {
 
   test("passes heartbeat interval through to browser runner", async () => {
     const log = vi.fn();
-    const executeBrowser = vi.fn(async () => ({
-      answerText: "text",
-      answerMarkdown: "markdown",
-      tookMs: 10,
-      answerTokens: 1,
-      answerChars: 5,
-    }));
+    const executeBrowser = vi.fn(async () =>
+      browserTransaction({
+        answerText: "text",
+        answerMarkdown: "markdown",
+        tookMs: 10,
+        answerTokens: 1,
+        answerChars: 5,
+      }),
+    );
     await runBrowserSessionExecution(
       {
         runOptions: { ...baseRunOptions, heartbeatIntervalMs: 15_000 },
@@ -946,13 +984,15 @@ describe("runBrowserSessionExecution", () => {
 
   test("allows Gemini in browser mode with custom executor", async () => {
     const log = vi.fn();
-    const executeBrowser = vi.fn().mockResolvedValue({
-      answerText: "gemini response",
-      answerMarkdown: "gemini response",
-      tookMs: 100,
-      answerTokens: 5,
-      answerChars: 15,
-    });
+    const executeBrowser = vi.fn().mockResolvedValue(
+      browserTransaction({
+        answerText: "gemini response",
+        answerMarkdown: "gemini response",
+        tookMs: 100,
+        answerTokens: 5,
+        answerChars: 15,
+      }),
+    );
     const result = await runBrowserSessionExecution(
       {
         runOptions: { ...baseRunOptions, model: "gemini-3-pro" },

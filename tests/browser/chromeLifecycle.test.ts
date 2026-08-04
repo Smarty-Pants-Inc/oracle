@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { LaunchedChrome } from "chrome-launcher";
-import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
+import { EventEmitter } from "node:events";
+import type {
+  ChromeLaunchResult,
+  StableChromeProcessHandle,
+} from "../../src/browser/chromeLifecycle.js";
+import type {
+  ChromeProcessIdentity,
+  ProfileDirectoryIdentity,
+} from "../../src/browser/profileState.js";
 
 const cdpNewMock = vi.fn();
 const cdpCloseMock = vi.fn();
@@ -23,6 +31,86 @@ const resolveLocalChromeLaunchRoute = () => ({
   usePatchedLauncher: false,
 });
 
+function profileIdentity(userDataDir: string): ProfileDirectoryIdentity {
+  const resolvedPath = path.resolve(userDataDir);
+  const canonicalPath = existsSync(resolvedPath) ? realpathSync(resolvedPath) : resolvedPath;
+  const physical = existsSync(canonicalPath) ? statSync(canonicalPath, { bigint: true }) : null;
+  return {
+    version: 1,
+    platform: process.platform,
+    canonicalPath,
+    device: physical?.dev.toString() ?? "1",
+    inode: physical?.ino.toString() ?? "2",
+  };
+}
+
+function processIdentity(
+  userDataDir: string,
+  pid: number,
+  launchNonce: string,
+): ChromeProcessIdentity {
+  const profileDirectory = profileIdentity(userDataDir);
+  return {
+    pid,
+    processStartTime: `launch-${pid}`,
+    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    normalizedUserDataDir: profileDirectory.canonicalPath,
+    launchNonce,
+    profileDirectory,
+  };
+}
+
+function retainedChildProcess(
+  pid: number,
+): StableChromeProcessHandle & { signalCalls: NodeJS.Signals[] } {
+  const emitter = new EventEmitter();
+  const state: { exitCode: number | null; signalCode: NodeJS.Signals | null } = {
+    exitCode: null,
+    signalCode: null,
+  };
+  const signalCalls: NodeJS.Signals[] = [];
+  return {
+    pid,
+    get exitCode() {
+      return state.exitCode;
+    },
+    get signalCode() {
+      return state.signalCode;
+    },
+    signalCalls,
+    kill: vi.fn((signal: NodeJS.Signals) => {
+      signalCalls.push(signal);
+      state.signalCode = signal;
+      queueMicrotask(() => emitter.emit("exit"));
+      return true;
+    }),
+    once: (event, listener) => emitter.once(event, listener),
+    removeListener: (event, listener) => emitter.removeListener(event, listener),
+  };
+}
+
+function chromeLaunchResult(
+  identity: ChromeProcessIdentity,
+  kill: ChromeLaunchResult["kill"],
+): ChromeLaunchResult {
+  return {
+    pid: identity.pid,
+    port: 9222,
+    process: undefined,
+    remoteDebuggingPipes: null,
+    kill,
+    processIdentity: identity,
+  };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
 
 vi.doMock("../../src/browser/profileState.js", async () => {
@@ -31,73 +119,58 @@ vi.doMock("../../src/browser/profileState.js", async () => {
   );
   return {
     ...original,
-    cleanupStaleProfileState: vi.fn(async () => undefined),
+    cleanupStaleProfileState: vi.fn(async () => true),
   };
 });
 
 describe("hidden macOS Chrome launch", () => {
-  test("uses a background-hidden app launch instead of the standard launcher", async () => {
+  test("retains the exact hidden-launch control authority", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const processIdentity = {
-      pid: 4321,
-      processStartTime: "launch-1",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-hidden-profile",
-      launchNonce: "11111111-1111-4111-8111-111111111111",
-    };
-    const rollbackKill = vi.fn(async () => undefined);
-    const hiddenMacLaunch = vi.fn(
-      async () =>
-        ({
-          pid: 4321,
-          port: 9222,
-          process: undefined,
-          remoteDebuggingPipes: null,
-          kill: rollbackKill,
-          processIdentity,
-        }) as unknown as ChromeLaunchResult,
+    const profile = profileIdentity("/tmp/oracle-hidden-profile");
+    const identity = processIdentity(
+      profile.canonicalPath,
+      4321,
+      "11111111-1111-4111-8111-111111111111",
     );
+    const stableKill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: identity.pid,
+      signal: "CONTROL_CHANNEL" as const,
+    }));
+    const hiddenMacLaunch = vi.fn(async () => chromeLaunchResult(identity, stableKill));
     const standardLaunch = vi.fn();
     const writeProcessIdentity = vi.fn(async () => undefined);
-    const terminateRecordedProcess = vi.fn(async () => ({ status: "terminated" }) as never);
     const logger = vi.fn<(message: string) => void>();
 
     const launched = await launchChrome(
       resolveBrowserConfig({ hideWindow: true, debugPort: 9222 }),
-      "/tmp/oracle-hidden-profile",
+      profile.canonicalPath,
       logger,
       {
         platform: "darwin",
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
         hiddenMacLaunch,
         standardLaunch,
+        captureProfileIdentity: async () => profile,
         writeProcessIdentity,
-        terminateRecordedProcess,
       },
     );
 
     expect(hiddenMacLaunch).toHaveBeenCalledWith(
-      expect.objectContaining({ userDataDir: "/tmp/oracle-hidden-profile", requestedPort: 9222 }),
+      expect.objectContaining({ userDataDir: profile.canonicalPath, requestedPort: 9222 }),
     );
     expect(standardLaunch).not.toHaveBeenCalled();
-    expect(writeProcessIdentity.mock.calls).toEqual([
-      ["/tmp/oracle-hidden-profile", processIdentity],
-    ]);
-    expect(launched.processIdentity).toBe(processIdentity);
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("hidden background Chrome"));
-
-    await launched.kill();
-    expect(terminateRecordedProcess).toHaveBeenCalledWith(
-      "/tmp/oracle-hidden-profile",
-      processIdentity,
-    );
-    expect(rollbackKill).not.toHaveBeenCalled();
+    expect(writeProcessIdentity).toHaveBeenCalledWith(profile.canonicalPath, identity);
+    await expect(launched.kill()).resolves.toMatchObject({
+      status: "stopped",
+      signal: "CONTROL_CHANNEL",
+    });
+    expect(stableKill).toHaveBeenCalledOnce();
   });
 
   test("builds an open command that is hidden, backgrounded, and isolated", async () => {
     const { buildHiddenMacChromeOpenArgs } = await import("../../src/browser/chromeLifecycle.js");
-
     expect(
       buildHiddenMacChromeOpenArgs("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", [
         "--remote-debugging-port=9222",
@@ -117,226 +190,132 @@ describe("hidden macOS Chrome launch", () => {
   test("fails closed when hidden headful launch cannot be guaranteed", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-
+    const profile = profileIdentity("/tmp/oracle-hidden-profile");
     await expect(
       launchChrome(
         resolveBrowserConfig({ hideWindow: true }),
-        "/tmp/oracle-hidden-profile",
+        profile.canonicalPath,
         vi.fn<(message: string) => void>(),
-        { platform: "linux" },
+        { platform: "linux", captureProfileIdentity: async () => profile },
       ),
     ).rejects.toThrow(/use --remote-chrome/i);
   });
 });
 
-describe("Chrome process identity", () => {
-  test("returns the exact identity captured for a standard launch", async () => {
+describe("stable Chrome process authority", () => {
+  test("terminates a current launch through its retained ChildProcess handle", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const rollbackKill = vi.fn(async () => undefined);
+    const profile = profileIdentity("/tmp/oracle-standard-profile");
+    const identity = processIdentity(
+      profile.canonicalPath,
+      5678,
+      "22222222-2222-4222-8222-222222222222",
+    );
+    const child = retainedChildProcess(identity.pid);
+    const legacyPidKill = vi.fn(async () => undefined);
     const standardLaunch = vi.fn(async () => ({
-      pid: 5678,
+      pid: identity.pid,
       port: 9222,
-      process: undefined,
+      process: child,
       remoteDebuggingPipes: null,
-      kill: rollbackKill,
+      kill: legacyPidKill,
     }));
-    const processIdentity = {
-      pid: 5678,
-      processStartTime: "launch-2",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-standard-profile",
-      launchNonce: "22222222-2222-4222-8222-222222222222",
-    };
-    const captureProcessIdentity = vi.fn(async () => processIdentity);
-    const writeProcessIdentity = vi.fn(async () => undefined);
-    const terminateRecordedProcess = vi.fn(async () => ({ status: "terminated" }) as never);
 
     const launched = await launchChrome(
       { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
-      "/tmp/oracle-standard-profile",
+      profile.canonicalPath,
       vi.fn<(message: string) => void>(),
       {
         standardLaunch: standardLaunch as never,
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
-        captureProcessIdentity,
-        writeProcessIdentity,
-        terminateRecordedProcess,
+        captureProfileIdentity: async () => profile,
+        captureProcessIdentity: vi.fn(async () => identity),
+        writeProcessIdentity: vi.fn(async () => undefined),
       },
     );
 
-    expect(captureProcessIdentity).toHaveBeenCalledWith("/tmp/oracle-standard-profile", 5678);
-    expect(writeProcessIdentity.mock.calls).toEqual([
-      ["/tmp/oracle-standard-profile", processIdentity],
-    ]);
-    expect(launched.processIdentity).toBe(processIdentity);
-
-    await launched.kill();
-    expect(terminateRecordedProcess).toHaveBeenCalledWith(
-      "/tmp/oracle-standard-profile",
-      processIdentity,
-    );
-    expect(rollbackKill).not.toHaveBeenCalled();
+    await expect(launched.kill()).resolves.toMatchObject({
+      status: "stopped",
+      pid: identity.pid,
+      signal: "SIGTERM",
+    });
+    expect(child.signalCalls).toEqual(["SIGTERM"]);
+    expect(legacyPidKill).not.toHaveBeenCalled();
   });
 
-  test("kills Chrome when exact process identity capture fails", async () => {
+  test("does not treat a retained handle without a process id as safely stopped", async () => {
+    const { createStableChildProcessChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const signal = vi.fn(() => true);
+    const child = {
+      pid: undefined,
+      exitCode: null,
+      signalCode: null,
+      kill: signal,
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    } satisfies StableChromeProcessHandle;
+
+    await expect(createStableChildProcessChromeKill(child)()).resolves.toMatchObject({
+      status: "unsafe",
+      reason: expect.stringMatching(/no stable process id/i),
+    });
+    expect(signal).not.toHaveBeenCalled();
+  });
+
+  test("rolls back identity capture failure only through the retained handle", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const profile = profileIdentity("/tmp/oracle-invalid-profile");
+    const child = retainedChildProcess(6789);
     const captureError = new Error("identity unavailable");
-    const rollbackKill = vi.fn(async () => undefined);
-    const standardLaunch = vi.fn(async () => ({
-      pid: 6789,
-      port: 9222,
-      process: undefined,
-      remoteDebuggingPipes: null,
-      kill: rollbackKill,
-    }));
-    const writeProcessIdentity = vi.fn(async () => undefined);
-
     await expect(
       launchChrome(
         { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
-        "/tmp/oracle-invalid-profile",
+        profile.canonicalPath,
         vi.fn<(message: string) => void>(),
         {
-          standardLaunch: standardLaunch as never,
+          standardLaunch: vi.fn(async () => ({
+            pid: 6789,
+            port: 9222,
+            process: child,
+            remoteDebuggingPipes: null,
+            kill: vi.fn(async () => undefined),
+          })) as never,
           resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+          captureProfileIdentity: async () => profile,
           captureProcessIdentity: vi.fn(async () => {
             throw captureError;
           }),
-          writeProcessIdentity,
         },
       ),
     ).rejects.toMatchObject({
       message: expect.stringMatching(/capture Chrome process identity/i),
       cause: captureError,
     });
-    expect(rollbackKill).toHaveBeenCalledOnce();
-    expect(writeProcessIdentity).not.toHaveBeenCalled();
+    expect(child.signalCalls).toEqual(["SIGTERM"]);
   });
 
-  test("aggregates identity capture and exact rollback failures", async () => {
-    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
-    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const captureError = new Error("identity unavailable");
-    const rollbackError = new Error("launcher kill failed");
-    const rollbackKill = vi.fn(async () => {
-      throw rollbackError;
-    });
-    const standardLaunch = vi.fn(async () => ({
-      pid: 6790,
-      port: 9222,
-      process: undefined,
-      remoteDebuggingPipes: null,
-      kill: rollbackKill,
-    }));
-    const writeProcessIdentity = vi.fn(async () => undefined);
-
-    await expect(
-      launchChrome(
-        { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
-        "/tmp/oracle-invalid-profile",
-        vi.fn<(message: string) => void>(),
-        {
-          standardLaunch: standardLaunch as never,
-          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
-          captureProcessIdentity: vi.fn(async () => {
-            throw captureError;
-          }),
-          writeProcessIdentity,
-        },
-      ),
-    ).rejects.toMatchObject({
-      name: "AggregateError",
-      errors: [captureError, rollbackError],
-    });
-    expect(rollbackKill).toHaveBeenCalledOnce();
-    expect(writeProcessIdentity).not.toHaveBeenCalled();
-  });
-
-  test("binds Chrome cleanup to the captured immutable identity", async () => {
-    const { createIdentityBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
-    const processIdentity = {
-      pid: 7890,
-      processStartTime: "launch-3",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-bound-profile",
-      launchNonce: "33333333-3333-4333-8333-333333333333",
-    };
-    const terminate = vi.fn(async () => ({ status: "terminated" }) as never);
-
-    const kill = createIdentityBoundChromeKill(
-      "/tmp/oracle-bound-profile",
-      processIdentity,
-      terminate,
-    );
-    await kill();
-
-    expect(terminate).toHaveBeenCalledWith("/tmp/oracle-bound-profile", processIdentity);
-  });
-
-  test("rolls back launch when provisional identity persistence fails", async () => {
-    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
-    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const processIdentity = {
-      pid: 8901,
-      processStartTime: "launch-4",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-rollback-profile",
-      launchNonce: "44444444-4444-4444-8444-444444444444",
-    };
-    const persistenceError = new Error("disk full");
-    const rollbackKill = vi.fn(async () => undefined);
-    const standardLaunch = vi.fn(async () => ({
-      pid: 8901,
-      port: 9222,
-      process: undefined,
-      remoteDebuggingPipes: null,
-      kill: rollbackKill,
-    }));
-
-    await expect(
-      launchChrome(
-        { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
-        "/tmp/oracle-rollback-profile",
-        vi.fn<(message: string) => void>(),
-        {
-          standardLaunch: standardLaunch as never,
-          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
-          captureProcessIdentity: vi.fn(async () => processIdentity),
-          writeProcessIdentity: vi.fn(async () => {
-            throw persistenceError;
-          }),
-        },
-      ),
-    ).rejects.toMatchObject({
-      message: expect.stringMatching(/persist Chrome process identity/i),
-      cause: persistenceError,
-    });
-    expect(rollbackKill).toHaveBeenCalledOnce();
-  });
-
-  test("aggregates identity persistence and exact rollback failures", async () => {
+  test("preserves the unsafe outcome when persistence rollback lacks stable authority", async () => {
     const { createProvisionalIdentityBoundChromeKill } =
       await import("../../src/browser/chromeLifecycle.js");
-    const processIdentity = {
-      pid: 8902,
-      processStartTime: "launch-4b",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-rollback-profile",
-      launchNonce: "44444444-4444-4444-8444-444444444445",
-    };
+    const identity = processIdentity(
+      "/tmp/oracle-rollback-profile",
+      8902,
+      "44444444-4444-4444-8444-444444444445",
+    );
     const persistenceError = new Error("disk full");
-    const rollbackError = new Error("launcher kill failed");
-    const rollbackKill = vi.fn(async () => {
-      throw rollbackError;
-    });
-
+    const stableKill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: identity.pid,
+      reason: "retained handle unavailable",
+    }));
     await expect(
       createProvisionalIdentityBoundChromeKill(
-        "/tmp/oracle-rollback-profile",
-        processIdentity,
-        rollbackKill,
+        identity.profileDirectory.canonicalPath,
+        identity,
+        stableKill,
         {
           writeIdentity: vi.fn(async () => {
             throw persistenceError;
@@ -345,82 +324,72 @@ describe("Chrome process identity", () => {
       ),
     ).rejects.toMatchObject({
       name: "AggregateError",
-      errors: [persistenceError, rollbackError],
+      errors: [
+        persistenceError,
+        expect.objectContaining({ message: "retained handle unavailable" }),
+      ],
     });
-    expect(rollbackKill).toHaveBeenCalledOnce();
+    expect(stableKill).toHaveBeenCalledOnce();
   });
 
-  test("recovers partial hidden-launch state from provisional identity authority", async () => {
+  test("returns the retained stable kill after identity persistence", async () => {
     const { createProvisionalIdentityBoundChromeKill } =
       await import("../../src/browser/chromeLifecycle.js");
-    const processIdentity = {
-      pid: 9012,
-      processStartTime: "launch-5",
-      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      normalizedUserDataDir: "/tmp/oracle-partial-profile",
-      launchNonce: "55555555-5555-4555-8555-555555555555",
-    };
-    const events: string[] = [];
-    const rollbackKill = vi.fn(async () => undefined);
-    const writeIdentity = vi.fn(async () => {
-      events.push("identity-persisted");
-    });
-    const terminate = vi.fn(async () => {
-      events.push("identity-terminated");
-      return { status: "stopped", pid: 9012, signal: "SIGTERM" } as const;
-    });
-
-    const kill = await createProvisionalIdentityBoundChromeKill(
+    const identity = processIdentity(
       "/tmp/oracle-partial-profile",
-      processIdentity,
-      rollbackKill,
-      { writeIdentity, terminate },
+      9012,
+      "55555555-5555-4555-8555-555555555555",
     );
-    await kill();
-
-    expect(writeIdentity).toHaveBeenCalledWith("/tmp/oracle-partial-profile", processIdentity);
-    expect(events).toEqual(["identity-persisted", "identity-terminated"]);
-    expect(rollbackKill).not.toHaveBeenCalled();
+    const writeIdentity = vi.fn(async () => undefined);
+    const stableKill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: identity.pid,
+      signal: "SIGTERM" as const,
+    }));
+    const kill = await createProvisionalIdentityBoundChromeKill(
+      identity.profileDirectory.canonicalPath,
+      identity,
+      stableKill,
+      { writeIdentity },
+    );
+    expect(stableKill).not.toHaveBeenCalled();
+    await expect(kill()).resolves.toMatchObject({ status: "stopped", pid: identity.pid });
+    expect(writeIdentity).toHaveBeenCalledWith(identity.profileDirectory.canonicalPath, identity);
   });
 });
 
 describe("registerTerminationHooks", () => {
-  test("kills Chrome and removes a copied profile on an in-flight signal", async () => {
+  test("removes a copied profile only after safe retained-handle termination", async () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-profile-signal-"));
     await writeFile(path.join(userDataDir, "Cookies"), "sensitive");
-    const chrome = {
-      kill: vi.fn().mockResolvedValue(undefined),
+    const identity = processIdentity(userDataDir, 1234, "66666666-6666-4666-8666-666666666666");
+    const kill = vi.fn(async () => ({
+      status: "stopped" as const,
       pid: 1234,
-      port: 9222,
-    };
+      signal: "SIGTERM" as const,
+    }));
+    const chrome = chromeLaunchResult(identity, kill);
     const emitRuntimeHint = vi.fn().mockResolvedValue(undefined);
+    const handled = deferred<void>();
     const previousExitCode = process.exitCode;
     const removeHooks = registerTerminationHooks(
-      chrome as unknown as import("chrome-launcher").LaunchedChrome,
+      chrome,
       userDataDir,
       false,
-      vi.fn() as unknown as import("../../src/browser/types.js").BrowserLogger,
+      vi.fn<(message: string) => void>(),
       {
         isInFlight: () => true,
         emitRuntimeHint,
         forceProfileCleanup: true,
+        onSignalHandled: () => handled.resolve(),
       },
     );
 
     try {
       process.emit("SIGTERM");
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (
-          await stat(userDataDir)
-            .then(() => false)
-            .catch(() => true)
-        )
-          break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      expect(chrome.kill).toHaveBeenCalledTimes(1);
+      await handled.promise;
+      expect(kill).toHaveBeenCalledTimes(1);
       expect(emitRuntimeHint).not.toHaveBeenCalled();
       await expect(stat(userDataDir)).rejects.toThrow();
     } finally {
@@ -430,37 +399,61 @@ describe("registerTerminationHooks", () => {
     }
   });
 
-  test("clears stale DevToolsActivePort hints when preserving userDataDir", async () => {
+  test("preserves profile and authority after unsafe termination", async () => {
+    const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
+    const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-profile-unsafe-"));
+    await writeFile(path.join(userDataDir, "authority"), "keep");
+    const identity = processIdentity(userDataDir, 1235, "77777777-7777-4777-8777-777777777777");
+    const kill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: 1235,
+      reason: "stable handle unavailable",
+    }));
+    const chrome = chromeLaunchResult(identity, kill);
+    const logger = vi.fn<(message: string) => void>();
+    const handled = deferred<void>();
+    const previousExitCode = process.exitCode;
+    const removeHooks = registerTerminationHooks(chrome, userDataDir, false, logger, {
+      forceProfileCleanup: true,
+      onSignalHandled: () => handled.resolve(),
+    });
+    try {
+      process.emit("SIGTERM");
+      await handled.promise;
+      expect(existsSync(path.join(userDataDir, "authority"))).toBe(true);
+      expect(logger).toHaveBeenCalledWith(expect.stringMatching(/preserving profile/i));
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+      await rm(userDataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("clears stale hints with the exact physical profile identity", async () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const profileState = await import("../../src/browser/profileState.js");
     const cleanupMock = vi.mocked(profileState.cleanupStaleProfileState);
-
-    const chrome = {
-      kill: vi.fn().mockResolvedValue(undefined),
-      pid: 1234,
-      port: 9222,
-    };
-    const logger = vi.fn();
     const userDataDir = "/tmp/oracle-manual-login-profile";
-
-    const removeHooks = registerTerminationHooks(
-      chrome as unknown as LaunchedChrome,
-      userDataDir,
-      false,
-      logger,
-      {
-        isInFlight: () => false,
-        preserveUserDataDir: true,
-      },
-    );
-
+    const identity = processIdentity(userDataDir, 1236, "88888888-8888-4888-8888-888888888888");
+    const kill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: 1236,
+      signal: "SIGTERM" as const,
+    }));
+    const chrome = chromeLaunchResult(identity, kill);
+    const logger = vi.fn<(message: string) => void>();
+    const handled = deferred<void>();
+    const removeHooks = registerTerminationHooks(chrome, userDataDir, false, logger, {
+      preserveUserDataDir: true,
+      onSignalHandled: () => handled.resolve(),
+    });
     process.emit("SIGINT");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
+    await handled.promise;
     removeHooks();
-
-    expect(chrome.kill).toHaveBeenCalledTimes(1);
-    expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, { lockRemovalMode: "never" });
+    expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, {
+      lockRemovalMode: "never",
+      expectedProfileIdentity: identity.profileDirectory,
+    });
   });
 });
 

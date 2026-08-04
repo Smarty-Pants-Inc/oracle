@@ -1,9 +1,10 @@
-import { access, readFile, rm } from "node:fs/promises";
+import { access, readFile, realpath, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
 import type { BrowserRecoveryCleanupMetadata } from "../../src/sessionManager.js";
+import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
 
 type BrowserAutomationErrorConstructor = new (
   message: string,
@@ -18,13 +19,26 @@ type DisconnectFixtureOptions = {
 
 const targetId = "recoverable-target";
 const conversationUrl = `https://chatgpt.com/c/${targetId}`;
-function chromeProcessIdentity(userDataDir: string, pid = 1234) {
+async function chromeProcessIdentity(
+  userDataDir: string,
+  pid = 1234,
+): Promise<ChromeProcessIdentity> {
+  const resolvedUserDataDir = await realpath(userDataDir);
+  const physicalProfile = await stat(resolvedUserDataDir, { bigint: true });
   return {
     pid,
     processStartTime: "disconnect-fixture-process-generation",
     executablePath: "/usr/bin/google-chrome",
-    normalizedUserDataDir: path.resolve(userDataDir),
+    normalizedUserDataDir:
+      process.platform === "win32" ? resolvedUserDataDir.toLowerCase() : resolvedUserDataDir,
     launchNonce: "33333333-3333-4333-8333-333333333333",
+    profileDirectory: {
+      version: 1 as const,
+      platform: process.platform,
+      canonicalPath: resolvedUserDataDir,
+      device: physicalProfile.dev.toString(),
+      inode: physicalProfile.ino.toString(),
+    },
   };
 }
 
@@ -226,14 +240,16 @@ async function withDisconnectFixture(
     probeChromeTargetLiveness: Mock;
     verifyPromptCommitted: Mock;
     profileDir: string;
+    processIdentity: ChromeProcessIdentity;
     providerObservedDispatchStart: boolean;
   }) => Promise<void> | void,
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let profileDir = "";
+  let processIdentity: ChromeProcessIdentity | null = null;
   let providerObservedDispatchStart = false;
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
-  const kill = vi.fn().mockResolvedValue(undefined);
+  const kill = vi.fn().mockResolvedValue({ status: "stopped", pid: 1234, signal: "SIGTERM" });
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
     targetFound: true,
@@ -266,12 +282,13 @@ async function withDisconnectFixture(
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
     launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => {
       profileDir = userDataDir;
+      processIdentity = await chromeProcessIdentity(userDataDir);
       return {
         pid: 1234,
         port: 9230,
         process: { unref: vi.fn() },
         kill,
-        processIdentity: chromeProcessIdentity(userDataDir),
+        processIdentity,
       };
     }),
     registerTerminationHooks: vi.fn(() => vi.fn()),
@@ -313,11 +330,12 @@ async function withDisconnectFixture(
     connectionLostUserMessage: vi.fn(() => "connection lost"),
   }));
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
-    runProviderSubmissionFlow: vi.fn(async () => {
+    runProviderSubmissionFlow: vi.fn(() => {
       providerObservedDispatchStart = true;
       disconnectHandler?.();
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      return { status: "attempted" as const };
+      // Keep the provider dispatch in flight so the fixture can only advance through the
+      // disconnect listener's fresh semantic assessment, never an event-loop timing race.
+      return new Promise<never>(() => undefined);
     }),
   }));
 
@@ -337,6 +355,9 @@ async function withDisconnectFixture(
           : {}),
       },
     }).catch((caught) => caught);
+    if (!processIdentity) {
+      throw new Error("Disconnect fixture did not acquire Chrome process authority");
+    }
 
     await verify({
       error,
@@ -346,6 +367,7 @@ async function withDisconnectFixture(
       probeChromeTargetLiveness,
       verifyPromptCommitted,
       profileDir,
+      processIdentity,
       providerObservedDispatchStart,
     });
   } finally {
@@ -388,7 +410,7 @@ describe("recoverable disconnect lifecycle", () => {
           runtime: {
             promptSubmitted: true,
             chromePid: 1234,
-            chromeProcessIdentity: chromeProcessIdentity(fixture.profileDir),
+            chromeProcessIdentity: fixture.processIdentity,
             conversationId: targetId,
             promptEpoch: {
               status: "committed",
@@ -418,7 +440,7 @@ describe("recoverable disconnect lifecycle", () => {
       const persistedIdentity = JSON.parse(
         await readFile(path.join(fixture.profileDir, "chrome-process-identity.json"), "utf8"),
       ) as unknown;
-      expect(persistedIdentity).toEqual(chromeProcessIdentity(fixture.profileDir));
+      expect(persistedIdentity).toEqual(fixture.processIdentity);
     });
   });
 

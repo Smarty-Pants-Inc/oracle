@@ -2,6 +2,7 @@ import path from "node:path";
 import type {
   BrowserRunOptions,
   BrowserRunResult,
+  BrowserRunTransaction,
   BrowserLogger,
   CookieParam,
 } from "../browser/types.js";
@@ -46,6 +47,22 @@ interface GeminiCookieLoadResult {
 
 function estimateTokenCount(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/**
+ * Gemini has no deferred browser authority once an execution resolves: its DOM flows await
+ * session.close(), and HTTP flows clear their timeout before returning. Represent that completed
+ * lifecycle explicitly rather than making callers fabricate cleanup callbacks.
+ */
+function createSettledGeminiTransaction(result: BrowserRunResult): BrowserRunTransaction {
+  const runtime: BrowserRunTransaction["runtime"] = {};
+  const finalization = { status: "completed" as const, runtime };
+  return {
+    ...result,
+    runtime,
+    finalize: async () => finalization,
+    abort: async () => finalization,
+  };
 }
 
 function resolveInvocationPath(value: string | undefined): string | undefined {
@@ -334,8 +351,8 @@ async function loadGeminiCookies(
 
 export function createGeminiWebExecutor(
   geminiOptions: GeminiWebOptions,
-): (runOptions: BrowserRunOptions) => Promise<BrowserRunResult> {
-  return async (runOptions: BrowserRunOptions): Promise<BrowserRunResult> => {
+): (runOptions: BrowserRunOptions) => Promise<BrowserRunTransaction> {
+  return async (runOptions: BrowserRunOptions): Promise<BrowserRunTransaction> => {
     const startTime = Date.now();
     const log = runOptions.log;
 
@@ -376,13 +393,13 @@ export function createGeminiWebExecutor(
           answerMarkdown = `## Thinking\n\n${browserResult.thoughts}\n\n## Response\n\n${browserResult.text}`;
         }
         log?.(`[gemini-web] Completed in ${tookMs}ms`);
-        return {
+        return createSettledGeminiTransaction({
           answerText: browserResult.text,
           answerMarkdown,
           tookMs,
           answerTokens: estimateTokenCount(browserResult.text),
           answerChars: browserResult.text.length,
-        };
+        });
       },
     };
 
@@ -518,13 +535,13 @@ export function createGeminiWebExecutor(
         const tookMs = Date.now() - startTime;
         log?.(`[gemini-web] Completed in ${tookMs}ms`);
 
-        return {
+        return createSettledGeminiTransaction({
           answerText,
           answerMarkdown,
           tookMs,
           answerTokens: estimateTokenCount(answerText),
           answerChars: answerText.length,
-        };
+        });
       },
     };
 

@@ -52,7 +52,7 @@ import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
-import { persistDurableBrowserAnswer } from "./durableAnswer.js";
+import { persistDurableBrowserAnswer, type DurableBrowserAnswerReceipt } from "./durableAnswer.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -101,6 +101,7 @@ export async function performSessionRun({
   const notificationSettings =
     notifications ?? deriveNotificationSettingsFromMetadata(sessionMeta, process.env);
   const modelForStatus = runOptions.model ?? sessionMeta.model;
+  let durableAnswerReceipt: DurableBrowserAnswerReceipt | undefined;
   try {
     if (mode === "browser") {
       if (!browserConfig) {
@@ -150,9 +151,23 @@ export async function performSessionRun({
       };
       let durablyCompleted = false;
       try {
-        const answerReceipt = await persistDurableBrowserAnswer({
+        durableAnswerReceipt = await persistDurableBrowserAnswer({
           sessionId: sessionMeta.id,
           answer: result.answerText ?? "",
+        });
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "completed",
+          completedAt: new Date().toISOString(),
+          usage: result.usage,
+          elapsedMs: result.elapsedMs,
+          errorMessage: undefined,
+          browser: currentBrowser,
+          artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, result.artifacts), [
+            durableAnswerReceipt.artifact,
+          ]),
+          response: undefined,
+          transport: undefined,
+          error: undefined,
         });
         await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
         await sendSessionNotification(
@@ -175,22 +190,18 @@ export async function performSessionRun({
             usage: result.usage,
           });
         }
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "completed",
-          completedAt: new Date().toISOString(),
-          usage: result.usage,
-          elapsedMs: result.elapsedMs,
-          errorMessage: undefined,
-          browser: currentBrowser,
-          artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, result.artifacts), [
-            answerReceipt.artifact,
-          ]),
-          response: undefined,
-          transport: undefined,
-          error: undefined,
-        });
         durablyCompleted = true;
-        const finalization = await result.finalize();
+        const finalization = await result.finalize().catch((finalizeError) => {
+          const message = `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`;
+          return {
+            status: "pending" as const,
+            runtime: {
+              ...result.runtime,
+              recoveryCleanupResult: { status: "failed" as const, error: message },
+            },
+            error: message,
+          };
+        });
         currentBrowser = { ...currentBrowser, runtime: finalization.runtime };
         await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
         if (finalization.status === "pending") {
@@ -203,6 +214,9 @@ export async function performSessionRun({
         return;
       } catch (error) {
         if (!durablyCompleted) {
+          if (durableAnswerReceipt) {
+            throw error;
+          }
           try {
             const abortion = await result.abort();
             currentBrowser = { ...currentBrowser, runtime: abortion.runtime };
@@ -796,6 +810,11 @@ export async function performSessionRun({
             runtime: browserRuntime ?? currentBrowser?.runtime,
           }
         : undefined,
+      ...(durableAnswerReceipt
+        ? {
+            artifacts: mergeArtifacts(sessionMeta.artifacts, [durableAnswerReceipt.artifact]),
+          }
+        : {}),
       response: responseMetadata,
       transport: transportMetadata,
       error: userError
@@ -1253,6 +1272,7 @@ async function autoReattachUntilComplete({
     let captureSucceeded = false;
     let durablyCompleted = false;
     let reattachResult: Awaited<ReturnType<typeof resumeBrowserSession>> | null = null;
+    let answerReceipt: DurableBrowserAnswerReceipt | undefined;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
@@ -1265,10 +1285,31 @@ async function autoReattachUntilComplete({
       captureSucceeded = true;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
-      const answerReceipt = await persistDurableBrowserAnswer({
+      const usage = {
+        inputTokens: 0,
+        outputTokens,
+        reasoningTokens: 0,
+        totalTokens: outputTokens,
+      };
+      answerReceipt = await persistDurableBrowserAnswer({
         sessionId: sessionMeta.id,
         answer: answerText,
         logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
+      });
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        usage,
+        errorMessage: undefined,
+        browser: {
+          ...browserMetadata,
+          config: browserConfig,
+          runtime: reattachResult.runtime,
+        },
+        artifacts: mergeArtifacts(sessionMeta.artifacts, [answerReceipt.artifact]),
+        response: { status: "completed" },
+        error: undefined,
+        transport: undefined,
       });
       const artifacts = await ensureSessionArtifacts({
         sessionId: sessionMeta.id,
@@ -1283,12 +1324,7 @@ async function autoReattachUntilComplete({
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "completed",
           completedAt: new Date().toISOString(),
-          usage: {
-            inputTokens: 0,
-            outputTokens,
-            reasoningTokens: 0,
-            totalTokens: outputTokens,
-          },
+          usage,
         });
       }
       await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
@@ -1308,12 +1344,7 @@ async function autoReattachUntilComplete({
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
         completedAt: new Date().toISOString(),
-        usage: {
-          inputTokens: 0,
-          outputTokens,
-          reasoningTokens: 0,
-          totalTokens: outputTokens,
-        },
+        usage,
         errorMessage: undefined,
         browser: {
           ...browserMetadata,
@@ -1366,6 +1397,9 @@ async function autoReattachUntilComplete({
             config: browserConfig,
             runtime: reattachResult?.runtime ?? runtime,
           },
+          ...(answerReceipt
+            ? { artifacts: mergeArtifacts(sessionMeta.artifacts, [answerReceipt.artifact]) }
+            : {}),
           response: { status: "error", incompleteReason: "incomplete-capture" },
           error: { category: "internal", message },
         });
@@ -1377,7 +1411,9 @@ async function autoReattachUntilComplete({
             });
           }
         } finally {
-          await reattachResult?.abandon().catch(() => undefined);
+          if (!answerReceipt) {
+            await reattachResult?.abandon().catch(() => undefined);
+          }
         }
         throw error;
       }

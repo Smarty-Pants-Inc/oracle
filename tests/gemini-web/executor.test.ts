@@ -15,18 +15,32 @@ const {
   cleanupStaleProfileState,
   verifyDevToolsReachable,
   delay,
+  captureProfileDirectoryIdentity,
+  acquireManualChromeOwner,
+  acquireBrowserTabLease,
 } = vi.hoisted(() => ({
   launchChrome: vi.fn(),
   connectWithNewTab: vi.fn(),
-  closeTab: vi.fn(async () => undefined),
-  killChrome: vi.fn(async () => undefined),
+  closeTab: vi.fn(async () => true),
+  killChrome: vi.fn(async () => ({ status: "stopped" as const, pid: 12345 })),
   resolveBrowserConfig: vi.fn((input: unknown) => input),
   readDevToolsPort: vi.fn(async () => null),
   writeDevToolsActivePort: vi.fn(async () => undefined),
   writeChromePid: vi.fn(async () => undefined),
-  cleanupStaleProfileState: vi.fn(async () => undefined),
+  cleanupStaleProfileState: vi.fn(async () => true),
   verifyDevToolsReachable: vi.fn(async () => ({ ok: false, error: "unreachable" })),
   delay: vi.fn(async () => undefined),
+  captureProfileDirectoryIdentity: vi.fn(
+    async (profileDir: string, _options?: { create?: boolean }) => ({
+      version: 1 as const,
+      platform: process.platform,
+      canonicalPath: profileDir,
+      device: "test-device",
+      inode: "test-inode",
+    }),
+  ),
+  acquireManualChromeOwner: vi.fn(),
+  acquireBrowserTabLease: vi.fn(),
 }));
 
 const runGeminiWebWithFallback = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({
@@ -81,11 +95,25 @@ vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
 }));
 vi.mock("../../src/browser/profileState.js", () => ({
+  captureProfileDirectoryIdentity,
+  cleanupStaleProfileState,
+  isSafeChromeTerminationOutcome: (outcome: { status?: string }) =>
+    outcome.status === "stopped" || outcome.status === "already-stopped",
   readDevToolsPort,
   writeDevToolsActivePort,
   writeChromePid,
-  cleanupStaleProfileState,
   verifyDevToolsReachable,
+}));
+vi.mock("../../src/browser/manualChromeOwner.js", () => ({
+  acquireManualChromeOwner,
+}));
+vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
+  DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
+  normalizeMaxConcurrentTabs: (value: unknown) => {
+    const numeric = typeof value === "string" ? Number.parseInt(value, 10) : Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 3;
+  },
+  acquireBrowserTabLease,
 }));
 vi.mock("../../src/browser/utils.js", () => ({
   delay,
@@ -128,12 +156,43 @@ describe("gemini-web executor", () => {
     verifyDevToolsReachable.mockReset();
     delay.mockClear();
     killChrome.mockClear();
+    captureProfileDirectoryIdentity.mockClear();
+    acquireManualChromeOwner.mockReset();
+    acquireBrowserTabLease.mockReset();
 
     launchChrome.mockResolvedValue({
       port: 9222,
       pid: 12345,
+      host: "127.0.0.1",
       kill: killChrome,
     });
+    acquireManualChromeOwner.mockImplementation(async (profileDir: string, config, logger) => {
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir, { create: true });
+      const chrome = await launchChrome(config, profileDir, logger);
+      const processIdentity = {
+        pid: chrome.pid,
+        processStartTime: "2026-08-04T00:00:00.000Z",
+        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        normalizedUserDataDir: profileDirectory.canonicalPath,
+        launchNonce: "executor-test-owner",
+        profileDirectory,
+      };
+      return {
+        chrome: { ...chrome, processIdentity },
+        processIdentity,
+        source: "launched" as const,
+      };
+    });
+    acquireBrowserTabLease.mockImplementation(async (profileDir: string) => ({
+      id: "lease-1",
+      profileDirectory: await captureProfileDirectoryIdentity(profileDir, { create: true }),
+      update: vi.fn(async () => undefined),
+      release: vi.fn(
+        async (options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> }) => {
+          await options?.onRelease?.({ isLastLease: true });
+        },
+      ),
+    }));
     const runtimeEvaluate = vi.fn(async ({ expression }: { expression?: string }) => {
       const source = String(expression ?? "");
       if (source.includes("requiresLogin")) {
@@ -393,7 +452,7 @@ describe("gemini-web executor", () => {
       log: () => {},
     });
 
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(closeTab).toHaveBeenCalledWith(9222, "target-1", expect.any(Function), "127.0.0.1");
     expect(killChrome).not.toHaveBeenCalled();
   });
 });

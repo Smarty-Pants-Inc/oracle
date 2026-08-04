@@ -8,6 +8,8 @@ import {
   type BrowserChrome,
 } from "../../src/browser/manualChromeOwner.js";
 import {
+  acquireProfileRunLock,
+  captureProfileDirectoryIdentity,
   readChromePid,
   readChromeProcessIdentity,
   readDevToolsPort,
@@ -31,25 +33,28 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function chromeIdentity(
+async function chromeIdentity(
   profileDir: string,
   pid: number,
   launchNonce: string,
-): ChromeProcessIdentity {
+): Promise<ChromeProcessIdentity> {
   const executablePath =
     process.platform === "win32"
       ? "c:\\program files\\google\\chrome\\application\\chrome.exe"
       : process.platform === "darwin"
         ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         : "/usr/bin/google-chrome";
-  const resolvedProfileDir = path.resolve(profileDir);
+  const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
   return {
     pid,
     processStartTime: "2026-08-04T12:00:00.000Z",
     executablePath,
     normalizedUserDataDir:
-      process.platform === "win32" ? resolvedProfileDir.toLowerCase() : resolvedProfileDir,
+      process.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
     launchNonce,
+    profileDirectory,
   };
 }
 
@@ -62,7 +67,7 @@ function launchedChrome(
     pid,
     port,
     processIdentity,
-    kill: vi.fn(async () => undefined),
+    kill: vi.fn(async () => ({ status: "stopped", pid, signal: "SIGTERM" }) as const),
     process: undefined,
   } as unknown as BrowserChrome;
 }
@@ -96,7 +101,7 @@ describe("manual Chrome owner acquisition", () => {
 
       const canonicalPid = 43_210;
       const canonicalPort = 45_678;
-      const canonicalIdentity = chromeIdentity(
+      const canonicalIdentity = await chromeIdentity(
         profileDir,
         canonicalPid,
         "00000000-0000-4000-8000-000000000001",
@@ -119,22 +124,15 @@ describe("manual Chrome owner acquisition", () => {
         async (_profileDir: string, identity: ChromeProcessIdentity) =>
           identity.launchNonce === canonicalIdentity.launchNonce,
       );
-      const lockReleased = createDeferred();
-      let lockHeld = false;
-      let lockOrdinal = 0;
-      const acquireProfileLock = vi.fn(async () => {
-        if (lockHeld) await lockReleased.promise;
-        lockHeld = true;
-        lockOrdinal += 1;
-        return {
-          path: path.join(profileDir, "oracle-automation.lock"),
-          lockId: `lock-${lockOrdinal}`,
-          release: async () => {
-            lockHeld = false;
-            lockReleased.resolve();
-          },
-        };
-      });
+      const secondLockAttempted = createDeferred();
+      let lockAttempts = 0;
+      const acquireProfileLock = vi.fn(
+        async (...args: Parameters<typeof acquireProfileRunLock>) => {
+          lockAttempts += 1;
+          if (lockAttempts === 2) secondLockAttempted.resolve();
+          return acquireProfileRunLock(...args);
+        },
+      );
       const deps = {
         acquireProfileLock,
         launch,
@@ -160,6 +158,7 @@ describe("manual Chrome owner acquisition", () => {
         "fallback-recovery",
         deps,
       );
+      await secondLockAttempted.promise;
       allowLaunchToFinish.resolve();
       const [normalOwner, fallbackOwner] = await Promise.all([
         normalOwnerPromise,
@@ -223,7 +222,11 @@ describe("manual Chrome owner acquisition", () => {
       await writeDevToolsActivePort(profileDir, 45_679);
       await writeChromePid(profileDir, 43_211);
       const writePid = vi.fn(writeChromePid);
-      const identity = chromeIdentity(profileDir, 43_211, "00000000-0000-4000-8000-000000000002");
+      const identity = await chromeIdentity(
+        profileDir,
+        43_211,
+        "00000000-0000-4000-8000-000000000002",
+      );
       await writeChromeProcessIdentity(profileDir, identity);
       const launch = vi.fn();
       const discoverExactProfileChrome = vi.fn(async () => ({ pid: 43_211, port: 45_679 }));
@@ -261,7 +264,11 @@ describe("manual Chrome owner acquisition", () => {
   test("repairs provisional identity-only authority without changing its generation", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-provisional-owner-"));
     try {
-      const identity = chromeIdentity(profileDir, 43_212, "00000000-0000-4000-8000-000000000003");
+      const identity = await chromeIdentity(
+        profileDir,
+        43_212,
+        "00000000-0000-4000-8000-000000000003",
+      );
       await writeChromeProcessIdentity(profileDir, identity);
       const captureIdentity = vi.fn();
       const writeIdentity = vi.fn(writeChromeProcessIdentity);
@@ -301,7 +308,11 @@ describe("manual Chrome owner acquisition", () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-rediscovered-owner-"));
     try {
       const writePid = vi.fn(writeChromePid);
-      const identity = chromeIdentity(profileDir, 43_212, "00000000-0000-4000-8000-000000000003");
+      const identity = await chromeIdentity(
+        profileDir,
+        43_212,
+        "00000000-0000-4000-8000-000000000003",
+      );
       const captureIdentity = vi.fn(async () => identity);
       const writeIdentity = vi.fn(writeChromeProcessIdentity);
       const launch = vi.fn();
@@ -359,6 +370,95 @@ describe("manual Chrome owner acquisition", () => {
       ).rejects.toThrow(/exact Chrome process\/profile owner could not be verified/i);
       expect(launch).not.toHaveBeenCalled();
       expect(writePid).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses split-brain launch after the locked profile path is retargeted", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedProfileDir = path.join(root, "moved-profile");
+    await fs.mkdir(profileDir);
+    try {
+      const lockedProfile = await captureProfileDirectoryIdentity(profileDir);
+      const release = vi.fn(async () => undefined);
+      const launch = vi.fn();
+
+      await expect(
+        acquireManualChromeOwner(
+          profileDir,
+          resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
+          logger,
+          "retargeted-profile",
+          {
+            acquireProfileLock: vi.fn(async () => ({
+              path: path.join(lockedProfile.canonicalPath, "oracle-automation.lock"),
+              lockId: "locked-profile-generation",
+              profileDirectory: lockedProfile,
+              release,
+            })),
+            discoverExactProfileChrome: vi.fn(async () => {
+              await fs.rename(profileDir, movedProfileDir);
+              await fs.mkdir(profileDir);
+              return null;
+            }),
+            launch,
+          },
+        ),
+      ).rejects.toThrow(/physical profile authority changed/i);
+      expect(launch).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rolls back a current launch when profile lock release loses authority", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-release-"));
+    try {
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const identity = await chromeIdentity(
+        profileDir,
+        43_213,
+        "00000000-0000-4000-8000-000000000004",
+      );
+      const stableKill = vi.fn(async () => ({
+        status: "stopped" as const,
+        pid: identity.pid,
+        signal: "SIGTERM" as const,
+      }));
+      const chrome = {
+        pid: identity.pid,
+        port: 45_681,
+        processIdentity: identity,
+        kill: stableKill,
+        process: undefined,
+      } as unknown as BrowserChrome;
+      const releaseError = new Error("profile lock authority changed");
+
+      await expect(
+        acquireManualChromeOwner(
+          profileDir,
+          resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
+          logger,
+          "release-authority",
+          {
+            acquireProfileLock: vi.fn(async () => ({
+              path: path.join(profileDirectory.canonicalPath, "oracle-automation.lock"),
+              lockId: "release-authority-generation",
+              profileDirectory,
+              release: vi.fn(async () => {
+                throw releaseError;
+              }),
+            })),
+            discoverExactProfileChrome: vi.fn(async () => null),
+            launch: vi.fn(async () => chrome),
+            verifyIdentity: vi.fn(async () => true),
+          },
+        ),
+      ).rejects.toBe(releaseError);
+      expect(stableKill).toHaveBeenCalledOnce();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }

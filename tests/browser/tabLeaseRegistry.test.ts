@@ -1,7 +1,8 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readProcessStartIdentity } from "../../src/browser/filesystemLock.js";
 import {
   acquireBrowserTabLease,
   hasOtherActiveBrowserTabLeases,
@@ -254,6 +255,29 @@ describe("tabLeaseRegistry", () => {
     }
   });
 
+  test("does not repeat final-lease cleanup when the same lease is released twice", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      const cleanup = vi.fn(async () => undefined);
+
+      await lease.release({
+        onRelease: async ({ isLastLease }) => {
+          if (isLastLease) await cleanup();
+        },
+      });
+      await lease.release({
+        onRelease: async ({ isLastLease }) => {
+          if (isLastLease) await cleanup();
+        },
+      });
+
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("blocks a new lease until final-lease cleanup completes", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
     try {
@@ -261,33 +285,50 @@ describe("tabLeaseRegistry", () => {
         maxConcurrentTabs: 3,
         timeoutMs: 500,
       });
+      let markCleanupStarted!: () => void;
+      const cleanupStarted = new Promise<void>((resolve) => {
+        markCleanupStarted = resolve;
+      });
       let finishCleanup!: () => void;
-      const cleanupStarted = new Promise<void>((resolveStarted) => {
-        void current.release({
-          onRelease: async ({ isLastLease }) => {
-            expect(isLastLease).toBe(true);
-            resolveStarted();
-            await new Promise<void>((resolveCleanup) => {
-              finishCleanup = resolveCleanup;
-            });
-          },
-        });
+      const cleanupFinished = new Promise<void>((resolve) => {
+        finishCleanup = resolve;
+      });
+      const releasePromise = current.release({
+        onRelease: async ({ isLastLease }) => {
+          expect(isLastLease).toBe(true);
+          markCleanupStarted();
+          await cleanupFinished;
+        },
       });
       await cleanupStarted;
 
       let acquired = false;
-      const nextPromise = acquireBrowserTabLease(dir, {
-        maxConcurrentTabs: 3,
-        pollMs: 25,
-        timeoutMs: 1000,
-      }).then((lease) => {
+      let markNextAttempted!: () => void;
+      const nextAttempted = new Promise<void>((resolve) => {
+        markNextAttempted = resolve;
+      });
+      const nextPromise = acquireBrowserTabLease(
+        dir,
+        {
+          maxConcurrentTabs: 3,
+          pollMs: 25,
+          timeoutMs: 1000,
+        },
+        {
+          readProcessStartIdentity: async (pid) => {
+            markNextAttempted();
+            return readProcessStartIdentity(pid);
+          },
+        },
+      ).then((lease) => {
         acquired = true;
         return lease;
       });
-      await new Promise((resolve) => setTimeout(resolve, 75));
+      await nextAttempted;
       expect(acquired).toBe(false);
 
       finishCleanup();
+      await releasePromise;
       const next = await nextPromise;
       expect(acquired).toBe(true);
       await next.release();
@@ -399,6 +440,50 @@ describe("tabLeaseRegistry", () => {
     } finally {
       await rm(missingDir, { recursive: true, force: true });
       await rm(malformedDir, { recursive: true, force: true });
+    }
+  });
+
+  test("never updates or releases a lease through a retargeted profile path", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-lease-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedProfileDir = path.join(root, "moved-profile");
+    await mkdir(profileDir);
+    try {
+      const lease = await acquireBrowserTabLease(profileDir, {
+        timeoutMs: 500,
+        sessionId: "physical-profile-generation",
+      });
+      await rename(profileDir, movedProfileDir);
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "replacement-marker"), "keep", "utf8");
+      const onRelease = vi.fn(async () => undefined);
+
+      await expect(lease.update({ chromeTargetId: "must-not-write" })).rejects.toThrow(
+        /physical browser profile changed/i,
+      );
+      await expect(lease.release({ onRelease })).rejects.toThrow(
+        /physical browser profile changed/i,
+      );
+      await expect(
+        hasOtherActiveBrowserTabLeases(profileDir, lease.id, {
+          expectedProfileIdentity: lease.profileDirectory,
+        }),
+      ).rejects.toThrow(/physical browser profile changed/i);
+      expect(onRelease).not.toHaveBeenCalled();
+      await expect(
+        readFile(path.join(profileDir, "oracle-tab-leases.json"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      const movedRegistry = JSON.parse(
+        await readFile(path.join(movedProfileDir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ id: string; chromeTargetId?: string }> };
+      expect(movedRegistry.leases).toHaveLength(1);
+      expect(movedRegistry.leases[0]?.id).toBe(lease.id);
+      expect(movedRegistry.leases[0]).not.toHaveProperty("chromeTargetId");
+      await expect(readFile(path.join(profileDir, "replacement-marker"), "utf8")).resolves.toBe(
+        "keep",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

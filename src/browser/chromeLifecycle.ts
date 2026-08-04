@@ -1,4 +1,3 @@
-import { rm } from "node:fs/promises";
 import net from "node:net";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -7,25 +6,52 @@ import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
   captureChromeProcessIdentity,
+  captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
-  terminateRecordedChromeForProfile,
+  isSafeChromeTerminationOutcome,
+  removeProfileDirectoryIfIdentityMatches,
+  sameProfileDirectoryIdentity,
   writeChromeProcessIdentity,
   type ChromeProcessIdentity,
+  type ProfileDirectoryIdentity,
+  type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
 import { delay } from "./utils.js";
 import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
 
-export type ChromeLaunchResult = Omit<LaunchedChrome, "kill"> & {
-  kill: () => Promise<void>;
-  host?: string;
-  processIdentity: ChromeProcessIdentity;
-};
-type CapturedChromeLaunch = LaunchedChrome & {
-  host?: string;
-  processIdentity: ChromeProcessIdentity;
-};
+export type ChromeStableKill = () => Promise<RecordedChromeTerminationOutcome>;
+
+export interface StableChromeProcessHandle {
+  readonly pid?: number;
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  kill(signal: NodeJS.Signals): boolean;
+  once(event: "exit", listener: () => void): unknown;
+  removeListener(event: "exit", listener: () => void): unknown;
+  unref?(): void;
+}
+
+export interface ChromeLaunchResult {
+  readonly pid: number;
+  readonly port: number;
+  readonly process?: StableChromeProcessHandle;
+  readonly remoteDebuggingPipes: LaunchedChrome["remoteDebuggingPipes"];
+  readonly host?: string;
+  readonly kill: ChromeStableKill;
+  readonly processIdentity: ChromeProcessIdentity;
+}
+
+interface StableChromeLauncher {
+  readonly pid?: number;
+  readonly port: number;
+  readonly process?: StableChromeProcessHandle;
+  readonly remoteDebuggingPipes: LaunchedChrome["remoteDebuggingPipes"];
+  readonly kill: ChromeStableKill;
+  readonly host?: string;
+  readonly processIdentity?: ChromeProcessIdentity;
+}
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
@@ -34,8 +60,8 @@ export interface ChromeLaunchDeps {
   hiddenMacLaunch?: typeof launchHiddenMacChrome;
   resolveLaunchRoute?: typeof resolveWslChromeLaunchRoute;
   captureProcessIdentity?: typeof captureChromeProcessIdentity;
+  captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
   writeProcessIdentity?: typeof writeChromeProcessIdentity;
-  terminateRecordedProcess?: typeof terminateRecordedChromeForProfile;
 }
 
 export async function launchChrome(
@@ -47,16 +73,17 @@ export async function launchChrome(
   const { connectHost, debugBindAddress, usePatchedLauncher } = (
     deps.resolveLaunchRoute ?? resolveWslChromeLaunchRoute
   )();
+  const profileDirectory = await (deps.captureProfileIdentity ?? captureProfileDirectoryIdentity)(
+    userDataDir,
+    { create: true },
+  );
+  const launchUserDataDir = profileDirectory.canonicalPath;
   const debugPort = config.debugPort ?? parseDebugPortEnv();
   const chromeFlags = buildChromeFlags(
     config.headless ?? false,
     debugBindAddress,
     config.hideWindow ?? false,
   );
-  // copy-profile reuses a copied signed-in profile whose cookies are
-  // Keychain-encrypted, so it must launch with the real Keychain (not mocked):
-  // strip the keychain-mocking flags from both chrome-launcher's defaults and
-  // Oracle's set, and ignore the defaults so they aren't re-added.
   const usingCopiedProfile = Boolean(config.copyProfileSource);
   if (usingCopiedProfile && config.chromeProfile) {
     chromeFlags.push(`--profile-directory=${config.chromeProfile}`);
@@ -70,70 +97,104 @@ export async function launchChrome(
     );
   }
 
-  let launcher: LaunchedChrome & { host?: string };
-  let processIdentity: ChromeProcessIdentity | undefined;
+  let launcher: StableChromeLauncher;
   if (hiddenHeadfulLaunch) {
-    const hiddenLauncher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
+    launcher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
       chromeFlags: launchOptions.chromeFlags,
       chromePath: config.chromePath ?? undefined,
-      userDataDir,
+      userDataDir: launchUserDataDir,
       requestedPort: debugPort ?? undefined,
       ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
       captureProcessIdentity: deps.captureProcessIdentity ?? captureChromeProcessIdentity,
-    });
-    launcher = hiddenLauncher;
-    processIdentity = hiddenLauncher.processIdentity;
-  } else if (usePatchedLauncher) {
-    launcher = await (deps.customHostLaunch ?? launchWithCustomHost)({
-      chromeFlags: launchOptions.chromeFlags,
-      chromePath: config.chromePath ?? undefined,
-      userDataDir,
-      host: connectHost ?? "127.0.0.1",
-      requestedPort: debugPort ?? undefined,
-      ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+      expectedProfileDirectory: profileDirectory,
     });
   } else {
-    launcher = Object.assign(
-      await (deps.standardLaunch ?? launch)({
-        chromePath: config.chromePath ?? undefined,
-        chromeFlags: launchOptions.chromeFlags,
-        userDataDir,
-        handleSIGINT: false,
-        port: debugPort ?? undefined,
-        ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
-      }),
-      { host: "127.0.0.1" },
-    );
+    const launched = usePatchedLauncher
+      ? await (deps.customHostLaunch ?? launchWithCustomHost)({
+          chromeFlags: launchOptions.chromeFlags,
+          chromePath: config.chromePath ?? undefined,
+          userDataDir: launchUserDataDir,
+          host: connectHost ?? "127.0.0.1",
+          requestedPort: debugPort ?? undefined,
+          ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+        })
+      : Object.assign(
+          await (deps.standardLaunch ?? launch)({
+            chromePath: config.chromePath ?? undefined,
+            chromeFlags: launchOptions.chromeFlags,
+            userDataDir: launchUserDataDir,
+            handleSIGINT: false,
+            port: debugPort ?? undefined,
+            ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+          }),
+          { host: "127.0.0.1" },
+        );
+    if (!launched.process) {
+      throw new Error(
+        `Launched Chrome for ${launchUserDataDir} did not expose a retained process handle; refusing PID-based lifecycle authority.`,
+      );
+    }
+    const retainedProcess = retainChromeChildProcess(launched.process);
+    launcher = {
+      pid: launched.pid,
+      port: launched.port,
+      process: retainedProcess,
+      remoteDebuggingPipes: launched.remoteDebuggingPipes,
+      host: launched.host,
+      kill: createStableChildProcessChromeKill(retainedProcess),
+    };
   }
-  processIdentity ??= await captureLaunchedChromeProcessIdentity(
-    userDataDir,
-    launcher,
-    deps.captureProcessIdentity ?? captureChromeProcessIdentity,
-  );
+
+  const processIdentity =
+    launcher.processIdentity ??
+    (await captureLaunchedChromeProcessIdentity(
+      launchUserDataDir,
+      launcher,
+      profileDirectory,
+      deps.captureProcessIdentity ?? captureChromeProcessIdentity,
+    ));
+  if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, profileDirectory)) {
+    const mismatch = new Error(
+      `Physical Chrome profile authority changed during launch: ${launchUserDataDir}`,
+    );
+    const rollback = await launcher.kill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
+      throw new AggregateError(
+        [mismatch, new Error(rollback.reason)],
+        `Chrome profile authority changed during launch, and safe rollback was unavailable.`,
+      );
+    }
+    throw mismatch;
+  }
   const kill = await createProvisionalIdentityBoundChromeKill(
-    userDataDir,
+    launchUserDataDir,
     processIdentity,
-    launcher.kill.bind(launcher),
-    {
-      writeIdentity: deps.writeProcessIdentity,
-      terminate: deps.terminateRecordedProcess,
-    },
+    launcher.kill,
+    { writeIdentity: deps.writeProcessIdentity },
   );
-  const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
+  if (typeof launcher.pid !== "number") {
+    throw new Error(`Launched Chrome for ${launchUserDataDir} did not retain a process id.`);
+  }
+  const pidLabel = ` (pid ${launcher.pid})`;
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
   logger(
     `${hiddenHeadfulLaunch ? "Launched hidden background Chrome" : "Launched Chrome"}${pidLabel} on port ${launcher.port}${hostLabel}`,
   );
-  return Object.assign(launcher, {
+  return {
+    pid: launcher.pid,
+    port: launcher.port,
+    process: launcher.process,
+    remoteDebuggingPipes: launcher.remoteDebuggingPipes,
     host: connectHost ?? "127.0.0.1",
     processIdentity,
     kill,
-  }) as ChromeLaunchResult;
+  };
 }
 
 async function captureLaunchedChromeProcessIdentity(
   userDataDir: string,
-  launcher: LaunchedChrome,
+  launcher: StableChromeLauncher,
+  expectedProfileDirectory: ProfileDirectoryIdentity,
   capture: typeof captureChromeProcessIdentity,
 ): Promise<ChromeProcessIdentity> {
   const pid = launcher.pid;
@@ -141,25 +202,27 @@ async function captureLaunchedChromeProcessIdentity(
     const identityError = new Error(
       `Launched Chrome for ${userDataDir} did not report a valid process id.`,
     );
-    try {
-      await launcher.kill();
-    } catch (rollbackError) {
+    const rollback = await launcher.kill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
       throw new AggregateError(
-        [identityError, rollbackError],
-        `Launched Chrome for ${userDataDir} did not report a valid process id, and launch rollback also failed.`,
+        [identityError, new Error(rollback.reason)],
+        `Launched Chrome did not report a valid process id, and safe launch rollback was unavailable.`,
       );
     }
     throw identityError;
   }
   try {
-    return await capture(userDataDir, pid);
+    const identity = await capture(userDataDir, pid);
+    if (!sameProfileDirectoryIdentity(identity.profileDirectory, expectedProfileDirectory)) {
+      throw new Error(`Physical profile authority changed while capturing Chrome identity.`);
+    }
+    return identity;
   } catch (error) {
-    try {
-      await launcher.kill();
-    } catch (rollbackError) {
+    const rollback = await launcher.kill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
       throw new AggregateError(
-        [error, rollbackError],
-        `Failed to capture Chrome process identity for ${userDataDir}, and launch rollback also failed.`,
+        [error, new Error(rollback.reason)],
+        `Failed to capture Chrome process identity, and safe launch rollback was unavailable.`,
       );
     }
     throw new Error(`Failed to capture Chrome process identity for ${userDataDir}.`, {
@@ -168,41 +231,124 @@ async function captureLaunchedChromeProcessIdentity(
   }
 }
 
-export function createIdentityBoundChromeKill(
-  userDataDir: string,
-  processIdentity: ChromeProcessIdentity,
-  terminate: typeof terminateRecordedChromeForProfile = terminateRecordedChromeForProfile,
-): () => Promise<void> {
-  return async () => {
-    await terminate(userDataDir, processIdentity);
-  };
-}
-
 export async function createProvisionalIdentityBoundChromeKill(
   userDataDir: string,
   processIdentity: ChromeProcessIdentity,
-  rollbackKill: () => void | Promise<void>,
-  deps: {
-    writeIdentity?: typeof writeChromeProcessIdentity;
-    terminate?: typeof terminateRecordedChromeForProfile;
-  } = {},
-): Promise<() => Promise<void>> {
+  stableKill: ChromeStableKill,
+  deps: { writeIdentity?: typeof writeChromeProcessIdentity } = {},
+): Promise<ChromeStableKill> {
   try {
     await (deps.writeIdentity ?? writeChromeProcessIdentity)(userDataDir, processIdentity);
   } catch (error) {
-    try {
-      await rollbackKill();
-    } catch (rollbackError) {
+    const rollback = await stableKill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
       throw new AggregateError(
-        [error, rollbackError],
-        `Failed to persist Chrome process identity for ${userDataDir}, and launch rollback also failed.`,
+        [error, new Error(rollback.reason)],
+        `Failed to persist Chrome process identity, and safe launch rollback was unavailable.`,
       );
     }
     throw new Error(`Failed to persist Chrome process identity for ${userDataDir}.`, {
       cause: error,
     });
   }
-  return createIdentityBoundChromeKill(userDataDir, processIdentity, deps.terminate);
+  return stableKill;
+}
+
+function retainChromeChildProcess(child: LaunchedChrome["process"]): StableChromeProcessHandle {
+  return {
+    get pid() {
+      return child.pid;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    get signalCode() {
+      return child.signalCode;
+    },
+    kill: (signal) => child.kill(signal),
+    once: (event, listener) => child.once(event, listener),
+    removeListener: (event, listener) => child.removeListener(event, listener),
+    unref: () => child.unref(),
+  };
+}
+
+export function createStableChildProcessChromeKill(
+  child: StableChromeProcessHandle,
+): ChromeStableKill {
+  let pending: Promise<RecordedChromeTerminationOutcome> | undefined;
+  return () => {
+    pending ??= terminateStableChildProcess(child);
+    return pending;
+  };
+}
+
+async function terminateStableChildProcess(
+  child: StableChromeProcessHandle,
+): Promise<RecordedChromeTerminationOutcome> {
+  const pid = child.pid;
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { status: "already-stopped", pid };
+  }
+  if (!pid) {
+    return {
+      status: "unsafe",
+      reason: "Retained Chrome process handle has no stable process id",
+    };
+  }
+  const gracefulExit = waitForChildProcessExit(child, 5_000);
+  try {
+    if (!child.kill("SIGTERM") && child.exitCode === null && child.signalCode === null) {
+      return { status: "unsafe", pid, reason: "Retained Chrome process handle rejected SIGTERM" };
+    }
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (await gracefulExit) return { status: "stopped", pid, signal: "SIGTERM" };
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { status: "stopped", pid, signal: "SIGTERM" };
+  }
+
+  const forcedExit = waitForChildProcessExit(child, 2_000);
+  try {
+    if (!child.kill("SIGKILL") && child.exitCode === null && child.signalCode === null) {
+      return { status: "unsafe", pid, reason: "Retained Chrome process handle rejected SIGKILL" };
+    }
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return (await forcedExit)
+    ? { status: "stopped", pid, signal: "SIGKILL" }
+    : { status: "unsafe", pid, reason: "Chrome did not exit through its retained process handle" };
+}
+
+async function waitForChildProcessExit(
+  child: StableChromeProcessHandle,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  let resolve!: (value: boolean) => void;
+  const promise = new Promise<boolean>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  const onExit = () => {
+    clearTimeout(timeout);
+    resolve(true);
+  };
+  const timeout = setTimeout(() => {
+    child.removeListener("exit", onExit);
+    resolve(child.exitCode !== null || child.signalCode !== null);
+  }, timeoutMs);
+  timeout.unref();
+  child.once("exit", onExit);
+  return await promise;
 }
 
 export async function positionChromeWindowOffscreen(
@@ -227,7 +373,7 @@ export async function positionChromeWindowOffscreen(
 }
 
 export function registerTerminationHooks(
-  chrome: LaunchedChrome,
+  chrome: ChromeLaunchResult,
   userDataDir: string,
   keepBrowser: boolean,
   logger: BrowserLogger,
@@ -238,21 +384,17 @@ export function registerTerminationHooks(
     emitRuntimeHint?: () => Promise<void>;
     /** Preserve the profile directory even when Chrome is terminated. */
     preserveUserDataDir?: boolean;
-    /**
-     * Always terminate Chrome and delete `userDataDir` on signal, even when the run is
-     * in-flight — for throwaway copied profiles (`--copy-profile`) that must not be left
-     * on disk. Overrides the in-flight "leave running" behavior.
-     */
+    /** Terminate Chrome and remove a throwaway copied profile even while in flight. */
     forceProfileCleanup?: boolean;
+    /** Test/embedding hook invoked after signal cleanup settles and before process exit. */
+    onSignalHandled?: () => void;
   },
 ): () => void {
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGQUIT"];
   let handling: boolean | undefined;
 
   const handleSignal = (signal: NodeJS.Signals) => {
-    if (handling) {
-      return;
-    }
+    if (handling) return;
     handling = true;
     const inFlight = opts?.isInFlight?.() ?? false;
     const forceCleanup = opts?.forceProfileCleanup ?? false;
@@ -270,47 +412,51 @@ export function registerTerminationHooks(
     }
     void (async () => {
       if (leaveRunning) {
-        // Ensure reattach hints are written before we exit.
         await opts?.emitRuntimeHint?.().catch(() => undefined);
         if (inFlight) {
           logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
         }
-      } else {
-        try {
-          await chrome.kill();
-        } catch {
-          // ignore kill failures
-        }
-        if (opts?.preserveUserDataDir) {
-          // Preserve the profile directory (manual login), but clear reattach hints so we don't
-          // try to reuse a dead DevTools port on the next run.
-          await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(
-            () => undefined,
-          );
-        } else {
-          await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
-        }
+        return;
       }
+
+      const termination = await chrome.kill().catch(
+        (error: unknown): RecordedChromeTerminationOutcome => ({
+          status: "unsafe",
+          pid: chrome.pid,
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        logger(
+          `Chrome termination was not authoritative; preserving profile and cleanup authority: ${termination.reason}`,
+        );
+        return;
+      }
+      if (opts?.preserveUserDataDir) {
+        const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
+          lockRemovalMode: "never",
+          expectedProfileIdentity: chrome.processIdentity.profileDirectory,
+        }).catch(() => false);
+        if (!cleaned) logger(`Preserved profile state because physical cleanup was not confirmed.`);
+        return;
+      }
+      const removed = await removeProfileDirectoryIfIdentityMatches(
+        userDataDir,
+        chrome.processIdentity.profileDirectory,
+      ).catch(() => false);
+      if (!removed) logger(`Preserved profile because its physical cleanup authority changed.`);
     })().finally(() => {
+      opts?.onSignalHandled?.();
       const exitCode = signal === "SIGINT" ? 130 : 1;
-      // Vitest treats any `process.exit()` call as an unhandled failure, even if mocked.
-      // Keep production behavior (hard-exit on signals) while letting tests observe state changes.
       process.exitCode = exitCode;
       const isTestRun = process.env.VITEST === "1" || process.env.NODE_ENV === "test";
-      if (!isTestRun) {
-        process.exit(exitCode);
-      }
+      if (!isTestRun) process.exit(exitCode);
     });
   };
 
-  for (const signal of signals) {
-    process.on(signal, handleSignal);
-  }
-
+  for (const signal of signals) process.on(signal, handleSignal);
   return () => {
-    for (const signal of signals) {
-      process.removeListener(signal, handleSignal);
-    }
+    for (const signal of signals) process.removeListener(signal, handleSignal);
   };
 }
 
@@ -609,11 +755,15 @@ function createSessionBoundChromeClient(browser: ChromeClient, sessionId: string
     removeListener: (event: string, listener: (...args: unknown[]) => void) => void;
   };
   const bindDomain = <T extends object>(domainName: string): T => {
-    const domain = (browser as unknown as Record<string, Record<string, unknown>>)[domainName] as
-      | Record<string, unknown>
-      | undefined;
+    const candidate: unknown = browser;
+    const domain =
+      candidate && typeof candidate === "object"
+        ? (candidate as Record<string, unknown>)[domainName]
+        : undefined;
+    const domainRecord =
+      domain && typeof domain === "object" ? (domain as Record<string, unknown>) : undefined;
     const eventName = (name: string) => `${domainName}.${name}.${sessionId}`;
-    return new Proxy((domain ?? {}) as T, {
+    return new Proxy((domainRecord ?? {}) as T, {
       get(target, prop, receiver) {
         if (prop === "on") {
           return (name: string, listener: (...args: unknown[]) => void) => {
@@ -965,6 +1115,7 @@ async function launchHiddenMacChrome({
   requestedPort,
   ignoreDefaultFlags,
   captureProcessIdentity,
+  expectedProfileDirectory,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
@@ -972,7 +1123,8 @@ async function launchHiddenMacChrome({
   requestedPort?: number;
   ignoreDefaultFlags?: boolean;
   captureProcessIdentity: typeof captureChromeProcessIdentity;
-}): Promise<CapturedChromeLaunch> {
+  expectedProfileDirectory: ProfileDirectoryIdentity;
+}): Promise<StableChromeLauncher> {
   const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
   if (!resolvedChromePath) {
     throw new Error("Chrome is not installed.");
@@ -992,35 +1144,83 @@ async function launchHiddenMacChrome({
     buildHiddenMacChromeOpenArgs(resolvedChromePath, chromeArgs),
   );
   await waitForDebugPort(port);
+  const control = await retainExactChromeControlChannel("127.0.0.1", port);
   const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
   if (!discovered || discovered.port !== port) {
-    throw new Error(
+    const launchError = new Error(
       `Hidden Chrome started on port ${port}, but its process could not be identified.`,
     );
+    const rollback = await control.kill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
+      throw new AggregateError([launchError, new Error(rollback.reason)], launchError.message);
+    }
+    throw launchError;
   }
-  const provisionalLauncher = {
+  control.setPid(discovered.pid);
+  const provisionalLauncher: StableChromeLauncher = {
     pid: discovered.pid,
     port,
     process: undefined,
     remoteDebuggingPipes: null,
-    kill: async () => {
-      try {
-        process.kill(discovered.pid, "SIGTERM");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-    },
+    kill: control.kill,
     host: "127.0.0.1",
-  } as unknown as LaunchedChrome & { host?: string };
+  };
   const processIdentity = await captureLaunchedChromeProcessIdentity(
     userDataDir,
     provisionalLauncher,
+    expectedProfileDirectory,
     captureProcessIdentity,
   );
+  return { ...provisionalLauncher, processIdentity };
+}
+
+async function retainExactChromeControlChannel(
+  host: string,
+  port: number,
+): Promise<{ kill: ChromeStableKill; setPid: (pid: number) => void }> {
+  const response = await fetch(`http://${host}:${port}/json/version`);
+  if (!response.ok) {
+    throw new Error(`Chrome control-channel discovery failed with HTTP ${response.status}`);
+  }
+  const payload = (await response.json()) as { webSocketDebuggerUrl?: unknown };
+  if (typeof payload.webSocketDebuggerUrl !== "string") {
+    throw new Error("Chrome did not expose an exact browser control channel");
+  }
+  const endpoint = new URL(payload.webSocketDebuggerUrl);
+  if (
+    endpoint.protocol !== "ws:" ||
+    endpoint.hostname !== host ||
+    Number.parseInt(endpoint.port, 10) !== port ||
+    !/^\/devtools\/browser\/[^/]+$/u.test(endpoint.pathname)
+  ) {
+    throw new Error("Chrome returned an invalid exact browser control channel");
+  }
+  const client = (await CDP({ target: endpoint.toString(), local: true })) as ChromeClient;
+  await client.Browser.getVersion();
+  let pid: number | undefined;
+  let pending: Promise<RecordedChromeTerminationOutcome> | undefined;
+  const kill: ChromeStableKill = () => {
+    pending ??= (async () => {
+      try {
+        await client.Browser.close();
+        await client.close().catch(() => undefined);
+        return { status: "stopped", pid, signal: "CONTROL_CHANNEL" };
+      } catch (error) {
+        return {
+          status: "unsafe",
+          pid,
+          reason: `Exact Chrome control channel failed: ${error instanceof Error ? error.message : error}`,
+        };
+      }
+    })();
+    return pending;
+  };
   return {
-    ...provisionalLauncher,
-    processIdentity,
-  } as CapturedChromeLaunch;
+    kill,
+    setPid: (value) => {
+      pid = value;
+    },
+  };
 }
 
 async function reserveLoopbackPort(): Promise<number> {
@@ -1176,43 +1376,45 @@ async function launchWithCustomHost({
   });
 
   if (host) {
-    const patched = launcher as unknown as { isDebuggerReady?: () => Promise<void>; port?: number };
-    patched.isDebuggerReady = function patchedIsDebuggerReady(
-      this: Launcher & { port?: number },
-    ): Promise<void> {
-      const debugPort = this.port ?? 0;
-      if (!debugPort) {
-        return Promise.reject(new Error("Missing Chrome debug port"));
-      }
-      return new Promise((resolve, reject) => {
-        const client = net.createConnection({ port: debugPort, host });
-        const cleanup = () => {
-          client.removeAllListeners();
-          client.end();
-          client.destroy();
-          client.unref();
-        };
-        client.once("error", (err) => {
-          cleanup();
-          reject(err);
+    Object.defineProperty(launcher, "isDebuggerReady", {
+      configurable: true,
+      value: function isDebuggerReady(this: Pick<Launcher, "port">): Promise<void> {
+        const debugPort = this.port ?? 0;
+        if (!debugPort) {
+          return Promise.reject(new Error("Missing Chrome debug port"));
+        }
+        return new Promise((resolve, reject) => {
+          const client = net.createConnection({ port: debugPort, host });
+          const cleanup = () => {
+            client.removeAllListeners();
+            client.end();
+            client.destroy();
+            client.unref();
+          };
+          client.once("error", (error) => {
+            cleanup();
+            reject(error);
+          });
+          client.once("connect", () => {
+            cleanup();
+            resolve();
+          });
         });
-        client.once("connect", () => {
-          cleanup();
-          resolve();
-        });
-      });
-    };
+      },
+    });
   }
 
   await launcher.launch();
-
-  const kill = async () => launcher.kill();
+  const { chromeProcess, pid, port, remoteDebuggingPipes } = launcher;
+  if (!chromeProcess || typeof pid !== "number" || typeof port !== "number") {
+    throw new Error("Chrome launcher did not retain a process and debug port.");
+  }
   return {
-    pid: launcher.pid ?? undefined,
-    port: launcher.port ?? 0,
-    process: launcher.chromeProcess as unknown as NonNullable<LaunchedChrome["process"]>,
-    kill,
+    pid,
+    port,
+    process: chromeProcess,
+    kill: () => launcher.kill(),
     host: host ?? undefined,
-    remoteDebuggingPipes: launcher.remoteDebuggingPipes,
-  } as unknown as LaunchedChrome & { host?: string };
+    remoteDebuggingPipes,
+  };
 }

@@ -103,6 +103,13 @@ export interface BrowserRecoveryCleanupResultMetadata {
   error?: string;
 }
 
+export interface BrowserRemoteRecoveryMetadata {
+  protocolVersion: number;
+  host: string;
+  transactionToken: string;
+  state: "pending" | "recoverable-error";
+}
+
 export interface BrowserRecoveryCleanupResourceMetadata {
   chromePid?: number;
   chromeProcessIdentity?: ChromeProcessIdentity;
@@ -112,6 +119,9 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
+  conversationId?: string;
+  promptEpoch?: BrowserPromptEpoch;
+  remoteRecovery?: BrowserRemoteRecoveryMetadata;
   recoveryCleanup: BrowserRecoveryCleanupMetadata;
 }
 
@@ -159,6 +169,8 @@ export interface BrowserRuntimeMetadata {
   recoveryCleanupResult?: BrowserRecoveryCleanupResultMetadata;
   /** Earlier cleanup authorities retained when fallback recovery launches another Chrome. */
   recoveryCleanupBacklog?: BrowserRecoveryCleanupResourceMetadata[];
+  /** Opaque transaction authority; the remote service credential is resolved separately. */
+  remoteRecovery?: BrowserRemoteRecoveryMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }
@@ -473,15 +485,30 @@ async function writeSessionMetadataFile(
   metadata: SessionMetadata,
 ): Promise<void> {
   const targetPath = metaPath(sessionId);
+  const directory = path.dirname(targetPath);
   const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    const handle = await fs.open(temporaryPath, "wx", 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(metadata, null, 2), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fs.rename(temporaryPath, targetPath);
+    await syncDirectory(directory);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const handle = await fs.open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 

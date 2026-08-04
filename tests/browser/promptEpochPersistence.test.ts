@@ -37,7 +37,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
   let committedRuntime: BrowserRuntimeMetadata | undefined;
   let rejectedResetRuntime: BrowserRuntimeMetadata | undefined;
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
-  const killChrome = vi.fn().mockResolvedValue(undefined);
+  const killChrome = vi.fn().mockResolvedValue({ status: "stopped", pid: 4321, signal: "SIGTERM" });
   const closeConnection = vi.fn().mockResolvedValue(undefined);
   const clearPromptComposer = vi.fn(async () => {
     composerText = "";
@@ -177,8 +177,18 @@ async function runTwoTurnResetFailure(transport: Transport) {
         pid: 4321,
         processStartTime: "epoch-fixture-process-generation",
         executablePath: "/usr/bin/google-chrome",
-        normalizedUserDataDir: path.resolve(userDataDir),
+        normalizedUserDataDir:
+          process.platform === "win32"
+            ? path.resolve(userDataDir).toLowerCase()
+            : path.resolve(userDataDir),
         launchNonce: "22222222-2222-4222-8222-222222222222",
+        profileDirectory: {
+          version: 1,
+          platform: process.platform,
+          canonicalPath: path.resolve(userDataDir),
+          device: "1",
+          inode: "2",
+        },
       },
       kill: killChrome,
     })),

@@ -152,6 +152,79 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("preserves a replacement generation classified after the stale owner was read", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const originalPid = 46_046;
+    const replacementPid = 47_047;
+    let releaseSecondInspection!: () => void;
+    const allowSecondInspection = new Promise<void>((resolve) => {
+      releaseSecondInspection = resolve;
+    });
+    let markSecondInspectionStarted!: () => void;
+    const secondInspectionStarted = new Promise<void>((resolve) => {
+      markSecondInspectionStarted = resolve;
+    });
+
+    try {
+      const original = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          pid: originalPid,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "original-start",
+        },
+      );
+
+      let originalIdentityReads = 0;
+      const racingAcquire = acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          pid: 48_048,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) => {
+            if (pid === originalPid) {
+              originalIdentityReads += 1;
+              if (originalIdentityReads === 2) {
+                markSecondInspectionStarted();
+                await allowSecondInspection;
+              }
+              return "reused-original-pid";
+            }
+            if (pid === replacementPid) return "replacement-start";
+            return "racing-contender-start";
+          },
+        },
+      );
+      await secondInspectionStarted;
+
+      const replacement = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          pid: replacementPid,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) =>
+            pid === originalPid ? "reused-original-pid" : "replacement-start",
+        },
+      );
+      releaseSecondInspection();
+
+      await expect(racingAcquire).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      const observedOwner = JSON.parse(
+        await readFile(path.join(lockPath, "owner.json"), "utf8"),
+      ) as { ownerNonce: string };
+      expect(observedOwner.ownerNonce).toBe(replacement.owner.ownerNonce);
+      await expect(original.release()).rejects.toThrow(/ownership changed/i);
+      await replacement.release();
+    } finally {
+      releaseSecondInspection();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not reclaim a live owner when process-start identity lookup is ambiguous", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");

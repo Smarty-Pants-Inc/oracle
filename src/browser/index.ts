@@ -1,8 +1,7 @@
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import net from "node:net";
-import { createHash, randomUUID } from "node:crypto";
 import { resolveBrowserConfig } from "./config.js";
 import { copyChromeProfile } from "./profileCopy.js";
 import type {
@@ -18,6 +17,7 @@ import type {
 } from "./types.js";
 import {
   launchChrome,
+  type ChromeLaunchResult,
   registerTerminationHooks,
   positionChromeWindowOffscreen,
   connectToRemoteChrome,
@@ -61,14 +61,9 @@ import {
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
-import type {
-  BrowserModelSelectionEvidence,
-  BrowserPromptEpoch,
-  BrowserRuntimeMetadata,
-} from "../sessionStore.js";
+import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
-import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.js";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
@@ -78,6 +73,7 @@ import {
   acquireProfileRunLock,
   isSafeChromeTerminationOutcome,
   terminateRecordedChromeForProfile,
+  removeProfileDirectoryIfIdentityMatches,
   writeChromePid,
   writeChromeProcessIdentity,
 } from "./profileState.js";
@@ -94,7 +90,7 @@ import {
 } from "./artifacts.js";
 import { collectGeneratedImageArtifacts } from "./chatgptImages.js";
 import { collectChatGptFileArtifacts } from "./chatgptFiles.js";
-import { runProviderSubmissionFlow, type PromptCommitEvidence } from "./providerDomFlow.js";
+import { runProviderSubmissionFlow } from "./providerDomFlow.js";
 import type { PromptCommitVerification } from "./actions/promptComposer.js";
 import { chatgptDomProvider } from "./providers/index.js";
 import { resolveAttachRunningConnection } from "./attachRunning.js";
@@ -120,6 +116,12 @@ import {
   extractStableConversationIdFromUrl as extractConversationIdFromUrl,
   isStableConversationUrl as isConversationUrl,
 } from "./conversationUrl.js";
+import {
+  BrowserRunLifecycleController,
+  completedBrowserCaptureCleanup,
+  pendingBrowserCaptureCleanup,
+  type BrowserCaptureSettlementMode,
+} from "./runLifecycle.js";
 
 export type {
   BrowserAutomationConfig,
@@ -193,139 +195,6 @@ function shouldKeepLocalBrowserOpen(options: {
   return options.effectiveKeepBrowser || options.preserveBrowserOnError;
 }
 
-type PromptDispatchState = {
-  status: "idle" | "ambiguous" | "committed";
-  epochId?: string;
-  prompt?: string;
-  promptSha256?: string;
-  baselineTurns?: number;
-  followUpOrdinal?: number;
-  remainingFollowUps?: number;
-  verification?: PromptCommitVerification;
-};
-
-type PromptEpochIdentity = {
-  epochId: string;
-  promptSha256: string;
-};
-
-function resetPromptDispatch(dispatch: PromptDispatchState): void {
-  dispatch.status = "idle";
-  delete dispatch.epochId;
-  delete dispatch.prompt;
-  delete dispatch.promptSha256;
-  delete dispatch.baselineTurns;
-  delete dispatch.followUpOrdinal;
-  delete dispatch.remainingFollowUps;
-  delete dispatch.verification;
-}
-
-function beginPromptDispatch(
-  dispatch: PromptDispatchState,
-  prompt: string,
-  baselineTurns: number,
-  followUpOrdinal: number,
-  remainingFollowUps: number,
-): PromptEpochIdentity {
-  if (
-    !Number.isInteger(baselineTurns) ||
-    baselineTurns < 0 ||
-    !Number.isInteger(followUpOrdinal) ||
-    followUpOrdinal < 0 ||
-    !Number.isInteger(remainingFollowUps) ||
-    remainingFollowUps < 0
-  ) {
-    throw new BrowserAutomationError("Prompt epoch counters must be nonnegative integers.", {
-      stage: "prompt-epoch",
-      code: "prompt-epoch-invalid",
-    });
-  }
-  const normalizedPrompt = prompt
-    .toLowerCase()
-    .replace(/```[^\n]*\n([\s\S]*?)```/g, " $1 ")
-    .replace(/```/g, " ")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-  dispatch.status = "ambiguous";
-  dispatch.epochId = randomUUID();
-  dispatch.prompt = prompt;
-  dispatch.promptSha256 = createHash("sha256").update(normalizedPrompt, "utf8").digest("hex");
-  dispatch.baselineTurns = baselineTurns;
-  dispatch.followUpOrdinal = followUpOrdinal;
-  dispatch.remainingFollowUps = remainingFollowUps;
-  delete dispatch.verification;
-  return { epochId: dispatch.epochId, promptSha256: dispatch.promptSha256 };
-}
-
-function markPromptDispatchCommitted(
-  dispatch: PromptDispatchState,
-  verification: PromptCommitVerification,
-  expected: PromptEpochIdentity,
-): void {
-  if (
-    dispatch.status !== "ambiguous" ||
-    dispatch.epochId !== expected.epochId ||
-    dispatch.promptSha256 !== expected.promptSha256 ||
-    typeof dispatch.baselineTurns !== "number" ||
-    !Number.isInteger(dispatch.baselineTurns) ||
-    dispatch.baselineTurns < 0 ||
-    !Number.isInteger(verification.verifiedUserTurnIndex) ||
-    verification.verifiedUserTurnIndex < dispatch.baselineTurns ||
-    !Number.isInteger(verification.committedTurns) ||
-    verification.committedTurns <= verification.verifiedUserTurnIndex ||
-    typeof verification.conversationId !== "string" ||
-    !verification.conversationId.trim()
-  ) {
-    throw new BrowserAutomationError(
-      "Prompt commit evidence does not belong to the current prompt epoch.",
-      { stage: "prompt-epoch", code: "prompt-epoch-mismatch" },
-    );
-  }
-  dispatch.status = "committed";
-  dispatch.verification = verification;
-}
-
-function currentPromptEpoch(dispatch: PromptDispatchState): BrowserPromptEpoch | undefined {
-  if (
-    dispatch.status === "idle" ||
-    !dispatch.epochId ||
-    !dispatch.promptSha256 ||
-    typeof dispatch.baselineTurns !== "number" ||
-    typeof dispatch.followUpOrdinal !== "number" ||
-    typeof dispatch.remainingFollowUps !== "number"
-  ) {
-    return undefined;
-  }
-  const pending = {
-    status: "pending" as const,
-    epochId: dispatch.epochId,
-    promptSha256: dispatch.promptSha256,
-    baselineTurns: dispatch.baselineTurns,
-    followUpOrdinal: dispatch.followUpOrdinal,
-    remainingFollowUps: dispatch.remainingFollowUps,
-  };
-  if (dispatch.status !== "committed" || !dispatch.verification) {
-    return pending;
-  }
-  return {
-    ...pending,
-    status: "committed",
-    verifiedUserTurnIndex: dispatch.verification.verifiedUserTurnIndex,
-    ...(dispatch.verification.verifiedUserTurnId
-      ? { verifiedUserTurnId: dispatch.verification.verifiedUserTurnId }
-      : {}),
-    ...(dispatch.verification.verifiedUserMessageId
-      ? { verifiedUserMessageId: dispatch.verification.verifiedUserMessageId }
-      : {}),
-    conversationId: dispatch.verification.conversationId,
-  };
-}
-
-function isPromptDispatchCommitted(dispatch: PromptDispatchState): boolean {
-  return currentPromptEpoch(dispatch)?.status === "committed";
-}
-
 type ChromeDisconnectAssessment = {
   liveness: Awaited<ReturnType<typeof probeChromeTargetLiveness>>;
   targetReachable: boolean;
@@ -338,16 +207,12 @@ async function assessChromeDisconnect(options: {
   port: number;
   targetId?: string | null;
   browserWSEndpoint?: string;
-  dispatch: PromptDispatchState;
+  lifecycle: BrowserRunLifecycleController;
   recoveryAllowed: boolean;
   commitTimeoutMs?: number;
   logger: BrowserLogger;
-  recordPromptCommitVerification: (
-    verification: PromptCommitVerification,
-    expected: PromptEpochIdentity,
-  ) => Promise<void>;
 }): Promise<ChromeDisconnectAssessment> {
-  const dispatch = { ...options.dispatch };
+  const dispatch = options.lifecycle.promptDispatch();
   const liveness: Awaited<ReturnType<typeof probeChromeTargetLiveness>> =
     await probeChromeTargetLiveness({
       host: options.host,
@@ -363,15 +228,7 @@ async function assessChromeDisconnect(options: {
   const targetReachable = Boolean(targetId) && isRecoverableChromeDisconnect(liveness);
   let promptCommitted = dispatch.status === "committed";
 
-  if (
-    targetReachable &&
-    dispatch.status === "ambiguous" &&
-    dispatch.prompt &&
-    dispatch.epochId &&
-    dispatch.promptSha256 &&
-    typeof dispatch.baselineTurns === "number" &&
-    targetId
-  ) {
+  if (targetReachable && dispatch.status === "pending" && targetId) {
     let connection: Awaited<ReturnType<typeof connectToRemoteChromeTarget>> | null = null;
     let verification: PromptCommitVerification | null = null;
     try {
@@ -395,21 +252,12 @@ async function assessChromeDisconnect(options: {
       await connection?.close().catch(() => undefined);
     }
     if (verification) {
-      await options.recordPromptCommitVerification(verification, {
+      await options.lifecycle.recordPromptCommitVerification(verification, {
         epochId: dispatch.epochId,
         promptSha256: dispatch.promptSha256,
       });
       promptCommitted = true;
     }
-  }
-  if (
-    targetReachable &&
-    dispatch.status === "ambiguous" &&
-    typeof dispatch.baselineTurns !== "number"
-  ) {
-    options.logger(
-      "[browser] Prompt commit cannot be recovered after disconnect because the pre-dispatch turn baseline is missing.",
-    );
   }
 
   return {
@@ -1253,55 +1101,6 @@ function shouldCleanupBlankTabsAfterLastLease(options: {
   );
 }
 
-type BrowserCaptureSettlementMode = "finalize" | "abort";
-
-function markBrowserCaptureCleanupPending(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  if (!runtime.recoveryCleanup && !runtime.recoveryCleanupBacklog?.length) return runtime;
-  return { ...runtime, recoveryCleanupResult: { status: "pending" } };
-}
-
-function completedBrowserCaptureCleanup(
-  runtime: BrowserRuntimeMetadata,
-): BrowserCaptureFinalizationResult {
-  const completed = { ...runtime };
-  delete completed.recoveryCleanup;
-  delete completed.recoveryCleanupResult;
-  return { status: "completed", runtime: completed };
-}
-
-function pendingBrowserCaptureCleanup(
-  runtime: BrowserRuntimeMetadata,
-  error: string,
-): BrowserCaptureFinalizationResult {
-  return {
-    status: "pending",
-    runtime: { ...runtime, recoveryCleanupResult: { status: "failed", error } },
-    error,
-  };
-}
-
-function createBrowserRunTransaction(
-  result: BrowserRunResult,
-  runtime: BrowserRuntimeMetadata,
-  settleResources: (
-    mode: BrowserCaptureSettlementMode,
-    pendingRuntime: BrowserRuntimeMetadata,
-  ) => Promise<BrowserCaptureFinalizationResult>,
-): BrowserRunTransaction {
-  const pendingRuntime = markBrowserCaptureCleanupPending(runtime);
-  let settlement: Promise<BrowserCaptureFinalizationResult> | null = null;
-  const settle = (mode: BrowserCaptureSettlementMode) => {
-    settlement ??= settleResources(mode, pendingRuntime);
-    return settlement;
-  };
-  return {
-    ...result,
-    runtime: pendingRuntime,
-    finalize: () => settle("finalize"),
-    abort: () => settle("abort"),
-  };
-}
-
 function buildSkippedModelSelectionEvidence(
   desiredModel: string | null | undefined,
   strategy: BrowserModelSelectionEvidence["strategy"],
@@ -1392,115 +1191,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
   let ownsTarget = true;
-  const promptDispatch: PromptDispatchState = { status: "idle" };
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
-  const buildLocalRuntimeHint = (): BrowserRuntimeMetadata => {
-    const promptEpoch = currentPromptEpoch(promptDispatch);
-    const conversationId =
-      (lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined) ??
-      (promptEpoch?.status === "committed" ? promptEpoch.conversationId : undefined);
-    return {
-      chromePid: chrome.pid,
-      chromeProcessIdentity: chrome.processIdentity,
-      chromePort: chrome.port,
-      chromeHost,
-      chromeTargetId: lastTargetId,
-      tabUrl: lastUrl,
-      conversationId,
-      promptSubmitted: promptEpoch?.status === "committed",
-      promptEpoch,
-      userDataDir,
-      recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-      controllerPid: process.pid,
-    };
-  };
-  const persistCurrentPromptAuthority = async (): Promise<void> => {
-    if (!chrome?.port || !runtimeHintCb) return;
-    await runtimeHintCb(buildLocalRuntimeHint(), modelSelectionEvidence);
-  };
-  const promptAuthorityPersistenceError = (cause: unknown): BrowserAutomationError =>
-    new BrowserAutomationError(
-      "Failed to durably persist current prompt authority.",
-      {
-        stage: "prompt-epoch-persistence",
-        code: "prompt-epoch-persistence-failed",
-        runtime: buildLocalRuntimeHint(),
-      },
-      cause,
-    );
-  const emitRuntimeHint = async (): Promise<void> => {
-    if (!chrome?.port) return;
-    try {
-      await runtimeHintCb?.(buildLocalRuntimeHint(), modelSelectionEvidence);
-      await tabLease?.update({
-        chromeHost,
-        chromePort: chrome.port,
-        chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to persist runtime hint: ${message}`);
-    }
-  };
-  const resetCurrentPromptDispatch = async (): Promise<void> => {
-    resetPromptDispatch(promptDispatch);
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      throw promptAuthorityPersistenceError(error);
-    }
-  };
-  const markPromptDispatchStarted = async (
-    prompt: string,
-    baselineTurns: number,
-    followUpOrdinal: number,
-    remainingFollowUps: number,
-  ): Promise<PromptEpochIdentity> => {
-    const identity = beginPromptDispatch(
-      promptDispatch,
-      prompt,
-      baselineTurns,
-      followUpOrdinal,
-      remainingFollowUps,
-    );
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      throw promptAuthorityPersistenceError(error);
-    }
-    return identity;
-  };
-  const recordPromptCommitVerification = async (
-    verification: PromptCommitVerification,
-    expected: PromptEpochIdentity,
-  ): Promise<void> => {
-    const previousDispatch = { ...promptDispatch };
-    markPromptDispatchCommitted(promptDispatch, verification, expected);
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      resetPromptDispatch(promptDispatch);
-      Object.assign(promptDispatch, previousDispatch);
-      throw promptAuthorityPersistenceError(error);
-    }
-    void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
-  };
-  const recordPromptCommitEvidence = async (
-    evidence: PromptCommitEvidence,
-    expected: PromptEpochIdentity,
-  ): Promise<void> => {
-    if (evidence.status !== "committed") return;
-    if (!evidence.verification) {
-      throw new BrowserAutomationError(
-        "Prompt provider reported a commit without current-turn verification.",
-        { stage: "prompt-epoch", code: "prompt-epoch-evidence-missing" },
-      );
-    }
-    await recordPromptCommitVerification(evidence.verification, expected);
-  };
   if (config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") {
     logger(
       `[browser-mode] config: ${JSON.stringify({
@@ -1633,7 +1326,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await handle.release().catch(() => undefined);
     }
     if (usingCopiedProfile) {
-      await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+      logger(
+        `[browser] Copy-profile acquisition failed without a confirmed safe Chrome termination outcome; preserving ${userDataDir}.`,
+      );
     }
     throw error;
   }
@@ -1644,15 +1339,25 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     try {
       await writeChromeProcessIdentity(userDataDir, chrome.processIdentity);
     } catch (error) {
-      const stopped = await chrome.kill().then(
-        () => true,
-        () => false,
-      );
-      if (stopped) {
-        await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
-      } else {
-        detachKeptChromeProcess(chrome);
-      }
+      const termination = await chrome.kill().catch((terminationError: unknown) => ({
+        status: "unsafe" as const,
+        pid: chrome.pid,
+        reason:
+          terminationError instanceof Error ? terminationError.message : String(terminationError),
+      }));
+      const safelyStopped = isSafeChromeTerminationOutcome(termination);
+      const profileRemoved = safelyStopped
+        ? await removeProfileDirectoryIfIdentityMatches(
+            userDataDir,
+            chrome.processIdentity.profileDirectory,
+          ).catch(() => false)
+        : false;
+      const cleanupError = !safelyStopped
+        ? termination.reason
+        : profileRemoved
+          ? undefined
+          : "Profile removal was not confirmed after Chrome termination";
+      if (!safelyStopped) detachKeptChromeProcess(chrome);
       throw new BrowserAutomationError(
         "Failed to persist Chrome process cleanup authority.",
         {
@@ -1664,12 +1369,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             chromeHost,
             userDataDir,
             recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-            recoveryCleanupResult: stopped
-              ? undefined
-              : {
+            recoveryCleanupResult: cleanupError
+              ? {
                   status: "failed",
-                  error: "Chrome termination failed after process identity persistence failed",
-                },
+                  error: cleanupError,
+                }
+              : undefined,
             controllerPid: process.pid,
           },
         },
@@ -1683,6 +1388,46 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePort: chrome.port,
     });
   }
+  const buildLocalRuntimeBase = (tabUrl = lastUrl): BrowserRuntimeMetadata => ({
+    chromePid: chrome.pid,
+    chromeProcessIdentity: chrome.processIdentity,
+    chromePort: chrome.port,
+    chromeHost,
+    userDataDir,
+    chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
+    tabUrl,
+    conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+    recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
+    controllerPid: process.pid,
+  });
+  const lifecycle = new BrowserRunLifecycleController({
+    getRuntime: () => buildLocalRuntimeBase(),
+    persistRuntime: async (runtime) => {
+      if (!chrome.port || !runtimeHintCb) return;
+      await runtimeHintCb(runtime, modelSelectionEvidence);
+    },
+    settleResources: settleLocalResources,
+    onPromptCommitted: () => {
+      void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    },
+  });
+  const buildLocalRuntimeMetadata = (tabUrl = lastUrl): BrowserRuntimeMetadata =>
+    lifecycle.runtime(buildLocalRuntimeBase(tabUrl));
+  const emitRuntimeHint = async (): Promise<void> => {
+    if (!chrome.port) return;
+    try {
+      await runtimeHintCb?.(buildLocalRuntimeMetadata(), modelSelectionEvidence);
+      await tabLease?.update({
+        chromeHost,
+        chromePort: chrome.port,
+        chromeTargetId: lastTargetId,
+        tabUrl: lastUrl,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Failed to persist runtime hint: ${message}`);
+    }
+  };
   let removeTerminationHooks: (() => void) | null = null;
   try {
     removeTerminationHooks = registerTerminationHooks(
@@ -1716,44 +1461,22 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let appliedCookies = 0;
   let preserveBrowserOnError = false;
   let disconnectAssessmentPromise: Promise<ChromeDisconnectAssessment> | null = null;
-  const buildLocalRuntimeMetadata = (tabUrl = lastUrl): BrowserRuntimeMetadata => {
-    const promptEpoch = currentPromptEpoch(promptDispatch);
-    const conversationId =
-      (tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined) ??
-      (promptEpoch?.status === "committed" ? promptEpoch.conversationId : undefined);
-    return {
-      chromePid: chrome.pid,
-      chromeProcessIdentity: chrome.processIdentity,
-      chromePort: chrome.port,
-      chromeHost,
-      userDataDir,
-      chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
-      tabUrl,
-      conversationId,
-      promptSubmitted: promptEpoch?.status === "committed",
-      promptEpoch,
-      recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-      controllerPid: process.pid,
-    };
-  };
   const getDisconnectAssessment = (): Promise<ChromeDisconnectAssessment> => {
     disconnectAssessmentPromise ??= assessChromeDisconnect({
       host: chromeHost,
       port: chrome.port,
       targetId: lastTargetId ?? isolatedTargetId,
-      dispatch: promptDispatch,
+      lifecycle,
       recoveryAllowed: !usingCopiedProfile,
       commitTimeoutMs: config.inputTimeoutMs,
       logger,
-      recordPromptCommitVerification,
     });
     return disconnectAssessmentPromise;
   };
-  let captureTransactionIssued = false;
-  const settleLocalResources = async (
+  async function settleLocalResources(
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> => {
+  ): Promise<BrowserCaptureFinalizationResult> {
     const errors: string[] = [];
     const aborting = mode === "abort";
     const shouldCloseOwnedRunTarget = aborting
@@ -1845,6 +1568,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               }
               const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
                 lockRemovalMode: "never",
+                expectedProfileIdentity: chrome.processIdentity.profileDirectory,
               });
               if (!cleaned) {
                 keepBrowserOpen = true;
@@ -1889,19 +1613,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger("[browser] Manual-login teardown was not confirmed; preserving Chrome resources.");
         }
       } else {
-        const stopped = await chrome.kill().then(
-          () => true,
-          () => false,
-        );
-        if (!stopped) {
+        const termination = await chrome.kill().catch((terminationError: unknown) => ({
+          status: "unsafe" as const,
+          pid: chrome.pid,
+          reason:
+            terminationError instanceof Error ? terminationError.message : String(terminationError),
+        }));
+        if (!isSafeChromeTerminationOutcome(termination)) {
           keepBrowserOpen = true;
-          errors.push("Chrome termination failed");
-          logger("[browser] Chrome termination failed; preserving its profile directory.");
-        } else {
-          const removed = await rm(userDataDir, { recursive: true, force: true }).then(
-            () => true,
-            () => false,
+          errors.push(termination.reason);
+          logger(
+            `[browser] Chrome termination was not safely confirmed; preserving its profile directory: ${termination.reason}`,
           );
+        } else {
+          const removed = await removeProfileDirectoryIfIdentityMatches(
+            userDataDir,
+            chrome.processIdentity.profileDirectory,
+          ).catch(() => false);
           if (!removed) {
             errors.push(`Profile removal was not confirmed: ${userDataDir}`);
             logger(`[browser] Failed to remove temporary Chrome profile ${userDataDir}.`);
@@ -1922,7 +1650,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     return errors.length > 0
       ? pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "))
       : completedBrowserCaptureCleanup(pendingRuntime);
-  };
+  }
 
   try {
     try {
@@ -1969,7 +1697,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const disconnectPromise = new Promise<never>((_, reject) => {
       client?.on("disconnect", () => {
         connectionClosedUnexpectedly = true;
+        // Until the fresh liveness/commit probe resolves, cleanup authority is unresolved.
+        // Preserve first so no concurrent failure path can tear down a potentially recoverable run.
+        preserveBrowserOnError = true;
         void getDisconnectAssessment().then((assessment) => {
+          preserveBrowserOnError = assessment.recoverable;
           if (assessment.recoverable) {
             logger(
               "CDP client disconnected; Chrome/target still reachable and the prompt is committed. Leaving run recoverable for reattach.",
@@ -2007,6 +1739,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
+    lifecycle.markAcquired();
     if (!config.headless && config.hideWindow) {
       await positionChromeWindowOffscreen(client, logger);
     }
@@ -2305,7 +2038,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       followUpOrdinal: number,
       remainingFollowUps: number,
     ) => {
-      await resetCurrentPromptDispatch();
+      await lifecycle.resetPrompt();
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
@@ -2316,7 +2049,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
         );
       }
-      const promptEpochIdentity = await markPromptDispatchStarted(
+      const promptEpochIdentity = await lifecycle.beginPromptDispatch(
         prompt,
         dispatchBaselineTurns,
         followUpOrdinal,
@@ -2404,7 +2137,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         log: logger,
         state: providerState,
       });
-      await recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
+      await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
@@ -2443,7 +2176,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       };
     };
     const reloadPromptComposer = async () => {
-      await resetCurrentPromptDispatch();
+      await lifecycle.resetPrompt();
       logger("[browser] Composer became unresponsive; reloading page and retrying once.");
       await raceWithDisconnect(Page.reload({ ignoreCache: true }));
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
@@ -2464,7 +2197,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             submitOnce(submissionPrompt, submissionAttachments, 0, followUpPrompts.length),
           ),
         reloadPromptComposer,
-        prepareFallbackSubmission: resetCurrentPromptDispatch,
+        prepareFallbackSubmission: () => lifecycle.resetPrompt(),
         logger,
       });
       baselineTurns = submission.baselineTurns;
@@ -2539,25 +2272,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
-        chromePid: chrome.pid,
-        chromeProcessIdentity: chrome.processIdentity,
-        chromePort: chrome.port,
-        chromeHost,
-        userDataDir,
-        chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-        promptSubmitted: isPromptDispatchCommitted(promptDispatch),
-        promptEpoch: currentPromptEpoch(promptDispatch),
-        recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-        controllerPid: process.pid,
       };
-      captureTransactionIssued = true;
-      return createBrowserRunTransaction(
-        result,
-        buildLocalRuntimeMetadata(lastUrl),
-        settleLocalResources,
-      );
+      return lifecycle.issueCapture(result);
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
@@ -2931,7 +2647,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               ),
             ),
           reloadPromptComposer,
-          prepareFallbackSubmission: resetCurrentPromptDispatch,
+          prepareFallbackSubmission: () => lifecycle.resetPrompt(),
           logger,
         });
         baselineTurns = submission.baselineTurns;
@@ -3051,25 +2767,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       tookMs: durationMs,
       answerTokens,
       answerChars,
-      chromePid: chrome.pid,
-      chromeProcessIdentity: chrome.processIdentity,
-      chromePort: chrome.port,
-      chromeHost,
-      userDataDir,
-      chromeTargetId: lastTargetId,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-      promptSubmitted: isPromptDispatchCommitted(promptDispatch),
-      promptEpoch: currentPromptEpoch(promptDispatch),
-      recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-      controllerPid: process.pid,
     };
-    captureTransactionIssued = true;
-    return createBrowserRunTransaction(
-      result,
-      buildLocalRuntimeMetadata(lastUrl),
-      settleLocalResources,
-    );
+    return lifecycle.issueCapture(result);
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
@@ -3191,14 +2890,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     removeDialogHandler?.();
     removeTerminationHooks?.();
-    if (!captureTransactionIssued) {
-      const finalization = await settleLocalResources(
-        "finalize",
-        markBrowserCaptureCleanupPending(buildLocalRuntimeMetadata()),
-      );
-      if (finalization.status === "pending") {
-        logger(`[browser] Browser cleanup remains pending: ${finalization.error}`);
-      }
+    const finalization = await lifecycle.settleIfUnpublished();
+    if (finalization?.status === "pending") {
+      logger(`[browser] Browser cleanup remains pending: ${finalization.error}`);
     }
   }
 }
@@ -3380,9 +3074,9 @@ async function _assertNavigatedToHttp(
   });
 }
 
-function detachKeptChromeProcess(chrome: Pick<LaunchedChrome, "process">): void {
+function detachKeptChromeProcess(chrome: Pick<ChromeLaunchResult, "process">): void {
   try {
-    chrome.process?.unref();
+    chrome.process?.unref?.();
   } catch {
     // Best-effort only; cleanup should not mask the original browser result.
   }
@@ -3409,7 +3103,6 @@ async function runRemoteBrowserMode(
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
-  const promptDispatch: PromptDispatchState = { status: "idle" };
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
   let ownsTarget = false;
@@ -3428,42 +3121,32 @@ async function runRemoteBrowserMode(
     };
   }
 
-  const buildRemoteRuntimeMetadata = (tabUrl = lastUrl): BrowserRuntimeMetadata => {
-    const promptEpoch = currentPromptEpoch(promptDispatch);
-    const conversationId =
-      (tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined) ??
-      (promptEpoch?.status === "committed" ? promptEpoch.conversationId : undefined);
-    return {
-      browserTransport: "cdp",
-      chromePort: port,
-      chromeHost: host,
-      chromeBrowserWSEndpoint: browserWSEndpoint,
-      chromeProfileRoot,
-      chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl,
-      conversationId,
-      promptSubmitted: promptEpoch?.status === "committed",
-      promptEpoch,
-      recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
-      controllerPid: process.pid,
-    };
-  };
-
+  const buildRemoteRuntimeBase = (tabUrl = lastUrl): BrowserRuntimeMetadata => ({
+    browserTransport: "cdp",
+    chromePort: port,
+    chromeHost: host,
+    chromeBrowserWSEndpoint: browserWSEndpoint,
+    chromeProfileRoot,
+    chromeTargetId: remoteTargetId ?? undefined,
+    tabUrl,
+    conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+    recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
+    controllerPid: process.pid,
+  });
   const runtimeHintCb = options.runtimeHintCb;
-  const persistCurrentPromptAuthority = async (): Promise<void> => {
-    if (!runtimeHintCb) return;
-    await runtimeHintCb(buildRemoteRuntimeMetadata(), modelSelectionEvidence);
-  };
-  const promptAuthorityPersistenceError = (cause: unknown): BrowserAutomationError =>
-    new BrowserAutomationError(
-      "Failed to durably persist current prompt authority.",
-      {
-        stage: "prompt-epoch-persistence",
-        code: "prompt-epoch-persistence-failed",
-        runtime: buildRemoteRuntimeMetadata(),
-      },
-      cause,
-    );
+  const lifecycle = new BrowserRunLifecycleController({
+    getRuntime: () => buildRemoteRuntimeBase(),
+    persistRuntime: async (runtime) => {
+      if (!runtimeHintCb) return;
+      await runtimeHintCb(runtime, modelSelectionEvidence);
+    },
+    settleResources: settleRemoteResources,
+    onPromptCommitted: () => {
+      void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    },
+  });
+  const buildRemoteRuntimeMetadata = (tabUrl = lastUrl): BrowserRuntimeMetadata =>
+    lifecycle.runtime(buildRemoteRuntimeBase(tabUrl));
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
     try {
@@ -3478,62 +3161,6 @@ async function runRemoteBrowserMode(
       const message = error instanceof Error ? error.message : String(error);
       logger(`Failed to persist runtime hint: ${message}`);
     }
-  };
-  const resetCurrentPromptDispatch = async (): Promise<void> => {
-    resetPromptDispatch(promptDispatch);
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      throw promptAuthorityPersistenceError(error);
-    }
-  };
-  const markPromptDispatchStarted = async (
-    prompt: string,
-    baselineTurns: number,
-    followUpOrdinal: number,
-    remainingFollowUps: number,
-  ): Promise<PromptEpochIdentity> => {
-    const identity = beginPromptDispatch(
-      promptDispatch,
-      prompt,
-      baselineTurns,
-      followUpOrdinal,
-      remainingFollowUps,
-    );
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      throw promptAuthorityPersistenceError(error);
-    }
-    return identity;
-  };
-  const recordPromptCommitVerification = async (
-    verification: PromptCommitVerification,
-    expected: PromptEpochIdentity,
-  ): Promise<void> => {
-    const previousDispatch = { ...promptDispatch };
-    markPromptDispatchCommitted(promptDispatch, verification, expected);
-    try {
-      await persistCurrentPromptAuthority();
-    } catch (error) {
-      resetPromptDispatch(promptDispatch);
-      Object.assign(promptDispatch, previousDispatch);
-      throw promptAuthorityPersistenceError(error);
-    }
-    void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
-  };
-  const recordPromptCommitEvidence = async (
-    evidence: PromptCommitEvidence,
-    expected: PromptEpochIdentity,
-  ): Promise<void> => {
-    if (evidence.status !== "committed") return;
-    if (!evidence.verification) {
-      throw new BrowserAutomationError(
-        "Prompt provider reported a commit without current-turn verification.",
-        { stage: "prompt-epoch", code: "prompt-epoch-evidence-missing" },
-      );
-    }
-    await recordPromptCommitVerification(evidence.verification, expected);
   };
 
   const startedAt = Date.now();
@@ -3553,19 +3180,17 @@ async function runRemoteBrowserMode(
       port,
       targetId: remoteTargetId,
       browserWSEndpoint,
-      dispatch: promptDispatch,
+      lifecycle,
       recoveryAllowed: true,
       commitTimeoutMs: config.inputTimeoutMs,
       logger,
-      recordPromptCommitVerification,
     });
     return disconnectAssessmentPromise;
   };
-  let captureTransactionIssued = false;
-  const settleRemoteResources = async (
+  async function settleRemoteResources(
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> => {
+  ): Promise<BrowserCaptureFinalizationResult> {
     const errors: string[] = [];
     const aborting = mode === "abort";
     const shouldCloseOwnedRemoteTarget = aborting
@@ -3610,7 +3235,7 @@ async function runRemoteBrowserMode(
     return errors.length > 0
       ? pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "))
       : completedBrowserCaptureCleanup(pendingRuntime);
-  };
+  }
 
   try {
     const remoteLeaseProfileDir = config.browserTabRef
@@ -3676,6 +3301,7 @@ async function runRemoteBrowserMode(
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
+    lifecycle.markAcquired();
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     await enableFocusEmulation(client, logger, "remote target");
 
@@ -3805,7 +3431,7 @@ async function runRemoteBrowserMode(
       followUpOrdinal: number,
       remainingFollowUps: number,
     ) => {
-      await resetCurrentPromptDispatch();
+      await lifecycle.resetPrompt();
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
@@ -3816,7 +3442,7 @@ async function runRemoteBrowserMode(
           { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
         );
       }
-      const promptEpochIdentity = await markPromptDispatchStarted(
+      const promptEpochIdentity = await lifecycle.beginPromptDispatch(
         prompt,
         dispatchBaselineTurns,
         followUpOrdinal,
@@ -3888,7 +3514,7 @@ async function runRemoteBrowserMode(
         log: logger,
         state: providerState,
       });
-      await recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
+      await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
@@ -3901,7 +3527,7 @@ async function runRemoteBrowserMode(
       };
     };
     const reloadPromptComposer = async () => {
-      await resetCurrentPromptDispatch();
+      await lifecycle.resetPrompt();
       logger("[browser] Composer became unresponsive; reloading page and retrying once.");
       await Page.reload({ ignoreCache: true });
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
@@ -3918,7 +3544,7 @@ async function runRemoteBrowserMode(
       submit: (submissionPrompt, submissionAttachments) =>
         submitOnce(submissionPrompt, submissionAttachments, 0, followUpPrompts.length),
       reloadPromptComposer,
-      prepareFallbackSubmission: resetCurrentPromptDispatch,
+      prepareFallbackSubmission: () => lifecycle.resetPrompt(),
       logger,
     });
     baselineTurns = submission.baselineTurns;
@@ -3988,22 +3614,8 @@ async function runRemoteBrowserMode(
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
-        chromePort: port,
-        chromeHost: host,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-        promptSubmitted: isPromptDispatchCommitted(promptDispatch),
-        promptEpoch: currentPromptEpoch(promptDispatch),
-        recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
-        controllerPid: process.pid,
       };
-      captureTransactionIssued = true;
-      return createBrowserRunTransaction(
-        result,
-        buildRemoteRuntimeMetadata(lastUrl),
-        settleRemoteResources,
-      );
+      return lifecycle.issueCapture(result);
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
@@ -4332,7 +3944,7 @@ async function runRemoteBrowserMode(
             followUpPrompts.length - index - 1,
           ),
         reloadPromptComposer,
-        prepareFallbackSubmission: resetCurrentPromptDispatch,
+        prepareFallbackSubmission: () => lifecycle.resetPrompt(),
         logger,
       });
       baselineTurns = submission.baselineTurns;
@@ -4440,19 +4052,6 @@ async function runRemoteBrowserMode(
       tookMs: durationMs,
       answerTokens,
       answerChars,
-      browserTransport: "cdp",
-      chromePid: undefined,
-      chromePort: port,
-      chromeHost: host,
-      chromeBrowserWSEndpoint: browserWSEndpoint,
-      chromeProfileRoot,
-      userDataDir: undefined,
-      chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-      promptSubmitted: isPromptDispatchCommitted(promptDispatch),
-      promptEpoch: currentPromptEpoch(promptDispatch),
-      recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
       artifacts: savedArtifacts,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
@@ -4460,14 +4059,8 @@ async function runRemoteBrowserMode(
       savedFiles: fileArtifacts.savedFiles,
       archive,
       modelSelection: modelSelectionEvidence,
-      controllerPid: process.pid,
     };
-    captureTransactionIssued = true;
-    return createBrowserRunTransaction(
-      result,
-      buildRemoteRuntimeMetadata(lastUrl),
-      settleRemoteResources,
-    );
+    return lifecycle.issueCapture(result);
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
@@ -4489,7 +4082,7 @@ async function runRemoteBrowserMode(
         await emitRuntimeHint();
       }
       preserveBrowserOnError =
-        isPromptDispatchCommitted(promptDispatch) ||
+        lifecycle.isPromptCommitted() ||
         preservedErrorKind === "cloudflare-challenge" ||
         (preservedErrorKind === "reattachable-capture" && archive?.archived !== true);
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
@@ -4526,14 +4119,9 @@ async function runRemoteBrowserMode(
       // ignore
     }
     removeDialogHandler?.();
-    if (!captureTransactionIssued) {
-      const finalization = await settleRemoteResources(
-        "finalize",
-        markBrowserCaptureCleanupPending(buildRemoteRuntimeMetadata()),
-      );
-      if (finalization.status === "pending") {
-        logger(`[browser] Remote browser cleanup remains pending: ${finalization.error}`);
-      }
+    const finalization = await lifecycle.settleIfUnpublished();
+    if (finalization?.status === "pending") {
+      logger(`[browser] Remote browser cleanup remains pending: ${finalization.error}`);
     }
   }
 }
@@ -4548,7 +4136,6 @@ export const __test__ = {
   classifyChatGptUiWarningText,
   collectChatGptUiWarnings,
   createAssistantTimeoutError,
-  createBrowserRunTransaction,
   detachKeptChromeProcess,
   formatManualLoginSetupCommand,
   isAssistantResponseTimeoutError,
@@ -4556,10 +4143,6 @@ export const __test__ = {
   isImageOnlyUiChromeText,
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
-  resetPromptDispatch,
-  beginPromptDispatch,
-  markPromptDispatchCommitted,
-  isPromptDispatchCommitted,
   resolveAttachmentUploadTimeoutMs,
   resolveManualLoginWaitMs,
   shouldCleanupBlankTabsAfterLastLease,

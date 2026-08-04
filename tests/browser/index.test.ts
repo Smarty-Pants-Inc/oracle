@@ -81,58 +81,8 @@ describe("shouldPreserveBrowserOnErrorForTest", () => {
     expect(classifyPreservedBrowserErrorForTest(error, false)).toBe("cloudflare-challenge");
   });
 });
+
 describe("recoverable disconnect policy", () => {
-  test("does not inherit a committed first prompt into a second dispatch epoch", () => {
-    const dispatch: Parameters<typeof __test__.resetPromptDispatch>[0] = { status: "idle" };
-
-    const firstIdentity = __test__.beginPromptDispatch(dispatch, "first prompt", 0, 0, 1);
-    __test__.markPromptDispatchCommitted(
-      dispatch,
-      {
-        committedTurns: 1,
-        verifiedUserTurnIndex: 0,
-        conversationId: "first-conversation",
-      },
-      firstIdentity,
-    );
-    expect(__test__.isPromptDispatchCommitted(dispatch)).toBe(true);
-
-    __test__.resetPromptDispatch(dispatch);
-    __test__.beginPromptDispatch(dispatch, "second prompt", 2, 1, 0);
-
-    expect(__test__.isPromptDispatchCommitted(dispatch)).toBe(false);
-    expect(dispatch).toMatchObject({
-      status: "ambiguous",
-      prompt: "second prompt",
-      baselineTurns: 2,
-      followUpOrdinal: 1,
-      remainingFollowUps: 0,
-    });
-    expect(dispatch.epochId).toEqual(expect.any(String));
-    expect(dispatch.promptSha256).toEqual(expect.any(String));
-  });
-
-  test("rejects commit evidence captured for a superseded epoch", () => {
-    const dispatch: Parameters<typeof __test__.resetPromptDispatch>[0] = { status: "idle" };
-    const staleIdentity = __test__.beginPromptDispatch(dispatch, "first prompt", 0, 0, 1);
-
-    __test__.resetPromptDispatch(dispatch);
-    __test__.beginPromptDispatch(dispatch, "second prompt", 2, 1, 0);
-
-    expect(() =>
-      __test__.markPromptDispatchCommitted(
-        dispatch,
-        {
-          committedTurns: 3,
-          verifiedUserTurnIndex: 2,
-          conversationId: "second-conversation",
-        },
-        staleIdentity,
-      ),
-    ).toThrow(/current prompt epoch/i);
-    expect(__test__.isPromptDispatchCommitted(dispatch)).toBe(false);
-  });
-
   test("never retains a copied profile after a preserved browser error", () => {
     expect(
       __test__.shouldKeepLocalBrowserOpen({
@@ -269,54 +219,6 @@ describe("recoverable disconnect policy", () => {
         chromePort: 9222,
       }),
     ).toBe(false);
-  });
-});
-
-describe("browser capture transaction", () => {
-  test("does not settle resources until the caller finalizes or aborts", async () => {
-    const settle = vi.fn(
-      async (
-        _mode: "finalize" | "abort",
-        runtime: Parameters<typeof __test__.createBrowserRunTransaction>[1],
-      ) => ({
-        status: "completed" as const,
-        runtime,
-      }),
-    );
-    const transaction = __test__.createBrowserRunTransaction(
-      {
-        answerText: "captured answer",
-        answerMarkdown: "captured answer",
-        tookMs: 1,
-        answerTokens: 2,
-        answerChars: 15,
-      },
-      {
-        chromePort: 9222,
-        chromeTargetId: "owned-target",
-        tabUrl: "https://chatgpt.com/c/captured",
-        recoveryCleanup: {
-          transport: "remote",
-          ownsTarget: true,
-          profileKind: "none",
-          keepBrowser: false,
-        },
-      },
-      settle,
-    );
-
-    expect(transaction.answerMarkdown).toBe("captured answer");
-    expect(transaction.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
-    expect(settle).not.toHaveBeenCalled();
-
-    await transaction.finalize();
-    await transaction.abort();
-
-    expect(settle).toHaveBeenCalledTimes(1);
-    expect(settle).toHaveBeenCalledWith(
-      "finalize",
-      expect.objectContaining({ recoveryCleanupResult: { status: "pending" } }),
-    );
   });
 });
 

@@ -10,7 +10,6 @@ import type {
   SessionArtifact,
 } from "../sessionStore.js";
 import { runBrowserMode } from "../browserMode.js";
-import type { BrowserRunResult } from "../browserMode.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
@@ -59,21 +58,30 @@ export interface BrowserSessionRunnerDeps {
   assemblePrompt?: typeof assembleBrowserPrompt;
   executeBrowser?: (
     options: Parameters<typeof runBrowserMode>[0],
-  ) => Promise<BrowserRunResult | BrowserRunTransaction>;
+  ) => Promise<BrowserRunTransaction>;
   persistRuntimeHint?: (
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
   ) => Promise<void> | void;
 }
 
-function isBrowserRunTransaction(
-  result: BrowserRunResult | BrowserRunTransaction,
-): result is BrowserRunTransaction {
-  return (
-    "runtime" in result &&
-    typeof result.finalize === "function" &&
-    typeof result.abort === "function"
-  );
+function assertBrowserRunTransaction(result: unknown): asserts result is BrowserRunTransaction {
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    !("runtime" in result) ||
+    typeof result.runtime !== "object" ||
+    result.runtime === null ||
+    !("finalize" in result) ||
+    typeof result.finalize !== "function" ||
+    !("abort" in result) ||
+    typeof result.abort !== "function"
+  ) {
+    throw new BrowserAutomationError(
+      "Browser execution returned a legacy bare result instead of a capture transaction.",
+      { stage: "browser-transaction-protocol", code: "legacy-result-rejected" },
+    );
+  }
 }
 
 const LARGE_PRO_FAST_INPUT_TOKEN_THRESHOLD = 25_000;
@@ -220,7 +228,7 @@ export async function runBrowserSessionExecution(
   const executionBrowserConfig = runOptions.browserResumeConversationUrl
     ? { ...browserConfig, resumeConversationUrl: runOptions.browserResumeConversationUrl }
     : browserConfig;
-  let browserResult: BrowserRunResult | BrowserRunTransaction;
+  let browserResult: BrowserRunTransaction;
   try {
     browserResult = await executeBrowser({
       prompt: promptArtifacts.composerText,
@@ -251,6 +259,7 @@ export async function runBrowserSessionExecution(
         }
       },
     });
+    assertBrowserRunTransaction(browserResult);
   } catch (error) {
     if (error instanceof BrowserAutomationError) {
       throw error;
@@ -258,7 +267,7 @@ export async function runBrowserSessionExecution(
     const message = error instanceof Error ? error.message : "Browser automation failed.";
     throw new BrowserAutomationError(message, { stage: "execute-browser" }, error);
   }
-  const browserTransaction = isBrowserRunTransaction(browserResult) ? browserResult : null;
+  const browserTransaction = browserResult;
   try {
     const modelSelection =
       browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
@@ -325,27 +334,7 @@ export async function runBrowserSessionExecution(
     if (line2) {
       log(chalk.dim(line2));
     }
-    const runtime: BrowserRuntimeMetadata = browserTransaction?.runtime ?? {
-      browserTransport: browserResult.browserTransport,
-      chromePid: browserResult.chromePid,
-      chromeProcessIdentity: browserResult.chromeProcessIdentity,
-      chromePort: browserResult.chromePort,
-      chromeHost: browserResult.chromeHost,
-      chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
-      chromeProfileRoot: browserResult.chromeProfileRoot,
-      userDataDir: browserResult.userDataDir,
-      chromeTargetId: browserResult.chromeTargetId,
-      tabUrl: browserResult.tabUrl,
-      conversationId: browserResult.conversationId,
-      promptSubmitted: browserResult.promptSubmitted,
-      promptEpoch: browserResult.promptEpoch,
-      controllerPid: browserResult.controllerPid ?? process.pid,
-      recoveryCleanup: browserResult.recoveryCleanup,
-    };
-    const settledFinalization = async (): Promise<BrowserCaptureFinalizationResult> => ({
-      status: "completed",
-      runtime,
-    });
+    const runtime = browserTransaction.runtime;
     return {
       usage,
       elapsedMs: browserResult.tookMs,
@@ -355,11 +344,11 @@ export async function runBrowserSessionExecution(
       warnings,
       answerText,
       artifacts: savedArtifacts,
-      finalize: browserTransaction?.finalize ?? settledFinalization,
-      abort: browserTransaction?.abort ?? settledFinalization,
+      finalize: browserTransaction.finalize,
+      abort: browserTransaction.abort,
     };
   } catch (error) {
-    await browserTransaction?.abort().catch(() => undefined);
+    await browserTransaction.abort().catch(() => undefined);
     throw error;
   }
 }

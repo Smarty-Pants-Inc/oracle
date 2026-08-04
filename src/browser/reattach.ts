@@ -1,8 +1,12 @@
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, mkdtemp, mkdir } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
+import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
+import { loadUserConfig } from "../config.js";
+import { settleRemoteBrowserRecovery } from "../remote/client.js";
+import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -32,10 +36,14 @@ import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js"
 import { CHATGPT_URL } from "./constants.js";
 import {
   cleanupStaleProfileState,
+  captureProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
+  removeProfileDirectoryIfIdentityMatches,
   terminateRecordedChromeForProfile,
+  verifyProfileDirectoryIdentity,
   writeChromePid,
   writeChromeProcessIdentity,
+  type ProfileDirectoryIdentity,
 } from "./profileState.js";
 import {
   acquireBrowserTabLease,
@@ -68,6 +76,8 @@ export interface ReattachCleanupDeps {
   cleanupStaleProfileState?: typeof cleanupStaleProfileState;
   teardownBrowserResourcesIfNoActiveLeases?: typeof teardownBrowserResourcesIfNoActiveLeases;
   removeProfile?: (profileDir: string) => Promise<boolean>;
+  settleRemoteBrowserRecovery?: typeof settleRemoteBrowserRecovery;
+  resolveRemoteRecoveryConfig?: () => Promise<{ host?: string; token?: string }>;
 }
 
 export interface ReattachRecoveryLock {
@@ -391,112 +401,629 @@ export async function retryBrowserRecoveryCleanup(
   return result;
 }
 
+type RecoveryCleanupEntry = {
+  resource: BrowserRecoveryCleanupResourceMetadata;
+  current: boolean;
+};
+
+type RecoveryCleanupGroup = {
+  key: string;
+  entries: RecoveryCleanupEntry[];
+};
+
 async function finalizeRecoveredRuntime(
   runtime: BrowserRuntimeMetadata,
   logger: BrowserLogger,
   deps: ReattachCleanupDeps = {},
+  releaseCurrentLease?: BrowserTabLease["release"],
 ): Promise<ReattachFinalizationResult> {
-  let current = runtime;
-  const backlog = runtime.recoveryCleanupBacklog ?? [];
-  for (let index = 0; index < backlog.length; index += 1) {
-    const resource = backlog[index];
-    if (!resource) continue;
-    const result = await finalizeSingleRecoveredRuntime(
-      { ...resource, recoveryCleanupBacklog: undefined },
+  const groups = groupRecoveryCleanupResources(runtime);
+  const pending: RecoveryCleanupEntry[] = [];
+  const errors: string[] = [];
+
+  for (const group of groups) {
+    const result = await finalizeRecoveryCleanupGroup(
+      group,
       logger,
       deps,
+      group.entries.some((entry) => entry.current) ? releaseCurrentLease : undefined,
     );
-    if (result.status === "pending") {
-      return pendingFinalization(
-        { ...current, recoveryCleanupBacklog: backlog.slice(index) },
-        result.error,
-      );
-    }
-    current = { ...current, recoveryCleanupBacklog: backlog.slice(index + 1) };
+    pending.push(...result.pending);
+    errors.push(...result.errors);
   }
-  const result = await finalizeSingleRecoveredRuntime(current, logger, deps);
-  if (result.status === "pending") return result;
-  const completedRuntime = { ...result.runtime };
-  delete completedRuntime.recoveryCleanupBacklog;
-  return { status: "completed", runtime: completedRuntime };
+
+  if (pending.length === 0) {
+    const completedRuntime = { ...runtime };
+    delete completedRuntime.recoveryCleanup;
+    delete completedRuntime.recoveryCleanupBacklog;
+    delete completedRuntime.recoveryCleanupResult;
+    delete completedRuntime.remoteRecovery;
+    return { status: "completed", runtime: completedRuntime };
+  }
+
+  const error = [...new Set(errors)].join("; ") || "Browser recovery cleanup remains pending";
+  const pendingRuntime = rebuildPendingCleanupRuntime(runtime, pending, error);
+  return { status: "pending", runtime: pendingRuntime, error };
 }
 
-async function finalizeSingleRecoveredRuntime(
-  runtime: BrowserRuntimeMetadata,
+async function finalizeRecoveryCleanupGroup(
+  group: RecoveryCleanupGroup,
   logger: BrowserLogger,
-  deps: ReattachCleanupDeps = {},
-): Promise<ReattachFinalizationResult> {
-  const cleanup = runtime.recoveryCleanup;
-  if (!cleanup) return { status: "completed", runtime: clearRecoveryCleanup(runtime) };
-
-  const host = runtime.chromeHost ?? "127.0.0.1";
-  const port =
-    runtime.chromePort ?? inferPortFromBrowserWSEndpoint(runtime.chromeBrowserWSEndpoint);
-  const closeTarget = deps.closeChromeTarget ?? closeChromeTarget;
-  const shouldCloseTarget =
-    cleanup.ownsTarget && (Boolean(cleanup.closeOwnedTargetOnComplete) || !cleanup.keepBrowser);
-  if (shouldCloseTarget) {
-    if (!runtime.chromeTargetId || !port) {
-      return pendingFinalization(runtime, "Owned Chrome target cleanup metadata is incomplete");
+  deps: ReattachCleanupDeps,
+  releaseCurrentLease?: BrowserTabLease["release"],
+): Promise<{ pending: RecoveryCleanupEntry[]; errors: string[] }> {
+  if (group.entries[0]?.resource.recoveryCleanup.transport === "remote") {
+    return finalizeRemoteRecoveryCleanupGroup(group, deps);
+  }
+  const pending: RecoveryCleanupEntry[] = [];
+  const errors: string[] = [];
+  const pendingKeys = new Set<string>();
+  const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
+  const addPending = (entry: RecoveryCleanupEntry, error: string): void => {
+    const key = recoveryCleanupResourceKey(entry.resource);
+    if (!pendingKeys.has(key)) {
+      pendingKeys.add(key);
+      pending.push(entry);
     }
-    const closed = await closeTarget({
-      host,
-      port,
-      browserWSEndpoint: runtime.chromeBrowserWSEndpoint,
-      targetId: runtime.chromeTargetId,
-      logger,
-    });
-    if (!closed) return pendingFinalization(runtime, "Chrome target close was not confirmed");
+    errors.push(`Cleanup group ${groupLabel}: ${error}`);
+  };
+
+  let leaseReleased = false;
+  const releaseLease = async (
+    onRelease?: (context: { isLastLease: boolean }) => Promise<void>,
+  ): Promise<void> => {
+    if (!releaseCurrentLease || leaseReleased) return;
+    await releaseCurrentLease(onRelease ? { onRelease } : undefined);
+    leaseReleased = true;
+  };
+
+  try {
+    const closeTarget = deps.closeChromeTarget ?? closeChromeTarget;
+    const connectionEntry =
+      group.entries.find(
+        (entry) =>
+          entry.current &&
+          Boolean(
+            entry.resource.chromePort ??
+            inferPortFromBrowserWSEndpoint(entry.resource.chromeBrowserWSEndpoint),
+          ),
+      ) ??
+      group.entries.find((entry) =>
+        Boolean(
+          entry.resource.chromePort ??
+          inferPortFromBrowserWSEndpoint(entry.resource.chromeBrowserWSEndpoint),
+        ),
+      );
+    const connectionResource = connectionEntry?.resource;
+    const connectionPort = connectionResource
+      ? (connectionResource.chromePort ??
+        inferPortFromBrowserWSEndpoint(connectionResource.chromeBrowserWSEndpoint))
+      : undefined;
+    const targets = new Map<string, RecoveryCleanupEntry[]>();
+    for (const entry of group.entries) {
+      const { resource } = entry;
+      const cleanup = resource.recoveryCleanup;
+      if (!cleanup.ownsTarget || (!cleanup.closeOwnedTargetOnComplete && cleanup.keepBrowser)) {
+        continue;
+      }
+      const targetKey =
+        resource.chromeTargetId ?? `missing:${recoveryCleanupResourceKey(resource)}`;
+      const targetEntries = targets.get(targetKey);
+      if (targetEntries) targetEntries.push(entry);
+      else targets.set(targetKey, [entry]);
+    }
+
+    for (const targetEntries of targets.values()) {
+      const representative = targetEntries[0];
+      if (!representative) continue;
+      const resource = representative.resource;
+      if (!resource.chromeTargetId || !connectionResource || !connectionPort) {
+        for (const entry of targetEntries) {
+          addPending(entry, "Owned Chrome target cleanup metadata is incomplete");
+        }
+        continue;
+      }
+      try {
+        const closed = await closeTarget({
+          host: connectionResource.chromeHost ?? "127.0.0.1",
+          port: connectionPort,
+          browserWSEndpoint: connectionResource.chromeBrowserWSEndpoint,
+          targetId: resource.chromeTargetId,
+          logger,
+        });
+        if (!closed) {
+          for (const entry of targetEntries) {
+            addPending(entry, `Chrome target close was not confirmed: ${resource.chromeTargetId}`);
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        for (const entry of targetEntries) {
+          addPending(entry, `Chrome target close failed: ${message}`);
+        }
+      }
+    }
+
+    const teardownEntries = group.entries.filter((entry) =>
+      requestsProcessTeardown(entry.resource),
+    );
+    const preserveProcess = group.entries.some(
+      (entry) => entry.resource.recoveryCleanup.keepBrowser,
+    );
+    if (teardownEntries.length === 0 || preserveProcess) return { pending, errors };
+
+    const teardownRepresentative =
+      teardownEntries.find((entry) => entry.current && entry.resource.userDataDir) ??
+      teardownEntries.find((entry) => entry.resource.userDataDir) ??
+      teardownEntries.find((entry) => entry.current) ??
+      teardownEntries[0];
+    if (!teardownRepresentative) return { pending, errors };
+    const teardownEntry = teardownOnlyEntry(teardownRepresentative);
+    if (pending.length > 0) {
+      const pendingCarriesTeardown = pending.some((entry) =>
+        requestsProcessTeardown(entry.resource),
+      );
+      if (!pendingCarriesTeardown)
+        addPending(teardownEntry, "Process teardown deferred until targets close");
+      return { pending, errors };
+    }
+
+    const invariantError = await validateGroupTeardownInvariants(teardownEntries);
+    if (invariantError) {
+      addPending(teardownEntry, invariantError);
+      return { pending, errors };
+    }
+
+    const resource = teardownEntry.resource;
+    const profileKind = resource.recoveryCleanup.profileKind;
+    try {
+      let teardownError: string | null = null;
+      if (profileKind === "manual-login" && releaseCurrentLease) {
+        const releaseOutcome: { isLastLease: boolean; error: string | null } = {
+          isLastLease: false,
+          error: null,
+        };
+        await releaseLease(async ({ isLastLease }) => {
+          releaseOutcome.isLastLease = isLastLease;
+          if (isLastLease) {
+            releaseOutcome.error = await teardownLocalRecoveryGroup(resource, logger, deps);
+          }
+        });
+        teardownError = releaseOutcome.isLastLease
+          ? releaseOutcome.error
+          : "Manual-login cleanup preserved resources (active-leases)";
+      } else if (profileKind === "manual-login") {
+        const teardown =
+          deps.teardownBrowserResourcesIfNoActiveLeases ?? teardownBrowserResourcesIfNoActiveLeases;
+        const profileDir = resource.userDataDir;
+        const processIdentity = resource.chromeProcessIdentity;
+        const profileDirectory = physicalProfileDirectoryIdentity(
+          processIdentity?.profileDirectory,
+        );
+        if (!profileDir) {
+          teardownError = "Cleanup profile path is missing";
+        } else if (!processIdentity) {
+          teardownError = "Chrome process identity cleanup metadata is missing";
+        } else if (!profileDirectory) {
+          teardownError = "Chrome physical profile identity cleanup metadata is missing";
+        } else {
+          let directError: string | null = null;
+          const outcome = await teardown(
+            profileDir,
+            async () => {
+              directError = await teardownLocalRecoveryGroup(resource, logger, deps);
+              return directError === null;
+            },
+            { logger, expectedProfileIdentity: profileDirectory },
+          );
+          if (outcome.status !== "completed") {
+            teardownError =
+              directError ??
+              outcome.error ??
+              `Manual-login cleanup preserved resources (${outcome.reason})`;
+          }
+        }
+      } else {
+        teardownError = await teardownLocalRecoveryGroup(resource, logger, deps);
+      }
+
+      if (teardownError) addPending(teardownEntry, teardownError);
+    } catch (error) {
+      addPending(teardownEntry, error instanceof Error ? error.message : String(error));
+    }
+    return { pending, errors };
+  } catch (error) {
+    const current = group.entries.find((entry) => entry.current) ?? group.entries[0];
+    if (current) addPending(current, error instanceof Error ? error.message : String(error));
+    return { pending, errors };
+  } finally {
+    if (releaseCurrentLease && !leaseReleased) {
+      try {
+        await releaseLease();
+      } catch (error) {
+        const current = group.entries.find((entry) => entry.current);
+        if (current) {
+          const message = `Current browser lease release failed: ${error instanceof Error ? error.message : String(error)}`;
+          if (pending.some((entry) => entry.current))
+            errors.push(`Cleanup group ${groupLabel}: ${message}`);
+          else addPending(teardownOnlyEntry(current), message);
+        }
+      }
+    }
+  }
+}
+
+async function finalizeRemoteRecoveryCleanupGroup(
+  group: RecoveryCleanupGroup,
+  deps: ReattachCleanupDeps,
+): Promise<{ pending: RecoveryCleanupEntry[]; errors: string[] }> {
+  const representative = group.entries.find((entry) => entry.current) ?? group.entries[0];
+  if (!representative) return { pending: [], errors: [] };
+  const authority = representative.resource.remoteRecovery;
+  const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
+  const pending = (error: string, remoteRecovery = authority) => ({
+    pending: group.entries.map((entry) => ({
+      ...entry,
+      resource: {
+        ...entry.resource,
+        remoteRecovery,
+        recoveryCleanup: { ...entry.resource.recoveryCleanup, transport: "remote" as const },
+      },
+    })),
+    errors: [`Cleanup group ${groupLabel}: ${error}`],
+  });
+  if (!authority) {
+    return pending("Remote cleanup transaction authority is missing.");
   }
 
-  if (cleanup.transport !== "local" || cleanup.keepBrowser || cleanup.profileKind === "none") {
-    return { status: "completed", runtime: clearRecoveryCleanup(runtime) };
+  let configured: { host?: string; token?: string };
+  try {
+    if (deps.resolveRemoteRecoveryConfig) {
+      configured = await deps.resolveRemoteRecoveryConfig();
+    } else {
+      const { config: userConfig } = await loadUserConfig({ includeProject: false });
+      configured = resolveRemoteServiceConfig({ userConfig, env: process.env });
+    }
+  } catch (error) {
+    return pending(
+      `Remote cleanup configuration is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  const profileDir = runtime.userDataDir;
-  const profileError = validateCleanupProfilePath(runtime, cleanup.profileKind);
-  if (!profileDir || profileError) {
-    return pendingFinalization(runtime, profileError ?? "Cleanup profile path is missing");
+
+  const resource = representative.resource;
+  const runtime: BrowserRuntimeMetadata = {
+    chromePid: resource.chromePid,
+    chromeProcessIdentity: resource.chromeProcessIdentity,
+    chromePort: resource.chromePort,
+    chromeHost: resource.chromeHost,
+    chromeBrowserWSEndpoint: resource.chromeBrowserWSEndpoint,
+    chromeProfileRoot: resource.chromeProfileRoot,
+    userDataDir: resource.userDataDir,
+    chromeTargetId: resource.chromeTargetId,
+    conversationId: resource.conversationId,
+    promptEpoch: resource.promptEpoch,
+    recoveryCleanup: resource.recoveryCleanup,
+    recoveryCleanupResult: { status: "pending" },
+    remoteRecovery: authority,
+  };
+  let result: BrowserCaptureFinalizationResult;
+  try {
+    result = await (deps.settleRemoteBrowserRecovery ?? settleRemoteBrowserRecovery)({
+      runtime,
+      configuredHost: configured.host ?? "",
+      authToken: configured.token,
+    });
+  } catch (error) {
+    return pending(
+      `Remote cleanup settlement remains retryable: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  const processIdentity = runtime.chromeProcessIdentity;
-  if (!processIdentity) {
-    return pendingFinalization(runtime, "Chrome process identity cleanup metadata is missing");
+  if (result.status === "completed") return { pending: [], errors: [] };
+  return pending(
+    result.error || "Remote cleanup settlement remains pending.",
+    result.runtime.remoteRecovery ?? authority,
+  );
+}
+
+async function teardownLocalRecoveryGroup(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+  logger: BrowserLogger,
+  deps: ReattachCleanupDeps,
+): Promise<string | null> {
+  const profileKind = resource.recoveryCleanup.profileKind;
+  const profileDir = resource.userDataDir;
+  const profileError = validateCleanupProfilePath(resource, profileKind);
+  if (!profileDir || profileError) return profileError ?? "Cleanup profile path is missing";
+
+  if (
+    (profileKind === "temporary" || profileKind === "copied") &&
+    (await cleanupProfileAbsent(profileDir))
+  ) {
+    return null;
+  }
+
+  const processIdentity = resource.chromeProcessIdentity;
+  if (!processIdentity) return "Chrome process identity cleanup metadata is missing";
+  const profileDirectory = physicalProfileDirectoryIdentity(processIdentity.profileDirectory);
+  if (!profileDirectory) {
+    return "Chrome physical profile identity cleanup metadata is missing";
+  }
+  if (!(await verifyProfileDirectoryIdentity(profileDir, profileDirectory))) {
+    return "Chrome process identity does not match the cleanup profile";
   }
 
   const terminateChrome =
     deps.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile;
-  const cleanupProfileState = deps.cleanupStaleProfileState ?? cleanupStaleProfileState;
-  if (cleanup.profileKind === "manual-login") {
-    const teardown =
-      deps.teardownBrowserResourcesIfNoActiveLeases ?? teardownBrowserResourcesIfNoActiveLeases;
-    const outcome = await teardown(
-      profileDir,
-      async () => {
-        const termination = await terminateChrome(profileDir, processIdentity, logger);
-        if (!isSafeChromeTerminationOutcome(termination)) {
-          logger(`[browser] Preserving manual-login profile: ${termination.reason}`);
-          return false;
-        }
-        return cleanupProfileState(profileDir, logger, { lockRemovalMode: "never" });
-      },
-      { logger },
-    );
-    if (outcome.status !== "completed") {
-      return pendingFinalization(
-        runtime,
-        outcome.error ?? `Manual-login cleanup preserved resources (${outcome.reason})`,
-      );
-    }
-    return { status: "completed", runtime: clearRecoveryCleanup(runtime) };
-  }
-
   const termination = await terminateChrome(profileDir, processIdentity, logger);
   if (!isSafeChromeTerminationOutcome(termination)) {
-    return pendingFinalization(runtime, termination.reason);
+    if (profileKind === "manual-login") {
+      logger(`[browser] Preserving manual-login profile: ${termination.reason}`);
+    }
+    return termination.reason;
   }
-  const removed = await removeCleanupProfile(profileDir, deps.removeProfile);
-  if (!removed)
-    return pendingFinalization(runtime, `Profile removal was not confirmed: ${profileDir}`);
-  return { status: "completed", runtime: clearRecoveryCleanup(runtime) };
+
+  if (profileKind === "manual-login") {
+    const cleanupProfileState = deps.cleanupStaleProfileState ?? cleanupStaleProfileState;
+    return (await cleanupProfileState(profileDir, logger, {
+      lockRemovalMode: "never",
+      expectedProfileIdentity: profileDirectory,
+    }))
+      ? null
+      : `Manual-login profile cleanup was not confirmed: ${profileDir}`;
+  }
+
+  return (await removeCleanupProfile(profileDir, profileDirectory, deps.removeProfile))
+    ? null
+    : `Profile removal was not confirmed: ${profileDir}`;
+}
+function groupRecoveryCleanupResources(runtime: BrowserRuntimeMetadata): RecoveryCleanupGroup[] {
+  const entries: RecoveryCleanupEntry[] = (runtime.recoveryCleanupBacklog ?? []).map(
+    (resource) => ({
+      resource,
+      current: false,
+    }),
+  );
+  const current = recoveryCleanupResourceFromRuntime(runtime);
+  if (current) entries.push({ resource: current, current: true });
+
+  const unique = new Map<string, RecoveryCleanupEntry>();
+  for (const entry of entries) {
+    const key = recoveryCleanupResourceKey(entry.resource);
+    const existing = unique.get(key);
+    if (existing) existing.current ||= entry.current;
+    else unique.set(key, { ...entry });
+  }
+
+  const groups = new Map<string, RecoveryCleanupGroup>();
+  for (const entry of unique.values()) {
+    const key = recoveryCleanupGroupKey(entry.resource);
+    const group = groups.get(key);
+    if (group) group.entries.push(entry);
+    else groups.set(key, { key, entries: [entry] });
+  }
+  return [...groups.values()];
+}
+
+function recoveryCleanupGroupKey(resource: BrowserRecoveryCleanupResourceMetadata): string {
+  const cleanup = resource.recoveryCleanup;
+  if (cleanup.transport === "local") {
+    const processIdentity = resource.chromeProcessIdentity;
+    const physicalProfile = processIdentity
+      ? (physicalProfileDirectoryIdentity(processIdentity.profileDirectory)?.canonicalPath ??
+        "missing-physical-profile")
+      : (resource.chromeProfileRoot ?? resource.userDataDir ?? null);
+    return JSON.stringify(["local", chromeProcessIdentityKey(processIdentity), physicalProfile]);
+  }
+  const remoteIdentity = remoteRecoveryIdentityKey(resource.remoteRecovery);
+  return JSON.stringify(
+    remoteIdentity
+      ? ["remote", remoteIdentity]
+      : [
+          "remote-missing-authority",
+          immutablePromptIdentity(resource.promptEpoch),
+          resource.conversationId ?? null,
+          resource.chromeProfileRoot ?? resource.userDataDir ?? null,
+        ],
+  );
+}
+
+function recoveryCleanupResourceKey(resource: BrowserRecoveryCleanupResourceMetadata): string {
+  return JSON.stringify([
+    recoveryCleanupGroupKey(resource),
+    resource.chromeTargetId ?? null,
+    resource.chromeHost ?? null,
+    resource.chromePort ?? null,
+    resource.chromeBrowserWSEndpoint ?? null,
+    resource.recoveryCleanup.ownsTarget,
+    resource.recoveryCleanup.profileKind,
+    resource.recoveryCleanup.keepBrowser,
+    Boolean(resource.recoveryCleanup.closeOwnedTargetOnComplete),
+  ]);
+}
+
+function chromeProcessIdentityKey(
+  identity: BrowserRecoveryCleanupResourceMetadata["chromeProcessIdentity"],
+): readonly unknown[] | null {
+  if (!identity) return null;
+  return [
+    identity.pid,
+    identity.processStartTime,
+    identity.executablePath,
+    identity.normalizedUserDataDir,
+    identity.launchNonce,
+    profileDirectoryIdentityKey(identity.profileDirectory) ?? ["missing-physical-profile"],
+  ];
+}
+
+function physicalProfileDirectoryIdentity(identity: unknown): ProfileDirectoryIdentity | null {
+  if (!identity || typeof identity !== "object") return null;
+  const candidate = identity as Record<string, unknown>;
+  if (
+    candidate.version !== 1 ||
+    typeof candidate.platform !== "string" ||
+    typeof candidate.canonicalPath !== "string" ||
+    typeof candidate.device !== "string" ||
+    typeof candidate.inode !== "string"
+  ) {
+    return null;
+  }
+  return identity as ProfileDirectoryIdentity;
+}
+
+function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | null {
+  const physicalProfile = physicalProfileDirectoryIdentity(identity);
+  if (!physicalProfile) return null;
+  return [
+    physicalProfile.version,
+    physicalProfile.platform,
+    physicalProfile.canonicalPath,
+    physicalProfile.device,
+    physicalProfile.inode,
+  ];
+}
+
+function immutablePromptIdentity(
+  promptEpoch: BrowserRecoveryCleanupResourceMetadata["promptEpoch"],
+): readonly unknown[] | null {
+  if (!promptEpoch) return null;
+  return [
+    promptEpoch.epochId,
+    promptEpoch.promptSha256,
+    promptEpoch.followUpOrdinal,
+    promptEpoch.status === "committed" ? promptEpoch.conversationId : null,
+  ];
+}
+
+function remoteRecoveryIdentityKey(
+  authority: BrowserRecoveryCleanupResourceMetadata["remoteRecovery"],
+): readonly unknown[] | null {
+  return authority ? [authority.protocolVersion, authority.host, authority.transactionToken] : null;
+}
+
+function requestsProcessTeardown(resource: BrowserRecoveryCleanupResourceMetadata): boolean {
+  const cleanup = resource.recoveryCleanup;
+  return cleanup.transport === "local" && !cleanup.keepBrowser && cleanup.profileKind !== "none";
+}
+
+function teardownOnlyEntry(entry: RecoveryCleanupEntry): RecoveryCleanupEntry {
+  return {
+    current: entry.current,
+    resource: {
+      ...entry.resource,
+      chromeTargetId: undefined,
+      recoveryCleanup: {
+        ...entry.resource.recoveryCleanup,
+        ownsTarget: false,
+        closeOwnedTargetOnComplete: undefined,
+      },
+    },
+  };
+}
+
+async function validateGroupTeardownInvariants(
+  entries: RecoveryCleanupEntry[],
+): Promise<string | null> {
+  const first = entries[0]?.resource;
+  if (!first) return "Cleanup group has no teardown authority";
+  const firstProcessIdentity = first.chromeProcessIdentity;
+  const firstProfileDirectory = physicalProfileDirectoryIdentity(
+    firstProcessIdentity?.profileDirectory,
+  );
+  const fallbackProfileSource = firstProcessIdentity
+    ? null
+    : (first.chromeProfileRoot ?? first.userDataDir);
+  const fallbackProfile = fallbackProfileSource ? path.resolve(fallbackProfileSource) : null;
+  for (const { resource } of entries) {
+    if (recoveryCleanupGroupKey(resource) !== recoveryCleanupGroupKey(first)) {
+      return "Cleanup group contains conflicting Chrome process identities";
+    }
+    if (resource.recoveryCleanup.profileKind !== first.recoveryCleanup.profileKind) {
+      return "Cleanup group contains conflicting profile teardown metadata";
+    }
+    if (firstProfileDirectory) {
+      if (
+        resource.userDataDir &&
+        !(await cleanupProfileAbsent(resource.userDataDir)) &&
+        !(await verifyProfileDirectoryIdentity(resource.userDataDir, firstProfileDirectory))
+      ) {
+        return "Cleanup group user-data directory does not match its process identity";
+      }
+      if (
+        resource.chromeProfileRoot &&
+        !(await cleanupProfileAbsent(resource.chromeProfileRoot)) &&
+        !(await verifyProfileDirectoryIdentity(resource.chromeProfileRoot, firstProfileDirectory))
+      ) {
+        return "Cleanup group profile root does not match its process identity";
+      }
+    } else {
+      if (
+        fallbackProfile &&
+        resource.userDataDir &&
+        path.resolve(resource.userDataDir) !== fallbackProfile
+      ) {
+        return "Cleanup group user-data directory does not match its process identity";
+      }
+      if (
+        fallbackProfile &&
+        resource.chromeProfileRoot &&
+        path.resolve(resource.chromeProfileRoot) !== fallbackProfile
+      ) {
+        return "Cleanup group profile root does not match its process identity";
+      }
+    }
+  }
+  return null;
+}
+
+function recoveryCleanupResourceFromRuntime(
+  runtime: BrowserRuntimeMetadata,
+): BrowserRecoveryCleanupResourceMetadata | null {
+  if (!runtime.recoveryCleanup) return null;
+  return {
+    chromePid: runtime.chromePid,
+    chromeProcessIdentity: runtime.chromeProcessIdentity,
+    chromePort: runtime.chromePort,
+    chromeHost: runtime.chromeHost,
+    chromeBrowserWSEndpoint: runtime.chromeBrowserWSEndpoint,
+    chromeProfileRoot: runtime.chromeProfileRoot,
+    userDataDir: runtime.userDataDir,
+    chromeTargetId: runtime.chromeTargetId,
+    conversationId: runtime.conversationId,
+    promptEpoch: runtime.promptEpoch,
+    remoteRecovery:
+      runtime.recoveryCleanup.transport === "remote" ? runtime.remoteRecovery : undefined,
+    recoveryCleanup: runtime.recoveryCleanup,
+  };
+}
+
+function rebuildPendingCleanupRuntime(
+  runtime: BrowserRuntimeMetadata,
+  entries: RecoveryCleanupEntry[],
+  error: string,
+): BrowserRuntimeMetadata {
+  const rebuilt = { ...runtime };
+  delete rebuilt.recoveryCleanup;
+  delete rebuilt.recoveryCleanupBacklog;
+  delete rebuilt.remoteRecovery;
+  const current = entries.find((entry) => entry.current);
+  if (current) {
+    rebuilt.recoveryCleanup = current.resource.recoveryCleanup;
+    rebuilt.remoteRecovery = current.resource.remoteRecovery;
+  }
+  const backlog = entries.filter((entry) => !entry.current).map((entry) => entry.resource);
+  if (backlog.length > 0) rebuilt.recoveryCleanupBacklog = backlog;
+  rebuilt.recoveryCleanupResult = { status: "failed", error };
+  return rebuilt;
+}
+
+async function cleanupProfileAbsent(profileDir: string): Promise<boolean> {
+  try {
+    await access(profileDir);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
 }
 
 function markRecoveryCleanupPending(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
@@ -516,13 +1043,6 @@ function pendingFinalization(
     },
     error,
   };
-}
-
-function clearRecoveryCleanup(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  const cleared = { ...runtime };
-  delete cleared.recoveryCleanup;
-  delete cleared.recoveryCleanupResult;
-  return cleared;
 }
 
 function validateCleanupProfilePath(
@@ -569,27 +1089,27 @@ function isPathWithin(parent: string, child: string): boolean {
 
 async function removeCleanupProfile(
   profileDir: string,
+  expectedIdentity: ProfileDirectoryIdentity,
   removeProfile?: (profileDir: string) => Promise<boolean>,
 ): Promise<boolean> {
   if (removeProfile) {
     return (await removeProfile(profileDir)) === true;
   }
-  await rm(profileDir, { recursive: true, force: true });
-  return !(await access(profileDir).then(
-    () => true,
-    () => false,
-  ));
+  return removeProfileDirectoryIfIdentityMatches(profileDir, expectedIdentity);
 }
-
 function defaultRecoveryLockPath(runtime: BrowserRuntimeMetadata): string {
+  const processIdentity = runtime.chromeProcessIdentity;
+  const physicalProfile = processIdentity
+    ? (physicalProfileDirectoryIdentity(processIdentity.profileDirectory)?.canonicalPath ??
+      "missing-physical-profile")
+    : (runtime.chromeProfileRoot ?? runtime.userDataDir ?? null);
   const identity = JSON.stringify([
-    runtime.chromeHost,
-    runtime.chromePort,
-    runtime.chromeBrowserWSEndpoint,
-    runtime.chromeProfileRoot,
-    runtime.userDataDir,
-    runtime.chromeTargetId,
-    runtime.conversationId,
+    "recovery-v2",
+    remoteRecoveryIdentityKey(runtime.remoteRecovery),
+    immutablePromptIdentity(runtime.promptEpoch),
+    runtime.conversationId ?? null,
+    physicalProfile,
+    chromeProcessIdentityKey(runtime.chromeProcessIdentity),
   ]);
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
   return path.join(os.tmpdir(), "oracle-browser-recovery-locks", `${digest}.lock`);
@@ -746,18 +1266,14 @@ function buildRecoveryCleanupBacklog(
   runtime: BrowserRuntimeMetadata,
 ): NonNullable<BrowserRuntimeMetadata["recoveryCleanupBacklog"]> {
   const backlog = [...(runtime.recoveryCleanupBacklog ?? [])];
-  if (runtime.recoveryCleanup) {
-    backlog.push({
-      chromePid: runtime.chromePid,
-      chromeProcessIdentity: runtime.chromeProcessIdentity,
-      chromePort: runtime.chromePort,
-      chromeHost: runtime.chromeHost,
-      chromeBrowserWSEndpoint: runtime.chromeBrowserWSEndpoint,
-      chromeProfileRoot: runtime.chromeProfileRoot,
-      userDataDir: runtime.userDataDir,
-      chromeTargetId: runtime.chromeTargetId,
-      recoveryCleanup: runtime.recoveryCleanup,
-    });
+  const current = recoveryCleanupResourceFromRuntime(runtime);
+  if (
+    current &&
+    !backlog.some(
+      (resource) => recoveryCleanupResourceKey(resource) === recoveryCleanupResourceKey(current),
+    )
+  ) {
+    backlog.push(current);
   }
   return backlog;
 }
@@ -816,6 +1332,7 @@ async function resumeBrowserSessionViaNewChrome(
     ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
     : await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
   if (manualLogin) await mkdir(userDataDir, { recursive: true });
+  const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
   let fallbackLease: BrowserTabLease | null = null;
   let chrome: BrowserChrome | null = null;
@@ -823,12 +1340,11 @@ async function resumeBrowserSessionViaNewChrome(
   let fallbackTargetId: string | null = null;
   let client: ChromeClient | null = null;
   let closeFallbackConnection: (() => Promise<void>) | null = null;
-  const releaseFallbackLease = async (
-    onRelease?: (context: { isLastLease: boolean }) => Promise<void>,
-  ): Promise<void> => {
+  const releaseFallbackLease: BrowserTabLease["release"] = async (options) => {
     const lease = fallbackLease;
+    if (!lease) return;
+    await lease.release(options);
     fallbackLease = null;
-    await lease?.release(onRelease ? { onRelease } : undefined);
   };
 
   try {
@@ -998,14 +1514,18 @@ async function resumeBrowserSessionViaNewChrome(
       recoveryCleanupBacklog: buildRecoveryCleanupBacklog(runtime),
       controllerPid: process.pid,
     };
+    delete fallbackRuntime.remoteRecovery;
     return {
       answerText,
       answerMarkdown,
       runtime: fallbackRuntime,
-      finalizeResources: async () => {
-        await releaseFallbackLease();
-        return finalizeRecoveredRuntime(fallbackRuntime, logger, deps.recoveryCleanup);
-      },
+      finalizeResources: async () =>
+        finalizeRecoveredRuntime(
+          fallbackRuntime,
+          logger,
+          deps.recoveryCleanup,
+          releaseFallbackLease,
+        ),
       abandonResources: releaseFallbackLease,
     };
   } catch (error) {
@@ -1027,25 +1547,41 @@ async function resumeBrowserSessionViaNewChrome(
       if (!closed) logger(`[browser] Failed to close recovery target ${fallbackTargetId}.`);
     }
     if (manualLogin) {
-      await releaseFallbackLease(async ({ isLastLease }) => {
-        if (!isLastLease || !chrome || resolved.keepBrowser || chromeOwnerSource !== "launched")
-          return;
-        let stopped = true;
-        try {
-          await chrome.kill();
-        } catch {
-          stopped = false;
-        }
-        if (!stopped) {
-          logger("[browser] Fallback Chrome termination failed; preserving manual-login state.");
-          return;
-        }
-        const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
-          lockRemovalMode: "never",
-        }).catch(() => false);
-        if (!cleaned) {
-          logger("[browser] Fallback manual-login cleanup was not confirmed; preserving state.");
-        }
+      await releaseFallbackLease({
+        onRelease: async ({ isLastLease }: { isLastLease: boolean }) => {
+          if (!isLastLease || !chrome || resolved.keepBrowser || chromeOwnerSource !== "launched")
+            return;
+          const profileDirectory = physicalProfileDirectoryIdentity(
+            chrome.processIdentity.profileDirectory,
+          );
+          if (!profileDirectory) {
+            logger(
+              "[browser] Fallback Chrome profile identity is invalid; preserving manual-login state.",
+            );
+            return;
+          }
+          const termination = await chrome.kill().catch((terminationError: unknown) => ({
+            status: "unsafe" as const,
+            pid: chrome?.pid,
+            reason:
+              terminationError instanceof Error
+                ? terminationError.message
+                : String(terminationError),
+          }));
+          if (!isSafeChromeTerminationOutcome(termination)) {
+            logger(
+              `[browser] Fallback Chrome termination was unsafe; preserving manual-login state: ${termination.reason}`,
+            );
+            return;
+          }
+          const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
+            lockRemovalMode: "never",
+            expectedProfileIdentity: profileDirectory,
+          }).catch(() => false);
+          if (!cleaned) {
+            logger("[browser] Fallback manual-login cleanup was not confirmed; preserving state.");
+          }
+        },
       }).catch((releaseError) => {
         logger(
           `[browser] Fallback lease release failed; preserving shared Chrome resources: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
@@ -1054,17 +1590,34 @@ async function resumeBrowserSessionViaNewChrome(
     } else {
       await releaseFallbackLease().catch(() => undefined);
       if (chrome && !resolved.keepBrowser) {
-        let stopped = true;
-        try {
-          await chrome.kill();
-        } catch {
-          stopped = false;
-        }
-        if (stopped) {
-          await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+        const profileDirectory = physicalProfileDirectoryIdentity(
+          chrome.processIdentity.profileDirectory,
+        );
+        if (!profileDirectory) {
+          logger(
+            "[browser] Fallback Chrome profile identity is invalid; preserving cleanup state.",
+          );
+        } else {
+          const termination = await chrome.kill().catch((terminationError: unknown) => ({
+            status: "unsafe" as const,
+            pid: chrome?.pid,
+            reason:
+              terminationError instanceof Error
+                ? terminationError.message
+                : String(terminationError),
+          }));
+          if (isSafeChromeTerminationOutcome(termination)) {
+            await removeProfileDirectoryIfIdentityMatches(userDataDir, profileDirectory).catch(
+              () => false,
+            );
+          } else {
+            logger(`[browser] Fallback Chrome cleanup remains pending: ${termination.reason}`);
+          }
         }
       } else if (!chrome) {
-        await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+        await removeProfileDirectoryIfIdentityMatches(userDataDir, fallbackProfileIdentity).catch(
+          () => false,
+        );
       }
     }
     throw error;
@@ -1079,5 +1632,7 @@ export const __test__ = {
   openConversationFromSidebar,
   finalizeRecoveredRuntime,
   buildRecoveryCleanupBacklog,
+  recoveryCleanupGroupKey,
+  defaultRecoveryLockPath,
   createOwnedRecoveryTargetConnection,
 };

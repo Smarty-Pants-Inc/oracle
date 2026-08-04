@@ -111,6 +111,101 @@ describe("browser follow-up resolution", () => {
     expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/harvested");
   });
 
+  test.each([
+    {
+      harvestUrl: "https://chatgpt.com/c/committed-id",
+      runtimeUrl: "https://chatgpt.com/c/wrong-runtime",
+    },
+    {
+      harvestUrl: "https://chatgpt.com/c/wrong-harvest",
+      runtimeUrl: "https://chatgpt.com/c/committed-id",
+    },
+  ])(
+    "rejects conflicting harvest/runtime URLs for a committed prompt epoch",
+    ({ harvestUrl, runtimeUrl }) => {
+      const metadata: SessionMetadata = {
+        ...baseMetadata,
+        mode: "browser",
+        browser: {
+          harvest: { url: harvestUrl },
+          runtime: {
+            tabUrl: runtimeUrl,
+            promptEpoch: {
+              status: "committed",
+              epochId: "epoch-1",
+              promptSha256: "a".repeat(64),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+              verifiedUserTurnIndex: 0,
+              conversationId: "committed-id",
+            },
+          },
+        },
+      };
+
+      expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+    },
+  );
+
+  test("uses the committed epoch id as the only URL fallback authority", () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { url: "https://chatgpt.com/" },
+        runtime: {
+          conversationId: "committed-id",
+          promptEpoch: {
+            status: "committed",
+            epochId: "epoch-1",
+            promptSha256: "a".repeat(64),
+            baselineTurns: 0,
+            followUpOrdinal: 0,
+            remainingFollowUps: 0,
+            verifiedUserTurnIndex: 0,
+            conversationId: "committed-id",
+          },
+        },
+      },
+    };
+
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBe(
+      "https://chatgpt.com/c/committed-id",
+    );
+    expect(
+      resolveBrowserResumeConversationUrl({
+        ...metadata,
+        browser: {
+          ...metadata.browser!,
+          runtime: { ...metadata.browser!.runtime!, conversationId: "wrong-runtime-id" },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("rejects URL fallback while a prompt epoch is pending", () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        runtime: {
+          conversationId: "pending-id",
+          promptEpoch: {
+            status: "pending",
+            epochId: "epoch-pending",
+            promptSha256: "a".repeat(64),
+            baselineTurns: 0,
+            followUpOrdinal: 0,
+            remainingFollowUps: 0,
+          },
+        },
+      },
+    };
+
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+  });
+
   test("rejects an external resume URL stored in metadata", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,

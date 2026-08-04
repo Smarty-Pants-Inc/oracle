@@ -1,26 +1,44 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
 import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
-const PROCESS_NONCE_T = "22222222-2222-4222-8222-222222222222";
 
 function chromeIdentity(
-  normalizedUserDataDir: string,
+  userDataDir: string,
   overrides: Partial<ChromeProcessIdentity> = {},
 ): ChromeProcessIdentity {
+  const usesWindowsPathRules =
+    process.platform === "win32" ||
+    /^[a-z]:[\\/]/iu.test(userDataDir) ||
+    userDataDir.startsWith("\\\\");
+  const pathApi = usesWindowsPathRules ? path.win32 : path;
+  const resolvedUserDataDir = pathApi.resolve(userDataDir);
+  const existsLocally = existsSync(resolvedUserDataDir);
+  const canonicalPath = existsLocally ? realpathSync(resolvedUserDataDir) : resolvedUserDataDir;
+  const physical = existsLocally ? statSync(canonicalPath, { bigint: true }) : null;
+  const platform = usesWindowsPathRules ? "win32" : process.platform;
   return {
     pid: 4242,
     processStartTime: "process-generation-s",
-    executablePath: "/usr/bin/google-chrome",
-    normalizedUserDataDir,
+    executablePath: usesWindowsPathRules
+      ? String.raw`c:\program files\google\chrome\application\chrome.exe`
+      : "/usr/bin/google-chrome",
+    normalizedUserDataDir: platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath,
     launchNonce: PROCESS_NONCE_S,
+    profileDirectory: {
+      version: 1,
+      platform,
+      canonicalPath,
+      device: physical?.dev.toString() ?? "1",
+      inode: physical?.ino.toString() ?? "1",
+    },
     ...overrides,
   };
 }
@@ -61,7 +79,7 @@ describe("profileState", () => {
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
       });
-      expect(existsSync(path.join(dir, "DevToolsActivePort"))).toBe(false);
+      expect(existsSync(path.join(dir, "DevToolsActivePort"))).toBe(true);
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(true);
       }
@@ -90,74 +108,45 @@ describe("profileState", () => {
     }
   });
 
-  test("waits for Chrome profile processes before returning from termination", async () => {
-    if (process.platform === "win32") return;
+  test("never signals a re-used pid after userspace identity verification", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
-    const child = spawn(
-      process.execPath,
-      [
-        "-e",
-        `
-          const fs = require("node:fs");
-          const path = require("node:path");
-          const profile = process.argv[1];
-          process.on("SIGTERM", () => process.send?.("sigterm"));
-          process.on("message", (message) => {
-            if (message !== "exit") return;
-            fs.mkdirSync(profile, { recursive: true });
-            fs.writeFileSync(path.join(profile, "late-write"), "late");
-            process.exit(0);
-          });
-          process.send?.("ready");
-        `,
-        dir,
-        "chrome",
-        `--user-data-dir=${dir}`,
-      ],
-      { stdio: ["ignore", "ignore", "ignore", "ipc"] },
-    );
-
     try {
-      if (!child.pid) throw new Error("Failed to start Chrome fixture");
-      await once(child, "message");
-      const identity = chromeIdentity(dir, { pid: child.pid });
-      const processSnapshot = {
-        pid: child.pid,
+      const identity = chromeIdentity(dir);
+      await profileState.writeChromeProcessIdentity(dir, identity);
+      const originalSnapshot = {
+        pid: identity.pid,
         processStartTime: identity.processStartTime,
         executablePath: identity.executablePath,
-        commandLine: `/usr/bin/google-chrome --user-data-dir="${dir}"`,
+        commandLine: `${identity.executablePath} --user-data-dir="${identity.profileDirectory.canonicalPath}"`,
       };
-
-      const signalReceived = once(child, "message").then(([message]) => {
-        expect(message).toBe("sigterm");
-        return "signal" as const;
-      });
-      const termination = profileState.terminateRecordedChromeForProfileForTest(
-        dir,
-        identity,
-        undefined,
-        {
-          platform: process.platform,
-          readIdentity: async () => identity,
-          readProcessSnapshot: async () => processSnapshot,
-        },
-      );
       await expect(
-        Promise.race([termination.then(() => "terminated" as const), signalReceived]),
-      ).resolves.toBe("signal");
+        profileState.verifyChromeProcessIdentityForTest(dir, identity, {
+          readIdentity: async () => identity,
+          readProcessSnapshot: async () => originalSnapshot,
+          verifyProfileIdentity: async () => true,
+        }),
+      ).resolves.toBe(true);
 
-      child.send("exit");
-      await expect(termination).resolves.toMatchObject({
-        status: "stopped",
-        pid: child.pid,
-        signal: "SIGTERM",
+      const signalByPid = vi.fn(async () => ({ stdout: "SUCCESS" }));
+      await expect(
+        profileState.terminateRecordedChromeForProfileForTest(dir, identity, undefined, {
+          readIdentity: async () => identity,
+          readProcessSnapshot: async () => ({
+            ...originalSnapshot,
+            processStartTime: "reused-process-generation",
+          }),
+          verifyProfileIdentity: async () => true,
+          isProcessAlive: () => true,
+          isChromeUsingUserDataDir: async () => false,
+          execute: signalByPid,
+        }),
+      ).resolves.toMatchObject({
+        status: "unsafe",
+        pid: identity.pid,
+        reason: expect.stringMatching(/no retained stable process handle/i),
       });
-      expect(profileState.isProcessAlive(child.pid)).toBe(false);
-
-      await rm(dir, { recursive: true, force: true });
-      expect(existsSync(dir)).toBe(false);
+      expect(signalByPid).not.toHaveBeenCalled();
     } finally {
-      child.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -176,17 +165,6 @@ describe("profileState", () => {
       ),
     ).toBe(true);
 
-    const terminationCalls: Array<{ file: string; args: string[] }> = [];
-    const terminate = async (file: string, args: string[]) => {
-      terminationCalls.push({ file, args });
-      return { stdout: "SUCCESS" };
-    };
-    await profileState.terminateChromeProcessForTest(4242, false, "win32", terminate);
-    await profileState.terminateChromeProcessForTest(4242, true, "win32", terminate);
-    expect(terminationCalls).toEqual([
-      { file: "taskkill.exe", args: ["/PID", "4242", "/T"] },
-      { file: "taskkill.exe", args: ["/PID", "4242", "/T", "/F"] },
-    ]);
     expect(
       profileState.isChromeCommandForUserDataDirForTest(
         String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session-other"`,
@@ -210,90 +188,93 @@ describe("profileState", () => {
     ).toBe(false);
   });
 
-  test("rejects stale Windows cleanup authority and revalidates before forced tree termination", async () => {
+  test("crash recovery without stable authority remains pending and never taskkills", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
-    const normalizedProfileDir = profileDir.toLowerCase();
-    const executablePath = String.raw`c:\program files\google\chrome\application\chrome.exe`;
-    const commandLine = String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session"`;
-    const sessionIdentity = chromeIdentity(normalizedProfileDir, {
-      executablePath,
-      processStartTime: "creation-s",
-    });
-    const laterIdentity = chromeIdentity(normalizedProfileDir, {
-      executablePath,
-      processStartTime: "creation-t",
-      launchNonce: PROCESS_NONCE_T,
-    });
-    const laterSnapshot = {
-      pid: laterIdentity.pid,
-      processStartTime: laterIdentity.processStartTime,
-      executablePath,
-      commandLine,
-    };
-    const rejectedCalls: Array<{ file: string; args: string[] }> = [];
+    const identity = chromeIdentity(profileDir);
+    const terminationCalls: Array<{ file: string; args: string[] }> = [];
     await expect(
-      profileState.terminateRecordedChromeForProfileForTest(
-        profileDir,
-        sessionIdentity,
-        undefined,
-        {
-          platform: "win32",
-          readIdentity: async () => laterIdentity,
-          readProcessSnapshot: async () => laterSnapshot,
-          execute: async (file, args) => {
-            rejectedCalls.push({ file, args });
-            return { stdout: "SUCCESS" };
-          },
-          isProcessAlive: () => true,
-          isChromeUsingUserDataDir: async () => true,
-          waitForChromeProfileProcessesToExit: async () => false,
+      profileState.terminateRecordedChromeForProfileForTest(profileDir, identity, undefined, {
+        platform: "win32",
+        readIdentity: async () => identity,
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+        isChromeUsingUserDataDir: async () => false,
+        execute: async (file, args) => {
+          terminationCalls.push({ file, args });
+          return { stdout: "SUCCESS" };
         },
-      ),
+      }),
     ).resolves.toMatchObject({
       status: "unsafe",
-      pid: 4242,
-      reason: `Chrome cleanup authority is stale for ${profileDir}`,
+      pid: identity.pid,
+      reason: expect.stringMatching(/authenticated exact Chrome control channel/i),
     });
-    expect(rejectedCalls.some(({ file }) => file === "taskkill.exe")).toBe(false);
+    expect(terminationCalls).toEqual([]);
+  });
 
-    let snapshotRead = 0;
-    const sessionSnapshot = {
-      pid: sessionIdentity.pid,
-      processStartTime: sessionIdentity.processStartTime,
-      executablePath,
-      commandLine,
-    };
-    const calls: Array<{ file: string; args: string[] }> = [];
-    await expect(
-      profileState.terminateRecordedChromeForProfileForTest(
-        profileDir,
-        sessionIdentity,
-        undefined,
-        {
-          platform: "win32",
-          readIdentity: async () => sessionIdentity,
-          readProcessSnapshot: async () => {
-            const snapshot = snapshotRead === 0 ? sessionSnapshot : laterSnapshot;
-            snapshotRead += 1;
-            return snapshot;
+  test("rejects descendant symlink traversal before profile authority", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-symlink-"));
+    const physical = path.join(root, "physical");
+    const alias = path.join(root, "alias");
+    try {
+      await mkdir(physical);
+      await symlink(physical, alias, "dir");
+      const nestedProfile = path.join(alias, "new-profile");
+      await expect(
+        profileState.captureProfileDirectoryIdentity(nestedProfile, { create: true }),
+      ).rejects.toThrow(/symlink|reparse/i);
+      expect(existsSync(path.join(physical, "new-profile"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rename retargeting cannot redirect destructive cleanup", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedDir = path.join(root, "moved-profile");
+    try {
+      await mkdir(profileDir);
+      await profileState.writeDevToolsActivePort(profileDir, 12345);
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.cleanupStaleProfileStateForTest(
+          profileDir,
+          undefined,
+          { lockRemovalMode: "never", expectedProfileIdentity: identity },
+          {
+            beforeDestructiveCleanup: async () => {
+              await rename(profileDir, movedDir);
+              await mkdir(profileDir);
+              await writeFile(path.join(profileDir, "replacement-marker"), "keep");
+            },
           },
-          execute: async (file, args) => {
-            calls.push({ file, args });
-            return { stdout: "SUCCESS" };
-          },
-          isProcessAlive: () => true,
-          isChromeUsingUserDataDir: async () => true,
-          waitForChromeProfileProcessesToExit: async () => false,
-        },
-      ),
-    ).resolves.toMatchObject({
-      status: "unsafe",
-      pid: 4242,
-      reason: "Chrome pid 4242 changed before forced termination",
-    });
-    expect(calls.filter(({ file }) => file === "taskkill.exe")).toEqual([
-      { file: "taskkill.exe", args: ["/PID", "4242", "/T"] },
-    ]);
+        ),
+      ).resolves.toBe(false);
+      expect(existsSync(path.join(profileDir, "replacement-marker"))).toBe(true);
+      expect(existsSync(path.join(movedDir, "DevToolsActivePort"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("profile persistence rejects a renamed and replaced directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-persist-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedDir = path.join(root, "moved-profile");
+    try {
+      await mkdir(profileDir);
+      const identity = chromeIdentity(profileDir);
+      await rename(profileDir, movedDir);
+      await mkdir(profileDir);
+      await expect(profileState.writeChromeProcessIdentity(profileDir, identity)).rejects.toThrow(
+        /does not belong|physical profile/i,
+      );
+      expect(existsSync(path.join(profileDir, "chrome-process-identity.json"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("skips manual-login cleanup when DevTools port is still reachable", async () => {
@@ -355,6 +336,25 @@ describe("profileState", () => {
     }
   });
 
+  test("preserves the lock when the profile directory generation changes before release", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-generation-"));
+    const dir = path.join(root, "profile");
+    const moved = path.join(root, "moved-profile");
+    await mkdir(dir);
+    try {
+      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      expect(lock).not.toBeNull();
+      await rename(dir, moved);
+      await mkdir(dir);
+
+      await expect(lock?.release()).rejects.toThrow(/identity changed/i);
+      expect(existsSync(path.join(moved, "oracle-automation.lock"))).toBe(true);
+      expect(existsSync(path.join(dir, "oracle-automation.lock"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("waits for profile lock and errors on timeout", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
@@ -377,9 +377,16 @@ describe("profileState", () => {
         throw new Error("Missing child pid");
       }
       const lockPath = path.join(dir, "oracle-automation.lock");
+      await mkdir(lockPath);
       await writeFile(
-        lockPath,
-        JSON.stringify({ pid: child.pid, lockId: "stale", createdAt: new Date().toISOString() }),
+        path.join(lockPath, "owner.json"),
+        `${JSON.stringify({
+          version: 1,
+          pid: child.pid,
+          processStartIdentity: "dead-process-start",
+          ownerNonce: "stale-owner-generation",
+          createdAt: new Date().toISOString(),
+        })}\n`,
       );
       const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
       expect(lock).not.toBeNull();
@@ -390,16 +397,15 @@ describe("profileState", () => {
     }
   });
 
-  test("deletes unreadable profile lock and continues", async () => {
+  test("fails closed for an unreadable legacy profile lock", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
       const lockPath = path.join(dir, "oracle-automation.lock");
       await writeFile(lockPath, "not-json");
-      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 2000, pollMs: 50 });
-      expect(lock).not.toBeNull();
-      expect(existsSync(lockPath)).toBe(true);
-      await lock?.release();
-      expect(existsSync(lockPath)).toBe(false);
+      await expect(
+        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
+      ).rejects.toThrow(/profile lock/i);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe("not-json");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

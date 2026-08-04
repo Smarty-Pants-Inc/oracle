@@ -1,6 +1,6 @@
 import type { BrowserSessionConfig, SessionMetadata } from "../sessionStore.js";
 import { CHATGPT_URL } from "../browser/constants.js";
-import { buildConversationUrl } from "../browser/reattachHelpers.js";
+import { buildConversationUrl, extractConversationIdFromUrl } from "../browser/reattachHelpers.js";
 import { resolveRecoveryUrl } from "../browser/recoverConversation.js";
 import { isRecoverableChatGptConversationUrl } from "../browser/reattachability.js";
 import { DEFAULT_MODEL } from "../oracle/config.js";
@@ -20,33 +20,53 @@ export interface FollowupSessionReader {
 /**
  * Resolve the ChatGPT conversation URL to reopen for a browser follow-up.
  *
- * Reuses the same recoverable-URL gate as conversation recovery
- * (`resolveRecoveryUrl`): prefer the post-harvest URL, fall back to the
- * runtime tab URL, and reject home / project-shell / external URLs via
- * `isRecoverableChatGptConversationUrl`. Only when neither candidate is a
- * recoverable `chatgpt.com/c/<id>` URL do we rebuild from a stored
- * `conversationId` against the session's ChatGPT base — and that rebuilt URL is
- * gated too. This prevents a stale or attacker-controlled URL in session
- * metadata from navigating the signed-in browser profile somewhere unintended.
+ * A committed prompt epoch is the durable conversation authority. Its exact
+ * conversation id must bind every recovered URL and is the only permitted
+ * fallback id. URL-only fallback remains solely for epoch-less legacy sessions;
+ * a pending epoch cannot authorize a follow-up target.
  */
 export function resolveBrowserResumeConversationUrl(
   metadata: SessionMetadata,
   fallbackBaseUrl = CHATGPT_URL,
 ): string | null {
+  const runtime = metadata.browser?.runtime;
+  const promptEpoch = runtime?.promptEpoch;
+  if (promptEpoch && promptEpoch.status !== "committed") return null;
+
   const gatedUrl = resolveRecoveryUrl(metadata);
-  if (gatedUrl) {
-    return gatedUrl;
+  if (gatedUrl) return gatedUrl;
+
+  const committedConversationId =
+    promptEpoch?.status === "committed" ? promptEpoch.conversationId.trim() : null;
+  if (promptEpoch && !committedConversationId) return null;
+  if (committedConversationId) {
+    const harvestUrl = metadata.browser?.harvest?.url;
+    const runtimeUrl = runtime?.tabUrl;
+    if (
+      (typeof harvestUrl === "string" &&
+        isRecoverableChatGptConversationUrl(harvestUrl) &&
+        extractConversationIdFromUrl(harvestUrl) !== committedConversationId) ||
+      (typeof runtimeUrl === "string" &&
+        isRecoverableChatGptConversationUrl(runtimeUrl) &&
+        extractConversationIdFromUrl(runtimeUrl) !== committedConversationId)
+    ) {
+      return null;
+    }
   }
-  const conversationId = metadata.browser?.runtime?.conversationId?.trim();
-  if (!conversationId) {
+  const storedConversationId = runtime?.conversationId?.trim();
+  if (
+    committedConversationId &&
+    storedConversationId &&
+    storedConversationId !== committedConversationId
+  ) {
     return null;
   }
+  const conversationId = committedConversationId ?? storedConversationId;
+  if (!conversationId) return null;
+
   const baseUrl = metadata.browser?.config?.url ?? fallbackBaseUrl;
   const built = buildConversationUrl({ conversationId }, baseUrl);
-  if (built && isRecoverableChatGptConversationUrl(built)) {
-    return built;
-  }
-  return null;
+  return built && isRecoverableChatGptConversationUrl(built) ? built : null;
 }
 
 export async function resolveBrowserFollowupReference(
