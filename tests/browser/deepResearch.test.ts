@@ -27,6 +27,7 @@ import {
   checkDeepResearchStatus,
 } from "../../src/browser/actions/deepResearch.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
+import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
 
 function createMockRuntime() {
   return {
@@ -1837,6 +1838,75 @@ describe("waitForDeepResearchCompletion", () => {
     expect(result.finished).toBe(false);
     expect(result.textLength).toBe(0);
     expect(result.isToolStub).toBe(false);
+  });
+
+  it("rejects a completed Deep Research answer when a later user turn exists", () => {
+    const epoch = {
+      status: "committed" as const,
+      epochId: "epoch-abc",
+      promptSha256: "a".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      conversationId: "abc",
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+    };
+    const locator: CommittedPromptEpochLocator = {
+      epoch,
+      conversationId: "abc",
+      promptSha256: epoch.promptSha256,
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationUrls: ["https://chatgpt.com/c/abc"],
+    };
+    const turn = (role: "user" | "assistant", id: string, messageId: string) => ({
+      id,
+      dataset: { turn: role, turnId: id },
+      textContent:
+        role === "assistant" ? "Completed Deep Research report with enough content." : "prompt",
+      innerText: role,
+      getAttribute: (name: string) =>
+        name === "data-message-author-role"
+          ? role
+          : name === "data-turn-id"
+            ? id
+            : name === "data-message-id"
+              ? messageId
+              : null,
+      matches: () => false,
+      querySelector: (selector: string) =>
+        selector === "[data-message-id]"
+          ? { getAttribute: () => messageId, dataset: { messageId } }
+          : null,
+      querySelectorAll: () => [],
+    });
+    const expectedUser = turn("user", "turn-0", "message-0");
+    const expectedAssistant = turn("assistant", "turn-1", "message-1");
+    const laterUser = turn("user", "turn-2", "message-2");
+    const laterAssistant = turn("assistant", "turn-3", "message-3");
+    const turns = [expectedUser, expectedAssistant, laterUser, laterAssistant];
+    const expression = buildDeepResearchCompletionPollExpressionForTest(1, "abc", locator);
+
+    const result = new vm.Script(expression).runInNewContext({
+      location: { href: "https://chatgpt.com/c/abc" },
+      document: {
+        body: { innerText: "" },
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => {
+          if (selector === "iframe") return [];
+          if (selector === '[data-message-author-role="assistant"], [data-turn="assistant"]') {
+            return [expectedAssistant, laterAssistant];
+          }
+          return turns;
+        },
+      },
+    }) as { identityMismatch?: boolean; finished?: boolean };
+
+    expect(result).toMatchObject({ identityMismatch: true });
+    expect(result.finished).not.toBe(true);
   });
 
   it("throws on timeout with metadata", async () => {

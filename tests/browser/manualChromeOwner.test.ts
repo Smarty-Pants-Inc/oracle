@@ -10,12 +10,9 @@ import {
 import {
   acquireProfileRunLock,
   captureProfileDirectoryIdentity,
-  readChromePid,
-  readChromeProcessIdentity,
   readDevToolsPort,
-  writeChromePid,
-  writeChromeProcessIdentity,
-  writeDevToolsActivePort,
+  readOracleChromeOwner,
+  writeOracleChromeOwner,
   type ChromeProcessIdentity,
 } from "../../src/browser/profileState.js";
 import {
@@ -31,6 +28,13 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = () => resolvePromise();
   });
   return { promise, resolve };
+}
+async function writeNativeDevToolsActivePort(profileDir: string, port: number): Promise<void> {
+  await fs.writeFile(
+    path.join(profileDir, "DevToolsActivePort"),
+    `${port}\n/devtools/browser`,
+    "utf8",
+  );
 }
 
 async function chromeIdentity(
@@ -118,8 +122,7 @@ describe("manual Chrome owner acquisition", () => {
       const discoverExactProfileChrome = vi.fn(async () =>
         ownerLaunched ? { pid: canonicalPid, port: canonicalPort } : null,
       );
-      const writePid = vi.fn(writeChromePid);
-      const writeIdentity = vi.fn(writeChromeProcessIdentity);
+      const writeOwner = vi.fn(writeOracleChromeOwner);
       const verifyIdentity = vi.fn(
         async (_profileDir: string, identity: ChromeProcessIdentity) =>
           identity.launchNonce === canonicalIdentity.launchNonce,
@@ -139,8 +142,7 @@ describe("manual Chrome owner acquisition", () => {
         discoverExactProfileChrome,
         probe: vi.fn(async () => ({ ok: true as const })),
         verifyIdentity,
-        writeIdentity,
-        writePid,
+        writeOwner,
       };
 
       const normalOwnerPromise = acquireManualChromeOwner(
@@ -170,23 +172,37 @@ describe("manual Chrome owner acquisition", () => {
       ]);
 
       expect(launch).toHaveBeenCalledTimes(1);
-      expect([normalOwner.source, fallbackOwner.source].sort()).toEqual([
-        "active-port",
-        "launched",
-      ]);
+      expect([normalOwner.source, fallbackOwner.source].sort()).toEqual(["launched", "recorded"]);
       expect(normalOwner.chrome.pid).toBe(canonicalPid);
       expect(fallbackOwner.chrome.pid).toBe(canonicalPid);
-      expect(await readChromePid(profileDir)).toBe(canonicalPid);
-      expect(await readDevToolsPort(profileDir)).toBe(canonicalPort);
-      expect(writePid).toHaveBeenCalledTimes(1);
-      expect(writeIdentity).toHaveBeenCalledTimes(1);
-      expect(writeIdentity).toHaveBeenCalledWith(profileDir, canonicalIdentity);
+      expect(await readOracleChromeOwner(profileDir)).toEqual({
+        port: canonicalPort,
+        processIdentity: canonicalIdentity,
+      });
+      const persistedOwner = JSON.parse(
+        await fs.readFile(path.join(profileDir, "oracle-chrome-owner.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(persistedOwner).toEqual({
+        port: canonicalPort,
+        processIdentity: canonicalIdentity,
+      });
+      expect(Object.keys(persistedOwner).sort()).toEqual(["port", "processIdentity"]);
+      await expect(fs.access(path.join(profileDir, "chrome.pid"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(
+        fs.access(path.join(profileDir, "chrome-process-identity.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readDevToolsPort(profileDir)).toBeNull();
+      expect(writeOwner).toHaveBeenCalledTimes(1);
+      expect(writeOwner).toHaveBeenCalledWith(profileDir, {
+        port: canonicalPort,
+        processIdentity: canonicalIdentity,
+      });
       expect(normalOwner.processIdentity).toEqual(canonicalIdentity);
       expect(fallbackOwner.processIdentity).toEqual(canonicalIdentity);
       expect(normalOwner.chrome.processIdentity).toEqual(canonicalIdentity);
       expect(fallbackOwner.chrome.processIdentity).toEqual(canonicalIdentity);
-      expect(await readChromeProcessIdentity(profileDir)).toEqual(canonicalIdentity);
-      expect(writePid).toHaveBeenCalledWith(profileDir, canonicalPid);
       expect(acquireProfileLock).toHaveBeenNthCalledWith(
         1,
         profileDir,
@@ -216,132 +232,136 @@ describe("manual Chrome owner acquisition", () => {
     }
   });
 
-  test("reuses verified active-port authority without rewriting chrome.pid", async () => {
+  test("reuses the verified atomic owner without mixing in native discovery state", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-active-owner-"));
     try {
-      await writeDevToolsActivePort(profileDir, 45_679);
-      await writeChromePid(profileDir, 43_211);
-      const writePid = vi.fn(writeChromePid);
       const identity = await chromeIdentity(
         profileDir,
         43_211,
         "00000000-0000-4000-8000-000000000002",
       );
-      await writeChromeProcessIdentity(profileDir, identity);
+      await writeOracleChromeOwner(profileDir, { port: 45_679, processIdentity: identity });
+      await writeNativeDevToolsActivePort(profileDir, 55_679);
+      const writeOwner = vi.fn(writeOracleChromeOwner);
       const launch = vi.fn();
-      const discoverExactProfileChrome = vi.fn(async () => ({ pid: 43_211, port: 45_679 }));
+      const discoverExactProfileChrome = vi.fn(async () => ({ pid: 43_211, port: 55_679 }));
       const verifyIdentity = vi.fn(async () => true);
-      const writeIdentity = vi.fn(writeChromeProcessIdentity);
 
       const owner = await acquireManualChromeOwner(
         profileDir,
         resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
         logger,
-        "active-port",
+        "active-owner-record",
         {
           discoverExactProfileChrome,
           launch,
           probe: vi.fn(async () => ({ ok: true as const })),
           verifyIdentity,
-          writeIdentity,
-          writePid,
+          writeOwner,
         },
       );
 
-      expect(owner.source).toBe("active-port");
-      expect(writePid).not.toHaveBeenCalled();
-      expect(launch).not.toHaveBeenCalled();
-      expect(await readChromePid(profileDir)).toBe(43_211);
+      expect(owner.source).toBe("recorded");
+      expect(owner.chrome.port).toBe(45_679);
+      expect(owner.chrome.pid).toBe(43_211);
       expect(owner.processIdentity).toEqual(identity);
+      expect(writeOwner).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
       expect(discoverExactProfileChrome).not.toHaveBeenCalled();
       expect(verifyIdentity).toHaveBeenCalledWith(profileDir, identity);
-      expect(writeIdentity).not.toHaveBeenCalled();
+      expect(await readDevToolsPort(profileDir)).toBe(55_679);
+      expect(await readOracleChromeOwner(profileDir)).toEqual({
+        port: 45_679,
+        processIdentity: identity,
+      });
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
   });
 
-  test("repairs provisional identity-only authority without changing its generation", async () => {
-    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-provisional-owner-"));
+  test("replaces a stale owner only as one complete rediscovered generation", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-generation-"));
     try {
-      const identity = await chromeIdentity(
+      const staleIdentity = await chromeIdentity(
         profileDir,
         43_212,
         "00000000-0000-4000-8000-000000000003",
       );
-      await writeChromeProcessIdentity(profileDir, identity);
-      const captureIdentity = vi.fn();
-      const writeIdentity = vi.fn(writeChromeProcessIdentity);
-      const writePid = vi.fn(writeChromePid);
+      const currentIdentity = await chromeIdentity(
+        profileDir,
+        43_214,
+        "00000000-0000-4000-8000-000000000005",
+      );
+      await writeOracleChromeOwner(profileDir, {
+        port: 45_680,
+        processIdentity: staleIdentity,
+      });
+      const writeOwner = vi.fn(writeOracleChromeOwner);
+      const captureIdentity = vi.fn(async () => currentIdentity);
       const launch = vi.fn();
 
       const owner = await acquireManualChromeOwner(
         profileDir,
         resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
         logger,
-        "provisional-repair",
+        "rediscovered-generation",
         {
           captureIdentity,
-          discoverExactProfileChrome: vi.fn(async () => ({ pid: 43_212, port: 45_680 })),
+          discoverExactProfileChrome: vi.fn(async () => ({ pid: 43_214, port: 45_682 })),
           launch,
           probe: vi.fn(async () => ({ ok: true as const })),
-          verifyIdentity: vi.fn(async () => true),
-          writeIdentity,
-          writePid,
+          verifyIdentity: vi.fn(
+            async (_profileDir: string, identity: ChromeProcessIdentity) =>
+              identity.launchNonce === currentIdentity.launchNonce,
+          ),
+          writeOwner,
         },
       );
 
       expect(owner.source).toBe("rediscovered");
-      expect(owner.processIdentity).toEqual(identity);
-      expect(captureIdentity).not.toHaveBeenCalled();
-      expect(writeIdentity).not.toHaveBeenCalled();
-      expect(writePid).toHaveBeenCalledWith(profileDir, 43_212);
-      expect(await readDevToolsPort(profileDir)).toBe(45_680);
-      expect(await readChromeProcessIdentity(profileDir)).toEqual(identity);
+      expect(owner.processIdentity).toEqual(currentIdentity);
+      expect(captureIdentity).toHaveBeenCalledWith(profileDir, 43_214);
+      expect(writeOwner).toHaveBeenCalledOnce();
+      expect(await readOracleChromeOwner(profileDir)).toEqual({
+        port: 45_682,
+        processIdentity: currentIdentity,
+      });
       expect(launch).not.toHaveBeenCalled();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
   });
 
-  test("writes PID authority only after exact process/profile rediscovery", async () => {
-    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-rediscovered-owner-"));
+  test("rolls back a launch when the atomic owner cannot be published", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-write-failure-"));
     try {
-      const writePid = vi.fn(writeChromePid);
       const identity = await chromeIdentity(
         profileDir,
-        43_212,
-        "00000000-0000-4000-8000-000000000003",
+        43_215,
+        "00000000-0000-4000-8000-000000000006",
       );
-      const captureIdentity = vi.fn(async () => identity);
-      const writeIdentity = vi.fn(writeChromeProcessIdentity);
-      const launch = vi.fn();
-      const owner = await acquireManualChromeOwner(
-        profileDir,
-        resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
-        logger,
-        "rediscovery",
-        {
-          captureIdentity,
-          discoverExactProfileChrome: vi.fn(async () => ({ pid: 43_212, port: 45_680 })),
-          launch,
-          probe: vi.fn(async () => ({ ok: true as const })),
-          verifyIdentity: vi.fn(async () => true),
-          writeIdentity,
-          writePid,
-        },
-      );
+      const chrome = launchedChrome(43_215, 45_683, identity);
+      const launch = vi.fn(async () => chrome);
 
-      expect(owner.source).toBe("rediscovered");
-      expect(writePid).toHaveBeenCalledTimes(1);
-      expect(writePid).toHaveBeenCalledWith(profileDir, 43_212);
-      expect(launch).not.toHaveBeenCalled();
-      expect(await readChromePid(profileDir)).toBe(43_212);
-      expect(await readDevToolsPort(profileDir)).toBe(45_680);
-      expect(captureIdentity).toHaveBeenCalledWith(profileDir, 43_212);
-      expect(writeIdentity).toHaveBeenCalledOnce();
-      expect(owner.processIdentity).toEqual(identity);
-      expect(await readChromeProcessIdentity(profileDir)).toEqual(identity);
+      await expect(
+        acquireManualChromeOwner(
+          profileDir,
+          resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
+          logger,
+          "owner-write-failure",
+          {
+            discoverExactProfileChrome: vi.fn(async () => null),
+            launch,
+            readOwner: vi.fn(async () => null),
+            writeOwner: vi.fn(async () => {
+              throw new Error("atomic owner write failed");
+            }),
+          },
+        ),
+      ).rejects.toThrow(/atomic owner write failed/i);
+      expect(launch).toHaveBeenCalledOnce();
+      expect(chrome.kill).toHaveBeenCalledOnce();
+      expect(await readOracleChromeOwner(profileDir)).toBeNull();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
@@ -350,9 +370,9 @@ describe("manual Chrome owner acquisition", () => {
   test("blocks instead of launching when a reachable endpoint lacks exact profile ownership", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-unverified-owner-"));
     try {
-      await writeDevToolsActivePort(profileDir, 45_681);
+      await writeNativeDevToolsActivePort(profileDir, 45_681);
       const launch = vi.fn();
-      const writePid = vi.fn(writeChromePid);
+      const writeOwner = vi.fn(writeOracleChromeOwner);
 
       await expect(
         acquireManualChromeOwner(
@@ -364,12 +384,12 @@ describe("manual Chrome owner acquisition", () => {
             discoverExactProfileChrome: vi.fn(async () => null),
             launch,
             probe: vi.fn(async () => ({ ok: true as const })),
-            writePid,
+            writeOwner,
           },
         ),
       ).rejects.toThrow(/exact Chrome process\/profile owner could not be verified/i);
       expect(launch).not.toHaveBeenCalled();
-      expect(writePid).not.toHaveBeenCalled();
+      expect(writeOwner).not.toHaveBeenCalled();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }

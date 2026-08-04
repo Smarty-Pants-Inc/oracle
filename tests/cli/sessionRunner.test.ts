@@ -25,12 +25,17 @@ vi.mock("../../src/browser/sessionRunner.ts", () => ({
 vi.mock("../../src/browser/reattach.ts", () => ({
   resumeBrowserSession: vi.fn(),
 }));
-vi.mock("../../src/cli/durableAnswer.ts", () => ({
-  persistDurableBrowserAnswer: vi.fn(),
-}));
+const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
+vi.mock("../../src/cli/durableAnswer.ts", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../../src/cli/durableAnswer.ts");
+  return {
+    ...actual,
+    persistDurableBrowserAnswer: persistDurableBrowserAnswerMock,
+  };
+});
 
 vi.mock("../../src/cli/notifier.ts", () => ({
-  sendSessionNotification: vi.fn(),
+  sendSessionNotification: vi.fn(async () => undefined),
   deriveNotificationSettingsFromMetadata: vi.fn(() => ({ enabled: true, sound: false })),
 }));
 
@@ -97,7 +102,6 @@ const baseRunOptions = {
 };
 
 const committedDemoAuthority = {
-  promptSubmitted: true,
   conversationId: "demo",
   promptEpoch: {
     status: "committed" as const,
@@ -107,6 +111,8 @@ const committedDemoAuthority = {
     followUpOrdinal: 0,
     remainingFollowUps: 0,
     verifiedUserTurnIndex: 1,
+    verifiedUserTurnId: "turn-1",
+    verifiedUserMessageId: "message-1",
     conversationId: "demo",
   },
 } satisfies BrowserRuntimeMetadata;
@@ -121,20 +127,18 @@ function createReattachResult(
   answerMarkdown: string,
   runtime: BrowserRuntimeMetadata,
 ) {
-  const capturedRuntime =
-    runtime.recoveryCleanup || runtime.recoveryCleanupBacklog?.length
-      ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
-      : runtime;
+  const capturedRuntime = runtime.recoveryCleanupResources?.length
+    ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
+    : runtime;
   const finalizedRuntime = { ...capturedRuntime };
-  delete finalizedRuntime.recoveryCleanup;
-  delete finalizedRuntime.recoveryCleanupBacklog;
+  delete finalizedRuntime.recoveryCleanupResources;
   delete finalizedRuntime.recoveryCleanupResult;
   const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
-  const abandon = vi.fn(async () => undefined);
+  const abort = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
   return {
-    value: { answerText, answerMarkdown, runtime: capturedRuntime, finalize, abandon },
+    value: { answerText, answerMarkdown, runtime: capturedRuntime, finalize, abort },
     finalize,
-    abandon,
+    abort,
   };
 }
 
@@ -205,6 +209,7 @@ beforeEach(() => {
     rejected: [],
     elapsedMs: 0,
   });
+  sessionStoreMock.updateModelRun.mockResolvedValue(undefined);
   sessionStoreMock.createLogWriter.mockReturnValue({
     logLine: vi.fn(),
     writeChunk: vi.fn(),
@@ -1095,12 +1100,20 @@ describe("performSessionRun", () => {
       chromePort: 9222,
       userDataDir: "/tmp/profile",
       chromeTargetId: "owned-target",
-      recoveryCleanup: {
-        transport: "local",
-        ownsTarget: true,
-        profileKind: "temporary",
-        keepBrowser: false,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePid: 123,
+          chromePort: 9222,
+          userDataDir: "/tmp/profile",
+          chromeTargetId: "owned-target",
+          recoveryCleanup: {
+            transport: "local",
+            ownsTarget: true,
+            profileKind: "temporary",
+            keepBrowser: false,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" },
     };
     const finalizedRuntime: BrowserRuntimeMetadata = {
@@ -1135,6 +1148,7 @@ describe("performSessionRun", () => {
         },
       ],
       answerText: "Answer",
+      promptText: "Normalized submitted prompt",
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
       finalize,
       abort,
@@ -1187,6 +1201,9 @@ describe("performSessionRun", () => {
       sessionId: baseSessionMeta.id,
       answer: "Answer",
     });
+    expect(vi.mocked(ensureSessionArtifacts)).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "Normalized submitted prompt" }),
+    );
     expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
@@ -1206,7 +1223,7 @@ describe("performSessionRun", () => {
       "gpt-5.2-pro",
       expect.objectContaining({ status: "completed" }),
     );
-    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeLessThan(
       vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
     );
     expect(vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1)).toBeGreaterThan(
@@ -1219,12 +1236,23 @@ describe("performSessionRun", () => {
   test("persists retryable cleanup authority when browser finalization throws", async () => {
     const runtime: BrowserRuntimeMetadata = {
       chromeTargetId: "remote-finalize-target",
-      recoveryCleanup: {
-        transport: "remote",
-        ownsTarget: true,
-        profileKind: "none",
-        keepBrowser: false,
-      },
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: "remote-finalize-target",
+          remoteRecovery: {
+            protocolVersion: 2,
+            host: "bridge.example:9443",
+            transactionToken: "a".repeat(64),
+            state: "pending",
+          },
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" },
       remoteRecovery: {
         protocolVersion: 2,
@@ -1264,26 +1292,29 @@ describe("performSessionRun", () => {
         runtime: {
           chromeTargetId: "remote-finalize-target",
           remoteRecovery: { transactionToken: "a".repeat(64), state: "pending" },
-          recoveryCleanupResult: {
-            status: "failed",
-            error: expect.stringContaining("bridge temporarily unavailable"),
-          },
+          recoveryCleanupResult: { status: "pending" },
         },
       },
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("cleanup remains pending"));
   });
-  test("retains the answer receipt when terminal metadata publication fails", async () => {
+  test("aborts after terminal metadata publication fails and retains the answer receipt", async () => {
     const pendingRuntime: BrowserRuntimeMetadata = {
       chromePort: 9222,
       chromeTargetId: "fallback-target",
       tabUrl: "https://chatgpt.com/c/fallback-answer",
-      recoveryCleanup: {
-        transport: "remote",
-        ownsTarget: true,
-        profileKind: "none",
-        keepBrowser: false,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeTargetId: "fallback-target",
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" },
     };
     const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
@@ -1319,7 +1350,7 @@ describe("performSessionRun", () => {
     ).rejects.toThrow("terminal metadata disk full");
 
     expect(finalize).not.toHaveBeenCalled();
-    expect(abort).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledOnce();
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
       (call) => call[1]?.status === "completed",
     );
@@ -1330,14 +1361,7 @@ describe("performSessionRun", () => {
     const errorUpdate = sessionStoreMock.updateSession.mock.calls[errorCallIndex]?.[1];
     expect(errorUpdate).toMatchObject({
       status: "error",
-      browser: {
-        runtime: {
-          chromeTargetId: "fallback-target",
-          tabUrl: "https://chatgpt.com/c/fallback-answer",
-          recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
-          recoveryCleanupResult: { status: "pending" },
-        },
-      },
+      browser: { runtime: {} },
       artifacts: [
         expect.objectContaining({
           path: "/tmp/durable-browser-answer.md",
@@ -1347,7 +1371,7 @@ describe("performSessionRun", () => {
     });
   });
 
-  test("publishes the answer receipt before optional model-run completion fails", async () => {
+  test("keeps the published answer completed when optional model-run projection fails", async () => {
     const runtime: BrowserRuntimeMetadata = {
       chromePort: 9222,
       chromeTargetId: "model-run-target",
@@ -1369,18 +1393,16 @@ describe("performSessionRun", () => {
       }
     });
 
-    await expect(
-      performSessionRun({
-        sessionMeta: baseSessionMeta,
-        runOptions: baseRunOptions,
-        mode: "browser",
-        browserConfig: { chromePath: null },
-        cwd: "/tmp",
-        log,
-        write,
-        version: cliVersion,
-      }),
-    ).rejects.toThrow("model run metadata disk full");
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
 
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
       (call) => call[1]?.status === "completed",
@@ -1396,16 +1418,10 @@ describe("performSessionRun", () => {
     ).toBeLessThan(
       sessionStoreMock.updateModelRun.mock.invocationCallOrder[completedModelRunIndex] ?? 0,
     );
-    expect(errorUpdate).toMatchObject({
-      artifacts: [
-        expect.objectContaining({
-          path: "/tmp/durable-browser-answer.md",
-          sha256: "answer-sha256",
-        }),
-      ],
-    });
-    expect(finalize).not.toHaveBeenCalled();
+    expect(errorUpdate).toBeUndefined();
+    expect(finalize).toHaveBeenCalledOnce();
     expect(abort).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("model-run projection failed"));
   });
 
   test("aborts and preserves browser authority when durable answer persistence fails", async () => {
@@ -1413,12 +1429,18 @@ describe("performSessionRun", () => {
       chromePort: 9222,
       chromeTargetId: "durability-target",
       tabUrl: "https://chatgpt.com/c/durability-answer",
-      recoveryCleanup: {
-        transport: "remote",
-        ownsTarget: true,
-        profileKind: "none",
-        keepBrowser: false,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeTargetId: "durability-target",
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" },
     };
     const retainedRuntime: BrowserRuntimeMetadata = {
@@ -1468,7 +1490,11 @@ describe("performSessionRun", () => {
       browser: {
         runtime: {
           chromeTargetId: "durability-target",
-          recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
+            }),
+          ],
           recoveryCleanupResult: { status: "failed", error: "target retained for retry" },
         },
       },
@@ -1597,7 +1623,7 @@ describe("performSessionRun", () => {
       ...baseSessionMeta,
       browser: {
         config: { desiredModel: "Old Pro" },
-        runtime: { promptSubmitted: true, tabUrl: "https://chatgpt.com/c/old" },
+        runtime: { tabUrl: "https://chatgpt.com/c/old" },
         modelSelection: {
           requestedModel: "Old Pro",
           resolvedLabel: "Old Pro",
@@ -1663,7 +1689,6 @@ describe("performSessionRun", () => {
           chromeHost: "127.0.0.1",
           tabUrl: "https://chatgpt.com/c/demo",
           conversationId: "demo",
-          promptSubmitted: false,
           promptEpoch: {
             status: "pending",
             epochId: "epoch-demo-pending",
@@ -1705,7 +1730,6 @@ describe("performSessionRun", () => {
       browser: expect.objectContaining({
         config: expect.any(Object),
         runtime: expect.objectContaining({
-          promptSubmitted: false,
           tabUrl: "https://chatgpt.com/c/demo",
           promptEpoch: expect.objectContaining({ status: "pending", baselineTurns: 0 }),
         }),
@@ -1788,7 +1812,7 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("Auto-reattach attempt 1");
   });
 
-  test("rejects legacy promptSubmitted authority without a committed prompt epoch", async () => {
+  test("rejects epoch-less recovery authority", async () => {
     const automationError = new BrowserAutomationError("Chrome disconnected", {
       stage: "connection-lost",
       recoverableDisconnect: true,
@@ -1798,7 +1822,6 @@ describe("performSessionRun", () => {
         chromeHost: "127.0.0.1",
         chromeTargetId: "TARGET-1",
         tabUrl: "https://chatgpt.com/c/demo",
-        promptSubmitted: true,
       },
     });
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
@@ -1839,7 +1862,6 @@ describe("performSessionRun", () => {
           chromePort: 9222,
           chromeHost: "127.0.0.1",
           tabUrl: "https://chatgpt.com/c/demo",
-          promptSubmitted: true,
         },
       },
     );
@@ -1958,12 +1980,19 @@ describe("performSessionRun", () => {
       chromeTargetId: "TARGET-1",
       tabUrl: "https://chatgpt.com/c/demo",
       ...committedDemoAuthority,
-      recoveryCleanup: {
-        transport: "remote" as const,
-        ownsTarget: false,
-        profileKind: "none" as const,
-        keepBrowser: true,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "TARGET-1",
+          recoveryCleanup: {
+            transport: "remote" as const,
+            ownsTarget: false,
+            profileKind: "none" as const,
+            keepBrowser: true,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" as const },
     } satisfies BrowserRuntimeMetadata;
     const reattach = createReattachResult(
@@ -1997,7 +2026,7 @@ describe("performSessionRun", () => {
       browser: { runtime: recoveredRuntime },
     });
     expect(reattach.finalize).toHaveBeenCalledOnce();
-    expect(reattach.abandon).not.toHaveBeenCalled();
+    expect(reattach.abort).not.toHaveBeenCalled();
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain("Auto-reattach succeeded; session marked completed.");
   });
@@ -2345,12 +2374,19 @@ describe("performSessionRun", () => {
       chromeTargetId: "TARGET-1",
       tabUrl: "https://chatgpt.com/c/demo",
       ...committedDemoAuthority,
-      recoveryCleanup: {
-        transport: "remote" as const,
-        ownsTarget: false,
-        profileKind: "none" as const,
-        keepBrowser: true,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "TARGET-1",
+          recoveryCleanup: {
+            transport: "remote" as const,
+            ownsTarget: false,
+            profileKind: "none" as const,
+            keepBrowser: true,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" as const },
     } satisfies BrowserRuntimeMetadata;
     const reattach = createReattachResult("ok text", "ok markdown", recoveredRuntime);
@@ -2413,7 +2449,7 @@ describe("performSessionRun", () => {
         response: { status: "incomplete", incompleteReason: "incomplete-capture" },
       }),
     ]);
-    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeLessThan(
       vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
     );
     expect(reattach.finalize).toHaveBeenCalledOnce();
@@ -2422,16 +2458,19 @@ describe("performSessionRun", () => {
       answer: "ok markdown",
       logHeader: "[auto-reattach] captured assistant response on attempt 1",
     });
+    expect(
+      vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(true);
     expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
     expect(reattach.finalize.mock.invocationCallOrder[0]).toBeGreaterThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
-    expect(reattach.abandon).not.toHaveBeenCalled();
+    expect(reattach.abort).not.toHaveBeenCalled();
   });
 
-  test("abandons auto-reattach when durable answer persistence fails", async () => {
+  test("aborts auto-reattach when durable answer persistence fails", async () => {
     const automationError = new BrowserAutomationError("assistant timed out", {
       stage: "assistant-timeout",
       runtime: {
@@ -2448,12 +2487,19 @@ describe("performSessionRun", () => {
       chromeTargetId: "TARGET-1",
       tabUrl: "https://chatgpt.com/c/demo",
       ...committedDemoAuthority,
-      recoveryCleanup: {
-        transport: "remote" as const,
-        ownsTarget: false,
-        profileKind: "none" as const,
-        keepBrowser: true,
-      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "TARGET-1",
+          recoveryCleanup: {
+            transport: "remote" as const,
+            ownsTarget: false,
+            profileKind: "none" as const,
+            keepBrowser: true,
+          },
+        },
+      ],
       recoveryCleanupResult: { status: "pending" as const },
     } satisfies BrowserRuntimeMetadata;
     const reattach = createReattachResult("ok text", "ok markdown", recoveredRuntime);
@@ -2483,14 +2529,20 @@ describe("performSessionRun", () => {
     expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
       status: "error",
       errorMessage: "answer fsync failed",
-      browser: { runtime: recoveredRuntime },
+      browser: { runtime: expect.objectContaining({ chromeTargetId: "TARGET-1" }) },
       response: { status: "error", incompleteReason: "incomplete-capture" },
     });
-    expect(reattach.abandon).toHaveBeenCalledOnce();
+    expect(
+      sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]?.browser?.runtime,
+    ).not.toHaveProperty("recoveryCleanupResources");
+    expect(reattach.abort).toHaveBeenCalledOnce();
     expect(reattach.finalize).not.toHaveBeenCalled();
-    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeLessThan(
-      reattach.abandon.mock.invocationCallOrder[0] ?? 0,
+    expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      reattach.abort.mock.invocationCallOrder[0] ?? 0,
     );
+    expect(
+      vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(false);
   });
 
   test("auto-reattach stops after a hard cap when it cannot capture an answer", async () => {

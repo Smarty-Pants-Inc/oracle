@@ -74,8 +74,7 @@ import {
   isSafeChromeTerminationOutcome,
   terminateRecordedChromeForProfile,
   removeProfileDirectoryIfIdentityMatches,
-  writeChromePid,
-  writeChromeProcessIdentity,
+  writeOracleChromeOwner,
 } from "./profileState.js";
 import {
   connectionLostUserMessage,
@@ -1334,54 +1333,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   }
   const { chrome, source: chromeOwnerSource } = acquiredChrome;
   const chromeHost = chrome.host ?? "127.0.0.1";
-  if (!manualLogin && chrome.pid) {
-    await writeChromePid(userDataDir, chrome.pid);
-    try {
-      await writeChromeProcessIdentity(userDataDir, chrome.processIdentity);
-    } catch (error) {
-      const termination = await chrome.kill().catch((terminationError: unknown) => ({
-        status: "unsafe" as const,
-        pid: chrome.pid,
-        reason:
-          terminationError instanceof Error ? terminationError.message : String(terminationError),
-      }));
-      const safelyStopped = isSafeChromeTerminationOutcome(termination);
-      const profileRemoved = safelyStopped
-        ? await removeProfileDirectoryIfIdentityMatches(
-            userDataDir,
-            chrome.processIdentity.profileDirectory,
-          ).catch(() => false)
-        : false;
-      const cleanupError = !safelyStopped
-        ? termination.reason
-        : profileRemoved
-          ? undefined
-          : "Profile removal was not confirmed after Chrome termination";
-      if (!safelyStopped) detachKeptChromeProcess(chrome);
-      throw new BrowserAutomationError(
-        "Failed to persist Chrome process cleanup authority.",
-        {
-          stage: "chrome-process-identity-persistence",
-          runtime: {
-            chromePid: chrome.pid,
-            chromeProcessIdentity: chrome.processIdentity,
-            chromePort: chrome.port,
-            chromeHost,
-            userDataDir,
-            recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
-            recoveryCleanupResult: cleanupError
-              ? {
-                  status: "failed",
-                  error: cleanupError,
-                }
-              : undefined,
-            controllerPid: process.pid,
-          },
-        },
-        error,
-      );
-    }
-  }
   if (tabLease) {
     await tabLease.update({
       chromeHost,
@@ -1393,11 +1344,28 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     chromeProcessIdentity: chrome.processIdentity,
     chromePort: chrome.port,
     chromeHost,
+    chromeProfileRoot: userDataDir,
     userDataDir,
     chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
     tabUrl,
     conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
-    recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
+    recoveryCleanupResources: [
+      {
+        chromePid: chrome.pid,
+        chromeProcessIdentity: chrome.processIdentity,
+        profileDirectoryIdentity: chrome.processIdentity?.profileDirectory,
+        chromePort: chrome.port,
+        chromeHost,
+        chromeProfileRoot: userDataDir,
+        userDataDir,
+        chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
+        conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+        tabLease: tabLease
+          ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
+          : undefined,
+        recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
+      },
+    ],
     controllerPid: process.pid,
   });
   const lifecycle = new BrowserRunLifecycleController({
@@ -2860,7 +2828,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Chrome connection lost before completion: ${normalizedError.message}`);
       logger(normalizedError.stack);
     }
-    const assessment = await getDisconnectAssessment();
+    let assessment = await getDisconnectAssessment();
+    if (assessment.recoverable) {
+      try {
+        await writeOracleChromeOwner(userDataDir, {
+          port: chrome.port,
+          processIdentity: chrome.processIdentity,
+        });
+      } catch (ownerError) {
+        logger(
+          `[browser] Failed to persist retained Chrome owner authority: ${ownerError instanceof Error ? ownerError.message : String(ownerError)}`,
+        );
+        assessment = { ...assessment, recoverable: false };
+      }
+    }
     preserveBrowserOnError = assessment.recoverable;
     await emitRuntimeHint();
     const connectionLostDetails =
@@ -3110,6 +3091,9 @@ async function runRemoteBrowserMode(
   const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
+  const remoteLeaseProfileDir = config.browserTabRef
+    ? null
+    : resolveRemoteTabLeaseProfileDir(config);
 
   function buildRemoteRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
     return {
@@ -3130,7 +3114,22 @@ async function runRemoteBrowserMode(
     chromeTargetId: remoteTargetId ?? undefined,
     tabUrl,
     conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
-    recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
+    recoveryCleanupResources: [
+      {
+        chromePort: port,
+        chromeHost: host,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot,
+        profileDirectoryIdentity: tabLease?.profileDirectory,
+        userDataDir: remoteLeaseProfileDir ?? undefined,
+        chromeTargetId: remoteTargetId ?? undefined,
+        conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+        tabLease: tabLease
+          ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
+          : undefined,
+        recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
+      },
+    ],
     controllerPid: process.pid,
   });
   const runtimeHintCb = options.runtimeHintCb;
@@ -3238,9 +3237,6 @@ async function runRemoteBrowserMode(
   }
 
   try {
-    const remoteLeaseProfileDir = config.browserTabRef
-      ? null
-      : resolveRemoteTabLeaseProfileDir(config);
     if (remoteLeaseProfileDir) {
       await mkdir(remoteLeaseProfileDir, { recursive: true });
       tabLease = await acquireBrowserTabLease(remoteLeaseProfileDir, {

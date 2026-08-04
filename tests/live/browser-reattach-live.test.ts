@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { runBrowserMode } from "../../src/browser/index.js";
 import { resumeBrowserSession } from "../../src/browser/reattach.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import { getCookies } from "@steipete/sweet-cookie";
 import { acquireLiveTestLock, releaseLiveTestLock } from "./liveLock.js";
 
@@ -63,16 +64,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
         const promptToken = `live reattach pro ${Date.now()}`;
         const prompt = `${promptToken}\nRepeat the first line exactly. No other text.`;
         const log = createLogger();
-        let runtime: {
-          chromePid?: number;
-          chromePort?: number;
-          chromeHost?: string;
-          userDataDir?: string;
-          chromeTargetId?: string;
-          tabUrl?: string;
-          controllerPid?: number;
-          conversationId?: string;
-        } = {};
+        let runtime: BrowserRuntimeMetadata = {};
 
         let result: Awaited<ReturnType<typeof runBrowserMode>> | null = null;
         let lastErrorMessage = "";
@@ -138,14 +130,14 @@ function isMissingChatGptSessionError(error: unknown): boolean {
         }
 
         expect(result.answerText.toLowerCase()).toContain(promptToken.toLowerCase());
-        const tabUrl = result.tabUrl ?? selectedProjectUrl;
-        const conversationId = (() => {
-          const marker = "/c/";
-          const idx = tabUrl.indexOf(marker);
-          if (idx === -1) return undefined;
-          const rest = tabUrl.slice(idx + marker.length);
-          return rest.split(/[/?#]/)[0] || undefined;
-        })();
+        if (!result.tabUrl) {
+          throw new Error("Live reattach run did not return an exact conversation URL.");
+        }
+        if (!result.promptEpoch || result.promptEpoch.status !== "committed") {
+          throw new Error("Live reattach run did not return committed prompt authority.");
+        }
+        const tabUrl = result.tabUrl;
+        const conversationId = result.promptEpoch.conversationId;
 
         runtime = {
           chromePid: result.chromePid,
@@ -156,6 +148,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
           userDataDir: result.userDataDir,
           controllerPid: result.controllerPid,
           conversationId,
+          promptEpoch: result.promptEpoch,
         };
 
         if (runtime.chromePid) {
@@ -167,7 +160,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
         }
         await new Promise((resolve) => setTimeout(resolve, 1_000));
 
-        // Open a new browser and reattach via project list + prompt preview.
+        // Reopen the exact conversation authorized by the committed prompt epoch.
         const reattached = await resumeBrowserSession(
           {
             ...runtime,
@@ -176,7 +169,6 @@ function isMissingChatGptSessionError(error: unknown): boolean {
           },
           { chromeProfile: "Default", url: selectedProjectUrl, timeoutMs: 1_200_000 },
           Object.assign(createLogger(), { verbose: true }),
-          { promptPreview: promptToken },
         );
 
         expect(reattached.answerText.toLowerCase()).toContain(promptToken.toLowerCase());

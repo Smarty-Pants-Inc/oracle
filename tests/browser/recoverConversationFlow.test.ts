@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
@@ -12,6 +13,19 @@ const meta = {
     },
     runtime: {
       tabUrl: "https://chatgpt.com/c/saved-conversation",
+      conversationId: "saved-conversation",
+      promptEpoch: {
+        status: "committed",
+        epochId: "epoch-saved-conversation",
+        promptSha256: createHash("sha256").update("original prompt").digest("hex"),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "turn-0",
+        verifiedUserMessageId: "message-0",
+        conversationId: "saved-conversation",
+      },
     },
   },
 } as unknown as SessionMetadata;
@@ -22,6 +36,10 @@ const readyHarvest = {
   assistantFollowsLatestUser: true,
   lastAssistantTurnIndex: 1,
   lastUserTurnIndex: 0,
+  lastUserTurnId: "turn-0",
+  lastUserMessageId: "message-0",
+  conversationId: "saved-conversation",
+  lastUserText: "original prompt",
   stopExists: false,
   lastAssistantText: "Recovered answer",
   lastAssistantMarkdown: "Recovered answer",
@@ -54,7 +72,7 @@ describe("recoverConversationTab lease ownership", () => {
     const chrome = { host: "127.0.0.1", port: 53999, kill: vi.fn(), process: undefined };
     const acquireManualChromeOwner = vi.fn(async () => {
       events.push("owner");
-      return { chrome, source: "active-port" as const };
+      return { chrome, source: "recorded" as const };
     });
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
@@ -81,13 +99,72 @@ describe("recoverConversationTab lease ownership", () => {
       expect.objectContaining({ maxConcurrentTabs: 1, sessionId: "sess-recover" }),
     );
     expect(recovered.ref).toBe("target-reused");
-    await Promise.all([recovered.cleanup(), recovered.cleanup()]);
+    await expect(Promise.all([recovered.cleanup(), recovered.cleanup()])).resolves.toEqual([
+      { status: "completed" },
+      { status: "completed" },
+    ]);
     expect(closeChromeTarget).toHaveBeenCalledTimes(1);
     expect(closeChromeTarget).toHaveBeenCalledWith(
       expect.objectContaining({ host: "127.0.0.1", port: 53999, targetId: "target-reused" }),
     );
     expect(events).toEqual(["lease", "owner", "update", "close", "release"]);
     expect(chrome.kill).not.toHaveBeenCalled();
+  });
+
+  test("keeps target and lease authority pending until target cleanup is confirmed", async () => {
+    const profileDirectory = {
+      version: 1 as const,
+      platform: process.platform,
+      canonicalPath: "/tmp/recover-profile",
+      device: "1",
+      inode: "2",
+    };
+    const release = vi.fn(async () => undefined);
+    const acquireBrowserTabLease = vi.fn(async () => ({
+      id: "lease-retry",
+      profileDirectory,
+      update: vi.fn(async () => undefined),
+      release,
+    }));
+    const closeChromeTarget = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(async () => "target-retry"),
+      harvestChatGptTab: vi.fn(async () => readyHarvest),
+    }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+      acquireManualChromeOwner: vi.fn(async () => ({
+        chrome: { host: "127.0.0.1", port: 53994, kill: vi.fn() },
+        source: "recorded" as const,
+      })),
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
+    vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
+      DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
+      normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
+      acquireBrowserTabLease,
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
+
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    const recovered = await recoverConversationTab(meta, logger, { readyTimeoutMs: 1 });
+    await expect(recovered.cleanup()).resolves.toMatchObject({
+      status: "pending",
+      resource: {
+        chromeHost: "127.0.0.1",
+        chromePort: 53994,
+        chromeTargetId: "target-retry",
+        tabLease: { id: "lease-retry", profileDirectory },
+        recoveryCleanup: { ownsTarget: true },
+      },
+    });
+    expect(release).not.toHaveBeenCalled();
+
+    await expect(recovered.cleanup()).resolves.toEqual({ status: "completed" });
+    expect(closeChromeTarget).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   test("updates the lease with recovered target metadata and terminates only a last launched owner", async () => {
@@ -143,7 +220,11 @@ describe("recoverConversationTab lease ownership", () => {
 
   test("closes the owned target and releases its lease when readiness fails", async () => {
     const update = vi.fn(async () => undefined);
-    const release = vi.fn(async () => undefined);
+    const release = vi.fn(
+      async (options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> }) => {
+        await options?.onRelease?.({ isLastLease: true });
+      },
+    );
     const closeChromeTarget = vi.fn(async () => true);
     const acquireBrowserTabLease = vi.fn(async () => ({ id: "lease-error", update, release }));
     const chrome = {
@@ -257,7 +338,7 @@ describe("recoverConversationTab lease ownership", () => {
     vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
       acquireManualChromeOwner: vi.fn(async () => ({
         chrome: { host: "127.0.0.1", port: 53996, kill: vi.fn() },
-        source: "active-port" as const,
+        source: "recorded" as const,
       })),
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));

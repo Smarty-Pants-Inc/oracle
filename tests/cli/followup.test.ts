@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import {
   resolveBrowserFollowupReference,
   resolveBrowserResumeConversationUrl,
@@ -12,6 +13,28 @@ const baseMetadata: SessionMetadata = {
   options: {},
 };
 
+function committedRuntime(
+  conversationId: string,
+  runtime: Omit<BrowserRuntimeMetadata, "conversationId" | "promptEpoch"> = {},
+): BrowserRuntimeMetadata {
+  return {
+    ...runtime,
+    conversationId,
+    promptEpoch: {
+      status: "committed",
+      epochId: `epoch-${conversationId}`,
+      promptSha256: "a".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationId,
+    },
+  };
+}
+
 describe("browser follow-up resolution", () => {
   test("derives a resume URL from conversationId", () => {
     const metadata: SessionMetadata = {
@@ -19,7 +42,7 @@ describe("browser follow-up resolution", () => {
       mode: "browser",
       browser: {
         config: { url: "https://chatgpt.com/" },
-        runtime: { conversationId: "abc-123" },
+        runtime: committedRuntime("abc-123"),
       },
     };
 
@@ -31,7 +54,9 @@ describe("browser follow-up resolution", () => {
       ...baseMetadata,
       mode: "browser",
       browser: {
-        runtime: { tabUrl: "https://chatgpt.com/c/live-thread" },
+        runtime: committedRuntime("live-thread", {
+          tabUrl: "https://chatgpt.com/c/live-thread",
+        }),
       },
     };
 
@@ -52,7 +77,7 @@ describe("browser follow-up resolution", () => {
           researchMode: "deep",
           archiveConversations: "auto",
         },
-        runtime: { conversationId: "resume-me" },
+        runtime: committedRuntime("resume-me"),
       },
     };
     const store = { readSession: vi.fn(async () => metadata) };
@@ -94,21 +119,30 @@ describe("browser follow-up resolution", () => {
     const store = { readSession: vi.fn(async () => metadata) };
 
     await expect(resolveBrowserFollowupReference("missing-url", store)).rejects.toThrow(
-      /does not contain a ChatGPT conversation URL.*oracle status/s,
+      /structurally valid committed prompt epoch.*oracle status/s,
     );
   });
 
-  test("prefers the harvested URL over a stale runtime tab URL", () => {
+  test("uses a harvested URL only when it matches the committed epoch", () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
       browser: {
         harvest: { url: "https://chatgpt.com/c/harvested" },
-        runtime: { tabUrl: "https://chatgpt.com/c/stale-runtime" },
+        runtime: committedRuntime("harvested"),
       },
     };
 
     expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/harvested");
+  });
+
+  test("rejects epoch-less browser locator fields", () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: { runtime: { conversationId: "legacy-only" } },
+    };
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
   });
 
   test.each([
@@ -138,6 +172,8 @@ describe("browser follow-up resolution", () => {
               followUpOrdinal: 0,
               remainingFollowUps: 0,
               verifiedUserTurnIndex: 0,
+              verifiedUserTurnId: "turn-0",
+              verifiedUserMessageId: "message-0",
               conversationId: "committed-id",
             },
           },
@@ -164,6 +200,8 @@ describe("browser follow-up resolution", () => {
             followUpOrdinal: 0,
             remainingFollowUps: 0,
             verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
             conversationId: "committed-id",
           },
         },
@@ -218,7 +256,7 @@ describe("browser follow-up resolution", () => {
 
     const store = { readSession: vi.fn(async () => metadata) };
     await expect(resolveBrowserFollowupReference("external-url", store)).rejects.toThrow(
-      /does not contain a ChatGPT conversation URL/s,
+      /structurally valid committed prompt epoch/s,
     );
   });
 
@@ -237,22 +275,21 @@ describe("browser follow-up resolution", () => {
 
     const store = { readSession: vi.fn(async () => metadata) };
     await expect(resolveBrowserFollowupReference("project-shell", store)).rejects.toThrow(
-      /does not contain a ChatGPT conversation URL/s,
+      /structurally valid committed prompt epoch/s,
     );
   });
 
-  test("rejects a conversationId fallback when the base URL is not ChatGPT", () => {
+  test("uses the canonical ChatGPT URL when the committed epoch is exact", () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
       browser: {
         config: { url: "https://evil.example.com/" },
-        runtime: { conversationId: "abc-123" },
+        runtime: committedRuntime("abc-123"),
       },
     };
 
-    // conversationId would rebuild against the stored base; the gate must reject a non-ChatGPT host.
-    expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/abc-123");
   });
 
   test("rejects insecure or non-default-port conversation URLs", () => {
@@ -260,10 +297,11 @@ describe("browser follow-up resolution", () => {
       "http://chatgpt.com/c/insecure",
       "https://chatgpt.com:444/c/wrong-port",
     ]) {
+      const conversationId = tabUrl.includes("insecure") ? "insecure" : "wrong-port";
       const metadata: SessionMetadata = {
         ...baseMetadata,
         mode: "browser",
-        browser: { runtime: { tabUrl } },
+        browser: { runtime: committedRuntime(conversationId, { tabUrl }) },
       };
       expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
     }

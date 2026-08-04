@@ -7,24 +7,22 @@ import {
   findRunningChromeDebugTargetForProfile,
   isSafeChromeTerminationOutcome,
   isProcessAlive,
-  readChromePid,
-  readChromeProcessIdentity,
   readDevToolsPort,
+  readOracleChromeOwner,
   sameChromeProcessIdentity,
   sameProfileDirectoryIdentity,
   verifyChromeProcessIdentity,
   verifyDevToolsReachable,
   verifyProfileDirectoryIdentity,
-  writeChromePid,
-  writeChromeProcessIdentity,
-  writeDevToolsActivePort,
+  writeOracleChromeOwner,
   type ChromeProcessIdentity,
+  type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
 import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
 import { delay } from "./utils.js";
 
-export type ManualChromeOwnerSource = "active-port" | "rediscovered" | "launched";
+export type ManualChromeOwnerSource = "recorded" | "rediscovered" | "launched";
 
 export type BrowserChrome = ChromeLaunchResult;
 
@@ -42,18 +40,16 @@ export interface ManualChromeOwnerDeps {
   isOwnerProcessAlive?: typeof isProcessAlive;
   launch?: typeof launchChrome;
   probe?: typeof verifyDevToolsReachable;
-  readIdentity?: typeof readChromeProcessIdentity;
-  readPid?: typeof readChromePid;
+  readOwner?: typeof readOracleChromeOwner;
   readPort?: typeof readDevToolsPort;
   verifyIdentity?: typeof verifyChromeProcessIdentity;
-  writeIdentity?: typeof writeChromeProcessIdentity;
-  writePid?: typeof writeChromePid;
-  writePort?: typeof writeDevToolsActivePort;
+  writeOwner?: typeof writeOracleChromeOwner;
 }
 
 /**
  * Acquire the one canonical Chrome process for a persistent manual-login profile.
- * Tab leases are deliberately separate: they authorize tabs, never another browser process.
+ * The atomic Oracle owner record is authoritative; DevToolsActivePort is only a discovery hint.
+ * Tab leases authorize tabs, never another browser process.
  */
 export async function acquireManualChromeOwner(
   profileDir: string,
@@ -130,7 +126,7 @@ export async function acquireManualChromeOwner(
         pid = requirePositiveInteger(chrome.pid, "pid", profileDir);
         port = requirePositiveInteger(chrome.port, "DevTools port", profileDir);
         processIdentity = requireProcessIdentity(chrome.processIdentity, pid, profileDir);
-        await persistCanonicalOwner(profileDir, { pid, port, processIdentity }, deps);
+        await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
       } catch (error) {
         const termination = await chrome.kill().catch(() => ({
           status: "unsafe" as const,
@@ -208,12 +204,41 @@ async function findExistingManualChromeOwner(
     );
   }
   const readPort = deps.readPort ?? readDevToolsPort;
-  const readPid = deps.readPid ?? readChromePid;
-  const readIdentity = deps.readIdentity ?? readChromeProcessIdentity;
+  const readOwner = deps.readOwner ?? readOracleChromeOwner;
   const verifyIdentity = deps.verifyIdentity ?? verifyChromeProcessIdentity;
   const discoverExact = deps.discoverExactProfileChrome ?? findRunningChromeDebugTargetForProfile;
   const probe = deps.probe ?? verifyDevToolsReachable;
   const ownerProcessAlive = deps.isOwnerProcessAlive ?? isProcessAlive;
+
+  const recordedOwner = await readOwner(profileDir);
+  const recordedIdentity = recordedOwner?.processIdentity;
+  const recordedIdentityVerified = Boolean(
+    recordedIdentity &&
+    sameProfileDirectoryIdentity(recordedIdentity.profileDirectory, expectedProfileDirectory) &&
+    (await verifyIdentity(profileDir, recordedIdentity)),
+  );
+  if (recordedOwner && recordedIdentity && recordedIdentityVerified) {
+    const recordedPort = requirePositiveInteger(
+      recordedOwner.port,
+      "recorded DevTools port",
+      profileDir,
+    );
+    const recordedPid = requirePositiveInteger(recordedIdentity.pid, "recorded pid", profileDir);
+    const reachable = await probe({ port: recordedPort });
+    if (!reachable.ok) {
+      throw new Error(
+        `Verified Chrome owner for ${profileDir} is running as pid ${recordedPid}, but DevTools port ${recordedPort} is unreachable (${reachable.error}); refusing to launch a second browser process`,
+      );
+    }
+    logger(
+      `Reusing canonical Chrome owner for ${profileDir} (DevTools port ${recordedPort}, pid ${recordedPid})`,
+    );
+    return {
+      chrome: reusableChrome(recordedPort, recordedPid, recordedIdentity),
+      processIdentity: recordedIdentity,
+      source: "recorded",
+    };
+  }
 
   let activePort = await readPort(profileDir);
   const waitMs = Math.max(0, waitForPortMs ?? 0);
@@ -224,35 +249,6 @@ async function findExistingManualChromeOwner(
       await delay(250);
       activePort = await readPort(profileDir);
     }
-  }
-
-  const recordedPid = await readPid(profileDir);
-  const recordedIdentity = await readIdentity(profileDir);
-  const recordedIdentityVerified = Boolean(
-    recordedIdentity &&
-    sameProfileDirectoryIdentity(recordedIdentity.profileDirectory, expectedProfileDirectory) &&
-    (await verifyIdentity(profileDir, recordedIdentity)),
-  );
-  if (
-    activePort &&
-    recordedPid &&
-    recordedIdentity?.pid === recordedPid &&
-    recordedIdentityVerified
-  ) {
-    const reachable = await probe({ port: activePort });
-    if (!reachable.ok) {
-      throw new Error(
-        `Verified Chrome owner for ${profileDir} is running as pid ${recordedPid}, but DevTools port ${activePort} is unreachable (${reachable.error}); refusing to launch a second browser process`,
-      );
-    }
-    logger(
-      `Reusing canonical Chrome owner for ${profileDir} (DevTools port ${activePort}, pid ${recordedPid})`,
-    );
-    return {
-      chrome: reusableChrome(activePort, recordedPid, recordedIdentity),
-      processIdentity: recordedIdentity,
-      source: "active-port",
-    };
   }
 
   const discovered = await discoverExact(profileDir);
@@ -276,7 +272,7 @@ async function findExistingManualChromeOwner(
         `Rediscovered Chrome owner belongs to a different physical profile generation.`,
       );
     }
-    await persistCanonicalOwner(profileDir, { pid, port, processIdentity }, deps);
+    await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
     logger(`Rediscovered exact Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
     return {
       chrome: reusableChrome(port, pid, processIdentity),
@@ -293,14 +289,14 @@ async function findExistingManualChromeOwner(
       );
     }
   }
-  const possiblyLivePid = recordedIdentity?.pid ?? recordedPid;
+  const possiblyLivePid = recordedIdentity?.pid;
   if (possiblyLivePid && ownerProcessAlive(possiblyLivePid)) {
     throw new Error(
       `Recorded Chrome owner pid ${possiblyLivePid} is still alive for ${profileDir}, but no exact reachable profile owner was verified; refusing to launch a second browser process`,
     );
   }
 
-  if (activePort || recordedPid || recordedIdentity) {
+  if (activePort || recordedOwner) {
     const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(
       profileDir,
       logger,
@@ -320,32 +316,34 @@ async function findExistingManualChromeOwner(
 
 async function persistCanonicalOwner(
   profileDir: string,
-  owner: { pid: number; port: number; processIdentity: ChromeProcessIdentity },
+  owner: OracleChromeOwnerRecord,
   deps: ManualChromeOwnerDeps,
 ): Promise<void> {
-  const writePort = deps.writePort ?? writeDevToolsActivePort;
-  const writePid = deps.writePid ?? writeChromePid;
-  const writeIdentity = deps.writeIdentity ?? writeChromeProcessIdentity;
-  const readIdentity = deps.readIdentity ?? readChromeProcessIdentity;
-  const readPort = deps.readPort ?? readDevToolsPort;
-  const readPid = deps.readPid ?? readChromePid;
+  const writeOwner = deps.writeOwner ?? writeOracleChromeOwner;
+  const readOwner = deps.readOwner ?? readOracleChromeOwner;
   const verifyIdentity = deps.verifyIdentity ?? verifyChromeProcessIdentity;
+  const pid = owner.processIdentity.pid;
 
-  requireProcessIdentity(owner.processIdentity, owner.pid, profileDir);
-  const persistedIdentity = await readIdentity(profileDir);
-  if (!persistedIdentity || !sameChromeProcessIdentity(persistedIdentity, owner.processIdentity)) {
-    await writeIdentity(profileDir, owner.processIdentity);
+  requirePositiveInteger(owner.port, "DevTools port", profileDir);
+  requireProcessIdentity(owner.processIdentity, pid, profileDir);
+  const persistedOwner = await readOwner(profileDir);
+  if (
+    !persistedOwner ||
+    persistedOwner.port !== owner.port ||
+    !sameChromeProcessIdentity(persistedOwner.processIdentity, owner.processIdentity)
+  ) {
+    await writeOwner(profileDir, owner);
   }
-  await writePort(profileDir, owner.port);
-  await writePid(profileDir, owner.pid);
-  const [persistedPort, persistedPid, identityVerified] = await Promise.all([
-    readPort(profileDir),
-    readPid(profileDir),
-    verifyIdentity(profileDir, owner.processIdentity),
-  ]);
-  if (persistedPort !== owner.port || persistedPid !== owner.pid || !identityVerified) {
+  const verifiedOwner = await readOwner(profileDir);
+  const identityVerified = await verifyIdentity(profileDir, owner.processIdentity);
+  if (
+    !verifiedOwner ||
+    verifiedOwner.port !== owner.port ||
+    !sameChromeProcessIdentity(verifiedOwner.processIdentity, owner.processIdentity) ||
+    !identityVerified
+  ) {
     throw new Error(
-      `Failed to persist canonical Chrome owner authority for ${profileDir} (expected pid ${owner.pid}, port ${owner.port}; found pid ${persistedPid ?? "missing"}, port ${persistedPort ?? "missing"}, identity ${identityVerified ? "verified" : "unverified"})`,
+      `Failed to persist canonical Chrome owner authority for ${profileDir} (expected pid ${pid}, port ${owner.port}; found pid ${verifiedOwner?.processIdentity.pid ?? "missing"}, port ${verifiedOwner?.port ?? "missing"}, identity ${identityVerified ? "verified" : "unverified"})`,
     );
   }
 }

@@ -1,10 +1,14 @@
-import { access, readFile, realpath, rm, stat } from "node:fs/promises";
+import { access, realpath, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
 import type { BrowserRecoveryCleanupMetadata } from "../../src/sessionManager.js";
-import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
+import {
+  readOracleChromeOwner,
+  type ChromeProcessIdentity,
+} from "../../src/browser/profileState.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 type BrowserAutomationErrorConstructor = new (
   message: string,
@@ -147,7 +151,10 @@ async function withRemoteLateDisconnectFixture(
         status: "committed" as const,
         verification: {
           committedTurns: 1,
+          promptSha256: promptIdentitySha256("keep this submitted conversation"),
           verifiedUserTurnIndex: 0,
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
           conversationId: targetId,
         },
       };
@@ -261,7 +268,10 @@ async function withDisconnectFixture(
     }
     return {
       committedTurns: 2,
+      promptSha256: promptIdentitySha256("keep this submitted conversation"),
       verifiedUserTurnIndex: 1,
+      verifiedUserTurnId: "turn-1",
+      verifiedUserMessageId: "message-1",
       conversationId: targetId,
     };
   });
@@ -408,7 +418,6 @@ describe("recoverable disconnect lifecycle", () => {
           stage: "connection-lost",
           recoverableDisconnect: true,
           runtime: {
-            promptSubmitted: true,
             chromePid: 1234,
             chromeProcessIdentity: fixture.processIdentity,
             conversationId: targetId,
@@ -420,27 +429,46 @@ describe("recoverable disconnect lifecycle", () => {
               followUpOrdinal: 0,
               remainingFollowUps: 0,
               verifiedUserTurnIndex: 1,
+              verifiedUserTurnId: "turn-1",
+              verifiedUserMessageId: "message-1",
               conversationId: targetId,
             },
-            recoveryCleanup: {
-              transport: "local",
-              ownsTarget: true,
-              profileKind: "temporary",
-              keepBrowser: false,
-            } satisfies BrowserRecoveryCleanupMetadata,
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromePid: 1234,
+                chromeProcessIdentity: fixture.processIdentity,
+                profileDirectoryIdentity: fixture.processIdentity.profileDirectory,
+                chromePort: 9230,
+                chromeHost: "127.0.0.1",
+                chromeProfileRoot: fixture.profileDir,
+                userDataDir: fixture.profileDir,
+                chromeTargetId: targetId,
+                conversationId: targetId,
+                promptEpoch: expect.objectContaining({
+                  status: "committed",
+                  verifiedUserTurnId: "turn-1",
+                  verifiedUserMessageId: "message-1",
+                  conversationId: targetId,
+                }),
+                recoveryCleanup: {
+                  transport: "local",
+                  ownsTarget: true,
+                  profileKind: "temporary",
+                  keepBrowser: false,
+                  closeOwnedTargetOnComplete: false,
+                } satisfies BrowserRecoveryCleanupMetadata,
+              }),
+            ],
           },
         },
       });
       expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
       expect(fixture.kill).not.toHaveBeenCalled();
       await expect(access(fixture.profileDir)).resolves.toBeUndefined();
-      await expect(readFile(path.join(fixture.profileDir, "chrome.pid"), "utf8")).resolves.toBe(
-        "1234\n",
-      );
-      const persistedIdentity = JSON.parse(
-        await readFile(path.join(fixture.profileDir, "chrome-process-identity.json"), "utf8"),
-      ) as unknown;
-      expect(persistedIdentity).toEqual(fixture.processIdentity);
+      await expect(readOracleChromeOwner(fixture.profileDir)).resolves.toEqual({
+        port: 9230,
+        processIdentity: fixture.processIdentity,
+      });
     });
   });
 
@@ -479,7 +507,16 @@ describe("recoverable disconnect lifecycle", () => {
           stage: "connection-lost",
           recoverableDisconnect: false,
           disconnectCause: "prompt-commit-unverified",
-          runtime: { promptSubmitted: false },
+          runtime: {
+            promptEpoch: {
+              status: "pending",
+              epochId: expect.any(String),
+              promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+            },
+          },
         },
       });
       expect(fixture.closeChromeTarget).toHaveBeenCalledWith(
@@ -505,7 +542,6 @@ describe("recoverable disconnect lifecycle", () => {
           stage: "connection-lost",
           recoverableDisconnect: true,
           runtime: {
-            promptSubmitted: true,
             conversationId: targetId,
             promptEpoch: {
               status: "committed",
@@ -515,13 +551,36 @@ describe("recoverable disconnect lifecycle", () => {
               followUpOrdinal: 0,
               remainingFollowUps: 0,
               verifiedUserTurnIndex: 0,
+              verifiedUserTurnId: "turn-0",
+              verifiedUserMessageId: "message-0",
               conversationId: targetId,
             },
-            recoveryCleanup: {
-              transport: "remote",
-              ownsTarget: true,
-              profileKind: "none",
-            },
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromeHost: "remote.example",
+                chromePort: 9333,
+                chromeBrowserWSEndpoint: undefined,
+                chromeProfileRoot: undefined,
+                profileDirectoryIdentity: undefined,
+                userDataDir: undefined,
+                conversationId: targetId,
+                chromeTargetId: targetId,
+                promptEpoch: expect.objectContaining({
+                  status: "committed",
+                  verifiedUserTurnId: "turn-0",
+                  verifiedUserMessageId: "message-0",
+                  conversationId: targetId,
+                }),
+                tabLease: undefined,
+                recoveryCleanup: {
+                  transport: "remote",
+                  ownsTarget: true,
+                  profileKind: "none",
+                  keepBrowser: false,
+                  closeOwnedTargetOnComplete: false,
+                },
+              }),
+            ],
           },
         },
       });
@@ -538,11 +597,32 @@ describe("recoverable disconnect lifecycle", () => {
           recoverableDisconnect: true,
           runtime: {
             chromeTargetId: targetId,
-            recoveryCleanup: {
-              transport: "remote",
-              ownsTarget: false,
-              profileKind: "none",
-            },
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromeHost: "remote.example",
+                chromePort: 9333,
+                chromeBrowserWSEndpoint: undefined,
+                chromeProfileRoot: undefined,
+                profileDirectoryIdentity: undefined,
+                userDataDir: undefined,
+                conversationId: targetId,
+                chromeTargetId: targetId,
+                promptEpoch: expect.objectContaining({
+                  status: "committed",
+                  verifiedUserTurnId: "turn-0",
+                  verifiedUserMessageId: "message-0",
+                  conversationId: targetId,
+                }),
+                tabLease: undefined,
+                recoveryCleanup: {
+                  transport: "remote",
+                  ownsTarget: false,
+                  profileKind: "none",
+                  keepBrowser: false,
+                  closeOwnedTargetOnComplete: false,
+                },
+              }),
+            ],
           },
         },
       });

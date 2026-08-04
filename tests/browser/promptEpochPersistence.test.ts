@@ -2,6 +2,8 @@ import { describe, expect, test, vi } from "vitest";
 import path from "node:path";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import { hasRecoverableChatGptConversation } from "../../src/browser/reattachability.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import type * as PromptComposerModule from "../../src/browser/actions/promptComposer.js";
 
 const conversationId = "epoch-conversation";
 const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
@@ -138,6 +140,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       composerText = "";
       return {
         committedTurns: turns.length,
+        promptSha256: promptIdentitySha256(prompt),
         verifiedUserTurnIndex: index,
         verifiedUserTurnId: `turn-${index}`,
         verifiedUserMessageId: `message-${index}`,
@@ -210,14 +213,18 @@ async function runTwoTurnResetFailure(transport: Transport) {
     acquireProfileRunLock: vi.fn(),
     isSafeChromeTerminationOutcome: vi.fn(() => true),
     terminateRecordedChromeForProfile: vi.fn().mockResolvedValue({ status: "not-running" }),
-    writeChromePid: vi.fn().mockResolvedValue(undefined),
-    writeChromeProcessIdentity: vi.fn().mockResolvedValue(undefined),
+    writeOracleChromeOwner: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
     clearStaleChatGptConversationCookies: vi.fn().mockResolvedValue(undefined),
     syncCookies: vi.fn().mockResolvedValue(0),
   }));
-  vi.doMock("../../src/browser/actions/promptComposer.js", () => ({ submitPrompt }));
+  vi.doMock("../../src/browser/actions/promptComposer.js", async () => ({
+    ...(await vi.importActual<typeof PromptComposerModule>(
+      "../../src/browser/actions/promptComposer.js",
+    )),
+    submitPrompt,
+  }));
   vi.doMock("../../src/browser/actions/navigation.js", () => ({
     ensurePromptReady: vi.fn().mockResolvedValue(undefined),
   }));
@@ -325,7 +332,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
         archiveConversations: "never",
       },
       runtimeHintCb: async (runtime) => {
-        if (sawCommittedEpoch && runtime.promptSubmitted === false) {
+        if (sawCommittedEpoch && runtime.promptEpoch === undefined) {
           rejectedResetRuntime = runtime;
           throw new Error("simulated prompt-two reset persistence failure");
         }
@@ -374,7 +381,6 @@ describe("semantic prompt epoch persistence", () => {
       expect(fixture.insertText).toHaveBeenCalledWith({ text: "prompt one" });
       expect(fixture.clearPromptComposer).toHaveBeenCalledTimes(1);
       expect(fixture.committedRuntime).toMatchObject({
-        promptSubmitted: true,
         conversationId,
         promptEpoch: {
           status: "committed",
@@ -390,7 +396,6 @@ describe("semantic prompt epoch persistence", () => {
         },
       });
       expect(fixture.rejectedResetRuntime).toMatchObject({
-        promptSubmitted: false,
         promptEpoch: undefined,
       });
       expect(fixture.error).toMatchObject({
@@ -398,7 +403,6 @@ describe("semantic prompt epoch persistence", () => {
           stage: "prompt-epoch-persistence",
           code: "prompt-epoch-persistence-failed",
           runtime: {
-            promptSubmitted: false,
             promptEpoch: undefined,
           },
         },

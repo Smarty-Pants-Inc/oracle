@@ -7,7 +7,6 @@ import type {
   BrowserPromptEpoch,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
-import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
 import type { ChromeProcessIdentity } from "./profileState.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
@@ -191,10 +190,8 @@ export interface BrowserRunResult {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
-  promptSubmitted?: boolean;
   promptEpoch?: BrowserPromptEpoch;
   controllerPid?: number;
-  recoveryCleanup?: BrowserRecoveryCleanupMetadata;
 }
 
 export type BrowserCaptureFinalizationResult =
@@ -205,12 +202,15 @@ export interface BrowserRunTransaction extends BrowserRunResult {
   /** Complete serializable locator and cleanup authority persisted before this transaction is returned. */
   runtime: BrowserRuntimeMetadata;
   /**
-   * Acknowledge durable answer/session publication, then retire resources. A pending result may be
-   * retried by calling finalize again; implementations must not convert transport failure to success.
+   * Acknowledge durable answer/session publication, then retire resources. The first settlement call
+   * binds the transaction to finalize. Pending results retry from their latest runtime when finalize
+   * is called again; completed results are memoized, and abort rejects after binding.
    */
   finalize: () => Promise<BrowserCaptureFinalizationResult>;
   /**
-   * Dispose newly owned resources when capture publication fails. A pending result remains retryable.
+   * Dispose newly owned resources when capture publication fails. The first settlement call binds the
+   * transaction to abort. Pending results retry from their latest runtime when abort is called again;
+   * completed results are memoized, and finalize rejects after binding.
    */
   abort: () => Promise<BrowserCaptureFinalizationResult>;
 }

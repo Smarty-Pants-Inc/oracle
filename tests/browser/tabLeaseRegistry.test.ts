@@ -18,6 +18,27 @@ describe("tabLeaseRegistry", () => {
     expect(normalizeMaxConcurrentTabs("nope")).toBe(3);
   });
 
+  test("fails without publishing a lease when process generation is unavailable", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      await expect(
+        acquireBrowserTabLease(
+          dir,
+          { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "missing-generation" },
+          {
+            pid: 123_456,
+            readProcessStartIdentity: async () => null,
+          },
+        ),
+      ).rejects.toThrow(/without a stable process generation/i);
+      await expect(
+        readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("queues when the max concurrent tab limit is reached", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
     try {
@@ -181,7 +202,7 @@ describe("tabLeaseRegistry", () => {
 
       const registry = JSON.parse(
         await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
-      ) as { leases: Array<{ sessionId?: string; processStartIdentity?: string | null }> };
+      ) as { leases: Array<{ sessionId?: string; processStartIdentity: string }> };
       expect(registry.leases).toEqual([
         expect.objectContaining({
           sessionId: "long-running-session",

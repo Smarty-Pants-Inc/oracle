@@ -1,19 +1,26 @@
 import net from "node:net";
 import { execFile } from "node:child_process";
+import { lstat, readFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { promisify } from "node:util";
 import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
+  assertProfileDirectoryIdentity,
   captureChromeProcessIdentity,
   captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
-  findRunningChromeDebugTargetForProfile,
+  findRunningChromeProcessForProfile,
+  getDevToolsActivePortPaths,
+  inspectChromeProcessIdentity,
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
   sameProfileDirectoryIdentity,
-  writeChromeProcessIdentity,
+  writeOracleChromeOwner,
   type ChromeProcessIdentity,
+  type ChromeProcessIdentityInspection,
+  type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
   type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
@@ -61,7 +68,7 @@ export interface ChromeLaunchDeps {
   resolveLaunchRoute?: typeof resolveWslChromeLaunchRoute;
   captureProcessIdentity?: typeof captureChromeProcessIdentity;
   captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
-  writeProcessIdentity?: typeof writeChromeProcessIdentity;
+  writeOwner?: typeof writeOracleChromeOwner;
 }
 
 export async function launchChrome(
@@ -166,11 +173,11 @@ export async function launchChrome(
     }
     throw mismatch;
   }
-  const kill = await createProvisionalIdentityBoundChromeKill(
+  const kill = await createOwnerBoundChromeKill(
     launchUserDataDir,
-    processIdentity,
+    { port: launcher.port, processIdentity },
     launcher.kill,
-    { writeIdentity: deps.writeProcessIdentity },
+    { writeOwner: deps.writeOwner },
   );
   if (typeof launcher.pid !== "number") {
     throw new Error(`Launched Chrome for ${launchUserDataDir} did not retain a process id.`);
@@ -231,23 +238,23 @@ async function captureLaunchedChromeProcessIdentity(
   }
 }
 
-export async function createProvisionalIdentityBoundChromeKill(
+export async function createOwnerBoundChromeKill(
   userDataDir: string,
-  processIdentity: ChromeProcessIdentity,
+  owner: OracleChromeOwnerRecord,
   stableKill: ChromeStableKill,
-  deps: { writeIdentity?: typeof writeChromeProcessIdentity } = {},
+  deps: { writeOwner?: typeof writeOracleChromeOwner } = {},
 ): Promise<ChromeStableKill> {
   try {
-    await (deps.writeIdentity ?? writeChromeProcessIdentity)(userDataDir, processIdentity);
+    await (deps.writeOwner ?? writeOracleChromeOwner)(userDataDir, owner);
   } catch (error) {
     const rollback = await stableKill();
     if (!isSafeChromeTerminationOutcome(rollback)) {
       throw new AggregateError(
         [error, new Error(rollback.reason)],
-        `Failed to persist Chrome process identity, and safe launch rollback was unavailable.`,
+        `Failed to persist Chrome owner authority, and safe launch rollback was unavailable.`,
       );
     }
-    throw new Error(`Failed to persist Chrome process identity for ${userDataDir}.`, {
+    throw new Error(`Failed to persist Chrome owner authority for ${userDataDir}.`, {
       cause: error,
     });
   }
@@ -1108,6 +1115,11 @@ export function buildHiddenMacChromeOpenArgs(chromePath: string, chromeArgs: str
   return ["-g", "-j", "-n", appPath, "--args", ...chromeArgs];
 }
 
+interface VerifiedDevToolsEndpoint {
+  port: number;
+  browserWSEndpoint: string;
+}
+
 async function launchHiddenMacChrome({
   chromeFlags,
   chromePath,
@@ -1126,15 +1138,18 @@ async function launchHiddenMacChrome({
   expectedProfileDirectory: ProfileDirectoryIdentity;
 }): Promise<StableChromeLauncher> {
   const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
-  if (!resolvedChromePath) {
-    throw new Error("Chrome is not installed.");
-  }
-  const port = requestedPort ?? (await reserveLoopbackPort());
+  if (!resolvedChromePath) throw new Error("Chrome is not installed.");
+
+  const debugPortArgument = requestedPort ?? 0;
+  const activePortBaseline =
+    requestedPort === undefined
+      ? await captureDevToolsActivePortBaseline(userDataDir, expectedProfileDirectory)
+      : null;
   const effectiveFlags = ignoreDefaultFlags
     ? chromeFlags
     : [...Launcher.defaultFlags(), ...chromeFlags];
   const chromeArgs = [
-    `--remote-debugging-port=${port}`,
+    `--remote-debugging-port=${debugPortArgument}`,
     `--user-data-dir=${userDataDir}`,
     ...effectiveFlags,
     "about:blank",
@@ -1143,41 +1158,128 @@ async function launchHiddenMacChrome({
     "/usr/bin/open",
     buildHiddenMacChromeOpenArgs(resolvedChromePath, chromeArgs),
   );
-  await waitForDebugPort(port);
-  const control = await retainExactChromeControlChannel("127.0.0.1", port);
-  const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
-  if (!discovered || discovered.port !== port) {
-    const launchError = new Error(
-      `Hidden Chrome started on port ${port}, but its process could not be identified.`,
+
+  const endpoint =
+    requestedPort !== undefined
+      ? await discoverBrowserWebSocketEndpoint("127.0.0.1", requestedPort)
+      : await waitForVerifiedDevToolsActivePort(
+          userDataDir,
+          expectedProfileDirectory,
+          activePortBaseline ?? new Map<string, string | null>(),
+        );
+  await waitForDebugPort(endpoint.port);
+  const listeningPid = await resolveListeningPortOwnerPid(endpoint.port);
+  const discovered = listeningPid
+    ? await findRunningChromeProcessForProfile(userDataDir, debugPortArgument, listeningPid)
+    : null;
+  if (!discovered) {
+    throw new Error(
+      `Hidden Chrome endpoint ${endpoint.port} could not be bound to its exact profile process.`,
     );
-    const rollback = await control.kill();
-    if (!isSafeChromeTerminationOutcome(rollback)) {
-      throw new AggregateError([launchError, new Error(rollback.reason)], launchError.message);
-    }
-    throw launchError;
   }
-  control.setPid(discovered.pid);
-  const provisionalLauncher: StableChromeLauncher = {
+  const processIdentity = await captureProcessIdentity(userDataDir, discovered.pid);
+  if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, expectedProfileDirectory)) {
+    throw new Error(`Physical profile authority changed while binding hidden Chrome.`);
+  }
+  const kill = await retainExactChromeControlChannel(
+    endpoint.browserWSEndpoint,
+    userDataDir,
+    processIdentity,
+  );
+  return {
     pid: discovered.pid,
-    port,
+    port: endpoint.port,
     process: undefined,
     remoteDebuggingPipes: null,
-    kill: control.kill,
+    kill,
     host: "127.0.0.1",
+    processIdentity,
   };
-  const processIdentity = await captureLaunchedChromeProcessIdentity(
-    userDataDir,
-    provisionalLauncher,
-    expectedProfileDirectory,
-    captureProcessIdentity,
-  );
-  return { ...provisionalLauncher, processIdentity };
 }
 
-async function retainExactChromeControlChannel(
+async function captureDevToolsActivePortBaseline(
+  userDataDir: string,
+  expectedProfileDirectory: ProfileDirectoryIdentity,
+): Promise<Map<string, string | null>> {
+  const baseline = new Map<string, string | null>();
+  for (const candidate of getDevToolsActivePortPaths(expectedProfileDirectory.canonicalPath)) {
+    try {
+      const entry = await lstat(candidate);
+      if (entry.isSymbolicLink() || !entry.isFile()) {
+        throw new Error(`Unsafe DevToolsActivePort entry: ${candidate}`);
+      }
+      baseline.set(candidate, await readFile(candidate, "utf8"));
+    } catch (error) {
+      if (readErrorCode(error) !== "ENOENT") throw error;
+      baseline.set(candidate, null);
+    }
+    await assertProfileDirectoryIdentity(
+      userDataDir,
+      expectedProfileDirectory,
+      "Hidden Chrome DevTools baseline",
+    );
+  }
+  return baseline;
+}
+
+async function waitForVerifiedDevToolsActivePort(
+  userDataDir: string,
+  expectedProfileDirectory: ProfileDirectoryIdentity,
+  baseline: ReadonlyMap<string, string | null>,
+  timeoutMs = 30_000,
+): Promise<VerifiedDevToolsEndpoint> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const candidate of getDevToolsActivePortPaths(expectedProfileDirectory.canonicalPath)) {
+      let before: Stats;
+      let raw: string;
+      try {
+        before = await lstat(candidate);
+        if (before.isSymbolicLink() || !before.isFile()) {
+          throw new Error(`Unsafe DevToolsActivePort entry: ${candidate}`);
+        }
+        raw = await readFile(candidate, "utf8");
+      } catch (error) {
+        if (readErrorCode(error) === "ENOENT") continue;
+        throw error;
+      }
+      await assertProfileDirectoryIdentity(
+        userDataDir,
+        expectedProfileDirectory,
+        "Hidden Chrome DevTools discovery",
+      );
+      const after = await lstat(candidate);
+      if (
+        before.dev !== after.dev ||
+        before.ino !== after.ino ||
+        before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs ||
+        baseline.get(candidate) === raw
+      ) {
+        continue;
+      }
+      const [rawPort, rawBrowserPath] = raw.split(/\r?\n/u);
+      if (!/^\d+$/u.test(rawPort?.trim() ?? "")) continue;
+      const port = Number.parseInt(rawPort?.trim() ?? "", 10);
+      const browserPath = rawBrowserPath?.trim() ?? "";
+      if (port <= 0 || port > 65_535 || !/^\/devtools\/browser\/[^/\s]+$/u.test(browserPath)) {
+        continue;
+      }
+      return {
+        port,
+        browserWSEndpoint: `ws://127.0.0.1:${port}${browserPath}`,
+      };
+    }
+    await delay(100);
+  }
+  throw new Error(`Timed out waiting for verified hidden Chrome DevToolsActivePort metadata.`);
+}
+
+async function discoverBrowserWebSocketEndpoint(
   host: string,
   port: number,
-): Promise<{ kill: ChromeStableKill; setPid: (pid: number) => void }> {
+): Promise<VerifiedDevToolsEndpoint> {
+  await waitForDebugPort(port);
   const response = await fetch(`http://${host}:${port}/json/version`);
   if (!response.ok) {
     throw new Error(`Chrome control-channel discovery failed with HTTP ${response.status}`);
@@ -1195,54 +1297,186 @@ async function retainExactChromeControlChannel(
   ) {
     throw new Error("Chrome returned an invalid exact browser control channel");
   }
-  const client = (await CDP({ target: endpoint.toString(), local: true })) as ChromeClient;
-  await client.Browser.getVersion();
-  let pid: number | undefined;
+  return { port, browserWSEndpoint: endpoint.toString() };
+}
+
+async function resolveListeningPortOwnerPid(
+  port: number,
+  execute: (file: string, args: string[]) => Promise<{ stdout: string }> = async (file, args) => {
+    const { stdout } = await execFileAsync(file, args, { encoding: "utf8" });
+    return { stdout: String(stdout ?? "") };
+  },
+): Promise<number | null> {
+  try {
+    const { stdout } = await execute("/usr/sbin/lsof", [
+      "-nP",
+      "-a",
+      `-iTCP:${port}`,
+      "-sTCP:LISTEN",
+      "-Fp",
+    ]);
+    const pids = new Set(
+      stdout
+        .split(/\r?\n/u)
+        .map((line) => line.match(/^p(\d+)$/u)?.[1])
+        .filter((value): value is string => Boolean(value))
+        .map((value) => Number.parseInt(value, 10)),
+    );
+    if (pids.size !== 1) return null;
+    const [pid] = pids;
+    return pid && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function verifyListeningPortOwnedByProcessForTest(
+  pid: number,
+  port: number,
+  execute: (file: string, args: string[]) => Promise<{ stdout: string }>,
+): Promise<boolean> {
+  return (await resolveListeningPortOwnerPid(port, execute)) === pid;
+}
+
+interface IdentityBoundChromeControlKillDeps {
+  inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
+async function retainExactChromeControlChannel(
+  browserWSEndpoint: string,
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+): Promise<ChromeStableKill> {
+  const client = (await CDP({ target: browserWSEndpoint, local: true })) as ChromeClient;
+  try {
+    await client.Browser.getVersion();
+    const endpoint = new URL(browserWSEndpoint);
+    const port = Number.parseInt(endpoint.port, 10);
+    const [listeningPid, inspection] = await Promise.all([
+      resolveListeningPortOwnerPid(port),
+      inspectChromeProcessIdentity(userDataDir, processIdentity),
+    ]);
+    if (listeningPid !== processIdentity.pid || inspection !== "current") {
+      throw new Error(`Hidden Chrome control channel is not bound to the exact process generation`);
+    }
+    return createIdentityBoundChromeControlKill(client, userDataDir, processIdentity, {});
+  } catch (error) {
+    await client.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+function createIdentityBoundChromeControlKill(
+  client: ChromeClient,
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+  deps: IdentityBoundChromeControlKillDeps,
+): ChromeStableKill {
+  let completed: RecordedChromeTerminationOutcome | undefined;
   let pending: Promise<RecordedChromeTerminationOutcome> | undefined;
-  const kill: ChromeStableKill = () => {
-    pending ??= (async () => {
-      try {
-        await client.Browser.close();
-        await client.close().catch(() => undefined);
-        return { status: "stopped", pid, signal: "CONTROL_CHANNEL" };
-      } catch (error) {
-        return {
-          status: "unsafe",
-          pid,
-          reason: `Exact Chrome control channel failed: ${error instanceof Error ? error.message : error}`,
-        };
+  let closeRequested = false;
+  return () => {
+    if (completed) return Promise.resolve(completed);
+    if (pending) return pending;
+    const attempt = (async (): Promise<RecordedChromeTerminationOutcome> => {
+      if (!closeRequested) {
+        const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
+        let current: ChromeProcessIdentityInspection;
+        try {
+          current = await inspect(userDataDir, processIdentity);
+        } catch {
+          current = "unavailable";
+        }
+        if (current === "exited") {
+          await client.close().catch(() => undefined);
+          completed = { status: "already-stopped", pid: processIdentity.pid };
+          return completed;
+        }
+        if (current !== "current") {
+          return {
+            status: "unsafe",
+            pid: processIdentity.pid,
+            reason: "Exact Chrome process generation could not be reverified before Browser.close",
+          };
+        }
+        try {
+          await client.Browser.close();
+          closeRequested = true;
+          await client.close().catch(() => undefined);
+        } catch (error) {
+          return {
+            status: "unsafe",
+            pid: processIdentity.pid,
+            reason: `Exact Chrome control channel failed: ${error instanceof Error ? error.message : error}`,
+          };
+        }
       }
+      const inspection = await waitForExactChromeProcessExit(userDataDir, processIdentity, deps);
+      if (inspection === "exited") {
+        completed = {
+          status: "stopped",
+          pid: processIdentity.pid,
+          signal: "CONTROL_CHANNEL",
+        };
+        return completed;
+      }
+      return {
+        status: "unsafe",
+        pid: processIdentity.pid,
+        reason:
+          inspection === "current"
+            ? "Exact Chrome process generation remained alive after Browser.close"
+            : "Exact Chrome process generation exit could not be proven",
+      };
     })();
-    return pending;
-  };
-  return {
-    kill,
-    setPid: (value) => {
-      pid = value;
-    },
+    pending = attempt;
+    void attempt.then(
+      () => {
+        if (pending === attempt) pending = undefined;
+      },
+      () => {
+        if (pending === attempt) pending = undefined;
+      },
+    );
+    return attempt;
   };
 }
 
-async function reserveLoopbackPort(): Promise<number> {
-  return await new Promise<number>((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      server.close((error) => {
-        if (error) reject(error);
-        else if (port > 0) resolve(port);
-        else reject(new Error("Failed to reserve a Chrome debugging port."));
-      });
-    });
-  });
+export function createIdentityBoundChromeControlKillForTest(
+  client: ChromeClient,
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+  deps: IdentityBoundChromeControlKillDeps,
+): ChromeStableKill {
+  return createIdentityBoundChromeControlKill(client, userDataDir, processIdentity, deps);
+}
+
+async function waitForExactChromeProcessExit(
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+  deps: IdentityBoundChromeControlKillDeps,
+): Promise<ChromeProcessIdentityInspection> {
+  const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
+  const deadline = Date.now() + (deps.timeoutMs ?? 5_000);
+  let latest: ChromeProcessIdentityInspection = "unavailable";
+  do {
+    try {
+      latest = await inspect(userDataDir, processIdentity);
+    } catch {
+      latest = "unavailable";
+    }
+    if (latest === "exited" || Date.now() >= deadline) return latest;
+    await delay(deps.pollMs ?? 100);
+  } while (Date.now() <= deadline);
+  return latest;
 }
 
 async function waitForDebugPort(port: number, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const ready = await new Promise<boolean>((resolve) => {
+    const connected = await new Promise<boolean>((resolve) => {
       const socket = net.createConnection({ host: "127.0.0.1", port });
       socket.once("connect", () => {
         socket.destroy();
@@ -1253,10 +1487,16 @@ async function waitForDebugPort(port: number, timeoutMs = 30_000): Promise<void>
         resolve(false);
       });
     });
-    if (ready) return;
+    if (connected) return;
     await delay(250);
   }
   throw new Error(`Timed out waiting for hidden Chrome on port ${port}.`);
+}
+
+function readErrorCode(error: unknown): unknown {
+  return error && typeof error === "object" && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined;
 }
 
 function buildChromeFlags(

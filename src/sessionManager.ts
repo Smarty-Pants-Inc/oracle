@@ -11,7 +11,7 @@ import type {
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
-import type { ChromeProcessIdentity } from "./browser/profileState.js";
+import type { ChromeProcessIdentity, ProfileDirectoryIdentity } from "./browser/profileState.js";
 import type {
   TransportFailureReason,
   ApiProviderMode,
@@ -109,10 +109,15 @@ export interface BrowserRemoteRecoveryMetadata {
   transactionToken: string;
   state: "pending" | "recoverable-error";
 }
+export interface BrowserRecoveryTabLeaseMetadata {
+  id: string;
+  profileDirectory: ProfileDirectoryIdentity;
+}
 
 export interface BrowserRecoveryCleanupResourceMetadata {
   chromePid?: number;
   chromeProcessIdentity?: ChromeProcessIdentity;
+  profileDirectoryIdentity?: ProfileDirectoryIdentity;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
@@ -122,6 +127,7 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   conversationId?: string;
   promptEpoch?: BrowserPromptEpoch;
   remoteRecovery?: BrowserRemoteRecoveryMetadata;
+  tabLease?: BrowserRecoveryTabLeaseMetadata;
   recoveryCleanup: BrowserRecoveryCleanupMetadata;
 }
 
@@ -142,8 +148,8 @@ export type BrowserPromptEpoch =
       followUpOrdinal: number;
       remainingFollowUps: number;
       verifiedUserTurnIndex: number;
-      verifiedUserTurnId?: string;
-      verifiedUserMessageId?: string;
+      verifiedUserTurnId: string;
+      verifiedUserMessageId: string;
       conversationId: string;
     };
 
@@ -159,16 +165,12 @@ export interface BrowserRuntimeMetadata {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
-  /** True only after Oracle has semantically verified the current prompt in ChatGPT. */
-  promptSubmitted?: boolean;
   /** Durable authority for the current prompt epoch; committed evidence is turn- and conversation-bound. */
   promptEpoch?: BrowserPromptEpoch;
-  /** Authority required to retire resources after a recovered run reaches a terminal result. */
-  recoveryCleanup?: BrowserRecoveryCleanupMetadata;
+  /** Ordered exact authority for every browser resource still requiring settlement. */
+  recoveryCleanupResources?: BrowserRecoveryCleanupResourceMetadata[];
   /** Durable state for cleanup that must occur only after answer/session persistence. */
   recoveryCleanupResult?: BrowserRecoveryCleanupResultMetadata;
-  /** Earlier cleanup authorities retained when fallback recovery launches another Chrome. */
-  recoveryCleanupBacklog?: BrowserRecoveryCleanupResourceMetadata[];
   /** Opaque transaction authority; the remote service credential is resolved separately. */
   remoteRecovery?: BrowserRemoteRecoveryMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
@@ -484,25 +486,33 @@ async function writeSessionMetadataFile(
   sessionId: string,
   metadata: SessionMetadata,
 ): Promise<void> {
-  const targetPath = metaPath(sessionId);
+  await writeFileAtomicDurable(metaPath(sessionId), JSON.stringify(metadata, null, 2));
+}
+
+export async function writeFileAtomicDurable(
+  targetPath: string,
+  data: string | Buffer,
+  mode = 0o600,
+): Promise<void> {
   const directory = path.dirname(targetPath);
+  await ensureDir(directory);
   const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    const handle = await fs.open(temporaryPath, "wx", 0o600);
+    const handle = await fs.open(temporaryPath, "wx", mode);
     try {
-      await handle.writeFile(JSON.stringify(metadata, null, 2), "utf8");
+      await handle.writeFile(data);
       await handle.sync();
     } finally {
       await handle.close();
     }
     await fs.rename(temporaryPath, targetPath);
-    await syncDirectory(directory);
+    await syncDirectoryIfSupported(directory);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+export async function syncDirectoryIfSupported(directory: string): Promise<void> {
   if (process.platform === "win32") return;
   const handle = await fs.open(directory, "r");
   try {

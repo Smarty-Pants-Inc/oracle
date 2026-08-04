@@ -1,8 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { open, readFile, rename, rm, mkdir } from "node:fs/promises";
-import type { SessionArtifact } from "../sessionStore.js";
+import { open, readFile, mkdir } from "node:fs/promises";
+import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
+import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
 
 export interface DurableBrowserAnswerReceipt {
   artifact: SessionArtifact;
@@ -28,7 +31,7 @@ export async function persistDurableBrowserAnswer(
   const paths = await sessionStore.getPaths(options.sessionId);
   const artifactsDir = path.join(paths.dir, "artifacts");
   await mkdir(artifactsDir, { recursive: true });
-  await syncDirectory(paths.dir);
+  await syncDirectoryIfSupported(paths.dir);
   const answerPath = path.join(artifactsDir, `browser-answer-${sha256}.md`);
   await ensureDurableFile(answerPath, payload);
 
@@ -63,6 +66,152 @@ export async function persistDurableBrowserAnswer(
   };
 }
 
+export interface BrowserCapturePublicationTransaction {
+  runtime: BrowserRuntimeMetadata;
+  finalize: () => Promise<BrowserCaptureFinalizationResult>;
+  abort: () => Promise<BrowserCaptureFinalizationResult>;
+}
+
+export interface PublishBrowserCaptureOptions<T> {
+  answerOptions: PersistDurableBrowserAnswerOptions;
+  transaction: BrowserCapturePublicationTransaction;
+  prepare: (receipt: DurableBrowserAnswerReceipt) => Promise<T> | T;
+  publish: (receipt: DurableBrowserAnswerReceipt, prepared: T) => Promise<void> | void;
+  persistRuntime: (runtime: BrowserRuntimeMetadata) => Promise<void> | void;
+  persistAnswer?: typeof persistDurableBrowserAnswer;
+}
+
+export interface PublishedBrowserCapture<T> {
+  receipt: DurableBrowserAnswerReceipt;
+  prepared: T;
+  finalization: BrowserCaptureFinalizationResult;
+}
+
+export async function publishBrowserCapture<T>(
+  options: PublishBrowserCaptureOptions<T>,
+): Promise<PublishedBrowserCapture<T>> {
+  const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
+  let receipt: DurableBrowserAnswerReceipt | undefined;
+  let prepared!: T;
+  try {
+    receipt = await persistAnswer(options.answerOptions);
+    prepared = await options.prepare(receipt);
+    await options.publish(receipt, prepared);
+  } catch (publicationError) {
+    await abortFailedBrowserCapture(options, publicationError, receipt);
+  }
+  if (!receipt) {
+    throw new Error("Browser capture publication completed without a durable answer receipt");
+  }
+
+  let finalization: BrowserCaptureFinalizationResult;
+  try {
+    finalization = await options.transaction.finalize();
+  } catch (finalizeError) {
+    finalization = {
+      status: "pending",
+      runtime: runtimeFromBrowserError(finalizeError) ?? options.transaction.runtime,
+      error: `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`,
+    };
+  }
+
+  try {
+    await options.persistRuntime(finalization.runtime);
+  } catch (persistenceError) {
+    throw new BrowserAutomationError(
+      `Browser answer was published, but exact cleanup authority could not be persisted: ${formatError(persistenceError)}`,
+      {
+        stage: "browser-capture-finalization",
+        code: "runtime-authority-persistence-failed",
+        runtime: finalization.runtime,
+        answerReceipt: receipt,
+        cleanupStatus: finalization.status,
+        ...(finalization.status === "pending" ? { cleanupError: finalization.error } : {}),
+      },
+      persistenceError,
+    );
+  }
+
+  return { receipt, prepared, finalization };
+}
+
+async function abortFailedBrowserCapture<T>(
+  options: PublishBrowserCaptureOptions<T>,
+  publicationError: unknown,
+  receipt: DurableBrowserAnswerReceipt | undefined,
+): Promise<never> {
+  let abortion: BrowserCaptureFinalizationResult;
+  try {
+    abortion = await options.transaction.abort();
+  } catch (abortError) {
+    const runtime = runtimeFromBrowserError(abortError) ?? options.transaction.runtime;
+    await persistAbortRuntime(options, runtime, publicationError, receipt, abortError);
+    throw new BrowserAutomationError(
+      `Browser answer publication failed (${formatError(publicationError)}); capture abort failed and remains retryable: ${formatError(abortError)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "publication-abort-failed",
+        runtime,
+        answerReceipt: receipt,
+        abortError: formatError(abortError),
+      },
+      publicationError,
+    );
+  }
+
+  await persistAbortRuntime(options, abortion.runtime, publicationError, receipt);
+  if (abortion.status === "pending") {
+    throw new BrowserAutomationError(
+      `Browser answer publication failed (${formatError(publicationError)}); cleanup remains retryable: ${abortion.error}`,
+      {
+        stage: "browser-capture-publication",
+        code: "publication-failed-cleanup-pending",
+        runtime: abortion.runtime,
+        answerReceipt: receipt,
+        cleanupError: abortion.error,
+      },
+      publicationError,
+    );
+  }
+  throw publicationError;
+}
+
+async function persistAbortRuntime<T>(
+  options: PublishBrowserCaptureOptions<T>,
+  runtime: BrowserRuntimeMetadata,
+  publicationError: unknown,
+  receipt: DurableBrowserAnswerReceipt | undefined,
+  abortError?: unknown,
+): Promise<void> {
+  try {
+    await options.persistRuntime(runtime);
+  } catch (persistenceError) {
+    throw new BrowserAutomationError(
+      `Browser answer publication failed (${formatError(publicationError)}); exact abort authority could not be persisted: ${formatError(persistenceError)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "abort-authority-persistence-failed",
+        runtime,
+        answerReceipt: receipt,
+        ...(abortError ? { abortError: formatError(abortError) } : {}),
+      },
+      publicationError,
+    );
+  }
+}
+
+function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata | undefined {
+  if (!(error instanceof BrowserAutomationError)) return undefined;
+  const runtime = error.details?.runtime;
+  return typeof runtime === "object" && runtime !== null
+    ? (runtime as BrowserRuntimeMetadata)
+    : undefined;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<void> {
   try {
     const existing = await readFile(targetPath);
@@ -75,24 +224,7 @@ async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<v
 }
 
 async function writeDurableFile(targetPath: string, payload: Buffer): Promise<void> {
-  await mkdir(path.dirname(targetPath), { recursive: true });
-  const tempPath = path.join(
-    path.dirname(targetPath),
-    `.${path.basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`,
-  );
-  try {
-    const handle = await open(tempPath, "wx", 0o600);
-    try {
-      await handle.writeFile(payload);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await rename(tempPath, targetPath);
-    await syncDirectory(path.dirname(targetPath));
-  } finally {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-  }
+  await writeFileAtomicDurable(targetPath, payload);
 }
 
 async function appendDurableFile(targetPath: string, payload: Buffer): Promise<void> {
@@ -100,16 +232,6 @@ async function appendDurableFile(targetPath: string, payload: Buffer): Promise<v
   const handle = await open(targetPath, "a", 0o600);
   try {
     await handle.writeFile(payload);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return;
-  const handle = await open(directory, "r");
-  try {
     await handle.sync();
   } finally {
     await handle.close();

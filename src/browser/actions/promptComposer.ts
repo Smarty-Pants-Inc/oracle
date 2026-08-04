@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   INPUT_SELECTORS,
@@ -20,6 +21,19 @@ const ENTER_KEY_EVENT = {
   nativeVirtualKeyCode: 13,
 } as const;
 const ENTER_KEY_TEXT = "\r";
+export function normalizePromptForIdentity(prompt: string): string {
+  return prompt
+    .toLowerCase()
+    .replace(/```[^\n]*\n([\s\S]*?)```/g, " $1 ")
+    .replace(/```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function promptIdentitySha256(prompt: string): string {
+  return createHash("sha256").update(normalizePromptForIdentity(prompt), "utf8").digest("hex");
+}
 
 export interface AttachmentReadyExpectation {
   name: string;
@@ -27,9 +41,10 @@ export interface AttachmentReadyExpectation {
 }
 export interface PromptCommitVerification {
   committedTurns: number;
+  promptSha256: string;
   verifiedUserTurnIndex: number;
-  verifiedUserTurnId?: string;
-  verifiedUserMessageId?: string;
+  verifiedUserTurnId: string;
+  verifiedUserMessageId: string;
   conversationId: string;
 }
 
@@ -799,14 +814,16 @@ export async function verifyPromptCommitted(
   }
   const baseline = Math.floor(baselineTurns);
   const deadline = Date.now() + timeoutMs;
-  const encodedPrompt = JSON.stringify(prompt.trim());
+  const normalizedPrompt = normalizePromptForIdentity(prompt);
+  const expectedPromptSha256 = promptIdentitySha256(prompt);
+  const encodedPrompt = JSON.stringify(normalizedPrompt);
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
   const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  // Only a matching user turn created at or after the pre-dispatch turn count can
-  // commit this epoch. Historical/repeated prompts and unrelated new turns cannot.
+  // Only a full normalized prompt match in a new user turn can commit this epoch.
+  // Prefixes, substrings, and historical repeated turns are never commit authority.
   const script = `(() => {
     const editor = document.querySelector(${primarySelectorLiteral});
     const fallback = document.querySelector(${fallbackSelectorLiteral});
@@ -819,8 +836,7 @@ export async function verifyPromptCommitted(
       text = text.replace(/\`([^\`]*)\`/g, '$1');
       return text.replace(/\\s+/g, ' ').trim();
     };
-    const normalizedPrompt = normalize(${encodedPrompt});
-    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
+    const normalizedPrompt = ${encodedPrompt};
     const articles = ${buildConversationTurnListExpression()};
     const readValue = (node) => {
       if (!node) return '';
@@ -842,9 +858,11 @@ export async function verifyPromptCommitted(
       return role === 'user' || Boolean(node?.querySelector?.('[data-message-author-role="user"]'));
     };
     const readTurnId = (node) => {
+      const testId = node?.getAttribute?.('data-testid');
       const value =
         node?.getAttribute?.('data-turn-id') ||
         node?.dataset?.turnId ||
+        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
         (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
       return typeof value === 'string' && value.trim() ? value.trim() : null;
     };
@@ -855,14 +873,11 @@ export async function verifyPromptCommitted(
       const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
       return typeof value === 'string' && value.trim() ? value.trim() : null;
     };
-    const matchesPrompt = (text) =>
-      normalizedPrompt.length > 0 &&
-      (text === normalizedPrompt ||
-        text.includes(normalizedPrompt) ||
-        (normalizedPromptPrefix.length > 30 && text.includes(normalizedPromptPrefix)));
+    const matchesPrompt = (text) => normalizedPrompt.length > 0 && text === normalizedPrompt;
     let matchedUserTurnIndex = null;
     let matchedUserTurnId = null;
     let matchedUserMessageId = null;
+    let matchedUserTurnText = null;
     for (let index = baseline; index < articles.length; index += 1) {
       const node = articles[index];
       if (!isUserTurn(node)) continue;
@@ -871,6 +886,7 @@ export async function verifyPromptCommitted(
       matchedUserTurnIndex = index;
       matchedUserTurnId = readTurnId(node);
       matchedUserMessageId = readMessageId(node);
+      matchedUserTurnText = text;
       break;
     }
     const inputs = inputSelectors
@@ -891,6 +907,7 @@ export async function verifyPromptCommitted(
       matchedUserTurnIndex,
       matchedUserTurnId,
       matchedUserMessageId,
+      matchedUserTurnText,
       hasNewTurn: articles.length > baseline,
       stopVisible: Boolean(document.querySelector(${stopSelectorLiteral})),
       assistantVisible: Boolean(
@@ -917,6 +934,7 @@ export async function verifyPromptCommitted(
     }
     const turnsCount = info?.turnsCount;
     const userTurnIndex = info?.matchedUserTurnIndex;
+    const matchedUserTurnText = info?.matchedUserTurnText;
     const conversationId = info?.conversationId?.trim();
     if (
       typeof turnsCount === "number" &&
@@ -925,13 +943,20 @@ export async function verifyPromptCommitted(
       Number.isInteger(userTurnIndex) &&
       userTurnIndex >= baseline &&
       turnsCount > userTurnIndex &&
+      typeof matchedUserTurnText === "string" &&
+      promptIdentitySha256(matchedUserTurnText) === expectedPromptSha256 &&
+      typeof info?.matchedUserTurnId === "string" &&
+      info.matchedUserTurnId.trim().length > 0 &&
+      typeof info?.matchedUserMessageId === "string" &&
+      info.matchedUserMessageId.trim().length > 0 &&
       conversationId
     ) {
       return {
         committedTurns: Math.floor(turnsCount),
         verifiedUserTurnIndex: userTurnIndex,
-        ...(info?.matchedUserTurnId ? { verifiedUserTurnId: info.matchedUserTurnId } : {}),
-        ...(info?.matchedUserMessageId ? { verifiedUserMessageId: info.matchedUserMessageId } : {}),
+        promptSha256: expectedPromptSha256,
+        verifiedUserTurnId: info.matchedUserTurnId.trim(),
+        verifiedUserMessageId: info.matchedUserMessageId.trim(),
         conversationId,
       };
     }
@@ -975,6 +1000,7 @@ interface CommitProbeState {
   matchedUserTurnIndex?: number | null;
   matchedUserTurnId?: string | null;
   matchedUserMessageId?: string | null;
+  matchedUserTurnText?: string | null;
   hasNewTurn?: boolean;
   stopVisible?: boolean;
   assistantVisible?: boolean;
@@ -996,6 +1022,8 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     matchedUserTurnIndex: probe.matchedUserTurnIndex,
     matchedUserTurnIdPresent: Boolean(probe.matchedUserTurnId),
     matchedUserMessageIdPresent: Boolean(probe.matchedUserMessageId),
+    matchedUserTurnLength:
+      typeof probe.matchedUserTurnText === "string" ? probe.matchedUserTurnText.length : undefined,
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,

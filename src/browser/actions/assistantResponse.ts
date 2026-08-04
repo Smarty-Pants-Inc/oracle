@@ -1,4 +1,6 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
+import type { CommittedPromptEpochLocator } from "../reattachability.js";
+import { BrowserAutomationError } from "../../oracle/errors.js";
 import {
   ANSWER_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
@@ -16,6 +18,7 @@ import {
   buildConversationDebugExpression,
 } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { promptIdentitySha256 } from "./promptComposer.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -179,12 +182,76 @@ export function buildActiveThinkingStatusPredicateJsForTest(fnName: string): str
   return buildActiveThinkingStatusPredicateJs(fnName);
 }
 
+export async function verifyCommittedPromptTurn(
+  Runtime: ChromeClient["Runtime"],
+  locator: CommittedPromptEpochLocator,
+): Promise<void> {
+  const expected = {
+    conversationId: locator.conversationId,
+    userTurnIndex: locator.verifiedUserTurnIndex,
+    userTurnId: locator.verifiedUserTurnId,
+    userMessageId: locator.verifiedUserMessageId,
+  };
+  const { result } = await Runtime.evaluate({
+    expression: `(() => {
+      const expected = ${JSON.stringify(expected)};
+      const href = typeof location === 'object' && location.href ? location.href : '';
+      const conversationId = href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+      if (conversationId !== expected.conversationId) return null;
+      const turns = ${buildConversationTurnListExpression()};
+      const turn = turns[expected.userTurnIndex];
+      if (!turn) return null;
+      const role = String(
+        turn.getAttribute?.('data-message-author-role') ||
+          turn.getAttribute?.('data-turn') ||
+          turn.dataset?.turn ||
+          '',
+      ).toLowerCase();
+      const isUser = role === 'user' || Boolean(
+        turn.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+      if (!isUser) return null;
+      const testId = turn.getAttribute?.('data-testid');
+      const turnId =
+        turn.getAttribute?.('data-turn-id') ||
+        turn.dataset?.turnId ||
+        (String(testId || '').startsWith('conversation-turn-') ? testId : null) ||
+        (String(turn.id || '').startsWith('conversation-turn-') ? turn.id : null);
+      const messageNode = turn.matches?.('[data-message-id]')
+        ? turn
+        : turn.querySelector?.('[data-message-id]');
+      const messageId =
+        messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId || null;
+      if (turnId !== expected.userTurnId) return null;
+      if (messageId !== expected.userMessageId) return null;
+      const text = String(turn.innerText || turn.textContent || '');
+      return { text, turnId, messageId };
+    })()`,
+    returnByValue: true,
+  });
+  const observed = result?.value as
+    | { text?: unknown; turnId?: unknown; messageId?: unknown }
+    | null
+    | undefined;
+  if (
+    !observed ||
+    typeof observed.text !== "string" ||
+    promptIdentitySha256(observed.text) !== locator.promptSha256
+  ) {
+    throw new BrowserAutomationError(
+      "Recovered ChatGPT turn does not match the committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
+}
+
 export async function waitForAssistantResponse(
   Runtime: ChromeClient["Runtime"],
   timeoutMs: number,
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<{
   text: string;
   html?: string;
@@ -199,6 +266,7 @@ export async function waitForAssistantResponse(
     timeoutMs,
     minTurnIndex,
     expectedConversationId,
+    expectedPromptTurn,
   );
   const evaluationPromise = Runtime.evaluate({
     expression,
@@ -219,6 +287,7 @@ export async function waitForAssistantResponse(
     timeoutMs,
     minTurnIndex,
     expectedConversationId,
+    expectedPromptTurn,
     pollerAbort.signal,
   ).then(
     (value) => ({ kind: "poll" as const, value }),
@@ -267,6 +336,7 @@ export async function waitForAssistantResponse(
           logger,
           minTurnIndex,
           expectedConversationId,
+          expectedPromptTurn,
         );
         if (recovered) {
           return recovered;
@@ -294,6 +364,7 @@ export async function waitForAssistantResponse(
         logger,
         minTurnIndex,
         expectedConversationId,
+        expectedPromptTurn,
       );
       if (recovered) {
         return recovered;
@@ -319,6 +390,7 @@ export async function waitForAssistantResponse(
     logger,
     minTurnIndex,
     expectedConversationId,
+    expectedPromptTurn,
   );
   const candidate = refreshed ?? parsed;
   if (isGeneratedImageAssistantAnswer(candidate)) {
@@ -341,6 +413,7 @@ export async function waitForAssistantResponse(
       remainingMs,
       minTurnIndex,
       expectedConversationId,
+      expectedPromptTurn,
     );
     if (completed) {
       return completed;
@@ -367,14 +440,23 @@ export async function readAssistantSnapshot(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<AssistantSnapshot | null> {
   const { result } = await Runtime.evaluate({
-    expression: buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId),
+    expression: buildAssistantSnapshotExpression(
+      minTurnIndex,
+      expectedConversationId,
+      expectedPromptTurn,
+    ),
     returnByValue: true,
   });
   const value = result?.value;
   if (value && typeof value === "object") {
     const snapshot = value as AssistantSnapshot;
+    if (expectedPromptTurn) {
+      const turnIndex = typeof snapshot.turnIndex === "number" ? snapshot.turnIndex : null;
+      if (turnIndex !== expectedPromptTurn.verifiedUserTurnIndex + 1) return null;
+    }
     if (typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
       const turnIndex = typeof snapshot.turnIndex === "number" ? snapshot.turnIndex : null;
       if (turnIndex === null) {
@@ -393,9 +475,37 @@ export async function captureAssistantMarkdown(
   Runtime: ChromeClient["Runtime"],
   meta: { messageId?: string | null; turnId?: string | null },
   logger: BrowserLogger,
+  expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<string | null> {
+  let exactMeta = meta;
+  if (expectedPromptTurn) {
+    await verifyCommittedPromptTurn(Runtime, expectedPromptTurn);
+    const exactSnapshot = await readAssistantSnapshot(
+      Runtime,
+      expectedPromptTurn.verifiedUserTurnIndex + 1,
+      expectedConversationId ?? expectedPromptTurn.conversationId,
+      expectedPromptTurn,
+    );
+    if (!exactSnapshot) return null;
+    if (
+      (meta.messageId && exactSnapshot.messageId !== meta.messageId) ||
+      (meta.turnId && exactSnapshot.turnId !== meta.turnId)
+    ) {
+      return null;
+    }
+    exactMeta = {
+      messageId: exactSnapshot.messageId ?? meta.messageId ?? null,
+      turnId: exactSnapshot.turnId ?? meta.turnId ?? null,
+    };
+    if (!exactMeta.messageId && !exactMeta.turnId) return null;
+  }
   const { result } = await Runtime.evaluate({
-    expression: buildCopyExpression(meta),
+    expression: buildCopyExpression(
+      exactMeta,
+      expectedConversationId ?? expectedPromptTurn?.conversationId,
+      Boolean(expectedPromptTurn),
+    ),
     returnByValue: true,
     awaitPromise: true,
   });
@@ -413,15 +523,19 @@ export async function captureAssistantMarkdown(
   return null;
 }
 
-export function buildAssistantExtractorForTest(name: string): string {
-  return buildAssistantExtractor(name);
+export function buildAssistantExtractorForTest(
+  name: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
+): string {
+  return buildAssistantExtractor(name, expectedPromptTurn);
 }
 
 export function buildAssistantSnapshotExpressionForTest(
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
-  return buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId);
+  return buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId, expectedPromptTurn);
 }
 
 export function buildConversationDebugExpressionForTest(): string {
@@ -434,8 +548,10 @@ export function buildMarkdownFallbackExtractorForTest(minTurnLiteral = "0"): str
 
 export function buildCopyExpressionForTest(
   meta: { messageId?: string | null; turnId?: string | null } = {},
+  expectedConversationId?: string,
+  requireExactHint = false,
 ): string {
-  return buildCopyExpression(meta);
+  return buildCopyExpression(meta, expectedConversationId, requireExactHint);
 }
 
 async function recoverAssistantResponse(
@@ -444,6 +560,7 @@ async function recoverAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<{
   text: string;
   html?: string;
@@ -456,7 +573,12 @@ async function recoverAssistantResponse(
   const recoveryStartedAt = Date.now();
   const recovered = await waitForCondition(
     async () => {
-      const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+      const snapshot = await readAssistantSnapshot(
+        Runtime,
+        minTurnIndex,
+        expectedConversationId,
+        expectedPromptTurn,
+      );
       return normalizeAssistantSnapshot(snapshot);
     },
     recoveryTimeoutMs,
@@ -473,6 +595,7 @@ async function recoverAssistantResponse(
         remainingMs,
         minTurnIndex,
         expectedConversationId,
+        expectedPromptTurn,
       );
       if (confirmed) {
         logger("Recovered and confirmed assistant response via polling fallback");
@@ -548,6 +671,7 @@ async function refreshAssistantSnapshot(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<{
   text: string;
   html?: string;
@@ -567,6 +691,7 @@ async function refreshAssistantSnapshot(
       Runtime,
       minTurnIndex,
       expectedConversationId,
+      expectedPromptTurn,
     ).catch(() => null);
     const latest = normalizeAssistantSnapshot(latestSnapshot);
     if (latest) {
@@ -617,6 +742,7 @@ async function pollAssistantCompletion(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
   abortSignal?: AbortSignal,
 ): Promise<{
   text: string;
@@ -630,7 +756,12 @@ async function pollAssistantCompletion(
     if (abortSignal?.aborted) {
       return null;
     }
-    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      expectedPromptTurn,
+    );
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
       // Generated-image answers stream no text and mount no action bar; accept immediately.
@@ -856,6 +987,7 @@ async function waitForCondition<T>(
 function buildAssistantSnapshotExpression(
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -865,20 +997,17 @@ function buildAssistantSnapshotExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
+  const hasExactPromptScope = expectedPromptTurn !== undefined;
   return `(() => {
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     const currentHref = typeof location === 'object' && location.href ? location.href : '';
     const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
-    if (
-      EXPECTED_CONVERSATION_ID &&
-      currentConversationId &&
-      currentConversationId !== EXPECTED_CONVERSATION_ID
-    ) {
+    if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
       return null;
     }
     // Learned: the default turn DOM misses project view; keep a fallback extractor.
-    ${buildAssistantExtractor("extractAssistantTurn")}
+    ${buildAssistantExtractor("extractAssistantTurn", expectedPromptTurn)}
     const extracted = extractAssistantTurn();
     const isPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
@@ -900,7 +1029,7 @@ function buildAssistantSnapshotExpression(
     }
     // Fallback for ChatGPT project view: answers can live outside conversation turns.
     const extractFallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
-    const fallback = extractFallback();
+    const fallback = ${hasExactPromptScope ? "null" : "extractFallback()"};
     if (fallback && !isPlaceholder(fallback) && !isActiveThinkingStatus(fallback)) {
       return fallback;
     }
@@ -912,6 +1041,7 @@ function buildResponseObserverExpression(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
   const selectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
@@ -923,6 +1053,7 @@ function buildResponseObserverExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
+  const hasExactPromptScope = expectedPromptTurn !== undefined;
   return `(() => {
     ${buildClickDispatcher()}
     const SELECTORS = ${selectorsLiteral};
@@ -938,8 +1069,7 @@ function buildResponseObserverExpression(
     };
     const matchesExpectedConversation = () => {
       if (!EXPECTED_CONVERSATION_ID) return true;
-      const currentId = currentConversationId();
-      return !currentId || currentId === EXPECTED_CONVERSATION_ID;
+      return currentConversationId() === EXPECTED_CONVERSATION_ID;
     };
     const isAnswerNowPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
@@ -966,7 +1096,7 @@ function buildResponseObserverExpression(
     };
 
     const MIN_TURN_INDEX = ${minTurnLiteral};
-    ${buildAssistantExtractor("extractFromTurns")}
+    ${buildAssistantExtractor("extractFromTurns", expectedPromptTurn)}
     // Learned: some layouts (project view) render markdown without assistant turn wrappers.
     const extractFromMarkdownFallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
 
@@ -1141,7 +1271,7 @@ function buildResponseObserverExpression(
         ? extractedRaw
         : null;
     let extracted = acceptSnapshot(extractedCandidate);
-    if (!extracted) {
+    if (!extracted && !${hasExactPromptScope}) {
       const fallbackRaw = extractFromMarkdownFallback();
       const fallbackCandidate =
         fallbackRaw &&
@@ -1158,26 +1288,59 @@ function buildResponseObserverExpression(
   })()`;
 }
 
-function buildAssistantExtractor(functionName: string): string {
+function buildAssistantExtractor(
+  functionName: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
+): string {
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
+  const expectedUserLiteral = expectedPromptTurn
+    ? JSON.stringify({
+        index: expectedPromptTurn.verifiedUserTurnIndex,
+        turnId: expectedPromptTurn.verifiedUserTurnId,
+        messageId: expectedPromptTurn.verifiedUserMessageId,
+      })
+    : "null";
   return `const ${functionName} = () => {
     ${buildClickDispatcher()}
     const ASSISTANT_SELECTOR = ${assistantLiteral};
+    const EXPECTED_USER = ${expectedUserLiteral};
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (turnAttr === 'assistant') {
-        return true;
-      }
+      if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-      if (role === 'assistant') {
-        return true;
-      }
+      if (role === 'assistant') return true;
       const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-      if (testId.includes('assistant')) {
-        return true;
-      }
+      if (testId.includes('assistant')) return true;
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
+    };
+    const isUserTurn = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const role = String(
+        node.getAttribute('data-message-author-role') ||
+          node.getAttribute('data-turn') ||
+          node.dataset?.turn ||
+          '',
+      ).toLowerCase();
+      return role === 'user' || Boolean(
+        node.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+    };
+    const readTurnId = (node) => {
+      const testId = node?.getAttribute?.('data-testid');
+      const value =
+        node?.getAttribute?.('data-turn-id') ||
+        node?.dataset?.turnId ||
+        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
+        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+    const readMessageId = (node) => {
+      const messageNode = node?.matches?.('[data-message-id]')
+        ? node
+        : node?.querySelector?.('[data-message-id]');
+      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
     };
 
     const expandCollapsibles = (root) => {
@@ -1198,11 +1361,32 @@ function buildAssistantExtractor(functionName: string): string {
     };
 
     const turns = ${buildConversationTurnListExpression()};
-    for (let index = turns.length - 1; index >= 0; index -= 1) {
-      const turn = turns[index];
-      if (!isAssistantTurn(turn)) {
-        continue;
+    const candidateIndexes = [];
+    if (EXPECTED_USER) {
+      const expectedUserTurn = turns[EXPECTED_USER.index];
+      if (
+        !isUserTurn(expectedUserTurn) ||
+        readTurnId(expectedUserTurn) !== EXPECTED_USER.turnId ||
+        readMessageId(expectedUserTurn) !== EXPECTED_USER.messageId
+      ) {
+        return null;
       }
+      let exactAssistantIndex = null;
+      for (let index = EXPECTED_USER.index + 1; index < turns.length; index += 1) {
+        const turn = turns[index];
+        if (isUserTurn(turn)) return null;
+        if (exactAssistantIndex === null && isAssistantTurn(turn)) {
+          exactAssistantIndex = index;
+        }
+      }
+      if (exactAssistantIndex !== null) candidateIndexes.push(exactAssistantIndex);
+    } else {
+      for (let index = turns.length - 1; index >= 0; index -= 1) candidateIndexes.push(index);
+    }
+
+    for (const index of candidateIndexes) {
+      const turn = turns[index];
+      if (!isAssistantTurn(turn)) continue;
       const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) ?? turn;
       expandCollapsibles(messageRoot);
       const preferred =
@@ -1214,9 +1398,7 @@ function buildAssistantExtractor(functionName: string): string {
         messageRoot.querySelector('.prose') ||
         messageRoot.querySelector('[class*="markdown"]');
       const contentRoot = preferred ?? messageRoot;
-      if (!contentRoot) {
-        continue;
-      }
+      if (!contentRoot) continue;
       const innerText = contentRoot?.innerText ?? '';
       const textContent = contentRoot?.textContent ?? '';
       const text = innerText.trim().length > 0 ? innerText : textContent;
@@ -1237,9 +1419,7 @@ function buildAssistantExtractor(functionName: string): string {
         const label = generatedImages.length === 1 ? 'Generated image.' : \`Generated \${generatedImages.length} images.\`;
         return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index };
       }
-      if (text.trim()) {
-        return { text, html, messageId, turnId, turnIndex: index };
-      }
+      if (text.trim()) return { text, html, messageId, turnId, turnIndex: index };
     }
     return null;
   };`;
@@ -1391,7 +1571,13 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
   })`;
 }
 
-function buildCopyExpression(meta: { messageId?: string | null; turnId?: string | null }): string {
+function buildCopyExpression(
+  meta: { messageId?: string | null; turnId?: string | null },
+  expectedConversationId?: string,
+  requireExactHint = false,
+): string {
+  const expectedConversationLiteral = JSON.stringify(expectedConversationId ?? null);
+  const requireExactHintLiteral = JSON.stringify(requireExactHint);
   return `(() => {
     ${buildClickDispatcher()}
     const BUTTON_SELECTOR = '${COPY_BUTTON_SELECTOR}';
@@ -1399,6 +1585,12 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
 
     const locateButton = () => {
       const hint = ${JSON.stringify(meta ?? {})};
+      const expectedConversationId = ${expectedConversationLiteral};
+      const requireExactHint = ${requireExactHintLiteral};
+      if (expectedConversationId) {
+        const currentConversationId = String(location?.href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] || null;
+        if (currentConversationId !== expectedConversationId) return null;
+      }
       if (hint?.messageId) {
         const node = document.querySelector('[data-message-id="' + hint.messageId + '"]');
         const buttons = node ? Array.from(node.querySelectorAll('${COPY_BUTTON_SELECTOR}')) : [];
@@ -1415,6 +1607,7 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
           return button;
         }
       }
+      if (requireExactHint) return null;
       const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
       const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
       const isAssistantTurn = (node) => {

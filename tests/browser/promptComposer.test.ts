@@ -36,6 +36,40 @@ describe("promptComposer", () => {
     expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
+  test("does not commit an exact prompt turn without stable turn and message ids", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 1,
+              matchedUserTurnIndex: 0,
+              matchedUserTurnId: null,
+              matchedUserMessageId: null,
+              matchedUserTurnText: "hello",
+              conversationId: "conversation-1",
+            },
+          },
+        }),
+      };
+      const pending = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        0,
+      );
+      const assertion = expect(pending).rejects.toThrow(/prompt did not appear/i);
+
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("does not treat historical assistant content as committed without a new turn", async () => {
     vi.useFakeTimers();
     try {
@@ -277,6 +311,117 @@ describe("promptComposer", () => {
     }
   });
 
+  test("rejects a new user turn that shares the first 120 characters but has a different suffix", async () => {
+    vi.useFakeTimers();
+    try {
+      const sharedPrefix = "x".repeat(120);
+      const intendedPrompt = `${sharedPrefix} intended suffix`;
+      const observedPrompt = `${sharedPrefix} unrelated suffix`;
+      const turn = {
+        innerText: observedPrompt,
+        textContent: observedPrompt,
+        id: "conversation-turn-0",
+        dataset: { turn: "user", turnId: "turn-0", messageId: "message-0" },
+        getAttribute(name: string) {
+          if (name === "data-message-author-role" || name === "data-turn") return "user";
+          if (name === "data-turn-id") return "turn-0";
+          if (name === "data-message-id") return "message-0";
+          return null;
+        },
+        matches: (selector: string) => selector === "[data-message-id]",
+        querySelector: () => null,
+      };
+      const document = {
+        querySelector: () => null,
+        querySelectorAll: (selector: string) =>
+          selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
+          selector === CONVERSATION_TURN_SELECTOR
+            ? [turn]
+            : [],
+      };
+      class FakeTextArea {}
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: Function(
+              "document",
+              "HTMLTextAreaElement",
+              "location",
+              `return ${expression};`,
+            )(document, FakeTextArea, { href: "https://chatgpt.com/c/exact-suffix" }),
+          },
+        })),
+      };
+
+      const pending = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        intendedPrompt,
+        150,
+        undefined,
+        0,
+      );
+      const assertion = expect(pending).rejects.toThrow(/prompt did not appear/i);
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("commits the exact prompt with stable data-testid and message identities", async () => {
+    const messageNode = {
+      dataset: { messageId: "message-0" },
+      getAttribute: (name: string) => (name === "data-message-id" ? "message-0" : null),
+    };
+    const turn = {
+      innerText: "Exact prompt text",
+      textContent: "Exact prompt text",
+      dataset: { turn: "user" },
+      getAttribute(name: string) {
+        if (name === "data-message-author-role" || name === "data-turn") return "user";
+        if (name === "data-testid") return "conversation-turn-0";
+        return null;
+      },
+      matches: () => false,
+      querySelector: (selector: string) => (selector === "[data-message-id]" ? messageNode : null),
+    };
+    const document = {
+      querySelector: () => null,
+      querySelectorAll: (selector: string) =>
+        selector === CONVERSATION_TURN_CONTAINER_SELECTOR || selector === CONVERSATION_TURN_SELECTOR
+          ? [turn]
+          : [],
+    };
+    class FakeTextArea {}
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: Function(
+            "document",
+            "HTMLTextAreaElement",
+            "location",
+            `return ${expression};`,
+          )(document, FakeTextArea, { href: "https://chatgpt.com/c/exact-conversation" }),
+        },
+      })),
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "Exact prompt text",
+        150,
+        undefined,
+        0,
+      ),
+    ).resolves.toMatchObject({
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "conversation-turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationId: "exact-conversation",
+    });
+  });
+
   test("attachment sends time out instead of allowing Enter fallback", async () => {
     vi.useFakeTimers();
     try {
@@ -369,6 +514,7 @@ describe("promptComposer", () => {
               matchedUserTurnIndex: 0,
               matchedUserTurnId: "turn-1",
               matchedUserMessageId: "message-1",
+              matchedUserTurnText: "hello",
               hasNewTurn: true,
               stopVisible: true,
               assistantVisible: false,

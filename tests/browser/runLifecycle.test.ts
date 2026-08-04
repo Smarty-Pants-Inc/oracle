@@ -5,10 +5,14 @@ import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 const committedVerification = {
   committedTurns: 1,
+  promptSha256: promptIdentitySha256("review"),
   verifiedUserTurnIndex: 0,
+  verifiedUserTurnId: "turn-0",
+  verifiedUserMessageId: "message-0",
   conversationId: "captured-conversation",
 };
 
@@ -19,12 +23,19 @@ function remoteRuntime(): BrowserRuntimeMetadata {
     chromePort: 9222,
     chromeTargetId: "owned-target",
     tabUrl: "https://chatgpt.com/c/captured-conversation",
-    recoveryCleanup: {
-      transport: "remote",
-      ownsTarget: true,
-      profileKind: "none",
-      keepBrowser: false,
-    },
+    recoveryCleanupResources: [
+      {
+        chromeHost: "remote.example",
+        chromePort: 9222,
+        chromeTargetId: "owned-target",
+        recoveryCleanup: {
+          transport: "remote",
+          ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: false,
+        },
+      },
+    ],
   };
 }
 
@@ -77,14 +88,29 @@ describe("BrowserRunLifecycleController", () => {
     });
 
     expect(lifecycle.phase()).toEqual({ kind: "caller-publication" });
-    expect(transaction.promptSubmitted).toBe(true);
     expect(transaction.promptEpoch).toMatchObject({ status: "committed" });
     expect(transaction.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
+    expect(transaction.runtime.recoveryCleanupResources).toEqual([
+      expect.objectContaining({
+        conversationId: "captured-conversation",
+        promptEpoch: expect.objectContaining({
+          status: "committed",
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
+        }),
+      }),
+    ]);
     expect(settleResources).not.toHaveBeenCalled();
     expect(await lifecycle.settleIfUnpublished()).toBeNull();
 
     await transaction.finalize();
-    await transaction.abort();
+    await expect(transaction.abort()).rejects.toMatchObject({
+      details: {
+        code: "browser-run-lifecycle-settlement-conflict",
+        requestedMode: "abort",
+        boundMode: "finalize",
+      },
+    });
 
     expect(settleResources).toHaveBeenCalledTimes(1);
     expect(settleResources).toHaveBeenCalledWith(
@@ -94,7 +120,6 @@ describe("BrowserRunLifecycleController", () => {
     expect(lifecycle.phase()).toEqual({ kind: "completed", mode: "finalize" });
     expect(persistRuntime).toHaveBeenCalledWith(
       expect.objectContaining({
-        promptSubmitted: true,
         promptEpoch: expect.objectContaining({ status: "committed" }),
       }),
     );
@@ -108,7 +133,10 @@ describe("BrowserRunLifecycleController", () => {
     lifecycle.markAcquired();
 
     const firstIdentity = await lifecycle.beginPromptDispatch("first prompt", 0, 0, 1);
-    await lifecycle.recordPromptCommitVerification(committedVerification, firstIdentity);
+    await lifecycle.recordPromptCommitVerification(
+      { ...committedVerification, promptSha256: firstIdentity.promptSha256 },
+      firstIdentity,
+    );
     await lifecycle.resetPrompt();
     const secondIdentity = await lifecycle.beginPromptDispatch("second prompt", 2, 1, 0);
 
@@ -125,6 +153,9 @@ describe("BrowserRunLifecycleController", () => {
         {
           committedTurns: 3,
           verifiedUserTurnIndex: 2,
+          verifiedUserTurnId: "turn-2",
+          verifiedUserMessageId: "message-2",
+          promptSha256: secondIdentity.promptSha256,
           conversationId: "second-conversation",
         },
         firstIdentity,
@@ -135,6 +166,9 @@ describe("BrowserRunLifecycleController", () => {
       {
         committedTurns: 3,
         verifiedUserTurnIndex: 2,
+        verifiedUserTurnId: "turn-2",
+        verifiedUserMessageId: "message-2",
+        promptSha256: secondIdentity.promptSha256,
         conversationId: "second-conversation",
       },
       secondIdentity,
@@ -161,7 +195,6 @@ describe("BrowserRunLifecycleController", () => {
       details: {
         code: "prompt-epoch-persistence-failed",
         runtime: {
-          promptSubmitted: false,
           promptEpoch: { status: "pending" },
         },
       },
@@ -172,33 +205,89 @@ describe("BrowserRunLifecycleController", () => {
     });
   });
 
-  test("records failed cleanup as an explicit pending-cleanup terminal phase", async () => {
-    const lifecycle = new BrowserRunLifecycleController({
-      getRuntime: remoteRuntime,
-      settleResources: async (_mode, runtime) =>
-        pendingBrowserCaptureCleanup(runtime, "target close was not confirmed"),
-    });
-    lifecycle.markAcquired();
-    const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
-    await lifecycle.recordPromptCommitVerification(committedVerification, identity);
-    const transaction = lifecycle.issueCapture({
-      answerText: "captured answer",
-      answerMarkdown: "captured answer",
-      tookMs: 1,
-      answerTokens: 2,
-      answerChars: 15,
-    });
+  test.each([
+    { mode: "finalize" as const, oppositeMode: "abort" as const },
+    { mode: "abort" as const, oppositeMode: "finalize" as const },
+  ])(
+    "retries pending $mode cleanup in the bound mode using the latest runtime",
+    async ({ mode, oppositeMode }) => {
+      const settleResources = vi
+        .fn(async (_mode: "finalize" | "abort", runtime: BrowserRuntimeMetadata) =>
+          completedBrowserCaptureCleanup(runtime),
+        )
+        .mockImplementationOnce(async (_mode, runtime) =>
+          pendingBrowserCaptureCleanup(
+            {
+              ...runtime,
+              chromeTargetId: "retry-target",
+              recoveryCleanupResources: runtime.recoveryCleanupResources?.map((resource) => ({
+                ...resource,
+                chromeTargetId: "retry-target",
+              })),
+            },
+            "target close was not confirmed",
+          ),
+        );
+      const lifecycle = new BrowserRunLifecycleController({
+        getRuntime: remoteRuntime,
+        settleResources,
+      });
+      lifecycle.markAcquired();
+      const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
+      await lifecycle.recordPromptCommitVerification(committedVerification, identity);
+      const transaction = lifecycle.issueCapture({
+        answerText: "captured answer",
+        answerMarkdown: "captured answer",
+        tookMs: 1,
+        answerTokens: 2,
+        answerChars: 15,
+      });
 
-    const finalization = await transaction.abort();
+      const first = await transaction[mode]();
 
-    expect(finalization).toMatchObject({
-      status: "pending",
-      error: "target close was not confirmed",
-    });
-    expect(lifecycle.phase()).toEqual({
-      kind: "cleanup-pending",
-      mode: "abort",
-      error: "target close was not confirmed",
-    });
-  });
+      expect(first).toMatchObject({
+        status: "pending",
+        error: "target close was not confirmed",
+        runtime: {
+          chromeTargetId: "retry-target",
+          recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
+        },
+      });
+      expect(lifecycle.phase()).toEqual({
+        kind: "cleanup-pending",
+        mode,
+        error: "target close was not confirmed",
+      });
+      await expect(transaction[oppositeMode]()).rejects.toMatchObject({
+        details: {
+          code: "browser-run-lifecycle-settlement-conflict",
+          requestedMode: oppositeMode,
+          boundMode: mode,
+        },
+      });
+
+      const second = await transaction[mode]();
+      const cached = await transaction[mode]();
+
+      expect(second).toMatchObject({
+        status: "completed",
+        runtime: { chromeTargetId: "retry-target" },
+      });
+      expect(cached).toBe(second);
+      expect(settleResources).toHaveBeenCalledTimes(2);
+      expect(settleResources).toHaveBeenNthCalledWith(
+        2,
+        mode,
+        expect.objectContaining({
+          chromeTargetId: "retry-target",
+          recoveryCleanupResult: {
+            status: "failed",
+            error: "target close was not confirmed",
+          },
+          recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
+        }),
+      );
+      expect(lifecycle.phase()).toEqual({ kind: "completed", mode });
+    },
+  );
 });

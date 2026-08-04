@@ -100,6 +100,108 @@ describe("browser automation expressions", () => {
     expect(result).toMatchObject({ text: "old answer", turnIndex: 1 });
   });
 
+  test("exact prompt scope rejects an answer after any later user turn", () => {
+    class FakeElement {
+      readonly dataset: Record<string, string>;
+
+      constructor(
+        private readonly role: "user" | "assistant",
+        readonly innerText: string,
+        private readonly index: number,
+      ) {
+        this.dataset = {
+          turn: role,
+          turnId: `turn-${index}`,
+          messageId: `message-${index}`,
+        };
+      }
+
+      get textContent(): string {
+        return this.innerText;
+      }
+
+      get innerHTML(): string {
+        return this.innerText;
+      }
+
+      get id(): string {
+        return `conversation-turn-${this.index}`;
+      }
+
+      getAttribute(name: string): string | null {
+        if (name === "data-message-author-role" || name === "data-turn") return this.role;
+        if (name === "data-turn-id") return `turn-${this.index}`;
+        if (name === "data-message-id") return `message-${this.index}`;
+        if (name === "data-testid") return `conversation-turn-${this.index}`;
+        return null;
+      }
+
+      matches(selector: string): boolean {
+        return selector === "[data-message-id]";
+      }
+
+      querySelector(selector: string): FakeElement | null {
+        if (selector.includes('data-message-author-role="user"') && this.role === "user") {
+          return this;
+        }
+        return null;
+      }
+
+      querySelectorAll(): FakeElement[] {
+        return [];
+      }
+    }
+
+    const locator = {
+      epoch: {
+        status: "committed" as const,
+        epochId: "epoch-original",
+        promptSha256: "a".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "turn-0",
+        verifiedUserMessageId: "message-0",
+        conversationId: "conversation-1",
+      },
+      conversationId: "conversation-1",
+      promptSha256: "a".repeat(64),
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationUrls: ["https://chatgpt.com/c/conversation-1"],
+    };
+    const expression = buildAssistantExtractorForTest("capture", locator);
+    const evaluate = (turns: FakeElement[]) =>
+      Function(
+        "document",
+        "HTMLElement",
+        `${expression}; return capture();`,
+      )(
+        {
+          querySelectorAll: (selector: string) =>
+            selector === CONVERSATION_TURN_CONTAINER_SELECTOR ? turns : [],
+        },
+        FakeElement,
+      ) as { text?: string; turnIndex?: number } | null;
+
+    expect(
+      evaluate([
+        new FakeElement("user", "original prompt", 0),
+        new FakeElement("assistant", "original answer", 1),
+      ]),
+    ).toMatchObject({ text: "original answer", turnIndex: 1 });
+    expect(
+      evaluate([
+        new FakeElement("user", "original prompt", 0),
+        new FakeElement("assistant", "original answer", 1),
+        new FakeElement("user", "later unrelated prompt", 2),
+        new FakeElement("assistant", "later unrelated answer", 3),
+      ]),
+    ).toBeNull();
+  });
+
   test("conversation debug expression references conversation selector", () => {
     const expression = buildConversationDebugExpressionForTest();
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));

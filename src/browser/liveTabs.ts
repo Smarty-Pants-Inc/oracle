@@ -53,6 +53,8 @@ export interface ChatGptTabSummary {
   lastAssistantSnippet: string;
   lastUserText: string;
   lastUserSnippet: string;
+  lastUserTurnId?: string;
+  lastUserMessageId?: string;
   focused: boolean;
   visibilityState: string;
   conversationId?: string;
@@ -217,6 +219,24 @@ function buildTabInspectionExpression(): string {
       const lastUserContainer = lastUserTurn
         ? turns.find((turn) => turn === lastUserTurn || turn.contains?.(lastUserTurn))
         : null;
+      const readTurnId = (node) => {
+        const testId = node?.getAttribute?.('data-testid');
+        const value =
+          node?.getAttribute?.('data-turn-id') ||
+          node?.dataset?.turnId ||
+          (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
+          (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
+        return typeof value === 'string' && value.trim() ? value.trim() : null;
+      };
+      const readMessageId = (node) => {
+        const messageNode = node?.matches?.('[data-message-id]')
+          ? node
+          : node?.querySelector?.('[data-message-id]');
+        const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
+        return typeof value === 'string' && value.trim() ? value.trim() : null;
+      };
+      const lastUserTurnId = readTurnId(lastUserContainer ?? lastUserTurn);
+      const lastUserMessageId = readMessageId(lastUserContainer ?? lastUserTurn);
       const answerNodes = rawAnswerNodes.filter(
         (node) =>
           !lastUserTurn ||
@@ -265,6 +285,8 @@ function buildTabInspectionExpression(): string {
         lastAssistantTurnIndex,
         lastUserTurnIndex,
         lastUserText,
+        lastUserTurnId,
+        lastUserMessageId,
         visibilityState: document.visibilityState,
         focused: Boolean(document.hasFocus?.()),
       };
@@ -335,6 +357,8 @@ export async function inspectChatGptTab(
       lastAssistantTurnIndex?: number;
       lastUserTurnIndex?: number;
       lastUserText?: string;
+      lastUserTurnId?: string;
+      lastUserMessageId?: string;
       visibilityState?: string;
       focused?: boolean;
     };
@@ -382,6 +406,14 @@ export async function inspectChatGptTab(
       lastAssistantSnippet: trimToSnippet(lastAssistantText),
       lastUserText,
       lastUserSnippet: trimToSnippet(lastUserText),
+      lastUserTurnId:
+        typeof info.lastUserTurnId === "string" && info.lastUserTurnId.trim()
+          ? info.lastUserTurnId.trim()
+          : undefined,
+      lastUserMessageId:
+        typeof info.lastUserMessageId === "string" && info.lastUserMessageId.trim()
+          ? info.lastUserMessageId.trim()
+          : undefined,
       focused: Boolean(info.focused),
       visibilityState: typeof info.visibilityState === "string" ? info.visibilityState : "",
       conversationId: extractConversationIdFromUrl(info.url ?? target.url ?? ""),

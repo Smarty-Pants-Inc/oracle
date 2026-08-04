@@ -1,7 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { BrowserPromptEpoch, BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { PromptCommitVerification } from "./actions/promptComposer.js";
+import { promptIdentitySha256, type PromptCommitVerification } from "./actions/promptComposer.js";
 import type { PromptCommitEvidence } from "./providerDomFlow.js";
 import type {
   BrowserCaptureFinalizationResult,
@@ -96,7 +96,7 @@ export interface BrowserRunLifecycleAdapters {
 export function markBrowserCaptureCleanupPending(
   runtime: BrowserRuntimeMetadata,
 ): BrowserRuntimeMetadata {
-  if (!runtime.recoveryCleanup && !runtime.recoveryCleanupBacklog?.length) return runtime;
+  if (!runtime.recoveryCleanupResources?.length) return runtime;
   return { ...runtime, recoveryCleanupResult: { status: "pending" } };
 }
 
@@ -104,8 +104,9 @@ export function completedBrowserCaptureCleanup(
   runtime: BrowserRuntimeMetadata,
 ): BrowserCaptureFinalizationResult {
   const completed = { ...runtime };
-  delete completed.recoveryCleanup;
+  delete completed.recoveryCleanupResources;
   delete completed.recoveryCleanupResult;
+  delete completed.remoteRecovery;
   return { status: "completed", runtime: completed };
 }
 
@@ -118,16 +119,6 @@ export function pendingBrowserCaptureCleanup(
     runtime: { ...runtime, recoveryCleanupResult: { status: "failed", error } },
     error,
   };
-}
-
-function normalizePromptForIdentity(prompt: string): string {
-  return prompt
-    .toLowerCase()
-    .replace(/```[^\n]*\n([\s\S]*?)```/g, " $1 ")
-    .replace(/```/g, " ")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function pendingPromptEpoch(
@@ -150,12 +141,8 @@ function committedPromptEpoch(
     ...pendingPromptEpoch(dispatch),
     status: "committed",
     verifiedUserTurnIndex: dispatch.verification.verifiedUserTurnIndex,
-    ...(dispatch.verification.verifiedUserTurnId
-      ? { verifiedUserTurnId: dispatch.verification.verifiedUserTurnId }
-      : {}),
-    ...(dispatch.verification.verifiedUserMessageId
-      ? { verifiedUserMessageId: dispatch.verification.verifiedUserMessageId }
-      : {}),
+    verifiedUserTurnId: dispatch.verification.verifiedUserTurnId,
+    verifiedUserMessageId: dispatch.verification.verifiedUserMessageId,
     conversationId: dispatch.verification.conversationId,
   };
 }
@@ -175,10 +162,8 @@ function captureResultRuntime(
   | "chromeTargetId"
   | "tabUrl"
   | "conversationId"
-  | "promptSubmitted"
   | "promptEpoch"
   | "controllerPid"
-  | "recoveryCleanup"
 > {
   return {
     browserTransport: runtime.browserTransport,
@@ -192,10 +177,8 @@ function captureResultRuntime(
     chromeTargetId: runtime.chromeTargetId,
     tabUrl: runtime.tabUrl,
     conversationId: runtime.conversationId,
-    promptSubmitted: runtime.promptSubmitted,
     promptEpoch: runtime.promptEpoch,
     controllerPid: runtime.controllerPid,
-    recoveryCleanup: runtime.recoveryCleanup,
   };
 }
 
@@ -269,8 +252,12 @@ export class BrowserRunLifecycleController {
     return {
       ...base,
       conversationId,
-      promptSubmitted: epoch?.status === "committed",
       promptEpoch: epoch,
+      recoveryCleanupResources: base.recoveryCleanupResources?.map((resource) => ({
+        ...resource,
+        conversationId,
+        promptEpoch: epoch,
+      })),
     };
   }
 
@@ -315,9 +302,7 @@ export class BrowserRunLifecycleController {
     const dispatch: PendingDispatch = {
       epochId: randomUUID(),
       prompt,
-      promptSha256: createHash("sha256")
-        .update(normalizePromptForIdentity(prompt), "utf8")
-        .digest("hex"),
+      promptSha256: promptIdentitySha256(prompt),
       baselineTurns,
       followUpOrdinal,
       remainingFollowUps,
@@ -342,10 +327,15 @@ export class BrowserRunLifecycleController {
     if (
       pending.epochId !== expected.epochId ||
       pending.promptSha256 !== expected.promptSha256 ||
+      verification.promptSha256 !== pending.promptSha256 ||
       !Number.isInteger(verification.verifiedUserTurnIndex) ||
       verification.verifiedUserTurnIndex < pending.baselineTurns ||
       !Number.isInteger(verification.committedTurns) ||
       verification.committedTurns <= verification.verifiedUserTurnIndex ||
+      typeof verification.verifiedUserTurnId !== "string" ||
+      !verification.verifiedUserTurnId.trim() ||
+      typeof verification.verifiedUserMessageId !== "string" ||
+      !verification.verifiedUserMessageId.trim() ||
       typeof verification.conversationId !== "string" ||
       !verification.conversationId.trim()
     ) {
@@ -412,9 +402,21 @@ export class BrowserRunLifecycleController {
       return this.beginSettlement(mode, this.state.runtime);
     }
     if (this.state.kind === "settling") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+      }
       return this.state.completion;
     }
-    if (this.state.kind === "completed" || this.state.kind === "cleanup-pending") {
+    if (this.state.kind === "cleanup-pending") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+      }
+      return this.beginSettlement(mode, this.state.result.runtime);
+    }
+    if (this.state.kind === "completed") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+      }
       return Promise.resolve(this.state.result);
     }
     return Promise.reject(this.illegalTransition(`settle published capture (${mode})`));
@@ -463,6 +465,22 @@ export class BrowserRunLifecycleController {
     return new BrowserAutomationError(
       "Prompt commit evidence does not belong to the current prompt epoch.",
       { stage: "prompt-epoch", code: "prompt-epoch-mismatch" },
+    );
+  }
+
+  private settlementModeConflict(
+    requestedMode: BrowserCaptureSettlementMode,
+    boundMode: BrowserCaptureSettlementMode,
+  ): BrowserAutomationError {
+    return new BrowserAutomationError(
+      `Browser run transaction is already bound to ${boundMode}; ${requestedMode} is not allowed.`,
+      {
+        stage: "browser-run-lifecycle",
+        code: "browser-run-lifecycle-settlement-conflict",
+        phase: this.state.kind,
+        requestedMode,
+        boundMode,
+      },
     );
   }
 

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
+import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
 
 const {
   launchChrome,
@@ -10,8 +11,7 @@ const {
   killChrome,
   resolveBrowserConfig,
   readDevToolsPort,
-  writeDevToolsActivePort,
-  writeChromePid,
+  writeOracleChromeOwner,
   cleanupStaleProfileState,
   verifyDevToolsReachable,
   delay,
@@ -25,8 +25,9 @@ const {
   killChrome: vi.fn(async () => ({ status: "stopped" as const, pid: 12345 })),
   resolveBrowserConfig: vi.fn((input: unknown) => input),
   readDevToolsPort: vi.fn(async () => null),
-  writeDevToolsActivePort: vi.fn(async () => undefined),
-  writeChromePid: vi.fn(async () => undefined),
+  writeOracleChromeOwner: vi.fn(
+    async (_profileDir: string, _owner: OracleChromeOwnerRecord) => undefined,
+  ),
   cleanupStaleProfileState: vi.fn(async () => true),
   verifyDevToolsReachable: vi.fn(async () => ({ ok: false, error: "unreachable" })),
   delay: vi.fn(async () => undefined),
@@ -100,8 +101,7 @@ vi.mock("../../src/browser/profileState.js", () => ({
   isSafeChromeTerminationOutcome: (outcome: { status?: string }) =>
     outcome.status === "stopped" || outcome.status === "already-stopped",
   readDevToolsPort,
-  writeDevToolsActivePort,
-  writeChromePid,
+  writeOracleChromeOwner,
   verifyDevToolsReachable,
 }));
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
@@ -150,8 +150,7 @@ describe("gemini-web executor", () => {
     closeTab.mockClear();
     resolveBrowserConfig.mockClear();
     readDevToolsPort.mockReset();
-    writeDevToolsActivePort.mockClear();
-    writeChromePid.mockClear();
+    writeOracleChromeOwner.mockClear();
     cleanupStaleProfileState.mockClear();
     verifyDevToolsReachable.mockReset();
     delay.mockClear();
@@ -169,17 +168,21 @@ describe("gemini-web executor", () => {
     acquireManualChromeOwner.mockImplementation(async (profileDir: string, config, logger) => {
       const profileDirectory = await captureProfileDirectoryIdentity(profileDir, { create: true });
       const chrome = await launchChrome(config, profileDir, logger);
-      const processIdentity = {
-        pid: chrome.pid,
-        processStartTime: "2026-08-04T00:00:00.000Z",
-        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        normalizedUserDataDir: profileDirectory.canonicalPath,
-        launchNonce: "executor-test-owner",
-        profileDirectory,
+      const ownerRecord: OracleChromeOwnerRecord = {
+        port: chrome.port,
+        processIdentity: {
+          pid: chrome.pid,
+          processStartTime: "2026-08-04T00:00:00.000Z",
+          executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          normalizedUserDataDir: profileDirectory.canonicalPath,
+          launchNonce: "executor-test-owner",
+          profileDirectory,
+        },
       };
+      await writeOracleChromeOwner(profileDir, ownerRecord);
       return {
-        chrome: { ...chrome, processIdentity },
-        processIdentity,
+        chrome: { ...chrome, processIdentity: ownerRecord.processIdentity },
+        processIdentity: ownerRecord.processIdentity,
         source: "launched" as const,
       };
     });

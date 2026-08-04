@@ -7,15 +7,16 @@ function recoverableRuntime(
 ) {
   return {
     ...locator,
-    promptSubmitted: true,
     promptEpoch: {
       status: "committed" as const,
       epochId: `epoch-${conversationId}`,
-      promptSha256: "test-prompt-sha256",
+      promptSha256: "a".repeat(64),
       baselineTurns: 0,
       followUpOrdinal: 0,
       remainingFollowUps: 0,
       verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
       conversationId,
     },
   };
@@ -60,6 +61,28 @@ describe("hasRecoverableChatGptConversation", () => {
     });
     pendingFollowUp.promptEpoch.remainingFollowUps = 1;
     expect(hasRecoverableChatGptConversation(pendingFollowUp)).toBe(false);
+  });
+
+  test("rejects malformed or truncated prompt digests", () => {
+    const runtime = recoverableRuntime("abc", { conversationId: "abc" });
+    runtime.promptEpoch.promptSha256 = "a".repeat(63);
+    expect(hasRecoverableChatGptConversation(runtime)).toBe(false);
+  });
+
+  test("rejects committed epochs without stable user turn and message ids", () => {
+    const runtime = recoverableRuntime("abc", { conversationId: "abc" });
+    expect(
+      hasRecoverableChatGptConversation({
+        ...runtime,
+        promptEpoch: { ...runtime.promptEpoch, verifiedUserTurnId: undefined },
+      } as never),
+    ).toBe(false);
+    expect(
+      hasRecoverableChatGptConversation({
+        ...runtime,
+        promptEpoch: { ...runtime.promptEpoch, verifiedUserMessageId: "" },
+      }),
+    ).toBe(false);
   });
 
   test("rejects ChatGPT home and project shell URLs", () => {

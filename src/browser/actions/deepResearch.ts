@@ -13,8 +13,13 @@ import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import { buildClickDispatcher } from "./domEvents.js";
-import { captureAssistantMarkdown, readAssistantSnapshot } from "./assistantResponse.js";
+import {
+  captureAssistantMarkdown,
+  readAssistantSnapshot,
+  verifyCommittedPromptTurn,
+} from "./assistantResponse.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import type { CommittedPromptEpochLocator } from "../reattachability.js";
 
 type ActivateOutcome =
   | { status: "activated" }
@@ -213,6 +218,8 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    expectedConversationId?: string;
+    expectedPromptTurn?: CommittedPromptEpochLocator;
   },
 ): Promise<{
   text: string;
@@ -226,6 +233,19 @@ export async function waitForDeepResearchCompletion(
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
       ? Math.floor(minTurnIndex)
       : -1;
+  const expectedPromptTurn = options?.expectedPromptTurn;
+  const expectedConversationId =
+    options?.expectedConversationId ?? expectedPromptTurn?.conversationId;
+  if (
+    expectedPromptTurn &&
+    (expectedConversationId !== expectedPromptTurn.conversationId ||
+      minTurnLiteral !== expectedPromptTurn.verifiedUserTurnIndex + 1)
+  ) {
+    throw new BrowserAutomationError(
+      "Deep Research recovery does not match the committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
   const scopedToNewTurns = minTurnLiteral >= 0;
   const ignoredTargetKeys = new Set(options?.ignoredTargetKeys ?? []);
   const requireScopedTargetOwner =
@@ -237,8 +257,15 @@ export async function waitForDeepResearchCompletion(
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
   while (Date.now() - start < timeoutMs) {
+    if (expectedPromptTurn) {
+      await verifyCommittedPromptTurn(Runtime, expectedPromptTurn);
+    }
     const { result } = await Runtime.evaluate({
-      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
+      expression: buildDeepResearchCompletionPollExpression(
+        minTurnLiteral,
+        expectedConversationId,
+        expectedPromptTurn,
+      ),
       returnByValue: true,
     });
 
@@ -252,9 +279,16 @@ export async function waitForDeepResearchCompletion(
           incompleteResult?: boolean;
           researchActivity?: boolean;
           accountBlocked?: boolean;
+          identityMismatch?: boolean;
         }
       | undefined;
 
+    if (val?.identityMismatch) {
+      throw new BrowserAutomationError(
+        "Deep Research recovery moved away from the committed prompt epoch.",
+        { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+      );
+    }
     if (val?.accountBlocked) {
       throw new BrowserAutomationError(
         "ChatGPT account security block detected during Deep Research. Open chatgpt.com in Chrome, secure the account, then rerun Oracle.",
@@ -321,7 +355,13 @@ export async function waitForDeepResearchCompletion(
         );
       }
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      return await extractDeepResearchResult(
+        Runtime,
+        logger,
+        minTurnIndex ?? undefined,
+        expectedConversationId,
+        expectedPromptTurn,
+      );
     }
 
     const incompleteFrameResult = Boolean(
@@ -374,19 +414,32 @@ export async function extractDeepResearchResult(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   minTurnIndex?: number,
+  expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
-  const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex);
+  const snapshot = await readAssistantSnapshot(
+    Runtime,
+    minTurnIndex,
+    expectedConversationId,
+    expectedPromptTurn,
+  );
   const meta = {
     turnId: snapshot?.turnId ?? null,
     messageId: snapshot?.messageId ?? null,
   };
 
-  // Try the copy-button approach first for clean markdown
-  const markdown = await captureAssistantMarkdown(Runtime, meta, logger);
+  // Try the copy-button approach first for clean markdown.
+  const markdown = await captureAssistantMarkdown(
+    Runtime,
+    meta,
+    logger,
+    expectedConversationId,
+    expectedPromptTurn,
+  );
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
     return { text: markdown, html: snapshot?.html ?? undefined, meta };
   }
@@ -1049,11 +1102,24 @@ function buildDeepResearchStatusExpression(): string {
   })()`;
 }
 
-function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string {
+function buildDeepResearchCompletionPollExpression(
+  minTurnIndex: number,
+  expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
+): string {
   const finishedSelector = JSON.stringify(FINISHED_ACTIONS_SELECTOR);
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
+  const expectedPromptLiteral = expectedPromptTurn
+    ? JSON.stringify({
+        conversationId: expectedConversationId ?? expectedPromptTurn.conversationId,
+        userTurnIndex: expectedPromptTurn.verifiedUserTurnIndex,
+        userTurnId: expectedPromptTurn.verifiedUserTurnId,
+        userMessageId: expectedPromptTurn.verifiedUserMessageId,
+      })
+    : "null";
   return `(() => {
     const MIN_TURN_INDEX = ${minTurnIndex};
+    const EXPECTED_PROMPT = ${expectedPromptLiteral};
     const stopVisible = Boolean(document.querySelector(${stopSelector}));
     const scopedToNewTurns = MIN_TURN_INDEX >= 0;
     const pageText = String(document.body?.innerText || '').toLowerCase().replace(/\\s+/g, ' ');
@@ -1061,18 +1127,59 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
       pageText.includes('secure your account') &&
       pageText.includes('regain access');
     const isAssistantTurn = (node) => {
+      if (!node) return false;
       const attr = String(node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       return attr === 'assistant' ||
         Boolean(node.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"]')) ||
         String(node.getAttribute('data-testid') || '').toLowerCase().includes('conversation-turn') &&
           /chatgpt\\s+said/i.test(node.innerText || node.textContent || '');
     };
+    const isUserTurn = (node) => {
+      if (!node) return false;
+      const attr = String(node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+      return attr === 'user' || Boolean(
+        node.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+    };
+    const readTurnId = (node) => {
+      const testId = node?.getAttribute?.('data-testid');
+      const value = node?.getAttribute?.('data-turn-id') || node?.dataset?.turnId ||
+        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
+        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+    const readMessageId = (node) => {
+      const messageNode = node?.matches?.('[data-message-id]') ? node : node?.querySelector?.('[data-message-id]');
+      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
     const conversationTurns = ${buildConversationTurnListExpression()};
+    let exactAssistantTurn = null;
+    if (EXPECTED_PROMPT) {
+      const currentConversationId = String(location?.href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] || null;
+      const expectedUserTurn = conversationTurns[EXPECTED_PROMPT.userTurnIndex];
+      if (
+        currentConversationId !== EXPECTED_PROMPT.conversationId ||
+        !isUserTurn(expectedUserTurn) ||
+        readTurnId(expectedUserTurn) !== EXPECTED_PROMPT.userTurnId ||
+        readMessageId(expectedUserTurn) !== EXPECTED_PROMPT.userMessageId
+      ) {
+        return { identityMismatch: true, accountBlocked };
+      }
+      for (let index = EXPECTED_PROMPT.userTurnIndex + 1; index < conversationTurns.length; index += 1) {
+        const turn = conversationTurns[index];
+        if (isUserTurn(turn)) return { identityMismatch: true, accountBlocked };
+        if (!exactAssistantTurn && isAssistantTurn(turn)) exactAssistantTurn = turn;
+      }
+    }
     const allAssistantTurns = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]'));
-    const scopedTurns = scopedToNewTurns
-      ? conversationTurns.slice(MIN_TURN_INDEX).filter(isAssistantTurn)
-      : allAssistantTurns;
-    const lastTurn = scopedTurns[scopedTurns.length - 1] || (scopedToNewTurns ? null : allAssistantTurns[allAssistantTurns.length - 1]);
+    const scopedTurns = EXPECTED_PROMPT
+      ? (exactAssistantTurn ? [exactAssistantTurn] : [])
+      : scopedToNewTurns
+        ? conversationTurns.slice(MIN_TURN_INDEX).filter(isAssistantTurn)
+        : allAssistantTurns;
+    const lastTurn = scopedTurns[scopedTurns.length - 1] ||
+      (scopedToNewTurns || EXPECTED_PROMPT ? null : allAssistantTurns[allAssistantTurns.length - 1]);
     const text = (lastTurn?.textContent || '').trim();
     const normalized = text.toLowerCase().replace(/\\s+/g, ' ').trim();
     const textLength = text.length;
@@ -1110,7 +1217,7 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
     const hasActiveScopedResearch = scopedToNewTurns && Boolean(lastTurn) &&
       hasScopedDeepResearchIframe &&
       (textLength < 40 || isToolStub || tailIsPlanningPanel || /chatgpt\\s+said:?$/i.test(text));
-    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked };
+    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, identityMismatch: false };
   })()`;
 }
 
@@ -1118,8 +1225,16 @@ export function buildDeepResearchStatusExpressionForTest(): string {
   return buildDeepResearchStatusExpression();
 }
 
-export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = -1): string {
-  return buildDeepResearchCompletionPollExpression(minTurnIndex);
+export function buildDeepResearchCompletionPollExpressionForTest(
+  minTurnIndex = -1,
+  expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
+): string {
+  return buildDeepResearchCompletionPollExpression(
+    minTurnIndex,
+    expectedConversationId,
+    expectedPromptTurn,
+  );
 }
 
 function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPill"): string {

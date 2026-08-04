@@ -15,8 +15,15 @@ import {
 } from "../browser/liveTabs.js";
 import {
   isRecoveredConversationHarvestReady,
+  recoveredConversationHarvestMatchesPromptEpoch,
   recoverConversationTab,
+  type RecoveredConversationCleanup,
 } from "../browser/recoverConversation.js";
+import {
+  resolveCommittedPromptEpochLocator,
+  type CommittedPromptEpochLocator,
+} from "../browser/reattachability.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 
 const LIVE_POLL_MS = 2000;
@@ -153,12 +160,9 @@ export function recoverBrowserMetadataFromHarvestForTest(
 ): NonNullable<SessionMetadata["browser"]> {
   const browser = meta.browser ?? {};
   const conversationId = harvested.conversationId ?? extractConversationIdFromUrl(harvested.url);
-  const promptPreview = normalizeHarvestComparison(meta.promptPreview ?? "");
-  const harvestedPrompt = normalizeHarvestComparison(
-    harvested.lastUserText || harvested.lastUserSnippet,
-  );
+  const locator = resolveCommittedPromptEpochLocator(browser.runtime, [harvested.url]);
   const promptMatched = Boolean(
-    promptPreview && harvestedPrompt && harvestedPrompt.startsWith(promptPreview),
+    locator && recoveredConversationHarvestMatchesPromptEpoch(harvested, locator),
   );
   const outputMatched = Boolean(
     persistedOutput &&
@@ -227,6 +231,29 @@ export function recoverBrowserMetadataFromHarvestForTest(
     harvest,
   };
 }
+function requireHarvestPromptEpoch(meta: SessionMetadata): CommittedPromptEpochLocator {
+  const locator = resolveCommittedPromptEpochLocator(meta.browser?.runtime, [
+    meta.browser?.harvest?.url,
+  ]);
+  if (!locator) {
+    throw new BrowserAutomationError(
+      "Browser harvest requires a structurally valid committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
+  return locator;
+}
+
+function assertHarvestMatchesPromptEpoch(
+  harvested: ChatGptTabSummary,
+  locator: CommittedPromptEpochLocator,
+): void {
+  if (recoveredConversationHarvestMatchesPromptEpoch(harvested, locator)) return;
+  throw new BrowserAutomationError(
+    "Refusing to publish a browser harvest that does not match the committed prompt epoch.",
+    { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+  );
+}
 
 async function persistHarvest(
   sessionId: string,
@@ -244,6 +271,42 @@ async function persistHarvest(
   }
   const browser = recoverBrowserMetadataFromHarvestForTest(meta, harvested, persistedOutput);
   await sessionStore.updateSession(sessionId, { browser });
+}
+async function settleRecoveredConversationCleanup(
+  sessionId: string,
+  cleanup: RecoveredConversationCleanup,
+): Promise<void> {
+  const result = await cleanup();
+  if (result.status === "completed") return;
+
+  const current = await sessionStore.readSession(sessionId).catch(() => null);
+  const previousRuntime = current?.browser?.runtime ?? {};
+  const resources = [...(previousRuntime.recoveryCleanupResources ?? [])];
+  const resourceIdentity = JSON.stringify(result.resource);
+  if (!resources.some((resource) => JSON.stringify(resource) === resourceIdentity)) {
+    resources.push(result.resource);
+  }
+  const runtime = {
+    ...previousRuntime,
+    recoveryCleanupResources: resources,
+    recoveryCleanupResult: { status: "failed" as const, error: result.error },
+  };
+  let persistenceError: unknown = null;
+  try {
+    await sessionStore.updateSession(sessionId, {
+      browser: { ...(current?.browser ?? {}), runtime },
+    });
+  } catch (error) {
+    persistenceError = error;
+  }
+  const persistenceSuffix = persistenceError
+    ? ` Cleanup authority persistence also failed: ${persistenceError instanceof Error ? persistenceError.message : String(persistenceError)}`
+    : "";
+  throw new BrowserAutomationError(
+    `Recovered browser cleanup remains pending: ${result.error}.${persistenceSuffix}`,
+    { stage: "recovered-conversation-cleanup", runtime },
+    persistenceError ?? undefined,
+  );
 }
 
 function printHarvestSummary(sessionId: string, harvested: ChatGptTabSummary): void {
@@ -327,6 +390,7 @@ export async function harvestSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
+  const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   const initialEndpoint = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
@@ -335,7 +399,7 @@ export async function harvestSessionBrowserOutput(
   const ref = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
 
-  let recoveredCleanup: (() => Promise<void>) | null = null;
+  let recoveredCleanup: RecoveredConversationCleanup | null = null;
   try {
     let harvested: ChatGptTabSummary;
     try {
@@ -367,7 +431,13 @@ export async function harvestSessionBrowserOutput(
       });
     }
 
+    assertHarvestMatchesPromptEpoch(harvested, promptLocator);
     await persistHarvest(sessionId, meta, harvested);
+    if (recoveredCleanup) {
+      const cleanup = recoveredCleanup;
+      recoveredCleanup = null;
+      await settleRecoveredConversationCleanup(sessionId, cleanup);
+    }
     printHarvestSummary(sessionId, harvested);
     const output = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
     if (options.writeOutputPath) {
@@ -378,7 +448,7 @@ export async function harvestSessionBrowserOutput(
     }
     return harvested;
   } finally {
-    await recoveredCleanup?.();
+    if (recoveredCleanup) await settleRecoveredConversationCleanup(sessionId, recoveredCleanup);
   }
 }
 
@@ -390,6 +460,7 @@ export async function liveTailSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
+  const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   let endpoint = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
@@ -397,7 +468,7 @@ export async function liveTailSessionBrowserOutput(
   };
   let browserTabRef = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
-  let recoveredCleanup: (() => Promise<void>) | null = null;
+  let recoveredCleanup: RecoveredConversationCleanup | null = null;
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
   let lastHash: string | null = null;
   let unchangedSince = Date.now();
@@ -439,8 +510,12 @@ export async function liveTailSessionBrowserOutput(
         port: endpoint.port,
         ref: browserTabRef,
       });
+      assertHarvestMatchesPromptEpoch(harvested, promptLocator);
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
-      if (requireRecoveredContent && !isRecoveredConversationHarvestReady(harvested)) {
+      if (
+        requireRecoveredContent &&
+        !isRecoveredConversationHarvestReady(harvested, promptLocator)
+      ) {
         if (Date.now() < recoveredContentDeadlineMs) {
           await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
           continue;
@@ -478,6 +553,11 @@ export async function liveTailSessionBrowserOutput(
           state: derivedState,
         };
         await persistHarvest(sessionId, meta, finalHarvest);
+        if (recoveredCleanup) {
+          const cleanup = recoveredCleanup;
+          recoveredCleanup = null;
+          await settleRecoveredConversationCleanup(sessionId, cleanup);
+        }
         printHarvestSummary(sessionId, finalHarvest);
         const output = finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
         if (options.writeOutputPath) {
@@ -492,6 +572,6 @@ export async function liveTailSessionBrowserOutput(
       await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
     }
   } finally {
-    await recoveredCleanup?.();
+    if (recoveredCleanup) await settleRecoveredConversationCleanup(sessionId, recoveredCleanup);
   }
 }

@@ -4,8 +4,9 @@ import { createHash } from "node:crypto";
 import { access, mkdtemp, mkdir } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import { loadUserConfig } from "../config.js";
-import { settleRemoteBrowserRecovery } from "../remote/client.js";
+import { resumeRemoteBrowserTransaction, settleRemoteBrowserRecovery } from "../remote/client.js";
 import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import {
   waitForAssistantResponse,
@@ -15,6 +16,7 @@ import {
   ensureLoggedIn,
   ensurePromptReady,
   waitForResumedConversationHydration,
+  verifyCommittedPromptTurn,
 } from "./pageActions.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger, ChromeClient } from "./types.js";
 import {
@@ -26,11 +28,7 @@ import {
   closeChromeTarget,
   type RemoteChromeConnection,
 } from "./chromeLifecycle.js";
-import {
-  acquireManualChromeOwner,
-  type BrowserChrome,
-  type ManualChromeOwnerSource,
-} from "./manualChromeOwner.js";
+import { acquireManualChromeOwner, type BrowserChrome } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
@@ -41,12 +39,11 @@ import {
   removeProfileDirectoryIfIdentityMatches,
   terminateRecordedChromeForProfile,
   verifyProfileDirectoryIdentity,
-  writeChromePid,
-  writeChromeProcessIdentity,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
 import {
   acquireBrowserTabLease,
+  releaseBrowserTabLease,
   teardownBrowserResourcesIfNoActiveLeases,
   type BrowserTabLease,
 } from "./tabLeaseRegistry.js";
@@ -62,13 +59,14 @@ import {
   openConversationFromSidebar,
   openConversationFromSidebarWithRetry,
   waitForLocationChange,
-  buildPromptEchoMatcher,
-  recoverPromptEcho,
-  alignPromptEchoMarkdown,
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
-import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
+import {
+  isRecoverableChatGptConversationUrl,
+  resolveCommittedPromptEpochLocator,
+  type CommittedPromptEpochLocator,
+} from "./reattachability.js";
 
 export interface ReattachCleanupDeps {
   closeChromeTarget?: typeof closeChromeTarget;
@@ -76,8 +74,10 @@ export interface ReattachCleanupDeps {
   cleanupStaleProfileState?: typeof cleanupStaleProfileState;
   teardownBrowserResourcesIfNoActiveLeases?: typeof teardownBrowserResourcesIfNoActiveLeases;
   removeProfile?: (profileDir: string) => Promise<boolean>;
+  releaseBrowserTabLease?: typeof releaseBrowserTabLease;
   settleRemoteBrowserRecovery?: typeof settleRemoteBrowserRecovery;
   resolveRemoteRecoveryConfig?: () => Promise<{ host?: string; token?: string }>;
+  isRemotePublicationAcknowledged?: () => boolean;
 }
 
 export interface ReattachRecoveryLock {
@@ -89,7 +89,7 @@ export interface ReattachCapture {
   answerMarkdown: string;
   runtime?: BrowserRuntimeMetadata;
   finalizeResources?: () => Promise<ReattachFinalizationResult>;
-  abandonResources?: () => Promise<void>;
+  abortResources?: () => Promise<ReattachFinalizationResult>;
 }
 
 export interface ReattachDeps {
@@ -99,6 +99,7 @@ export interface ReattachDeps {
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
   waitForConversationHydration?: typeof waitForResumedConversationHydration;
+  verifyCommittedPromptTurn?: typeof verifyCommittedPromptTurn;
   acquireManualChromeOwner?: typeof acquireManualChromeOwner;
   createRecoveryTarget?: typeof createChromePageTarget;
   connectRecoveryTarget?: typeof connectToRemoteChromeTarget;
@@ -106,10 +107,11 @@ export interface ReattachDeps {
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachCapture>;
-  promptPreview?: string;
   recoveryCleanup?: ReattachCleanupDeps;
   recoveryLockPath?: string;
   acquireRecoveryLock?: (lockPath: string) => Promise<ReattachRecoveryLock>;
+  isRemotePublicationAcknowledged?: () => boolean;
+  resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
 }
 
 export type ReattachFinalizationResult = BrowserCaptureFinalizationResult;
@@ -119,7 +121,7 @@ export interface ReattachResult {
   answerMarkdown: string;
   runtime: BrowserRuntimeMetadata;
   finalize: () => Promise<ReattachFinalizationResult>;
-  abandon: () => Promise<void>;
+  abort: () => Promise<ReattachFinalizationResult>;
 }
 
 export async function resumeBrowserSession(
@@ -128,8 +130,9 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
-  const promptEpoch = requireCommittedPromptEpoch(runtime);
-  const minAssistantTurnIndex = promptEpoch.verifiedUserTurnIndex + 1;
+  const promptLocator = requireCommittedPromptEpochLocator(runtime);
+  const promptEpoch = promptLocator.epoch;
+  const minAssistantTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);
   let lockHeld = true;
@@ -154,50 +157,72 @@ export async function resumeBrowserSession(
     authoritativeRuntime: BrowserRuntimeMetadata = runtime,
   ): ReattachResult => {
     const runtimeForCapture = capture.runtime ?? authoritativeRuntime;
+    const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
+    assertSameCommittedPromptEpoch(promptLocator, captureLocator);
     const capturedRuntime = markRecoveryCleanupPending(runtimeForCapture);
-    let finalization: Promise<ReattachFinalizationResult> | null = null;
-    let abandoned = false;
+    let settlementMode: "finalize" | "abort" | null = null;
+    let settlementRuntime = capturedRuntime;
+    let settlementInFlight: Promise<ReattachFinalizationResult> | null = null;
+    let completedSettlement: ReattachFinalizationResult | null = null;
+
+    const settle = async (mode: "finalize" | "abort"): Promise<ReattachFinalizationResult> => {
+      if (settlementMode && settlementMode !== mode) {
+        throw new BrowserAutomationError(
+          `Browser recovery is already bound to ${settlementMode} settlement.`,
+          { stage: "browser-recovery-settlement", code: "settlement-mode-conflict" },
+        );
+      }
+      if (completedSettlement) return completedSettlement;
+      if (settlementInFlight) return settlementInFlight;
+      settlementMode = mode;
+      settlementInFlight = (async () => {
+        let result: ReattachFinalizationResult;
+        try {
+          const captureSettler =
+            mode === "abort"
+              ? (capture.abortResources ?? capture.finalizeResources)
+              : capture.finalizeResources;
+          result = captureSettler
+            ? await captureSettler()
+            : await finalizeRecoveredRuntime(
+                settlementRuntime,
+                logger,
+                {
+                  ...deps.recoveryCleanup,
+                  isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
+                },
+                mode,
+              );
+        } catch (error) {
+          result = pendingFinalization(
+            settlementRuntime,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        settlementRuntime = result.runtime;
+        if (result.status !== "completed") return result;
+        try {
+          await releaseRecoveryLock();
+        } catch (error) {
+          return pendingFinalization(
+            settlementRuntime,
+            `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        completedSettlement = result;
+        return result;
+      })().finally(() => {
+        settlementInFlight = null;
+      });
+      return settlementInFlight;
+    };
+
     return {
       answerText: capture.answerText,
       answerMarkdown: capture.answerMarkdown,
       runtime: capturedRuntime,
-      finalize: async () => {
-        if (abandoned) {
-          return pendingFinalization(capturedRuntime, "Recovery was abandoned before cleanup");
-        }
-        finalization ??= (async () => {
-          let result: ReattachFinalizationResult;
-          try {
-            result = capture.finalizeResources
-              ? await capture.finalizeResources()
-              : await finalizeRecoveredRuntime(runtimeForCapture, logger, deps.recoveryCleanup);
-          } catch (error) {
-            result = pendingFinalization(
-              runtimeForCapture,
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-          try {
-            await releaseRecoveryLock();
-          } catch (error) {
-            return pendingFinalization(
-              runtimeForCapture,
-              `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-          return result;
-        })();
-        return finalization;
-      },
-      abandon: async () => {
-        if (finalization || abandoned) return;
-        abandoned = true;
-        try {
-          await capture.abandonResources?.();
-        } finally {
-          await releaseRecoveryLock();
-        }
-      },
+      finalize: () => settle("finalize"),
+      abort: () => settle("abort"),
     };
   };
 
@@ -209,6 +234,32 @@ export async function resumeBrowserSession(
   };
 
   try {
+    if (runtime.remoteRecovery) {
+      const configured = deps.recoveryCleanup?.resolveRemoteRecoveryConfig
+        ? await deps.recoveryCleanup.resolveRemoteRecoveryConfig()
+        : resolveRemoteServiceConfig({
+            userConfig: (await loadUserConfig({ includeProject: false })).config,
+            env: process.env,
+          });
+      const transaction = await (
+        deps.resumeRemoteBrowserTransaction ?? resumeRemoteBrowserTransaction
+      )({
+        runtime,
+        configuredHost: configured.host ?? "",
+        authToken: configured.token,
+        log: logger,
+      });
+      return buildResult(
+        {
+          answerText: transaction.answerText,
+          answerMarkdown: transaction.answerMarkdown,
+          runtime: transaction.runtime,
+          finalizeResources: transaction.finalize,
+          abortResources: transaction.abort,
+        },
+        transaction.runtime,
+      );
+    }
     if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
       logger("No running Chrome detected; reopening browser to locate the session.");
       return await recover();
@@ -217,6 +268,8 @@ export async function resumeBrowserSession(
     let liveRuntime = runtime;
     try {
       liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+      const livePromptLocator = requireCommittedPromptEpochLocator(liveRuntime);
+      assertSameCommittedPromptEpoch(promptLocator, livePromptLocator);
       const host = liveRuntime.chromeHost ?? "127.0.0.1";
       const port =
         liveRuntime.chromePort ??
@@ -242,13 +295,34 @@ export async function resumeBrowserSession(
             : "Stored Chrome target is unavailable or no longer matches the committed conversation.",
         );
       }
+      const previousTargetId = liveRuntime.chromeTargetId;
+      const selectedResources = [...(liveRuntime.recoveryCleanupResources ?? [])];
+      const promptIdentity = JSON.stringify(immutablePromptIdentity(liveRuntime.promptEpoch));
+      for (let index = selectedResources.length - 1; index >= 0; index -= 1) {
+        const resource = selectedResources[index];
+        if (!resource) continue;
+        const samePrompt =
+          JSON.stringify(immutablePromptIdentity(resource.promptEpoch)) === promptIdentity;
+        const sameTarget = previousTargetId
+          ? resource.chromeTargetId === previousTargetId
+          : !resource.chromeTargetId;
+        if (!samePrompt || !sameTarget) continue;
+        selectedResources[index] = {
+          ...resource,
+          chromeHost: host,
+          chromePort: port,
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chromeTargetId: targetId,
+          recoveryCleanup: explicitTabRef
+            ? { ...resource.recoveryCleanup, ownsTarget: false }
+            : resource.recoveryCleanup,
+        };
+        break;
+      }
       liveRuntime = {
         ...liveRuntime,
         chromeTargetId: targetId,
-        recoveryCleanup:
-          explicitTabRef && liveRuntime.recoveryCleanup
-            ? { ...liveRuntime.recoveryCleanup, ownsTarget: false }
-            : liveRuntime.recoveryCleanup,
+        recoveryCleanupResources: selectedResources,
       };
       const connection = deps.connect
         ? await (async () => {
@@ -314,6 +388,8 @@ export async function resumeBrowserSession(
         requirePromptReady: false,
         expectedConversationUrl: expectedConversationUrl ?? undefined,
       });
+      const verifyPromptTurn = deps.verifyCommittedPromptTurn ?? verifyCommittedPromptTurn;
+      await verifyPromptTurn(Runtime, promptLocator);
       const minTurnIndex = minAssistantTurnIndex;
       if (config?.researchMode === "deep") {
         const waitForDeepResearch =
@@ -321,6 +397,8 @@ export async function resumeBrowserSession(
         const researchResult = await withTimeout(
           waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex, Page, client, {
             requireScopedTargetOwner: true,
+            expectedConversationId: promptLocator.conversationId,
+            expectedPromptTurn: promptLocator,
           }),
           timeoutMs + 5_000,
           "Reattach Deep Research response timed out",
@@ -332,35 +410,44 @@ export async function resumeBrowserSession(
           runtime: liveRuntime,
         });
       }
-      const promptEcho = buildPromptEchoMatcher();
       const answer = await withTimeout(
-        waitForResponse(Runtime, timeoutMs, logger, minTurnIndex),
+        waitForResponse(
+          Runtime,
+          timeoutMs,
+          logger,
+          minTurnIndex,
+          promptLocator.conversationId,
+          promptLocator,
+        ),
         timeoutMs + 5_000,
         "Reattach response timed out",
       );
-      const recovered = await recoverPromptEcho(
-        Runtime,
-        answer,
-        promptEcho,
-        logger,
-        minTurnIndex,
-        timeoutMs,
-      );
       const markdown =
         (await withTimeout(
-          captureMarkdown(Runtime, recovered.meta, logger),
+          captureMarkdown(
+            Runtime,
+            answer.meta,
+            logger,
+            promptLocator.conversationId,
+            promptLocator,
+          ),
           15_000,
           "Reattach markdown capture timed out",
-        )) ?? recovered.text;
-      const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+        )) ?? answer.text;
       await closeAttached();
       return buildResult({
-        answerText: aligned.answerText,
-        answerMarkdown: aligned.answerMarkdown,
+        answerText: answer.text,
+        answerMarkdown: markdown,
         runtime: liveRuntime,
       });
     } catch (error) {
       await closeAttached();
+      if (
+        error instanceof BrowserAutomationError &&
+        error.details?.code === "committed-prompt-identity-mismatch"
+      ) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       logger(
         `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
@@ -380,13 +467,27 @@ export async function resumeBrowserSession(
 export async function retryBrowserRecoveryCleanup(
   runtime: BrowserRuntimeMetadata,
   logger: BrowserLogger,
-  deps: Pick<ReattachDeps, "recoveryCleanup" | "recoveryLockPath" | "acquireRecoveryLock"> = {},
+  deps: Pick<
+    ReattachDeps,
+    | "recoveryCleanup"
+    | "recoveryLockPath"
+    | "acquireRecoveryLock"
+    | "isRemotePublicationAcknowledged"
+  > = {},
 ): Promise<ReattachFinalizationResult> {
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);
   let result: ReattachFinalizationResult;
   try {
-    result = await finalizeRecoveredRuntime(runtime, logger, deps.recoveryCleanup);
+    result = await finalizeRecoveredRuntime(
+      runtime,
+      logger,
+      {
+        ...deps.recoveryCleanup,
+        isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
+      },
+      "finalize",
+    );
   } catch (error) {
     result = pendingFinalization(runtime, error instanceof Error ? error.message : String(error));
   }
@@ -403,7 +504,7 @@ export async function retryBrowserRecoveryCleanup(
 
 type RecoveryCleanupEntry = {
   resource: BrowserRecoveryCleanupResourceMetadata;
-  current: boolean;
+  order: number;
 };
 
 type RecoveryCleanupGroup = {
@@ -415,27 +516,21 @@ async function finalizeRecoveredRuntime(
   runtime: BrowserRuntimeMetadata,
   logger: BrowserLogger,
   deps: ReattachCleanupDeps = {},
-  releaseCurrentLease?: BrowserTabLease["release"],
+  mode: "finalize" | "abort" = "finalize",
 ): Promise<ReattachFinalizationResult> {
   const groups = groupRecoveryCleanupResources(runtime);
   const pending: RecoveryCleanupEntry[] = [];
   const errors: string[] = [];
 
   for (const group of groups) {
-    const result = await finalizeRecoveryCleanupGroup(
-      group,
-      logger,
-      deps,
-      group.entries.some((entry) => entry.current) ? releaseCurrentLease : undefined,
-    );
+    const result = await finalizeRecoveryCleanupGroup(group, logger, deps, mode);
     pending.push(...result.pending);
     errors.push(...result.errors);
   }
 
   if (pending.length === 0) {
     const completedRuntime = { ...runtime };
-    delete completedRuntime.recoveryCleanup;
-    delete completedRuntime.recoveryCleanupBacklog;
+    delete completedRuntime.recoveryCleanupResources;
     delete completedRuntime.recoveryCleanupResult;
     delete completedRuntime.remoteRecovery;
     return { status: "completed", runtime: completedRuntime };
@@ -450,14 +545,15 @@ async function finalizeRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
   logger: BrowserLogger,
   deps: ReattachCleanupDeps,
-  releaseCurrentLease?: BrowserTabLease["release"],
+  mode: "finalize" | "abort",
 ): Promise<{ pending: RecoveryCleanupEntry[]; errors: string[] }> {
   if (group.entries[0]?.resource.recoveryCleanup.transport === "remote") {
-    return finalizeRemoteRecoveryCleanupGroup(group, deps);
+    return finalizeRemoteRecoveryCleanupGroup(group, deps, mode);
   }
   const pending: RecoveryCleanupEntry[] = [];
   const errors: string[] = [];
   const pendingKeys = new Set<string>();
+  const releasedLeaseIds = new Set<string>();
   const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
   const addPending = (entry: RecoveryCleanupEntry, error: string): void => {
     const key = recoveryCleanupResourceKey(entry.resource);
@@ -468,33 +564,21 @@ async function finalizeRecoveryCleanupGroup(
     errors.push(`Cleanup group ${groupLabel}: ${error}`);
   };
 
-  let leaseReleased = false;
-  const releaseLease = async (
-    onRelease?: (context: { isLastLease: boolean }) => Promise<void>,
-  ): Promise<void> => {
-    if (!releaseCurrentLease || leaseReleased) return;
-    await releaseCurrentLease(onRelease ? { onRelease } : undefined);
-    leaseReleased = true;
-  };
-
   try {
     const closeTarget = deps.closeChromeTarget ?? closeChromeTarget;
-    const connectionEntry =
-      group.entries.find(
-        (entry) =>
-          entry.current &&
-          Boolean(
-            entry.resource.chromePort ??
-            inferPortFromBrowserWSEndpoint(entry.resource.chromeBrowserWSEndpoint),
-          ),
-      ) ??
-      group.entries.find((entry) =>
+    let connectionResource: BrowserRecoveryCleanupResourceMetadata | undefined;
+    for (let index = group.entries.length - 1; index >= 0; index -= 1) {
+      const candidate = group.entries[index]?.resource;
+      if (
+        candidate &&
         Boolean(
-          entry.resource.chromePort ??
-          inferPortFromBrowserWSEndpoint(entry.resource.chromeBrowserWSEndpoint),
-        ),
-      );
-    const connectionResource = connectionEntry?.resource;
+          candidate.chromePort ?? inferPortFromBrowserWSEndpoint(candidate.chromeBrowserWSEndpoint),
+        )
+      ) {
+        connectionResource = candidate;
+        break;
+      }
+    }
     const connectionPort = connectionResource
       ? (connectionResource.chromePort ??
         inferPortFromBrowserWSEndpoint(connectionResource.chromeBrowserWSEndpoint))
@@ -550,47 +634,90 @@ async function finalizeRecoveryCleanupGroup(
     const preserveProcess = group.entries.some(
       (entry) => entry.resource.recoveryCleanup.keepBrowser,
     );
-    if (teardownEntries.length === 0 || preserveProcess) return { pending, errors };
-
     const teardownRepresentative =
-      teardownEntries.find((entry) => entry.current && entry.resource.userDataDir) ??
-      teardownEntries.find((entry) => entry.resource.userDataDir) ??
-      teardownEntries.find((entry) => entry.current) ??
-      teardownEntries[0];
-    if (!teardownRepresentative) return { pending, errors };
-    const teardownEntry = teardownOnlyEntry(teardownRepresentative);
+      teardownEntries.find((entry) => entry.resource.userDataDir) ?? teardownEntries[0];
+    const teardownEntry = teardownRepresentative
+      ? teardownOnlyEntry(teardownRepresentative)
+      : undefined;
+    if (teardownEntries.length > 0 && !preserveProcess) {
+      const invariantError = await validateGroupTeardownInvariants(teardownEntries);
+      if (invariantError && teardownEntry) {
+        addPending(teardownEntry, invariantError);
+        return { pending, errors };
+      }
+    }
+
+    let teardownViaLeaseAttempted = false;
+    let teardownViaLeaseError: string | null = null;
+    const releaseLease = deps.releaseBrowserTabLease ?? releaseBrowserTabLease;
+    const seenLeaseIds = new Set<string>();
+    for (const entry of group.entries) {
+      const lease = entry.resource.tabLease;
+      if (!lease || seenLeaseIds.has(lease.id)) continue;
+      seenLeaseIds.add(lease.id);
+      if (pendingKeys.has(recoveryCleanupResourceKey(entry.resource))) continue;
+      const profileDir = entry.resource.userDataDir;
+      if (!profileDir) {
+        addPending(teardownOnlyEntry(entry), "Browser tab lease profile path is missing");
+        continue;
+      }
+      try {
+        await releaseLease(profileDir, lease.id, logger, {
+          expectedProfileIdentity: lease.profileDirectory,
+          onRelease:
+            teardownEntry &&
+            teardownEntries.length > 0 &&
+            !preserveProcess &&
+            teardownEntry.resource.recoveryCleanup.profileKind === "manual-login"
+              ? async ({ isLastLease }) => {
+                  if (!isLastLease) return;
+                  teardownViaLeaseAttempted = true;
+                  teardownViaLeaseError = await teardownLocalRecoveryGroup(
+                    teardownEntry.resource,
+                    logger,
+                    deps,
+                  );
+                }
+              : undefined,
+        });
+        releasedLeaseIds.add(lease.id);
+      } catch (error) {
+        addPending(
+          teardownOnlyEntry(entry),
+          `Browser tab lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
     if (pending.length > 0) {
-      const pendingCarriesTeardown = pending.some((entry) =>
-        requestsProcessTeardown(entry.resource),
-      );
-      if (!pendingCarriesTeardown)
-        addPending(teardownEntry, "Process teardown deferred until targets close");
+      if (
+        teardownEntry &&
+        teardownEntries.length > 0 &&
+        !preserveProcess &&
+        !pending.some((entry) => requestsProcessTeardown(entry.resource))
+      ) {
+        addPending(
+          removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds),
+          "Process teardown deferred until target and lease cleanup complete",
+        );
+      }
       return { pending, errors };
     }
 
-    const invariantError = await validateGroupTeardownInvariants(teardownEntries);
-    if (invariantError) {
-      addPending(teardownEntry, invariantError);
+    if (!teardownEntry || teardownEntries.length === 0 || preserveProcess) {
       return { pending, errors };
     }
 
-    const resource = teardownEntry.resource;
+    const resource = removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds).resource;
     const profileKind = resource.recoveryCleanup.profileKind;
     try {
       let teardownError: string | null = null;
-      if (profileKind === "manual-login" && releaseCurrentLease) {
-        const releaseOutcome: { isLastLease: boolean; error: string | null } = {
-          isLastLease: false,
-          error: null,
-        };
-        await releaseLease(async ({ isLastLease }) => {
-          releaseOutcome.isLastLease = isLastLease;
-          if (isLastLease) {
-            releaseOutcome.error = await teardownLocalRecoveryGroup(resource, logger, deps);
-          }
-        });
-        teardownError = releaseOutcome.isLastLease
-          ? releaseOutcome.error
+      if (
+        group.entries.some((entry) => entry.resource.tabLease) &&
+        profileKind === "manual-login"
+      ) {
+        teardownError = teardownViaLeaseAttempted
+          ? teardownViaLeaseError
           : "Manual-login cleanup preserved resources (active-leases)";
       } else if (profileKind === "manual-login") {
         const teardown =
@@ -627,37 +754,29 @@ async function finalizeRecoveryCleanupGroup(
         teardownError = await teardownLocalRecoveryGroup(resource, logger, deps);
       }
 
-      if (teardownError) addPending(teardownEntry, teardownError);
+      if (teardownError) {
+        addPending(removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds), teardownError);
+      }
     } catch (error) {
-      addPending(teardownEntry, error instanceof Error ? error.message : String(error));
+      addPending(
+        removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds),
+        error instanceof Error ? error.message : String(error),
+      );
     }
     return { pending, errors };
   } catch (error) {
-    const current = group.entries.find((entry) => entry.current) ?? group.entries[0];
-    if (current) addPending(current, error instanceof Error ? error.message : String(error));
+    const first = group.entries[0];
+    if (first) addPending(first, error instanceof Error ? error.message : String(error));
     return { pending, errors };
-  } finally {
-    if (releaseCurrentLease && !leaseReleased) {
-      try {
-        await releaseLease();
-      } catch (error) {
-        const current = group.entries.find((entry) => entry.current);
-        if (current) {
-          const message = `Current browser lease release failed: ${error instanceof Error ? error.message : String(error)}`;
-          if (pending.some((entry) => entry.current))
-            errors.push(`Cleanup group ${groupLabel}: ${message}`);
-          else addPending(teardownOnlyEntry(current), message);
-        }
-      }
-    }
   }
 }
 
 async function finalizeRemoteRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
   deps: ReattachCleanupDeps,
+  mode: "finalize" | "abort",
 ): Promise<{ pending: RecoveryCleanupEntry[]; errors: string[] }> {
-  const representative = group.entries.find((entry) => entry.current) ?? group.entries[0];
+  const representative = group.entries[group.entries.length - 1];
   if (!representative) return { pending: [], errors: [] };
   const authority = representative.resource.remoteRecovery;
   const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
@@ -675,6 +794,9 @@ async function finalizeRemoteRecoveryCleanupGroup(
   if (!authority) {
     return pending("Remote cleanup transaction authority is missing.");
   }
+  if (mode === "finalize" && deps.isRemotePublicationAcknowledged?.() !== true) {
+    return pending("Remote settlement requires durable answer publication acknowledgment.");
+  }
 
   let configured: { host?: string; token?: string };
   try {
@@ -691,6 +813,11 @@ async function finalizeRemoteRecoveryCleanupGroup(
   }
 
   const resource = representative.resource;
+  const remoteResources = group.entries.map((entry) => ({
+    ...entry.resource,
+    remoteRecovery: authority,
+    recoveryCleanup: { ...entry.resource.recoveryCleanup, transport: "remote" as const },
+  }));
   const runtime: BrowserRuntimeMetadata = {
     chromePid: resource.chromePid,
     chromeProcessIdentity: resource.chromeProcessIdentity,
@@ -702,7 +829,7 @@ async function finalizeRemoteRecoveryCleanupGroup(
     chromeTargetId: resource.chromeTargetId,
     conversationId: resource.conversationId,
     promptEpoch: resource.promptEpoch,
-    recoveryCleanup: resource.recoveryCleanup,
+    recoveryCleanupResources: remoteResources,
     recoveryCleanupResult: { status: "pending" },
     remoteRecovery: authority,
   };
@@ -712,6 +839,7 @@ async function finalizeRemoteRecoveryCleanupGroup(
       runtime,
       configuredHost: configured.host ?? "",
       authToken: configured.token,
+      mode,
     });
   } catch (error) {
     return pending(
@@ -719,9 +847,13 @@ async function finalizeRemoteRecoveryCleanupGroup(
     );
   }
   if (result.status === "completed") return { pending: [], errors: [] };
+  const returnedAuthority =
+    result.runtime.recoveryCleanupResources?.find(
+      (candidate) => candidate.recoveryCleanup.transport === "remote",
+    )?.remoteRecovery ?? result.runtime.remoteRecovery;
   return pending(
     result.error || "Remote cleanup settlement remains pending.",
-    result.runtime.remoteRecovery ?? authority,
+    returnedAuthority ?? authority,
   );
 }
 
@@ -743,8 +875,9 @@ async function teardownLocalRecoveryGroup(
   }
 
   const processIdentity = resource.chromeProcessIdentity;
-  if (!processIdentity) return "Chrome process identity cleanup metadata is missing";
-  const profileDirectory = physicalProfileDirectoryIdentity(processIdentity.profileDirectory);
+  const profileDirectory = physicalProfileDirectoryIdentity(
+    processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
+  );
   if (!profileDirectory) {
     return "Chrome physical profile identity cleanup metadata is missing";
   }
@@ -752,14 +885,18 @@ async function teardownLocalRecoveryGroup(
     return "Chrome process identity does not match the cleanup profile";
   }
 
-  const terminateChrome =
-    deps.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile;
-  const termination = await terminateChrome(profileDir, processIdentity, logger);
-  if (!isSafeChromeTerminationOutcome(termination)) {
-    if (profileKind === "manual-login") {
-      logger(`[browser] Preserving manual-login profile: ${termination.reason}`);
+  if (processIdentity) {
+    const terminateChrome =
+      deps.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile;
+    const termination = await terminateChrome(profileDir, processIdentity, logger);
+    if (!isSafeChromeTerminationOutcome(termination)) {
+      if (profileKind === "manual-login") {
+        logger(`[browser] Preserving manual-login profile: ${termination.reason}`);
+      }
+      return termination.reason;
     }
-    return termination.reason;
+  } else if (profileKind === "manual-login") {
+    return "Chrome process identity cleanup metadata is missing";
   }
 
   if (profileKind === "manual-login") {
@@ -777,21 +914,13 @@ async function teardownLocalRecoveryGroup(
     : `Profile removal was not confirmed: ${profileDir}`;
 }
 function groupRecoveryCleanupResources(runtime: BrowserRuntimeMetadata): RecoveryCleanupGroup[] {
-  const entries: RecoveryCleanupEntry[] = (runtime.recoveryCleanupBacklog ?? []).map(
-    (resource) => ({
-      resource,
-      current: false,
-    }),
+  const entries: RecoveryCleanupEntry[] = (runtime.recoveryCleanupResources ?? []).map(
+    (resource, order) => ({ resource, order }),
   );
-  const current = recoveryCleanupResourceFromRuntime(runtime);
-  if (current) entries.push({ resource: current, current: true });
-
   const unique = new Map<string, RecoveryCleanupEntry>();
   for (const entry of entries) {
     const key = recoveryCleanupResourceKey(entry.resource);
-    const existing = unique.get(key);
-    if (existing) existing.current ||= entry.current;
-    else unique.set(key, { ...entry });
+    if (!unique.has(key)) unique.set(key, entry);
   }
 
   const groups = new Map<string, RecoveryCleanupGroup>();
@@ -808,11 +937,10 @@ function recoveryCleanupGroupKey(resource: BrowserRecoveryCleanupResourceMetadat
   const cleanup = resource.recoveryCleanup;
   if (cleanup.transport === "local") {
     const processIdentity = resource.chromeProcessIdentity;
-    const physicalProfile = processIdentity
-      ? (physicalProfileDirectoryIdentity(processIdentity.profileDirectory)?.canonicalPath ??
-        "missing-physical-profile")
-      : (resource.chromeProfileRoot ?? resource.userDataDir ?? null);
-    return JSON.stringify(["local", chromeProcessIdentityKey(processIdentity), physicalProfile]);
+    const profileIdentity = profileDirectoryIdentityKey(
+      processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
+    ) ?? ["missing-physical-profile", resource.chromeProfileRoot ?? resource.userDataDir ?? null];
+    return JSON.stringify(["local", chromeProcessIdentityKey(processIdentity), profileIdentity]);
   }
   const remoteIdentity = remoteRecoveryIdentityKey(resource.remoteRecovery);
   return JSON.stringify(
@@ -834,6 +962,9 @@ function recoveryCleanupResourceKey(resource: BrowserRecoveryCleanupResourceMeta
     resource.chromeHost ?? null,
     resource.chromePort ?? null,
     resource.chromeBrowserWSEndpoint ?? null,
+    resource.tabLease
+      ? [resource.tabLease.id, profileDirectoryIdentityKey(resource.tabLease.profileDirectory)]
+      : null,
     resource.recoveryCleanup.ownsTarget,
     resource.recoveryCleanup.profileKind,
     resource.recoveryCleanup.keepBrowser,
@@ -907,7 +1038,7 @@ function requestsProcessTeardown(resource: BrowserRecoveryCleanupResourceMetadat
 
 function teardownOnlyEntry(entry: RecoveryCleanupEntry): RecoveryCleanupEntry {
   return {
-    current: entry.current,
+    order: entry.order,
     resource: {
       ...entry.resource,
       chromeTargetId: undefined,
@@ -920,6 +1051,18 @@ function teardownOnlyEntry(entry: RecoveryCleanupEntry): RecoveryCleanupEntry {
   };
 }
 
+function removeReleasedLeaseAuthority(
+  entry: RecoveryCleanupEntry,
+  releasedLeaseIds: Set<string>,
+): RecoveryCleanupEntry {
+  const leaseId = entry.resource.tabLease?.id;
+  if (!leaseId || !releasedLeaseIds.has(leaseId)) return entry;
+  return {
+    ...entry,
+    resource: { ...entry.resource, tabLease: undefined },
+  };
+}
+
 async function validateGroupTeardownInvariants(
   entries: RecoveryCleanupEntry[],
 ): Promise<string | null> {
@@ -927,7 +1070,7 @@ async function validateGroupTeardownInvariants(
   if (!first) return "Cleanup group has no teardown authority";
   const firstProcessIdentity = first.chromeProcessIdentity;
   const firstProfileDirectory = physicalProfileDirectoryIdentity(
-    firstProcessIdentity?.profileDirectory,
+    firstProcessIdentity?.profileDirectory ?? first.profileDirectoryIdentity,
   );
   const fallbackProfileSource = firstProcessIdentity
     ? null
@@ -975,45 +1118,25 @@ async function validateGroupTeardownInvariants(
   return null;
 }
 
-function recoveryCleanupResourceFromRuntime(
-  runtime: BrowserRuntimeMetadata,
-): BrowserRecoveryCleanupResourceMetadata | null {
-  if (!runtime.recoveryCleanup) return null;
-  return {
-    chromePid: runtime.chromePid,
-    chromeProcessIdentity: runtime.chromeProcessIdentity,
-    chromePort: runtime.chromePort,
-    chromeHost: runtime.chromeHost,
-    chromeBrowserWSEndpoint: runtime.chromeBrowserWSEndpoint,
-    chromeProfileRoot: runtime.chromeProfileRoot,
-    userDataDir: runtime.userDataDir,
-    chromeTargetId: runtime.chromeTargetId,
-    conversationId: runtime.conversationId,
-    promptEpoch: runtime.promptEpoch,
-    remoteRecovery:
-      runtime.recoveryCleanup.transport === "remote" ? runtime.remoteRecovery : undefined,
-    recoveryCleanup: runtime.recoveryCleanup,
-  };
-}
-
 function rebuildPendingCleanupRuntime(
   runtime: BrowserRuntimeMetadata,
   entries: RecoveryCleanupEntry[],
   error: string,
 ): BrowserRuntimeMetadata {
-  const rebuilt = { ...runtime };
-  delete rebuilt.recoveryCleanup;
-  delete rebuilt.recoveryCleanupBacklog;
-  delete rebuilt.remoteRecovery;
-  const current = entries.find((entry) => entry.current);
-  if (current) {
-    rebuilt.recoveryCleanup = current.resource.recoveryCleanup;
-    rebuilt.remoteRecovery = current.resource.remoteRecovery;
+  const ordered = [...entries].sort((left, right) => left.order - right.order);
+  const resources: BrowserRecoveryCleanupResourceMetadata[] = [];
+  const seen = new Set<string>();
+  for (const entry of ordered) {
+    const key = recoveryCleanupResourceKey(entry.resource);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    resources.push(entry.resource);
   }
-  const backlog = entries.filter((entry) => !entry.current).map((entry) => entry.resource);
-  if (backlog.length > 0) rebuilt.recoveryCleanupBacklog = backlog;
-  rebuilt.recoveryCleanupResult = { status: "failed", error };
-  return rebuilt;
+  return {
+    ...runtime,
+    recoveryCleanupResources: resources,
+    recoveryCleanupResult: { status: "failed", error },
+  };
 }
 
 async function cleanupProfileAbsent(profileDir: string): Promise<boolean> {
@@ -1027,7 +1150,7 @@ async function cleanupProfileAbsent(profileDir: string): Promise<boolean> {
 }
 
 function markRecoveryCleanupPending(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  if (!runtime.recoveryCleanup && !runtime.recoveryCleanupBacklog?.length) return runtime;
+  if (!runtime.recoveryCleanupResources?.length) return runtime;
   return { ...runtime, recoveryCleanupResult: { status: "pending" } };
 }
 
@@ -1098,18 +1221,15 @@ async function removeCleanupProfile(
   return removeProfileDirectoryIfIdentityMatches(profileDir, expectedIdentity);
 }
 function defaultRecoveryLockPath(runtime: BrowserRuntimeMetadata): string {
-  const processIdentity = runtime.chromeProcessIdentity;
-  const physicalProfile = processIdentity
-    ? (physicalProfileDirectoryIdentity(processIdentity.profileDirectory)?.canonicalPath ??
-      "missing-physical-profile")
-    : (runtime.chromeProfileRoot ?? runtime.userDataDir ?? null);
+  const cleanupAuthority = (runtime.recoveryCleanupResources ?? []).map((resource) =>
+    recoveryCleanupResourceKey(resource),
+  );
   const identity = JSON.stringify([
-    "recovery-v2",
+    "recovery-v3",
+    cleanupAuthority,
     remoteRecoveryIdentityKey(runtime.remoteRecovery),
     immutablePromptIdentity(runtime.promptEpoch),
     runtime.conversationId ?? null,
-    physicalProfile,
-    chromeProcessIdentityKey(runtime.chromeProcessIdentity),
   ]);
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
   return path.join(os.tmpdir(), "oracle-browser-recovery-locks", `${digest}.lock`);
@@ -1140,11 +1260,31 @@ async function refreshAttachRuntime(
   if (!activePort) {
     return runtime;
   }
+  const runtimeProcessKey = chromeProcessIdentityKey(runtime.chromeProcessIdentity);
+  const profileRoot = path.resolve(runtime.chromeProfileRoot);
+  const recoveryCleanupResources = runtime.recoveryCleanupResources?.map((resource) => {
+    if (resource.recoveryCleanup.transport !== "local") return resource;
+    const sameAuthority = runtimeProcessKey
+      ? JSON.stringify(chromeProcessIdentityKey(resource.chromeProcessIdentity)) ===
+        JSON.stringify(runtimeProcessKey)
+      : [resource.chromeProfileRoot, resource.userDataDir].some(
+          (candidate) => candidate && path.resolve(candidate) === profileRoot,
+        );
+    return sameAuthority
+      ? {
+          ...resource,
+          chromeHost: host,
+          chromePort: activePort.port,
+          chromeBrowserWSEndpoint: activePort.browserWSEndpoint,
+        }
+      : resource;
+  });
   return {
     ...runtime,
     chromeHost: host,
     chromePort: activePort.port,
     chromeBrowserWSEndpoint: activePort.browserWSEndpoint,
+    recoveryCleanupResources,
   };
 }
 
@@ -1215,73 +1355,53 @@ function buildCommittedConversationUrl(
   return extractRecoverableConversationId(canonicalUrl) === conversationId ? canonicalUrl : null;
 }
 
-function requireCommittedPromptEpoch(
+function requireCommittedPromptEpochLocator(
   runtime: BrowserRuntimeMetadata,
-): Extract<NonNullable<BrowserRuntimeMetadata["promptEpoch"]>, { status: "committed" }> {
-  const epoch = runtime.promptEpoch;
-  if (!epoch || epoch.status !== "committed") {
-    throw new Error("Browser reattach requires a committed prompt epoch.");
-  }
-  if (
-    typeof epoch.epochId !== "string" ||
-    !epoch.epochId.trim() ||
-    typeof epoch.promptSha256 !== "string" ||
-    !epoch.promptSha256.trim() ||
-    !Number.isInteger(epoch.baselineTurns) ||
-    epoch.baselineTurns < 0 ||
-    typeof epoch.conversationId !== "string" ||
-    !epoch.conversationId.trim() ||
-    !Number.isInteger(epoch.verifiedUserTurnIndex) ||
-    epoch.verifiedUserTurnIndex < epoch.baselineTurns ||
-    !Number.isInteger(epoch.followUpOrdinal) ||
-    epoch.followUpOrdinal < 0 ||
-    !Number.isInteger(epoch.remainingFollowUps) ||
-    epoch.remainingFollowUps < 0
-  ) {
-    throw new Error("Browser reattach prompt epoch is invalid.");
-  }
-  if (epoch.remainingFollowUps > 0) {
-    throw new Error(
-      "Browser reattach cannot complete while committed follow-up prompts remain pending.",
+): CommittedPromptEpochLocator {
+  const locator = resolveCommittedPromptEpochLocator(runtime);
+  if (!locator) {
+    throw new BrowserAutomationError(
+      "Browser reattach requires a structurally valid committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
     );
   }
-  const explicitConversationId = runtime.conversationId?.trim();
-  const tabConversationId = extractConversationIdFromUrl(runtime.tabUrl ?? "");
-  if (tabConversationId && !isRecoverableChatGptConversationUrl(runtime.tabUrl)) {
-    throw new Error("Browser reattach stored tab URL is not a recoverable ChatGPT conversation.");
+  if (locator.epoch.remainingFollowUps > 0) {
+    throw new BrowserAutomationError(
+      "Browser reattach cannot complete while committed follow-up prompts remain pending.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
   }
-  const locators = [explicitConversationId, tabConversationId].filter((value): value is string =>
-    Boolean(value),
-  );
-  if (locators.length === 0) {
-    throw new Error("Browser reattach has no conversation locator for its prompt epoch.");
-  }
-  if (locators.some((conversationId) => conversationId !== epoch.conversationId)) {
-    throw new Error("Browser reattach prompt epoch does not match the stored conversation.");
-  }
-  return epoch;
+  return locator;
 }
 
-function buildRecoveryCleanupBacklog(
-  runtime: BrowserRuntimeMetadata,
-): NonNullable<BrowserRuntimeMetadata["recoveryCleanupBacklog"]> {
-  const backlog = [...(runtime.recoveryCleanupBacklog ?? [])];
-  const current = recoveryCleanupResourceFromRuntime(runtime);
+function assertSameCommittedPromptEpoch(
+  expected: CommittedPromptEpochLocator,
+  actual: CommittedPromptEpochLocator,
+): void {
   if (
-    current &&
-    !backlog.some(
-      (resource) => recoveryCleanupResourceKey(resource) === recoveryCleanupResourceKey(current),
-    )
+    expected.epoch.epochId !== actual.epoch.epochId ||
+    expected.promptSha256 !== actual.promptSha256 ||
+    expected.conversationId !== actual.conversationId ||
+    expected.verifiedUserTurnIndex !== actual.verifiedUserTurnIndex ||
+    expected.verifiedUserTurnId !== actual.verifiedUserTurnId ||
+    expected.verifiedUserMessageId !== actual.verifiedUserMessageId ||
+    expected.epoch.baselineTurns !== actual.epoch.baselineTurns ||
+    expected.epoch.followUpOrdinal !== actual.epoch.followUpOrdinal ||
+    expected.epoch.remainingFollowUps !== actual.epoch.remainingFollowUps
   ) {
-    backlog.push(current);
+    throw new BrowserAutomationError(
+      "Recovered browser runtime does not match the committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
   }
-  return backlog;
 }
 
 async function createOwnedRecoveryTargetConnection(
   chrome: Pick<BrowserChrome, "host" | "port">,
   logger: BrowserLogger,
   deps: ReattachDeps,
+  onTargetAcquired?: (targetId: string) => void,
+  onTargetCleaned?: (targetId: string) => void,
 ): Promise<RemoteChromeConnection> {
   const host = chrome.host ?? "127.0.0.1";
   const createTarget = deps.createRecoveryTarget ?? createChromePageTarget;
@@ -1289,6 +1409,7 @@ async function createOwnedRecoveryTargetConnection(
   if (!targetId) {
     throw new Error("Unable to create a dedicated Chrome target for browser recovery.");
   }
+  onTargetAcquired?.(targetId);
 
   let connection: RemoteChromeConnection | null = null;
   try {
@@ -1306,14 +1427,26 @@ async function createOwnedRecoveryTargetConnection(
     return { ...connection, targetId, ownership: "created" };
   } catch (error) {
     await connection?.close().catch(() => undefined);
-    const closeOwnedTarget = deps.recoveryCleanup?.closeChromeTarget ?? closeChromeTarget;
-    const closed = await closeOwnedTarget({
-      host,
-      port: chrome.port,
-      targetId,
-      logger,
-    }).catch(() => false);
-    if (!closed) logger(`[browser] Failed to close unused recovery target ${targetId}.`);
+    const closeTarget = deps.recoveryCleanup?.closeChromeTarget ?? closeChromeTarget;
+    let cleanupError: string | null = null;
+    try {
+      const closed = await closeTarget({ host, port: chrome.port, targetId, logger });
+      if (!closed) cleanupError = "created target close was not confirmed";
+      else onTargetCleaned?.(targetId);
+    } catch (closeError) {
+      cleanupError = closeError instanceof Error ? closeError.message : String(closeError);
+    }
+    if (cleanupError) {
+      const original = error instanceof Error ? error.message : String(error);
+      throw new BrowserAutomationError(
+        `${original} Created recovery target cleanup remains pending: ${cleanupError}`,
+        {
+          stage: "browser-recovery-target",
+          code: "created-target-cleanup-pending",
+        },
+        error,
+      );
+    }
     throw error;
   }
 }
@@ -1325,8 +1458,9 @@ async function resumeBrowserSessionViaNewChrome(
   deps: ReattachDeps,
 ): Promise<ReattachCapture> {
   const resolved = resolveBrowserConfig(config ?? {});
-  const promptEpoch = requireCommittedPromptEpoch(runtime);
-  const minTurnIndex = promptEpoch.verifiedUserTurnIndex + 1;
+  const promptLocator = requireCommittedPromptEpochLocator(runtime);
+  const promptEpoch = promptLocator.epoch;
+  const minTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
   const manualLogin = Boolean(resolved.manualLogin);
   const userDataDir = manualLogin
     ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
@@ -1334,19 +1468,70 @@ async function resumeBrowserSessionViaNewChrome(
   if (manualLogin) await mkdir(userDataDir, { recursive: true });
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
+  const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
   let fallbackLease: BrowserTabLease | null = null;
   let chrome: BrowserChrome | null = null;
-  let chromeOwnerSource: ManualChromeOwnerSource | null = null;
   let fallbackTargetId: string | null = null;
+  let fallbackRuntime: BrowserRuntimeMetadata | null = null;
   let client: ChromeClient | null = null;
   let closeFallbackConnection: (() => Promise<void>) | null = null;
-  const releaseFallbackLease: BrowserTabLease["release"] = async (options) => {
-    const lease = fallbackLease;
-    if (!lease) return;
-    await lease.release(options);
-    fallbackLease = null;
+  const refreshFallbackRuntime = (): BrowserRuntimeMetadata => {
+    const ownsProcess = Boolean(chrome && !resolved.keepBrowser);
+    const hasNewAuthority = !manualLogin || Boolean(fallbackLease || chrome || fallbackTargetId);
+    const profileKind = ownsProcess
+      ? manualLogin
+        ? "manual-login"
+        : "temporary"
+      : !chrome && !manualLogin
+        ? "temporary"
+        : "none";
+    const resource: BrowserRecoveryCleanupResourceMetadata = {
+      chromePid: chrome?.pid,
+      chromeProcessIdentity: chrome?.processIdentity,
+      profileDirectoryIdentity:
+        chrome?.processIdentity?.profileDirectory ?? fallbackProfileIdentity,
+      chromePort: chrome?.port,
+      chromeHost: chrome?.host ?? "127.0.0.1",
+      chromeProfileRoot: userDataDir,
+      userDataDir,
+      chromeTargetId: fallbackTargetId ?? undefined,
+      conversationId: promptEpoch.conversationId,
+      promptEpoch,
+      tabLease: fallbackLease
+        ? { id: fallbackLease.id, profileDirectory: fallbackLease.profileDirectory }
+        : undefined,
+      recoveryCleanup: {
+        transport: "local",
+        ownsTarget: Boolean(fallbackTargetId),
+        profileKind,
+        keepBrowser: profileKind === "none" ? true : Boolean(resolved.keepBrowser),
+      },
+    };
+    const next: BrowserRuntimeMetadata = {
+      ...runtime,
+      browserTransport: "cdp",
+      chromePid: chrome?.pid,
+      chromeProcessIdentity: chrome?.processIdentity,
+      chromePort: chrome?.port,
+      chromeHost: chrome?.host ?? "127.0.0.1",
+      chromeBrowserWSEndpoint: undefined,
+      chromeProfileRoot: userDataDir,
+      userDataDir,
+      chromeTargetId: fallbackTargetId ?? undefined,
+      recoveryCleanupResources: hasNewAuthority
+        ? [...inheritedRecoveryCleanupResources, resource]
+        : inheritedRecoveryCleanupResources,
+      recoveryCleanupResult: hasNewAuthority
+        ? { status: "pending" }
+        : runtime.recoveryCleanupResult,
+      controllerPid: process.pid,
+    };
+    delete next.remoteRecovery;
+    fallbackRuntime = next;
+    return next;
   };
 
+  refreshFallbackRuntime();
   try {
     if (manualLogin) {
       fallbackLease = await acquireBrowserTabLease(userDataDir, {
@@ -1355,6 +1540,7 @@ async function resumeBrowserSessionViaNewChrome(
         logger,
         sessionId: `reattach-${process.pid}`,
       });
+      refreshFallbackRuntime();
     }
     if (manualLogin) {
       const owner = await (deps.acquireManualChromeOwner ?? acquireManualChromeOwner)(
@@ -1364,17 +1550,25 @@ async function resumeBrowserSessionViaNewChrome(
         `reattach-${process.pid}`,
       );
       chrome = owner.chrome;
-      chromeOwnerSource = owner.source;
     } else {
       chrome = await launchChrome(resolved, userDataDir, logger);
-      chromeOwnerSource = "launched";
-      await writeChromePid(userDataDir, chrome.pid);
-      await writeChromeProcessIdentity(userDataDir, chrome.processIdentity);
     }
+    refreshFallbackRuntime();
     const chromeHost = chrome.host ?? "127.0.0.1";
-    const recoveryConnection = await createOwnedRecoveryTargetConnection(chrome, logger, deps);
+    const recoveryConnection = await createOwnedRecoveryTargetConnection(
+      chrome,
+      logger,
+      deps,
+      (targetId) => {
+        fallbackTargetId = targetId;
+        refreshFallbackRuntime();
+      },
+      () => {
+        fallbackTargetId = null;
+        refreshFallbackRuntime();
+      },
+    );
     const recoveryTargetId = recoveryConnection.targetId;
-    fallbackTargetId = recoveryTargetId;
     client = recoveryConnection.client;
     closeFallbackConnection = recoveryConnection.close;
     await fallbackLease?.update({
@@ -1451,6 +1645,8 @@ async function resumeBrowserSessionViaNewChrome(
       requirePromptReady: false,
       expectedConversationUrl: conversationUrl ?? undefined,
     });
+    const verifyPromptTurn = deps.verifyCommittedPromptTurn ?? verifyCommittedPromptTurn;
+    await verifyPromptTurn(Runtime, promptLocator);
     const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
     const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
     const timeoutMs = resolved.timeoutMs ?? 120_000;
@@ -1467,25 +1663,33 @@ async function resumeBrowserSessionViaNewChrome(
         minTurnIndex,
         Page,
         client,
-        { requireScopedTargetOwner: true },
+        {
+          requireScopedTargetOwner: true,
+          expectedConversationId: promptLocator.conversationId,
+          expectedPromptTurn: promptLocator,
+        },
       );
       answerText = researchResult.text;
       answerMarkdown = researchResult.text;
     } else {
-      const promptEcho = buildPromptEchoMatcher();
-      const answer = await waitForResponse(Runtime, timeoutMs, logger, minTurnIndex);
-      const recovered = await recoverPromptEcho(
+      const answer = await waitForResponse(
         Runtime,
-        answer,
-        promptEcho,
+        timeoutMs,
         logger,
         minTurnIndex,
-        timeoutMs,
+        promptLocator.conversationId,
+        promptLocator,
       );
-      const markdown = (await captureMarkdown(Runtime, recovered.meta, logger)) ?? recovered.text;
-      const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
-      answerText = aligned.answerText;
-      answerMarkdown = aligned.answerMarkdown;
+      const markdown =
+        (await captureMarkdown(
+          Runtime,
+          answer.meta,
+          logger,
+          promptLocator.conversationId,
+          promptLocator,
+        )) ?? answer.text;
+      answerText = answer.text;
+      answerMarkdown = markdown;
     }
 
     const closeConnection = closeFallbackConnection;
@@ -1493,40 +1697,10 @@ async function resumeBrowserSessionViaNewChrome(
     await closeConnection().catch(() => undefined);
     closeFallbackConnection = null;
     client = null;
-    const fallbackRuntime: BrowserRuntimeMetadata = {
-      ...runtime,
-      browserTransport: "cdp",
-      chromePid: chrome.pid,
-      chromeProcessIdentity: chrome.processIdentity,
-      chromePort: chrome.port,
-      chromeHost,
-      chromeBrowserWSEndpoint: undefined,
-      chromeProfileRoot: userDataDir,
-      userDataDir,
-      chromeTargetId: recoveryTargetId,
-      recoveryCleanup: {
-        transport: "local",
-        ownsTarget: true,
-        profileKind: manualLogin ? "manual-login" : "temporary",
-        keepBrowser: Boolean(resolved.keepBrowser),
-      },
-      recoveryCleanupResult: { status: "pending" },
-      recoveryCleanupBacklog: buildRecoveryCleanupBacklog(runtime),
-      controllerPid: process.pid,
-    };
-    delete fallbackRuntime.remoteRecovery;
     return {
       answerText,
       answerMarkdown,
-      runtime: fallbackRuntime,
-      finalizeResources: async () =>
-        finalizeRecoveredRuntime(
-          fallbackRuntime,
-          logger,
-          deps.recoveryCleanup,
-          releaseFallbackLease,
-        ),
-      abandonResources: releaseFallbackLease,
+      runtime: fallbackRuntime ?? refreshFallbackRuntime(),
     };
   } catch (error) {
     if (closeFallbackConnection) {
@@ -1536,89 +1710,31 @@ async function resumeBrowserSessionViaNewChrome(
       await client?.close().catch(() => undefined);
     }
     client = null;
-    if (chrome && fallbackTargetId) {
-      const closeOwnedTarget = deps.recoveryCleanup?.closeChromeTarget ?? closeChromeTarget;
-      const closed = await closeOwnedTarget({
-        host: chrome.host ?? "127.0.0.1",
-        port: chrome.port,
-        targetId: fallbackTargetId,
+    const authorityRuntime = fallbackRuntime ?? refreshFallbackRuntime();
+    let cleanupResult: ReattachFinalizationResult;
+    try {
+      cleanupResult = await finalizeRecoveredRuntime(
+        authorityRuntime,
         logger,
-      }).catch(() => false);
-      if (!closed) logger(`[browser] Failed to close recovery target ${fallbackTargetId}.`);
+        deps.recoveryCleanup,
+        "abort",
+      );
+    } catch (cleanupError) {
+      cleanupResult = pendingFinalization(
+        authorityRuntime,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      );
     }
-    if (manualLogin) {
-      await releaseFallbackLease({
-        onRelease: async ({ isLastLease }: { isLastLease: boolean }) => {
-          if (!isLastLease || !chrome || resolved.keepBrowser || chromeOwnerSource !== "launched")
-            return;
-          const profileDirectory = physicalProfileDirectoryIdentity(
-            chrome.processIdentity.profileDirectory,
-          );
-          if (!profileDirectory) {
-            logger(
-              "[browser] Fallback Chrome profile identity is invalid; preserving manual-login state.",
-            );
-            return;
-          }
-          const termination = await chrome.kill().catch((terminationError: unknown) => ({
-            status: "unsafe" as const,
-            pid: chrome?.pid,
-            reason:
-              terminationError instanceof Error
-                ? terminationError.message
-                : String(terminationError),
-          }));
-          if (!isSafeChromeTerminationOutcome(termination)) {
-            logger(
-              `[browser] Fallback Chrome termination was unsafe; preserving manual-login state: ${termination.reason}`,
-            );
-            return;
-          }
-          const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
-            lockRemovalMode: "never",
-            expectedProfileIdentity: profileDirectory,
-          }).catch(() => false);
-          if (!cleaned) {
-            logger("[browser] Fallback manual-login cleanup was not confirmed; preserving state.");
-          }
+    if (cleanupResult.status === "pending") {
+      throw new BrowserAutomationError(
+        `Browser fallback recovery failed and cleanup remains pending: ${cleanupResult.error}`,
+        {
+          stage: "browser-reattach-fallback-cleanup",
+          code: "fallback-cleanup-pending",
+          runtime: cleanupResult.runtime,
         },
-      }).catch((releaseError) => {
-        logger(
-          `[browser] Fallback lease release failed; preserving shared Chrome resources: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
-        );
-      });
-    } else {
-      await releaseFallbackLease().catch(() => undefined);
-      if (chrome && !resolved.keepBrowser) {
-        const profileDirectory = physicalProfileDirectoryIdentity(
-          chrome.processIdentity.profileDirectory,
-        );
-        if (!profileDirectory) {
-          logger(
-            "[browser] Fallback Chrome profile identity is invalid; preserving cleanup state.",
-          );
-        } else {
-          const termination = await chrome.kill().catch((terminationError: unknown) => ({
-            status: "unsafe" as const,
-            pid: chrome?.pid,
-            reason:
-              terminationError instanceof Error
-                ? terminationError.message
-                : String(terminationError),
-          }));
-          if (isSafeChromeTerminationOutcome(termination)) {
-            await removeProfileDirectoryIfIdentityMatches(userDataDir, profileDirectory).catch(
-              () => false,
-            );
-          } else {
-            logger(`[browser] Fallback Chrome cleanup remains pending: ${termination.reason}`);
-          }
-        }
-      } else if (!chrome) {
-        await removeProfileDirectoryIfIdentityMatches(userDataDir, fallbackProfileIdentity).catch(
-          () => false,
-        );
-      }
+        error,
+      );
     }
     throw error;
   }
@@ -1631,7 +1747,6 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   finalizeRecoveredRuntime,
-  buildRecoveryCleanupBacklog,
   recoveryCleanupGroupKey,
   defaultRecoveryLockPath,
   createOwnedRecoveryTargetConnection,

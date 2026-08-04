@@ -192,7 +192,7 @@ describe("openGeminiBrowserSession", () => {
         kill: ownerKill,
       },
       processIdentity,
-      source: "active-port",
+      source: "recorded",
     });
 
     const session = await openGeminiBrowserSession({
@@ -262,11 +262,9 @@ describe("openGeminiBrowserSession", () => {
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
 
-  it("rejects after attempting target, client, and lease cleanup failures", async () => {
-    const profileDir = path.join(tempRoot, "close-failure-profile");
-    closeTab.mockResolvedValueOnce(false);
-    clientClose.mockRejectedValueOnce(new Error("CDP close failed"));
-    leaseRelease.mockRejectedValueOnce(new Error("lease release failed"));
+  it("retries target closure before releasing controller or lease authority", async () => {
+    const profileDir = path.join(tempRoot, "close-retry-profile");
+    closeTab.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const session = await openGeminiBrowserSession({
       browserConfig: { manualLoginProfileDir: profileDir },
       keepBrowserDefault: false,
@@ -275,8 +273,18 @@ describe("openGeminiBrowserSession", () => {
 
     await expect(session.close()).rejects.toThrow("did not settle cleanly");
     expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(clientClose).not.toHaveBeenCalled();
+    expect(leaseRelease).not.toHaveBeenCalled();
+    expect(ownerKill).not.toHaveBeenCalled();
+
+    await expect(session.close()).resolves.toBeUndefined();
+    await expect(session.close()).resolves.toBeUndefined();
+
+    expect(closeTab).toHaveBeenCalledTimes(2);
     expect(clientClose).toHaveBeenCalledTimes(1);
     expect(leaseRelease).toHaveBeenCalledTimes(1);
+    expect(ownerKill).toHaveBeenCalledTimes(1);
+    expect(cleanupStaleProfileState).toHaveBeenCalledTimes(1);
   });
 
   it("rejects when launched-owner cleanup cannot confirm the exact profile", async () => {

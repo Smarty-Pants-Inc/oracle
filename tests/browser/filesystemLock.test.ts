@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
@@ -13,6 +13,26 @@ async function agePath(targetPath: string, ageMs = 10_000): Promise<void> {
 }
 
 describe("crash-recoverable filesystem lock", () => {
+  test("fails before publishing a lock when process generation is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "missing-parent", "recovery.lock");
+    try {
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            pid: 10_000,
+            readProcessStartIdentity: async () => null,
+          },
+        ),
+      ).rejects.toThrow(/without a stable process generation/i);
+      await expect(stat(path.dirname(lockPath))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("reclaims a crash-left lock directory after the incomplete-state grace period", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
@@ -89,7 +109,8 @@ describe("crash-recoverable filesystem lock", () => {
           {
             pid: 10_003,
             readProcessLiveness: (pid) => (pid === 41_041 ? "alive" : "dead"),
-            readProcessStartIdentity: async () => null,
+            readProcessStartIdentity: async (pid) =>
+              pid === 41_041 ? null : "current-process-start",
           },
         ),
       ).rejects.toBeInstanceOf(FilesystemLockBusyError);

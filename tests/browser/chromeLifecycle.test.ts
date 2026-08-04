@@ -140,7 +140,7 @@ describe("hidden macOS Chrome launch", () => {
     }));
     const hiddenMacLaunch = vi.fn(async () => chromeLaunchResult(identity, stableKill));
     const standardLaunch = vi.fn();
-    const writeProcessIdentity = vi.fn(async () => undefined);
+    const writeOwner = vi.fn(async () => undefined);
     const logger = vi.fn<(message: string) => void>();
 
     const launched = await launchChrome(
@@ -153,7 +153,7 @@ describe("hidden macOS Chrome launch", () => {
         hiddenMacLaunch,
         standardLaunch,
         captureProfileIdentity: async () => profile,
-        writeProcessIdentity,
+        writeOwner,
       },
     );
 
@@ -161,7 +161,10 @@ describe("hidden macOS Chrome launch", () => {
       expect.objectContaining({ userDataDir: profile.canonicalPath, requestedPort: 9222 }),
     );
     expect(standardLaunch).not.toHaveBeenCalled();
-    expect(writeProcessIdentity).toHaveBeenCalledWith(profile.canonicalPath, identity);
+    expect(writeOwner).toHaveBeenCalledWith(profile.canonicalPath, {
+      port: 9222,
+      processIdentity: identity,
+    });
     await expect(launched.kill()).resolves.toMatchObject({
       status: "stopped",
       signal: "CONTROL_CHANNEL",
@@ -200,6 +203,57 @@ describe("hidden macOS Chrome launch", () => {
       ),
     ).rejects.toThrow(/use --remote-chrome/i);
   });
+
+  test("does not claim stopped until the exact hidden Chrome generation exits", async () => {
+    const { createIdentityBoundChromeControlKillForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const identity = processIdentity(
+      "/tmp/oracle-hidden-profile",
+      4321,
+      "11111111-1111-4111-8111-111111111112",
+    );
+    const browserClose = vi.fn(async () => undefined);
+    const clientClose = vi.fn(async () => undefined);
+    const inspectProcessIdentity = vi
+      .fn()
+      .mockResolvedValueOnce("current" as const)
+      .mockResolvedValueOnce("current" as const)
+      .mockResolvedValueOnce("exited" as const);
+    const kill = createIdentityBoundChromeControlKillForTest(
+      { Browser: { close: browserClose }, close: clientClose } as never,
+      identity.profileDirectory.canonicalPath,
+      identity,
+      { inspectProcessIdentity, timeoutMs: 0 },
+    );
+
+    await expect(kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: identity.pid,
+      reason: expect.stringMatching(/remained alive/i),
+    });
+    await expect(kill()).resolves.toMatchObject({
+      status: "stopped",
+      pid: identity.pid,
+      signal: "CONTROL_CHANNEL",
+    });
+    expect(browserClose).toHaveBeenCalledOnce();
+    expect(clientClose).toHaveBeenCalledOnce();
+    expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
+  });
+
+  test("accepts a hidden Chrome endpoint only when macOS reports the exact listener pid", async () => {
+    const { verifyListeningPortOwnedByProcessForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const exactOwner = vi.fn(async () => ({ stdout: "p4321\n" }));
+    const differentOwner = vi.fn(async () => ({ stdout: "p9999\n" }));
+
+    await expect(verifyListeningPortOwnedByProcessForTest(4321, 64305, exactOwner)).resolves.toBe(
+      true,
+    );
+    await expect(
+      verifyListeningPortOwnedByProcessForTest(4321, 64305, differentOwner),
+    ).resolves.toBe(false);
+  });
 });
 
 describe("stable Chrome process authority", () => {
@@ -231,7 +285,7 @@ describe("stable Chrome process authority", () => {
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
         captureProfileIdentity: async () => profile,
         captureProcessIdentity: vi.fn(async () => identity),
-        writeProcessIdentity: vi.fn(async () => undefined),
+        writeOwner: vi.fn(async () => undefined),
       },
     );
 
@@ -298,8 +352,7 @@ describe("stable Chrome process authority", () => {
   });
 
   test("preserves the unsafe outcome when persistence rollback lacks stable authority", async () => {
-    const { createProvisionalIdentityBoundChromeKill } =
-      await import("../../src/browser/chromeLifecycle.js");
+    const { createOwnerBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
       "/tmp/oracle-rollback-profile",
       8902,
@@ -312,12 +365,12 @@ describe("stable Chrome process authority", () => {
       reason: "retained handle unavailable",
     }));
     await expect(
-      createProvisionalIdentityBoundChromeKill(
+      createOwnerBoundChromeKill(
         identity.profileDirectory.canonicalPath,
-        identity,
+        { port: 9222, processIdentity: identity },
         stableKill,
         {
-          writeIdentity: vi.fn(async () => {
+          writeOwner: vi.fn(async () => {
             throw persistenceError;
           }),
         },
@@ -333,28 +386,30 @@ describe("stable Chrome process authority", () => {
   });
 
   test("returns the retained stable kill after identity persistence", async () => {
-    const { createProvisionalIdentityBoundChromeKill } =
-      await import("../../src/browser/chromeLifecycle.js");
+    const { createOwnerBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
       "/tmp/oracle-partial-profile",
       9012,
       "55555555-5555-4555-8555-555555555555",
     );
-    const writeIdentity = vi.fn(async () => undefined);
+    const writeOwner = vi.fn(async () => undefined);
     const stableKill = vi.fn(async () => ({
       status: "stopped" as const,
       pid: identity.pid,
       signal: "SIGTERM" as const,
     }));
-    const kill = await createProvisionalIdentityBoundChromeKill(
+    const kill = await createOwnerBoundChromeKill(
       identity.profileDirectory.canonicalPath,
-      identity,
+      { port: 9222, processIdentity: identity },
       stableKill,
-      { writeIdentity },
+      { writeOwner },
     );
     expect(stableKill).not.toHaveBeenCalled();
     await expect(kill()).resolves.toMatchObject({ status: "stopped", pid: identity.pid });
-    expect(writeIdentity).toHaveBeenCalledWith(identity.profileDirectory.canonicalPath, identity);
+    expect(writeOwner).toHaveBeenCalledWith(identity.profileDirectory.canonicalPath, {
+      port: 9222,
+      processIdentity: identity,
+    });
   });
 });
 

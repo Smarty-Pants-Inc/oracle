@@ -46,13 +46,17 @@ import { formatFinishLine } from "../oracle/finishLine.js";
 import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
-import { resumeBrowserSession } from "../browser/reattach.js";
+import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
-import { persistDurableBrowserAnswer, type DurableBrowserAnswerReceipt } from "./durableAnswer.js";
+import {
+  persistDurableBrowserAnswer,
+  publishBrowserCapture,
+  type DurableBrowserAnswerReceipt,
+} from "./durableAnswer.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -149,98 +153,84 @@ export async function performSessionRun({
         modelSelection: result.modelSelection,
         warnings: result.warnings,
       };
-      let durablyCompleted = false;
-      try {
-        durableAnswerReceipt = await persistDurableBrowserAnswer({
+      const publication = await publishBrowserCapture({
+        answerOptions: {
           sessionId: sessionMeta.id,
           answer: result.answerText ?? "",
-        });
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "completed",
-          completedAt: new Date().toISOString(),
-          usage: result.usage,
-          elapsedMs: result.elapsedMs,
-          errorMessage: undefined,
-          browser: currentBrowser,
-          artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, result.artifacts), [
-            durableAnswerReceipt.artifact,
-          ]),
-          response: undefined,
-          transport: undefined,
-          error: undefined,
-        });
-        await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
-        await sendSessionNotification(
-          {
+        },
+        transaction: result,
+        persistAnswer: persistDurableBrowserAnswer,
+        prepare: async (receipt) => {
+          durableAnswerReceipt = receipt;
+          const artifacts = await ensureSessionArtifacts({
             sessionId: sessionMeta.id,
-            sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-            mode,
-            model: sessionMeta.model,
-            usage: result.usage,
-            characters: result.answerText?.length,
-          },
-          notificationSettings,
-          log,
-          result.answerText?.slice(0, 140),
-        );
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            prompt: result.promptText ?? runOptions.prompt,
+            answerMarkdown: result.answerText ?? "",
+            conversationUrl: result.runtime.tabUrl,
+            browserConfig,
+            existingArtifacts: result.artifacts,
+            logger: ((message?: string) => message && log(dim(message))) as BrowserLogger,
+          });
+          return { artifacts };
+        },
+        publish: async (receipt, prepared) => {
+          await sessionStore.updateSession(sessionMeta.id, {
             status: "completed",
             completedAt: new Date().toISOString(),
             usage: result.usage,
+            elapsedMs: result.elapsedMs,
+            errorMessage: undefined,
+            browser: currentBrowser,
+            artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, prepared.artifacts), [
+              receipt.artifact,
+            ]),
+            response: undefined,
+            transport: undefined,
+            error: undefined,
           });
-        }
-        durablyCompleted = true;
-        const finalization = await result.finalize().catch((finalizeError) => {
-          const message = `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`;
-          return {
-            status: "pending" as const,
-            runtime: {
-              ...result.runtime,
-              recoveryCleanupResult: { status: "failed" as const, error: message },
-            },
-            error: message,
-          };
-        });
-        currentBrowser = { ...currentBrowser, runtime: finalization.runtime };
-        await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
-        if (finalization.status === "pending") {
-          log(
-            kleur.yellow(
-              `Browser capture completed; cleanup remains pending: ${finalization.error}`,
-            ),
-          );
-        }
-        return;
-      } catch (error) {
-        if (!durablyCompleted) {
-          if (durableAnswerReceipt) {
-            throw error;
-          }
-          try {
-            const abortion = await result.abort();
-            currentBrowser = { ...currentBrowser, runtime: abortion.runtime };
-          } catch (abortError) {
-            currentBrowser = {
-              ...currentBrowser,
-              runtime: {
-                ...result.runtime,
-                recoveryCleanupResult: {
-                  status: "failed",
-                  error: `Capture abort failed: ${formatError(abortError)}`,
-                },
-              },
-            };
-          }
-          throw error;
-        }
+        },
+        persistRuntime: async (runtime) => {
+          currentBrowser = { ...currentBrowser, runtime };
+          await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
+        },
+      });
+      if (publication.finalization.status === "pending") {
         log(
-          dim(
-            `Browser capture completed, but cleanup state persistence failed: ${formatError(error)}`,
+          kleur.yellow(
+            `Browser capture completed; cleanup remains pending: ${publication.finalization.error}`,
           ),
         );
-        return;
       }
+      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
+      await sendSessionNotification(
+        {
+          sessionId: sessionMeta.id,
+          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
+          mode,
+          model: sessionMeta.model,
+          usage: result.usage,
+          characters: result.answerText?.length,
+        },
+        notificationSettings,
+        log,
+        result.answerText?.slice(0, 140),
+      ).catch((error) => {
+        log(dim(`Browser answer published; notification failed: ${formatError(error)}`));
+      });
+      if (modelForStatus) {
+        await sessionStore
+          .updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            usage: result.usage,
+          })
+          .catch((error) => {
+            log(
+              dim(`Browser answer published; model-run projection failed: ${formatError(error)}`),
+            );
+          });
+      }
+      return;
     }
     const multiModels = Array.isArray(runOptions.models) ? runOptions.models.filter(Boolean) : [];
     if (multiModels.length > 1) {
@@ -1271,18 +1261,21 @@ async function autoReattachUntilComplete({
     log(dim(`Auto-reattach attempt ${attempt}...`));
     let captureSucceeded = false;
     let durablyCompleted = false;
-    let reattachResult: Awaited<ReturnType<typeof resumeBrowserSession>> | null = null;
+    let reattachResult: ReattachResult | null = null;
     let answerReceipt: DurableBrowserAnswerReceipt | undefined;
+    let authoritativeRuntime = runtime;
+    let remotePublicationAcknowledged = false;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
         timeoutMs,
       };
       reattachResult = await resumeBrowserSession(runtime, reattachConfig, logger, {
-        promptPreview: sessionMeta.promptPreview,
         recoveryLockPath,
+        isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
       });
       captureSucceeded = true;
+      authoritativeRuntime = reattachResult.runtime;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const usage = {
@@ -1291,41 +1284,67 @@ async function autoReattachUntilComplete({
         reasoningTokens: 0,
         totalTokens: outputTokens,
       };
-      answerReceipt = await persistDurableBrowserAnswer({
-        sessionId: sessionMeta.id,
-        answer: answerText,
-        logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
-      });
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage,
-        errorMessage: undefined,
-        browser: {
-          ...browserMetadata,
-          config: browserConfig,
-          runtime: reattachResult.runtime,
+      const publication = await publishBrowserCapture({
+        answerOptions: {
+          sessionId: sessionMeta.id,
+          answer: answerText,
+          logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
         },
-        artifacts: mergeArtifacts(sessionMeta.artifacts, [answerReceipt.artifact]),
-        response: { status: "completed" },
-        error: undefined,
-        transport: undefined,
+        transaction: reattachResult,
+        persistAnswer: persistDurableBrowserAnswer,
+        prepare: async (receipt) => {
+          answerReceipt = receipt;
+          const artifacts = await ensureSessionArtifacts({
+            sessionId: sessionMeta.id,
+            prompt: runOptions.prompt,
+            answerMarkdown: answerText,
+            conversationUrl: reattachResult?.runtime.tabUrl,
+            browserConfig,
+            existingArtifacts: sessionMeta.artifacts,
+            logger,
+          });
+          return { artifacts };
+        },
+        publish: async (receipt, prepared) => {
+          await sessionStore.updateSession(sessionMeta.id, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            usage,
+            errorMessage: undefined,
+            browser: {
+              ...browserMetadata,
+              config: browserConfig,
+              runtime: reattachResult?.runtime ?? authoritativeRuntime,
+            },
+            artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, prepared.artifacts), [
+              receipt.artifact,
+            ]),
+            response: { status: "completed" },
+            error: undefined,
+            transport: undefined,
+          });
+          remotePublicationAcknowledged = true;
+        },
+        persistRuntime: async (latestRuntime) => {
+          authoritativeRuntime = latestRuntime;
+          await sessionStore.updateSession(sessionMeta.id, {
+            browser: {
+              ...browserMetadata,
+              config: browserConfig,
+              runtime: latestRuntime,
+            },
+          });
+        },
       });
-      const artifacts = await ensureSessionArtifacts({
-        sessionId: sessionMeta.id,
-        prompt: runOptions.prompt,
-        answerMarkdown: answerText,
-        conversationUrl: reattachResult.runtime.tabUrl,
-        browserConfig,
-        existingArtifacts: sessionMeta.artifacts,
-        logger,
-      });
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-          status: "completed",
-          completedAt: new Date().toISOString(),
-          usage,
-        });
+      durablyCompleted = true;
+      if (publication.finalization.status === "pending") {
+        log(
+          kleur.yellow(
+            `Auto-reattach completed; browser cleanup remains pending: ${publication.finalization.error}`,
+          ),
+        );
+      } else {
+        log(kleur.green("Auto-reattach succeeded; session marked completed."));
       }
       await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
       await sendSessionNotification(
@@ -1340,54 +1359,40 @@ async function autoReattachUntilComplete({
         notificationSettings,
         log,
         answerText.slice(0, 140),
-      );
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage,
-        errorMessage: undefined,
-        browser: {
-          ...browserMetadata,
-          config: browserConfig,
-          runtime: reattachResult.runtime,
-        },
-        artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, artifacts), [
-          answerReceipt.artifact,
-        ]),
-        response: { status: "completed" },
-        error: undefined,
-        transport: undefined,
+      ).catch((error) => {
+        log(dim(`Auto-reattach answer published; notification failed: ${formatError(error)}`));
       });
-      durablyCompleted = true;
-      const finalization = await reattachResult.finalize();
-      await sessionStore.updateSession(sessionMeta.id, {
-        browser: {
-          ...browserMetadata,
-          config: browserConfig,
-          runtime: finalization.runtime,
-        },
-      });
-      if (finalization.status === "pending") {
-        log(
-          kleur.yellow(
-            `Auto-reattach completed; browser cleanup remains pending: ${finalization.error}`,
-          ),
-        );
-      } else {
-        log(kleur.green("Auto-reattach succeeded; session marked completed."));
+      if (modelForStatus) {
+        await sessionStore
+          .updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            usage,
+          })
+          .catch((error) => {
+            log(
+              dim(
+                `Auto-reattach answer published; model-run projection failed: ${formatError(error)}`,
+              ),
+            );
+          });
       }
       return true;
     } catch (error) {
       if (durablyCompleted) {
         log(
           dim(
-            `Auto-reattach completed, but cleanup state persistence failed: ${formatError(error)}`,
+            `Auto-reattach completed, but a post-publication side effect failed: ${formatError(error)}`,
           ),
         );
         return true;
       }
       if (captureSucceeded) {
         const message = formatError(error);
+        const userError = asOracleUserError(error);
+        const failureRuntime =
+          (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime ??
+          authoritativeRuntime;
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
@@ -1395,25 +1400,25 @@ async function autoReattachUntilComplete({
           browser: {
             ...browserMetadata,
             config: browserConfig,
-            runtime: reattachResult?.runtime ?? runtime,
+            runtime: failureRuntime,
           },
           ...(answerReceipt
             ? { artifacts: mergeArtifacts(sessionMeta.artifacts, [answerReceipt.artifact]) }
             : {}),
           response: { status: "error", incompleteReason: "incomplete-capture" },
-          error: { category: "internal", message },
+          error: userError
+            ? {
+                category: userError.category,
+                message: userError.message,
+                details: userError.details,
+              }
+            : { category: "internal", message },
         });
-        try {
-          if (modelForStatus) {
-            await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-              status: "error",
-              completedAt: new Date().toISOString(),
-            });
-          }
-        } finally {
-          if (!answerReceipt) {
-            await reattachResult?.abandon().catch(() => undefined);
-          }
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "error",
+            completedAt: new Date().toISOString(),
+          });
         }
         throw error;
       }

@@ -26,6 +26,7 @@ export {
   waitForAssistantResponse,
   readAssistantSnapshot,
   captureAssistantMarkdown,
+  verifyCommittedPromptTurn,
   buildAssistantExtractorForTest,
   buildAssistantSnapshotExpressionForTest,
   buildConversationDebugExpressionForTest,

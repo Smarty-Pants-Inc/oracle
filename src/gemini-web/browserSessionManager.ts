@@ -62,73 +62,99 @@ export async function openGeminiBrowserSession(
 
   let targetId: string | null = null;
   let client: ChromeClient | null = null;
-  let closePromise: Promise<void> | null = null;
-  const close = (): Promise<void> => {
-    closePromise ??= (async () => {
-      const failures: Error[] = [];
-      const recordFailure = (error: unknown, action: string): void => {
-        const message = error instanceof Error ? error.message : String(error);
-        failures.push(new Error(`Gemini browser session ${action}: ${message}`));
-      };
+  let targetClosed = false;
+  let clientClosed = false;
+  let leaseReleased = false;
+  let ownerCleanupRequired = false;
+  let ownerTerminated = false;
+  let profileCleaned = false;
+  let closeCompleted = false;
+  let closeAttempt: Promise<void> | null = null;
 
-      if (targetId) {
-        try {
-          if (!(await closeTab(port, targetId, logger, host))) {
-            failures.push(new Error(`Gemini browser session could not close target ${targetId}.`));
-          }
-        } catch (error) {
-          recordFailure(error, `could not close target ${targetId}`);
-        }
+  const cleanupFailure = (action: string, cause?: unknown): Error => {
+    const detail =
+      cause === undefined ? "" : `: ${cause instanceof Error ? cause.message : String(cause)}`;
+    return new Error(`Gemini browser session did not settle cleanly: ${action}${detail}`);
+  };
+
+  const settleLaunchedOwner = async (): Promise<void> => {
+    if (!ownerCleanupRequired) return;
+    if (!ownerTerminated) {
+      let termination: RecordedChromeTerminationOutcome;
+      try {
+        termination = await chrome.kill();
+      } catch (error) {
+        throw cleanupFailure("could not terminate its launched Chrome owner", error);
       }
-      if (client) {
-        try {
-          await client.close();
-        } catch (error) {
-          recordFailure(error, "could not close its CDP client");
-        }
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        throw cleanupFailure(`could not safely terminate Chrome: ${termination.reason}`);
       }
+      ownerTerminated = true;
+    }
+    if (!profileCleaned) {
+      let cleaned: boolean;
+      try {
+        cleaned = await cleanupStaleProfileState(profileDir, log, {
+          lockRemovalMode: "never",
+          expectedProfileIdentity: processIdentity.profileDirectory,
+        });
+      } catch (error) {
+        throw cleanupFailure("could not clean up its terminated Chrome profile", error);
+      }
+      if (!cleaned) {
+        throw cleanupFailure("could not confirm profile cleanup");
+      }
+      profileCleaned = true;
+    }
+  };
+
+  const settle = async (): Promise<void> => {
+    if (!targetClosed && targetId) {
+      let closed: boolean;
+      try {
+        closed = await closeTab(port, targetId, logger, host);
+      } catch (error) {
+        throw cleanupFailure(`could not close target ${targetId}`, error);
+      }
+      if (!closed) {
+        throw cleanupFailure(`could not close target ${targetId}`);
+      }
+      targetClosed = true;
+    }
+    if (!clientClosed && client) {
+      try {
+        await client.close();
+      } catch (error) {
+        throw cleanupFailure("could not close its CDP client", error);
+      }
+      clientClosed = true;
+    }
+    if (ownerCleanupRequired) {
+      await settleLaunchedOwner();
+    }
+    if (!leaseReleased) {
       try {
         await tabLease.release({
           onRelease: async ({ isLastLease }) => {
-            if (keepBrowser || !isLastLease || owner.source !== "launched") return;
-            let termination: RecordedChromeTerminationOutcome;
-            try {
-              termination = await chrome.kill();
-            } catch (error) {
-              recordFailure(error, "could not terminate its launched Chrome owner");
-              return;
-            }
-            if (!isSafeChromeTerminationOutcome(termination)) {
-              failures.push(
-                new Error(
-                  `Gemini browser session could not safely terminate Chrome: ${termination.reason}`,
-                ),
-              );
-              return;
-            }
-            try {
-              const cleaned = await cleanupStaleProfileState(profileDir, log, {
-                lockRemovalMode: "never",
-                expectedProfileIdentity: processIdentity.profileDirectory,
-              });
-              if (!cleaned) {
-                failures.push(
-                  new Error("Gemini browser session could not confirm profile cleanup."),
-                );
-              }
-            } catch (error) {
-              recordFailure(error, "could not clean up its terminated Chrome profile");
-            }
+            ownerCleanupRequired = !keepBrowser && isLastLease && owner.source === "launched";
+            await settleLaunchedOwner();
           },
         });
       } catch (error) {
-        recordFailure(error, "could not release its browser tab lease");
+        throw cleanupFailure("could not release its browser tab lease", error);
       }
-      if (failures.length > 0) {
-        throw new AggregateError(failures, "Gemini browser session did not settle cleanly.");
-      }
-    })();
-    return closePromise;
+      leaseReleased = true;
+    }
+    closeCompleted = true;
+  };
+
+  const close = (): Promise<void> => {
+    if (closeCompleted) return Promise.resolve();
+    if (closeAttempt) return closeAttempt;
+    closeAttempt = settle().finally(() => {
+      closeAttempt = null;
+    });
+    return closeAttempt;
   };
 
   try {

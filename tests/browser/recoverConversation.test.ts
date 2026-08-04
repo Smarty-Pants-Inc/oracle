@@ -4,12 +4,14 @@ import {
   resolveRecoveryProfileDir,
   resolveRecoveryUrl,
 } from "../../src/browser/recoverConversation.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
 function metaWith(
-  runtime: Record<string, unknown> | undefined,
-  harvest: Record<string, unknown> | undefined,
-  config: Record<string, unknown> | undefined = undefined,
+  runtime: NonNullable<SessionMetadata["browser"]>["runtime"] | undefined,
+  harvest: NonNullable<SessionMetadata["browser"]>["harvest"] | undefined,
+  config: NonNullable<SessionMetadata["browser"]>["config"] | undefined = undefined,
 ): SessionMetadata {
   return {
     id: "x",
@@ -25,94 +27,64 @@ function metaWith(
   } as unknown as SessionMetadata;
 }
 
-describe("resolveRecoveryUrl", () => {
-  test("accepts a chatgpt.com/c/<id> conversation URL", () => {
-    expect(
-      resolveRecoveryUrl(metaWith({ tabUrl: "https://chatgpt.com/c/abc-123" }, undefined)),
-    ).toBe("https://chatgpt.com/c/abc-123");
-  });
-
-  test("accepts a legacy chat.openai.com/c/<id> URL", () => {
-    expect(
-      resolveRecoveryUrl(metaWith({ tabUrl: "https://chat.openai.com/c/legacy-id" }, undefined)),
-    ).toBe("https://chat.openai.com/c/legacy-id");
-  });
-
-  test("rejects the ChatGPT home shell URL", () => {
-    expect(resolveRecoveryUrl(metaWith({ tabUrl: "https://chatgpt.com/" }, undefined))).toBeNull();
-  });
-
-  test("rejects a project shell URL with no conversation segment", () => {
-    expect(
-      resolveRecoveryUrl(
-        metaWith({ tabUrl: "https://chatgpt.com/g/g-12345-some-project" }, undefined),
-      ),
-    ).toBeNull();
-  });
-
-  test("rejects an unrelated external URL stored in metadata", () => {
-    expect(
-      resolveRecoveryUrl(metaWith({ tabUrl: "https://example.com/some/path" }, undefined)),
-    ).toBeNull();
-  });
-
-  test("rejects malformed URL strings", () => {
-    expect(resolveRecoveryUrl(metaWith({ tabUrl: "not a url" }, undefined))).toBeNull();
-    expect(resolveRecoveryUrl(metaWith({ tabUrl: "" }, undefined))).toBeNull();
-  });
-
-  test("prefers harvest.url when runtime.tabUrl is a stale shell URL", () => {
-    expect(
-      resolveRecoveryUrl(
-        metaWith({ tabUrl: "https://chatgpt.com/" }, { url: "https://chatgpt.com/c/from-harvest" }),
-      ),
-    ).toBe("https://chatgpt.com/c/from-harvest");
-  });
-
-  test("falls back to runtime.tabUrl when harvest.url is missing", () => {
-    expect(
-      resolveRecoveryUrl(metaWith({ tabUrl: "https://chatgpt.com/c/runtime-only" }, undefined)),
-    ).toBe("https://chatgpt.com/c/runtime-only");
-  });
-
-  test("accepts recovered URLs only when they match the committed prompt epoch", () => {
-    expect(
-      resolveRecoveryUrl(
-        metaWith(
-          {
-            tabUrl: "https://chatgpt.com/c/committed-id",
-            promptEpoch: {
-              status: "committed",
-              epochId: "epoch-1",
-              promptSha256: "a".repeat(64),
-              baselineTurns: 0,
-              followUpOrdinal: 0,
-              remainingFollowUps: 0,
-              verifiedUserTurnIndex: 0,
-              conversationId: "committed-id",
-            },
-          },
-          { url: "https://chatgpt.com/c/committed-id" },
-        ),
-      ),
-    ).toBe("https://chatgpt.com/c/committed-id");
-  });
-
-  test("rejects conflicting harvest or runtime URLs for a committed prompt epoch", () => {
-    const epoch = {
-      status: "committed" as const,
-      epochId: "epoch-1",
+function committedRuntime(
+  conversationId: string,
+  runtime: Omit<BrowserRuntimeMetadata, "conversationId" | "promptEpoch"> = {},
+): BrowserRuntimeMetadata {
+  return {
+    ...runtime,
+    conversationId,
+    promptEpoch: {
+      status: "committed",
+      epochId: `epoch-${conversationId}`,
       promptSha256: "a".repeat(64),
       baselineTurns: 0,
       followUpOrdinal: 0,
       remainingFollowUps: 0,
       verifiedUserTurnIndex: 0,
-      conversationId: "committed-id",
-    };
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationId,
+    },
+  };
+}
+
+describe("resolveRecoveryUrl", () => {
+  test("accepts only a URL matching a committed prompt epoch", () => {
     expect(
       resolveRecoveryUrl(
         metaWith(
-          { tabUrl: "https://chatgpt.com/c/committed-id", promptEpoch: epoch },
+          committedRuntime("abc-123", { tabUrl: "https://chatgpt.com/c/abc-123" }),
+          undefined,
+        ),
+      ),
+    ).toBe("https://chatgpt.com/c/abc-123");
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          committedRuntime("legacy-id", {
+            tabUrl: "https://chat.openai.com/c/legacy-id",
+          }),
+          undefined,
+        ),
+      ),
+    ).toBe("https://chat.openai.com/c/legacy-id");
+  });
+
+  test("rejects epoch-less URL and conversation fields", () => {
+    expect(
+      resolveRecoveryUrl(metaWith({ tabUrl: "https://chatgpt.com/c/legacy-only" }, undefined)),
+    ).toBeNull();
+    expect(resolveRecoveryUrl(metaWith({ conversationId: "legacy-only" }, undefined))).toBeNull();
+  });
+
+  test("rejects conflicting harvest or runtime URLs", () => {
+    expect(
+      resolveRecoveryUrl(
+        metaWith(
+          committedRuntime("committed-id", {
+            tabUrl: "https://chatgpt.com/c/committed-id",
+          }),
           { url: "https://chatgpt.com/c/wrong-harvest" },
         ),
       ),
@@ -120,19 +92,21 @@ describe("resolveRecoveryUrl", () => {
     expect(
       resolveRecoveryUrl(
         metaWith(
-          { tabUrl: "https://chatgpt.com/c/wrong-runtime", promptEpoch: epoch },
+          committedRuntime("committed-id", {
+            tabUrl: "https://chatgpt.com/c/wrong-runtime",
+          }),
           { url: "https://chatgpt.com/c/committed-id" },
         ),
       ),
     ).toBeNull();
   });
 
-  test("rejects URL-only recovery while a prompt epoch is pending", () => {
+  test("rejects recovery while the prompt epoch is pending", () => {
     expect(
       resolveRecoveryUrl(
         metaWith(
           {
-            tabUrl: "https://chatgpt.com/c/pending-id",
+            conversationId: "pending-id",
             promptEpoch: {
               status: "pending",
               epochId: "epoch-pending",
@@ -148,12 +122,26 @@ describe("resolveRecoveryUrl", () => {
     ).toBeNull();
   });
 
-  test("returns null when neither candidate is a valid conversation URL", () => {
+  test("builds a canonical URL from the committed conversation identity", () => {
     expect(
       resolveRecoveryUrl(
-        metaWith({ tabUrl: "https://chatgpt.com/" }, { url: "https://example.com/foo" }),
+        metaWith(committedRuntime("committed-id"), undefined, {
+          url: "https://chatgpt.com/",
+        }),
       ),
-    ).toBeNull();
+    ).toBe("https://chatgpt.com/c/committed-id");
+  });
+
+  test("rejects invalid stored URLs even when an epoch exists", () => {
+    for (const tabUrl of [
+      "https://chatgpt.com/",
+      "https://example.com/c/committed-id",
+      "not a url",
+    ]) {
+      expect(
+        resolveRecoveryUrl(metaWith(committedRuntime("committed-id", { tabUrl }), undefined)),
+      ).toBeNull();
+    }
   });
 
   test("ignores empty browser metadata", () => {
@@ -182,6 +170,56 @@ describe("isRecoveredConversationHarvestReady", () => {
         assistantCount: 1,
         lastAssistantText: "Historical answer",
       }),
+    ).toBe(false);
+  });
+
+  test("requires the full prompt digest and exact persisted user turn identity", () => {
+    const sharedPrefix = "x".repeat(120);
+    const prompt = `${sharedPrefix} intended suffix`;
+    const epoch = {
+      status: "committed" as const,
+      epochId: "epoch-exact",
+      promptSha256: promptIdentitySha256(prompt),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 2,
+      verifiedUserTurnId: "turn-2",
+      verifiedUserMessageId: "message-2",
+      conversationId: "exact-conversation",
+    };
+    const locator = {
+      epoch,
+      conversationId: epoch.conversationId,
+      promptSha256: epoch.promptSha256,
+      verifiedUserTurnIndex: epoch.verifiedUserTurnIndex,
+      verifiedUserTurnId: epoch.verifiedUserTurnId,
+      verifiedUserMessageId: epoch.verifiedUserMessageId,
+      conversationUrls: ["https://chatgpt.com/c/exact-conversation"],
+    };
+    const exactHarvest = {
+      conversationId: "exact-conversation",
+      lastUserTurnIndex: 2,
+      lastUserTurnId: "turn-2",
+      lastUserMessageId: "message-2",
+      lastUserText: prompt,
+      lastAssistantTurnIndex: 3,
+      assistantCount: 1,
+      lastAssistantText: "Exact answer",
+    };
+
+    expect(isRecoveredConversationHarvestReady(exactHarvest, locator)).toBe(true);
+    expect(
+      isRecoveredConversationHarvestReady(
+        { ...exactHarvest, lastUserText: `${sharedPrefix} unrelated suffix` },
+        locator,
+      ),
+    ).toBe(false);
+    expect(
+      isRecoveredConversationHarvestReady(
+        { ...exactHarvest, lastUserTurnIndex: 4, lastUserTurnId: "turn-4" },
+        locator,
+      ),
     ).toBe(false);
   });
 

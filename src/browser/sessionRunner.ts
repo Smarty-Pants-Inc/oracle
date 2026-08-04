@@ -42,6 +42,7 @@ export interface BrowserExecutionResult {
   modelSelection?: BrowserModelSelectionEvidence;
   warnings?: BrowserRunWarning[];
   answerText: string;
+  promptText?: string;
   artifacts?: SessionArtifact[];
   finalize: () => Promise<BrowserCaptureFinalizationResult>;
   abort: () => Promise<BrowserCaptureFinalizationResult>;
@@ -268,89 +269,75 @@ export async function runBrowserSessionExecution(
     throw new BrowserAutomationError(message, { stage: "execute-browser" }, error);
   }
   const browserTransaction = browserResult;
-  try {
-    const modelSelection =
-      browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
-    if (modelSelection) {
-      log(
-        `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
-      );
-    }
-    const warnings = buildBrowserRunWarnings({
-      runOptions,
-      browserConfig,
-      inputTokens: promptArtifacts.estimatedInputTokens,
-      elapsedMs: browserResult.tookMs,
-      modelSelection,
-    });
-    for (const warning of warnings) {
-      log(chalk.yellow(`[browser] ${warning.message}`));
-    }
-    if (!runOptions.silent) {
-      log(chalk.bold("Answer:"));
-      log(
-        browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"),
-      );
-      log("");
-    }
-    const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
-    const savedArtifacts = await ensureSessionArtifacts({
-      sessionId: runOptions.sessionId,
-      prompt: promptArtifacts.composerText,
-      answerMarkdown: answerText,
-      conversationUrl: browserResult.tabUrl,
-      browserConfig,
-      existingArtifacts: browserResult.artifacts,
-      logger: automationLogger,
-    });
-    const usage = {
-      inputTokens: promptArtifacts.estimatedInputTokens,
-      outputTokens: browserResult.answerTokens,
-      reasoningTokens: 0,
-      totalTokens: promptArtifacts.estimatedInputTokens + browserResult.answerTokens,
-    };
-    const tokensDisplay = [
-      usage.inputTokens,
-      usage.outputTokens,
-      usage.reasoningTokens,
-      usage.totalTokens,
-    ]
-      .map((value) => formatTokenCount(value))
-      .join("/");
-    const tokensPart = (() => {
-      const parts = tokensDisplay.split("/");
-      if (parts.length !== 4) return tokensDisplay;
-      return `↑${parts[0]} ↓${parts[1]} ↻${parts[2]} Δ${parts[3]}`;
-    })();
-    const { line1, line2 } = formatFinishLine({
-      elapsedMs: browserResult.tookMs,
-      model: `${resolveBrowserModelDisplayName({ model: runOptions.model, evidence: modelSelection })}[browser]`,
-      tokensPart,
-      detailParts: [
-        runOptions.file && runOptions.file.length > 0 ? `files=${runOptions.file.length}` : null,
-      ],
-    });
-    log(chalk.blue(line1));
-    if (line2) {
-      log(chalk.dim(line2));
-    }
-    const runtime = browserTransaction.runtime;
-    return {
-      usage,
-      elapsedMs: browserResult.tookMs,
-      runtime,
-      archive: browserResult.archive,
-      modelSelection,
-      warnings,
-      answerText,
-      artifacts: savedArtifacts,
-      finalize: browserTransaction.finalize,
-      abort: browserTransaction.abort,
-    };
-  } catch (error) {
-    await browserTransaction.abort().catch(() => undefined);
-    throw error;
+  const modelSelection =
+    browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
+  if (modelSelection) {
+    log(
+      `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
+    );
   }
+  const warnings = buildBrowserRunWarnings({
+    runOptions,
+    browserConfig,
+    inputTokens: promptArtifacts.estimatedInputTokens,
+    elapsedMs: browserResult.tookMs,
+    modelSelection,
+  });
+  for (const warning of warnings) {
+    log(chalk.yellow(`[browser] ${warning.message}`));
+  }
+  if (!runOptions.silent) {
+    log(chalk.bold("Answer:"));
+    log(browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"));
+    log("");
+  }
+  const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
+  const savedArtifacts = browserResult.artifacts;
+  const usage = {
+    inputTokens: promptArtifacts.estimatedInputTokens,
+    outputTokens: browserResult.answerTokens,
+    reasoningTokens: 0,
+    totalTokens: promptArtifacts.estimatedInputTokens + browserResult.answerTokens,
+  };
+  const tokensDisplay = [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.reasoningTokens,
+    usage.totalTokens,
+  ]
+    .map((value) => formatTokenCount(value))
+    .join("/");
+  const tokensPart = (() => {
+    const parts = tokensDisplay.split("/");
+    if (parts.length !== 4) return tokensDisplay;
+    return `↑${parts[0]} ↓${parts[1]} ↻${parts[2]} Δ${parts[3]}`;
+  })();
+  const { line1, line2 } = formatFinishLine({
+    elapsedMs: browserResult.tookMs,
+    model: `${resolveBrowserModelDisplayName({ model: runOptions.model, evidence: modelSelection })}[browser]`,
+    tokensPart,
+    detailParts: [
+      runOptions.file && runOptions.file.length > 0 ? `files=${runOptions.file.length}` : null,
+    ],
+  });
+  log(chalk.blue(line1));
+  if (line2) {
+    log(chalk.dim(line2));
+  }
+  const runtime = browserTransaction.runtime;
+  return {
+    usage,
+    elapsedMs: browserResult.tookMs,
+    runtime,
+    archive: browserResult.archive,
+    modelSelection,
+    warnings,
+    answerText,
+    promptText: promptArtifacts.composerText,
+    artifacts: savedArtifacts,
+    finalize: browserTransaction.finalize,
+    abort: browserTransaction.abort,
+  };
 }
 
 export async function ensureSessionArtifacts(params: {

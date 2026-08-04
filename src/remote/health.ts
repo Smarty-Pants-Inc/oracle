@@ -1,11 +1,12 @@
 import http from "node:http";
 import net from "node:net";
-import { parseHostPort } from "../bridge/connection.js";
 import {
+  DEFAULT_REMOTE_SOCKET_IDLE_TIMEOUT_MS,
   MAX_REMOTE_ARTIFACT_BYTES,
-  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+  RemoteHealthResponseSchema,
   type RemoteArtifactCapabilities,
 } from "./types.js";
+import { parsePlaintextRemoteEndpoint } from "./remoteServiceConfig.js";
 
 export interface RemoteHealthResult {
   ok: boolean;
@@ -16,73 +17,105 @@ export interface RemoteHealthResult {
   capabilities?: RemoteArtifactCapabilities;
 }
 
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 export async function checkTcpConnection(
   host: string,
   timeoutMs = 2000,
 ): Promise<{ ok: boolean; error?: string }> {
-  const { hostname, port } = parseHostPort(host);
-  return await new Promise((resolve) => {
-    const socket = net.createConnection({ host: hostname, port });
-    const onError = (err: Error) => {
-      cleanup();
-      resolve({ ok: false, error: err.message });
-    };
-    const onConnect = () => {
-      cleanup();
-      resolve({ ok: true });
-    };
-    const onTimeout = () => {
-      cleanup();
-      resolve({ ok: false, error: `timeout after ${timeoutMs}ms` });
-    };
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.end();
-      socket.destroy();
-      socket.unref();
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once("error", onError);
-    socket.once("connect", onConnect);
-    socket.once("timeout", onTimeout);
-  });
+  let endpoint: { hostname: string; port: number };
+  try {
+    endpoint = parsePlaintextRemoteEndpoint(host);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  const { promise, resolve } = createDeferred<{ ok: boolean; error?: string }>();
+  const socket = net.createConnection({ host: endpoint.hostname, port: endpoint.port });
+  const onError = (err: Error) => {
+    cleanup();
+    resolve({ ok: false, error: err.message });
+  };
+  const onConnect = () => {
+    cleanup();
+    resolve({ ok: true });
+  };
+  const onTimeout = () => {
+    cleanup();
+    resolve({ ok: false, error: `timeout after ${timeoutMs}ms` });
+  };
+  const cleanup = () => {
+    socket.removeAllListeners();
+    socket.end();
+    socket.destroy();
+    socket.unref();
+  };
+  socket.setTimeout(timeoutMs);
+  socket.once("error", onError);
+  socket.once("connect", onConnect);
+  socket.once("timeout", onTimeout);
+  return await promise;
 }
 
 export async function checkRemoteHealth({
   host,
   token,
   timeoutMs = 5000,
+  idleTimeoutMs = Math.min(timeoutMs, DEFAULT_REMOTE_SOCKET_IDLE_TIMEOUT_MS),
 }: {
   host: string;
   token?: string;
   timeoutMs?: number;
+  idleTimeoutMs?: number;
 }): Promise<RemoteHealthResult> {
-  const { hostname, port } = parseHostPort(host);
-  const headers: Record<string, string> = { accept: "application/json" };
-  if (token) {
-    headers.authorization = `Bearer ${token}`;
+  let endpoint: { hostname: string; port: number };
+  try {
+    endpoint = parsePlaintextRemoteEndpoint(host);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (token) headers.authorization = `Bearer ${token}`;
   try {
     const response = await requestJson({
-      hostname,
-      port,
+      ...endpoint,
       path: "/health",
       headers,
-      timeoutMs,
+      overallTimeoutMs: timeoutMs,
+      idleTimeoutMs,
     });
-    if (response.statusCode === 200 && typeof response.json === "object" && response.json) {
-      const ok = (response.json as { ok?: unknown }).ok === true;
-      const version = (response.json as { version?: unknown }).version;
-      const uptimeSeconds = (response.json as { uptimeSeconds?: unknown }).uptimeSeconds;
-      const capabilities = parseCapabilities(
-        (response.json as { capabilities?: unknown }).capabilities,
-      );
+    if (response.statusCode === 200) {
+      const parsed = RemoteHealthResponseSchema.safeParse(response.json);
+      if (!parsed.success) {
+        return {
+          ok: false,
+          statusCode: response.statusCode,
+          error: `invalid remote health protocol: ${parsed.error.issues[0]?.message ?? "unknown schema error"}`,
+        };
+      }
       return {
-        ok,
+        ok: true,
         statusCode: response.statusCode,
-        version: typeof version === "string" ? version : undefined,
-        uptimeSeconds: typeof uptimeSeconds === "number" ? uptimeSeconds : undefined,
-        capabilities,
+        version: parsed.data.version,
+        uptimeSeconds: parsed.data.uptimeSeconds,
+        capabilities: {
+          ...parsed.data.capabilities,
+          maxArtifactBytes: Math.min(
+            parsed.data.capabilities.maxArtifactBytes,
+            MAX_REMOTE_ARTIFACT_BYTES,
+          ),
+        },
       };
     }
     if (response.statusCode === 404) {
@@ -100,57 +133,9 @@ export async function checkRemoteHealth({
   }
 }
 
-function parseCapabilities(value: unknown): RemoteArtifactCapabilities | undefined {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-  const raw = value as {
-    artifactTransfer?: unknown;
-    artifactProtocolVersion?: unknown;
-    transactionProtocolVersion?: unknown;
-    maxArtifactBytes?: unknown;
-    maxRequestBytes?: unknown;
-    maxAttachmentBytes?: unknown;
-    maxTotalAttachmentBytes?: unknown;
-    maxAttachments?: unknown;
-    maxPromptChars?: unknown;
-  };
-  if (
-    raw.artifactTransfer !== true ||
-    !isPositiveSafeInteger(raw.artifactProtocolVersion) ||
-    raw.transactionProtocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
-    !isPositiveSafeInteger(raw.maxArtifactBytes) ||
-    !isPositiveSafeInteger(raw.maxRequestBytes) ||
-    !isPositiveSafeInteger(raw.maxAttachmentBytes) ||
-    !isPositiveSafeInteger(raw.maxTotalAttachmentBytes) ||
-    !isPositiveSafeInteger(raw.maxAttachments) ||
-    !isPositiveSafeInteger(raw.maxPromptChars)
-  ) {
-    return undefined;
-  }
-  return {
-    artifactTransfer: true,
-    artifactProtocolVersion: raw.artifactProtocolVersion,
-    transactionProtocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-    maxArtifactBytes: Math.min(raw.maxArtifactBytes, MAX_REMOTE_ARTIFACT_BYTES),
-    maxRequestBytes: raw.maxRequestBytes,
-    maxAttachmentBytes: raw.maxAttachmentBytes,
-    maxTotalAttachmentBytes: raw.maxTotalAttachmentBytes,
-    maxAttachments: raw.maxAttachments,
-    maxPromptChars: raw.maxPromptChars,
-  };
-}
-
-function isPositiveSafeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
 function extractErrorMessage(json: unknown, bodyText: string): string | null {
-  if (json && typeof json === "object") {
-    const err = (json as { error?: unknown }).error;
-    if (typeof err === "string" && err.trim().length > 0) {
-      return err.trim();
-    }
+  if (json && typeof json === "object" && "error" in json && typeof json.error === "string") {
+    if (json.error.trim().length > 0) return json.error.trim();
   }
   const trimmed = bodyText.trim();
   return trimmed.length ? trimmed : null;
@@ -161,45 +146,65 @@ async function requestJson({
   port,
   path,
   headers,
-  timeoutMs,
+  overallTimeoutMs,
+  idleTimeoutMs,
 }: {
   hostname: string;
   port: number;
   path: string;
   headers: Record<string, string>;
-  timeoutMs: number;
+  overallTimeoutMs: number;
+  idleTimeoutMs: number;
 }): Promise<{ statusCode: number; json: unknown; bodyText: string }> {
-  return await new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname,
-        port,
-        path,
-        method: "GET",
-        headers,
-      },
-      (res) => {
-        res.setEncoding("utf8");
-        let body = "";
-        res.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        res.on("end", () => {
-          const statusCode = res.statusCode ?? 0;
-          let json: unknown = null;
-          try {
-            json = body.length ? JSON.parse(body) : null;
-          } catch {
-            json = null;
-          }
-          resolve({ statusCode, json, bodyText: body });
-        });
-      },
-    );
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`timeout after ${timeoutMs}ms`));
+  const { promise, resolve, reject } = createDeferred<{
+    statusCode: number;
+    json: unknown;
+    bodyText: string;
+  }>();
+  let settled = false;
+  let overallTimer: NodeJS.Timeout | null = null;
+  const finish = (
+    outcome:
+      | { response: { statusCode: number; json: unknown; bodyText: string } }
+      | { error: Error },
+  ) => {
+    if (settled) return;
+    settled = true;
+    if (overallTimer) clearTimeout(overallTimer);
+    if ("error" in outcome) reject(outcome.error);
+    else resolve(outcome.response);
+  };
+  const req = http.request({ hostname, port, path, method: "GET", headers }, (res) => {
+    res.setTimeout(idleTimeoutMs, () => {
+      res.destroy(new Error(`health request exceeded ${idleTimeoutMs}ms idle timeout`));
     });
-    req.on("error", reject);
-    req.end();
+    res.setEncoding("utf8");
+    let body = "";
+    res.on("data", (chunk: string) => {
+      body += chunk;
+      if (Buffer.byteLength(body, "utf8") > 1024 * 1024) {
+        res.destroy(new Error("health response exceeded size limit"));
+      }
+    });
+    res.on("end", () => {
+      let json: unknown = null;
+      try {
+        json = body.length ? JSON.parse(body) : null;
+      } catch {
+        json = null;
+      }
+      finish({ response: { statusCode: res.statusCode ?? 0, json, bodyText: body } });
+    });
+    res.on("error", (error) => finish({ error }));
   });
+  overallTimer = setTimeout(() => {
+    req.destroy(new Error(`health request exceeded ${overallTimeoutMs}ms overall timeout`));
+  }, overallTimeoutMs);
+  overallTimer.unref();
+  req.setTimeout(idleTimeoutMs, () => {
+    req.destroy(new Error(`health request exceeded ${idleTimeoutMs}ms idle timeout`));
+  });
+  req.on("error", (error) => finish({ error }));
+  req.end();
+  return await promise;
 }

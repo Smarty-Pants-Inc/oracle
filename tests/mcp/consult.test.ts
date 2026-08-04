@@ -397,7 +397,7 @@ describe("summarizeModelRunsForConsult", () => {
     setOracleHomeDirOverrideForTest(home);
     const prevHost = process.env.ORACLE_REMOTE_HOST;
     const prevToken = process.env.ORACLE_REMOTE_TOKEN;
-    process.env.ORACLE_REMOTE_HOST = "remote.example:8080";
+    process.env.ORACLE_REMOTE_HOST = "127.0.0.1:8080";
     process.env.ORACLE_REMOTE_TOKEN = "remote-token";
     try {
       const handlers: Array<(input: unknown) => Promise<unknown>> = [];

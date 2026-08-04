@@ -5,11 +5,11 @@ import {
   mkdir,
   open,
   readFile,
+  readlink,
   realpath,
   rename,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { execFile } from "node:child_process";
@@ -33,8 +33,7 @@ const DEVTOOLS_ACTIVE_PORT_RELATIVE_PATHS = [
   path.join("Default", DEVTOOLS_ACTIVE_PORT_FILENAME),
 ] as const;
 
-const CHROME_PID_FILENAME = "chrome.pid";
-const CHROME_PROCESS_IDENTITY_FILENAME = "chrome-process-identity.json";
+const ORACLE_CHROME_OWNER_FILENAME = "oracle-chrome-owner.json";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
 
 const execFileAsync = promisify(execFile);
@@ -68,23 +67,30 @@ export interface ChromeProcessIdentity {
   readonly profileDirectory: ProfileDirectoryIdentity;
 }
 
+export interface OracleChromeOwnerRecord {
+  readonly port: number;
+  readonly processIdentity: ChromeProcessIdentity;
+}
+
 interface ChromeProcessSnapshot {
   pid: number;
   processStartTime: string;
   executablePath: string;
   commandLine: string;
+  commandTokens?: readonly string[];
 }
 
 interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
-  readIdentity?: (userDataDir: string) => Promise<ChromeProcessIdentity | null>;
+  readOwner?: (userDataDir: string) => Promise<OracleChromeOwnerRecord | null>;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
   captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
   verifyProfileIdentity?: (
     userDataDir: string,
     identity: ProfileDirectoryIdentity,
   ) => Promise<boolean>;
+  isProcessAlive?: (pid: number) => boolean;
 }
 
 export async function captureProfileDirectoryIdentity(
@@ -149,15 +155,70 @@ export function sameProfileDirectoryIdentity(
   );
 }
 
+interface RemoveProfileDirectoryDeps {
+  isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
+  beforeQuarantineRename?: () => void | Promise<void>;
+  beforeQuarantineDelete?: (quarantinePath: string) => void | Promise<void>;
+}
+
 export async function removeProfileDirectoryIfIdentityMatches(
   userDataDir: string,
   expected: ProfileDirectoryIdentity,
 ): Promise<boolean> {
+  return removeProfileDirectoryIfIdentityMatchesWithDeps(userDataDir, expected, {});
+}
+
+export async function removeProfileDirectoryIfIdentityMatchesForTest(
+  userDataDir: string,
+  expected: ProfileDirectoryIdentity,
+  deps: RemoveProfileDirectoryDeps,
+): Promise<boolean> {
+  return removeProfileDirectoryIfIdentityMatchesWithDeps(userDataDir, expected, deps);
+}
+
+async function removeProfileDirectoryIfIdentityMatchesWithDeps(
+  userDataDir: string,
+  expected: ProfileDirectoryIdentity,
+  deps: RemoveProfileDirectoryDeps,
+): Promise<boolean> {
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
-  if (await isChromeUsingUserDataDir(expected.canonicalPath)) return false;
+  const profileInUse = deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir;
+  if (await profileInUse(expected.canonicalPath)) return false;
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
-  await rm(expected.canonicalPath, { recursive: true, force: true });
-  return !(await pathExists(expected.canonicalPath));
+  await deps.beforeQuarantineRename?.();
+
+  const quarantinePath = path.join(
+    path.dirname(expected.canonicalPath),
+    `.${path.basename(expected.canonicalPath)}.oracle-delete-${process.pid}-${randomUUID()}`,
+  );
+  try {
+    await rename(expected.canonicalPath, quarantinePath);
+  } catch (error) {
+    if (["ENOENT", "EEXIST", "ENOTEMPTY"].includes(String(readErrorCode(error)))) return false;
+    throw error;
+  }
+
+  const quarantinedIdentity = Object.freeze({
+    ...expected,
+    canonicalPath: path.resolve(quarantinePath),
+  });
+  const restore = async (): Promise<void> => {
+    if (await pathExists(expected.canonicalPath)) return;
+    await rename(quarantinePath, expected.canonicalPath).catch(() => undefined);
+  };
+  if (!(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity))) {
+    await restore();
+    return false;
+  }
+  if (await profileInUse(expected.canonicalPath)) {
+    await restore();
+    return false;
+  }
+
+  await deps.beforeQuarantineDelete?.(quarantinePath);
+  if (!(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity))) return false;
+  await rm(quarantinePath, { recursive: true, force: true });
+  return !(await pathExists(quarantinePath));
 }
 
 async function rejectProfileSymlinkTraversal(
@@ -218,13 +279,25 @@ export async function readDevToolsPort(userDataDir: string): Promise<number | nu
   }
   for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
     try {
+      const before = await lstat(candidate);
+      if (before.isSymbolicLink() || !before.isFile()) {
+        throw new Error(`Unsafe DevToolsActivePort entry: ${candidate}`);
+      }
       const raw = await readFile(candidate, "utf8");
       await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
-      const firstLine = raw.split(/\r?\n/u)[0]?.trim();
-      const port = Number.parseInt(firstLine ?? "", 10);
-      if (Number.isFinite(port)) {
-        return port;
+      const after = await lstat(candidate);
+      if (
+        before.dev !== after.dev ||
+        before.ino !== after.ino ||
+        before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs
+      ) {
+        throw new Error(`DevToolsActivePort changed while reading: ${candidate}`);
       }
+      const firstLine = raw.split(/\r?\n/u)[0]?.trim() ?? "";
+      if (!/^\d+$/u.test(firstLine)) continue;
+      const port = Number.parseInt(firstLine, 10);
+      if (port > 0 && port <= 65_535) return port;
     } catch (error) {
       if (readErrorCode(error) !== "ENOENT") throw error;
       await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
@@ -232,50 +305,6 @@ export async function readDevToolsPort(userDataDir: string): Promise<number | nu
   }
   await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
   return null;
-}
-
-export async function writeDevToolsActivePort(userDataDir: string, port: number): Promise<void> {
-  const profile = await captureProfileDirectoryIdentity(userDataDir, { create: true });
-  const contents = `${port}\n/devtools/browser`;
-  for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
-    await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority persistence");
-    await mkdir(path.dirname(candidate), { recursive: true });
-    await writeFile(candidate, contents, "utf8");
-  }
-  await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority persistence");
-}
-
-export async function readChromePid(userDataDir: string): Promise<number | null> {
-  let profile: ProfileDirectoryIdentity;
-  try {
-    profile = await captureProfileDirectoryIdentity(userDataDir);
-  } catch (error) {
-    if (readErrorCode(error) === "ENOENT") return null;
-    throw error;
-  }
-  const pidPath = path.join(profile.canonicalPath, CHROME_PID_FILENAME);
-  try {
-    const raw = (await readFile(pidPath, "utf8")).trim();
-    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid authority read");
-    const pid = Number.parseInt(raw, 10);
-    if (!Number.isFinite(pid) || pid <= 0) return null;
-    return pid;
-  } catch (error) {
-    if (readErrorCode(error) !== "ENOENT") throw error;
-    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid authority read");
-    return null;
-  }
-}
-
-export async function writeChromePid(userDataDir: string, pid: number): Promise<void> {
-  if (!Number.isFinite(pid) || pid <= 0) return;
-  const profile = await captureProfileDirectoryIdentity(userDataDir, { create: true });
-  await writeFile(
-    path.join(profile.canonicalPath, CHROME_PID_FILENAME),
-    `${Math.trunc(pid)}\n`,
-    "utf8",
-  );
-  await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome pid persistence");
 }
 
 export async function captureChromeProcessIdentity(
@@ -318,7 +347,7 @@ async function captureChromeProcessIdentityWithDeps(
     !snapshot.processStartTime.trim() ||
     !executablePath ||
     !isChromeExecutablePath(executablePath, platform) ||
-    !isChromeCommandForUserDataDir(snapshot.commandLine, profileDirectory.canonicalPath, platform)
+    !isChromeSnapshotForUserDataDir(snapshot, profileDirectory.canonicalPath, platform)
   ) {
     throw new Error(`Chrome pid ${pid} does not have a stable identity for ${userDataDir}`);
   }
@@ -332,9 +361,9 @@ async function captureChromeProcessIdentityWithDeps(
   });
 }
 
-export async function readChromeProcessIdentity(
+export async function readOracleChromeOwner(
   userDataDir: string,
-): Promise<ChromeProcessIdentity | null> {
+): Promise<OracleChromeOwnerRecord | null> {
   let profile: ProfileDirectoryIdentity;
   try {
     profile = await captureProfileDirectoryIdentity(userDataDir);
@@ -342,49 +371,45 @@ export async function readChromeProcessIdentity(
     if (readErrorCode(error) === "ENOENT") return null;
     throw error;
   }
-  const identityPath = path.join(profile.canonicalPath, CHROME_PROCESS_IDENTITY_FILENAME);
+  const ownerPath = path.join(profile.canonicalPath, ORACLE_CHROME_OWNER_FILENAME);
   let raw: string;
   try {
-    raw = await readFile(identityPath, "utf8");
+    raw = await readFile(ownerPath, "utf8");
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
-    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome process authority read");
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner authority read");
     return null;
   }
-  let parsed: unknown;
+  let value: unknown;
   try {
-    parsed = JSON.parse(raw);
+    value = JSON.parse(raw);
   } catch {
-    throw new Error(`Chrome process identity is malformed: ${identityPath}`);
+    throw new Error(`Chrome owner authority is malformed: ${ownerPath}`);
   }
-  const identity = parseChromeProcessIdentity(parsed, process.platform);
-  if (!identity || !sameProfileDirectoryIdentity(identity.profileDirectory, profile)) {
-    throw new Error(`Chrome process identity is invalid or stale: ${identityPath}`);
+  const owner = parseOracleChromeOwnerRecord(value, process.platform);
+  if (!owner || !sameProfileDirectoryIdentity(owner.processIdentity.profileDirectory, profile)) {
+    throw new Error(`Chrome owner authority is invalid or stale: ${ownerPath}`);
   }
-  await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome process authority read");
-  return identity;
+  await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner authority read");
+  return owner;
 }
 
-export async function writeChromeProcessIdentity(
+export async function writeOracleChromeOwner(
   userDataDir: string,
-  identity: ChromeProcessIdentity,
+  owner: OracleChromeOwnerRecord,
 ): Promise<void> {
-  const validated = parseChromeProcessIdentity(identity, process.platform);
+  const validated = parseOracleChromeOwnerRecord(owner, process.platform);
   if (
     !validated ||
-    !(await verifyProfileDirectoryIdentity(userDataDir, validated.profileDirectory)) ||
-    validated.normalizedUserDataDir !==
-      normalizeProfileArgument(validated.profileDirectory.canonicalPath, process.platform)
+    !(await verifyProfileDirectoryIdentity(userDataDir, validated.processIdentity.profileDirectory))
   ) {
-    throw new Error(`Chrome process identity does not belong to ${userDataDir}`);
+    throw new Error(`Chrome owner authority does not belong to ${userDataDir}`);
   }
-  const identityPath = path.join(
-    validated.profileDirectory.canonicalPath,
-    CHROME_PROCESS_IDENTITY_FILENAME,
-  );
+  const profile = validated.processIdentity.profileDirectory;
+  const ownerPath = path.join(profile.canonicalPath, ORACLE_CHROME_OWNER_FILENAME);
   const temporaryPath = path.join(
-    validated.profileDirectory.canonicalPath,
-    `.${CHROME_PROCESS_IDENTITY_FILENAME}.tmp-${process.pid}-${randomUUID()}`,
+    profile.canonicalPath,
+    `.${ORACLE_CHROME_OWNER_FILENAME}.tmp-${process.pid}-${randomUUID()}`,
   );
   try {
     const handle = await open(temporaryPath, "wx", 0o600);
@@ -394,24 +419,18 @@ export async function writeChromeProcessIdentity(
     } finally {
       await handle.close();
     }
-    await assertProfileDirectoryIdentity(
-      userDataDir,
-      validated.profileDirectory,
-      "Chrome process authority persistence",
-    );
-    await rename(temporaryPath, identityPath);
-    await syncProfileDirectory(validated.profileDirectory.canonicalPath);
-    await assertProfileDirectoryIdentity(
-      userDataDir,
-      validated.profileDirectory,
-      "Chrome process authority persistence",
-    );
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner persistence");
+    await rename(temporaryPath, ownerPath);
+    await syncProfileDirectory(profile.canonicalPath);
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner persistence");
   } finally {
-    if (await verifyProfileDirectoryIdentity(userDataDir, validated.profileDirectory)) {
+    if (await verifyProfileDirectoryIdentity(userDataDir, profile)) {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
     }
   }
 }
+
+export type ChromeProcessIdentityInspection = "current" | "exited" | "unavailable";
 
 export async function verifyChromeProcessIdentity(
   userDataDir: string,
@@ -433,44 +452,71 @@ async function verifyChromeProcessIdentityWithDeps(
   identity: ChromeProcessIdentity,
   deps: ChromeProcessIdentityDeps,
 ): Promise<boolean> {
+  let persistedOwner: OracleChromeOwnerRecord | null;
+  try {
+    persistedOwner = await (deps.readOwner
+      ? deps.readOwner(userDataDir)
+      : readOracleChromeOwner(userDataDir));
+  } catch {
+    return false;
+  }
+  if (!persistedOwner || !sameChromeProcessIdentity(persistedOwner.processIdentity, identity)) {
+    return false;
+  }
+  return (await inspectChromeProcessIdentityWithDeps(userDataDir, identity, deps)) === "current";
+}
+
+export async function inspectChromeProcessIdentity(
+  userDataDir: string,
+  identity: ChromeProcessIdentity,
+): Promise<ChromeProcessIdentityInspection> {
+  return inspectChromeProcessIdentityWithDeps(userDataDir, identity, {});
+}
+
+export async function inspectChromeProcessIdentityForTest(
+  userDataDir: string,
+  identity: ChromeProcessIdentity,
+  deps: ChromeProcessIdentityDeps,
+): Promise<ChromeProcessIdentityInspection> {
+  return inspectChromeProcessIdentityWithDeps(userDataDir, identity, deps);
+}
+
+async function inspectChromeProcessIdentityWithDeps(
+  userDataDir: string,
+  identity: ChromeProcessIdentity,
+  deps: ChromeProcessIdentityDeps,
+): Promise<ChromeProcessIdentityInspection> {
   const platform = deps.platform ?? process.platform;
   const validated = parseChromeProcessIdentity(identity, platform);
-  if (!validated || !sameChromeProcessIdentity(validated, identity)) return false;
+  if (!validated || !sameChromeProcessIdentity(validated, identity)) return "unavailable";
   const physicalProfileMatches = await (deps.verifyProfileIdentity
     ? deps.verifyProfileIdentity(userDataDir, identity.profileDirectory)
     : verifyProfileDirectoryIdentity(userDataDir, identity.profileDirectory));
-  if (!physicalProfileMatches) return false;
+  if (!physicalProfileMatches) return "unavailable";
   const normalizedUserDataDir = normalizeProfileArgument(
     identity.profileDirectory.canonicalPath,
     platform,
   );
   if (!normalizedUserDataDir || identity.normalizedUserDataDir !== normalizedUserDataDir) {
-    return false;
+    return "unavailable";
   }
-  let persisted: ChromeProcessIdentity | null;
-  try {
-    persisted = await (deps.readIdentity
-      ? deps.readIdentity(userDataDir)
-      : readChromeProcessIdentity(userDataDir));
-  } catch {
-    return false;
-  }
-  if (!persisted || !sameChromeProcessIdentity(persisted, identity)) return false;
+
+  const processAlive = deps.isProcessAlive ?? isProcessAlive;
+  if (!processAlive(identity.pid)) return "exited";
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(identity.pid)
     : readChromeProcessSnapshot(identity.pid, platform, deps.execute ?? executeProcessCommand));
-  if (!snapshot) return false;
+  if (!snapshot) return processAlive(identity.pid) ? "unavailable" : "exited";
+  if (snapshot.pid !== identity.pid) return "unavailable";
+  if (snapshot.processStartTime.trim() !== identity.processStartTime) return "exited";
   const executablePath = normalizeExecutablePath(snapshot.executablePath, platform);
-  return (
-    snapshot.pid === identity.pid &&
-    snapshot.processStartTime.trim() === identity.processStartTime &&
-    executablePath === identity.executablePath &&
-    isChromeCommandForUserDataDir(
-      snapshot.commandLine,
-      identity.profileDirectory.canonicalPath,
-      platform,
-    )
-  );
+  if (
+    executablePath !== identity.executablePath ||
+    !isChromeSnapshotForUserDataDir(snapshot, identity.profileDirectory.canonicalPath, platform)
+  ) {
+    return "unavailable";
+  }
+  return "current";
 }
 
 export function sameChromeProcessIdentity(
@@ -530,6 +576,34 @@ function parseChromeProcessIdentity(
   });
 }
 
+function parseOracleChromeOwnerRecord(
+  value: unknown,
+  platform: NodeJS.Platform,
+): OracleChromeOwnerRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 2 ||
+    !Object.hasOwn(record, "port") ||
+    !Object.hasOwn(record, "processIdentity")
+  ) {
+    return null;
+  }
+  if (
+    !Number.isInteger(record.port) ||
+    (record.port as number) <= 0 ||
+    (record.port as number) > 65_535
+  ) {
+    return null;
+  }
+  const processIdentity = parseChromeProcessIdentity(record.processIdentity, platform);
+  if (!processIdentity) return null;
+  return Object.freeze({
+    port: record.port as number,
+    processIdentity,
+  });
+}
+
 function parseProfileDirectoryIdentity(
   value: unknown,
   platform: NodeJS.Platform,
@@ -585,15 +659,45 @@ export interface RunningChromeDebugTarget {
 export async function findRunningChromeDebugTargetForProfile(
   userDataDir: string,
 ): Promise<RunningChromeDebugTarget | null> {
-  if (process.platform === "win32") {
+  if (process.platform === "win32") return null;
+  try {
+    const [activePort, { stdout }] = await Promise.all([
+      readDevToolsPort(userDataDir),
+      execFileAsync("ps", ["-ax", "-o", "pid=", "-o", "command="], {
+        maxBuffer: 10 * 1024 * 1024,
+      }),
+    ]);
+    return findChromeDebugTargetForProfileFromProcessList(
+      String(stdout ?? ""),
+      userDataDir,
+      activePort,
+    );
+  } catch {
     return null;
   }
+}
 
+export async function findRunningChromeProcessForProfile(
+  userDataDir: string,
+  expectedDebugPortArgument: number,
+  expectedPid?: number,
+): Promise<{ pid: number } | null> {
+  if (process.platform === "win32") return null;
   try {
     const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=", "-o", "command="], {
       maxBuffer: 10 * 1024 * 1024,
     });
-    return findChromeDebugTargetForProfileFromProcessList(String(stdout ?? ""), userDataDir);
+    for (const line of String(stdout ?? "").split("\n")) {
+      const match = line.match(/^\s*(\d+)\s+(.+)$/u);
+      if (!match) continue;
+      const pid = Number.parseInt(match[1] ?? "", 10);
+      const command = match[2] ?? "";
+      if (!Number.isFinite(pid) || pid <= 0 || (expectedPid && pid !== expectedPid)) continue;
+      if (!isChromeCommandForUserDataDir(command, userDataDir)) continue;
+      if (readRemoteDebuggingPortArgument(command) !== expectedDebugPortArgument) continue;
+      return { pid };
+    }
+    return null;
   } catch {
     return null;
   }
@@ -602,17 +706,18 @@ export async function findRunningChromeDebugTargetForProfile(
 function findChromeDebugTargetForProfileFromProcessList(
   processList: string,
   userDataDir: string,
+  activePort: number | null = null,
 ): RunningChromeDebugTarget | null {
   for (const line of processList.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(.+)$/);
+    const match = line.match(/^\s*(\d+)\s+(.+)$/u);
     if (!match) continue;
     const pid = Number.parseInt(match[1] ?? "", 10);
     const command = match[2] ?? "";
     if (!Number.isFinite(pid) || pid <= 0) continue;
     if (!isChromeCommandForUserDataDir(command, userDataDir)) continue;
-    const portMatch = command.match(/--remote-debugging-port(?:=|\s+)(\d+)/);
-    const port = Number.parseInt(portMatch?.[1] ?? "", 10);
-    if (!Number.isFinite(port) || port <= 0) continue;
+    const configuredPort = readRemoteDebuggingPortArgument(command);
+    const port = configuredPort === 0 ? activePort : configuredPort;
+    if (!port || port <= 0) continue;
     return { pid, port };
   }
   return null;
@@ -621,8 +726,9 @@ function findChromeDebugTargetForProfileFromProcessList(
 export function findChromeDebugTargetForProfileFromProcessListForTest(
   processList: string,
   userDataDir: string,
+  activePort: number | null = null,
 ): RunningChromeDebugTarget | null {
-  return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir);
+  return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir, activePort);
 }
 export type RecordedChromeTerminationOutcome =
   | {
@@ -640,7 +746,6 @@ export function isSafeChromeTerminationOutcome(
 }
 
 interface RecordedChromeTerminationDeps extends ChromeProcessIdentityDeps {
-  isProcessAlive?: (pid: number) => boolean;
   isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
 }
 
@@ -663,11 +768,11 @@ async function terminateRecordedChromeForProfileWithDeps(
     logger?.(`${reason}; preserving cleanup state`);
     return { status: "unsafe", reason, pid: identity.pid };
   }
-  let persistedIdentity: ChromeProcessIdentity | null;
+  let persistedOwner: OracleChromeOwnerRecord | null;
   try {
-    persistedIdentity = await (deps.readIdentity
-      ? deps.readIdentity(userDataDir)
-      : readChromeProcessIdentity(userDataDir));
+    persistedOwner = await (deps.readOwner
+      ? deps.readOwner(userDataDir)
+      : readOracleChromeOwner(userDataDir));
   } catch (error) {
     return {
       status: "unsafe",
@@ -675,7 +780,7 @@ async function terminateRecordedChromeForProfileWithDeps(
       pid: identity.pid,
     };
   }
-  if (!persistedIdentity || !sameChromeProcessIdentity(persistedIdentity, identity)) {
+  if (!persistedOwner || !sameChromeProcessIdentity(persistedOwner.processIdentity, identity)) {
     const reason = `Chrome cleanup authority is stale for ${userDataDir}`;
     logger?.(`${reason}; preserving cleanup state`);
     return { status: "unsafe", reason, pid: identity.pid };
@@ -777,6 +882,32 @@ async function readChromeProcessSnapshot(
 ): Promise<ChromeProcessSnapshot | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
+    if (platform === "linux") {
+      const procRoot = `/proc/${Math.trunc(pid)}`;
+      const initialStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
+      if (!initialStat || initialStat.pid !== pid) return null;
+      const executablePath = await readlink(path.join(procRoot, "exe"));
+      const rawCommandLine = await readFile(path.join(procRoot, "cmdline"));
+      const confirmedStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
+      if (
+        !confirmedStat ||
+        confirmedStat.pid !== pid ||
+        confirmedStat.startTicks !== initialStat.startTicks
+      ) {
+        return null;
+      }
+      const commandTokens = rawCommandLine.toString("utf8").split("\0");
+      if (commandTokens.at(-1) === "") commandTokens.pop();
+      if (commandTokens.length === 0) return null;
+      return {
+        pid,
+        processStartTime: `linux-proc-start-ticks:${initialStat.startTicks}`,
+        executablePath,
+        commandLine: commandTokens.map((token) => JSON.stringify(token)).join(" "),
+        commandTokens,
+      };
+    }
+
     if (platform === "win32") {
       const { stdout } = await execute("powershell.exe", [
         "-NoProfile",
@@ -801,12 +932,31 @@ async function readChromeProcessSnapshot(
       };
     }
 
-    const readPsField = async (field: "lstart" | "comm" | "command"): Promise<string> => {
+    if (platform !== "darwin") return null;
+    const readPsField = async (field: "lstart" | "command"): Promise<string> => {
       const { stdout } = await execute("ps", ["-p", String(Math.trunc(pid)), "-o", `${field}=`]);
       return stdout.trim();
     };
     const processStartTime = await readPsField("lstart");
-    const executablePath = await readPsField("comm");
+    const { stdout: executableFiles } = await execute("/usr/sbin/lsof", [
+      "-nP",
+      "-a",
+      "-p",
+      String(Math.trunc(pid)),
+      "-d",
+      "txt",
+      "-Fn",
+    ]);
+    const executablePath = executableFiles
+      .split(/\r?\n/u)
+      .filter((line) => line.startsWith("n"))
+      .map((line) => line.slice(1).trim())
+      .find((candidate) =>
+        Boolean(
+          normalizeExecutablePath(candidate, platform) &&
+          isChromeExecutablePath(candidate, platform),
+        ),
+      );
     const commandLine = await readPsField("command");
     const confirmedStartTime = await readPsField("lstart");
     if (
@@ -823,21 +973,34 @@ async function readChromeProcessSnapshot(
   }
 }
 
-function isChromeExecutablePrefix(tokens: string[]): boolean {
+function parseLinuxProcStat(raw: string): { pid: number; startTicks: string } | null {
+  const openingParenthesis = raw.indexOf("(");
+  const closingParenthesis = raw.lastIndexOf(")");
+  if (openingParenthesis <= 0 || closingParenthesis <= openingParenthesis) return null;
+  const pid = Number.parseInt(raw.slice(0, openingParenthesis).trim(), 10);
+  const fieldsAfterCommand = raw
+    .slice(closingParenthesis + 1)
+    .trim()
+    .split(/\s+/u);
+  const startTicks = fieldsAfterCommand[19];
+  if (!Number.isInteger(pid) || pid <= 0 || !startTicks || !/^\d+$/u.test(startTicks)) {
+    return null;
+  }
+  return { pid, startTicks };
+}
+
+function isChromeExecutablePrefix(tokens: readonly string[]): boolean {
   const firstFlagIndex = tokens.findIndex((token) => token.startsWith("--"));
   if (firstFlagIndex <= 0) return false;
   const executable = tokens.slice(0, firstFlagIndex).join(" ").toLowerCase();
   return executable.includes("chrome") || executable.includes("chromium");
 }
 
-function isChromeCommandForUserDataDir(
-  command: string | null,
+function isChromeCommandTokensForUserDataDir(
+  tokens: readonly string[],
   userDataDir: string,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform,
 ): boolean {
-  if (!command) return false;
-  const tokens = tokenizeCommandLine(command);
-  if (!tokens) return false;
   const profileArguments: string[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] ?? "";
@@ -851,12 +1014,51 @@ function isChromeCommandForUserDataDir(
       profileArguments.push(token.slice(token.indexOf("=") + 1));
     }
   }
-  if (profileArguments.length !== 1) return false;
-  const profileArgument = profileArguments[0];
-  if (!profileArgument || !isChromeExecutablePrefix(tokens)) return false;
+  if (profileArguments.length !== 1 || !isChromeExecutablePrefix(tokens)) return false;
   const expected = normalizeProfileArgument(userDataDir, platform);
-  const actual = normalizeProfileArgument(profileArgument, platform);
+  const actual = normalizeProfileArgument(profileArguments[0] ?? "", platform);
   return expected !== null && actual === expected;
+}
+
+function isChromeCommandForUserDataDir(
+  command: string | null,
+  userDataDir: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (!command) return false;
+  const tokens = tokenizeCommandLine(command);
+  return Boolean(tokens && isChromeCommandTokensForUserDataDir(tokens, userDataDir, platform));
+}
+
+function isChromeSnapshotForUserDataDir(
+  snapshot: ChromeProcessSnapshot,
+  userDataDir: string,
+  platform: NodeJS.Platform,
+): boolean {
+  return snapshot.commandTokens
+    ? isChromeCommandTokensForUserDataDir(snapshot.commandTokens, userDataDir, platform)
+    : isChromeCommandForUserDataDir(snapshot.commandLine, userDataDir, platform);
+}
+
+function readRemoteDebuggingPortArgument(command: string): number | null {
+  const tokens = tokenizeCommandLine(command);
+  if (!tokens) return null;
+  const values: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? "";
+    const lower = token.toLowerCase();
+    if (lower === "--remote-debugging-port") {
+      const value = tokens[index + 1];
+      if (!value || value.startsWith("--")) return null;
+      values.push(value);
+      index += 1;
+    } else if (lower.startsWith("--remote-debugging-port=")) {
+      values.push(token.slice(token.indexOf("=") + 1));
+    }
+  }
+  if (values.length !== 1 || !/^\d+$/u.test(values[0] ?? "")) return null;
+  const port = Number.parseInt(values[0] ?? "", 10);
+  return port >= 0 && port <= 65_535 ? port : null;
 }
 
 export function isChromeCommandForUserDataDirForTest(
@@ -1067,7 +1269,16 @@ async function cleanupStaleProfileStateWithDeps(
   }
   const lockRemovalMode = options.lockRemovalMode ?? "never";
   if (lockRemovalMode === "if_oracle_pid_dead") {
-    const pid = await readChromePid(profile.canonicalPath);
+    let owner: OracleChromeOwnerRecord | null;
+    try {
+      owner = await readOracleChromeOwner(profile.canonicalPath);
+    } catch (error) {
+      logger?.(
+        `Refusing stale profile cleanup because Chrome owner authority is unreadable: ${error instanceof Error ? error.message : error}`,
+      );
+      return false;
+    }
+    const pid = owner?.processIdentity.pid;
     if (pid && isProcessAlive(pid)) {
       logger?.(`Chrome pid ${pid} still alive; preserving profile state`);
       return false;
@@ -1098,8 +1309,7 @@ async function cleanupStaleProfileStateWithDeps(
     "SingletonLock",
     "SingletonSocket",
     "SingletonCookie",
-    CHROME_PID_FILENAME,
-    CHROME_PROCESS_IDENTITY_FILENAME,
+    ORACLE_CHROME_OWNER_FILENAME,
   ];
   for (const staleFile of staleFiles) {
     if (!(await verifyProfile(userDataDir, profile))) return false;

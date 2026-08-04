@@ -96,6 +96,7 @@ describe("runBrowserSessionExecution", () => {
     expect(result.runtime).toEqual({ conversationId: "foo" });
     expect(result.runtime).not.toHaveProperty("chromePid");
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
+    expect(result.promptText).toBe("prompt");
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),

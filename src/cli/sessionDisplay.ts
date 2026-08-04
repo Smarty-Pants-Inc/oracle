@@ -3,6 +3,7 @@ import kleur from "kleur";
 import path from "node:path";
 import type {
   SessionMetadata,
+  BrowserRuntimeMetadata,
   SessionTransportMetadata,
   SessionUserErrorMetadata,
 } from "../sessionStore.js";
@@ -12,8 +13,16 @@ import { formatFinishLine } from "../oracle/finishLine.js";
 import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
-import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
-import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
+import {
+  resumeBrowserSession,
+  retryBrowserRecoveryCleanup,
+  type ReattachResult,
+} from "../browser/reattach.js";
+import {
+  hasRecoverableChatGptConversation,
+  isRecoverableChatGptConversationUrl,
+  resolveCommittedPromptEpochLocator,
+} from "../browser/reattachability.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -36,7 +45,11 @@ import {
   formatSessionBrowserModelWithRequestedKey,
   resolveSessionBrowserModelDisplayName,
 } from "../browser/modelDisplay.js";
-import { persistDurableBrowserAnswer } from "./durableAnswer.js";
+import {
+  persistDurableBrowserAnswer,
+  publishBrowserCapture,
+  type DurableBrowserAnswerReceipt,
+} from "./durableAnswer.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? kleur.dim(text) : text);
@@ -57,6 +70,34 @@ function isProcessAlive(pid?: number): boolean {
     }
     return true;
   }
+}
+
+function repairTrustedStaleConversationUrl(
+  runtime: BrowserRuntimeMetadata | undefined,
+): BrowserRuntimeMetadata | undefined {
+  const candidate = runtime?.tabUrl?.trim();
+  if (!runtime || !candidate || isRecoverableChatGptConversationUrl(candidate)) return runtime;
+  let shellUrl: URL;
+  try {
+    shellUrl = new URL(candidate);
+  } catch {
+    return runtime;
+  }
+  if (
+    shellUrl.protocol !== "https:" ||
+    shellUrl.port ||
+    (shellUrl.hostname !== "chatgpt.com" && shellUrl.hostname !== "chat.openai.com")
+  ) {
+    return runtime;
+  }
+  if (/\/c(?:\/|$)/u.test(shellUrl.pathname)) return runtime;
+  const locator = resolveCommittedPromptEpochLocator({ ...runtime, tabUrl: undefined });
+  if (!locator || locator.epoch.remainingFollowUps > 0) return runtime;
+  return {
+    ...runtime,
+    conversationId: locator.conversationId,
+    tabUrl: `${shellUrl.origin}/c/${locator.conversationId}`,
+  };
 }
 
 function formatBytes(bytes: number): string {
@@ -138,6 +179,19 @@ async function saveReattachBrowserArtifacts(
     logger,
   }).catch(() => null);
   return appendArtifacts(metadata.artifacts, [reportArtifact, transcriptArtifact]);
+}
+
+function hasDurableBrowserAnswerReceipt(metadata: SessionMetadata): boolean {
+  return Boolean(
+    metadata.artifacts?.some(
+      (artifact) =>
+        artifact.kind === "transcript" &&
+        artifact.label === "Durable browser answer" &&
+        typeof artifact.sha256 === "string" &&
+        artifact.sha256.length === 64 &&
+        typeof artifact.sizeBytes === "number",
+    ),
+  );
 }
 
 export interface ShowStatusOptions {
@@ -225,12 +279,13 @@ export async function attachSession(
   sessionId: string,
   options?: AttachSessionOptions,
 ): Promise<void> {
-  let metadata = await sessionStore.readSession(sessionId);
-  if (!metadata) {
+  const storedMetadata = await sessionStore.readSession(sessionId);
+  if (!storedMetadata) {
     console.error(chalk.red(`No session found with ID ${sessionId}`));
     process.exitCode = 1;
     return;
   }
+  let metadata: SessionMetadata = storedMetadata;
   if (metadata.mode === "browser" && metadata.status === "running" && !metadata.browser?.runtime) {
     await wait(250);
     const refreshed = await sessionStore.readSession(sessionId);
@@ -253,9 +308,21 @@ export async function attachSession(
   const wantsRender = Boolean(options?.renderMarkdown);
   const isVerbose = Boolean(process.env.ORACLE_VERBOSE_RENDER);
   let runtime = metadata.browser?.runtime;
+  const repairedRuntime = repairTrustedStaleConversationUrl(runtime);
+  if (repairedRuntime !== runtime && repairedRuntime) {
+    await sessionStore.updateSession(sessionId, {
+      browser: { ...metadata.browser, runtime: repairedRuntime },
+    });
+    metadata = {
+      ...metadata,
+      browser: { ...metadata.browser, runtime: repairedRuntime },
+    };
+    runtime = repairedRuntime;
+  }
   if (
     metadata.status === "completed" &&
-    (runtime?.recoveryCleanup || runtime?.recoveryCleanupBacklog?.length) &&
+    hasDurableBrowserAnswerReceipt(metadata) &&
+    runtime?.recoveryCleanupResources?.length &&
     runtime.recoveryCleanupResult
   ) {
     const cleanupLogger = Object.assign(
@@ -268,6 +335,7 @@ export async function attachSession(
       const sessionPaths = await sessionStore.getPaths(sessionId);
       const cleanup = await retryBrowserRecoveryCleanup(runtime, cleanupLogger, {
         recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+        isRemotePublicationAcknowledged: () => true,
       });
       await sessionStore.updateSession(sessionId, {
         browser: { ...metadata.browser, runtime: cleanup.runtime },
@@ -337,12 +405,16 @@ export async function attachSession(
         `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
       ),
     );
-    let reattachResult: Awaited<ReturnType<typeof resumeBrowserSession>> | null = null;
-    let durablyCompleted = false;
+    let reattachResult: ReattachResult | null = null;
+    let answerPublished = false;
+    let answerReceipt: DurableBrowserAnswerReceipt | undefined;
+    let answerArtifacts: SessionMetadata["artifacts"];
+    let authoritativeRuntime = runtime as NonNullable<typeof runtime>;
+    let remotePublicationAcknowledged = false;
     try {
       const sessionPaths = await sessionStore.getPaths(sessionId);
       reattachResult = await resumeBrowserSession(
-        runtime as NonNullable<typeof runtime>,
+        authoritativeRuntime,
         metadata.browser?.config,
         Object.assign(
           ((message?: string) => {
@@ -351,75 +423,103 @@ export async function attachSession(
           { verbose: true },
         ),
         {
-          promptPreview: metadata.promptPreview,
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+          isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
         },
       );
+      authoritativeRuntime = reattachResult.runtime;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText;
       const outputTokens = estimateTokenCount(answerText);
-      const answerReceipt = await persistDurableBrowserAnswer({
-        sessionId,
-        answer: answerText,
-        logHeader:
-          completedDeepResearchPlaceholder ||
-          (hasIncompleteCapture && deepResearchPlaceholderCapture)
-            ? "[reattach] replaced incomplete Deep Research capture from existing Chrome tab"
-            : "[reattach] captured assistant response from existing Chrome tab",
-        replaceLog:
-          completedDeepResearchPlaceholder ||
-          (hasIncompleteCapture && deepResearchPlaceholderCapture),
+      const usage = {
+        inputTokens: 0,
+        outputTokens,
+        reasoningTokens: 0,
+        totalTokens: outputTokens,
+      };
+      const publication = await publishBrowserCapture({
+        answerOptions: {
+          sessionId,
+          answer: answerText,
+          logHeader:
+            completedDeepResearchPlaceholder ||
+            (hasIncompleteCapture && deepResearchPlaceholderCapture)
+              ? "[reattach] replaced incomplete Deep Research capture from existing Chrome tab"
+              : "[reattach] captured assistant response from existing Chrome tab",
+          replaceLog:
+            completedDeepResearchPlaceholder ||
+            (hasIncompleteCapture && deepResearchPlaceholderCapture),
+        },
+        transaction: reattachResult,
+        persistAnswer: persistDurableBrowserAnswer,
+        prepare: async (receipt) => {
+          answerReceipt = receipt;
+          answerArtifacts = appendArtifacts(
+            await saveReattachBrowserArtifacts(
+              sessionId,
+              metadata,
+              reattachResult as ReattachResult,
+            ),
+            [receipt.artifact],
+          );
+          return { artifacts: answerArtifacts };
+        },
+        publish: async (_receipt, prepared) => {
+          await sessionStore.updateSession(sessionId, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            usage,
+            errorMessage: undefined,
+            browser: {
+              config: metadata.browser?.config,
+              runtime: authoritativeRuntime,
+              modelSelection: metadata.browser?.modelSelection,
+              warnings: metadata.browser?.warnings,
+            },
+            artifacts: prepared.artifacts,
+            response: { status: "completed" },
+            error: undefined,
+            transport: undefined,
+          });
+          remotePublicationAcknowledged = true;
+        },
+        persistRuntime: async (latestRuntime) => {
+          authoritativeRuntime = latestRuntime;
+          const artifacts =
+            answerArtifacts ??
+            (answerReceipt
+              ? appendArtifacts(metadata.artifacts, [answerReceipt.artifact])
+              : undefined);
+          await sessionStore.updateSession(sessionId, {
+            browser: {
+              config: metadata.browser?.config,
+              runtime: latestRuntime,
+              modelSelection: metadata.browser?.modelSelection,
+              warnings: metadata.browser?.warnings,
+            },
+            ...(artifacts ? { artifacts } : {}),
+          });
+        },
       });
-      const artifacts = appendArtifacts(
-        await saveReattachBrowserArtifacts(sessionId, metadata, reattachResult),
-        [answerReceipt.artifact],
-      );
+      answerPublished = true;
       if (metadata.model) {
-        await sessionStore.updateModelRun(metadata.id, metadata.model, {
-          status: "completed",
-          usage: {
-            inputTokens: 0,
-            outputTokens,
-            reasoningTokens: 0,
-            totalTokens: outputTokens,
-          },
-          completedAt: new Date().toISOString(),
-        });
+        await sessionStore
+          .updateModelRun(metadata.id, metadata.model, {
+            status: "completed",
+            usage,
+            completedAt: new Date().toISOString(),
+          })
+          .catch((error) => {
+            console.log(
+              chalk.yellow(
+                `Reattach answer published; model-run projection failed: ${error instanceof Error ? error.message : String(error)}`,
+              ),
+            );
+          });
       }
-      await sessionStore.updateSession(sessionId, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage: {
-          inputTokens: 0,
-          outputTokens,
-          reasoningTokens: 0,
-          totalTokens: outputTokens,
-        },
-        errorMessage: undefined,
-        browser: {
-          config: metadata.browser?.config,
-          runtime: reattachResult.runtime,
-          modelSelection: metadata.browser?.modelSelection,
-          warnings: metadata.browser?.warnings,
-        },
-        artifacts,
-        response: { status: "completed" },
-        error: undefined,
-        transport: undefined,
-      });
-      durablyCompleted = true;
-      const finalization = await reattachResult.finalize();
-      await sessionStore.updateSession(sessionId, {
-        browser: {
-          config: metadata.browser?.config,
-          runtime: finalization.runtime,
-          modelSelection: metadata.browser?.modelSelection,
-          warnings: metadata.browser?.warnings,
-        },
-      });
-      if (finalization.status === "pending") {
+      if (publication.finalization.status === "pending") {
         console.log(
           chalk.yellow(
-            `Reattach completed; browser cleanup remains pending: ${finalization.error}`,
+            `Reattach completed; browser cleanup remains pending: ${publication.finalization.error}`,
           ),
         );
       } else {
@@ -427,38 +527,39 @@ export async function attachSession(
       }
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
-      if (reattachResult && !durablyCompleted) {
-        let recoveryAuthorityPersisted = false;
-        try {
-          await sessionStore.updateSession(sessionId, {
-            browser: {
-              config: metadata.browser?.config,
-              runtime: reattachResult.runtime,
-              modelSelection: metadata.browser?.modelSelection,
-              warnings: metadata.browser?.warnings,
-            },
-          });
-          recoveryAuthorityPersisted = true;
-        } catch (authorityError) {
-          console.log(
-            chalk.red(
-              `Reattach cleanup authority could not be persisted: ${authorityError instanceof Error ? authorityError.message : String(authorityError)}`,
-            ),
-          );
-        }
-        if (recoveryAuthorityPersisted) {
-          await reattachResult.abandon().catch(() => undefined);
-        }
+      let authorityPersisted = true;
+      try {
+        const artifacts =
+          answerArtifacts ??
+          (answerReceipt
+            ? appendArtifacts(metadata.artifacts, [answerReceipt.artifact])
+            : undefined);
+        await sessionStore.updateSession(sessionId, {
+          browser: {
+            config: metadata.browser?.config,
+            runtime: authoritativeRuntime,
+            modelSelection: metadata.browser?.modelSelection,
+            warnings: metadata.browser?.warnings,
+          },
+          ...(artifacts ? { artifacts } : {}),
+        });
+      } catch (authorityError) {
+        authorityPersisted = false;
+        console.log(
+          chalk.red(
+            `Reattach cleanup authority could not be persisted: ${authorityError instanceof Error ? authorityError.message : String(authorityError)}`,
+          ),
+        );
       }
       const message = error instanceof Error ? error.message : String(error);
       console.log(
         chalk.red(
-          durablyCompleted
+          answerPublished
             ? `Reattach completed, but cleanup state persistence failed: ${message}`
             : `Reattach failed: ${message}`,
         ),
       );
-      if (completedDeepResearchPlaceholder && !durablyCompleted) {
+      if (completedDeepResearchPlaceholder && !answerPublished) {
         if (metadata.model) {
           await sessionStore.updateModelRun(metadata.id, metadata.model, {
             status: "error",
@@ -479,6 +580,9 @@ export async function attachSession(
           },
         });
         metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+      }
+      if (!authorityPersisted) {
+        throw error;
       }
     }
   }

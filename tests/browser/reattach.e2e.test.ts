@@ -9,33 +9,39 @@ import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
 
 vi.mock("../../src/browser/reattach.js", () => ({
   resumeBrowserSession: vi.fn(),
-  retryBrowserRecoveryCleanup: vi.fn(async (runtime: BrowserRuntimeMetadata) => ({
-    status: "completed",
-    runtime: {
-      ...runtime,
-      recoveryCleanupBacklog: undefined,
-      recoveryCleanupResult: undefined,
-    },
-  })),
+  retryBrowserRecoveryCleanup: vi.fn(async (runtime: BrowserRuntimeMetadata) => {
+    const completedRuntime = { ...runtime };
+    delete completedRuntime.recoveryCleanupResources;
+    delete completedRuntime.recoveryCleanupResult;
+    delete completedRuntime.remoteRecovery;
+    return { status: "completed", runtime: completedRuntime };
+  }),
 }));
 function committedRuntime(
   conversationId: string,
   runtime: BrowserRuntimeMetadata = {},
 ): BrowserRuntimeMetadata {
+  const promptEpoch = {
+    status: "committed" as const,
+    epochId: `epoch-${conversationId}`,
+    promptSha256: "b".repeat(64),
+    baselineTurns: 0,
+    followUpOrdinal: 0,
+    remainingFollowUps: 0,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "turn-0",
+    verifiedUserMessageId: "message-0",
+    conversationId,
+  };
   return {
     ...runtime,
-    promptSubmitted: true,
     conversationId,
-    promptEpoch: {
-      status: "committed",
-      epochId: `epoch-${conversationId}`,
-      promptSha256: "b".repeat(64),
-      baselineTurns: 0,
-      followUpOrdinal: 0,
-      remainingFollowUps: 0,
-      verifiedUserTurnIndex: 0,
-      conversationId,
-    },
+    promptEpoch,
+    recoveryCleanupResources: runtime.recoveryCleanupResources?.map((resource) => ({
+      ...resource,
+      conversationId: resource.conversationId ?? conversationId,
+      promptEpoch: resource.promptEpoch ?? promptEpoch,
+    })),
   };
 }
 
@@ -62,14 +68,13 @@ function createReattachResult(
   runtime: BrowserRuntimeMetadata,
   onFinalize?: () => Promise<void> | void,
 ) {
-  const capturedRuntime =
-    runtime.recoveryCleanup || runtime.recoveryCleanupBacklog?.length
-      ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
-      : runtime;
+  const capturedRuntime = runtime.recoveryCleanupResources?.length
+    ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
+    : runtime;
   const finalizedRuntime = { ...capturedRuntime };
-  delete finalizedRuntime.recoveryCleanup;
-  delete finalizedRuntime.recoveryCleanupBacklog;
+  delete finalizedRuntime.recoveryCleanupResources;
   delete finalizedRuntime.recoveryCleanupResult;
+  delete finalizedRuntime.remoteRecovery;
   return {
     answerText,
     answerMarkdown,
@@ -78,7 +83,7 @@ function createReattachResult(
       await onFinalize?.();
       return { status: "completed" as const, runtime: finalizedRuntime };
     }),
-    abandon: vi.fn(async () => undefined),
+    abort: vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime })),
   };
 }
 
@@ -92,7 +97,7 @@ afterEach(() => {
 });
 
 describe("browser reattach end-to-end (simulated)", () => {
-  test("retries backlog-only browser cleanup for a completed session", async () => {
+  test("retries resource-only browser cleanup for a completed session", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
     const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");
     setOracleHomeDirOverrideForTest(tmpHome);
@@ -102,19 +107,26 @@ describe("browser reattach end-to-end (simulated)", () => {
       const retryMock = vi.mocked(retryBrowserRecoveryCleanup);
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+      // Dynamic import preserves the per-test module graph after vi.resetModules and home override.
+      const { persistDurableBrowserAnswer } = await import("../../src/cli/durableAnswer.js");
 
       await sessionStore.ensureStorage();
       const sessionMeta = await sessionStore.createSession(
         { prompt: "Test prompt", model: "gpt-5.2-pro", mode: "browser", browserConfig: {} },
         path.join(tmpHome, "repo"),
       );
+      const receipt = await persistDurableBrowserAnswer({
+        sessionId: sessionMeta.id,
+        answer: "Previously published browser answer",
+      });
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
         mode: "browser",
+        artifacts: [receipt.artifact],
         browser: {
           config: {},
           runtime: {
-            recoveryCleanupBacklog: [
+            recoveryCleanupResources: [
               {
                 chromeHost: "remote.example.test",
                 chromePort: 9222,
@@ -137,7 +149,7 @@ describe("browser reattach end-to-end (simulated)", () => {
 
       expect(retryMock).toHaveBeenCalledTimes(1);
       expect(retryMock).toHaveBeenCalledWith(
-        expect.objectContaining({ recoveryCleanupBacklog: expect.any(Array) }),
+        expect.objectContaining({ recoveryCleanupResources: expect.any(Array) }),
         expect.any(Function),
         expect.objectContaining({
           recoveryLockPath: path.join(
@@ -147,7 +159,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         }),
       );
       const persisted = await sessionStore.readSession(sessionMeta.id);
-      expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupBacklog");
+      expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
       expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
@@ -224,7 +236,7 @@ describe("browser reattach end-to-end (simulated)", () => {
       expect(runs.some((r) => r.status === "completed")).toBe(true);
       expect(durableCompletionObserved).toBe(true);
       expect(reattachResult.finalize).toHaveBeenCalledOnce();
-      expect(reattachResult.abandon).not.toHaveBeenCalled();
+      expect(reattachResult.abort).not.toHaveBeenCalled();
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -268,7 +280,6 @@ describe("browser reattach end-to-end (simulated)", () => {
             chromeHost: "127.0.0.1",
             chromeTargetId: "t-1",
             tabUrl: "https://chatgpt.com/c/demo",
-            promptSubmitted: false,
           },
         },
         response: { status: "error", incompleteReason: "chrome-disconnected" },
@@ -320,7 +331,10 @@ describe("browser reattach end-to-end (simulated)", () => {
         chromeTargetId: "t-1",
         tabUrl: "https://chatgpt.com/",
       });
-      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown", runtime));
+      const canonicalRuntime = { ...runtime, tabUrl: "https://chatgpt.com/c/demo" };
+      resumeMock.mockResolvedValue(
+        createReattachResult("ok text", "ok markdown", canonicalRuntime),
+      );
       await sessionStore.updateSession(sessionMeta.id, {
         status: "running",
         startedAt: new Date().toISOString(),
@@ -336,6 +350,7 @@ describe("browser reattach end-to-end (simulated)", () => {
           details: { stage: "connection-lost", recoverableDisconnect: true },
         },
       });
+      const persistSpy = vi.spyOn(sessionStore, "updateSession");
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -344,8 +359,17 @@ describe("browser reattach end-to-end (simulated)", () => {
       logSpy.mockRestore();
 
       expect(resumeMock).toHaveBeenCalledTimes(1);
+      expect(resumeMock.mock.calls[0]?.[0]?.tabUrl).toBe("https://chatgpt.com/c/demo");
+      const canonicalWriteIndex = persistSpy.mock.calls.findIndex(
+        ([, patch]) => patch.browser?.runtime?.tabUrl === "https://chatgpt.com/c/demo",
+      );
+      expect(canonicalWriteIndex).toBeGreaterThanOrEqual(0);
+      expect(persistSpy.mock.invocationCallOrder[canonicalWriteIndex] ?? 0).toBeLessThan(
+        resumeMock.mock.invocationCallOrder[0] ?? 0,
+      );
       const updated = await sessionStore.readSession(sessionMeta.id);
       expect(updated?.status).toBe("completed");
+      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/demo");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -434,11 +458,12 @@ describe("browser reattach end-to-end (simulated)", () => {
       const runtime = committedRuntime("deep-project", {
         tabUrl: "https://chatgpt.com/g/g-p-demo/project",
       });
+      const canonicalRuntime = { ...runtime, tabUrl: "https://chatgpt.com/c/deep-project" };
       resumeMock.mockResolvedValue(
         createReattachResult(
           "# Deep report\n\nRecovered report body.",
           "# Deep report\n\nRecovered report body.",
-          runtime,
+          canonicalRuntime,
         ),
       );
 
@@ -465,6 +490,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         },
         response: { status: "completed" },
       });
+      const persistSpy = vi.spyOn(sessionStore, "updateSession");
       const paths = await sessionStore.getPaths(sessionMeta.id);
       await fs.writeFile(paths.log, "Answer:\nCalled tool\n", "utf8");
 
@@ -475,6 +501,16 @@ describe("browser reattach end-to-end (simulated)", () => {
       logSpy.mockRestore();
 
       expect(resumeMock).toHaveBeenCalledTimes(1);
+      expect(resumeMock.mock.calls[0]?.[0]?.tabUrl).toBe("https://chatgpt.com/c/deep-project");
+      const canonicalWriteIndex = persistSpy.mock.calls.findIndex(
+        ([, patch]) => patch.browser?.runtime?.tabUrl === "https://chatgpt.com/c/deep-project",
+      );
+      expect(canonicalWriteIndex).toBeGreaterThanOrEqual(0);
+      expect(persistSpy.mock.invocationCallOrder[canonicalWriteIndex] ?? 0).toBeLessThan(
+        resumeMock.mock.invocationCallOrder[0] ?? 0,
+      );
+      const updated = await sessionStore.readSession(sessionMeta.id);
+      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/deep-project");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -616,12 +652,24 @@ describe("browser reattach end-to-end (simulated)", () => {
         chromeTargetId: "t-1",
         tabUrl: "https://chatgpt.com/c/demo",
         controllerPid: deadControllerPid,
-        recoveryCleanup: {
-          transport: "local",
-          ownsTarget: true,
-          profileKind: "temporary",
-          keepBrowser: false,
-        },
+        recoveryCleanupResources: [
+          {
+            chromePid: 4242,
+            chromeProcessIdentity: processIdentity,
+            profileDirectoryIdentity: processIdentity.profileDirectory,
+            chromePort: 51559,
+            chromeHost: "127.0.0.1",
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            chromeTargetId: "t-1",
+            recoveryCleanup: {
+              transport: "local",
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+            },
+          },
+        ],
       });
       resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown", runtime));
 

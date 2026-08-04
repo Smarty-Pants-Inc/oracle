@@ -27,3 +27,14 @@ describe("alignPromptEchoPair", () => {
     expect(result.isEcho).toBe(true);
   });
 });
+
+describe("buildPromptEchoMatcher", () => {
+  test("requires the full normalized prompt rather than a prefix or truncated fragment", () => {
+    const sharedPrefix = "x".repeat(200);
+    const matcher = buildPromptEchoMatcher(`${sharedPrefix} intended suffix`);
+    expect(matcher).not.toBeNull();
+    expect(matcher?.isEcho(`${sharedPrefix} intended suffix`)).toBe(true);
+    expect(matcher?.isEcho(`${sharedPrefix} unrelated suffix`)).toBe(false);
+    expect(matcher?.isEcho(sharedPrefix.slice(0, 120))).toBe(false);
+  });
+});

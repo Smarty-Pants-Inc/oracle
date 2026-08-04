@@ -12,6 +12,8 @@ vi.mock("../../src/sessionStore.ts", () => ({
 
 vi.mock("../../src/sessionManager.ts", () => ({
   wait: vi.fn(),
+  writeFileAtomicDurable: vi.fn(),
+  syncDirectoryIfSupported: vi.fn(),
 }));
 
 describe("showStatus cleanup tip", () => {

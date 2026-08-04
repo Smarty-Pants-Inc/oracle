@@ -4,7 +4,17 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
 import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
 
@@ -43,17 +53,26 @@ function chromeIdentity(
   };
 }
 
+async function writeNativeDevToolsFixture(userDataDir: string, port: number): Promise<void> {
+  await writeFile(
+    path.join(userDataDir, "DevToolsActivePort"),
+    `${port}\n/devtools/browser/test-browser\n`,
+    "utf8",
+  );
+}
+
 describe("profileState", () => {
-  test("writes DevToolsActivePort to both root and Default", async () => {
+  test("reads Chrome-native DevToolsActivePort without publishing Oracle-owned copies", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      await profileState.writeDevToolsActivePort(dir, 12345);
-      const root = path.join(dir, "DevToolsActivePort");
-      const nested = path.join(dir, "Default", "DevToolsActivePort");
-      expect(existsSync(root)).toBe(true);
-      expect(existsSync(nested)).toBe(true);
-      expect((await readFile(root, "utf8")).split("\n")[0]?.trim()).toBe("12345");
-      expect((await readFile(nested, "utf8")).split("\n")[0]?.trim()).toBe("12345");
+      const nestedDir = path.join(dir, "Default");
+      await mkdir(nestedDir);
+      await writeNativeDevToolsFixture(dir, 12345);
+      await writeFile(
+        path.join(nestedDir, "DevToolsActivePort"),
+        "54321\n/devtools/browser/nested\n",
+        "utf8",
+      );
       await expect(profileState.readDevToolsPort(dir)).resolves.toBe(12345);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -69,13 +88,17 @@ describe("profileState", () => {
       path.join(dir, "SingletonCookie"),
     ];
     try {
-      await profileState.writeDevToolsActivePort(dir, 12345);
+      await writeNativeDevToolsFixture(dir, 12345);
       for (const lock of lockFiles) {
         await writeFile(lock, "x");
       }
 
-      // Alive pid => keep locks
-      await profileState.writeChromePid(dir, process.pid);
+      // Alive pid => keep locks and the one atomic owner record.
+      const aliveIdentity = chromeIdentity(dir, { pid: process.pid });
+      await profileState.writeOracleChromeOwner(dir, {
+        port: 12345,
+        processIdentity: aliveIdentity,
+      });
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
       });
@@ -84,25 +107,30 @@ describe("profileState", () => {
         expect(existsSync(lock)).toBe(true);
       }
 
-      // Dead pid => remove locks
+      // Dead pid => remove locks and the matching owner generation.
       for (const lock of lockFiles) {
         await writeFile(lock, "x");
       }
       const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
       await once(child, "exit");
-      await profileState.writeChromePid(dir, child.pid ?? 0);
-      await profileState.writeChromeProcessIdentity(dir, chromeIdentity(dir, { pid: child.pid }));
-      expect(existsSync(path.join(dir, "chrome-process-identity.json"))).toBe(true);
-      await expect(profileState.readChromeProcessIdentity(dir)).resolves.toEqual(
-        chromeIdentity(dir, { pid: child.pid }),
-      );
+      if (!child.pid) throw new Error("Exited child never published a pid");
+      const deadIdentity = chromeIdentity(dir, { pid: child.pid });
+      await profileState.writeOracleChromeOwner(dir, {
+        port: 12345,
+        processIdentity: deadIdentity,
+      });
+      expect(existsSync(path.join(dir, "oracle-chrome-owner.json"))).toBe(true);
+      await expect(profileState.readOracleChromeOwner(dir)).resolves.toEqual({
+        port: 12345,
+        processIdentity: deadIdentity,
+      });
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
       });
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(false);
       }
-      expect(existsSync(path.join(dir, "chrome-process-identity.json"))).toBe(false);
+      expect(existsSync(path.join(dir, "oracle-chrome-owner.json"))).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -112,7 +140,7 @@ describe("profileState", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
     try {
       const identity = chromeIdentity(dir);
-      await profileState.writeChromeProcessIdentity(dir, identity);
+      await profileState.writeOracleChromeOwner(dir, { port: 12345, processIdentity: identity });
       const originalSnapshot = {
         pid: identity.pid,
         processStartTime: identity.processStartTime,
@@ -121,16 +149,17 @@ describe("profileState", () => {
       };
       await expect(
         profileState.verifyChromeProcessIdentityForTest(dir, identity, {
-          readIdentity: async () => identity,
+          readOwner: async () => ({ port: 12345, processIdentity: identity }),
           readProcessSnapshot: async () => originalSnapshot,
           verifyProfileIdentity: async () => true,
+          isProcessAlive: () => true,
         }),
       ).resolves.toBe(true);
 
       const signalByPid = vi.fn(async () => ({ stdout: "SUCCESS" }));
       await expect(
         profileState.terminateRecordedChromeForProfileForTest(dir, identity, undefined, {
-          readIdentity: async () => identity,
+          readOwner: async () => ({ port: 12345, processIdentity: identity }),
           readProcessSnapshot: async () => ({
             ...originalSnapshot,
             processStartTime: "reused-process-generation",
@@ -188,6 +217,50 @@ describe("profileState", () => {
     ).toBe(false);
   });
 
+  test("captures a macOS Chrome executable from its physical text vnode", async () => {
+    const userDataDir = "/tmp/oracle-mac-profile";
+    const profileDirectory = {
+      version: 1 as const,
+      platform: "darwin" as const,
+      canonicalPath: userDataDir,
+      device: "1",
+      inode: "2",
+    };
+    const execute = vi.fn(async (file: string, args: string[]) => {
+      if (file === "/usr/sbin/lsof") {
+        return {
+          stdout: "p4321\nftxt\nn/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n",
+        };
+      }
+      if (file === "ps" && args.at(-1) === "lstart=") {
+        return { stdout: "Tue Aug  4 12:00:00 2026\n" };
+      }
+      if (file === "ps" && args.at(-1) === "command=") {
+        return {
+          stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir}\n`,
+        };
+      }
+      throw new Error(`Unexpected process query: ${file} ${args.join(" ")}`);
+    });
+
+    await expect(
+      profileState.captureChromeProcessIdentityForTest(userDataDir, 4321, {
+        platform: "darwin",
+        execute,
+        captureProfileIdentity: async () => profileDirectory,
+      }),
+    ).resolves.toMatchObject({
+      pid: 4321,
+      processStartTime: "Tue Aug  4 12:00:00 2026",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: userDataDir,
+    });
+    expect(execute).toHaveBeenCalledWith(
+      "/usr/sbin/lsof",
+      expect.arrayContaining(["-p", "4321", "-d", "txt"]),
+    );
+  });
+
   test("crash recovery without stable authority remains pending and never taskkills", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const identity = chromeIdentity(profileDir);
@@ -195,7 +268,7 @@ describe("profileState", () => {
     await expect(
       profileState.terminateRecordedChromeForProfileForTest(profileDir, identity, undefined, {
         platform: "win32",
-        readIdentity: async () => identity,
+        readOwner: async () => ({ port: 12345, processIdentity: identity }),
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
         isChromeUsingUserDataDir: async () => false,
@@ -211,6 +284,54 @@ describe("profileState", () => {
     });
     expect(terminationCalls).toEqual([]);
   });
+
+  test.runIf(process.platform === "linux")(
+    "captures and verifies a real Linux process through procfs generation data",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-process-"));
+      const profileDir = path.join(root, "profile with spaces");
+      const chromeExecutable = path.join(root, "google-chrome");
+      await mkdir(profileDir);
+      await copyFile(process.execPath, chromeExecutable);
+      await chmod(chromeExecutable, 0o755);
+      const child = spawn(
+        chromeExecutable,
+        [
+          "-e",
+          "require('node:net').createServer().listen(0)",
+          "--",
+          `--user-data-dir=${profileDir}`,
+        ],
+        { stdio: "ignore" },
+      );
+      const exited = once(child, "exit");
+      try {
+        await once(child, "spawn");
+        if (!child.pid) throw new Error("Linux Chrome fixture did not expose a pid");
+        const identity = await profileState.captureChromeProcessIdentity(profileDir, child.pid);
+        expect(identity.executablePath).toBe(chromeExecutable);
+        expect(identity.processStartTime).toMatch(/^linux-proc-start-ticks:\d+$/u);
+        await profileState.writeOracleChromeOwner(profileDir, {
+          port: 45678,
+          processIdentity: identity,
+        });
+        await expect(profileState.verifyChromeProcessIdentity(profileDir, identity)).resolves.toBe(
+          true,
+        );
+        child.kill("SIGTERM");
+        await exited;
+        await expect(profileState.verifyChromeProcessIdentity(profileDir, identity)).resolves.toBe(
+          false,
+        );
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await exited.catch(() => undefined);
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("rejects descendant symlink traversal before profile authority", async () => {
     if (process.platform === "win32") return;
@@ -236,7 +357,7 @@ describe("profileState", () => {
     const movedDir = path.join(root, "moved-profile");
     try {
       await mkdir(profileDir);
-      await profileState.writeDevToolsActivePort(profileDir, 12345);
+      await writeNativeDevToolsFixture(profileDir, 12345);
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.cleanupStaleProfileStateForTest(
@@ -259,6 +380,59 @@ describe("profileState", () => {
     }
   });
 
+  test("path replacement cannot redirect final profile deletion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedGeneration = path.join(root, "verified-generation");
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "authorized-marker"), "preserve");
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+          beforeQuarantineRename: async () => {
+            await rename(profileDir, movedGeneration);
+            await mkdir(profileDir);
+            await writeFile(path.join(profileDir, "replacement-marker"), "never-delete");
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(existsSync(path.join(movedGeneration, "authorized-marker"))).toBe(true);
+      expect(existsSync(path.join(profileDir, "replacement-marker"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("quarantine replacement cannot redirect final profile deletion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-quarantine-retarget-"));
+    const profileDir = path.join(root, "profile");
+    const movedGeneration = path.join(root, "verified-generation");
+    let replacementPath: string | undefined;
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "authorized-marker"), "preserve");
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+          beforeQuarantineDelete: async (quarantinePath) => {
+            replacementPath = quarantinePath;
+            await rename(quarantinePath, movedGeneration);
+            await mkdir(quarantinePath);
+            await writeFile(path.join(quarantinePath, "replacement-marker"), "never-delete");
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(existsSync(path.join(movedGeneration, "authorized-marker"))).toBe(true);
+      expect(replacementPath).toBeDefined();
+      expect(existsSync(path.join(replacementPath ?? "", "replacement-marker"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("profile persistence rejects a renamed and replaced directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-persist-retarget-"));
     const profileDir = path.join(root, "profile");
@@ -268,10 +442,10 @@ describe("profileState", () => {
       const identity = chromeIdentity(profileDir);
       await rename(profileDir, movedDir);
       await mkdir(profileDir);
-      await expect(profileState.writeChromeProcessIdentity(profileDir, identity)).rejects.toThrow(
-        /does not belong|physical profile/i,
-      );
-      expect(existsSync(path.join(profileDir, "chrome-process-identity.json"))).toBe(false);
+      await expect(
+        profileState.writeOracleChromeOwner(profileDir, { port: 12345, processIdentity: identity }),
+      ).rejects.toThrow(/does not belong|physical profile/i);
+      expect(existsSync(path.join(profileDir, "oracle-chrome-owner.json"))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -280,7 +454,7 @@ describe("profileState", () => {
   test("skips manual-login cleanup when DevTools port is still reachable", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      await profileState.writeDevToolsActivePort(dir, 12345);
+      await writeNativeDevToolsFixture(dir, 12345);
       await expect(
         profileState.shouldCleanupManualLoginProfileState(dir, undefined, {
           connectionClosedUnexpectedly: true,
@@ -295,7 +469,7 @@ describe("profileState", () => {
   test("skips normal manual-login cleanup when reused Chrome is still reachable", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      await profileState.writeDevToolsActivePort(dir, 12345);
+      await writeNativeDevToolsFixture(dir, 12345);
       await expect(
         profileState.shouldCleanupManualLoginProfileState(dir, undefined, {
           connectionClosedUnexpectedly: false,
@@ -310,7 +484,7 @@ describe("profileState", () => {
   test("runs manual-login cleanup when DevTools port is unreachable", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      await profileState.writeDevToolsActivePort(dir, 12345);
+      await writeNativeDevToolsFixture(dir, 12345);
       await expect(
         profileState.shouldCleanupManualLoginProfileState(dir, undefined, {
           connectionClosedUnexpectedly: true,
@@ -460,5 +634,16 @@ describe("profileState", () => {
       pid: 456,
       port: 64305,
     });
+  });
+
+  test("binds a port-zero Chrome process to its native active port", () => {
+    const dir = "/Users/example/.oracle/browser-profile";
+    const processList = `
+      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --user-data-dir=${dir} about:blank
+    `;
+
+    expect(
+      profileState.findChromeDebugTargetForProfileFromProcessListForTest(processList, dir, 64305),
+    ).toEqual({ pid: 456, port: 64305 });
   });
 });

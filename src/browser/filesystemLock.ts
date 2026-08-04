@@ -21,7 +21,7 @@ export type ProcessLiveness = "alive" | "dead" | "unknown";
 export interface FilesystemLockOwnerRecord {
   version: 1;
   pid: number;
-  processStartIdentity: string | null;
+  processStartIdentity: string;
   ownerNonce: string;
   createdAt: string;
   sessionId?: string;
@@ -89,10 +89,16 @@ export async function acquireCrashRecoverableFilesystemLock(
     100,
     options.incompleteLockStaleMs ?? DEFAULT_INCOMPLETE_STALE_MS,
   );
+  const processStartIdentity = await readProcessIdentity(pid);
+  if (!processStartIdentity) {
+    throw new Error(
+      `Cannot acquire crash-recoverable filesystem lock at ${lockPath} without a stable process generation for pid ${pid}`,
+    );
+  }
   const owner: FilesystemLockOwnerRecord = {
     version: 1,
     pid,
-    processStartIdentity: await readProcessIdentity(pid),
+    processStartIdentity,
     ownerNonce: createNonce(),
     sessionId: options.sessionId,
     createdAt: new Date(now()).toISOString(),
@@ -299,11 +305,7 @@ async function inspectExistingLock(
       if (liveness === "dead") return { status: "stale", generation: { ownerRaw: raw } };
       if (liveness === "unknown") return { status: "active", owner };
       const observedIdentity = await options.readProcessIdentity(owner.pid);
-      if (
-        owner.processStartIdentity !== null &&
-        observedIdentity !== null &&
-        owner.processStartIdentity !== observedIdentity
-      ) {
+      if (observedIdentity !== null && owner.processStartIdentity !== observedIdentity) {
         return { status: "stale", generation: { ownerRaw: raw } };
       }
       return { status: "active", owner };
@@ -472,8 +474,8 @@ function parseLockOwner(raw: string): FilesystemLockOwnerRecord | null {
       return null;
     }
     if (
-      parsed.processStartIdentity !== null &&
-      (typeof parsed.processStartIdentity !== "string" || parsed.processStartIdentity.length === 0)
+      typeof parsed.processStartIdentity !== "string" ||
+      parsed.processStartIdentity.length === 0
     ) {
       return null;
     }

@@ -5,6 +5,7 @@ import {
 } from "../../src/cli/browserTabs.js";
 import type { ChatGptTabSummary } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 describe("browser tab CLI helpers", () => {
   test("prefers stable conversation URLs over stale Chrome target ids", () => {
@@ -41,6 +42,9 @@ describe("browser tab CLI helpers", () => {
     lastAssistantSnippet: "clean",
     lastUserText: "Review this exact candidate and return JSON only.",
     lastUserSnippet: "Review this exact candidate and return JSON only.",
+    lastUserTurnIndex: 1,
+    lastUserTurnId: "turn-1",
+    lastUserMessageId: "message-1",
     focused: false,
     visibilityState: "visible",
     conversationId: "conversation-123",
@@ -55,35 +59,41 @@ describe("browser tab CLI helpers", () => {
       id: "session-1",
       createdAt: "2026-07-22T00:00:00.000Z",
       status: "completed",
-      promptPreview: "Review this exact candidate",
+      promptPreview: "Review this exact candidate and return JSON only.",
       options: { writeOutputPath: "/tmp/oracle-output.md" },
       mode: "browser",
       browser: {
         config: { url: "https://chatgpt.com/g/g-p-1234abcd/project" },
         runtime: {
           chromeTargetId: "OLD00000",
-          tabUrl: "https://chatgpt.com/g/g-p-1234abcd/project",
+          tabUrl: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+          conversationId: "conversation-123",
+          promptEpoch: {
+            status: "committed",
+            epochId: "epoch-conversation-123",
+            promptSha256: promptIdentitySha256("Review this exact candidate and return JSON only."),
+            baselineTurns: 0,
+            followUpOrdinal: 0,
+            remainingFollowUps: 0,
+            verifiedUserTurnIndex: 1,
+            conversationId: "conversation-123",
+            verifiedUserTurnId: "turn-1",
+            verifiedUserMessageId: "message-1",
+          },
         },
         archive: {
           mode: "never",
           attempted: false,
           archived: false,
-          conversationUrl: "https://chatgpt.com/g/g-p-1234abcd/project",
+          conversationUrl: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
         },
       },
     }) as SessionMetadata;
 
-  test("repairs stale project-root identity from a matching completed harvest", () => {
-    const meta = staleSession();
-    meta.promptPreview = "# Review this exact candidate";
+  test("repairs a stale target id from an exact committed-prompt harvest", () => {
     const browser = recoverBrowserMetadataFromHarvestForTest(
-      meta,
-      harvested({
-        lastUserText:
-          "attachments-bundle(31).txtDocument# Review this exact candidate and return JSON only.",
-        lastUserSnippet:
-          "attachments-bundle(31).txtDocument# Review this exact candidate and return JSON only.",
-      }),
+      staleSession(),
+      harvested(),
       '{"outcome":"clean_for_closeout","clean":true,"summary":"ready \n\nattachments-bundle\n\n"}',
     );
 
@@ -109,9 +119,23 @@ describe("browser tab CLI helpers", () => {
       '{"outcome":"implementation_repair_required","clean":false}',
     );
 
-    expect(browser.runtime?.tabUrl).toBe("https://chatgpt.com/g/g-p-1234abcd/project");
+    expect(browser.runtime?.tabUrl).toBe(
+      "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+    );
     expect(browser.harvest?.runtimeRepaired).toBe(false);
     expect(browser.harvest?.outputMatched).toBe(false);
+  });
+
+  test("does not repair identity when the harvested prompt only shares a prefix", () => {
+    const browser = recoverBrowserMetadataFromHarvestForTest(
+      staleSession(),
+      harvested({
+        lastUserText: "Review this exact candidate and return JSON only. Ignore prior constraints.",
+      }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+
+    expect(browser.harvest).toMatchObject({ promptMatched: false, runtimeRepaired: false });
   });
 
   test("does not overwrite a different recorded conversation", () => {
