@@ -652,7 +652,6 @@ async function attemptSendButton(
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
 ): Promise<boolean> {
-  const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
   const script = `(() => {
     ${buildClickDispatcher()}
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
