@@ -7,10 +7,7 @@ import {
   STOP_BUTTON_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
-import {
-  buildConversationTurnCountExpression,
-  buildConversationTurnListExpression,
-} from "../conversationTurns.js";
+import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -28,6 +25,13 @@ export interface AttachmentReadyExpectation {
   name: string;
   generatedBundle?: boolean;
 }
+export interface PromptCommitVerification {
+  committedTurns: number;
+  verifiedUserTurnIndex: number;
+  verifiedUserTurnId?: string;
+  verifiedUserMessageId?: string;
+  conversationId: string;
+}
 
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
 
@@ -36,15 +40,22 @@ export async function submitPrompt(
     runtime: ChromeClient["Runtime"];
     input: ChromeClient["Input"];
     attachmentNames?: AttachmentReadyInput[];
-    baselineTurns?: number | null;
+    baselineTurns: number;
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
     onPromptDispatchStarted?: () => Promise<void> | void;
   },
   prompt: string,
   logger: BrowserLogger,
-): Promise<number | null> {
+): Promise<PromptCommitVerification> {
   const { runtime, input } = deps;
+  if (!Number.isFinite(deps.baselineTurns) || deps.baselineTurns < 0) {
+    throw new BrowserAutomationError(
+      "Unable to bind prompt dispatch to a pre-dispatch conversation baseline.",
+      { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
+    );
+  }
+  const baselineTurns = Math.floor(deps.baselineTurns);
 
   await waitForDomReady(runtime, logger, deps.inputTimeoutMs ?? undefined);
   const encodedPrompt = JSON.stringify(prompt);
@@ -239,13 +250,7 @@ export async function submitPrompt(
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-  return await verifyPromptCommitted(
-    runtime,
-    prompt,
-    commitTimeoutMs,
-    logger,
-    deps.baselineTurns ?? undefined,
-  );
+  return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, baselineTurns);
 }
 
 export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logger: BrowserLogger) {
@@ -783,9 +788,16 @@ export async function verifyPromptCommitted(
   Runtime: ChromeClient["Runtime"],
   prompt: string,
   timeoutMs: number,
-  logger?: BrowserLogger,
-  baselineTurns?: number,
-): Promise<number | null> {
+  logger: BrowserLogger | undefined,
+  baselineTurns: number,
+): Promise<PromptCommitVerification> {
+  if (!Number.isFinite(baselineTurns) || baselineTurns < 0) {
+    throw new BrowserAutomationError(
+      "Unable to verify prompt commit without a pre-dispatch conversation baseline.",
+      { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
+    );
+  }
+  const baseline = Math.floor(baselineTurns);
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
@@ -793,97 +805,106 @@ export async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  let baseline: number | null =
-    typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
-      ? Math.floor(baselineTurns)
-      : null;
-  if (baseline === null) {
-    try {
-      const { result } = await Runtime.evaluate({
-        expression: buildConversationTurnCountExpression(),
-        returnByValue: true,
-      });
-      const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
-      if (Number.isFinite(raw)) {
-        baseline = Math.max(0, Math.floor(raw));
-      }
-    } catch {
-      // ignore; baseline stays unknown
-    }
-  }
-  const baselineLiteral = baseline ?? -1;
-  // Learned: ChatGPT can echo/format text; normalize markdown and use prefix matches to detect the sent prompt.
+  // Only a matching user turn created at or after the pre-dispatch turn count can
+  // commit this epoch. Historical/repeated prompts and unrelated new turns cannot.
   const script = `(() => {
-		    const editor = document.querySelector(${primarySelectorLiteral});
-		    const fallback = document.querySelector(${fallbackSelectorLiteral});
-		    const inputSelectors = ${inputSelectorsLiteral};
-	    const normalize = (value) => {
-	      let text = value?.toLowerCase?.() ?? '';
-	      // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
-	      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-	      text = text.replace(/\`\`\`/g, ' ');
-	      text = text.replace(/\`([^\`]*)\`/g, '$1');
-	      return text.replace(/\\s+/g, ' ').trim();
-	    };
-	    const normalizedPrompt = normalize(${encodedPrompt});
-	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
-	    const articles = ${buildConversationTurnListExpression()};
-	    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
-	    const readValue = (node) => {
-	      if (!node) return '';
-	      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
-	      return node.innerText ?? '';
-	    };
-	    const isVisible = (node) => {
-	      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-	      const rect = node.getBoundingClientRect();
-	      return rect.width > 0 && rect.height > 0;
-	    };
-	    const inputs = inputSelectors
-	      .map((selector) => document.querySelector(selector))
-	      .filter((node) => Boolean(node));
-	    const visibleInputs = inputs.filter((node) => isVisible(node));
-	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
-	    const userMatched =
-	      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
-	    const prefixMatched =
-	      normalizedPromptPrefix.length > 30 &&
-	      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
-		    const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
-		    const lastMatched =
-		      normalizedPrompt.length > 0 &&
-		      (lastTurn.includes(normalizedPrompt) ||
-		        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
-		    const baseline = ${baselineLiteral};
-		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
-		    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
-		    const assistantVisible = Boolean(
-		      document.querySelector(${assistantSelectorLiteral}) ||
-		      document.querySelector('[data-testid*="assistant"]'),
-		    );
-	    // Learned: composer clearing + stop button or assistant presence is a reliable fallback signal.
-      const editorValue = editor?.innerText ?? '';
-      const fallbackValue = fallback?.value ?? '';
-      const activeEmpty =
-        activeInputs.length === 0 ? null : activeInputs.every((node) => !String(readValue(node)).trim());
-      const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      const inConversation = /\\/c\\//.test(href);
-		    return {
-        baseline,
-	      userMatched,
-	      prefixMatched,
-	      lastMatched,
-	      hasNewTurn,
-	      stopVisible,
-      assistantVisible,
+    const editor = document.querySelector(${primarySelectorLiteral});
+    const fallback = document.querySelector(${fallbackSelectorLiteral});
+    const inputSelectors = ${inputSelectorsLiteral};
+    const baseline = ${baseline};
+    const normalize = (value) => {
+      let text = value?.toLowerCase?.() ?? '';
+      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
+      text = text.replace(/\`\`\`/g, ' ');
+      text = text.replace(/\`([^\`]*)\`/g, '$1');
+      return text.replace(/\\s+/g, ' ').trim();
+    };
+    const normalizedPrompt = normalize(${encodedPrompt});
+    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
+    const articles = ${buildConversationTurnListExpression()};
+    const readValue = (node) => {
+      if (!node) return '';
+      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
+      return node.innerText ?? '';
+    };
+    const isVisible = (node) => {
+      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const isUserTurn = (node) => {
+      const role = String(
+        node?.getAttribute?.('data-message-author-role') ||
+          node?.getAttribute?.('data-turn') ||
+          node?.dataset?.turn ||
+          '',
+      ).toLowerCase();
+      return role === 'user' || Boolean(node?.querySelector?.('[data-message-author-role="user"]'));
+    };
+    const readTurnId = (node) => {
+      const value =
+        node?.getAttribute?.('data-turn-id') ||
+        node?.dataset?.turnId ||
+        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+    const readMessageId = (node) => {
+      const messageNode = node?.matches?.('[data-message-id]')
+        ? node
+        : node?.querySelector?.('[data-message-id]');
+      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+    const matchesPrompt = (text) =>
+      normalizedPrompt.length > 0 &&
+      (text === normalizedPrompt ||
+        text.includes(normalizedPrompt) ||
+        (normalizedPromptPrefix.length > 30 && text.includes(normalizedPromptPrefix)));
+    let matchedUserTurnIndex = null;
+    let matchedUserTurnId = null;
+    let matchedUserMessageId = null;
+    for (let index = baseline; index < articles.length; index += 1) {
+      const node = articles[index];
+      if (!isUserTurn(node)) continue;
+      const text = normalize(node?.innerText || node?.textContent || '');
+      if (!matchesPrompt(text)) continue;
+      matchedUserTurnIndex = index;
+      matchedUserTurnId = readTurnId(node);
+      matchedUserMessageId = readMessageId(node);
+      break;
+    }
+    const inputs = inputSelectors
+      .map((selector) => document.querySelector(selector))
+      .filter((node) => Boolean(node));
+    const visibleInputs = inputs.filter((node) => isVisible(node));
+    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+    const editorValue = editor?.innerText ?? '';
+    const fallbackValue = fallback?.value ?? '';
+    const activeEmpty =
+      activeInputs.length === 0 ? null : activeInputs.every((node) => !String(readValue(node)).trim());
+    const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
+    const href = typeof location === 'object' && location.href ? location.href : '';
+    const conversationId = href.match(/\\/c\\/([^/?#]+)/)?.[1] ?? null;
+    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
+    return {
+      baseline,
+      matchedUserTurnIndex,
+      matchedUserTurnId,
+      matchedUserMessageId,
+      hasNewTurn: articles.length > baseline,
+      stopVisible: Boolean(document.querySelector(${stopSelectorLiteral})),
+      assistantVisible: Boolean(
+        document.querySelector(${assistantSelectorLiteral}) ||
+          document.querySelector('[data-testid*="assistant"]'),
+      ),
       composerCleared,
-      inConversation,
+      inConversation: Boolean(conversationId),
+      conversationId,
       href,
       fallbackValue,
       editorValue,
-      lastTurn,
-      turnsCount: normalizedTurns.length,
+      lastTurn: normalizedTurns[normalizedTurns.length - 1] ?? '',
+      turnsCount: articles.length,
     };
   })()`;
 
@@ -894,19 +915,25 @@ export async function verifyPromptCommitted(
     if (info && typeof info === "object") {
       lastProbe = info;
     }
-    const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
-    const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
-    const baselineUnknown =
-      typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
-    if (matchesPrompt && (baselineUnknown || info?.hasNewTurn)) {
-      return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
-    }
-    const fallbackCommit =
-      info?.composerCleared &&
-      Boolean(info?.hasNewTurn) &&
-      ((info?.stopVisible ?? false) || info?.assistantVisible || info?.inConversation);
-    if (fallbackCommit) {
-      return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
+    const turnsCount = info?.turnsCount;
+    const userTurnIndex = info?.matchedUserTurnIndex;
+    const conversationId = info?.conversationId?.trim();
+    if (
+      typeof turnsCount === "number" &&
+      Number.isFinite(turnsCount) &&
+      typeof userTurnIndex === "number" &&
+      Number.isInteger(userTurnIndex) &&
+      userTurnIndex >= baseline &&
+      turnsCount > userTurnIndex &&
+      conversationId
+    ) {
+      return {
+        committedTurns: Math.floor(turnsCount),
+        verifiedUserTurnIndex: userTurnIndex,
+        ...(info?.matchedUserTurnId ? { verifiedUserTurnId: info.matchedUserTurnId } : {}),
+        ...(info?.matchedUserMessageId ? { verifiedUserMessageId: info.matchedUserMessageId } : {}),
+        conversationId,
+      };
     }
     await delay(100);
   }
@@ -945,14 +972,15 @@ export async function verifyPromptCommitted(
 
 interface CommitProbeState {
   baseline?: number;
-  userMatched?: boolean;
-  prefixMatched?: boolean;
-  lastMatched?: boolean;
+  matchedUserTurnIndex?: number | null;
+  matchedUserTurnId?: string | null;
+  matchedUserMessageId?: string | null;
   hasNewTurn?: boolean;
   stopVisible?: boolean;
   assistantVisible?: boolean;
   composerCleared?: boolean;
   inConversation?: boolean;
+  conversationId?: string | null;
   turnsCount?: number;
   href?: string;
   editorValue?: string;
@@ -960,14 +988,14 @@ interface CommitProbeState {
   lastTurn?: string;
 }
 
-// Keep booleans/counts but replace free text with lengths so session metadata stays lean.
+// Keep booleans/counts but replace free text and stable ids with lengths/presence.
 function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> {
   return {
     baseline: probe.baseline,
     turnsCount: probe.turnsCount,
-    userMatched: probe.userMatched,
-    prefixMatched: probe.prefixMatched,
-    lastMatched: probe.lastMatched,
+    matchedUserTurnIndex: probe.matchedUserTurnIndex,
+    matchedUserTurnIdPresent: Boolean(probe.matchedUserTurnId),
+    matchedUserMessageIdPresent: Boolean(probe.matchedUserMessageId),
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,

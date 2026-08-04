@@ -6,20 +6,36 @@ import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
+  captureChromeProcessIdentity,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
   terminateRecordedChromeForProfile,
-  writeChromePid,
+  writeChromeProcessIdentity,
+  type ChromeProcessIdentity,
 } from "./profileState.js";
 import { delay } from "./utils.js";
 import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
+
+export type ChromeLaunchResult = Omit<LaunchedChrome, "kill"> & {
+  kill: () => Promise<void>;
+  host?: string;
+  processIdentity: ChromeProcessIdentity;
+};
+type CapturedChromeLaunch = LaunchedChrome & {
+  host?: string;
+  processIdentity: ChromeProcessIdentity;
+};
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
   standardLaunch?: typeof launch;
   customHostLaunch?: typeof launchWithCustomHost;
   hiddenMacLaunch?: typeof launchHiddenMacChrome;
+  resolveLaunchRoute?: typeof resolveWslChromeLaunchRoute;
+  captureProcessIdentity?: typeof captureChromeProcessIdentity;
+  writeProcessIdentity?: typeof writeChromeProcessIdentity;
+  terminateRecordedProcess?: typeof terminateRecordedChromeForProfile;
 }
 
 export async function launchChrome(
@@ -27,8 +43,10 @@ export async function launchChrome(
   userDataDir: string,
   logger: BrowserLogger,
   deps: ChromeLaunchDeps = {},
-) {
-  const { connectHost, debugBindAddress, usePatchedLauncher } = resolveWslChromeLaunchRoute();
+): Promise<ChromeLaunchResult> {
+  const { connectHost, debugBindAddress, usePatchedLauncher } = (
+    deps.resolveLaunchRoute ?? resolveWslChromeLaunchRoute
+  )();
   const debugPort = config.debugPort ?? parseDebugPortEnv();
   const chromeFlags = buildChromeFlags(
     config.headless ?? false,
@@ -53,14 +71,18 @@ export async function launchChrome(
   }
 
   let launcher: LaunchedChrome & { host?: string };
+  let processIdentity: ChromeProcessIdentity | undefined;
   if (hiddenHeadfulLaunch) {
-    launcher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
+    const hiddenLauncher = await (deps.hiddenMacLaunch ?? launchHiddenMacChrome)({
       chromeFlags: launchOptions.chromeFlags,
       chromePath: config.chromePath ?? undefined,
       userDataDir,
       requestedPort: debugPort ?? undefined,
       ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+      captureProcessIdentity: deps.captureProcessIdentity ?? captureChromeProcessIdentity,
     });
+    launcher = hiddenLauncher;
+    processIdentity = hiddenLauncher.processIdentity;
   } else if (usePatchedLauncher) {
     launcher = await (deps.customHostLaunch ?? launchWithCustomHost)({
       chromeFlags: launchOptions.chromeFlags,
@@ -83,14 +105,104 @@ export async function launchChrome(
       { host: "127.0.0.1" },
     );
   }
+  processIdentity ??= await captureLaunchedChromeProcessIdentity(
+    userDataDir,
+    launcher,
+    deps.captureProcessIdentity ?? captureChromeProcessIdentity,
+  );
+  const kill = await createProvisionalIdentityBoundChromeKill(
+    userDataDir,
+    processIdentity,
+    launcher.kill.bind(launcher),
+    {
+      writeIdentity: deps.writeProcessIdentity,
+      terminate: deps.terminateRecordedProcess,
+    },
+  );
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
   logger(
     `${hiddenHeadfulLaunch ? "Launched hidden background Chrome" : "Launched Chrome"}${pidLabel} on port ${launcher.port}${hostLabel}`,
   );
-  return Object.assign(launcher, { host: connectHost ?? "127.0.0.1" }) as LaunchedChrome & {
-    host?: string;
+  return Object.assign(launcher, {
+    host: connectHost ?? "127.0.0.1",
+    processIdentity,
+    kill,
+  }) as ChromeLaunchResult;
+}
+
+async function captureLaunchedChromeProcessIdentity(
+  userDataDir: string,
+  launcher: LaunchedChrome,
+  capture: typeof captureChromeProcessIdentity,
+): Promise<ChromeProcessIdentity> {
+  const pid = launcher.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    const identityError = new Error(
+      `Launched Chrome for ${userDataDir} did not report a valid process id.`,
+    );
+    try {
+      await launcher.kill();
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [identityError, rollbackError],
+        `Launched Chrome for ${userDataDir} did not report a valid process id, and launch rollback also failed.`,
+      );
+    }
+    throw identityError;
+  }
+  try {
+    return await capture(userDataDir, pid);
+  } catch (error) {
+    try {
+      await launcher.kill();
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        `Failed to capture Chrome process identity for ${userDataDir}, and launch rollback also failed.`,
+      );
+    }
+    throw new Error(`Failed to capture Chrome process identity for ${userDataDir}.`, {
+      cause: error,
+    });
+  }
+}
+
+export function createIdentityBoundChromeKill(
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+  terminate: typeof terminateRecordedChromeForProfile = terminateRecordedChromeForProfile,
+): () => Promise<void> {
+  return async () => {
+    await terminate(userDataDir, processIdentity);
   };
+}
+
+export async function createProvisionalIdentityBoundChromeKill(
+  userDataDir: string,
+  processIdentity: ChromeProcessIdentity,
+  rollbackKill: () => void | Promise<void>,
+  deps: {
+    writeIdentity?: typeof writeChromeProcessIdentity;
+    terminate?: typeof terminateRecordedChromeForProfile;
+  } = {},
+): Promise<() => Promise<void>> {
+  try {
+    await (deps.writeIdentity ?? writeChromeProcessIdentity)(userDataDir, processIdentity);
+  } catch (error) {
+    try {
+      await rollbackKill();
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        `Failed to persist Chrome process identity for ${userDataDir}, and launch rollback also failed.`,
+      );
+    }
+    throw new Error(`Failed to persist Chrome process identity for ${userDataDir}.`, {
+      cause: error,
+    });
+  }
+  return createIdentityBoundChromeKill(userDataDir, processIdentity, deps.terminate);
 }
 
 export async function positionChromeWindowOffscreen(
@@ -234,9 +346,9 @@ export async function connectToRemoteChrome(
     const targetConnection = await connectToNewTarget(host, port, targetUrl, logger, {
       opened: () => `Opened dedicated remote Chrome tab targeting ${targetUrl}`,
       openFailed: (message) =>
-        `Failed to open dedicated remote Chrome tab (${message}); falling back to first target.`,
+        `Failed to open dedicated remote Chrome tab (${message}); falling back to an existing page target.`,
       attachFailed: (targetId, message) =>
-        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to first target.`,
+        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to an existing page target.`,
       closeFailed: (targetId, message) =>
         `Failed to close unused remote Chrome tab ${targetId}: ${message}`,
     });
@@ -244,25 +356,30 @@ export async function connectToRemoteChrome(
       return {
         client: targetConnection.client,
         targetId: targetConnection.targetId,
+        ownership: "created",
         close: async () => {
           await targetConnection.client.close().catch(() => undefined);
         },
       };
     }
   }
-  const fallbackClient = await CDP({ host, port });
-  logger(`Connected to remote Chrome DevTools protocol at ${host}:${port}`);
-  return {
-    client: fallbackClient,
-    close: async () => {
-      await fallbackClient.close().catch(() => undefined);
-    },
-  };
+  const targets = await listRemoteChromeTargets({ host, port });
+  const fallbackTarget = targets.find((target) => target.type === "page" && target.targetId);
+  if (!fallbackTarget?.targetId) {
+    throw new Error(`No attachable remote Chrome page target is available at ${host}:${port}.`);
+  }
+  logger(`Attached to existing remote Chrome tab ${fallbackTarget.targetId}`);
+  return await connectToRemoteChromeTarget(host, port, logger, {
+    targetId: fallbackTarget.targetId,
+  });
 }
+
+export type RemoteTargetOwnership = "created" | "attached";
 
 export interface RemoteChromeConnection {
   client: ChromeClient;
-  targetId?: string;
+  targetId: string;
+  ownership: RemoteTargetOwnership;
   browserWSEndpoint?: string;
   close: () => Promise<void>;
 }
@@ -291,8 +408,17 @@ export async function listRemoteChromeTargets(options: {
   browserWSEndpoint?: string;
 }): Promise<RemoteTargetInfo[]> {
   if (!options.browserWSEndpoint) {
-    const targets = await CDP.List({ host: options.host, port: options.port });
-    return targets as unknown as RemoteTargetInfo[];
+    const targets = (await CDP.List({ host: options.host, port: options.port })) as Array<{
+      id?: string;
+      targetId?: string;
+      type?: string;
+      url?: string;
+    }>;
+    return targets.map((target) => ({
+      targetId: target.targetId ?? target.id,
+      type: target.type,
+      url: target.url,
+    }));
   }
   const browser = await CDP({ target: options.browserWSEndpoint, local: true });
   try {
@@ -320,10 +446,14 @@ export async function connectToRemoteChromeTarget(
   },
 ): Promise<RemoteChromeConnection> {
   if (!options.browserWSEndpoint) {
+    if (!options.targetId) {
+      throw new Error("A target id is required to attach to remote Chrome over HTTP.");
+    }
     const client = await CDP({ host, port, target: options.targetId });
     return {
       client,
       targetId: options.targetId,
+      ownership: "attached",
       close: async () => {
         await client.close().catch(() => undefined);
       },
@@ -337,6 +467,7 @@ export async function connectToRemoteChromeTarget(
     logger,
     options.approvalWaitMs,
   );
+  const ownership: RemoteTargetOwnership = options.targetId ? "attached" : "created";
   let targetId = options.targetId;
   try {
     if (!targetId) {
@@ -352,6 +483,7 @@ export async function connectToRemoteChromeTarget(
       client,
       targetId,
       browserWSEndpoint: options.browserWSEndpoint,
+      ownership,
       close: async () => {
         await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
           () => undefined,
@@ -363,6 +495,14 @@ export async function connectToRemoteChromeTarget(
       },
     };
   } catch (error) {
+    if (ownership === "created" && targetId) {
+      try {
+        await browser.Target.closeTarget({ targetId });
+      } catch (closeError) {
+        const message = closeError instanceof Error ? closeError.message : String(closeError);
+        logger(`Failed to close unused remote Chrome tab ${targetId}: ${message}`);
+      }
+    }
     await browser.close().catch(() => undefined);
     throw error;
   }
@@ -624,23 +764,20 @@ export async function closeChromeTarget(options: {
   logger: BrowserLogger;
   host?: string;
   browserWSEndpoint?: string;
-  retainChrome: boolean;
 }): Promise<boolean> {
   const host = options.host ?? "127.0.0.1";
   if (!options.browserWSEndpoint) {
-    if (options.retainChrome) {
-      const replacement = await ensureChromePageTargetAfterClose(
-        options.port,
-        options.targetId,
-        options.logger,
-        host,
+    const replacement = await ensureChromePageTargetAfterClose(
+      options.port,
+      options.targetId,
+      options.logger,
+      host,
+    );
+    if (!replacement) {
+      options.logger(
+        `[browser] Leaving browser tab ${options.targetId} open because Chrome has no replacement page target.`,
       );
-      if (!replacement) {
-        options.logger(
-          `[browser] Leaving browser tab ${options.targetId} open because Chrome has no replacement page target.`,
-        );
-        return false;
-      }
+      return false;
     }
     return closeTab(options.port, options.targetId, options.logger, host);
   }
@@ -654,10 +791,7 @@ export async function closeChromeTarget(options: {
       options.logger(`Closed isolated browser tab (target=${options.targetId})`);
       return true;
     }
-    if (
-      options.retainChrome &&
-      !targets.some((target) => target.type === "page" && target.targetId !== options.targetId)
-    ) {
+    if (!targets.some((target) => target.type === "page" && target.targetId !== options.targetId)) {
       const created = await browser.Target.createTarget({ url: "about:blank" });
       if (!created.targetId) {
         options.logger(
@@ -830,13 +964,15 @@ async function launchHiddenMacChrome({
   userDataDir,
   requestedPort,
   ignoreDefaultFlags,
+  captureProcessIdentity,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
   userDataDir: string;
   requestedPort?: number;
   ignoreDefaultFlags?: boolean;
-}): Promise<LaunchedChrome & { host?: string }> {
+  captureProcessIdentity: typeof captureChromeProcessIdentity;
+}): Promise<CapturedChromeLaunch> {
   const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
   if (!resolvedChromePath) {
     throw new Error("Chrome is not installed.");
@@ -862,17 +998,29 @@ async function launchHiddenMacChrome({
       `Hidden Chrome started on port ${port}, but its process could not be identified.`,
     );
   }
-  await writeChromePid(userDataDir, discovered.pid);
-  return {
+  const provisionalLauncher = {
     pid: discovered.pid,
     port,
     process: undefined,
     remoteDebuggingPipes: null,
     kill: async () => {
-      await terminateRecordedChromeForProfile(userDataDir);
+      try {
+        process.kill(discovered.pid, "SIGTERM");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
     },
     host: "127.0.0.1",
   } as unknown as LaunchedChrome & { host?: string };
+  const processIdentity = await captureLaunchedChromeProcessIdentity(
+    userDataDir,
+    provisionalLauncher,
+    captureProcessIdentity,
+  );
+  return {
+    ...provisionalLauncher,
+    processIdentity,
+  } as CapturedChromeLaunch;
 }
 
 async function reserveLoopbackPort(): Promise<number> {

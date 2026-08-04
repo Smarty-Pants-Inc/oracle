@@ -52,6 +52,7 @@ import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+import { persistDurableBrowserAnswer } from "./durableAnswer.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -140,46 +141,92 @@ export async function performSessionRun({
         },
         runnerDeps,
       );
-      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
-      await sendSessionNotification(
-        {
+      currentBrowser = {
+        config: browserConfig,
+        runtime: result.runtime,
+        archive: result.archive,
+        modelSelection: result.modelSelection,
+        warnings: result.warnings,
+      };
+      let durablyCompleted = false;
+      try {
+        const answerReceipt = await persistDurableBrowserAnswer({
           sessionId: sessionMeta.id,
-          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-          mode,
-          model: sessionMeta.model,
-          usage: result.usage,
-          characters: result.answerText?.length,
-        },
-        notificationSettings,
-        log,
-        result.answerText?.slice(0, 140),
-      );
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+          answer: result.answerText ?? "",
+        });
+        await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
+        await sendSessionNotification(
+          {
+            sessionId: sessionMeta.id,
+            sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
+            mode,
+            model: sessionMeta.model,
+            usage: result.usage,
+            characters: result.answerText?.length,
+          },
+          notificationSettings,
+          log,
+          result.answerText?.slice(0, 140),
+        );
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            usage: result.usage,
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
           status: "completed",
           completedAt: new Date().toISOString(),
           usage: result.usage,
+          elapsedMs: result.elapsedMs,
+          errorMessage: undefined,
+          browser: currentBrowser,
+          artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, result.artifacts), [
+            answerReceipt.artifact,
+          ]),
+          response: undefined,
+          transport: undefined,
+          error: undefined,
         });
+        durablyCompleted = true;
+        const finalization = await result.finalize();
+        currentBrowser = { ...currentBrowser, runtime: finalization.runtime };
+        await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
+        if (finalization.status === "pending") {
+          log(
+            kleur.yellow(
+              `Browser capture completed; cleanup remains pending: ${finalization.error}`,
+            ),
+          );
+        }
+        return;
+      } catch (error) {
+        if (!durablyCompleted) {
+          try {
+            const abortion = await result.abort();
+            currentBrowser = { ...currentBrowser, runtime: abortion.runtime };
+          } catch (abortError) {
+            currentBrowser = {
+              ...currentBrowser,
+              runtime: {
+                ...result.runtime,
+                recoveryCleanupResult: {
+                  status: "failed",
+                  error: `Capture abort failed: ${formatError(abortError)}`,
+                },
+              },
+            };
+          }
+          throw error;
+        }
+        log(
+          dim(
+            `Browser capture completed, but cleanup state persistence failed: ${formatError(error)}`,
+          ),
+        );
+        return;
       }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage: result.usage,
-        elapsedMs: result.elapsedMs,
-        errorMessage: undefined,
-        browser: {
-          config: browserConfig,
-          runtime: result.runtime,
-          archive: result.archive,
-          modelSelection: result.modelSelection,
-          warnings: result.warnings,
-        },
-        artifacts: mergeArtifacts(sessionMeta.artifacts, result.artifacts),
-        response: undefined,
-        transport: undefined,
-        error: undefined,
-      });
-      return;
     }
     const multiModels = Array.isArray(runOptions.models) ? runOptions.models.filter(Boolean) : [];
     if (multiModels.length > 1) {
@@ -528,9 +575,7 @@ export async function performSessionRun({
       runtime: BrowserRuntimeMetadata | null | undefined,
     ): void => {
       if (reattachGuidanceLogged || mode !== "browser") return;
-      if (!hasRecoverableChatGptConversation(runtime) && runtime?.promptSubmitted !== true) {
-        return;
-      }
+      if (!hasRecoverableChatGptConversation(runtime)) return;
       reattachGuidanceLogged = true;
       log(formatBrowserReattachGuidance(sessionMeta.id));
     };
@@ -541,17 +586,8 @@ export async function performSessionRun({
       const recoverableDisconnect =
         (userError.details as { recoverableDisconnect?: boolean } | undefined)
           ?.recoverableDisconnect === true;
-      const hasRecoveryLocator = Boolean(
-        hasRecoverableChatGptConversation(recoverableRuntime) ||
-        recoverableRuntime?.chromePort ||
-        recoverableRuntime?.chromeBrowserWSEndpoint ||
-        recoverableRuntime?.chromeProfileRoot,
-      );
-      if (
-        !recoverableDisconnect ||
-        recoverableRuntime?.promptSubmitted !== true ||
-        !hasRecoveryLocator
-      ) {
+      const hasRecoveryAuthority = hasRecoverableChatGptConversation(recoverableRuntime);
+      if (!recoverableDisconnect || !hasRecoveryAuthority) {
         log(
           dim(
             "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
@@ -652,7 +688,8 @@ export async function performSessionRun({
       };
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       const autoRuntime = runtime ?? currentBrowser?.runtime;
-      const willAutoReattach = autoReattachIntervalMs > 0 && Boolean(autoRuntime);
+      const willAutoReattach =
+        autoReattachIntervalMs > 0 && hasRecoverableChatGptConversation(autoRuntime);
       if (willAutoReattach) {
         if (modelForStatus) {
           await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -1228,6 +1265,11 @@ async function autoReattachUntilComplete({
       captureSucceeded = true;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
+      const answerReceipt = await persistDurableBrowserAnswer({
+        sessionId: sessionMeta.id,
+        answer: answerText,
+        logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
+      });
       const artifacts = await ensureSessionArtifacts({
         sessionId: sessionMeta.id,
         prompt: runOptions.prompt,
@@ -1237,11 +1279,6 @@ async function autoReattachUntilComplete({
         existingArtifacts: sessionMeta.artifacts,
         logger,
       });
-      const logWriter = sessionStore.createLogWriter(sessionMeta.id);
-      logWriter.logLine(`[auto-reattach] captured assistant response on attempt ${attempt}`);
-      logWriter.logLine("Answer:");
-      logWriter.logLine(answerText);
-      logWriter.stream.end();
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "completed",
@@ -1283,7 +1320,9 @@ async function autoReattachUntilComplete({
           config: browserConfig,
           runtime: reattachResult.runtime,
         },
-        artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
+        artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, artifacts), [
+          answerReceipt.artifact,
+        ]),
         response: { status: "completed" },
         error: undefined,
         transport: undefined,
@@ -1308,9 +1347,6 @@ async function autoReattachUntilComplete({
       }
       return true;
     } catch (error) {
-      if (reattachResult && !durablyCompleted) {
-        await reattachResult.abandon().catch(() => undefined);
-      }
       if (durablyCompleted) {
         log(
           dim(
@@ -1321,12 +1357,6 @@ async function autoReattachUntilComplete({
       }
       if (captureSucceeded) {
         const message = formatError(error);
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-          });
-        }
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
@@ -1339,6 +1369,16 @@ async function autoReattachUntilComplete({
           response: { status: "error", incompleteReason: "incomplete-capture" },
           error: { category: "internal", message },
         });
+        try {
+          if (modelForStatus) {
+            await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+              status: "error",
+              completedAt: new Date().toISOString(),
+            });
+          }
+        } finally {
+          await reattachResult?.abandon().catch(() => undefined);
+        }
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);

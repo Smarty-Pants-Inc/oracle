@@ -13,7 +13,12 @@ import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserArchiveResult, BrowserLogger } from "./types.js";
+import type {
+  BrowserArchiveResult,
+  BrowserCaptureFinalizationResult,
+  BrowserLogger,
+  BrowserRunTransaction,
+} from "./types.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -39,6 +44,8 @@ export interface BrowserExecutionResult {
   warnings?: BrowserRunWarning[];
   answerText: string;
   artifacts?: SessionArtifact[];
+  finalize: () => Promise<BrowserCaptureFinalizationResult>;
+  abort: () => Promise<BrowserCaptureFinalizationResult>;
 }
 
 interface RunBrowserSessionArgs {
@@ -50,11 +57,23 @@ interface RunBrowserSessionArgs {
 
 export interface BrowserSessionRunnerDeps {
   assemblePrompt?: typeof assembleBrowserPrompt;
-  executeBrowser?: typeof runBrowserMode;
+  executeBrowser?: (
+    options: Parameters<typeof runBrowserMode>[0],
+  ) => Promise<BrowserRunResult | BrowserRunTransaction>;
   persistRuntimeHint?: (
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
   ) => Promise<void> | void;
+}
+
+function isBrowserRunTransaction(
+  result: BrowserRunResult | BrowserRunTransaction,
+): result is BrowserRunTransaction {
+  return (
+    "runtime" in result &&
+    typeof result.finalize === "function" &&
+    typeof result.abort === "function"
+  );
 }
 
 const LARGE_PRO_FAST_INPUT_TOKEN_THRESHOLD = 25_000;
@@ -201,7 +220,7 @@ export async function runBrowserSessionExecution(
   const executionBrowserConfig = runOptions.browserResumeConversationUrl
     ? { ...browserConfig, resumeConversationUrl: runOptions.browserResumeConversationUrl }
     : browserConfig;
-  let browserResult: BrowserRunResult;
+  let browserResult: BrowserRunResult | BrowserRunTransaction;
   try {
     browserResult = await executeBrowser({
       prompt: promptArtifacts.composerText,
@@ -239,75 +258,77 @@ export async function runBrowserSessionExecution(
     const message = error instanceof Error ? error.message : "Browser automation failed.";
     throw new BrowserAutomationError(message, { stage: "execute-browser" }, error);
   }
-  const modelSelection =
-    browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
-  if (modelSelection) {
-    log(
-      `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
-    );
-  }
-  const warnings = buildBrowserRunWarnings({
-    runOptions,
-    browserConfig,
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    elapsedMs: browserResult.tookMs,
-    modelSelection,
-  });
-  for (const warning of warnings) {
-    log(chalk.yellow(`[browser] ${warning.message}`));
-  }
-  if (!runOptions.silent) {
-    log(chalk.bold("Answer:"));
-    log(browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"));
-    log("");
-  }
-  const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
-  const savedArtifacts = await ensureSessionArtifacts({
-    sessionId: runOptions.sessionId,
-    prompt: promptArtifacts.composerText,
-    answerMarkdown: answerText,
-    conversationUrl: browserResult.tabUrl,
-    browserConfig,
-    existingArtifacts: browserResult.artifacts,
-    logger: automationLogger,
-  });
-  const usage = {
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    outputTokens: browserResult.answerTokens,
-    reasoningTokens: 0,
-    totalTokens: promptArtifacts.estimatedInputTokens + browserResult.answerTokens,
-  };
-  const tokensDisplay = [
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.reasoningTokens,
-    usage.totalTokens,
-  ]
-    .map((value) => formatTokenCount(value))
-    .join("/");
-  const tokensPart = (() => {
-    const parts = tokensDisplay.split("/");
-    if (parts.length !== 4) return tokensDisplay;
-    return `↑${parts[0]} ↓${parts[1]} ↻${parts[2]} Δ${parts[3]}`;
-  })();
-  const { line1, line2 } = formatFinishLine({
-    elapsedMs: browserResult.tookMs,
-    model: `${resolveBrowserModelDisplayName({ model: runOptions.model, evidence: modelSelection })}[browser]`,
-    tokensPart,
-    detailParts: [
-      runOptions.file && runOptions.file.length > 0 ? `files=${runOptions.file.length}` : null,
-    ],
-  });
-  log(chalk.blue(line1));
-  if (line2) {
-    log(chalk.dim(line2));
-  }
-  return {
-    usage,
-    elapsedMs: browserResult.tookMs,
-    runtime: {
+  const browserTransaction = isBrowserRunTransaction(browserResult) ? browserResult : null;
+  try {
+    const modelSelection =
+      browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
+    if (modelSelection) {
+      log(
+        `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
+      );
+    }
+    const warnings = buildBrowserRunWarnings({
+      runOptions,
+      browserConfig,
+      inputTokens: promptArtifacts.estimatedInputTokens,
+      elapsedMs: browserResult.tookMs,
+      modelSelection,
+    });
+    for (const warning of warnings) {
+      log(chalk.yellow(`[browser] ${warning.message}`));
+    }
+    if (!runOptions.silent) {
+      log(chalk.bold("Answer:"));
+      log(
+        browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"),
+      );
+      log("");
+    }
+    const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
+    const savedArtifacts = await ensureSessionArtifacts({
+      sessionId: runOptions.sessionId,
+      prompt: promptArtifacts.composerText,
+      answerMarkdown: answerText,
+      conversationUrl: browserResult.tabUrl,
+      browserConfig,
+      existingArtifacts: browserResult.artifacts,
+      logger: automationLogger,
+    });
+    const usage = {
+      inputTokens: promptArtifacts.estimatedInputTokens,
+      outputTokens: browserResult.answerTokens,
+      reasoningTokens: 0,
+      totalTokens: promptArtifacts.estimatedInputTokens + browserResult.answerTokens,
+    };
+    const tokensDisplay = [
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.reasoningTokens,
+      usage.totalTokens,
+    ]
+      .map((value) => formatTokenCount(value))
+      .join("/");
+    const tokensPart = (() => {
+      const parts = tokensDisplay.split("/");
+      if (parts.length !== 4) return tokensDisplay;
+      return `↑${parts[0]} ↓${parts[1]} ↻${parts[2]} Δ${parts[3]}`;
+    })();
+    const { line1, line2 } = formatFinishLine({
+      elapsedMs: browserResult.tookMs,
+      model: `${resolveBrowserModelDisplayName({ model: runOptions.model, evidence: modelSelection })}[browser]`,
+      tokensPart,
+      detailParts: [
+        runOptions.file && runOptions.file.length > 0 ? `files=${runOptions.file.length}` : null,
+      ],
+    });
+    log(chalk.blue(line1));
+    if (line2) {
+      log(chalk.dim(line2));
+    }
+    const runtime: BrowserRuntimeMetadata = browserTransaction?.runtime ?? {
       browserTransport: browserResult.browserTransport,
       chromePid: browserResult.chromePid,
+      chromeProcessIdentity: browserResult.chromeProcessIdentity,
       chromePort: browserResult.chromePort,
       chromeHost: browserResult.chromeHost,
       chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
@@ -317,15 +338,30 @@ export async function runBrowserSessionExecution(
       tabUrl: browserResult.tabUrl,
       conversationId: browserResult.conversationId,
       promptSubmitted: browserResult.promptSubmitted,
+      promptEpoch: browserResult.promptEpoch,
       controllerPid: browserResult.controllerPid ?? process.pid,
       recoveryCleanup: browserResult.recoveryCleanup,
-    },
-    archive: browserResult.archive,
-    modelSelection,
-    warnings,
-    answerText,
-    artifacts: savedArtifacts,
-  };
+    };
+    const settledFinalization = async (): Promise<BrowserCaptureFinalizationResult> => ({
+      status: "completed",
+      runtime,
+    });
+    return {
+      usage,
+      elapsedMs: browserResult.tookMs,
+      runtime,
+      archive: browserResult.archive,
+      modelSelection,
+      warnings,
+      answerText,
+      artifacts: savedArtifacts,
+      finalize: browserTransaction?.finalize ?? settledFinalization,
+      abort: browserTransaction?.abort ?? settledFinalization,
+    };
+  } catch (error) {
+    await browserTransaction?.abort().catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function ensureSessionArtifacts(params: {

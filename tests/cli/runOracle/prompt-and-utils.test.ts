@@ -343,7 +343,7 @@ describe("oracle utility helpers", () => {
           return "";
         },
       };
-      await expect(readFiles([hugeFile], { cwd: dir, fsModule })).rejects.toThrow(
+      await expect(readFiles(["huge.bin"], { cwd: dir, fsModule })).rejects.toThrow(
         /exceed the 512 MB limit/i,
       );
     } finally {

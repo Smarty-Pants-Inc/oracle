@@ -11,6 +11,7 @@ import type {
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
+import type { ChromeProcessIdentity } from "./browser/profileState.js";
 import type {
   TransportFailureReason,
   ApiProviderMode,
@@ -104,6 +105,7 @@ export interface BrowserRecoveryCleanupResultMetadata {
 
 export interface BrowserRecoveryCleanupResourceMetadata {
   chromePid?: number;
+  chromeProcessIdentity?: ChromeProcessIdentity;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
@@ -113,9 +115,32 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   recoveryCleanup: BrowserRecoveryCleanupMetadata;
 }
 
+export type BrowserPromptEpoch =
+  | {
+      status: "pending";
+      epochId: string;
+      promptSha256: string;
+      baselineTurns: number;
+      followUpOrdinal: number;
+      remainingFollowUps: number;
+    }
+  | {
+      status: "committed";
+      epochId: string;
+      promptSha256: string;
+      baselineTurns: number;
+      followUpOrdinal: number;
+      remainingFollowUps: number;
+      verifiedUserTurnIndex: number;
+      verifiedUserTurnId?: string;
+      verifiedUserMessageId?: string;
+      conversationId: string;
+    };
+
 export interface BrowserRuntimeMetadata {
   browserTransport?: "cdp";
   chromePid?: number;
+  chromeProcessIdentity?: ChromeProcessIdentity;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
@@ -126,6 +151,8 @@ export interface BrowserRuntimeMetadata {
   conversationId?: string;
   /** True only after Oracle has semantically verified the current prompt in ChatGPT. */
   promptSubmitted?: boolean;
+  /** Durable authority for the current prompt epoch; committed evidence is turn- and conversation-bound. */
+  promptEpoch?: BrowserPromptEpoch;
   /** Authority required to retire resources after a recovered run reaches a terminal result. */
   recoveryCleanup?: BrowserRecoveryCleanupMetadata;
   /** Durable state for cleanup that must occur only after answer/session persistence. */

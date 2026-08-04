@@ -10,7 +10,7 @@ import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises"
 import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
-import type { BrowserRunResult } from "../browserMode.js";
+import type { BrowserRunResult, BrowserRunTransaction } from "../browserMode.js";
 import type {
   RemoteArtifactCapabilities,
   RemoteArtifactDescriptor,
@@ -48,7 +48,9 @@ export interface RemoteServerOptions {
 }
 
 interface RemoteServerDeps {
-  runBrowser?: typeof runBrowserMode;
+  runBrowser?: (
+    options: Parameters<typeof runBrowserMode>[0],
+  ) => Promise<BrowserRunResult | BrowserRunTransaction>;
 }
 
 interface RemoteServerInstance {
@@ -224,6 +226,8 @@ export async function createRemoteServer(
           attachments: BrowserAttachment[];
         }
       | undefined;
+    let browserTransaction: BrowserRunTransaction | null = null;
+    let capturePublished = false;
     try {
       const attachmentsPayload = Array.isArray(payload.attachments) ? payload.attachments : [];
       for (const [index, attachment] of attachmentsPayload.entries()) {
@@ -293,7 +297,7 @@ export async function createRemoteServer(
         }
       }
 
-      const result = await runBrowser({
+      const capture = await runBrowser({
         prompt: payload.prompt,
         attachments,
         fallbackSubmission,
@@ -309,6 +313,14 @@ export async function createRemoteServer(
         sessionId: payload.options.sessionId,
         followUpPrompts: payload.options.followUpPrompts,
       });
+      const result: BrowserRunResult = capture;
+      if (
+        "runtime" in capture &&
+        typeof capture.finalize === "function" &&
+        typeof capture.abort === "function"
+      ) {
+        browserTransaction = capture;
+      }
 
       const artifactRegistration = await registerRemoteArtifacts({
         runId,
@@ -332,6 +344,17 @@ export async function createRemoteServer(
         type: "result",
         result: sanitizeResult(result, artifactRegistration.warnings),
       });
+      capturePublished = true;
+      if (browserTransaction) {
+        const finalization = await browserTransaction.finalize().catch((error) => ({
+          status: "pending" as const,
+          runtime: browserTransaction?.runtime ?? {},
+          error: error instanceof Error ? error.message : String(error),
+        }));
+        if (finalization.status === "pending") {
+          logger(`[serve] Browser cleanup remains pending for run ${runId}: ${finalization.error}`);
+        }
+      }
       logger(
         `[serve] Run ${runId} completed in ${Date.now() - runStartedAt}ms${
           artifactDescriptors.length > 0
@@ -340,6 +363,9 @@ export async function createRemoteServer(
         }`,
       );
     } catch (error) {
+      if (browserTransaction && !capturePublished) {
+        await browserTransaction.abort().catch(() => undefined);
+      }
       const message = error instanceof Error ? error.message : String(error);
       sendEvent({ type: "error", message });
       logger(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${message}`);

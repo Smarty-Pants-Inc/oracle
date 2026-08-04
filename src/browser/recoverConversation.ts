@@ -3,7 +3,8 @@ import type { SessionMetadata } from "../sessionStore.js";
 import type { BrowserLogger } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { resolveBrowserConfig } from "./config.js";
-import { acquireManualLoginChromeForRun, isImageOnlyUiChromeText } from "./index.js";
+import { isImageOnlyUiChromeText } from "./index.js";
+import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
 import { harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
 
@@ -120,13 +121,13 @@ export function isRecoveredConversationHarvestReady(harvested: {
 }
 
 /**
- * Re-open a previously-harvested ChatGPT conversation by relaunching Chrome
- * with the session's persistent profile and navigating to the saved tab URL.
+ * Re-open a previously-harvested ChatGPT conversation by acquiring the canonical Chrome owner
+ * for the session's persistent profile and navigating a tab to the saved URL.
  *
  * Used as a fallback when `harvestChatGptTab` can find no live tab matching the
  * stored target (common after the original CLI run exits and closes its
  * browser). ChatGPT preserves attachments + history at the conversation URL,
- * so harvesting against the relaunched tab returns the original message + any
+ * so harvesting against the recovered tab returns the original message + any
  * assistant response that completed after the original run gave up.
  */
 export async function recoverConversationTab(
@@ -168,10 +169,12 @@ export async function recoverConversationTab(
   const config = resolveBrowserConfig(meta.browser?.config);
 
   logger(
-    `[browser] Recovery: relaunching Chrome with profile ${userDataDir} and navigating to ${url}`,
+    `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
   );
 
-  const { chrome } = await acquireManualLoginChromeForRun(userDataDir, config, logger, meta.id, {});
+  const owner = await acquireManualChromeOwner(userDataDir, config, logger, meta.id);
+  const { chrome } = owner;
+  const launchedChrome = owner.source === "launched" ? chrome : null;
   const host = chrome.host ?? "127.0.0.1";
   const port = chrome.port;
 
@@ -183,12 +186,14 @@ export async function recoverConversationTab(
 
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
 
-    return { host, port, url, ref: targetId, chrome };
+    return { host, port, url, ref: targetId, chrome: launchedChrome };
   } catch (error) {
-    try {
-      chrome.kill();
-    } catch {
-      // best-effort cleanup
+    if (launchedChrome) {
+      try {
+        await launchedChrome.kill();
+      } catch {
+        // Preserve the recovery error; cleanup is best effort here.
+      }
     }
     throw error;
   }

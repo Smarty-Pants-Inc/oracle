@@ -6,6 +6,24 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
+import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
+
+const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
+const PROCESS_NONCE_T = "22222222-2222-4222-8222-222222222222";
+
+function chromeIdentity(
+  normalizedUserDataDir: string,
+  overrides: Partial<ChromeProcessIdentity> = {},
+): ChromeProcessIdentity {
+  return {
+    pid: 4242,
+    processStartTime: "process-generation-s",
+    executablePath: "/usr/bin/google-chrome",
+    normalizedUserDataDir,
+    launchNonce: PROCESS_NONCE_S,
+    ...overrides,
+  };
+}
 
 describe("profileState", () => {
   test("writes DevToolsActivePort to both root and Default", async () => {
@@ -55,12 +73,18 @@ describe("profileState", () => {
       const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
       await once(child, "exit");
       await profileState.writeChromePid(dir, child.pid ?? 0);
+      await profileState.writeChromeProcessIdentity(dir, chromeIdentity(dir, { pid: child.pid }));
+      expect(existsSync(path.join(dir, "chrome-process-identity.json"))).toBe(true);
+      await expect(profileState.readChromeProcessIdentity(dir)).resolves.toEqual(
+        chromeIdentity(dir, { pid: child.pid }),
+      );
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
       });
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(false);
       }
+      expect(existsSync(path.join(dir, "chrome-process-identity.json"))).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -96,13 +120,28 @@ describe("profileState", () => {
     try {
       if (!child.pid) throw new Error("Failed to start Chrome fixture");
       await once(child, "message");
-      await profileState.writeChromePid(dir, child.pid);
+      const identity = chromeIdentity(dir, { pid: child.pid });
+      const processSnapshot = {
+        pid: child.pid,
+        processStartTime: identity.processStartTime,
+        executablePath: identity.executablePath,
+        commandLine: `/usr/bin/google-chrome --user-data-dir="${dir}"`,
+      };
 
       const signalReceived = once(child, "message").then(([message]) => {
         expect(message).toBe("sigterm");
         return "signal" as const;
       });
-      const termination = profileState.terminateRecordedChromeForProfile(dir);
+      const termination = profileState.terminateRecordedChromeForProfileForTest(
+        dir,
+        identity,
+        undefined,
+        {
+          platform: process.platform,
+          readIdentity: async () => identity,
+          readProcessSnapshot: async () => processSnapshot,
+        },
+      );
       await expect(
         Promise.race([termination.then(() => "terminated" as const), signalReceived]),
       ).resolves.toBe("signal");
@@ -126,17 +165,16 @@ describe("profileState", () => {
   test("reads and validates a Windows Chrome command line without case-sensitive path assumptions", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const command = String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="c:\users\oracle\appdata\local\temp\oracle-browser-session"`;
-    const execute = async (file: string, args: string[]) => {
-      expect(file).toBe("powershell.exe");
-      expect(args).toContain("-NonInteractive");
-      expect(args.at(-1)).toContain("ProcessId = 4242");
-      return { stdout: command };
-    };
-
-    await expect(profileState.readProcessCommandForTest(4242, "win32", execute)).resolves.toBe(
-      command,
+    expect(profileState.isChromeCommandForUserDataDirForTest(command, profileDir, "win32")).toBe(
+      true,
     );
-    expect(profileState.isChromeCommandForUserDataDirForTest(command, profileDir)).toBe(true);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\.\oracle-browser-session"`,
+        profileDir,
+        "win32",
+      ),
+    ).toBe(true);
 
     const terminationCalls: Array<{ file: string; args: string[] }> = [];
     const terminate = async (file: string, args: string[]) => {
@@ -148,6 +186,113 @@ describe("profileState", () => {
     expect(terminationCalls).toEqual([
       { file: "taskkill.exe", args: ["/PID", "4242", "/T"] },
       { file: "taskkill.exe", args: ["/PID", "4242", "/T", "/F"] },
+    ]);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session-other"`,
+        profileDir,
+        "win32",
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `${command} --user-data-dir="${profileDir}-other"`,
+        profileDir,
+        "win32",
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" "https://example.test/${profileDir}" --user-data-dir="${profileDir}-other"`,
+        profileDir,
+        "win32",
+      ),
+    ).toBe(false);
+  });
+
+  test("rejects stale Windows cleanup authority and revalidates before forced tree termination", async () => {
+    const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
+    const normalizedProfileDir = profileDir.toLowerCase();
+    const executablePath = String.raw`c:\program files\google\chrome\application\chrome.exe`;
+    const commandLine = String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session"`;
+    const sessionIdentity = chromeIdentity(normalizedProfileDir, {
+      executablePath,
+      processStartTime: "creation-s",
+    });
+    const laterIdentity = chromeIdentity(normalizedProfileDir, {
+      executablePath,
+      processStartTime: "creation-t",
+      launchNonce: PROCESS_NONCE_T,
+    });
+    const laterSnapshot = {
+      pid: laterIdentity.pid,
+      processStartTime: laterIdentity.processStartTime,
+      executablePath,
+      commandLine,
+    };
+    const rejectedCalls: Array<{ file: string; args: string[] }> = [];
+    await expect(
+      profileState.terminateRecordedChromeForProfileForTest(
+        profileDir,
+        sessionIdentity,
+        undefined,
+        {
+          platform: "win32",
+          readIdentity: async () => laterIdentity,
+          readProcessSnapshot: async () => laterSnapshot,
+          execute: async (file, args) => {
+            rejectedCalls.push({ file, args });
+            return { stdout: "SUCCESS" };
+          },
+          isProcessAlive: () => true,
+          isChromeUsingUserDataDir: async () => true,
+          waitForChromeProfileProcessesToExit: async () => false,
+        },
+      ),
+    ).resolves.toMatchObject({
+      status: "unsafe",
+      pid: 4242,
+      reason: `Chrome cleanup authority is stale for ${profileDir}`,
+    });
+    expect(rejectedCalls.some(({ file }) => file === "taskkill.exe")).toBe(false);
+
+    let snapshotRead = 0;
+    const sessionSnapshot = {
+      pid: sessionIdentity.pid,
+      processStartTime: sessionIdentity.processStartTime,
+      executablePath,
+      commandLine,
+    };
+    const calls: Array<{ file: string; args: string[] }> = [];
+    await expect(
+      profileState.terminateRecordedChromeForProfileForTest(
+        profileDir,
+        sessionIdentity,
+        undefined,
+        {
+          platform: "win32",
+          readIdentity: async () => sessionIdentity,
+          readProcessSnapshot: async () => {
+            const snapshot = snapshotRead === 0 ? sessionSnapshot : laterSnapshot;
+            snapshotRead += 1;
+            return snapshot;
+          },
+          execute: async (file, args) => {
+            calls.push({ file, args });
+            return { stdout: "SUCCESS" };
+          },
+          isProcessAlive: () => true,
+          isChromeUsingUserDataDir: async () => true,
+          waitForChromeProfileProcessesToExit: async () => false,
+        },
+      ),
+    ).resolves.toMatchObject({
+      status: "unsafe",
+      pid: 4242,
+      reason: "Chrome pid 4242 changed before forced termination",
+    });
+    expect(calls.filter(({ file }) => file === "taskkill.exe")).toEqual([
+      { file: "taskkill.exe", args: ["/PID", "4242", "/T"] },
     ]);
   });
 
@@ -270,7 +415,25 @@ describe("profileState", () => {
     ).toBe(true);
     expect(
       profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}/./`,
+        dir,
+      ),
+    ).toBe(true);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/other",
+        dir,
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}-other`,
+        dir,
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome https://example.test/${dir} --user-data-dir=/tmp/other`,
         dir,
       ),
     ).toBe(false);

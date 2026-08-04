@@ -1,6 +1,5 @@
 import chalk from "chalk";
 import kleur from "kleur";
-import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   SessionMetadata,
@@ -37,6 +36,7 @@ import {
   formatSessionBrowserModelWithRequestedKey,
   resolveSessionBrowserModelDisplayName,
 } from "../browser/modelDisplay.js";
+import { persistDurableBrowserAnswer } from "./durableAnswer.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? kleur.dim(text) : text);
@@ -110,28 +110,6 @@ export function isDeepResearchPlaceholderCapture(
   const modelUsage = metadata.models?.find((run) => run.model === metadata.model)?.usage;
   const outputTokens = metadata.usage?.outputTokens ?? modelUsage?.outputTokens;
   return isDeepResearchToolCallPlaceholder(answer, outputTokens);
-}
-
-async function writeReattachAnswer(
-  sessionId: string,
-  result: { answerText: string; answerMarkdown: string },
-  replaceExistingLog: boolean,
-): Promise<void> {
-  const body = result.answerMarkdown || result.answerText;
-  if (replaceExistingLog) {
-    const paths = await sessionStore.getPaths(sessionId);
-    await fs.writeFile(
-      paths.log,
-      `[reattach] replaced incomplete Deep Research capture from existing Chrome tab\nAnswer:\n${body}\n`,
-      "utf8",
-    );
-    return;
-  }
-  const logWriter = sessionStore.createLogWriter(sessionId);
-  logWriter.logLine("[reattach] captured assistant response from existing Chrome tab");
-  logWriter.logLine("Answer:");
-  logWriter.logLine(body);
-  logWriter.stream.end();
 }
 
 async function saveReattachBrowserArtifacts(
@@ -333,28 +311,19 @@ export async function attachSession(
   const hasRecoverableConversation = hasRecoverableChatGptConversation(runtime);
   const disconnectRecoveryAuthorized =
     !hasChromeDisconnect ||
-    ((metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
-      ?.recoverableDisconnect === true &&
-      runtime?.promptSubmitted === true);
+    (metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
+      ?.recoverableDisconnect === true;
   const explicitlyNonRecoverable =
-    runtime?.promptSubmitted === false ||
     (metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
       ?.recoverableDisconnect === false;
-  const hasLiveChromeFallback = Boolean(
-    (metadata.status === "running" || hasIncompleteCapture || completedDeepResearchPlaceholder) &&
-    (runtime?.chromePort || runtime?.chromeBrowserWSEndpoint || runtime?.chromeProfileRoot),
-  );
   const canReattach =
     (statusAllowsReattach || completedDeepResearchPlaceholder) &&
     metadata.mode === "browser" &&
     hasFallbackSessionInfo &&
+    hasRecoverableConversation &&
     !explicitlyNonRecoverable &&
     disconnectRecoveryAuthorized &&
     !workerAlive &&
-    (hasRecoverableConversation ||
-      runtime?.promptSubmitted ||
-      hasLiveChromeFallback ||
-      completedDeepResearchPlaceholder) &&
     (hasChromeDisconnect ||
       hasIncompleteCapture ||
       completedDeepResearchPlaceholder ||
@@ -386,13 +355,23 @@ export async function attachSession(
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
         },
       );
-      const outputTokens = estimateTokenCount(reattachResult.answerMarkdown);
-      const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, reattachResult);
-      await writeReattachAnswer(
+      const answerText = reattachResult.answerMarkdown || reattachResult.answerText;
+      const outputTokens = estimateTokenCount(answerText);
+      const answerReceipt = await persistDurableBrowserAnswer({
         sessionId,
-        reattachResult,
-        completedDeepResearchPlaceholder ||
+        answer: answerText,
+        logHeader:
+          completedDeepResearchPlaceholder ||
+          (hasIncompleteCapture && deepResearchPlaceholderCapture)
+            ? "[reattach] replaced incomplete Deep Research capture from existing Chrome tab"
+            : "[reattach] captured assistant response from existing Chrome tab",
+        replaceLog:
+          completedDeepResearchPlaceholder ||
           (hasIncompleteCapture && deepResearchPlaceholderCapture),
+      });
+      const artifacts = appendArtifacts(
+        await saveReattachBrowserArtifacts(sessionId, metadata, reattachResult),
+        [answerReceipt.artifact],
       );
       if (metadata.model) {
         await sessionStore.updateModelRun(metadata.id, metadata.model, {
@@ -449,7 +428,27 @@ export async function attachSession(
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
       if (reattachResult && !durablyCompleted) {
-        await reattachResult.abandon().catch(() => undefined);
+        let recoveryAuthorityPersisted = false;
+        try {
+          await sessionStore.updateSession(sessionId, {
+            browser: {
+              config: metadata.browser?.config,
+              runtime: reattachResult.runtime,
+              modelSelection: metadata.browser?.modelSelection,
+              warnings: metadata.browser?.warnings,
+            },
+          });
+          recoveryAuthorityPersisted = true;
+        } catch (authorityError) {
+          console.log(
+            chalk.red(
+              `Reattach cleanup authority could not be persisted: ${authorityError instanceof Error ? authorityError.message : String(authorityError)}`,
+            ),
+          );
+        }
+        if (recoveryAuthorityPersisted) {
+          await reattachResult.abandon().catch(() => undefined);
+        }
       }
       const message = error instanceof Error ? error.message : String(error);
       console.log(

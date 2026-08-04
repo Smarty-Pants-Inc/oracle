@@ -1,8 +1,10 @@
+import type { PromptCommitVerification } from "./actions/promptComposer.js";
+
 import type { BrowserLogger } from "./types.js";
 
 export type DomEvaluate = <T>(expression: string) => Promise<T | undefined>;
 export type PromptCommitEvidence =
-  | { status: "committed"; committedTurns?: number }
+  | { status: "committed"; verification: PromptCommitVerification }
   | { status: "attempted" };
 
 export interface ProviderDomFlowContext {

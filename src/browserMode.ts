@@ -2,6 +2,7 @@ export type {
   BrowserAutomationConfig,
   BrowserRunOptions,
   BrowserRunResult,
+  BrowserRunTransaction,
 } from "./browser/index.js";
 
 export {

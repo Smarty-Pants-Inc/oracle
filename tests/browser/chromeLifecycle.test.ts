@@ -3,6 +3,7 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { LaunchedChrome } from "chrome-launcher";
+import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
 
 const cdpNewMock = vi.fn();
 const cdpCloseMock = vi.fn();
@@ -14,6 +15,12 @@ const cdpMock = Object.assign(vi.fn(), {
   Close: cdpCloseMock,
   // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
   List: cdpListMock,
+});
+
+const resolveLocalChromeLaunchRoute = () => ({
+  connectHost: null,
+  debugBindAddress: null,
+  usePatchedLauncher: false,
 });
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
@@ -32,6 +39,14 @@ describe("hidden macOS Chrome launch", () => {
   test("uses a background-hidden app launch instead of the standard launcher", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const processIdentity = {
+      pid: 4321,
+      processStartTime: "launch-1",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-hidden-profile",
+      launchNonce: "11111111-1111-4111-8111-111111111111",
+    };
+    const rollbackKill = vi.fn(async () => undefined);
     const hiddenMacLaunch = vi.fn(
       async () =>
         ({
@@ -39,24 +54,45 @@ describe("hidden macOS Chrome launch", () => {
           port: 9222,
           process: undefined,
           remoteDebuggingPipes: null,
-          kill: vi.fn(),
-        }) as unknown as LaunchedChrome & { host?: string },
+          kill: rollbackKill,
+          processIdentity,
+        }) as unknown as ChromeLaunchResult,
     );
     const standardLaunch = vi.fn();
+    const writeProcessIdentity = vi.fn(async () => undefined);
+    const terminateRecordedProcess = vi.fn(async () => ({ status: "terminated" }) as never);
     const logger = vi.fn<(message: string) => void>();
 
-    await launchChrome(
-      resolveBrowserConfig({ hideWindow: false, debugPort: 9222 }),
+    const launched = await launchChrome(
+      resolveBrowserConfig({ hideWindow: true, debugPort: 9222 }),
       "/tmp/oracle-hidden-profile",
       logger,
-      { platform: "darwin", hiddenMacLaunch, standardLaunch },
+      {
+        platform: "darwin",
+        resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+        hiddenMacLaunch,
+        standardLaunch,
+        writeProcessIdentity,
+        terminateRecordedProcess,
+      },
     );
 
     expect(hiddenMacLaunch).toHaveBeenCalledWith(
       expect.objectContaining({ userDataDir: "/tmp/oracle-hidden-profile", requestedPort: 9222 }),
     );
     expect(standardLaunch).not.toHaveBeenCalled();
+    expect(writeProcessIdentity.mock.calls).toEqual([
+      ["/tmp/oracle-hidden-profile", processIdentity],
+    ]);
+    expect(launched.processIdentity).toBe(processIdentity);
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("hidden background Chrome"));
+
+    await launched.kill();
+    expect(terminateRecordedProcess).toHaveBeenCalledWith(
+      "/tmp/oracle-hidden-profile",
+      processIdentity,
+    );
+    expect(rollbackKill).not.toHaveBeenCalled();
   });
 
   test("builds an open command that is hidden, backgrounded, and isolated", async () => {
@@ -90,6 +126,261 @@ describe("hidden macOS Chrome launch", () => {
         { platform: "linux" },
       ),
     ).rejects.toThrow(/use --remote-chrome/i);
+  });
+});
+
+describe("Chrome process identity", () => {
+  test("returns the exact identity captured for a standard launch", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const rollbackKill = vi.fn(async () => undefined);
+    const standardLaunch = vi.fn(async () => ({
+      pid: 5678,
+      port: 9222,
+      process: undefined,
+      remoteDebuggingPipes: null,
+      kill: rollbackKill,
+    }));
+    const processIdentity = {
+      pid: 5678,
+      processStartTime: "launch-2",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-standard-profile",
+      launchNonce: "22222222-2222-4222-8222-222222222222",
+    };
+    const captureProcessIdentity = vi.fn(async () => processIdentity);
+    const writeProcessIdentity = vi.fn(async () => undefined);
+    const terminateRecordedProcess = vi.fn(async () => ({ status: "terminated" }) as never);
+
+    const launched = await launchChrome(
+      { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
+      "/tmp/oracle-standard-profile",
+      vi.fn<(message: string) => void>(),
+      {
+        standardLaunch: standardLaunch as never,
+        resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+        captureProcessIdentity,
+        writeProcessIdentity,
+        terminateRecordedProcess,
+      },
+    );
+
+    expect(captureProcessIdentity).toHaveBeenCalledWith("/tmp/oracle-standard-profile", 5678);
+    expect(writeProcessIdentity.mock.calls).toEqual([
+      ["/tmp/oracle-standard-profile", processIdentity],
+    ]);
+    expect(launched.processIdentity).toBe(processIdentity);
+
+    await launched.kill();
+    expect(terminateRecordedProcess).toHaveBeenCalledWith(
+      "/tmp/oracle-standard-profile",
+      processIdentity,
+    );
+    expect(rollbackKill).not.toHaveBeenCalled();
+  });
+
+  test("kills Chrome when exact process identity capture fails", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const captureError = new Error("identity unavailable");
+    const rollbackKill = vi.fn(async () => undefined);
+    const standardLaunch = vi.fn(async () => ({
+      pid: 6789,
+      port: 9222,
+      process: undefined,
+      remoteDebuggingPipes: null,
+      kill: rollbackKill,
+    }));
+    const writeProcessIdentity = vi.fn(async () => undefined);
+
+    await expect(
+      launchChrome(
+        { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
+        "/tmp/oracle-invalid-profile",
+        vi.fn<(message: string) => void>(),
+        {
+          standardLaunch: standardLaunch as never,
+          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+          captureProcessIdentity: vi.fn(async () => {
+            throw captureError;
+          }),
+          writeProcessIdentity,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/capture Chrome process identity/i),
+      cause: captureError,
+    });
+    expect(rollbackKill).toHaveBeenCalledOnce();
+    expect(writeProcessIdentity).not.toHaveBeenCalled();
+  });
+
+  test("aggregates identity capture and exact rollback failures", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const captureError = new Error("identity unavailable");
+    const rollbackError = new Error("launcher kill failed");
+    const rollbackKill = vi.fn(async () => {
+      throw rollbackError;
+    });
+    const standardLaunch = vi.fn(async () => ({
+      pid: 6790,
+      port: 9222,
+      process: undefined,
+      remoteDebuggingPipes: null,
+      kill: rollbackKill,
+    }));
+    const writeProcessIdentity = vi.fn(async () => undefined);
+
+    await expect(
+      launchChrome(
+        { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
+        "/tmp/oracle-invalid-profile",
+        vi.fn<(message: string) => void>(),
+        {
+          standardLaunch: standardLaunch as never,
+          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+          captureProcessIdentity: vi.fn(async () => {
+            throw captureError;
+          }),
+          writeProcessIdentity,
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      errors: [captureError, rollbackError],
+    });
+    expect(rollbackKill).toHaveBeenCalledOnce();
+    expect(writeProcessIdentity).not.toHaveBeenCalled();
+  });
+
+  test("binds Chrome cleanup to the captured immutable identity", async () => {
+    const { createIdentityBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
+    const processIdentity = {
+      pid: 7890,
+      processStartTime: "launch-3",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-bound-profile",
+      launchNonce: "33333333-3333-4333-8333-333333333333",
+    };
+    const terminate = vi.fn(async () => ({ status: "terminated" }) as never);
+
+    const kill = createIdentityBoundChromeKill(
+      "/tmp/oracle-bound-profile",
+      processIdentity,
+      terminate,
+    );
+    await kill();
+
+    expect(terminate).toHaveBeenCalledWith("/tmp/oracle-bound-profile", processIdentity);
+  });
+
+  test("rolls back launch when provisional identity persistence fails", async () => {
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const processIdentity = {
+      pid: 8901,
+      processStartTime: "launch-4",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-rollback-profile",
+      launchNonce: "44444444-4444-4444-8444-444444444444",
+    };
+    const persistenceError = new Error("disk full");
+    const rollbackKill = vi.fn(async () => undefined);
+    const standardLaunch = vi.fn(async () => ({
+      pid: 8901,
+      port: 9222,
+      process: undefined,
+      remoteDebuggingPipes: null,
+      kill: rollbackKill,
+    }));
+
+    await expect(
+      launchChrome(
+        { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
+        "/tmp/oracle-rollback-profile",
+        vi.fn<(message: string) => void>(),
+        {
+          standardLaunch: standardLaunch as never,
+          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+          captureProcessIdentity: vi.fn(async () => processIdentity),
+          writeProcessIdentity: vi.fn(async () => {
+            throw persistenceError;
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/persist Chrome process identity/i),
+      cause: persistenceError,
+    });
+    expect(rollbackKill).toHaveBeenCalledOnce();
+  });
+
+  test("aggregates identity persistence and exact rollback failures", async () => {
+    const { createProvisionalIdentityBoundChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const processIdentity = {
+      pid: 8902,
+      processStartTime: "launch-4b",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-rollback-profile",
+      launchNonce: "44444444-4444-4444-8444-444444444445",
+    };
+    const persistenceError = new Error("disk full");
+    const rollbackError = new Error("launcher kill failed");
+    const rollbackKill = vi.fn(async () => {
+      throw rollbackError;
+    });
+
+    await expect(
+      createProvisionalIdentityBoundChromeKill(
+        "/tmp/oracle-rollback-profile",
+        processIdentity,
+        rollbackKill,
+        {
+          writeIdentity: vi.fn(async () => {
+            throw persistenceError;
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      errors: [persistenceError, rollbackError],
+    });
+    expect(rollbackKill).toHaveBeenCalledOnce();
+  });
+
+  test("recovers partial hidden-launch state from provisional identity authority", async () => {
+    const { createProvisionalIdentityBoundChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const processIdentity = {
+      pid: 9012,
+      processStartTime: "launch-5",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: "/tmp/oracle-partial-profile",
+      launchNonce: "55555555-5555-4555-8555-555555555555",
+    };
+    const events: string[] = [];
+    const rollbackKill = vi.fn(async () => undefined);
+    const writeIdentity = vi.fn(async () => {
+      events.push("identity-persisted");
+    });
+    const terminate = vi.fn(async () => {
+      events.push("identity-terminated");
+      return { status: "stopped", pid: 9012, signal: "SIGTERM" } as const;
+    });
+
+    const kill = await createProvisionalIdentityBoundChromeKill(
+      "/tmp/oracle-partial-profile",
+      processIdentity,
+      rollbackKill,
+      { writeIdentity, terminate },
+    );
+    await kill();
+
+    expect(writeIdentity).toHaveBeenCalledWith("/tmp/oracle-partial-profile", processIdentity);
+    expect(events).toEqual(["identity-persisted", "identity-terminated"]);
+    expect(rollbackKill).not.toHaveBeenCalled();
   });
 });
 
@@ -481,6 +772,7 @@ describe("closeBlankChromeTabs", () => {
       flatten: true,
     });
     expect(connection.targetId).toBe("target-9");
+    expect(connection.ownership).toBe("created");
     await connection.client.Emulation.setFocusEmulationEnabled({ enabled: true });
     expect(browserClient.Emulation.setFocusEmulationEnabled).toHaveBeenCalledWith(
       { enabled: true },
@@ -495,6 +787,93 @@ describe("closeBlankChromeTabs", () => {
     await connection.close();
     expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({ sessionId: "session-9" });
     expect(browserClient.Target.closeTarget).not.toHaveBeenCalled();
+  });
+
+  test("closes a newly created websocket target when attachment fails", async () => {
+    const cleanupOrder: string[] = [];
+    const browserClient = {
+      Target: {
+        createTarget: vi.fn(async () => ({ targetId: "created-target" })),
+        attachToTarget: vi.fn(async () => {
+          throw new Error("attach failed");
+        }),
+        closeTarget: vi.fn(async () => {
+          cleanupOrder.push("target");
+          return { success: true };
+        }),
+      },
+      close: vi.fn(async () => {
+        cleanupOrder.push("browser");
+      }),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+
+    const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    await expect(
+      connectToRemoteChromeTarget("127.0.0.1", 9222, vi.fn<(message: string) => void>(), {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetUrl: "https://chatgpt.com/",
+      }),
+    ).rejects.toThrow("attach failed");
+
+    expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({
+      targetId: "created-target",
+    });
+    expect(cleanupOrder).toEqual(["target", "browser"]);
+  });
+
+  test("does not close a caller-supplied websocket target when attachment fails", async () => {
+    const browserClient = {
+      Target: {
+        createTarget: vi.fn(async () => ({ targetId: "unused" })),
+        attachToTarget: vi.fn(async () => {
+          throw new Error("attach failed");
+        }),
+        closeTarget: vi.fn(async () => ({ success: true })),
+      },
+      close: vi.fn(async () => undefined),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+
+    const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    await expect(
+      connectToRemoteChromeTarget("127.0.0.1", 9222, vi.fn<(message: string) => void>(), {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetId: "borrowed-target",
+        closeTargetOnDispose: true,
+      }),
+    ).rejects.toThrow("attach failed");
+
+    expect(browserClient.Target.createTarget).not.toHaveBeenCalled();
+    expect(browserClient.Target.closeTarget).not.toHaveBeenCalled();
+    expect(browserClient.close).toHaveBeenCalledOnce();
+  });
+
+  test("reports explicit attached ownership for the HTTP fallback target", async () => {
+    const fallbackClient = { close: vi.fn(async () => undefined) };
+    cdpNewMock.mockRejectedValue(new Error("cannot create target"));
+    cdpListMock.mockResolvedValue([
+      { id: "borrowed-target", type: "page", url: "https://chatgpt.com/" },
+    ]);
+    cdpMock.mockResolvedValue(fallbackClient);
+
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const connection = await connectToRemoteChrome(
+      "127.0.0.1",
+      9222,
+      vi.fn<(message: string) => void>(),
+      "about:blank",
+    );
+
+    expect(cdpMock).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      target: "borrowed-target",
+    });
+    expect(connection.targetId).toBe("borrowed-target");
+    expect(connection.ownership).toBe("attached");
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
@@ -611,8 +990,41 @@ describe("closeBlankChromeTabs", () => {
 });
 
 describe("closeChromeTarget", () => {
+  beforeEach(() => {
+    cdpMock.mockReset();
+    cdpNewMock.mockReset();
+    cdpCloseMock.mockReset();
+    cdpListMock.mockReset();
+  });
+
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  test("retains a replacement page before closing through HTTP", async () => {
+    vi.useFakeTimers();
+    const cleanupOrder: string[] = [];
+    cdpListMock
+      .mockResolvedValueOnce([{ id: "owned", type: "page", url: "https://chatgpt.com/c/1" }])
+      .mockResolvedValueOnce([{ id: "replacement", type: "page", url: "about:blank" }]);
+    cdpNewMock.mockImplementationOnce(async () => {
+      cleanupOrder.push("replacement");
+      return { id: "replacement" };
+    });
+    cdpCloseMock.mockImplementationOnce(async () => {
+      cleanupOrder.push("close");
+    });
+    const { closeChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    const closing = closeChromeTarget({
+      port: 9222,
+      targetId: "owned",
+      logger: vi.fn<(message: string) => void>(),
+    });
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(closing).resolves.toBe(true);
+    expect(cleanupOrder).toEqual(["replacement", "close"]);
   });
 
   test("retains a replacement page while closing through a browser websocket", async () => {
@@ -641,7 +1053,6 @@ describe("closeChromeTarget", () => {
       targetId: "owned",
       logger: vi.fn<(message: string) => void>(),
       browserWSEndpoint: "wss://remote.example/devtools/browser/abc",
-      retainChrome: true,
     });
     await vi.advanceTimersByTimeAsync(25);
 

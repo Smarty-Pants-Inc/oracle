@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { SessionMetadata } from "../../src/sessionManager.ts";
+import type {
+  BrowserRuntimeMetadata,
+  SessionArtifact,
+  SessionMetadata,
+} from "../../src/sessionManager.ts";
 import {
   buildReattachLine,
   formatResponseMetadata,
@@ -13,6 +17,11 @@ import {
 import chalk from "chalk";
 
 const waitMock = vi.hoisted(() => vi.fn());
+const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
+const retryBrowserRecoveryCleanupMock = vi.hoisted(() => vi.fn());
+const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
+const saveBrowserTranscriptArtifactMock = vi.hoisted(() => vi.fn());
+const saveDeepResearchReportArtifactMock = vi.hoisted(() => vi.fn());
 const sessionStoreMock = vi.hoisted(() => ({
   readSession: vi.fn(),
   readLog: vi.fn(),
@@ -34,6 +43,26 @@ vi.mock("../../src/sessionStore.ts", () => ({
 vi.mock("../../src/sessionManager.ts", () => ({
   wait: vi.fn(),
 }));
+vi.mock("../../src/browser/reattach.ts", () => ({
+  resumeBrowserSession: resumeBrowserSessionMock,
+  retryBrowserRecoveryCleanup: retryBrowserRecoveryCleanupMock,
+}));
+
+vi.mock("../../src/cli/durableAnswer.ts", () => ({
+  persistDurableBrowserAnswer: persistDurableBrowserAnswerMock,
+}));
+
+vi.mock("../../src/browser/artifacts.ts", () => ({
+  appendArtifacts: (
+    existing: SessionArtifact[] | undefined,
+    additions: Array<SessionArtifact | null | undefined>,
+  ): SessionArtifact[] | undefined => {
+    const artifacts = [...(existing ?? []), ...additions.filter((value) => value != null)];
+    return artifacts.length > 0 ? (artifacts as SessionArtifact[]) : undefined;
+  },
+  saveBrowserTranscriptArtifact: saveBrowserTranscriptArtifactMock,
+  saveDeepResearchReportArtifact: saveDeepResearchReportArtifactMock,
+}));
 
 vi.mock("../../src/cli/markdownRenderer.ts", () => {
   return {
@@ -52,6 +81,23 @@ const readSessionRequestMock = sessionStoreMock.readRequest as unknown as Return
 const originalIsTty = process.stdout.isTTY;
 const originalChalkLevel = chalk.level;
 
+function committedPromptAuthority(conversationId: string): BrowserRuntimeMetadata {
+  return {
+    promptSubmitted: true,
+    conversationId,
+    promptEpoch: {
+      status: "committed",
+      epochId: `epoch-${conversationId}`,
+      promptSha256: "e".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 1,
+      conversationId,
+    },
+  };
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   process.exitCode = undefined;
@@ -64,7 +110,32 @@ beforeEach(() => {
       fn.mockReset();
     }
   });
+  for (const mock of [
+    resumeBrowserSessionMock,
+    retryBrowserRecoveryCleanupMock,
+    persistDurableBrowserAnswerMock,
+    saveBrowserTranscriptArtifactMock,
+    saveDeepResearchReportArtifactMock,
+  ]) {
+    mock.mockReset();
+  }
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/sessions");
+  sessionStoreMock.getPaths.mockResolvedValue({
+    dir: "/tmp/sessions/sess",
+    log: "/tmp/sessions/sess/session.log",
+  });
+  persistDurableBrowserAnswerMock.mockResolvedValue({
+    artifact: {
+      kind: "transcript",
+      path: "/tmp/sessions/sess/artifacts/durable-browser-answer.md",
+      sha256: "answer-sha256",
+      sizeBytes: 16,
+    },
+    sha256: "answer-sha256",
+    sizeBytes: 16,
+  });
+  saveBrowserTranscriptArtifactMock.mockResolvedValue(null);
+  saveDeepResearchReportArtifactMock.mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -392,6 +463,180 @@ describe("attachSession rendering", () => {
         status: "error",
         response: { status: "incomplete", incompleteReason: "incomplete-capture" },
       }),
+    );
+  });
+
+  test("persists a verified answer receipt before manual reattach completion and cleanup", async () => {
+    const recoverableMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      browser: {
+        config: { chromePath: null },
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "manual-recovery-target",
+          tabUrl: "https://chatgpt.com/c/manual-recovery",
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: true,
+          },
+          recoveryCleanupResult: { status: "pending" },
+          ...committedPromptAuthority("manual-recovery"),
+        },
+      },
+    } as SessionMetadata;
+    const finalizedRuntime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "manual-recovery-target",
+      tabUrl: "https://chatgpt.com/c/manual-recovery",
+      ...committedPromptAuthority("manual-recovery"),
+    };
+    const finalize = vi.fn(async () => ({
+      status: "completed" as const,
+      runtime: finalizedRuntime,
+    }));
+    const abandon = vi.fn(async () => undefined);
+    resumeBrowserSessionMock.mockResolvedValue({
+      answerText: "Recovered answer",
+      answerMarkdown: "Recovered **answer**",
+      runtime: recoverableMeta.browser?.runtime,
+      finalize,
+      abandon,
+    });
+    readSessionMetadataMock
+      .mockResolvedValueOnce(recoverableMeta)
+      .mockResolvedValue({ ...recoverableMeta, status: "completed" });
+    readSessionLogMock.mockResolvedValue("Answer:\nRecovered **answer**");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      ([, patch]) => patch.status === "completed",
+    );
+    expect(persistDurableBrowserAnswerMock).toHaveBeenCalledWith({
+      sessionId: "sess",
+      answer: "Recovered **answer**",
+      logHeader: "[reattach] captured assistant response from existing Chrome tab",
+      replaceLog: false,
+    });
+    expect(persistDurableBrowserAnswerMock.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
+    );
+    expect(sessionStoreMock.updateSession.mock.calls[completedCallIndex]?.[1]).toMatchObject({
+      status: "completed",
+      artifacts: [
+        expect.objectContaining({
+          path: "/tmp/sessions/sess/artifacts/durable-browser-answer.md",
+          sha256: "answer-sha256",
+        }),
+      ],
+    });
+    expect(finalize.mock.invocationCallOrder[0]).toBeGreaterThan(
+      sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
+    );
+    expect(abandon).not.toHaveBeenCalled();
+  });
+
+  test("abandons manual reattach when durable answer persistence fails", async () => {
+    const recoverableMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      browser: {
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "manual-failure-target",
+          tabUrl: "https://chatgpt.com/c/manual-failure",
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: true,
+          },
+          recoveryCleanupResult: { status: "pending" },
+          ...committedPromptAuthority("manual-failure"),
+        },
+      },
+    } as SessionMetadata;
+    const finalize = vi.fn();
+    const abandon = vi.fn(async () => undefined);
+    resumeBrowserSessionMock.mockResolvedValue({
+      answerText: "Recovered answer",
+      answerMarkdown: "Recovered answer",
+      runtime: recoverableMeta.browser?.runtime,
+      finalize,
+      abandon,
+    });
+    persistDurableBrowserAnswerMock.mockRejectedValueOnce(new Error("answer fsync failed"));
+    readSessionMetadataMock.mockResolvedValue(recoverableMeta);
+    readSessionLogMock.mockResolvedValue("incomplete");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(abandon).toHaveBeenCalledOnce();
+    expect(finalize).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls).not.toContainEqual([
+      "sess",
+      expect.objectContaining({ status: "completed" }),
+    ]);
+    const authorityUpdateIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      ([, patch]) => patch.browser?.runtime === recoverableMeta.browser?.runtime,
+    );
+    expect(authorityUpdateIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      sessionStoreMock.updateSession.mock.invocationCallOrder[authorityUpdateIndex],
+    ).toBeLessThan(abandon.mock.invocationCallOrder[0] ?? 0);
+  });
+
+  test("does not reattach legacy promptSubmitted state without a committed epoch", async () => {
+    const staleMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      browser: {
+        runtime: {
+          chromePort: 9222,
+          controllerPid: 2_147_483_647,
+          promptSubmitted: true,
+          tabUrl: "https://chatgpt.com/c/stale-boolean",
+        },
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValue(staleMeta);
+    readSessionLogMock.mockResolvedValue("incomplete");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Attempting to reattach to the existing Chrome session"),
     );
   });
 

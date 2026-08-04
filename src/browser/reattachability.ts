@@ -1,5 +1,5 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import { isStableConversationUrl } from "./conversationUrl.js";
+import { extractStableConversationIdFromUrl, isStableConversationUrl } from "./conversationUrl.js";
 
 /**
  * True when the URL points at a specific ChatGPT conversation (`/c/<id>`) on
@@ -29,14 +29,43 @@ export function isRecoverableChatGptConversationUrl(candidate: string | null | u
 export function hasRecoverableChatGptConversation(
   runtime: BrowserRuntimeMetadata | null | undefined,
 ): boolean {
-  if (!runtime) {
+  const epoch = runtime?.promptEpoch;
+  if (
+    !runtime ||
+    !epoch ||
+    epoch.status !== "committed" ||
+    typeof epoch.epochId !== "string" ||
+    !epoch.epochId.trim() ||
+    typeof epoch.promptSha256 !== "string" ||
+    !epoch.promptSha256.trim() ||
+    !Number.isInteger(epoch.baselineTurns) ||
+    epoch.baselineTurns < 0 ||
+    !Number.isInteger(epoch.followUpOrdinal) ||
+    epoch.followUpOrdinal < 0 ||
+    !Number.isInteger(epoch.remainingFollowUps) ||
+    epoch.remainingFollowUps !== 0 ||
+    !Number.isInteger(epoch.verifiedUserTurnIndex) ||
+    epoch.verifiedUserTurnIndex < epoch.baselineTurns ||
+    typeof epoch.conversationId !== "string" ||
+    !epoch.conversationId.trim()
+  ) {
     return false;
   }
-  if (runtime.promptSubmitted === false) {
-    return false;
+  const locators: string[] = [];
+  const explicitConversationId = runtime.conversationId?.trim();
+  if (explicitConversationId) {
+    locators.push(explicitConversationId);
   }
-  if (runtime.conversationId?.trim()) {
-    return true;
+  const tabUrl = runtime.tabUrl?.trim();
+  if (tabUrl) {
+    const tabConversationId = extractStableConversationIdFromUrl(tabUrl);
+    if (tabConversationId) {
+      if (!isRecoverableChatGptConversationUrl(tabUrl)) return false;
+      locators.push(tabConversationId);
+    }
   }
-  return isRecoverableChatGptConversationUrl(runtime.tabUrl);
+  return (
+    locators.length > 0 &&
+    locators.every((conversationId) => conversationId === epoch.conversationId)
+  );
 }

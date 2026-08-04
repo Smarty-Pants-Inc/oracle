@@ -17,13 +17,59 @@ vi.mock("../../src/browser/reattach.js", () => ({
     },
   })),
 }));
-function createReattachResult(answerText: string, answerMarkdown: string) {
-  const runtime: BrowserRuntimeMetadata = {};
+function committedRuntime(
+  conversationId: string,
+  runtime: BrowserRuntimeMetadata = {},
+): BrowserRuntimeMetadata {
+  return {
+    ...runtime,
+    promptSubmitted: true,
+    conversationId,
+    promptEpoch: {
+      status: "committed",
+      epochId: `epoch-${conversationId}`,
+      promptSha256: "b".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      conversationId,
+    },
+  };
+}
+
+function chromeProcessIdentity(userDataDir: string, pid: number) {
+  return {
+    pid,
+    processStartTime: "e2e-process-generation",
+    executablePath: "/usr/bin/google-chrome",
+    normalizedUserDataDir: path.resolve(userDataDir),
+    launchNonce: "44444444-4444-4444-8444-444444444444",
+  };
+}
+
+function createReattachResult(
+  answerText: string,
+  answerMarkdown: string,
+  runtime: BrowserRuntimeMetadata,
+  onFinalize?: () => Promise<void> | void,
+) {
+  const capturedRuntime =
+    runtime.recoveryCleanup || runtime.recoveryCleanupBacklog?.length
+      ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
+      : runtime;
+  const finalizedRuntime = { ...capturedRuntime };
+  delete finalizedRuntime.recoveryCleanup;
+  delete finalizedRuntime.recoveryCleanupBacklog;
+  delete finalizedRuntime.recoveryCleanupResult;
   return {
     answerText,
     answerMarkdown,
-    runtime,
-    finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
+    runtime: capturedRuntime,
+    finalize: vi.fn(async () => {
+      await onFinalize?.();
+      return { status: "completed" as const, runtime: finalizedRuntime };
+    }),
     abandon: vi.fn(async () => undefined),
   };
 }
@@ -92,6 +138,9 @@ describe("browser reattach end-to-end (simulated)", () => {
           ),
         }),
       );
+      const persisted = await sessionStore.readSession(sessionMeta.id);
+      expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupBacklog");
+      expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -106,7 +155,6 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown"));
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -125,19 +173,19 @@ describe("browser reattach end-to-end (simulated)", () => {
         status: "running",
         startedAt: new Date().toISOString(),
       });
+      const runtime = committedRuntime("demo", {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/c/demo",
+      });
       await sessionStore.updateSession(sessionMeta.id, {
         status: "running",
         startedAt: new Date().toISOString(),
         mode: "browser",
         browser: {
           config: {},
-          runtime: {
-            chromePort: 51559,
-            chromeHost: "127.0.0.1",
-            chromeTargetId: "t-1",
-            tabUrl: "https://chatgpt.com/c/demo",
-            promptSubmitted: true,
-          },
+          runtime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
         error: {
@@ -146,6 +194,13 @@ describe("browser reattach end-to-end (simulated)", () => {
           details: { stage: "connection-lost", recoverableDisconnect: true },
         },
       });
+      let durableCompletionObserved = false;
+      const reattachResult = createReattachResult("ok text", "ok markdown", runtime, async () => {
+        const durable = await sessionStore.readSession(sessionMeta.id);
+        durableCompletionObserved =
+          durable?.status === "completed" && durable.response?.status === "completed";
+      });
+      resumeMock.mockResolvedValue(reattachResult);
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -159,6 +214,9 @@ describe("browser reattach end-to-end (simulated)", () => {
       expect(resumeMock).toHaveBeenCalledTimes(1);
       const runs = updated?.models ?? [];
       expect(runs.some((r) => r.status === "completed")).toBe(true);
+      expect(durableCompletionObserved).toBe(true);
+      expect(reattachResult.finalize).toHaveBeenCalledOnce();
+      expect(reattachResult.abandon).not.toHaveBeenCalled();
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -173,7 +231,9 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue(createReattachResult("should not happen", "nope"));
+      resumeMock.mockResolvedValue(
+        createReattachResult("should not happen", "nope", committedRuntime("demo")),
+      );
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -232,7 +292,6 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown"));
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -247,19 +306,20 @@ describe("browser reattach end-to-end (simulated)", () => {
         },
         "/repo",
       );
+      const runtime = committedRuntime("demo", {
+        chromeProfileRoot: path.join(tmpHome, "chrome-profile"),
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/",
+      });
+      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown", runtime));
       await sessionStore.updateSession(sessionMeta.id, {
         status: "running",
         startedAt: new Date().toISOString(),
         mode: "browser",
         browser: {
           config: {},
-          runtime: {
-            chromeProfileRoot: path.join(tmpHome, "chrome-profile"),
-            chromeHost: "127.0.0.1",
-            chromeTargetId: "t-1",
-            tabUrl: "https://chatgpt.com/",
-            promptSubmitted: true,
-          },
+          runtime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
         error: {
@@ -292,10 +352,17 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
+      const runtime = committedRuntime("deep", {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/c/deep",
+      });
       resumeMock.mockResolvedValue(
         createReattachResult(
           "# Deep report\n\nRecovered report body.",
           "# Deep report\n\nRecovered report body.",
+          runtime,
         ),
       );
 
@@ -322,12 +389,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
         browser: {
           config: { researchMode: "deep" },
-          runtime: {
-            chromePort: 51559,
-            chromeHost: "127.0.0.1",
-            chromeTargetId: "t-1",
-            tabUrl: "https://chatgpt.com/c/deep",
-          },
+          runtime,
         },
         response: { status: "completed" },
       });
@@ -361,10 +423,14 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
+      const runtime = committedRuntime("deep-project", {
+        tabUrl: "https://chatgpt.com/g/g-p-demo/project",
+      });
       resumeMock.mockResolvedValue(
         createReattachResult(
           "# Deep report\n\nRecovered report body.",
           "# Deep report\n\nRecovered report body.",
+          runtime,
         ),
       );
 
@@ -387,9 +453,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
         browser: {
           config: { researchMode: "deep" },
-          runtime: {
-            tabUrl: "https://chatgpt.com/g/g-p-demo/project",
-          },
+          runtime,
         },
         response: { status: "completed" },
       });
@@ -417,7 +481,6 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown"));
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -456,17 +519,18 @@ describe("browser reattach end-to-end (simulated)", () => {
         stdio: "ignore",
       });
       await once(deadController, "exit");
+      const runtime = committedRuntime("demo", {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/c/demo",
+        controllerPid: deadController.pid ?? undefined,
+      });
+      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown", runtime));
       await sessionStore.updateSession(sessionMeta.id, {
         browser: {
           config: {},
-          runtime: {
-            chromePort: 51559,
-            chromeHost: "127.0.0.1",
-            chromeTargetId: "t-1",
-            tabUrl: "https://chatgpt.com/c/demo",
-            controllerPid: deadController.pid ?? undefined,
-            promptSubmitted: true,
-          },
+          runtime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
         error: {
@@ -500,7 +564,6 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown"));
 
       const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
       const { sessionStore } = await import("../../src/sessionStore.js");
@@ -533,19 +596,32 @@ describe("browser reattach end-to-end (simulated)", () => {
       });
       await once(deadController, "exit");
       const deadControllerPid = deadController.pid ?? undefined;
+      const profileDir = path.join(tmpHome, "oracle-browser-termination-profile");
+      const processIdentity = chromeProcessIdentity(profileDir, 4242);
+      const runtime = committedRuntime("demo", {
+        chromePid: 4242,
+        chromeProcessIdentity: processIdentity,
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/c/demo",
+        controllerPid: deadControllerPid,
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: true,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
+      });
+      resumeMock.mockResolvedValue(createReattachResult("ok text", "ok markdown", runtime));
 
       const emitRuntimeHint = async () => {
         await sessionStore.updateSession(sessionMeta.id, {
           browser: {
             config: {},
-            runtime: {
-              chromePort: 51559,
-              chromeHost: "127.0.0.1",
-              chromeTargetId: "t-1",
-              tabUrl: "https://chatgpt.com/c/demo",
-              controllerPid: deadControllerPid,
-              promptSubmitted: true,
-            },
+            runtime,
           },
           response: { status: "running", incompleteReason: "chrome-disconnected" },
           error: {
@@ -559,12 +635,13 @@ describe("browser reattach end-to-end (simulated)", () => {
       const chrome = {
         pid: 4242,
         port: 51559,
+        processIdentity,
         kill: vi.fn().mockResolvedValue(undefined),
       };
       const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
       const removeHooks = registerTerminationHooks(
         chrome as unknown as import("chrome-launcher").LaunchedChrome,
-        path.join(tmpHome, "chrome-profile"),
+        profileDir,
         false,
         () => {},
         { isInFlight: () => true, emitRuntimeHint },

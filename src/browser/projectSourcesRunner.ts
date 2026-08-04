@@ -1,7 +1,6 @@
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LaunchedChrome } from "chrome-launcher";
 import {
   closeTab,
   connectWithNewTab,
@@ -9,6 +8,11 @@ import {
   positionChromeWindowOffscreen,
   registerTerminationHooks,
 } from "./chromeLifecycle.js";
+import {
+  acquireManualChromeOwner,
+  type BrowserChrome,
+  type ManualChromeOwnerSource,
+} from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import {
@@ -25,13 +29,7 @@ import {
 import {
   acquireProfileRunLock,
   cleanupStaleProfileState,
-  findRunningChromeDebugTargetForProfile,
-  readChromePid,
-  readDevToolsPort,
   shouldCleanupManualLoginProfileState,
-  verifyDevToolsReachable,
-  writeChromePid,
-  writeDevToolsActivePort,
   type ProfileRunLock,
 } from "./profileState.js";
 import { CHATGPT_URL } from "./constants.js";
@@ -51,8 +49,6 @@ import {
 import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
-
-type BrowserChrome = LaunchedChrome & { host?: string };
 
 export async function runBrowserProjectSources(
   request: ProjectSourcesRequest,
@@ -120,7 +116,7 @@ export async function runBrowserProjectSources(
   }
 
   let chrome: BrowserChrome | null = null;
-  let reusedChrome: LaunchedChrome | null = null;
+  let chromeOwnerSource: ManualChromeOwnerSource | null = null;
   let client: ChromeClient | null = null;
   let isolatedTargetId: string | null = null;
   let removeTerminationHooks: (() => void) | null = null;
@@ -130,13 +126,13 @@ export async function runBrowserProjectSources(
 
   try {
     const acquired = manualLogin
-      ? await acquireManualLoginChromeForProjectSources(userDataDir, config, logger)
+      ? await acquireManualChromeOwner(userDataDir, config, logger, "project-sources")
       : {
           chrome: await launchChrome({ ...config, remoteChrome: null }, userDataDir, logger),
-          reusedChrome: null,
+          source: "launched" as const,
         };
     chrome = acquired.chrome;
-    reusedChrome = acquired.reusedChrome;
+    chromeOwnerSource = acquired.source;
     const chromeHost = chrome.host ?? "127.0.0.1";
     if (tabLease) {
       await tabLease.update({ chromeHost, chromePort: chrome.port });
@@ -145,7 +141,7 @@ export async function runBrowserProjectSources(
     removeTerminationHooks = registerTerminationHooks(
       chrome,
       userDataDir,
-      effectiveKeepBrowser,
+      effectiveKeepBrowser || (manualLogin && chromeOwnerSource !== "launched"),
       logger,
       {
         isInFlight: () => !completed,
@@ -153,7 +149,7 @@ export async function runBrowserProjectSources(
       },
     );
 
-    const strictTabIsolation = Boolean(manualLogin && reusedChrome);
+    const strictTabIsolation = Boolean(manualLogin && chromeOwnerSource !== "launched");
     const devtoolsRetries = manualLogin ? 6 : 0;
     const connection = await connectWithNewTab(chrome.port, logger, "about:blank", chromeHost, {
       fallbackToDefault: !strictTabIsolation,
@@ -276,7 +272,7 @@ export async function runBrowserProjectSources(
       );
       if (keepBrowserOpen) {
         logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-      } else if (reusedChrome && !connectionClosedUnexpectedly) {
+      } else if (chromeOwnerSource !== "launched" && !connectionClosedUnexpectedly) {
         keepBrowserOpen = true;
         logger("[browser] Reused shared Chrome; leaving browser process running.");
       }
@@ -414,117 +410,4 @@ async function waitForProjectSourcesLogin({
       `Browser mode is using Oracle's private Chrome profile at ${profileDir ?? "(default profile)"}, not your normal Chrome profile. ` +
       `Run first-time setup, sign in there, then retry: ${setupCommand}`,
   );
-}
-
-async function acquireManualLoginChromeForProjectSources(
-  userDataDir: string,
-  config: ResolvedBrowserConfig,
-  logger: BrowserLogger,
-): Promise<{ chrome: BrowserChrome; reusedChrome: LaunchedChrome | null }> {
-  const lockTimeoutMs = Math.max(0, config.profileLockTimeoutMs ?? 0);
-  let launchLock: ProfileRunLock | null = null;
-  if (lockTimeoutMs > 0) {
-    launchLock = await acquireProfileRunLock(userDataDir, {
-      timeoutMs: lockTimeoutMs,
-      logger,
-      sessionId: "project-sources",
-    });
-  }
-  try {
-    const reusedChrome = await maybeReuseProjectSourcesChrome(userDataDir, logger, {
-      waitForPortMs: config.reuseChromeWaitMs,
-    });
-    const chrome =
-      reusedChrome ??
-      (await launchChrome(
-        {
-          ...config,
-          remoteChrome: null,
-        },
-        userDataDir,
-        logger,
-      ));
-    if (chrome.port) {
-      await writeDevToolsActivePort(userDataDir, chrome.port);
-      if (!reusedChrome && chrome.pid) {
-        await writeChromePid(userDataDir, chrome.pid);
-      }
-    }
-    return { chrome, reusedChrome };
-  } finally {
-    await launchLock?.release().catch(() => undefined);
-  }
-}
-
-async function maybeReuseProjectSourcesChrome(
-  userDataDir: string,
-  logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
-): Promise<LaunchedChrome | null> {
-  const waitForPortMs = Math.max(0, options.waitForPortMs ?? 0);
-  let port = await readDevToolsPort(userDataDir);
-  if (!port && waitForPortMs > 0) {
-    const deadline = Date.now() + waitForPortMs;
-    logger(`Waiting up to ${Math.round(waitForPortMs / 1000)}s for shared Chrome to appear...`);
-    while (!port && Date.now() < deadline) {
-      await delay(250);
-      port = await readDevToolsPort(userDataDir);
-    }
-  }
-  let pid = await readChromePid(userDataDir);
-  if (!port) {
-    const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
-    if (!discovered) {
-      if (pid) {
-        logger(
-          `No reachable Chrome DevTools target found for ${userDataDir}; clearing stale profile state before launching new Chrome.`,
-        );
-        await cleanupStaleProfileState(userDataDir, logger, {
-          lockRemovalMode: "if_oracle_pid_dead",
-        });
-      }
-      return null;
-    }
-    const probe = await (options.probe ?? verifyDevToolsReachable)({ port: discovered.port });
-    if (!probe.ok) {
-      logger(
-        `Discovered Chrome for ${userDataDir} on port ${discovered.port} but it was unreachable (${probe.error}); launching new Chrome.`,
-      );
-      await cleanupStaleProfileState(userDataDir, logger, {
-        lockRemovalMode: "if_oracle_pid_dead",
-      });
-      return null;
-    }
-    await writeDevToolsActivePort(userDataDir, discovered.port);
-    await writeChromePid(userDataDir, discovered.pid);
-    port = discovered.port;
-    pid = discovered.pid;
-    logger(
-      `Discovered running Chrome for ${userDataDir}; reusing (DevTools port ${port}, pid ${pid})`,
-    );
-    return { port, pid, kill: async () => {}, process: undefined } as unknown as LaunchedChrome;
-  }
-  const probe = await (options.probe ?? verifyDevToolsReachable)({ port });
-  if (!probe.ok) {
-    logger(
-      `Recorded Chrome DevTools port ${port} is stale (${probe.error}); launching new Chrome.`,
-    );
-    await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "if_oracle_pid_dead" });
-    return null;
-  }
-  logger(`Reusing running Chrome on port ${port} with profile ${userDataDir}`);
-  return {
-    port,
-    pid: pid ?? undefined,
-    kill: async () => {},
-    process: undefined,
-  } as unknown as LaunchedChrome;
-}
-
-export async function maybeReuseProjectSourcesChromeForTest(
-  userDataDir: string,
-  logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
-): Promise<LaunchedChrome | null> {
-  return maybeReuseProjectSourcesChrome(userDataDir, logger, options);
 }

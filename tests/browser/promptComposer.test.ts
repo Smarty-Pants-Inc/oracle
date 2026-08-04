@@ -25,6 +25,17 @@ describe("promptComposer", () => {
     );
   });
 
+  test("refuses commit verification without a finite pre-dispatch baseline", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150, undefined, Number.NaN),
+    ).rejects.toMatchObject({
+      details: { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
   test("does not treat historical assistant content as committed without a new turn", async () => {
     vi.useFakeTimers();
     try {
@@ -54,7 +65,13 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        10,
+      );
       // Attach the rejection handler before timers advance to avoid unhandled-rejection warnings.
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
@@ -141,7 +158,13 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        10,
+      );
       const assertion = promise.then(
         () => {
           throw new Error("expected verifyPromptCommitted to reject");
@@ -175,36 +198,83 @@ describe("promptComposer", () => {
     }
   });
 
-  test("allows prompt match even if baseline turn count cannot be read", async () => {
-    const runtime = {
-      evaluate: vi
-        .fn()
-        // Baseline read fails
-        .mockRejectedValueOnce(new Error("turn read failed"))
-        // First poll shows prompt match (baseline unknown)
-        .mockResolvedValueOnce({
-          result: {
-            value: {
-              baseline: -1,
-              turnsCount: 1,
-              userMatched: true,
-              prefixMatched: false,
-              lastMatched: true,
-              hasNewTurn: false,
-              stopVisible: false,
-              assistantVisible: false,
-              composerCleared: false,
-              inConversation: true,
-            },
+  test("does not let a historical repeated prompt authorize an unrelated new turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const makeTurn = (role: "user" | "assistant", text: string, index: number) => {
+        const node = {
+          innerText: text,
+          textContent: text,
+          id: `conversation-turn-${index}`,
+          dataset: {
+            turn: role,
+            turnId: `turn-${index}`,
+            messageId: `message-${index}`,
           },
-        }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
+          getAttribute(name: string) {
+            if (name === "data-message-author-role" || name === "data-turn") return role;
+            if (name === "data-turn-id") return `turn-${index}`;
+            if (name === "data-message-id") return `message-${index}`;
+            return null;
+          },
+          matches(selector: string) {
+            return selector === "[data-message-id]";
+          },
+          querySelector(selector: string) {
+            if (selector === "[data-message-id]") {
+              return {
+                dataset: { messageId: `message-${index}` },
+                getAttribute: () => `message-${index}`,
+              };
+            }
+            if (selector === '[data-message-author-role="user"]' && role === "user") return {};
+            return null;
+          },
+        };
+        return node;
+      };
+      const topLevelTurns = [
+        makeTurn("user", "repeat this prompt", 0),
+        makeTurn("assistant", "historical answer", 1),
+        makeTurn("user", "an unrelated new prompt", 2),
+      ];
+      const document = {
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => {
+          if (selector === CONVERSATION_TURN_CONTAINER_SELECTOR) return topLevelTurns;
+          if (selector === CONVERSATION_TURN_SELECTOR) return topLevelTurns;
+          return [];
+        },
+      };
+      class FakeTextArea {}
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: Function(
+              "document",
+              "HTMLTextAreaElement",
+              "location",
+              `return ${expression};`,
+            )(document, FakeTextArea, { href: "https://chatgpt.com/c/repeated-prompt" }),
+          },
+        })),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
 
-    await expect(
-      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
-    ).resolves.toBe(1);
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "repeat this prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("attachment sends time out instead of allowing Enter fallback", async () => {
@@ -296,14 +366,15 @@ describe("promptComposer", () => {
             value: {
               baseline: 0,
               turnsCount: 1,
-              userMatched: true,
-              prefixMatched: false,
-              lastMatched: true,
+              matchedUserTurnIndex: 0,
+              matchedUserTurnId: "turn-1",
+              matchedUserMessageId: "message-1",
               hasNewTurn: true,
               stopVisible: true,
               assistantVisible: false,
               composerCleared: true,
               inConversation: true,
+              conversationId: "conversation-1",
             },
           },
         };

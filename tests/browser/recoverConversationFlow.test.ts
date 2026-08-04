@@ -29,6 +29,8 @@ const readyHarvest = {
 };
 const logger = (_message: string) => {};
 
+// Dynamic imports are required because each case installs isolated module mocks after resetModules.
+
 describe("recoverConversationTab flow", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -37,7 +39,7 @@ describe("recoverConversationTab flow", () => {
   test("opens the saved URL in an existing Chrome endpoint before launching another profile", async () => {
     const openChatGptTarget = vi.fn(async () => "target-1");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
-    const acquireManualLoginChromeForRun = vi.fn();
+    const acquireManualChromeOwner = vi.fn();
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -45,8 +47,8 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
     vi.doMock("../../src/browser/index.js", () => ({
-      acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
 
@@ -66,7 +68,7 @@ describe("recoverConversationTab flow", () => {
       port: 9222,
       ref: "target-1",
     });
-    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(acquireManualChromeOwner).not.toHaveBeenCalled();
     expect(recovered.ref).toBe("target-1");
     expect(recovered.chrome).toBeNull();
   });
@@ -77,8 +79,15 @@ describe("recoverConversationTab flow", () => {
       .mockRejectedValueOnce(new Error("ECONNREFUSED"))
       .mockResolvedValueOnce("target-2");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
-    const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
-    const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
+    const chrome = {
+      port: 53999,
+      kill: vi.fn(async () => undefined),
+      process: { unref: vi.fn() },
+    };
+    const acquireManualChromeOwner = vi.fn(async () => ({
+      chrome,
+      source: "launched" as const,
+    }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -86,8 +95,8 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
     vi.doMock("../../src/browser/index.js", () => ({
-      acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
 
@@ -97,12 +106,11 @@ describe("recoverConversationTab flow", () => {
       readyTimeoutMs: 1,
     });
 
-    expect(acquireManualLoginChromeForRun).toHaveBeenCalledWith(
+    expect(acquireManualChromeOwner).toHaveBeenCalledWith(
       "/tmp/recover-profile",
       expect.objectContaining({ manualLogin: true }),
       logger,
       "sess-recover",
-      {},
     );
     expect(harvestChatGptTab).toHaveBeenLastCalledWith({
       host: "127.0.0.1",
@@ -116,7 +124,7 @@ describe("recoverConversationTab flow", () => {
   test("does not require a local profile when reopening through a recorded endpoint", async () => {
     const openChatGptTarget = vi.fn(async () => "target-1");
     const harvestChatGptTab = vi.fn(async () => readyHarvest);
-    const acquireManualLoginChromeForRun = vi.fn();
+    const acquireManualChromeOwner = vi.fn();
     const remoteMeta = {
       ...meta,
       browser: {
@@ -135,8 +143,8 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
     vi.doMock("../../src/browser/index.js", () => ({
-      acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
 
@@ -147,7 +155,7 @@ describe("recoverConversationTab flow", () => {
     });
 
     expect(recovered.chrome).toBeNull();
-    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(acquireManualChromeOwner).not.toHaveBeenCalled();
   });
 
   test("kills launched Chrome when recovered content never becomes ready", async () => {
@@ -156,8 +164,15 @@ describe("recoverConversationTab flow", () => {
       .mockRejectedValueOnce(new Error("ECONNREFUSED"))
       .mockResolvedValueOnce("target-2");
     const harvestChatGptTab = vi.fn();
-    const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
-    const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
+    const chrome = {
+      port: 53999,
+      kill: vi.fn(async () => undefined),
+      process: { unref: vi.fn() },
+    };
+    const acquireManualChromeOwner = vi.fn(async () => ({
+      chrome,
+      source: "launched" as const,
+    }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -165,8 +180,8 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab,
     }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
     vi.doMock("../../src/browser/index.js", () => ({
-      acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
 
@@ -185,8 +200,15 @@ describe("recoverConversationTab flow", () => {
     const openChatGptTarget = vi.fn(async () => {
       throw new Error("CDP.New failed");
     });
-    const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
-    const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
+    const chrome = {
+      port: 53999,
+      kill: vi.fn(async () => undefined),
+      process: { unref: vi.fn() },
+    };
+    const acquireManualChromeOwner = vi.fn(async () => ({
+      chrome,
+      source: "launched" as const,
+    }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -194,8 +216,8 @@ describe("recoverConversationTab flow", () => {
       openChatGptTarget,
       harvestChatGptTab: vi.fn(),
     }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
     vi.doMock("../../src/browser/index.js", () => ({
-      acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
 
@@ -207,5 +229,38 @@ describe("recoverConversationTab flow", () => {
     ).rejects.toThrow(/CDP.New failed/);
 
     expect(chrome.kill).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not terminate a reused Chrome owner when recovery target opening fails", async () => {
+    const openChatGptTarget = vi.fn(async () => {
+      throw new Error("CDP.New failed");
+    });
+    const chrome = {
+      port: 53999,
+      kill: vi.fn(async () => undefined),
+      process: undefined,
+    };
+    const acquireManualChromeOwner = vi.fn(async () => ({
+      chrome,
+      source: "active-port" as const,
+    }));
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget,
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      isImageOnlyUiChromeText: () => false,
+    }));
+
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(recoverConversationTab(meta, logger, { readyTimeoutMs: 1 })).rejects.toThrow(
+      /CDP.New failed/,
+    );
+
+    expect(chrome.kill).not.toHaveBeenCalled();
   });
 });

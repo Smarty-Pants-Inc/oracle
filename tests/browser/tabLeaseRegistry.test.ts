@@ -20,7 +20,13 @@ describe("tabLeaseRegistry", () => {
   test("queues when the max concurrent tab limit is reached", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
     try {
-      const logger = vi.fn();
+      let signalWaiting: () => void = () => undefined;
+      const waitingForSlot = new Promise<void>((resolve) => {
+        signalWaiting = resolve;
+      });
+      const logger = vi.fn((message: string) => {
+        if (message.includes("Waiting for ChatGPT browser slot")) signalWaiting();
+      });
       const first = await acquireBrowserTabLease(dir, {
         maxConcurrentTabs: 3,
         pollMs: 25,
@@ -50,7 +56,12 @@ describe("tabLeaseRegistry", () => {
         return lease;
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 75));
+      await Promise.race([
+        waitingForSlot,
+        fourthPromise.then(() => {
+          throw new Error("Queued browser lease acquired before emitting its waiting signal");
+        }),
+      ]);
       expect(resolved).toBe(false);
       expect(logger).toHaveBeenCalledWith(
         expect.stringContaining("Waiting for ChatGPT browser slot"),
@@ -74,14 +85,21 @@ describe("tabLeaseRegistry", () => {
       const stale = await acquireBrowserTabLease(
         dir,
         { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "stale-session" },
-        { pid: 123_456, isProcessAlive: () => true },
+        {
+          pid: 123_456,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "stale-process-start",
+        },
       );
       await stale.update({ chromeTargetId: "target-stale" });
 
       const fresh = await acquireBrowserTabLease(
         dir,
         { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "fresh-session" },
-        { isProcessAlive: (pid) => pid !== 123_456 },
+        {
+          readProcessLiveness: (pid) => (pid === 123_456 ? "dead" : "alive"),
+          readProcessStartIdentity: async () => "fresh-process-start",
+        },
       );
       await fresh.update({ chromeTargetId: "target-fresh", tabUrl: "https://chatgpt.com/c/1" });
 
@@ -96,6 +114,79 @@ describe("tabLeaseRegistry", () => {
       });
 
       await fresh.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("drops a live pid lease when its process-start identity changed", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      await acquireBrowserTabLease(
+        dir,
+        { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "reused-pid-session" },
+        {
+          pid: 345_678,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "original-process-start",
+        },
+      );
+
+      const fresh = await acquireBrowserTabLease(
+        dir,
+        { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "replacement-session" },
+        {
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) =>
+            pid === 345_678 ? "reused-process-start" : "replacement-process-start",
+        },
+      );
+
+      const registry = JSON.parse(
+        await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ sessionId?: string }> };
+      expect(registry.leases).toEqual([
+        expect.objectContaining({ sessionId: "replacement-session" }),
+      ]);
+      await fresh.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("retains a live matching lease after more than six hours", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const sevenHoursAgo = Date.now() - 7 * 60 * 60 * 1000;
+    try {
+      await acquireBrowserTabLease(
+        dir,
+        { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "long-running-session" },
+        {
+          now: () => sevenHoursAgo,
+          pid: 234_567,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "long-running-process-start",
+        },
+      );
+
+      const teardown = vi.fn(async () => true);
+      await expect(
+        teardownBrowserResourcesIfNoActiveLeases(dir, teardown, {
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "long-running-process-start",
+        }),
+      ).resolves.toEqual({ status: "preserved", reason: "active-leases" });
+      expect(teardown).not.toHaveBeenCalled();
+
+      const registry = JSON.parse(
+        await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ sessionId?: string; processStartIdentity?: string | null }> };
+      expect(registry.leases).toEqual([
+        expect.objectContaining({
+          sessionId: "long-running-session",
+          processStartIdentity: "long-running-process-start",
+        }),
+      ]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -255,6 +346,38 @@ describe("tabLeaseRegistry", () => {
       });
       expect(teardown).not.toHaveBeenCalled();
       await lease.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not treat a torn registry as zero leases during acquire", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    const tornRegistry = '{"version":1,"leases":[';
+    try {
+      await writeFile(registryPath, tornRegistry, "utf8");
+
+      await expect(
+        acquireBrowserTabLease(dir, { maxConcurrentTabs: 1, timeoutMs: 100 }),
+      ).rejects.toThrow();
+      await expect(readFile(registryPath, "utf8")).resolves.toBe(tornRegistry);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps update and release fail-closed after registry corruption", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    const tornRegistry = '{"version":1,"leases":[{"id":';
+    try {
+      const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      await writeFile(registryPath, tornRegistry, "utf8");
+
+      await expect(lease.update({ chromeTargetId: "must-not-write" })).rejects.toThrow();
+      await expect(lease.release()).rejects.toThrow();
+      await expect(readFile(registryPath, "utf8")).resolves.toBe(tornRegistry);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

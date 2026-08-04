@@ -18,6 +18,15 @@ type DisconnectFixtureOptions = {
 
 const targetId = "recoverable-target";
 const conversationUrl = `https://chatgpt.com/c/${targetId}`;
+function chromeProcessIdentity(userDataDir: string, pid = 1234) {
+  return {
+    pid,
+    processStartTime: "disconnect-fixture-process-generation",
+    executablePath: "/usr/bin/google-chrome",
+    normalizedUserDataDir: path.resolve(userDataDir),
+    launchNonce: "33333333-3333-4333-8333-333333333333",
+  };
+}
 
 function createClient(options: { onDisconnect?: (handler: () => void) => void }) {
   const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
@@ -44,6 +53,7 @@ function createClient(options: { onDisconnect?: (handler: () => void) => void })
 }
 
 async function withRemoteLateDisconnectFixture(
+  ownership: "created" | "attached",
   verify: (fixture: {
     error: unknown;
     browserAutomationError: BrowserAutomationErrorConstructor;
@@ -80,6 +90,7 @@ async function withRemoteLateDisconnectFixture(
     connectToRemoteChrome: vi.fn().mockResolvedValue({
       client,
       targetId,
+      ownership,
       close: closeRemoteConnection,
     }),
     closeChromeTarget,
@@ -116,17 +127,17 @@ async function withRemoteLateDisconnectFixture(
     connectionLostUserMessage: vi.fn(() => "connection lost"),
   }));
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
-    runProviderSubmissionFlow: vi.fn(
-      async (_adapter: unknown, context: { state?: Record<string, unknown> }) => {
-        const onPromptDispatchStarted = context.state?.onPromptDispatchStarted;
-        if (typeof onPromptDispatchStarted !== "function") {
-          throw new Error("Test browser flow did not expose prompt dispatch state.");
-        }
-        await onPromptDispatchStarted();
-        providerObservedDispatchStart = true;
-        return { status: "committed" as const, committedTurns: 1 };
-      },
-    ),
+    runProviderSubmissionFlow: vi.fn(async () => {
+      providerObservedDispatchStart = true;
+      return {
+        status: "committed" as const,
+        verification: {
+          committedTurns: 1,
+          verifiedUserTurnIndex: 0,
+          conversationId: targetId,
+        },
+      };
+    }),
   }));
   vi.doMock("../../src/browser/chatgptImages.js", () => ({
     collectGeneratedImageArtifacts: vi.fn().mockResolvedValue({
@@ -222,7 +233,7 @@ async function withDisconnectFixture(
   let profileDir = "";
   let providerObservedDispatchStart = false;
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
-  const kill = vi.fn();
+  const kill = vi.fn().mockResolvedValue(undefined);
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
     targetFound: true,
@@ -232,7 +243,11 @@ async function withDisconnectFixture(
     if (options.semanticProbeSucceeds === false) {
       throw new Error("prompt commit not observed");
     }
-    return 2;
+    return {
+      committedTurns: 2,
+      verifiedUserTurnIndex: 1,
+      conversationId: targetId,
+    };
   });
   const primaryClient = createClient({
     onDisconnect: (handler) => {
@@ -243,6 +258,7 @@ async function withDisconnectFixture(
   const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
     client: recoveryClient,
     targetId,
+    ownership: "attached",
     close: vi.fn().mockResolvedValue(undefined),
   });
 
@@ -255,6 +271,7 @@ async function withDisconnectFixture(
         port: 9230,
         process: { unref: vi.fn() },
         kill,
+        processIdentity: chromeProcessIdentity(userDataDir),
       };
     }),
     registerTerminationHooks: vi.fn(() => vi.fn()),
@@ -296,19 +313,12 @@ async function withDisconnectFixture(
     connectionLostUserMessage: vi.fn(() => "connection lost"),
   }));
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
-    runProviderSubmissionFlow: vi.fn(
-      async (_adapter: unknown, context: { state?: Record<string, unknown> }) => {
-        const onPromptDispatchStarted = context.state?.onPromptDispatchStarted;
-        if (typeof onPromptDispatchStarted !== "function") {
-          throw new Error("Test browser flow did not expose prompt dispatch state.");
-        }
-        await onPromptDispatchStarted();
-        providerObservedDispatchStart = true;
-        disconnectHandler?.();
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        return { status: "attempted" as const };
-      },
-    ),
+    runProviderSubmissionFlow: vi.fn(async () => {
+      providerObservedDispatchStart = true;
+      disconnectHandler?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return { status: "attempted" as const };
+    }),
   }));
 
   try {
@@ -319,6 +329,7 @@ async function withDisconnectFixture(
       prompt: "keep this submitted conversation",
       config: {
         cookieSync: false,
+        manualLogin: false,
         headless: true,
         modelStrategy: "ignore",
         ...(options.copiedProfile
@@ -376,6 +387,19 @@ describe("recoverable disconnect lifecycle", () => {
           recoverableDisconnect: true,
           runtime: {
             promptSubmitted: true,
+            chromePid: 1234,
+            chromeProcessIdentity: chromeProcessIdentity(fixture.profileDir),
+            conversationId: targetId,
+            promptEpoch: {
+              status: "committed",
+              epochId: expect.any(String),
+              promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+              verifiedUserTurnIndex: 1,
+              conversationId: targetId,
+            },
             recoveryCleanup: {
               transport: "local",
               ownsTarget: true,
@@ -391,6 +415,10 @@ describe("recoverable disconnect lifecycle", () => {
       await expect(readFile(path.join(fixture.profileDir, "chrome.pid"), "utf8")).resolves.toBe(
         "1234\n",
       );
+      const persistedIdentity = JSON.parse(
+        await readFile(path.join(fixture.profileDir, "chrome-process-identity.json"), "utf8"),
+      ) as unknown;
+      expect(persistedIdentity).toEqual(chromeProcessIdentity(fixture.profileDir));
     });
   });
 
@@ -411,7 +439,6 @@ describe("recoverable disconnect lifecycle", () => {
           port: 9230,
           targetId,
           host: "127.0.0.1",
-          retainChrome: true,
         }),
       );
       expect(fixture.kill).toHaveBeenCalledTimes(1);
@@ -438,7 +465,6 @@ describe("recoverable disconnect lifecycle", () => {
           port: 9230,
           targetId,
           host: "127.0.0.1",
-          retainChrome: true,
         }),
       );
       expect(fixture.kill).toHaveBeenCalledTimes(1);
@@ -447,7 +473,7 @@ describe("recoverable disconnect lifecycle", () => {
   });
 
   test("recovers a committed remote target when it disconnects during the final archive await", async () => {
-    await withRemoteLateDisconnectFixture(async (fixture) => {
+    await withRemoteLateDisconnectFixture("created", async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
       expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
       expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
@@ -458,6 +484,17 @@ describe("recoverable disconnect lifecycle", () => {
           recoverableDisconnect: true,
           runtime: {
             promptSubmitted: true,
+            conversationId: targetId,
+            promptEpoch: {
+              status: "committed",
+              epochId: expect.any(String),
+              promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              baselineTurns: 0,
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+              verifiedUserTurnIndex: 0,
+              conversationId: targetId,
+            },
             recoveryCleanup: {
               transport: "remote",
               ownsTarget: true,
@@ -467,6 +504,26 @@ describe("recoverable disconnect lifecycle", () => {
         },
       });
       expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+    });
+  });
+
+  test("records an attached remote fallback target as user-owned", async () => {
+    await withRemoteLateDisconnectFixture("attached", async (fixture) => {
+      expect(fixture.error).toMatchObject({
+        details: {
+          stage: "connection-lost",
+          recoverableDisconnect: true,
+          runtime: {
+            chromeTargetId: targetId,
+            recoveryCleanup: {
+              transport: "remote",
+              ownsTarget: false,
+              profileKind: "none",
+            },
+          },
+        },
+      });
       expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
     });
   });

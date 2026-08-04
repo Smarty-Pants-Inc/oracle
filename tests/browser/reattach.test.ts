@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
   resumeBrowserSession,
   retryBrowserRecoveryCleanup,
@@ -9,6 +9,17 @@ import {
 } from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
+import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
+
+function chromeProcessIdentity(userDataDir: string, pid?: number): ChromeProcessIdentity {
+  return {
+    pid: pid ?? 1234,
+    processStartTime: "test-process-generation",
+    executablePath: "/usr/bin/google-chrome",
+    normalizedUserDataDir: path.resolve(userDataDir),
+    launchNonce: "11111111-1111-4111-8111-111111111111",
+  };
+}
 
 type FakeTarget = { id?: string; targetId?: string; type?: string; url?: string };
 type FakeClient = {
@@ -26,11 +37,38 @@ type FakeClient = {
   Page?: { enable: () => void };
   close: () => Promise<void> | void;
 };
+function withCommittedPromptEpoch(
+  runtime: BrowserRuntimeMetadata = {},
+  verifiedUserTurnIndex = 1,
+): BrowserRuntimeMetadata {
+  const conversationId =
+    runtime.conversationId ?? runtime.tabUrl?.match(/\/c\/([^/?#]+)/u)?.[1] ?? "test-conversation";
+  const processIdentity =
+    runtime.chromeProcessIdentity ??
+    (runtime.recoveryCleanup?.transport === "local" && runtime.userDataDir
+      ? chromeProcessIdentity(runtime.userDataDir, runtime.chromePid)
+      : undefined);
+  return {
+    ...runtime,
+    ...(processIdentity ? { chromeProcessIdentity: processIdentity } : {}),
+    conversationId,
+    promptEpoch: {
+      status: "committed",
+      epochId: `epoch-${conversationId}`,
+      promptSha256: "a".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex,
+      conversationId,
+    },
+  };
+}
 
 describe("resumeBrowserSession", () => {
   test("selects target and captures markdown via stubs", async () => {
     const profileDir = path.join(os.tmpdir(), "oracle-reattach-profile");
-    const runtime: BrowserRuntimeMetadata = {
+    const runtime = withCommittedPromptEpoch({
       chromePort: 51559,
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
@@ -42,7 +80,7 @@ describe("resumeBrowserSession", () => {
         profileKind: "temporary",
         keepBrowser: false,
       },
-    };
+    });
     const listTargets = vi.fn(
       async () =>
         [
@@ -124,19 +162,26 @@ describe("resumeBrowserSession", () => {
     expect(finalization.status).toBe("completed");
     expect(cleanupOrder).toEqual(["connection", "target", "terminate", "remove-profile"]);
     expect(closeChromeTarget).toHaveBeenCalledWith(
-      expect.objectContaining({ port: 51559, targetId: "target-1", retainChrome: true }),
+      expect.objectContaining({ port: 51559, targetId: "target-1" }),
     );
-    expect(terminateRecordedChromeForProfile).toHaveBeenCalledWith(profileDir, logger);
+    expect(terminateRecordedChromeForProfile).toHaveBeenCalledWith(
+      profileDir,
+      runtime.chromeProcessIdentity,
+      logger,
+    );
     expect(removeProfile).toHaveBeenCalledWith(profileDir);
   });
 
-  test("uses prompt preview turn index when reattaching to an already-open answer", async () => {
-    const runtime = {
-      chromePort: 51559,
-      chromeHost: "127.0.0.1",
-      chromeTargetId: "target-1",
-      tabUrl: "https://chatgpt.com/c/abc",
-    };
+  test("uses the committed prompt epoch as the assistant turn floor", async () => {
+    const runtime = withCommittedPromptEpoch(
+      {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: "target-1",
+        tabUrl: "https://chatgpt.com/c/abc",
+      },
+      2,
+    );
     const listTargets = vi.fn(
       async () =>
         [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
@@ -147,9 +192,6 @@ describe("resumeBrowserSession", () => {
       }
       if (expression === "1+1") {
         return { result: { value: 2 } };
-      }
-      if (expression.includes("const needle =")) {
-        return { result: { value: 3 } };
       }
       return { result: { value: null } };
     });
@@ -177,20 +219,120 @@ describe("resumeBrowserSession", () => {
       waitForAssistantResponse,
       captureAssistantMarkdown,
       waitForConversationHydration: vi.fn(async () => 2),
-      promptPreview: "live reattach pro 123",
+      promptPreview: "stale serialized prompt preview",
     });
     await result.abandon();
 
     expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
   });
 
+  test("rejects unauthorized or incomplete prompt epochs", async () => {
+    const unauthorizedRuntimes: BrowserRuntimeMetadata[] = [
+      {
+        chromePort: 51559,
+        tabUrl: "https://chatgpt.com/c/abc",
+      },
+      {
+        chromePort: 51559,
+        tabUrl: "https://chatgpt.com/c/abc",
+        promptEpoch: {
+          status: "pending",
+          epochId: "follow-up-pending",
+          promptSha256: "pending-prompt-sha256",
+          baselineTurns: 4,
+          followUpOrdinal: 1,
+          remainingFollowUps: 0,
+        },
+      },
+      {
+        chromePort: 51559,
+        conversationId: "abc",
+        tabUrl: "https://chatgpt.com/c/abc",
+        promptEpoch: {
+          status: "committed",
+          epochId: "wrong-conversation",
+          promptSha256: "wrong-conversation-sha256",
+          baselineTurns: 4,
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+          verifiedUserTurnIndex: 4,
+          conversationId: "different-conversation",
+        },
+      },
+      {
+        chromePort: 51559,
+        conversationId: "abc",
+        tabUrl: "https://example.com/c/abc",
+        promptEpoch: {
+          status: "committed",
+          epochId: "hostile-stored-url",
+          promptSha256: "f".repeat(64),
+          baselineTurns: 4,
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+          verifiedUserTurnIndex: 4,
+          conversationId: "abc",
+        },
+      },
+      {
+        chromePort: 51559,
+        conversationId: "abc",
+        chromeTargetId: "target-1",
+        tabUrl: "https://chatgpt.com/c/abc",
+        promptEpoch: {
+          status: "committed",
+          epochId: "follow-ups-remain",
+          promptSha256: "current-prompt-sha256",
+          baselineTurns: 4,
+          followUpOrdinal: 0,
+          remainingFollowUps: 1,
+          verifiedUserTurnIndex: 4,
+          conversationId: "abc",
+        },
+      },
+      {
+        chromePort: 51559,
+        conversationId: "abc",
+        chromeTargetId: "target-1",
+        tabUrl: "https://chatgpt.com/c/abc",
+        promptEpoch: {
+          status: "committed",
+          epochId: " ",
+          promptSha256: " ",
+          baselineTurns: 5,
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+          verifiedUserTurnIndex: 4,
+          conversationId: "abc",
+        },
+      },
+    ];
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "prior prompt answer",
+      html: "",
+      meta: { messageId: "prior-answer", turnId: "conversation-turn-3" },
+    }));
+
+    for (const runtime of unauthorizedRuntimes) {
+      await expect(
+        resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
+          listTargets: vi.fn(async () => {
+            throw new Error("prior assistant answer must not be captured");
+          }),
+          waitForAssistantResponse,
+        }),
+      ).rejects.toThrow(/prompt epoch|conversation|follow-up/i);
+    }
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
+  });
+
   test("uses Deep Research completion path when reattaching research sessions", async () => {
-    const runtime = {
+    const runtime = withCommittedPromptEpoch({
       chromePort: 51559,
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
       tabUrl: "https://chatgpt.com/c/deep",
-    };
+    });
     const listTargets = vi.fn(
       async () =>
         [
@@ -264,9 +406,9 @@ describe("resumeBrowserSession", () => {
   });
 
   test("falls back to recovery when chrome port is missing", async () => {
-    const runtime = {
+    const runtime = withCommittedPromptEpoch({
       tabUrl: "https://chatgpt.com/c/abc",
-    };
+    });
     const recoverSession = vi.fn(async () => ({
       answerText: "fallback",
       answerMarkdown: "fallback-md",
@@ -281,12 +423,12 @@ describe("resumeBrowserSession", () => {
   });
 
   test("tries live reattach from browser websocket metadata before falling back", async () => {
-    const runtime = {
+    const runtime = withCommittedPromptEpoch({
       chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
       chromeProfileRoot: path.join(os.tmpdir(), "oracle-attach-running-profile"),
       tabUrl: "https://chatgpt.com/c/abc",
       chromeTargetId: "target-2",
-    };
+    });
     const listTargets = vi.fn(
       async () =>
         [
@@ -343,12 +485,12 @@ describe("resumeBrowserSession", () => {
   });
 
   test("closes the attached client before falling back to recovery", async () => {
-    const runtime = {
+    const runtime = withCommittedPromptEpoch({
       chromePort: 51559,
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
       tabUrl: "https://chatgpt.com/c/abc",
-    };
+    });
     const listTargets = vi.fn(async () => {
       return [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[];
     }) as unknown as () => Promise<FakeTarget[]>;
@@ -398,16 +540,211 @@ describe("resumeBrowserSession", () => {
     expect(recoverSession).toHaveBeenCalled();
     await result.abandon();
   });
+  test("fails closed when the original target is missing among unrelated user tabs", async () => {
+    const profileRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-refresh-"));
+    const refreshedPort = 63332;
+    const refreshedEndpoint = `ws://127.0.0.1:${refreshedPort}/devtools/browser/refreshed`;
+    const fallbackProfileRoot = path.join(profileRoot, "fallback-profile");
+    await writeFile(
+      path.join(profileRoot, "DevToolsActivePort"),
+      `${refreshedPort}\n/devtools/browser/refreshed\n`,
+      "utf8",
+    );
+
+    try {
+      const runtime = withCommittedPromptEpoch({
+        chromePort: 41111,
+        chromeHost: "127.0.0.1",
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:41111/devtools/browser/stale",
+        chromeProfileRoot: profileRoot,
+        chromeTargetId: "missing-original-target",
+        tabUrl: "https://chatgpt.com/c/abc",
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: false,
+        },
+      });
+      const listTargets = vi.fn(async () => [
+        { targetId: "unrelated-target", type: "page", url: "https://chatgpt.com/c/unrelated" },
+        { targetId: "same-conversation-user-tab", type: "page", url: runtime.tabUrl },
+      ]) as unknown as () => Promise<FakeTarget[]>;
+      const connect = vi.fn(async () => {
+        throw new Error("must not attach to a user-owned target");
+      }) as unknown as (options?: unknown) => Promise<ChromeClient>;
+      const waitForConversationHydration = vi.fn(async () => 2);
+      const recoverSession = vi.fn(async (authoritativeRuntime: BrowserRuntimeMetadata) => ({
+        answerText: "fallback",
+        answerMarkdown: "fallback-md",
+        runtime: {
+          ...authoritativeRuntime,
+          chromePid: 4242,
+          chromePort: 64443,
+          chromeBrowserWSEndpoint: undefined,
+          chromeProfileRoot: fallbackProfileRoot,
+          userDataDir: fallbackProfileRoot,
+          chromeTargetId: undefined,
+          recoveryCleanup: {
+            transport: "remote" as const,
+            ownsTarget: false,
+            profileKind: "none" as const,
+            keepBrowser: true,
+          },
+          recoveryCleanupBacklog: __test__.buildRecoveryCleanupBacklog(authoritativeRuntime),
+        },
+      }));
+      const closeChromeTarget = vi.fn(async () => true);
+
+      const result = await resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
+        listTargets,
+        connect,
+        waitForConversationHydration,
+        recoverSession,
+        recoveryCleanup: { closeChromeTarget },
+      });
+
+      expect(result.answerMarkdown).toBe("fallback-md");
+      expect(connect).not.toHaveBeenCalled();
+      expect(waitForConversationHydration).not.toHaveBeenCalled();
+      expect(recoverSession).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chromePort: refreshedPort,
+          chromeBrowserWSEndpoint: refreshedEndpoint,
+          chromeTargetId: undefined,
+        }),
+        {},
+      );
+      expect(result.runtime.recoveryCleanupBacklog).toEqual([
+        expect.objectContaining({
+          chromePort: refreshedPort,
+          chromeBrowserWSEndpoint: refreshedEndpoint,
+          chromeTargetId: undefined,
+        }),
+      ]);
+
+      const finalized = await result.finalize();
+      expect(finalized).toMatchObject({
+        status: "pending",
+        error: "Owned Chrome target cleanup metadata is incomplete",
+      });
+      expect(closeChromeTarget).not.toHaveBeenCalled();
+    } finally {
+      await rm(profileRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("allows an explicit browser tab reference without claiming ownership", async () => {
+    const runtime = withCommittedPromptEpoch({
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "missing-original-target",
+      tabUrl: "https://chatgpt.com/c/abc",
+      recoveryCleanup: {
+        transport: "local",
+        ownsTarget: true,
+        profileKind: "none",
+        keepBrowser: false,
+      },
+    });
+    const listTargets = vi.fn(async () => [
+      { targetId: "borrowed-target", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: { value: expression === "location.href" ? runtime.tabUrl : 2 },
+    }));
+    const connect = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          close: vi.fn(async () => undefined),
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const closeChromeTarget = vi.fn(async () => true);
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { browserTabRef: "borrowed-target", timeoutMs: 2_000 },
+      vi.fn() as BrowserLogger,
+      {
+        listTargets,
+        connect,
+        waitForConversationHydration: vi.fn(async () => 2),
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "borrowed capture",
+          html: "",
+          meta: { messageId: "m1", turnId: "conversation-turn-3" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "borrowed capture"),
+        recoveryCleanup: { closeChromeTarget },
+      },
+    );
+
+    expect(result.runtime).toMatchObject({
+      chromeTargetId: "borrowed-target",
+      recoveryCleanup: { ownsTarget: false },
+    });
+    expect((await result.finalize()).status).toBe("completed");
+    expect(closeChromeTarget).not.toHaveBeenCalled();
+  });
 });
 
 describe("recovery resource finalization", () => {
   const { finalizeRecoveredRuntime } = __test__;
   const stopped = { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
 
+  test("serializes immutable Chrome process identity into cleanup backlog", () => {
+    const profileDir = path.join(os.tmpdir(), "oracle-backlog-identity");
+    const processIdentity = chromeProcessIdentity(profileDir, 4242);
+    expect(
+      __test__.buildRecoveryCleanupBacklog({
+        chromePid: 4242,
+        chromeProcessIdentity: processIdentity,
+        userDataDir: profileDir,
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
+      }),
+    ).toEqual([
+      expect.objectContaining({
+        chromePid: 4242,
+        chromeProcessIdentity: processIdentity,
+        userDataDir: profileDir,
+      }),
+    ]);
+  });
+
+  test("retains local cleanup authority when process identity is missing", async () => {
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const result = await finalizeRecoveredRuntime(
+      {
+        userDataDir: path.join(os.tmpdir(), "oracle-browser-missing-process-identity"),
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
+      },
+      vi.fn() as BrowserLogger,
+      { terminateRecordedChromeForProfile },
+    );
+
+    expect(result).toMatchObject({
+      status: "pending",
+      error: "Chrome process identity cleanup metadata is missing",
+    });
+    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+  });
+
   test("defers cleanup until finalize and runs the finalizer once", async () => {
     const events: string[] = [];
     const profileDir = path.join(os.tmpdir(), "oracle-reattach-fallback-profile");
-    const runtime: BrowserRuntimeMetadata = {
+    const runtime = withCommittedPromptEpoch({
       chromePort: 9222,
       chromeTargetId: "original-target",
       userDataDir: profileDir,
@@ -417,7 +754,7 @@ describe("recovery resource finalization", () => {
         profileKind: "temporary",
         keepBrowser: false,
       },
-    };
+    });
     const logger = vi.fn() as BrowserLogger;
     const result = await resumeBrowserSession(runtime, {}, logger, {
       recoverSession: vi.fn(async () => {
@@ -455,14 +792,19 @@ describe("recovery resource finalization", () => {
       runtime: {},
     }));
     const abandonResources = vi.fn(async () => undefined);
-    const result = await resumeBrowserSession({}, {}, vi.fn() as BrowserLogger, {
-      recoverSession: vi.fn(async () => ({
-        answerText: "captured",
-        answerMarkdown: "captured",
-        finalizeResources,
-        abandonResources,
-      })),
-    });
+    const result = await resumeBrowserSession(
+      withCommittedPromptEpoch(),
+      {},
+      vi.fn() as BrowserLogger,
+      {
+        recoverSession: vi.fn(async () => ({
+          answerText: "captured",
+          answerMarkdown: "captured",
+          finalizeResources,
+          abandonResources,
+        })),
+      },
+    );
 
     await result.abandon();
     expect(abandonResources).toHaveBeenCalledOnce();
@@ -475,6 +817,7 @@ describe("recovery resource finalization", () => {
     const result = await finalizeRecoveredRuntime(
       {
         userDataDir: profileDir,
+        chromeProcessIdentity: chromeProcessIdentity(profileDir),
         recoveryCleanup: {
           transport: "local",
           ownsTarget: false,
@@ -509,6 +852,7 @@ describe("recovery resource finalization", () => {
       const result = await retryBrowserRecoveryCleanup(
         {
           userDataDir: profileDir,
+          chromeProcessIdentity: chromeProcessIdentity(profileDir),
           recoveryCleanup: {
             transport: "local",
             ownsTarget: false,
@@ -527,7 +871,13 @@ describe("recovery resource finalization", () => {
         },
       );
 
-      expect(result).toEqual({ status: "completed", runtime: { userDataDir: profileDir } });
+      expect(result).toEqual({
+        status: "completed",
+        runtime: {
+          userDataDir: profileDir,
+          chromeProcessIdentity: chromeProcessIdentity(profileDir),
+        },
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -539,6 +889,9 @@ describe("recovery resource finalization", () => {
     const result = await finalizeRecoveredRuntime(
       {
         userDataDir: path.join(os.homedir(), ".oracle", "browser-profile"),
+        chromeProcessIdentity: chromeProcessIdentity(
+          path.join(os.homedir(), ".oracle", "browser-profile"),
+        ),
         recoveryCleanup: {
           transport: "local",
           ownsTarget: false,
@@ -572,6 +925,7 @@ describe("recovery resource finalization", () => {
     const result = await finalizeRecoveredRuntime(
       {
         userDataDir: profileDir,
+        chromeProcessIdentity: chromeProcessIdentity(profileDir),
         recoveryCleanup: {
           transport: "local",
           ownsTarget: false,
@@ -626,7 +980,6 @@ describe("recovery resource finalization", () => {
       expect.objectContaining({
         targetId: "remote-owned-target",
         browserWSEndpoint: "wss://remote.example.test/devtools/browser/abc",
-        retainChrome: true,
       }),
     );
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
@@ -678,16 +1031,20 @@ describe("recovery resource finalization", () => {
     const recoveryLockPath = path.join(root, "browser-recovery.lock");
     const logger = vi.fn() as BrowserLogger;
     const recoverSession = vi.fn(async () => ({ answerText: "ok", answerMarkdown: "ok" }));
+    const runtime = withCommittedPromptEpoch();
     try {
-      const first = await resumeBrowserSession({}, {}, logger, {
+      const first = await resumeBrowserSession(runtime, {}, logger, {
         recoverSession,
         recoveryLockPath,
       });
       await expect(
-        resumeBrowserSession({}, {}, logger, { recoverSession, recoveryLockPath }),
+        resumeBrowserSession(runtime, {}, logger, { recoverSession, recoveryLockPath }),
       ).rejects.toThrow(/already in progress/i);
       await first.abandon();
-      const next = await resumeBrowserSession({}, {}, logger, { recoverSession, recoveryLockPath });
+      const next = await resumeBrowserSession(runtime, {}, logger, {
+        recoverSession,
+        recoveryLockPath,
+      });
       await next.abandon();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -697,7 +1054,7 @@ describe("recovery resource finalization", () => {
   test("does not finalize resources after failed fallback recovery", async () => {
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     const removeProfile = vi.fn(async () => true);
-    const runtime: BrowserRuntimeMetadata = {
+    const runtime = withCommittedPromptEpoch({
       chromePort: 9222,
       userDataDir: path.join(os.tmpdir(), "oracle-browser-failed-recovery"),
       recoveryCleanup: {
@@ -706,7 +1063,7 @@ describe("recovery resource finalization", () => {
         profileKind: "temporary",
         keepBrowser: false,
       },
-    };
+    });
 
     await expect(
       resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
@@ -730,6 +1087,7 @@ describe("reattach helpers", () => {
     extractConversationIdFromUrl,
     buildConversationUrl,
     openConversationFromSidebar,
+    createOwnedRecoveryTargetConnection,
   } = __test__;
   type EvaluateParams = { expression: string };
   type EvaluateResult<T> = { result: { value: T } };
@@ -756,22 +1114,106 @@ describe("reattach helpers", () => {
     );
   });
 
-  test("pickTarget prefers a saved conversation over a stale target id", () => {
+  test("creates and binds a dedicated owned recovery target", async () => {
+    const logger = vi.fn() as BrowserLogger;
+    const createRecoveryTarget = vi.fn(async () => "created-target");
+    const closeConnection = vi.fn(async () => undefined);
+    const connectRecoveryTarget = vi.fn(async () => ({
+      client: { close: vi.fn(async () => undefined) } as unknown as ChromeClient,
+      targetId: "created-target",
+      ownership: "attached" as const,
+      close: closeConnection,
+    }));
+
+    const connection = await createOwnedRecoveryTargetConnection(
+      { host: "127.0.0.1", port: 63333 },
+      logger,
+      { createRecoveryTarget, connectRecoveryTarget },
+    );
+
+    expect(createRecoveryTarget).toHaveBeenCalledWith(63333, logger, "127.0.0.1");
+    expect(connectRecoveryTarget).toHaveBeenCalledWith("127.0.0.1", 63333, logger, {
+      targetId: "created-target",
+      closeTargetOnDispose: false,
+    });
+    expect(connection).toMatchObject({ targetId: "created-target", ownership: "created" });
+    await connection.close();
+    expect(closeConnection).toHaveBeenCalledOnce();
+  });
+
+  test("rejects a recovery connection that is not bound to the created target", async () => {
+    const logger = vi.fn() as BrowserLogger;
+    const closeConnection = vi.fn(async () => undefined);
+    const closeChromeTarget = vi.fn(async () => true);
+
+    await expect(
+      createOwnedRecoveryTargetConnection({ host: "127.0.0.1", port: 63333 }, logger, {
+        createRecoveryTarget: vi.fn(async () => "created-target"),
+        connectRecoveryTarget: vi.fn(async () => ({
+          client: { close: vi.fn(async () => undefined) } as unknown as ChromeClient,
+          targetId: "different-target",
+          ownership: "attached" as const,
+          close: closeConnection,
+        })),
+        recoveryCleanup: { closeChromeTarget },
+      }),
+    ).rejects.toThrow(/different-target.*created-target/i);
+    expect(closeConnection).toHaveBeenCalledOnce();
+    expect(closeChromeTarget).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 63333,
+      targetId: "created-target",
+      logger,
+    });
+  });
+
+  test("pickTarget requires the stored target and committed conversation to match", () => {
     const targets = [
       { targetId: "t-1", type: "page", url: "https://chatgpt.com/c/first" },
       { targetId: "t-2", type: "page", url: "https://chatgpt.com/c/second" },
       { targetId: "t-3", type: "page", url: "about:blank" },
     ];
-    expect(pickTarget(targets, { chromeTargetId: "t-2" })).toEqual(targets[1]);
+    expect(
+      pickTarget(targets, {
+        chromeTargetId: "t-1",
+        tabUrl: "https://chatgpt.com/c/first",
+        conversationId: "first",
+      }),
+    ).toEqual(targets[0]);
     expect(
       pickTarget(targets, {
         chromeTargetId: "t-2",
         tabUrl: "https://chatgpt.com/c/first",
         conversationId: "first",
       }),
-    ).toEqual(targets[0]);
-    expect(pickTarget(targets, { tabUrl: "https://chatgpt.com/c/first" })).toEqual(targets[0]);
-    expect(pickTarget(targets, {})).toEqual(targets[0]);
+    ).toBeUndefined();
+    expect(pickTarget(targets, { tabUrl: "https://chatgpt.com/c/first" })).toBeUndefined();
+    expect(pickTarget(targets, {})).toBeUndefined();
+    expect(
+      pickTarget([{ targetId: "external", type: "page", url: "https://example.com/c/first" }], {
+        chromeTargetId: "external",
+        conversationId: "first",
+      }),
+    ).toBeUndefined();
+  });
+
+  test("pickTarget permits only an explicitly referenced borrowed target", () => {
+    const targets = [
+      { targetId: "t-1", type: "page", url: "https://chatgpt.com/c/first" },
+      { targetId: "t-2", type: "page", url: "https://chatgpt.com/c/second" },
+    ];
+    expect(pickTarget(targets, { conversationId: "second" }, "t-2")).toEqual(targets[1]);
+    expect(pickTarget(targets, { conversationId: "second" }, "second")).toEqual(targets[1]);
+    expect(pickTarget(targets, { conversationId: "second" }, "missing")).toBeUndefined();
+    expect(pickTarget(targets, { conversationId: "second" }, "current")).toBeUndefined();
+    const ambiguous = [
+      { targetId: "same-1", type: "page", url: "https://chatgpt.com/c/same" },
+      { targetId: "same-2", type: "page", url: "https://chatgpt.com/c/same" },
+    ];
+    expect(pickTarget(ambiguous, { conversationId: "same" }, "same")).toBeUndefined();
+    expect(
+      pickTarget(ambiguous, { conversationId: "same" }, "https://chatgpt.com/c/same"),
+    ).toBeUndefined();
   });
 
   test("pickTarget keeps the saved target among duplicate conversation tabs", () => {
@@ -788,13 +1230,18 @@ describe("reattach helpers", () => {
     ).toEqual(targets[1]);
   });
 
-  test("pickTarget understands CDP list ids", () => {
+  test("pickTarget understands CDP list ids when conversation identity agrees", () => {
     const targets = [
       { id: "page-1", type: "page", url: "https://chatgpt.com/c/first" },
       { id: "page-2", type: "page", url: "about:blank" },
     ];
 
-    expect(pickTarget(targets, { chromeTargetId: "page-1" })).toEqual(targets[0]);
+    expect(
+      pickTarget(targets, {
+        chromeTargetId: "page-1",
+        conversationId: "first",
+      }),
+    ).toEqual(targets[0]);
   });
 
   test("openConversationFromSidebar passes conversationId and projects preference", async () => {

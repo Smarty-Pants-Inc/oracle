@@ -4,9 +4,11 @@ import type {
   BrowserModelSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
+  BrowserPromptEpoch,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
 import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
+import type { ChromeProcessIdentity } from "./profileState.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
@@ -180,6 +182,7 @@ export interface BrowserRunResult {
   answerChars: number;
   browserTransport?: "cdp";
   chromePid?: number;
+  chromeProcessIdentity?: ChromeProcessIdentity;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
@@ -189,8 +192,22 @@ export interface BrowserRunResult {
   tabUrl?: string;
   conversationId?: string;
   promptSubmitted?: boolean;
+  promptEpoch?: BrowserPromptEpoch;
   controllerPid?: number;
   recoveryCleanup?: BrowserRecoveryCleanupMetadata;
+}
+
+export type BrowserCaptureFinalizationResult =
+  | { status: "completed"; runtime: BrowserRuntimeMetadata }
+  | { status: "pending"; runtime: BrowserRuntimeMetadata; error: string };
+
+export interface BrowserRunTransaction extends BrowserRunResult {
+  /** Canonical locator and cleanup authority persisted before resource retirement. */
+  runtime: BrowserRuntimeMetadata;
+  /** Retire resources after the caller has durably stored the capture and pending authority. */
+  finalize: () => Promise<BrowserCaptureFinalizationResult>;
+  /** Dispose newly owned resources when capture persistence fails before finalization. */
+  abort: () => Promise<BrowserCaptureFinalizationResult>;
 }
 
 export type ResolvedBrowserConfig = Required<

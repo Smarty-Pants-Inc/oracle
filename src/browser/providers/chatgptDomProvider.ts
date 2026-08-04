@@ -15,9 +15,8 @@ interface ChatgptDomProviderState {
   timeoutMs: number;
   inputTimeoutMs?: number;
   attachmentTimeoutMs?: number;
-  baselineTurns?: number | null;
+  baselineTurns: number;
   attachmentNames?: AttachmentReadyExpectation[];
-  committedTurns?: number | null;
   onPromptDispatchStarted?: () => Promise<void> | void;
 }
 
@@ -40,12 +39,12 @@ async function typePrompt(_ctx: ProviderDomFlowContext): Promise<void> {
 
 async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<PromptCommitEvidence> {
   const state = requireState(ctx);
-  const committedTurns = await submitPrompt(
+  const verification = await submitPrompt(
     {
       runtime: state.runtime,
       input: state.input,
       attachmentNames: state.attachmentNames ?? [],
-      baselineTurns: state.baselineTurns ?? undefined,
+      baselineTurns: state.baselineTurns,
       inputTimeoutMs: state.inputTimeoutMs ?? undefined,
       attachmentTimeoutMs: state.attachmentTimeoutMs ?? undefined,
       onPromptDispatchStarted: state.onPromptDispatchStarted,
@@ -53,18 +52,8 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<Prom
     ctx.prompt,
     state.logger,
   );
-  state.committedTurns =
-    typeof committedTurns === "number" && Number.isFinite(committedTurns) ? committedTurns : null;
-  if (
-    state.committedTurns != null &&
-    (state.baselineTurns == null || state.committedTurns > state.baselineTurns)
-  ) {
-    state.baselineTurns = Math.max(0, state.committedTurns - 1);
-  }
-  return {
-    status: "committed",
-    ...(state.committedTurns == null ? {} : { committedTurns: state.committedTurns }),
-  };
+  state.baselineTurns = verification.verifiedUserTurnIndex + 1;
+  return { status: "committed", verification };
 }
 
 async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
