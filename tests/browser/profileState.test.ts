@@ -54,7 +54,7 @@ async function physicalChromeIdentity(
     processStartTime: "process-generation-s",
     executablePath:
       process.platform === "win32"
-        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
         : process.platform === "darwin"
           ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
           : "/usr/bin/google-chrome",
@@ -233,7 +233,7 @@ describe("profileState", () => {
   });
 
   test("captures a macOS Chrome executable from its physical text vnode", async () => {
-    const userDataDir = path.join(os.tmpdir(), "oracle-mac-profile");
+    const userDataDir = "/tmp/oracle-mac-profile";
     const profileDirectory = {
       version: 1 as const,
       platform: "darwin" as const,

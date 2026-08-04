@@ -1547,7 +1547,7 @@ async function verifyAndSyncArtifactFile(
   artifactPath: string,
   descriptor: RemoteArtifactDescriptor,
 ): Promise<{ size: number; sha256: string }> {
-  const handle = await open(artifactPath, "r");
+  const handle = await open(artifactPath, "r+");
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.size !== descriptor.byteSize) {

@@ -34,7 +34,7 @@ async function chromeProcessIdentity(
     processStartTime: "disconnect-fixture-process-generation",
     executablePath:
       profileDirectory.platform === "win32"
-        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
         : profileDirectory.platform === "darwin"
           ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
           : "/usr/bin/google-chrome",

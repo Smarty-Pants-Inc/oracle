@@ -15,6 +15,7 @@ import {
   attachSession,
 } from "../../src/cli/sessionDisplay.ts";
 import chalk from "chalk";
+import path from "node:path";
 
 const waitMock = vi.hoisted(() => vi.fn());
 const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
@@ -568,7 +569,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: "/tmp/sessions/sess/browser-recovery.lock",
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
         isRemotePublicationAcknowledged: expect.any(Function),
       }),
       "finalize",
@@ -661,7 +662,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: "/tmp/sessions/sess/browser-recovery.lock",
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
       }),
       "abort",
     );

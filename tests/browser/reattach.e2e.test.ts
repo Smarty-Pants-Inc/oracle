@@ -46,16 +46,24 @@ function committedRuntime(
 }
 
 function chromeProcessIdentity(userDataDir: string, pid: number) {
+  const canonicalPath = path.resolve(userDataDir);
+  const normalizedUserDataDir =
+    process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath;
   return {
     pid,
     processStartTime: "e2e-process-generation",
-    executablePath: "/usr/bin/google-chrome",
-    normalizedUserDataDir: path.resolve(userDataDir),
+    executablePath:
+      process.platform === "win32"
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
+        : process.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome",
+    normalizedUserDataDir,
     launchNonce: "44444444-4444-4444-8444-444444444444",
     profileDirectory: {
       version: 1 as const,
       platform: process.platform,
-      canonicalPath: path.resolve(userDataDir),
+      canonicalPath,
       device: "1",
       inode: "2",
     },
@@ -696,22 +704,20 @@ describe("browser reattach end-to-end (simulated)", () => {
         kill: vi.fn().mockResolvedValue({ status: "stopped", pid: 4242, signal: "SIGTERM" }),
       };
       const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+      let resolveSignalHandled!: () => void;
+      const signalHandled = new Promise<void>((resolve) => {
+        resolveSignalHandled = resolve;
+      });
       const removeHooks = registerTerminationHooks(
         chrome as unknown as ChromeLaunchResult,
         profileDir,
         false,
         () => {},
-        { isInFlight: () => true, emitRuntimeHint },
+        { isInFlight: () => true, emitRuntimeHint, onSignalHandled: resolveSignalHandled },
       );
 
       process.emit("SIGINT");
-      for (let i = 0; i < 20; i += 1) {
-        const refreshed = await sessionStore.readSession(sessionMeta.id);
-        if (refreshed?.browser?.runtime?.chromePort) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      await signalHandled;
 
       removeHooks();
       exitSpy.mockRestore();
