@@ -297,7 +297,9 @@ describe("crash-recoverable filesystem lock", () => {
       reclaimerLock = await reclaimer;
       await expect(releaseAttempt).rejects.toThrow(/ownership changed/i);
 
-      await expect(reclaimerLock.release()).resolves.toBeUndefined();
+      await expect(reclaimerLock.release()).rejects.toThrow(
+        "injected mutation request cleanup failure",
+      );
       expect(reclaimerRemovalAttempts).toBe(1);
       await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
       expect(
@@ -408,6 +410,114 @@ describe("crash-recoverable filesystem lock", () => {
       resumeStalledPublisher();
       await stalledAcquire.catch(() => undefined);
       await successor?.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("finishes timed-out queue cleanup before rejecting acquisition", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const mutationRootPath = `${lockPath}.mutations`;
+    const originalPid = 50_050;
+    const blockerPid = 51_051;
+    const contenderPid = 52_052;
+    let resumeBlocker!: () => void;
+    const allowBlocker = new Promise<void>((resolve) => {
+      resumeBlocker = resolve;
+    });
+    let markBlockerReady!: () => void;
+    const blockerReady = new Promise<void>((resolve) => {
+      markBlockerReady = resolve;
+    });
+    let resumeCleanup!: () => void;
+    const allowCleanup = new Promise<void>((resolve) => {
+      resumeCleanup = resolve;
+    });
+    let markCleanupBlocked!: () => void;
+    const cleanupBlocked = new Promise<void>((resolve) => {
+      markCleanupBlocked = resolve;
+    });
+    let blockerLock: CrashRecoverableFilesystemLock | undefined;
+    let timedAcquire: Promise<CrashRecoverableFilesystemLock> | undefined;
+    let cleanupAttempts = 0;
+    let timedAcquireSettled = false;
+    const identities: Record<number, string> = {
+      [originalPid]: "original-start",
+      [blockerPid]: "blocker-start",
+      [contenderPid]: "contender-start",
+    };
+    await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: originalPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+      },
+    );
+    const blocker = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: blockerPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) =>
+          pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        beforeStaleLockQuarantine: async () => {
+          markBlockerReady();
+          await allowBlocker;
+        },
+      },
+    );
+
+    try {
+      await blockerReady;
+      timedAcquire = acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 20, pollMs: 10 },
+        {
+          pid: contenderPid,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) =>
+            pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          beforeMutationRequestRemoval: async () => {
+            cleanupAttempts += 1;
+            if (cleanupAttempts === 1) {
+              throw new Error("injected timed-out request cleanup failure");
+            }
+            markCleanupBlocked();
+            await allowCleanup;
+          },
+        },
+      ).finally(() => {
+        timedAcquireSettled = true;
+      });
+      void timedAcquire.catch(() => undefined);
+
+      await cleanupBlocked;
+      expect(cleanupAttempts).toBe(2);
+      expect(timedAcquireSettled).toBe(false);
+      expect(
+        (await readdir(mutationRootPath)).filter((entry) => entry.startsWith("request-")),
+      ).toHaveLength(2);
+
+      resumeCleanup();
+      await expect(timedAcquire).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      expect(timedAcquireSettled).toBe(true);
+      expect(
+        (await readdir(mutationRootPath)).filter((entry) => entry.startsWith("request-")),
+      ).toHaveLength(1);
+
+      resumeBlocker();
+      blockerLock = await blocker;
+      await blockerLock.release();
+      blockerLock = undefined;
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      resumeCleanup();
+      resumeBlocker();
+      await Promise.allSettled([blocker, timedAcquire].filter(Boolean) as Promise<unknown>[]);
+      await blockerLock?.release().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
   });
