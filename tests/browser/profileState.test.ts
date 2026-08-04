@@ -67,6 +67,7 @@ describe("profileState", () => {
   });
 
   test("waits for Chrome profile processes before returning from termination", async () => {
+    if (process.platform === "win32") return;
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
     const child = spawn(
       process.execPath,
@@ -107,7 +108,11 @@ describe("profileState", () => {
       ).resolves.toBe("signal");
 
       child.send("exit");
-      await expect(termination).resolves.toBe(true);
+      await expect(termination).resolves.toMatchObject({
+        status: "stopped",
+        pid: child.pid,
+        signal: "SIGTERM",
+      });
       expect(profileState.isProcessAlive(child.pid)).toBe(false);
 
       await rm(dir, { recursive: true, force: true });
@@ -116,6 +121,34 @@ describe("profileState", () => {
       child.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("reads and validates a Windows Chrome command line without case-sensitive path assumptions", async () => {
+    const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
+    const command = String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="c:\users\oracle\appdata\local\temp\oracle-browser-session"`;
+    const execute = async (file: string, args: string[]) => {
+      expect(file).toBe("powershell.exe");
+      expect(args).toContain("-NonInteractive");
+      expect(args.at(-1)).toContain("ProcessId = 4242");
+      return { stdout: command };
+    };
+
+    await expect(profileState.readProcessCommandForTest(4242, "win32", execute)).resolves.toBe(
+      command,
+    );
+    expect(profileState.isChromeCommandForUserDataDirForTest(command, profileDir)).toBe(true);
+
+    const terminationCalls: Array<{ file: string; args: string[] }> = [];
+    const terminate = async (file: string, args: string[]) => {
+      terminationCalls.push({ file, args });
+      return { stdout: "SUCCESS" };
+    };
+    await profileState.terminateChromeProcessForTest(4242, false, "win32", terminate);
+    await profileState.terminateChromeProcessForTest(4242, true, "win32", terminate);
+    expect(terminationCalls).toEqual([
+      { file: "taskkill.exe", args: ["/PID", "4242", "/T"] },
+      { file: "taskkill.exe", args: ["/PID", "4242", "/T", "/F"] },
+    ]);
   });
 
   test("skips manual-login cleanup when DevTools port is still reachable", async () => {

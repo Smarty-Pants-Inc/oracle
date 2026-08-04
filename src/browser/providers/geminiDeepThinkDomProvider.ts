@@ -1,4 +1,8 @@
-import type { ProviderDomAdapter, ProviderDomFlowContext } from "../providerDomFlow.js";
+import type {
+  PromptCommitEvidence,
+  ProviderDomAdapter,
+  ProviderDomFlowContext,
+} from "../providerDomFlow.js";
 import { joinSelectors } from "../providerDomFlow.js";
 
 const UI_TIMEOUT_MS = 60_000;
@@ -172,7 +176,7 @@ async function typePrompt(ctx: ProviderDomFlowContext): Promise<void> {
   await ctx.delay(500);
 }
 
-async function submitPrompt(ctx: ProviderDomFlowContext): Promise<void> {
+async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEvidence> {
   ctx.log?.("[gemini-web] Sending prompt...");
   const inputSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.input);
   const sendButtonSelectors = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.sendButton);
@@ -195,6 +199,7 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<void> {
   if (sendResult !== "clicked" && sendResult !== "enter") {
     throw new Error("Failed to submit prompt in Gemini Deep Think mode (send control not found).");
   }
+  return { status: "attempted" };
 }
 
 async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: string }> {

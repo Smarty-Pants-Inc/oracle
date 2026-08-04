@@ -50,7 +50,11 @@ vi.mock("../../src/sessionStore.ts", () => ({
   sessionStore: sessionStoreMock,
 }));
 
-import type { SessionMetadata, SessionModelRun } from "../../src/sessionManager.ts";
+import type {
+  BrowserRuntimeMetadata,
+  SessionMetadata,
+  SessionModelRun,
+} from "../../src/sessionManager.ts";
 import type { ModelName } from "../../src/oracle.ts";
 import { performSessionRun } from "../../src/cli/sessionRunner.ts";
 import {
@@ -91,6 +95,20 @@ const log = vi.fn();
 const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
 const originalPlatform = process.platform;
+
+function createReattachResult(
+  answerText: string,
+  answerMarkdown: string,
+  runtime: BrowserRuntimeMetadata,
+) {
+  const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+  const abandon = vi.fn(async () => undefined);
+  return {
+    value: { answerText, answerMarkdown, runtime, finalize, abandon },
+    finalize,
+    abandon,
+  };
+}
 
 async function withExactEnv<T>(
   updates: Record<string, string | undefined>,
@@ -155,6 +173,12 @@ beforeEach(() => {
   });
   sessionStoreMock.readModelLog.mockResolvedValue("model log body");
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/.oracle/sessions");
+  sessionStoreMock.getPaths.mockResolvedValue({
+    dir: path.join(os.tmpdir(), "oracle-test-session"),
+    metadata: path.join(os.tmpdir(), "oracle-test-session", "metadata.json"),
+    log: path.join(os.tmpdir(), "oracle-test-session", "session.log"),
+    request: path.join(os.tmpdir(), "oracle-test-session", "request.json"),
+  });
   vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
   vi.spyOn(fsPromises, "writeFile").mockResolvedValue(undefined);
 });
@@ -1331,6 +1355,7 @@ describe("performSessionRun", () => {
           chromePort: 9222,
           chromeHost: "127.0.0.1",
           tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
         },
       },
     );
@@ -1390,7 +1415,7 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("Auto-reattach attempt 1");
   });
 
-  test("skips auto-reattach when disconnect is classified non-recoverable", async () => {
+  test("marks a non-recoverable disconnect as an error without reattach", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome window closed before oracle finished. Please keep it open until completion.",
       {
@@ -1409,24 +1434,28 @@ describe("performSessionRun", () => {
       throw automationError;
     });
 
-    await performSessionRun({
-      sessionMeta: baseSessionMeta,
-      runOptions: baseRunOptions,
-      mode: "browser",
-      browserConfig: { chromePath: null },
-      cwd: "/tmp",
-      log,
-      write,
-      version: cliVersion,
-    });
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/Chrome window closed/);
 
     expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(logLines).toContain("Skipping auto-reattach: disconnect classified as non-recoverable.");
+    expect(logLines).toContain(
+      "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
+    );
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
-      status: "running",
-      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      status: "error",
+      response: { status: "error", incompleteReason: "chrome-disconnected" },
     });
   });
 
@@ -1510,10 +1539,17 @@ describe("performSessionRun", () => {
       );
       throw automationError;
     });
-    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
-      answerText: "recovered answer",
-      answerMarkdown: "recovered **answer**",
-    });
+    const recoveredRuntime = {
+      chromePort: 9222,
+      tabUrl: "https://chatgpt.com/c/demo",
+      recoveryCleanupResult: { status: "pending" as const },
+    };
+    const reattach = createReattachResult(
+      "recovered answer",
+      "recovered **answer**",
+      recoveredRuntime,
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce(reattach.value);
     vi.mocked(ensureSessionArtifacts).mockResolvedValueOnce([
       { kind: "transcript", path: "/tmp/transcript.md" },
     ]);
@@ -1530,11 +1566,16 @@ describe("performSessionRun", () => {
     });
 
     expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
-    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
-    expect(finalUpdate).toMatchObject({
+    const completedUpdate = sessionStoreMock.updateSession.mock.calls.find(
+      ([, updates]) => updates.status === "completed",
+    )?.[1];
+    expect(completedUpdate).toMatchObject({
       status: "completed",
       response: { status: "completed" },
+      browser: { runtime: recoveredRuntime },
     });
+    expect(reattach.finalize).toHaveBeenCalledOnce();
+    expect(reattach.abandon).not.toHaveBeenCalled();
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain("Auto-reattach succeeded; session marked completed.");
   });
@@ -1622,7 +1663,7 @@ describe("performSessionRun", () => {
     );
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain(
-      "Chrome disconnected before a ChatGPT conversation was created; marking session error.",
+      "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
     );
     expect(logLines).not.toContain("oracle session sess-1 --render");
   });
@@ -1870,10 +1911,13 @@ describe("performSessionRun", () => {
       );
       throw automationError;
     });
-    vi.mocked(resumeBrowserSession).mockResolvedValue({
-      answerText: "ok text",
-      answerMarkdown: "ok markdown",
-    });
+    const recoveredRuntime = {
+      chromePort: 9222,
+      tabUrl: "https://chatgpt.com/c/demo",
+      recoveryCleanupResult: { status: "pending" as const },
+    };
+    const reattach = createReattachResult("ok text", "ok markdown", recoveredRuntime);
+    vi.mocked(resumeBrowserSession).mockResolvedValue(reattach.value);
     vi.mocked(ensureSessionArtifacts).mockResolvedValue([
       { kind: "transcript", path: "/tmp/transcript.md" },
       { kind: "deep-research-report", path: "/tmp/deep-research-report.md" },
@@ -1904,8 +1948,10 @@ describe("performSessionRun", () => {
         conversationUrl: "https://chatgpt.com/c/demo",
       }),
     );
-    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
-    expect(finalUpdate).toMatchObject({
+    const completedUpdate = sessionStoreMock.updateSession.mock.calls.find(
+      ([, updates]) => updates.status === "completed",
+    )?.[1];
+    expect(completedUpdate).toMatchObject({
       status: "completed",
       artifacts: [
         { kind: "transcript", path: "/tmp/transcript.md" },
@@ -1927,6 +1973,8 @@ describe("performSessionRun", () => {
     expect(sessionStoreMock.updateSession.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
       vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
     );
+    expect(reattach.finalize).toHaveBeenCalledOnce();
+    expect(reattach.abandon).not.toHaveBeenCalled();
   });
 
   test("does not repeat completion side effects when auto-reattach persistence fails", async () => {
@@ -1935,10 +1983,11 @@ describe("performSessionRun", () => {
       runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
     });
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
-    vi.mocked(resumeBrowserSession).mockResolvedValue({
-      answerText: "ok text",
-      answerMarkdown: "ok markdown",
+    const reattach = createReattachResult("ok text", "ok markdown", {
+      chromePort: 9222,
+      tabUrl: "https://chatgpt.com/c/demo",
     });
+    vi.mocked(resumeBrowserSession).mockResolvedValue(reattach.value);
     sessionStoreMock.updateSession.mockImplementation(
       async (_sessionId: string, updates: Partial<SessionMetadata>) => {
         if (updates.status === "completed") {
@@ -1974,6 +2023,8 @@ describe("performSessionRun", () => {
       errorMessage: "metadata write failed",
       response: { status: "error", incompleteReason: "incomplete-capture" },
     });
+    expect(reattach.abandon).toHaveBeenCalledOnce();
+    expect(reattach.finalize).not.toHaveBeenCalled();
   });
 
   test("auto-reattach stops after a hard cap when it cannot capture an answer", async () => {

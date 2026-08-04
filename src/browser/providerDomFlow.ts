@@ -1,6 +1,9 @@
 import type { BrowserLogger } from "./types.js";
 
 export type DomEvaluate = <T>(expression: string) => Promise<T | undefined>;
+export type PromptCommitEvidence =
+  | { status: "committed"; committedTurns?: number }
+  | { status: "attempted" };
 
 export interface ProviderDomFlowContext {
   prompt: string;
@@ -21,7 +24,7 @@ export interface ProviderDomAdapter {
   waitForUi: (ctx: ProviderDomFlowContext) => Promise<void>;
   selectMode?: (ctx: ProviderDomFlowContext) => Promise<void>;
   typePrompt: (ctx: ProviderDomFlowContext) => Promise<void>;
-  submitPrompt: (ctx: ProviderDomFlowContext) => Promise<void>;
+  submitPrompt: (ctx: ProviderDomFlowContext) => Promise<PromptCommitEvidence>;
   waitForResponse: (ctx: ProviderDomFlowContext) => Promise<ProviderDomResponse>;
   extractThoughts?: (ctx: ProviderDomFlowContext) => Promise<string | null>;
 }
@@ -33,13 +36,13 @@ export interface ProviderDomFlowResult extends ProviderDomResponse {
 export async function runProviderSubmissionFlow(
   adapter: ProviderDomAdapter,
   ctx: ProviderDomFlowContext,
-): Promise<void> {
+): Promise<PromptCommitEvidence> {
   await adapter.waitForUi(ctx);
   if (adapter.selectMode) {
     await adapter.selectMode(ctx);
   }
   await adapter.typePrompt(ctx);
-  await adapter.submitPrompt(ctx);
+  return await adapter.submitPrompt(ctx);
 }
 
 export async function runProviderDomFlow(

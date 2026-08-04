@@ -1,11 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import {
   acquireBrowserTabLease,
   hasOtherActiveBrowserTabLeases,
   normalizeMaxConcurrentTabs,
+  teardownBrowserResourcesIfNoActiveLeases,
 } from "../../src/browser/tabLeaseRegistry.js";
 
 describe("tabLeaseRegistry", () => {
@@ -201,6 +202,80 @@ describe("tabLeaseRegistry", () => {
       await next.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("runs teardown only while the registry is empty and locked", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      const seed = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      await seed.release();
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      let finishTeardown!: () => void;
+      const finish = new Promise<void>((resolve) => {
+        finishTeardown = resolve;
+      });
+      const teardownPromise = teardownBrowserResourcesIfNoActiveLeases(dir, async () => {
+        markStarted();
+        await finish;
+        return true;
+      });
+      await started;
+
+      let acquired = false;
+      const leasePromise = acquireBrowserTabLease(dir, {
+        timeoutMs: 1000,
+        pollMs: 25,
+      }).then((lease) => {
+        acquired = true;
+        return lease;
+      });
+      expect(acquired).toBe(false);
+      finishTeardown();
+      await expect(teardownPromise).resolves.toEqual({ status: "completed" });
+      const lease = await leasePromise;
+      expect(acquired).toBe(true);
+      await lease.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves resources when another lease is active", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      const teardown = vi.fn(async () => true);
+      await expect(teardownBrowserResourcesIfNoActiveLeases(dir, teardown)).resolves.toEqual({
+        status: "preserved",
+        reason: "active-leases",
+      });
+      expect(teardown).not.toHaveBeenCalled();
+      await lease.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for missing or malformed registry state", async () => {
+    const missingDir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const malformedDir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    try {
+      const teardown = vi.fn(async () => true);
+      await expect(
+        teardownBrowserResourcesIfNoActiveLeases(missingDir, teardown),
+      ).resolves.toMatchObject({ status: "preserved", reason: "registry-unavailable" });
+      await writeFile(path.join(malformedDir, "oracle-tab-leases.json"), "not-json", "utf8");
+      await expect(
+        teardownBrowserResourcesIfNoActiveLeases(malformedDir, teardown),
+      ).resolves.toMatchObject({ status: "preserved", reason: "registry-unavailable" });
+      expect(teardown).not.toHaveBeenCalled();
+    } finally {
+      await rm(missingDir, { recursive: true, force: true });
+      await rm(malformedDir, { recursive: true, force: true });
     }
   });
 });

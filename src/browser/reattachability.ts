@@ -32,6 +32,9 @@ export function hasRecoverableChatGptConversation(
   if (!runtime) {
     return false;
   }
+  if (runtime.promptSubmitted === false) {
+    return false;
+  }
   if (runtime.conversationId?.trim()) {
     return true;
   }

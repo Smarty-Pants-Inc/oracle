@@ -538,13 +538,23 @@ export async function performSessionRun({
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
       const recoverableRuntime = runtime ?? currentBrowser?.runtime;
+      const recoverableDisconnect =
+        (userError.details as { recoverableDisconnect?: boolean } | undefined)
+          ?.recoverableDisconnect === true;
+      const hasRecoveryLocator = Boolean(
+        hasRecoverableChatGptConversation(recoverableRuntime) ||
+        recoverableRuntime?.chromePort ||
+        recoverableRuntime?.chromeBrowserWSEndpoint ||
+        recoverableRuntime?.chromeProfileRoot,
+      );
       if (
-        !hasRecoverableChatGptConversation(recoverableRuntime) &&
-        recoverableRuntime?.promptSubmitted !== true
+        !recoverableDisconnect ||
+        recoverableRuntime?.promptSubmitted !== true ||
+        !hasRecoveryLocator
       ) {
         log(
           dim(
-            "Chrome disconnected before a ChatGPT conversation was created; marking session error.",
+            "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
           ),
         );
         if (modelForStatus) {
@@ -597,16 +607,6 @@ export async function performSessionRun({
         response: { status: "running", incompleteReason: "chrome-disconnected" },
       });
       logBrowserReattachGuidance(recoverableRuntime);
-      // Only auto-reattach when liveness classified the target as still alive.
-      // Closed-Chrome disconnects stay running + guidance but must not enter a
-      // futile resume loop (fail closed on availability).
-      const recoverableDisconnect =
-        (userError.details as { recoverableDisconnect?: boolean } | undefined)
-          ?.recoverableDisconnect === true;
-      if (!recoverableDisconnect) {
-        log(dim("Skipping auto-reattach: disconnect classified as non-recoverable."));
-        return;
-      }
       // Connection-lost should attempt the same recovery path as assistant-timeout.
       // When auto-reattach interval is unset, still try a single resume so a live
       // Chrome/target can be harvested instead of leaving the session permanently running.
@@ -1195,6 +1195,10 @@ async function autoReattachUntilComplete({
     }
   }) as BrowserLogger;
   logger.verbose = true;
+  const recoveryLockPath = path.join(
+    (await sessionStore.getPaths(sessionMeta.id)).dir,
+    "browser-recovery.lock",
+  );
 
   let attempt = 0;
   for (;;) {
@@ -1210,22 +1214,25 @@ async function autoReattachUntilComplete({
     attempt += 1;
     log(dim(`Auto-reattach attempt ${attempt}...`));
     let captureSucceeded = false;
+    let durablyCompleted = false;
+    let reattachResult: Awaited<ReturnType<typeof resumeBrowserSession>> | null = null;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
         timeoutMs,
       };
-      const result = await resumeBrowserSession(runtime, reattachConfig, logger, {
+      reattachResult = await resumeBrowserSession(runtime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
+        recoveryLockPath,
       });
       captureSucceeded = true;
-      const answerText = result.answerMarkdown || result.answerText || "";
+      const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const artifacts = await ensureSessionArtifacts({
         sessionId: sessionMeta.id,
         prompt: runOptions.prompt,
         answerMarkdown: answerText,
-        conversationUrl: runtime.tabUrl,
+        conversationUrl: reattachResult.runtime.tabUrl,
         browserConfig,
         existingArtifacts: sessionMeta.artifacts,
         logger,
@@ -1254,10 +1261,7 @@ async function autoReattachUntilComplete({
           sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
           mode: sessionMeta.mode ?? "browser",
           model: sessionMeta.model ?? runOptions.model,
-          usage: {
-            inputTokens: 0,
-            outputTokens,
-          },
+          usage: { inputTokens: 0, outputTokens },
           characters: answerText.length,
         },
         notificationSettings,
@@ -1277,16 +1281,44 @@ async function autoReattachUntilComplete({
         browser: {
           ...browserMetadata,
           config: browserConfig,
-          runtime,
+          runtime: reattachResult.runtime,
         },
         artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
         response: { status: "completed" },
         error: undefined,
         transport: undefined,
       });
-      log(kleur.green("Auto-reattach succeeded; session marked completed."));
+      durablyCompleted = true;
+      const finalization = await reattachResult.finalize();
+      await sessionStore.updateSession(sessionMeta.id, {
+        browser: {
+          ...browserMetadata,
+          config: browserConfig,
+          runtime: finalization.runtime,
+        },
+      });
+      if (finalization.status === "pending") {
+        log(
+          kleur.yellow(
+            `Auto-reattach completed; browser cleanup remains pending: ${finalization.error}`,
+          ),
+        );
+      } else {
+        log(kleur.green("Auto-reattach succeeded; session marked completed."));
+      }
       return true;
     } catch (error) {
+      if (reattachResult && !durablyCompleted) {
+        await reattachResult.abandon().catch(() => undefined);
+      }
+      if (durablyCompleted) {
+        log(
+          dim(
+            `Auto-reattach completed, but cleanup state persistence failed: ${formatError(error)}`,
+          ),
+        );
+        return true;
+      }
       if (captureSucceeded) {
         const message = formatError(error);
         if (modelForStatus) {
@@ -1302,13 +1334,10 @@ async function autoReattachUntilComplete({
           browser: {
             ...browserMetadata,
             config: browserConfig,
-            runtime,
+            runtime: reattachResult?.runtime ?? runtime,
           },
           response: { status: "error", incompleteReason: "incomplete-capture" },
-          error: {
-            category: "internal",
-            message,
-          },
+          error: { category: "internal", message },
         });
         throw error;
       }

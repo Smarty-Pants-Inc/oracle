@@ -17,6 +17,17 @@ const CHROME_PID_FILENAME = "chrome.pid";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
 
 const execFileAsync = promisify(execFile);
+
+type ProcessCommandExecutor = (file: string, args: string[]) => Promise<{ stdout: string }>;
+
+const executeProcessCommand: ProcessCommandExecutor = async (file, args) => {
+  const { stdout } = await execFileAsync(file, args, {
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return { stdout: String(stdout ?? "") };
+};
 const CHROME_TERMINATION_TIMEOUT_MS = 5_000;
 const CHROME_FORCE_TERMINATION_TIMEOUT_MS = 2_000;
 const CHROME_TERMINATION_POLL_MS = 50;
@@ -127,58 +138,144 @@ export function findChromeDebugTargetForProfileFromProcessListForTest(
 ): RunningChromeDebugTarget | null {
   return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir);
 }
+export type RecordedChromeTerminationOutcome =
+  | { status: "stopped"; pid: number; signal: "SIGTERM" | "SIGKILL" }
+  | { status: "already-stopped"; pid?: number }
+  | { status: "unsafe"; reason: string; pid?: number };
+
+export function isSafeChromeTerminationOutcome(
+  outcome: RecordedChromeTerminationOutcome,
+): outcome is Exclude<RecordedChromeTerminationOutcome, { status: "unsafe" }> {
+  return outcome.status === "stopped" || outcome.status === "already-stopped";
+}
 
 export async function terminateRecordedChromeForProfile(
   userDataDir: string,
   logger?: ProfileStateLogger,
-): Promise<boolean> {
-  const pid = await readChromePid(userDataDir);
-  if (!pid || !isProcessAlive(pid)) {
-    return false;
+): Promise<RecordedChromeTerminationOutcome> {
+  const pidPath = path.join(userDataDir, CHROME_PID_FILENAME);
+  let pid: number;
+  try {
+    const raw = (await readFile(pidPath, "utf8")).trim();
+    pid = Number.parseInt(raw, 10);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      return { status: "unsafe", reason: "recorded Chrome pid is invalid" };
+    }
+  } catch (error) {
+    const errorCode =
+      error && typeof error === "object" && "code" in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    if (errorCode !== "ENOENT") {
+      return {
+        status: "unsafe",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (await isChromeUsingUserDataDir(userDataDir)) {
+      return { status: "unsafe", reason: "Chrome is using the profile without a recorded pid" };
+    }
+    return { status: "already-stopped" };
+  }
+  if (!isProcessAlive(pid)) {
+    if (await isChromeUsingUserDataDir(userDataDir)) {
+      return { status: "unsafe", reason: "another Chrome process is using the profile", pid };
+    }
+    return { status: "already-stopped", pid };
   }
   const command = await readProcessCommand(pid);
   if (!isChromeCommandForUserDataDir(command, userDataDir)) {
-    logger?.(`Recorded Chrome pid ${pid} does not match ${userDataDir}; skipping termination`);
-    return false;
+    const reason = `Recorded Chrome pid ${pid} does not match ${userDataDir}`;
+    logger?.(`${reason}; skipping termination`);
+    return { status: "unsafe", reason, pid };
   }
-  try {
-    process.kill(pid, "SIGTERM");
-    if (await waitForChromeProfileProcessesToExit(userDataDir, CHROME_TERMINATION_TIMEOUT_MS)) {
-      logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
-      return true;
-    }
 
-    const currentCommand = await readProcessCommand(pid);
-    if (!isChromeCommandForUserDataDir(currentCommand, userDataDir)) {
-      logger?.(`Chrome pid ${pid} changed before forced termination; skipping SIGKILL`);
-      return false;
-    }
-    process.kill(pid, "SIGKILL");
-    if (
-      await waitForChromeProfileProcessesToExit(userDataDir, CHROME_FORCE_TERMINATION_TIMEOUT_MS)
-    ) {
-      logger?.(`Force-terminated shared manual-login Chrome pid ${pid}`);
-      return true;
-    }
-    logger?.(`Chrome processes for ${userDataDir} did not exit after SIGKILL`);
-    return false;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger?.(`Failed to terminate shared manual-login Chrome pid ${pid}: ${message}`);
-    return false;
+  const gracefulError = await terminateChromeProcess(pid, false).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  if (
+    !gracefulError &&
+    (await waitForChromeProfileProcessesToExit(userDataDir, CHROME_TERMINATION_TIMEOUT_MS, pid))
+  ) {
+    logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
+    return { status: "stopped", pid, signal: "SIGTERM" };
   }
+  if (!isProcessAlive(pid) && !(await isChromeUsingUserDataDir(userDataDir))) {
+    return { status: "already-stopped", pid };
+  }
+
+  const currentCommand = await readProcessCommand(pid);
+  if (!isChromeCommandForUserDataDir(currentCommand, userDataDir)) {
+    const reason = `Chrome pid ${pid} changed before forced termination`;
+    logger?.(`${reason}; skipping forced termination`);
+    return { status: "unsafe", reason, pid };
+  }
+  const forceError = await terminateChromeProcess(pid, true).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  if (
+    !forceError &&
+    (await waitForChromeProfileProcessesToExit(
+      userDataDir,
+      CHROME_FORCE_TERMINATION_TIMEOUT_MS,
+      pid,
+    ))
+  ) {
+    logger?.(`Force-terminated shared manual-login Chrome pid ${pid}`);
+    return { status: "stopped", pid, signal: "SIGKILL" };
+  }
+  if (!isProcessAlive(pid) && !(await isChromeUsingUserDataDir(userDataDir))) {
+    return { status: "already-stopped", pid };
+  }
+  const reason = forceError
+    ? forceError instanceof Error
+      ? forceError.message
+      : String(forceError)
+    : `Chrome processes for ${userDataDir} did not exit after forced termination`;
+  logger?.(`Failed to terminate shared manual-login Chrome pid ${pid}: ${reason}`);
+  return { status: "unsafe", reason, pid };
 }
 
 async function waitForChromeProfileProcessesToExit(
   userDataDir: string,
   timeoutMs: number,
+  pid: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  while (await isChromeUsingUserDataDir(userDataDir)) {
+  while (isProcessAlive(pid) || (await isChromeUsingUserDataDir(userDataDir))) {
     if (Date.now() >= deadline) return false;
     await delay(CHROME_TERMINATION_POLL_MS);
   }
   return true;
+}
+
+async function terminateChromeProcess(
+  pid: number,
+  force: boolean,
+  platform: NodeJS.Platform = process.platform,
+  execute: ProcessCommandExecutor = executeProcessCommand,
+): Promise<void> {
+  if (platform === "win32") {
+    await execute("taskkill.exe", [
+      "/PID",
+      String(Math.trunc(pid)),
+      "/T",
+      ...(force ? ["/F"] : []),
+    ]);
+    return;
+  }
+  process.kill(pid, force ? "SIGKILL" : "SIGTERM");
+}
+
+export function terminateChromeProcessForTest(
+  pid: number,
+  force: boolean,
+  platform: NodeJS.Platform,
+  execute: ProcessCommandExecutor,
+): Promise<void> {
+  return terminateChromeProcess(pid, force, platform, execute);
 }
 
 function isChromeCommandForUserDataDir(command: string | null, userDataDir: string): boolean {
@@ -187,7 +284,7 @@ function isChromeCommandForUserDataDir(command: string | null, userDataDir: stri
   return (
     (lower.includes("chrome") || lower.includes("chromium")) &&
     lower.includes("user-data-dir") &&
-    command.includes(userDataDir)
+    lower.includes(userDataDir.toLowerCase())
   );
 }
 
@@ -395,35 +492,36 @@ export async function cleanupStaleProfileState(
   userDataDir: string,
   logger?: ProfileStateLogger,
   options: { lockRemovalMode?: "never" | "if_oracle_pid_dead" } = {},
-): Promise<void> {
+): Promise<boolean> {
+  let cleaned = true;
   for (const candidate of getDevToolsActivePortPaths(userDataDir)) {
     try {
       await rm(candidate, { force: true });
       logger?.(`Removed stale DevToolsActivePort: ${candidate}`);
     } catch {
-      // ignore cleanup errors
+      cleaned = false;
     }
   }
 
   const lockRemovalMode = options.lockRemovalMode ?? "never";
   if (lockRemovalMode === "never") {
-    return;
+    return cleaned;
   }
 
   const pid = await readChromePid(userDataDir);
   if (!pid) {
-    return;
+    return cleaned;
   }
   if (isProcessAlive(pid)) {
     logger?.(`Chrome pid ${pid} still alive; skipping profile lock cleanup`);
-    return;
+    return false;
   }
 
   // Extra safety: if Chrome is running with this profile (but with a different PID, e.g. user relaunched
   // without remote debugging), never delete lock files.
   if (await isChromeUsingUserDataDir(userDataDir)) {
     logger?.("Detected running Chrome using this profile; skipping profile lock cleanup");
-    return;
+    return false;
   }
 
   const lockFiles = [
@@ -433,15 +531,31 @@ export async function cleanupStaleProfileState(
     path.join(userDataDir, "SingletonCookie"),
   ];
   for (const lock of lockFiles) {
-    await rm(lock, { force: true }).catch(() => undefined);
+    try {
+      await rm(lock, { force: true });
+    } catch {
+      cleaned = false;
+    }
   }
   logger?.("Cleaned up stale Chrome profile locks");
+  return cleaned;
 }
 
 async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
   if (process.platform === "win32") {
-    // On Windows, lockfiles are typically held open and removal should fail anyway; avoid expensive process scans.
-    return false;
+    try {
+      const { stdout } = await executeProcessCommand("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(chrome|chromium)\\.exe$' } | ForEach-Object { $_.CommandLine }",
+      ]);
+      return stdout
+        .split(/\r?\n/)
+        .some((command) => isChromeCommandForUserDataDir(command, userDataDir));
+    } catch {
+      return true;
+    }
   }
 
   try {
@@ -449,33 +563,40 @@ async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
       maxBuffer: 10 * 1024 * 1024,
     });
     const lines = String(stdout ?? "").split("\n");
-    const needle = userDataDir;
-    for (const line of lines) {
-      if (!line) continue;
-      const lower = line.toLowerCase();
-      if (!lower.includes("chrome") && !lower.includes("chromium")) continue;
-      if (line.includes(needle) && lower.includes("user-data-dir")) {
-        return true;
-      }
-    }
+    return lines.some((command) => isChromeCommandForUserDataDir(command, userDataDir));
   } catch {
-    // best effort
+    return true;
   }
-  return false;
 }
 
-async function readProcessCommand(pid: number): Promise<string | null> {
+async function readProcessCommand(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  execute: ProcessCommandExecutor = executeProcessCommand,
+): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      "ps",
-      ["-p", String(Math.trunc(pid)), "-o", "command="],
-      {
-        maxBuffer: 1024 * 1024,
-      },
-    );
-    const command = String(stdout ?? "").trim();
+    if (platform === "win32") {
+      const { stdout } = await execute("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$ErrorActionPreference = 'Stop'; $process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${Math.trunc(pid)}'; if ($null -ne $process.CommandLine) { [Console]::Out.Write($process.CommandLine) }`,
+      ]);
+      const command = stdout.trim();
+      return command || null;
+    }
+    const { stdout } = await execute("ps", ["-p", String(Math.trunc(pid)), "-o", "command="]);
+    const command = stdout.trim();
     return command || null;
   } catch {
     return null;
   }
+}
+
+export function readProcessCommandForTest(
+  pid: number,
+  platform: NodeJS.Platform,
+  execute: ProcessCommandExecutor,
+): Promise<string | null> {
+  return readProcessCommand(pid, platform, execute);
 }

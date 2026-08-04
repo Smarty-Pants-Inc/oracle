@@ -81,6 +81,159 @@ describe("shouldPreserveBrowserOnErrorForTest", () => {
     expect(classifyPreservedBrowserErrorForTest(error, false)).toBe("cloudflare-challenge");
   });
 });
+describe("recoverable disconnect policy", () => {
+  test("does not inherit a committed first prompt into a second dispatch epoch", () => {
+    const dispatch: Parameters<typeof __test__.resetPromptDispatch>[0] = { status: "idle" };
+
+    __test__.beginPromptDispatch(dispatch, "first prompt", 0);
+    __test__.markPromptDispatchCommitted(dispatch);
+    expect(__test__.isPromptDispatchCommitted(dispatch)).toBe(true);
+
+    __test__.resetPromptDispatch(dispatch);
+    __test__.beginPromptDispatch(dispatch, "second prompt", 2);
+
+    expect(__test__.isPromptDispatchCommitted(dispatch)).toBe(false);
+    expect(dispatch).toEqual({ status: "ambiguous", prompt: "second prompt", baselineTurns: 2 });
+  });
+
+  test("never retains a copied profile after a preserved browser error", () => {
+    expect(
+      __test__.shouldKeepLocalBrowserOpen({
+        effectiveKeepBrowser: false,
+        preserveBrowserOnError: true,
+        usingCopiedProfile: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("keeps existing retention semantics for ordinary profiles", () => {
+    expect(
+      __test__.shouldKeepLocalBrowserOpen({
+        effectiveKeepBrowser: false,
+        preserveBrowserOnError: true,
+        usingCopiedProfile: false,
+      }),
+    ).toBe(true);
+  });
+
+  test("keeps the completed conversation tab when keepBrowser is enabled", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "complete",
+        ownsTarget: true,
+        keepBrowser: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("closes owned completed tabs by default", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "complete",
+        ownsTarget: true,
+        keepBrowser: false,
+      }),
+    ).toBe(true);
+  });
+
+  test("closes a completed service-owned tab while keeping shared Chrome alive", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "complete",
+        ownsTarget: true,
+        keepBrowser: true,
+        closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("does not close attached targets", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "complete",
+        ownsTarget: false,
+        keepBrowser: false,
+        closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("closes owned incomplete targets by default", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "attempted",
+        ownsTarget: true,
+        keepBrowser: false,
+        closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("keeps owned incomplete targets only for explicit recovery", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "attempted",
+        ownsTarget: true,
+        keepBrowser: false,
+        closeOwnedTabOnComplete: true,
+        preserveForRecovery: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("schedules final blank cleanup for retained manual-login Chrome", () => {
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(true);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: false,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "attempted",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: false,
+        connectionClosedUnexpectedly: false,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+    expect(
+      __test__.shouldCleanupBlankTabsAfterLastLease({
+        runStatus: "complete",
+        ownsTarget: true,
+        connectionClosedUnexpectedly: true,
+        manualLogin: true,
+        keepBrowser: true,
+        chromePort: 9222,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("authenticated model-selection errors", () => {
   test("preserves picker diagnostics without adding cookie guidance", () => {

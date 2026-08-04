@@ -492,6 +492,9 @@ describe("closeBlankChromeTabs", () => {
       }
     ).send("Target.setAutoAttach", { autoAttach: true }, "session-9");
     expect(send).toHaveBeenCalledWith("Target.setAutoAttach", { autoAttach: true }, "session-9");
+    await connection.close();
+    expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({ sessionId: "session-9" });
+    expect(browserClient.Target.closeTarget).not.toHaveBeenCalled();
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
@@ -607,6 +610,47 @@ describe("closeBlankChromeTabs", () => {
   });
 });
 
+describe("closeChromeTarget", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("retains a replacement page while closing through a browser websocket", async () => {
+    vi.useFakeTimers();
+    const browserClient = {
+      Target: {
+        getTargets: vi
+          .fn()
+          .mockResolvedValueOnce({
+            targetInfos: [{ targetId: "owned", type: "page", url: "https://chatgpt.com/c/1" }],
+          })
+          .mockResolvedValueOnce({
+            targetInfos: [{ targetId: "replacement", type: "page", url: "about:blank" }],
+          }),
+        createTarget: vi.fn(async () => ({ targetId: "replacement" })),
+        closeTarget: vi.fn(async () => ({ success: true })),
+      },
+      close: vi.fn(async () => undefined),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+    // Load after the hoisted CDP mock so the transport helper uses this test's browser client.
+    const { closeChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    const closing = closeChromeTarget({
+      port: 9222,
+      targetId: "owned",
+      logger: vi.fn<(message: string) => void>(),
+      browserWSEndpoint: "wss://remote.example/devtools/browser/abc",
+      retainChrome: true,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(closing).resolves.toBe(true);
+    expect(browserClient.Target.createTarget).toHaveBeenCalledWith({ url: "about:blank" });
+    expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "owned" });
+    expect(browserClient.close).toHaveBeenCalledOnce();
+  });
+});
 describe("ensureChromePageTargetAfterClose", () => {
   beforeEach(() => {
     cdpNewMock.mockReset();

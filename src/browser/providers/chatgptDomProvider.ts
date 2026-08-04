@@ -1,5 +1,9 @@
 import type { BrowserLogger, ChromeClient } from "../types.js";
-import type { ProviderDomAdapter, ProviderDomFlowContext } from "../providerDomFlow.js";
+import type {
+  PromptCommitEvidence,
+  ProviderDomAdapter,
+  ProviderDomFlowContext,
+} from "../providerDomFlow.js";
 import { ensurePromptReady } from "../actions/navigation.js";
 import { submitPrompt, type AttachmentReadyExpectation } from "../actions/promptComposer.js";
 import { waitForAssistantResponse } from "../actions/assistantResponse.js";
@@ -34,7 +38,7 @@ async function typePrompt(_ctx: ProviderDomFlowContext): Promise<void> {
   // submitPrompt() handles typing + send for ChatGPT.
 }
 
-async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void> {
+async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<PromptCommitEvidence> {
   const state = requireState(ctx);
   const committedTurns = await submitPrompt(
     {
@@ -57,6 +61,10 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
   ) {
     state.baselineTurns = Math.max(0, state.committedTurns - 1);
   }
+  return {
+    status: "committed",
+    ...(state.committedTurns == null ? {} : { committedTurns: state.committedTurns }),
+  };
 }
 
 async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{

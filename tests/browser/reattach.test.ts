@@ -1,5 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
-import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import {
+  resumeBrowserSession,
+  retryBrowserRecoveryCleanup,
+  __test__,
+} from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
 
@@ -22,11 +29,12 @@ type FakeClient = {
 
 describe("resumeBrowserSession", () => {
   test("selects target and captures markdown via stubs", async () => {
+    const profileDir = path.join(os.tmpdir(), "oracle-reattach-profile");
     const runtime: BrowserRuntimeMetadata = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
-      userDataDir: "/tmp/oracle-reattach-profile",
+      userDataDir: profileDir,
       tabUrl: "https://chatgpt.com/c/abc",
       recoveryCleanup: {
         transport: "local",
@@ -72,16 +80,17 @@ describe("resumeBrowserSession", () => {
     }));
     const captureAssistantMarkdown = vi.fn(async () => "markdown response");
     const waitForConversationHydration = vi.fn(async () => 2);
-    const closeTab = vi.fn(async () => {
+    const closeChromeTarget = vi.fn(async () => {
       cleanupOrder.push("target");
       return true;
     });
     const terminateRecordedChromeForProfile = vi.fn(async () => {
       cleanupOrder.push("terminate");
-      return true;
+      return { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
     });
     const removeProfile = vi.fn(async () => {
       cleanupOrder.push("remove-profile");
+      return true;
     });
     const logger = vi.fn() as BrowserLogger;
     logger.verbose = true;
@@ -92,7 +101,7 @@ describe("resumeBrowserSession", () => {
       waitForAssistantResponse,
       captureAssistantMarkdown,
       waitForConversationHydration,
-      recoveryCleanup: { closeTab, terminateRecordedChromeForProfile, removeProfile },
+      recoveryCleanup: { closeChromeTarget, terminateRecordedChromeForProfile, removeProfile },
     });
 
     expect(result.answerMarkdown).toBe("markdown response");
@@ -110,13 +119,15 @@ describe("resumeBrowserSession", () => {
       waitForAssistantResponse.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
     );
     expect(close).toHaveBeenCalledOnce();
+    expect(cleanupOrder).toEqual(["connection"]);
+    const finalization = await result.finalize();
+    expect(finalization.status).toBe("completed");
     expect(cleanupOrder).toEqual(["connection", "target", "terminate", "remove-profile"]);
-    expect(closeTab).toHaveBeenCalledWith(51559, "target-1", logger, "127.0.0.1");
-    expect(terminateRecordedChromeForProfile).toHaveBeenCalledWith(
-      "/tmp/oracle-reattach-profile",
-      logger,
+    expect(closeChromeTarget).toHaveBeenCalledWith(
+      expect.objectContaining({ port: 51559, targetId: "target-1", retainChrome: true }),
     );
-    expect(removeProfile).toHaveBeenCalledWith("/tmp/oracle-reattach-profile");
+    expect(terminateRecordedChromeForProfile).toHaveBeenCalledWith(profileDir, logger);
+    expect(removeProfile).toHaveBeenCalledWith(profileDir);
   });
 
   test("uses prompt preview turn index when reattaching to an already-open answer", async () => {
@@ -160,7 +171,7 @@ describe("resumeBrowserSession", () => {
     const captureAssistantMarkdown = vi.fn(async () => "live reattach pro 123");
     const logger = vi.fn() as BrowserLogger;
 
-    await resumeBrowserSession(runtime, { timeoutMs: 2000 }, logger, {
+    const result = await resumeBrowserSession(runtime, { timeoutMs: 2000 }, logger, {
       listTargets,
       connect,
       waitForAssistantResponse,
@@ -168,6 +179,7 @@ describe("resumeBrowserSession", () => {
       waitForConversationHydration: vi.fn(async () => 2),
       promptPreview: "live reattach pro 123",
     });
+    await result.abandon();
 
     expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
   });
@@ -247,6 +259,7 @@ describe("resumeBrowserSession", () => {
       },
     );
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
+    await result.abandon();
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();
   });
 
@@ -264,12 +277,13 @@ describe("resumeBrowserSession", () => {
 
     expect(result.answerMarkdown).toBe("fallback-md");
     expect(recoverSession).toHaveBeenCalled();
+    await result.abandon();
   });
 
   test("tries live reattach from browser websocket metadata before falling back", async () => {
     const runtime = {
       chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
-      chromeProfileRoot: "/tmp/oracle-attach-running-profile",
+      chromeProfileRoot: path.join(os.tmpdir(), "oracle-attach-running-profile"),
       tabUrl: "https://chatgpt.com/c/abc",
       chromeTargetId: "target-2",
     };
@@ -325,6 +339,7 @@ describe("resumeBrowserSession", () => {
         local: true,
       }),
     );
+    await result.abandon();
   });
 
   test("closes the attached client before falling back to recovery", async () => {
@@ -381,18 +396,21 @@ describe("resumeBrowserSession", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(recoverSession).toHaveBeenCalled();
+    await result.abandon();
   });
 });
 
 describe("recovery resource finalization", () => {
   const { finalizeRecoveredRuntime } = __test__;
+  const stopped = { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
 
-  test("finalizes the original resources only after fallback capture succeeds", async () => {
+  test("defers cleanup until finalize and runs the finalizer once", async () => {
     const events: string[] = [];
+    const profileDir = path.join(os.tmpdir(), "oracle-reattach-fallback-profile");
     const runtime: BrowserRuntimeMetadata = {
       chromePort: 9222,
       chromeTargetId: "original-target",
-      userDataDir: "/tmp/oracle-fallback-profile",
+      userDataDir: profileDir,
       recoveryCleanup: {
         transport: "local",
         ownsTarget: true,
@@ -401,68 +419,62 @@ describe("recovery resource finalization", () => {
       },
     };
     const logger = vi.fn() as BrowserLogger;
-    const recoverSession = vi.fn(async () => {
-      events.push("fallback-capture");
-      return { answerText: "fallback", answerMarkdown: "fallback" };
-    });
-
-    await resumeBrowserSession(runtime, {}, logger, {
-      recoverSession,
+    const result = await resumeBrowserSession(runtime, {}, logger, {
+      recoverSession: vi.fn(async () => {
+        events.push("fallback-capture");
+        return { answerText: "fallback", answerMarkdown: "fallback" };
+      }),
       recoveryCleanup: {
-        closeTab: vi.fn(async () => {
+        closeChromeTarget: vi.fn(async () => {
           events.push("close-target");
           return true;
         }),
         terminateRecordedChromeForProfile: vi.fn(async () => {
           events.push("terminate");
-          return true;
+          return stopped;
         }),
         removeProfile: vi.fn(async () => {
           events.push("remove-profile");
+          return true;
         }),
       },
     });
 
+    expect(events).toEqual(["fallback-capture"]);
+    expect(result.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
+    const first = await result.finalize();
+    const second = await result.finalize();
+    expect(first.status).toBe("completed");
+    expect(second).toBe(first);
     expect(events).toEqual(["fallback-capture", "close-target", "terminate", "remove-profile"]);
   });
 
-  test("keeps local Chrome and its profile when keepBrowser is set", async () => {
-    const logger = vi.fn() as BrowserLogger;
-    const closeTab = vi.fn(async () => true);
-    const terminateRecordedChromeForProfile = vi.fn(async () => true);
-    const removeProfile = vi.fn(async () => {});
-    const runtime: BrowserRuntimeMetadata = {
-      chromePort: 9222,
-      chromeTargetId: "owned-target",
-      userDataDir: "/tmp/oracle-kept-profile",
-      recoveryCleanup: {
-        transport: "local",
-        ownsTarget: true,
-        profileKind: "copied",
-        keepBrowser: true,
-        closeOwnedTargetOnComplete: true,
-      },
-    };
-
-    await finalizeRecoveredRuntime(runtime, logger, {
-      closeTab,
-      terminateRecordedChromeForProfile,
-      removeProfile,
+  test("abandon releases authority without running cleanup", async () => {
+    const finalizeResources = vi.fn(async () => ({
+      status: "completed" as const,
+      runtime: {},
+    }));
+    const abandonResources = vi.fn(async () => undefined);
+    const result = await resumeBrowserSession({}, {}, vi.fn() as BrowserLogger, {
+      recoverSession: vi.fn(async () => ({
+        answerText: "captured",
+        answerMarkdown: "captured",
+        finalizeResources,
+        abandonResources,
+      })),
     });
 
-    expect(closeTab).toHaveBeenCalledWith(9222, "owned-target", logger, "127.0.0.1");
-    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
-    expect(removeProfile).not.toHaveBeenCalled();
+    await result.abandon();
+    expect(abandonResources).toHaveBeenCalledOnce();
+    expect(finalizeResources).not.toHaveBeenCalled();
   });
 
-  test("removes a copied profile when local Chrome is not kept", async () => {
-    const terminateRecordedChromeForProfile = vi.fn(async () => true);
-    const removeProfile = vi.fn(async () => {});
-    const logger = vi.fn() as BrowserLogger;
-
-    await finalizeRecoveredRuntime(
+  test("retains cleanup authority when Chrome termination is unsafe", async () => {
+    const removeProfile = vi.fn(async () => true);
+    const profileDir = path.join(os.tmpdir(), "oracle-browser-unsafe-cleanup");
+    const result = await finalizeRecoveredRuntime(
       {
-        userDataDir: "/tmp/oracle-copied-profile",
+        userDataDir: profileDir,
         recoveryCleanup: {
           transport: "local",
           ownsTarget: false,
@@ -470,195 +482,224 @@ describe("recovery resource finalization", () => {
           keepBrowser: false,
         },
       },
-      logger,
-      { terminateRecordedChromeForProfile, removeProfile },
-    );
-
-    expect(terminateRecordedChromeForProfile).toHaveBeenCalledWith(
-      "/tmp/oracle-copied-profile",
-      logger,
-    );
-    expect(removeProfile).toHaveBeenCalledWith("/tmp/oracle-copied-profile");
-  });
-
-  test("does not close an owned target retained by keepBrowser", async () => {
-    const closeTab = vi.fn(async () => true);
-    const logger = vi.fn() as BrowserLogger;
-
-    await finalizeRecoveredRuntime(
+      vi.fn() as BrowserLogger,
       {
-        chromePort: 9222,
-        chromeTargetId: "retained-target",
-        userDataDir: "/tmp/oracle-kept-profile",
-        recoveryCleanup: {
-          transport: "local",
-          ownsTarget: true,
-          profileKind: "none",
-          keepBrowser: true,
-        },
-      },
-      logger,
-      { closeTab },
-    );
-
-    expect(closeTab).not.toHaveBeenCalled();
-  });
-
-  test("preserves a manual-login profile while another lease is active", async () => {
-    const events: string[] = [];
-    const logger = vi.fn() as BrowserLogger;
-    const terminateRecordedChromeForProfile = vi.fn(async () => {
-      events.push("terminate");
-      return true;
-    });
-    const cleanupStaleProfileState = vi.fn(async () => {
-      events.push("cleanup-profile-state");
-    });
-
-    await finalizeRecoveredRuntime(
-      {
-        userDataDir: "/Users/example/.oracle/browser-profile",
-        recoveryCleanup: {
-          transport: "local",
-          ownsTarget: false,
-          profileKind: "manual-login",
-          keepBrowser: false,
-        },
-      },
-      logger,
-      {
-        hasOtherActiveBrowserTabLeases: vi.fn(async () => {
-          events.push("check-leases");
-          return true;
-        }),
-        terminateRecordedChromeForProfile,
-        cleanupStaleProfileState,
-      },
-    );
-
-    expect(events).toEqual(["check-leases"]);
-    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
-    expect(cleanupStaleProfileState).not.toHaveBeenCalled();
-  });
-
-  test("terminates and clears stale state after the final manual-login lease", async () => {
-    const events: string[] = [];
-    const logger = vi.fn() as BrowserLogger;
-    const terminateRecordedChromeForProfile = vi.fn(async () => {
-      events.push("terminate");
-      return true;
-    });
-    const cleanupStaleProfileState = vi.fn(async () => {
-      events.push("cleanup-profile-state");
-    });
-    const removeProfile = vi.fn(async () => {
-      events.push("remove-profile");
-    });
-
-    await finalizeRecoveredRuntime(
-      {
-        userDataDir: "/Users/example/.oracle/browser-profile",
-        recoveryCleanup: {
-          transport: "local",
-          ownsTarget: false,
-          profileKind: "manual-login",
-          keepBrowser: false,
-        },
-      },
-      logger,
-      {
-        hasOtherActiveBrowserTabLeases: vi.fn(async () => {
-          events.push("check-leases");
-          return false;
-        }),
-        terminateRecordedChromeForProfile,
-        cleanupStaleProfileState,
+        terminateRecordedChromeForProfile: vi.fn(async () => ({
+          status: "unsafe" as const,
+          reason: "pid mismatch",
+        })),
         removeProfile,
       },
     );
 
-    expect(events).toEqual(["check-leases", "terminate", "cleanup-profile-state"]);
-    expect(cleanupStaleProfileState).toHaveBeenCalledWith(
-      "/Users/example/.oracle/browser-profile",
-      logger,
-      { lockRemovalMode: "never" },
-    );
+    expect(result).toMatchObject({
+      status: "pending",
+      runtime: {
+        recoveryCleanup: { profileKind: "copied" },
+        recoveryCleanupResult: { status: "failed", error: "pid mismatch" },
+      },
+    });
     expect(removeProfile).not.toHaveBeenCalled();
   });
 
-  test("never terminates remote Chrome or removes its profile", async () => {
-    const closeTab = vi.fn(async () => true);
-    const terminateRecordedChromeForProfile = vi.fn(async () => true);
-    const cleanupStaleProfileState = vi.fn(async () => {});
-    const removeProfile = vi.fn(async () => {});
-    const logger = vi.fn() as BrowserLogger;
+  test("retries retained cleanup authority under the recovery lock", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-retry-test-"));
+    const profileDir = path.join(os.tmpdir(), "oracle-browser-retry-cleanup");
+    try {
+      const result = await retryBrowserRecoveryCleanup(
+        {
+          userDataDir: profileDir,
+          recoveryCleanup: {
+            transport: "local",
+            ownsTarget: false,
+            profileKind: "temporary",
+            keepBrowser: false,
+          },
+          recoveryCleanupResult: { status: "failed", error: "previous termination failure" },
+        },
+        vi.fn() as BrowserLogger,
+        {
+          recoveryLockPath: path.join(root, "browser-recovery.lock"),
+          recoveryCleanup: {
+            terminateRecordedChromeForProfile: vi.fn(async () => stopped),
+            removeProfile: vi.fn(async () => true),
+          },
+        },
+      );
 
-    await finalizeRecoveredRuntime(
+      expect(result).toEqual({ status: "completed", runtime: { userDataDir: profileDir } });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves manual-login resources while another lease is active", async () => {
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const cleanupStaleProfileState = vi.fn(async () => true);
+    const result = await finalizeRecoveredRuntime(
+      {
+        userDataDir: path.join(os.homedir(), ".oracle", "browser-profile"),
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
+          profileKind: "manual-login",
+          keepBrowser: false,
+        },
+      },
+      vi.fn() as BrowserLogger,
+      {
+        teardownBrowserResourcesIfNoActiveLeases: vi.fn(async () => ({
+          status: "preserved" as const,
+          reason: "active-leases" as const,
+        })),
+        terminateRecordedChromeForProfile,
+        cleanupStaleProfileState,
+      },
+    );
+
+    expect(result.status).toBe("pending");
+    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+    expect(cleanupStaleProfileState).not.toHaveBeenCalled();
+  });
+
+  test("terminates and clears manual-login state inside atomic teardown", async () => {
+    const events: string[] = [];
+    const profileDir = path.join(os.homedir(), ".oracle", "browser-profile");
+    const cleanupStaleProfileState = vi.fn(async () => {
+      events.push("cleanup-profile-state");
+      return true;
+    });
+    const result = await finalizeRecoveredRuntime(
+      {
+        userDataDir: profileDir,
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
+          profileKind: "manual-login",
+          keepBrowser: false,
+        },
+      },
+      vi.fn() as BrowserLogger,
+      {
+        teardownBrowserResourcesIfNoActiveLeases: vi.fn(async (_dir, teardown) =>
+          (await teardown())
+            ? { status: "completed" as const }
+            : { status: "preserved" as const, reason: "teardown-unsafe" as const },
+        ),
+        terminateRecordedChromeForProfile: vi.fn(async () => {
+          events.push("terminate");
+          return stopped;
+        }),
+        cleanupStaleProfileState,
+      },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(events).toEqual(["terminate", "cleanup-profile-state"]);
+    expect(cleanupStaleProfileState).toHaveBeenCalledWith(profileDir, expect.any(Function), {
+      lockRemovalMode: "never",
+    });
+  });
+
+  test("uses transport-aware close and never terminates remote Chrome", async () => {
+    const closeChromeTarget = vi.fn(async () => true);
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const result = await finalizeRecoveredRuntime(
       {
         chromeHost: "remote.example.test",
         chromePort: 9222,
+        chromeBrowserWSEndpoint: "wss://remote.example.test/devtools/browser/abc",
         chromeTargetId: "remote-owned-target",
-        userDataDir: "/tmp/remote-profile",
         recoveryCleanup: {
           transport: "remote",
           ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: false,
+        },
+      },
+      vi.fn() as BrowserLogger,
+      { closeChromeTarget, terminateRecordedChromeForProfile },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(closeChromeTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetId: "remote-owned-target",
+        browserWSEndpoint: "wss://remote.example.test/devtools/browser/abc",
+        retainChrome: true,
+      }),
+    );
+    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+  });
+
+  test("rejects serialized temporary profiles outside approved runtime roots", async () => {
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const result = await finalizeRecoveredRuntime(
+      {
+        userDataDir: path.join(os.homedir(), "Downloads", "oracle-browser-malicious"),
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
           profileKind: "temporary",
           keepBrowser: false,
         },
       },
-      logger,
-      { closeTab, terminateRecordedChromeForProfile, cleanupStaleProfileState, removeProfile },
+      vi.fn() as BrowserLogger,
+      { terminateRecordedChromeForProfile },
     );
 
-    expect(closeTab).toHaveBeenCalledWith(
-      9222,
-      "remote-owned-target",
-      logger,
-      "remote.example.test",
-    );
+    expect(result).toMatchObject({ status: "pending", error: expect.stringMatching(/outside/) });
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
-    expect(cleanupStaleProfileState).not.toHaveBeenCalled();
-    expect(removeProfile).not.toHaveBeenCalled();
   });
 
-  test("does nothing without recovery cleanup metadata", async () => {
-    const closeTab = vi.fn(async () => true);
-    const terminateRecordedChromeForProfile = vi.fn(async () => true);
-    const cleanupStaleProfileState = vi.fn(async () => {});
-    const hasOtherActiveBrowserTabLeases = vi.fn(async () => false);
-    const removeProfile = vi.fn(async () => {});
-    const logger = vi.fn() as BrowserLogger;
-
-    await finalizeRecoveredRuntime(
+  test("rejects noncanonical temporary profile paths before termination", async () => {
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const profileDir = `${path.join(os.tmpdir(), "oracle-browser-parent")}${path.sep}..${path.sep}oracle-browser-traversal`;
+    const result = await finalizeRecoveredRuntime(
       {
-        chromePort: 9222,
-        chromeTargetId: "target",
-        userDataDir: "/tmp/oracle-profile",
+        userDataDir: profileDir,
+        recoveryCleanup: {
+          transport: "local",
+          ownsTarget: false,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
       },
-      logger,
-      {
-        closeTab,
-        terminateRecordedChromeForProfile,
-        cleanupStaleProfileState,
-        hasOtherActiveBrowserTabLeases,
-        removeProfile,
-      },
+      vi.fn() as BrowserLogger,
+      { terminateRecordedChromeForProfile },
     );
 
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "pending", error: expect.stringMatching(/canonical/) });
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
-    expect(cleanupStaleProfileState).not.toHaveBeenCalled();
-    expect(hasOtherActiveBrowserTabLeases).not.toHaveBeenCalled();
-    expect(removeProfile).not.toHaveBeenCalled();
+  });
+
+  test("serializes concurrent recovery for one session", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-lock-test-"));
+    const recoveryLockPath = path.join(root, "browser-recovery.lock");
+    const logger = vi.fn() as BrowserLogger;
+    const recoverSession = vi.fn(async () => ({ answerText: "ok", answerMarkdown: "ok" }));
+    try {
+      const first = await resumeBrowserSession({}, {}, logger, {
+        recoverSession,
+        recoveryLockPath,
+      });
+      await expect(
+        resumeBrowserSession({}, {}, logger, { recoverSession, recoveryLockPath }),
+      ).rejects.toThrow(/already in progress/i);
+      await first.abandon();
+      const next = await resumeBrowserSession({}, {}, logger, { recoverSession, recoveryLockPath });
+      await next.abandon();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("does not finalize resources after failed fallback recovery", async () => {
-    const terminateRecordedChromeForProfile = vi.fn(async () => true);
-    const removeProfile = vi.fn(async () => {});
-    const logger = vi.fn() as BrowserLogger;
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const removeProfile = vi.fn(async () => true);
     const runtime: BrowserRuntimeMetadata = {
       chromePort: 9222,
-      userDataDir: "/tmp/oracle-failed-recovery",
+      userDataDir: path.join(os.tmpdir(), "oracle-browser-failed-recovery"),
       recoveryCleanup: {
         transport: "local",
         ownsTarget: false,
@@ -668,7 +709,7 @@ describe("recovery resource finalization", () => {
     };
 
     await expect(
-      resumeBrowserSession(runtime, {}, logger, {
+      resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
         listTargets: vi.fn(async () => {
           throw new Error("live capture failed");
         }),
@@ -678,7 +719,6 @@ describe("recovery resource finalization", () => {
         recoveryCleanup: { terminateRecordedChromeForProfile, removeProfile },
       }),
     ).rejects.toThrow("fallback capture failed");
-
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
     expect(removeProfile).not.toHaveBeenCalled();
   });

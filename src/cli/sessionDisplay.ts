@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import kleur from "kleur";
 import fs from "node:fs/promises";
+import path from "node:path";
 import type {
   SessionMetadata,
   SessionTransportMetadata,
@@ -12,7 +13,7 @@ import { formatFinishLine } from "../oracle/finishLine.js";
 import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
-import { resumeBrowserSession } from "../browser/reattach.js";
+import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
   appendArtifacts,
@@ -273,10 +274,41 @@ export async function attachSession(
   const initialStatus = metadata.status;
   const wantsRender = Boolean(options?.renderMarkdown);
   const isVerbose = Boolean(process.env.ORACLE_VERBOSE_RENDER);
-  const runtime = metadata.browser?.runtime;
+  let runtime = metadata.browser?.runtime;
+  if (
+    metadata.status === "completed" &&
+    (runtime?.recoveryCleanup || runtime?.recoveryCleanupBacklog?.length) &&
+    runtime.recoveryCleanupResult
+  ) {
+    const cleanupLogger = Object.assign(
+      ((message?: string) => {
+        if (message) console.log(dim(message));
+      }) as unknown as BrowserLogger,
+      { verbose: true },
+    );
+    try {
+      const sessionPaths = await sessionStore.getPaths(sessionId);
+      const cleanup = await retryBrowserRecoveryCleanup(runtime, cleanupLogger, {
+        recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+      });
+      await sessionStore.updateSession(sessionId, {
+        browser: { ...metadata.browser, runtime: cleanup.runtime },
+      });
+      metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+      runtime = metadata.browser?.runtime;
+      if (cleanup.status === "pending") {
+        console.log(chalk.yellow(`Browser cleanup remains pending: ${cleanup.error}`));
+      }
+    } catch (error) {
+      console.log(
+        chalk.yellow(
+          `Browser cleanup retry was deferred: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+    }
+  }
   const controllerAlive = isProcessAlive(runtime?.controllerPid);
   const workerAlive = isProcessAlive(metadata.lifecycle?.workerPid);
-
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
   const hasIncompleteCapture = metadata.response?.incompleteReason === "incomplete-capture";
   const statusAllowsReattach =
@@ -299,6 +331,15 @@ export async function attachSession(
   const completedDeepResearchPlaceholder =
     metadata.status === "completed" && deepResearchPlaceholderCapture;
   const hasRecoverableConversation = hasRecoverableChatGptConversation(runtime);
+  const disconnectRecoveryAuthorized =
+    !hasChromeDisconnect ||
+    ((metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
+      ?.recoverableDisconnect === true &&
+      runtime?.promptSubmitted === true);
+  const explicitlyNonRecoverable =
+    runtime?.promptSubmitted === false ||
+    (metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
+      ?.recoverableDisconnect === false;
   const hasLiveChromeFallback = Boolean(
     (metadata.status === "running" || hasIncompleteCapture || completedDeepResearchPlaceholder) &&
     (runtime?.chromePort || runtime?.chromeBrowserWSEndpoint || runtime?.chromeProfileRoot),
@@ -307,6 +348,8 @@ export async function attachSession(
     (statusAllowsReattach || completedDeepResearchPlaceholder) &&
     metadata.mode === "browser" &&
     hasFallbackSessionInfo &&
+    !explicitlyNonRecoverable &&
+    disconnectRecoveryAuthorized &&
     !workerAlive &&
     (hasRecoverableConversation ||
       runtime?.promptSubmitted ||
@@ -325,25 +368,29 @@ export async function attachSession(
         `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
       ),
     );
+    let reattachResult: Awaited<ReturnType<typeof resumeBrowserSession>> | null = null;
+    let durablyCompleted = false;
     try {
-      const result = await resumeBrowserSession(
+      const sessionPaths = await sessionStore.getPaths(sessionId);
+      reattachResult = await resumeBrowserSession(
         runtime as NonNullable<typeof runtime>,
         metadata.browser?.config,
         Object.assign(
           ((message?: string) => {
-            if (message) {
-              console.log(dim(message));
-            }
+            if (message) console.log(dim(message));
           }) as unknown as BrowserLogger,
           { verbose: true },
         ),
-        { promptPreview: metadata.promptPreview },
+        {
+          promptPreview: metadata.promptPreview,
+          recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+        },
       );
-      const outputTokens = estimateTokenCount(result.answerMarkdown);
-      const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, result);
+      const outputTokens = estimateTokenCount(reattachResult.answerMarkdown);
+      const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, reattachResult);
       await writeReattachAnswer(
         sessionId,
-        result,
+        reattachResult,
         completedDeepResearchPlaceholder ||
           (hasIncompleteCapture && deepResearchPlaceholderCapture),
       );
@@ -371,7 +418,7 @@ export async function attachSession(
         errorMessage: undefined,
         browser: {
           config: metadata.browser?.config,
-          runtime,
+          runtime: reattachResult.runtime,
           modelSelection: metadata.browser?.modelSelection,
           warnings: metadata.browser?.warnings,
         },
@@ -380,12 +427,39 @@ export async function attachSession(
         error: undefined,
         transport: undefined,
       });
-      console.log(chalk.green("Reattach succeeded; session marked completed."));
+      durablyCompleted = true;
+      const finalization = await reattachResult.finalize();
+      await sessionStore.updateSession(sessionId, {
+        browser: {
+          config: metadata.browser?.config,
+          runtime: finalization.runtime,
+          modelSelection: metadata.browser?.modelSelection,
+          warnings: metadata.browser?.warnings,
+        },
+      });
+      if (finalization.status === "pending") {
+        console.log(
+          chalk.yellow(
+            `Reattach completed; browser cleanup remains pending: ${finalization.error}`,
+          ),
+        );
+      } else {
+        console.log(chalk.green("Reattach succeeded; session marked completed."));
+      }
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
+      if (reattachResult && !durablyCompleted) {
+        await reattachResult.abandon().catch(() => undefined);
+      }
       const message = error instanceof Error ? error.message : String(error);
-      console.log(chalk.red(`Reattach failed: ${message}`));
-      if (completedDeepResearchPlaceholder) {
+      console.log(
+        chalk.red(
+          durablyCompleted
+            ? `Reattach completed, but cleanup state persistence failed: ${message}`
+            : `Reattach failed: ${message}`,
+        ),
+      );
+      if (completedDeepResearchPlaceholder && !durablyCompleted) {
         if (metadata.model) {
           await sessionStore.updateModelRun(metadata.id, metadata.model, {
             status: "error",

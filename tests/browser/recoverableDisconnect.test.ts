@@ -1,7 +1,8 @@
-import { access, rm } from "node:fs/promises";
+import { access, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
-import { __test__ } from "../../src/browser/index.js";
 import type { BrowserRecoveryCleanupMetadata } from "../../src/sessionManager.js";
 
 type BrowserAutomationErrorConstructor = new (
@@ -20,7 +21,7 @@ const conversationUrl = `https://chatgpt.com/c/${targetId}`;
 
 function createClient(options: { onDisconnect?: (handler: () => void) => void }) {
   const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
-    result: { value: expression === "location.href" ? conversationUrl : null },
+    result: { value: expression === "location.href" ? conversationUrl : 0 },
   }));
 
   return {
@@ -48,7 +49,7 @@ async function withRemoteLateDisconnectFixture(
     browserAutomationError: BrowserAutomationErrorConstructor;
     archiveChatGptConversation: Mock;
     closeRemoteConnection: Mock;
-    closeTab: Mock;
+    closeChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
     providerObservedDispatchStart: boolean;
   }) => Promise<void> | void,
@@ -56,7 +57,7 @@ async function withRemoteLateDisconnectFixture(
   let disconnectHandler: (() => void) | undefined;
   let providerObservedDispatchStart = false;
   const closeRemoteConnection = vi.fn().mockResolvedValue(undefined);
-  const closeTab = vi.fn().mockResolvedValue(true);
+  const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
     targetFound: true,
@@ -81,7 +82,8 @@ async function withRemoteLateDisconnectFixture(
       targetId,
       close: closeRemoteConnection,
     }),
-    closeTab,
+    closeChromeTarget,
+    closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
     clearStaleChatGptConversationCookies: vi.fn().mockResolvedValue(undefined),
@@ -122,6 +124,7 @@ async function withRemoteLateDisconnectFixture(
         }
         await onPromptDispatchStarted();
         providerObservedDispatchStart = true;
+        return { status: "committed" as const, committedTurns: 1 };
       },
     ),
   }));
@@ -143,7 +146,9 @@ async function withRemoteLateDisconnectFixture(
   }));
   vi.doMock("../../src/browser/artifacts.js", () => ({
     appendArtifacts: vi.fn((_current: unknown, artifacts: unknown[]) => artifacts.filter(Boolean)),
-    saveBrowserTranscriptArtifact: vi.fn().mockResolvedValue({ path: "/tmp/transcript.md" }),
+    saveBrowserTranscriptArtifact: vi.fn().mockResolvedValue({
+      path: path.join(os.tmpdir(), "transcript.md"),
+    }),
   }));
   vi.doMock("../../src/browser/actions/archiveConversation.js", () => ({
     resolveBrowserArchiveDecision: vi.fn(() => ({
@@ -180,7 +185,7 @@ async function withRemoteLateDisconnectFixture(
       browserAutomationError,
       archiveChatGptConversation,
       closeRemoteConnection,
-      closeTab,
+      closeChromeTarget,
       probeChromeTargetLiveness,
       providerObservedDispatchStart,
     });
@@ -204,7 +209,7 @@ async function withDisconnectFixture(
   options: DisconnectFixtureOptions,
   verify: (fixture: {
     error: unknown;
-    closeTab: Mock;
+    closeChromeTarget: Mock;
     kill: Mock;
     connectToRemoteChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
@@ -216,7 +221,7 @@ async function withDisconnectFixture(
   let disconnectHandler: (() => void) | undefined;
   let profileDir = "";
   let providerObservedDispatchStart = false;
-  const closeTab = vi.fn().mockResolvedValue(true);
+  const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const kill = vi.fn();
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
@@ -255,7 +260,8 @@ async function withDisconnectFixture(
     registerTerminationHooks: vi.fn(() => vi.fn()),
     connectWithNewTab: vi.fn().mockResolvedValue({ client: primaryClient, targetId }),
     connectToRemoteChromeTarget,
-    closeTab,
+    closeChromeTarget,
+    closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/profileCopy.js", () => ({
     copyChromeProfile: vi.fn().mockResolvedValue("Default"),
@@ -300,6 +306,7 @@ async function withDisconnectFixture(
         providerObservedDispatchStart = true;
         disconnectHandler?.();
         await new Promise<void>((resolve) => setImmediate(resolve));
+        return { status: "attempted" as const };
       },
     ),
   }));
@@ -314,13 +321,15 @@ async function withDisconnectFixture(
         cookieSync: false,
         headless: true,
         modelStrategy: "ignore",
-        ...(options.copiedProfile ? { copyProfileSource: "/tmp/source-profile" } : {}),
+        ...(options.copiedProfile
+          ? { copyProfileSource: path.join(os.tmpdir(), "source-profile") }
+          : {}),
       },
     }).catch((caught) => caught);
 
     await verify({
       error,
-      closeTab,
+      closeChromeTarget,
       kill,
       connectToRemoteChromeTarget,
       probeChromeTargetLiveness,
@@ -343,146 +352,6 @@ async function withDisconnectFixture(
   }
 }
 
-describe("recoverable disconnect policy", () => {
-  test("never retains a copied profile after a preserved browser error", () => {
-    expect(
-      __test__.shouldKeepLocalBrowserOpen({
-        effectiveKeepBrowser: false,
-        preserveBrowserOnError: true,
-        usingCopiedProfile: true,
-      }),
-    ).toBe(false);
-  });
-
-  test("keeps existing retention semantics for ordinary profiles", () => {
-    expect(
-      __test__.shouldKeepLocalBrowserOpen({
-        effectiveKeepBrowser: false,
-        preserveBrowserOnError: true,
-        usingCopiedProfile: false,
-      }),
-    ).toBe(true);
-  });
-
-  test("keeps the completed conversation tab when keepBrowser is enabled", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "complete",
-        ownsTarget: true,
-        keepBrowser: true,
-      }),
-    ).toBe(false);
-  });
-
-  test("closes owned completed tabs by default", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "complete",
-        ownsTarget: true,
-        keepBrowser: false,
-      }),
-    ).toBe(true);
-  });
-
-  test("closes a completed service-owned tab while keeping shared Chrome alive", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "complete",
-        ownsTarget: true,
-        keepBrowser: true,
-        closeOwnedTabOnComplete: true,
-      }),
-    ).toBe(true);
-  });
-
-  test("does not close attached targets", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "complete",
-        ownsTarget: false,
-        keepBrowser: false,
-        closeOwnedTabOnComplete: true,
-      }),
-    ).toBe(false);
-  });
-
-  test("closes owned incomplete targets by default", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "attempted",
-        ownsTarget: true,
-        keepBrowser: false,
-        closeOwnedTabOnComplete: true,
-      }),
-    ).toBe(true);
-  });
-
-  test("keeps owned incomplete targets only for explicit recovery", () => {
-    expect(
-      __test__.shouldCloseOwnedRunTargetAfterRun({
-        runStatus: "attempted",
-        ownsTarget: true,
-        keepBrowser: false,
-        closeOwnedTabOnComplete: true,
-        preserveForRecovery: true,
-      }),
-    ).toBe(false);
-  });
-
-  test("schedules final blank cleanup for retained manual-login Chrome", () => {
-    expect(
-      __test__.shouldCleanupBlankTabsAfterLastLease({
-        runStatus: "complete",
-        ownsTarget: true,
-        connectionClosedUnexpectedly: false,
-        manualLogin: true,
-        keepBrowser: true,
-        chromePort: 9222,
-      }),
-    ).toBe(true);
-    expect(
-      __test__.shouldCleanupBlankTabsAfterLastLease({
-        runStatus: "complete",
-        ownsTarget: true,
-        connectionClosedUnexpectedly: false,
-        manualLogin: true,
-        keepBrowser: false,
-        chromePort: 9222,
-      }),
-    ).toBe(false);
-    expect(
-      __test__.shouldCleanupBlankTabsAfterLastLease({
-        runStatus: "attempted",
-        ownsTarget: true,
-        connectionClosedUnexpectedly: false,
-        manualLogin: true,
-        keepBrowser: true,
-        chromePort: 9222,
-      }),
-    ).toBe(false);
-    expect(
-      __test__.shouldCleanupBlankTabsAfterLastLease({
-        runStatus: "complete",
-        ownsTarget: false,
-        connectionClosedUnexpectedly: false,
-        manualLogin: true,
-        keepBrowser: true,
-        chromePort: 9222,
-      }),
-    ).toBe(false);
-    expect(
-      __test__.shouldCleanupBlankTabsAfterLastLease({
-        runStatus: "complete",
-        ownsTarget: true,
-        connectionClosedUnexpectedly: true,
-        manualLogin: true,
-        keepBrowser: true,
-        chromePort: 9222,
-      }),
-    ).toBe(false);
-  });
-});
-
 describe("recoverable disconnect lifecycle", () => {
   test("recovers an ordinary temporary profile after a semantically committed dispatch", async () => {
     await withDisconnectFixture({}, async (fixture) => {
@@ -497,7 +366,7 @@ describe("recoverable disconnect lifecycle", () => {
       expect(fixture.verifyPromptCommitted).toHaveBeenCalledWith(
         expect.objectContaining({ evaluate: expect.any(Function) }),
         "keep this submitted conversation",
-        15_000,
+        60_000,
         expect.any(Function),
         0,
       );
@@ -516,9 +385,12 @@ describe("recoverable disconnect lifecycle", () => {
           },
         },
       });
-      expect(fixture.closeTab).not.toHaveBeenCalled();
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
       expect(fixture.kill).not.toHaveBeenCalled();
       await expect(access(fixture.profileDir)).resolves.toBeUndefined();
+      await expect(readFile(path.join(fixture.profileDir, "chrome.pid"), "utf8")).resolves.toBe(
+        "1234\n",
+      );
     });
   });
 
@@ -534,11 +406,13 @@ describe("recoverable disconnect lifecycle", () => {
           disconnectCause: "copied-profile-not-reattachable",
         },
       });
-      expect(fixture.closeTab).toHaveBeenCalledWith(
-        9230,
-        targetId,
-        expect.any(Function),
-        "127.0.0.1",
+      expect(fixture.closeChromeTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          port: 9230,
+          targetId,
+          host: "127.0.0.1",
+          retainChrome: true,
+        }),
       );
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
@@ -559,11 +433,13 @@ describe("recoverable disconnect lifecycle", () => {
           runtime: { promptSubmitted: false },
         },
       });
-      expect(fixture.closeTab).toHaveBeenCalledWith(
-        9230,
-        targetId,
-        expect.any(Function),
-        "127.0.0.1",
+      expect(fixture.closeChromeTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          port: 9230,
+          targetId,
+          host: "127.0.0.1",
+          retainChrome: true,
+        }),
       );
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
@@ -591,7 +467,7 @@ describe("recoverable disconnect lifecycle", () => {
         },
       });
       expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
-      expect(fixture.closeTab).not.toHaveBeenCalled();
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
     });
   });
 });

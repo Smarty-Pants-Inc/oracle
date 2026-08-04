@@ -226,7 +226,7 @@ export async function connectToRemoteChrome(
     return await connectToRemoteChromeTarget(host, port, logger, {
       browserWSEndpoint,
       targetUrl: targetUrl ?? "about:blank",
-      closeTargetOnDispose: true,
+      closeTargetOnDispose: false,
       approvalWaitMs: options?.approvalWaitMs,
     });
   }
@@ -246,7 +246,6 @@ export async function connectToRemoteChrome(
         targetId: targetConnection.targetId,
         close: async () => {
           await targetConnection.client.close().catch(() => undefined);
-          await closeRemoteChromeTarget(host, port, targetConnection.targetId, logger);
         },
       };
     }
@@ -259,26 +258,6 @@ export async function connectToRemoteChrome(
       await fallbackClient.close().catch(() => undefined);
     },
   };
-}
-
-export async function closeRemoteChromeTarget(
-  host: string,
-  port: number,
-  targetId: string | undefined,
-  logger: BrowserLogger,
-): Promise<void> {
-  if (!targetId) {
-    return;
-  }
-  try {
-    await CDP.Close({ host, port, id: targetId });
-    if (logger.verbose) {
-      logger(`Closed remote Chrome tab ${targetId}`);
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to close remote Chrome tab ${targetId}: ${message}`);
-  }
 }
 
 export interface RemoteChromeConnection {
@@ -636,6 +615,78 @@ export async function closeTab(
     const message = error instanceof Error ? error.message : String(error);
     logger(`Failed to close browser tab ${targetId}: ${message}`);
     return false;
+  }
+}
+
+export async function closeChromeTarget(options: {
+  port: number;
+  targetId: string;
+  logger: BrowserLogger;
+  host?: string;
+  browserWSEndpoint?: string;
+  retainChrome: boolean;
+}): Promise<boolean> {
+  const host = options.host ?? "127.0.0.1";
+  if (!options.browserWSEndpoint) {
+    if (options.retainChrome) {
+      const replacement = await ensureChromePageTargetAfterClose(
+        options.port,
+        options.targetId,
+        options.logger,
+        host,
+      );
+      if (!replacement) {
+        options.logger(
+          `[browser] Leaving browser tab ${options.targetId} open because Chrome has no replacement page target.`,
+        );
+        return false;
+      }
+    }
+    return closeTab(options.port, options.targetId, options.logger, host);
+  }
+
+  let browser: Awaited<ReturnType<typeof CDP>> | null = null;
+  try {
+    browser = await CDP({ target: options.browserWSEndpoint, local: true });
+    const readTargets = async () => (await browser!.Target.getTargets()).targetInfos ?? [];
+    const targets = await readTargets();
+    if (!targets.some((target) => target.targetId === options.targetId)) {
+      options.logger(`Closed isolated browser tab (target=${options.targetId})`);
+      return true;
+    }
+    if (
+      options.retainChrome &&
+      !targets.some((target) => target.type === "page" && target.targetId !== options.targetId)
+    ) {
+      const created = await browser.Target.createTarget({ url: "about:blank" });
+      if (!created.targetId) {
+        options.logger(
+          `[browser] Leaving browser tab ${options.targetId} open because Chrome has no replacement page target.`,
+        );
+        return false;
+      }
+      options.logger(`Opened replacement Chrome tab (target=${created.targetId})`);
+    }
+    const closed = await browser.Target.closeTarget({ targetId: options.targetId });
+    if (closed.success === false) {
+      options.logger(`Browser tab close was rejected (target=${options.targetId})`);
+      return false;
+    }
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await delay(25);
+      if (!(await readTargets()).some((target) => target.targetId === options.targetId)) {
+        options.logger(`Closed isolated browser tab (target=${options.targetId})`);
+        return true;
+      }
+    }
+    options.logger(`Browser tab close was not confirmed (target=${options.targetId})`);
+    return false;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options.logger(`Failed to close browser tab ${options.targetId}: ${message}`);
+    return false;
+  } finally {
+    await browser?.close().catch(() => undefined);
   }
 }
 

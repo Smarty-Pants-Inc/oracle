@@ -42,6 +42,13 @@ interface BrowserTabLeaseDeps {
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
 }
+export type BrowserLeaseTeardownOutcome =
+  | { status: "completed" }
+  | {
+      status: "preserved";
+      reason: "active-leases" | "registry-unavailable" | "teardown-unsafe";
+      error?: string;
+    };
 
 export function normalizeMaxConcurrentTabs(value: unknown): number {
   if (value === undefined || value === null) {
@@ -159,7 +166,7 @@ export async function releaseBrowserTabLease(
   options: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> } = {},
 ): Promise<void> {
   await withRegistryLock(profileDir, async () => {
-    const registry = await readRegistry(profileDir);
+    const registry = await readRegistryStrict(profileDir);
     const active = pruneStaleLeases(registry.leases, {
       nowMs: Date.now(),
       staleMs: DEFAULT_STALE_MS,
@@ -168,7 +175,7 @@ export async function releaseBrowserTabLease(
     const leases = active.filter((lease) => lease.id !== leaseId);
     await writeRegistry(profileDir, { version: 1, leases });
     await options.onRelease?.({ isLastLease: leases.length === 0 });
-  }).catch(() => undefined);
+  });
   logger?.(`[browser] Released ChatGPT browser slot ${leaseId.slice(0, 8)}.`);
 }
 
@@ -184,7 +191,7 @@ export async function hasOtherActiveBrowserTabLeases(
   const now = options.now ?? Date.now;
   const staleMs = Math.max(60_000, options.staleMs ?? DEFAULT_STALE_MS);
   return withRegistryLock(profileDir, async () => {
-    const registry = await readRegistry(profileDir);
+    const registry = await readRegistryStrict(profileDir);
     const active = pruneStaleLeases(registry.leases, {
       nowMs: now(),
       staleMs,
@@ -196,6 +203,45 @@ export async function hasOtherActiveBrowserTabLeases(
     return active.some((lease) => lease.id !== leaseId);
   });
 }
+export async function teardownBrowserResourcesIfNoActiveLeases(
+  profileDir: string,
+  teardown: () => Promise<boolean>,
+  options: {
+    staleMs?: number;
+    now?: () => number;
+    isProcessAlive?: (pid: number) => boolean;
+    logger?: BrowserLogger;
+  } = {},
+): Promise<BrowserLeaseTeardownOutcome> {
+  const now = options.now ?? Date.now;
+  const staleMs = Math.max(60_000, options.staleMs ?? DEFAULT_STALE_MS);
+  try {
+    return await withRegistryLock(profileDir, async () => {
+      const registry = await readRegistryStrict(profileDir);
+      const active = pruneStaleLeases(registry.leases, {
+        nowMs: now(),
+        staleMs,
+        isProcessAlive: options.isProcessAlive ?? isProcessAlive,
+      });
+      if (active.length !== registry.leases.length) {
+        await writeRegistry(profileDir, { version: 1, leases: active });
+      }
+      if (active.length > 0) {
+        return { status: "preserved", reason: "active-leases" };
+      }
+      const completed = await teardown();
+      return completed
+        ? { status: "completed" }
+        : { status: "preserved", reason: "teardown-unsafe" };
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options.logger?.(
+      `[browser] Lease registry unavailable during teardown; preserving Chrome resources: ${message}`,
+    );
+    return { status: "preserved", reason: "registry-unavailable", error: message };
+  }
+}
 
 async function withRegistryLock<T>(profileDir: string, callback: () => Promise<T>): Promise<T> {
   const lockDir = path.join(profileDir, REGISTRY_LOCK_DIRNAME);
@@ -205,12 +251,15 @@ async function withRegistryLock<T>(profileDir: string, callback: () => Promise<T
       await mkdir(lockDir, { recursive: false });
       break;
     } catch (error) {
-      if ((error as { code?: string }).code !== "EEXIST") {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+      if (code !== "EEXIST") {
         throw error;
       }
       if (Date.now() - startedAt > REGISTRY_LOCK_TIMEOUT_MS) {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
-        continue;
+        throw new Error(`Timed out waiting for browser tab lease registry lock at ${lockDir}`);
       }
       await delay(50);
     }
@@ -236,6 +285,19 @@ async function readRegistry(profileDir: string): Promise<BrowserTabLeaseRegistry
   } catch {
     return { version: 1, leases: [] };
   }
+}
+
+async function readRegistryStrict(profileDir: string): Promise<BrowserTabLeaseRegistryFile> {
+  const raw = await readFile(registryPath(profileDir), "utf8");
+  const parsed = JSON.parse(raw) as BrowserTabLeaseRegistryFile;
+  if (parsed.version !== 1 || !Array.isArray(parsed.leases)) {
+    throw new Error("Invalid browser tab lease registry");
+  }
+  const leases = parsed.leases.filter(isLeaseRecord);
+  if (leases.length !== parsed.leases.length) {
+    throw new Error("Invalid browser tab lease record");
+  }
+  return { version: 1, leases };
 }
 
 async function writeRegistry(

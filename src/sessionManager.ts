@@ -97,6 +97,22 @@ export interface BrowserRecoveryCleanupMetadata {
   closeOwnedTargetOnComplete?: boolean;
 }
 
+export interface BrowserRecoveryCleanupResultMetadata {
+  status: "pending" | "failed";
+  error?: string;
+}
+
+export interface BrowserRecoveryCleanupResourceMetadata {
+  chromePid?: number;
+  chromePort?: number;
+  chromeHost?: string;
+  chromeBrowserWSEndpoint?: string;
+  chromeProfileRoot?: string;
+  userDataDir?: string;
+  chromeTargetId?: string;
+  recoveryCleanup: BrowserRecoveryCleanupMetadata;
+}
+
 export interface BrowserRuntimeMetadata {
   browserTransport?: "cdp";
   chromePid?: number;
@@ -112,6 +128,10 @@ export interface BrowserRuntimeMetadata {
   promptSubmitted?: boolean;
   /** Authority required to retire resources after a recovered run reaches a terminal result. */
   recoveryCleanup?: BrowserRecoveryCleanupMetadata;
+  /** Durable state for cleanup that must occur only after answer/session persistence. */
+  recoveryCleanupResult?: BrowserRecoveryCleanupResultMetadata;
+  /** Earlier cleanup authorities retained when fallback recovery launches another Chrome. */
+  recoveryCleanupBacklog?: BrowserRecoveryCleanupResourceMetadata[];
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }
