@@ -414,6 +414,118 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("does not expose an ownerless mutation request before ticket publication", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const originalPid = 53_053;
+    const stalledPid = 54_054;
+    const contenderPid = 55_055;
+    let resumeOwnerWrite!: () => void;
+    const allowOwnerWrite = new Promise<void>((resolve) => {
+      resumeOwnerWrite = resolve;
+    });
+    let markOwnerWriteBlocked!: () => void;
+    const ownerWriteBlocked = new Promise<void>((resolve) => {
+      markOwnerWriteBlocked = resolve;
+    });
+    let resumeContender!: () => void;
+    const allowContender = new Promise<void>((resolve) => {
+      resumeContender = resolve;
+    });
+    let markContenderReady!: () => void;
+    const contenderReady = new Promise<void>((resolve) => {
+      markContenderReady = resolve;
+    });
+    let stalledRequestPath: string | undefined;
+    let stalledLock: CrashRecoverableFilesystemLock | undefined;
+    let contenderLock: CrashRecoverableFilesystemLock | undefined;
+    const identities: Record<number, string> = {
+      [originalPid]: "original-start",
+      [stalledPid]: "stalled-start",
+      [contenderPid]: "contender-start",
+    };
+    await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: originalPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+      },
+    );
+    const stalledAcquire = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      { timeoutMs: 5_000, pollMs: 10 },
+      {
+        pid: stalledPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) =>
+          pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        beforeMutationRequestOwnerWrite: async (requestPath) => {
+          stalledRequestPath = requestPath;
+          markOwnerWriteBlocked();
+          await allowOwnerWrite;
+        },
+      },
+    );
+
+    let contenderAcquire: Promise<CrashRecoverableFilesystemLock> | undefined;
+    try {
+      await ownerWriteBlocked;
+      expect(stalledRequestPath).toBeDefined();
+      expect(await readFile(path.join(stalledRequestPath!, "owner.json"), "utf8")).toBe("");
+      await expect(stat(path.join(stalledRequestPath!, "ticket"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      contenderAcquire = acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 5_000, pollMs: 10 },
+        {
+          pid: contenderPid,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) =>
+            pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          beforeStaleLockQuarantine: async () => {
+            markContenderReady();
+            await allowContender;
+          },
+        },
+      );
+      await contenderReady;
+      expect((await stat(stalledRequestPath!)).isDirectory()).toBe(true);
+      expect(await readFile(path.join(stalledRequestPath!, "owner.json"), "utf8")).toBe("");
+
+      resumeOwnerWrite();
+      await vi.waitFor(async () => {
+        expect(await readFile(path.join(stalledRequestPath!, "ticket"), "utf8")).toMatch(
+          /^[1-9]\d*\n$/u,
+        );
+      });
+      expect((await stat(stalledRequestPath!)).isDirectory()).toBe(true);
+
+      resumeContender();
+      contenderLock = await contenderAcquire;
+      await contenderLock.release();
+      contenderLock = undefined;
+
+      stalledLock = await stalledAcquire;
+      expect(stalledLock.owner.pid).toBe(stalledPid);
+      await stalledLock.release();
+      stalledLock = undefined;
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      resumeOwnerWrite();
+      resumeContender();
+      await Promise.allSettled(
+        [stalledAcquire, contenderAcquire].filter(Boolean) as Promise<unknown>[],
+      );
+      await contenderLock?.release().catch(() => undefined);
+      await stalledLock?.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("finishes timed-out queue cleanup before rejecting acquisition", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
