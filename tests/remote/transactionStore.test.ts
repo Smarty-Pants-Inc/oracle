@@ -79,6 +79,7 @@ describe("RemoteTransactionStore", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],

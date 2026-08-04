@@ -43,6 +43,7 @@ const runtime: BrowserRunTransaction["runtime"] = {
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     },
   ],

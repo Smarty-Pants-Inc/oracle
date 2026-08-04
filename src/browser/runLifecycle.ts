@@ -95,9 +95,21 @@ export interface BrowserRunLifecycleAdapters {
 
 export function markBrowserCaptureCleanupPending(
   runtime: BrowserRuntimeMetadata,
+  settlementMode?: BrowserCaptureSettlementMode,
 ): BrowserRuntimeMetadata {
-  if (!runtime.recoveryCleanupResources?.length) return runtime;
-  return { ...runtime, recoveryCleanupResult: { status: "pending" } };
+  const hasCleanupAuthority = Boolean(
+    runtime.recoveryCleanupResources?.length ||
+    runtime.recoveryCleanupResult ||
+    runtime.remoteRecovery,
+  );
+  if (!hasCleanupAuthority) return runtime;
+  return {
+    ...runtime,
+    recoveryCleanupResult: {
+      status: "pending",
+      ...(settlementMode ? { settlementMode } : {}),
+    },
+  };
 }
 
 export function completedBrowserCaptureCleanup(
@@ -466,11 +478,15 @@ export class BrowserRunLifecycleController {
     mode: BrowserCaptureSettlementMode,
     runtime: BrowserRuntimeMetadata,
   ): Promise<BrowserCaptureFinalizationResult> {
+    const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
     const completion = Promise.resolve()
-      .then(() => this.adapters.settleResources(mode, runtime))
+      .then(async () => {
+        await this.adapters.persistRuntime?.(boundRuntime);
+        return this.adapters.settleResources(mode, boundRuntime);
+      })
       .catch((error) =>
         pendingBrowserCaptureCleanup(
-          runtime,
+          boundRuntime,
           error instanceof Error ? error.message : String(error),
           mode,
         ),
@@ -483,7 +499,7 @@ export class BrowserRunLifecycleController {
             : { kind: "cleanup-pending", mode, result: boundResult };
         return boundResult;
       });
-    this.state = { kind: "settling", mode, runtime, completion };
+    this.state = { kind: "settling", mode, runtime: boundRuntime, completion };
     return completion;
   }
 

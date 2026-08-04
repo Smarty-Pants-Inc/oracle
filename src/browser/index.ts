@@ -52,6 +52,7 @@ import {
   waitForUserTurnAttachments,
   readAssistantSnapshot,
   verifyPromptCommitted,
+  verifyCommittedPromptTurn,
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
@@ -83,7 +84,11 @@ import {
   isRecoverableChromeDisconnect,
   probeChromeTargetLiveness,
 } from "./cdpLiveness.js";
-import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
+import {
+  acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
+  type BrowserTabLease,
+} from "./tabLeaseRegistry.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -117,6 +122,10 @@ import {
   extractStableConversationIdFromUrl as extractConversationIdFromUrl,
   isStableConversationUrl as isConversationUrl,
 } from "./conversationUrl.js";
+import {
+  resolveCommittedPromptEpochLocator,
+  type CommittedPromptEpochLocator,
+} from "./reattachability.js";
 import {
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
@@ -666,6 +675,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
   timeoutMs: number;
   minTurnIndex?: number;
   expectedConversationId?: string;
+  expectedPromptTurn?: CommittedPromptEpochLocator;
   imageOutputRequested: boolean;
   logger: BrowserLogger;
 }): Promise<AssistantAnswer> {
@@ -679,6 +689,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
     params.timeoutMs,
     params.minTurnIndex,
     params.expectedConversationId,
+    params.expectedPromptTurn,
   );
   if (response) {
     if (response.html?.includes("/backend-api/estuary/content?id=file_")) {
@@ -708,13 +719,22 @@ async function pollGeneratedImageOrTextAssistantResponse(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ): Promise<AssistantAnswer | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    let snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId).catch(
-      () => null,
-    );
-    if (!snapshot && typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
+    let snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      expectedPromptTurn,
+    ).catch(() => null);
+    if (
+      !snapshot &&
+      !expectedPromptTurn &&
+      typeof minTurnIndex === "number" &&
+      Number.isFinite(minTurnIndex)
+    ) {
       const relaxedSnapshot = await readAssistantSnapshot(
         Runtime,
         undefined,
@@ -724,6 +744,25 @@ async function pollGeneratedImageOrTextAssistantResponse(
       if (relaxedHtml.includes("/backend-api/estuary/content?id=file_")) {
         snapshot = relaxedSnapshot;
       }
+    }
+    const candidateHtml = typeof snapshot?.html === "string" ? snapshot.html : "";
+    const candidateHasGeneratedImage = candidateHtml.includes(
+      "/backend-api/estuary/content?id=file_",
+    );
+    if (candidateHasGeneratedImage && expectedPromptTurn) {
+      const revalidated = await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
+      const sameMessage = !snapshot?.messageId || revalidated.messageId === snapshot.messageId;
+      const sameTurn = !snapshot?.turnId || revalidated.turnId === snapshot.turnId;
+      const revalidatedHtml = typeof revalidated.html === "string" ? revalidated.html : "";
+      if (
+        !sameMessage ||
+        !sameTurn ||
+        !revalidatedHtml.includes("/backend-api/estuary/content?id=file_")
+      ) {
+        await delay(750);
+        continue;
+      }
+      snapshot = revalidated;
     }
     const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
     const html = typeof snapshot?.html === "string" ? snapshot.html : "";
@@ -962,10 +1001,61 @@ export function maybeArchiveInterruptedConversationForTest(
 
 type BrowserSubmissionResult = {
   baselineTurns: number | null;
+  promptLocator: CommittedPromptEpochLocator;
   baselineAssistantText: string | null;
   deepResearchTargetKeys?: string[];
   deepResearchTargetBaselineCaptured?: boolean;
 };
+
+function requireCommittedPromptLocator(
+  lifecycle: BrowserRunLifecycleController,
+): CommittedPromptEpochLocator {
+  const epoch = lifecycle.promptEpoch();
+  const locator = resolveCommittedPromptEpochLocator({
+    promptEpoch: epoch,
+    conversationId: epoch?.status === "committed" ? epoch.conversationId : undefined,
+  });
+  if (!locator) {
+    throw new BrowserAutomationError(
+      "Prompt commit evidence did not produce a valid committed prompt epoch locator.",
+      { stage: "prompt-epoch", code: "prompt-epoch-evidence-missing" },
+    );
+  }
+  return locator;
+}
+
+async function assertCommittedPromptEpochCurrent(
+  Runtime: ChromeClient["Runtime"],
+  locator: CommittedPromptEpochLocator,
+) {
+  await verifyCommittedPromptTurn(Runtime, locator);
+  const snapshot = await readAssistantSnapshot(
+    Runtime,
+    locator.verifiedUserTurnIndex + 1,
+    locator.conversationId,
+    locator,
+  );
+  if (!snapshot) {
+    throw new BrowserAutomationError(
+      "Assistant response no longer belongs to the committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
+  return snapshot;
+}
+
+function createPromptEpochGuardedRuntime(
+  Runtime: ChromeClient["Runtime"],
+  locator: CommittedPromptEpochLocator,
+): ChromeClient["Runtime"] {
+  const evaluate: ChromeClient["Runtime"]["evaluate"] = async (params) => {
+    await assertCommittedPromptEpochCurrent(Runtime, locator);
+    const result = await Runtime.evaluate(params);
+    await assertCommittedPromptEpochCurrent(Runtime, locator);
+    return result;
+  };
+  return { evaluate } as ChromeClient["Runtime"];
+}
 
 async function captureDeepResearchTargetBaseline(
   client: ChromeClient,
@@ -1108,6 +1198,37 @@ function shouldCloseOwnedRunTargetAfterRun(options: {
     !(options.runStatus === "attempted" && options.preserveForRecovery) &&
     (Boolean(options.closeOwnedTabOnComplete) || !options.keepBrowser)
   );
+}
+
+function projectRetryableCleanupRuntime(
+  runtime: BrowserRuntimeMetadata,
+  completed: { targetId?: string | null; tabLeaseId?: string | null },
+): BrowserRuntimeMetadata {
+  const targetId = completed.targetId ?? null;
+  const tabLeaseId = completed.tabLeaseId ?? null;
+  if (!targetId && !tabLeaseId) return runtime;
+  const resources = runtime.recoveryCleanupResources?.map((resource) => {
+    const targetCompleted = Boolean(targetId && resource.chromeTargetId === targetId);
+    const leaseCompleted = Boolean(tabLeaseId && resource.tabLease?.id === tabLeaseId);
+    if (!targetCompleted && !leaseCompleted) return resource;
+    return {
+      ...resource,
+      ...(targetCompleted ? { chromeTargetId: undefined } : {}),
+      ...(leaseCompleted ? { tabLease: undefined } : {}),
+      recoveryCleanup: targetCompleted
+        ? {
+            ...resource.recoveryCleanup,
+            ownsTarget: false,
+            closeOwnedTargetOnComplete: undefined,
+          }
+        : resource.recoveryCleanup,
+    };
+  });
+  return {
+    ...runtime,
+    ...(targetId && runtime.chromeTargetId === targetId ? { chromeTargetId: undefined } : {}),
+    ...(resources ? { recoveryCleanupResources: resources } : {}),
+  };
 }
 
 function shouldCleanupBlankTabsAfterLastLease(options: {
@@ -1292,7 +1413,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         manualLogin,
         ownerSource: chromeOwnerSource,
       }),
-      closeOwnedTargetOnComplete: Boolean(options.closeOwnedTabOnComplete),
+      closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
+        runStatus,
+        ownsTarget,
+        keepBrowser: effectiveKeepBrowser,
+        closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+        preserveForRecovery: preserveBrowserOnError,
+      }),
     };
   }
   if (manualLogin) {
@@ -1371,6 +1498,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePort: chrome.port,
     });
   }
+  const manualLeaseTeardownAuthority =
+    manualLogin && tabLease
+      ? retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, { logger })
+      : null;
   const buildLocalRuntimeBase = (tabUrl = lastUrl): BrowserRuntimeMetadata => ({
     chromePid: chrome.pid,
     chromeProcessIdentity: chrome.processIdentity,
@@ -1473,21 +1604,31 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     });
     return disconnectAssessmentPromise;
   };
+  let closedOwnedTargetId: string | null = null;
+  let releasedTabLeaseId: string | null = null;
   async function settleLocalResources(
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
   ): Promise<BrowserCaptureFinalizationResult> {
     const errors: string[] = [];
     const aborting = mode === "abort";
-    const shouldCloseOwnedRunTarget = aborting
-      ? ownsTarget && manualLogin
-      : shouldCloseOwnedRunTargetAfterRun({
-          runStatus,
-          ownsTarget,
-          keepBrowser: effectiveKeepBrowser,
-          closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
-          preserveForRecovery: preserveBrowserOnError,
-        });
+    const pendingResource = pendingRuntime.recoveryCleanupResources?.[0];
+    const pendingCleanup = pendingResource?.recoveryCleanup;
+    const pendingOwnsTarget = pendingCleanup?.ownsTarget === true;
+    const finalizeTargetCloseDecision = pendingCleanup?.closeOwnedTargetOnComplete;
+    if (!aborting && pendingOwnsTarget && typeof finalizeTargetCloseDecision !== "boolean") {
+      return pendingBrowserCaptureCleanup(
+        pendingRuntime,
+        "Owned Chrome target finalize disposition is missing",
+      );
+    }
+    const targetId = pendingResource?.chromeTargetId ?? null;
+    const targetCleanupCompleted = Boolean(targetId && closedOwnedTargetId === targetId);
+    const shouldCloseOwnedRunTarget =
+      !targetCleanupCompleted &&
+      (aborting
+        ? pendingOwnsTarget && manualLogin
+        : pendingOwnsTarget && finalizeTargetCloseDecision === true);
     let keepBrowserOpen = aborting
       ? manualLogin && (effectiveKeepBrowser || chromeOwnerSource !== "launched")
       : shouldKeepLocalBrowserOpen({
@@ -1495,8 +1636,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           preserveBrowserOnError,
           usingCopiedProfile,
         });
-    let manualTeardownCompleted = false;
-    const targetId = isolatedTargetId ?? lastTargetId;
     if (shouldCloseOwnedRunTarget) {
       if (!targetId || !chrome.port) {
         errors.push("Owned Chrome target cleanup metadata is incomplete");
@@ -1507,13 +1646,21 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
           host: chromeHost,
         });
-        if (!closed && (manualLogin || keepBrowserOpen)) {
+        if (closed) {
+          closedOwnedTargetId = targetId;
+        } else if (manualLogin || keepBrowserOpen) {
           errors.push("Chrome target close was not confirmed");
         }
       }
     }
-    if (aborting && tabLease && errors.length > 0) {
-      return pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "));
+    if (errors.length > 0) {
+      return pendingBrowserCaptureCleanup(
+        projectRetryableCleanupRuntime(pendingRuntime, {
+          targetId: closedOwnedTargetId,
+          tabLeaseId: releasedTabLeaseId,
+        }),
+        errors.join("; "),
+      );
     }
     const cleanupBlankTabs = async () => {
       if (
@@ -1533,7 +1680,48 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         preserveOneBlank: true,
       });
     };
-    if (tabLease) {
+    if (manualLogin && !keepBrowserOpen && manualLeaseTeardownAuthority) {
+      let teardownError: string | null = null;
+      const outcome = await manualLeaseTeardownAuthority.settle(async () => {
+        try {
+          await cleanupBlankTabs();
+        } catch (error) {
+          teardownError = `Blank-tab cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+          return false;
+        }
+        try {
+          const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
+          if (settlement.status === "unsafe") {
+            teardownError = settlement.reason;
+            return false;
+          }
+          if (settlement.status === "preserved") {
+            keepBrowserOpen = true;
+            logger("[browser] Reused canonical Chrome owner; leaving shared Chrome running.");
+          }
+          return true;
+        } catch (error) {
+          teardownError = `Manual-login teardown failed: ${error instanceof Error ? error.message : String(error)}`;
+          return false;
+        }
+      });
+      if (manualLeaseTeardownAuthority.leaseReleased && tabLease) {
+        releasedTabLeaseId = tabLease.id;
+        tabLease = null;
+      }
+      if (outcome.status === "completed" && outcome.disposition === "active-lease-handoff") {
+        keepBrowserOpen = true;
+        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
+      } else if (outcome.status === "preserved") {
+        keepBrowserOpen = true;
+        const reason =
+          teardownError ??
+          outcome.error ??
+          `Manual-login cleanup preserved resources (${outcome.reason})`;
+        errors.push(reason);
+        logger(`[browser] Preserving shared Chrome resources: ${reason}`);
+      }
+    } else if (tabLease) {
       const handle = tabLease;
       try {
         await handle.release({
@@ -1554,23 +1742,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                 `Blank-tab cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
               );
             }
-            if (!keepBrowserOpen && manualLogin) {
-              const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
-              if (settlement.status === "unsafe") {
-                keepBrowserOpen = true;
-                errors.push(settlement.reason);
-                logger(`[browser] Preserving shared Chrome resources: ${settlement.reason}`);
-                return;
-              }
-              if (settlement.status === "preserved") {
-                keepBrowserOpen = true;
-                logger("[browser] Reused canonical Chrome owner; leaving shared Chrome running.");
-                return;
-              }
-              manualTeardownCompleted = true;
-            }
           },
         });
+        releasedTabLeaseId = handle.id;
         tabLease = null;
       } catch (error) {
         keepBrowserOpen = true;
@@ -1588,47 +1762,39 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       if (manualLogin && !keepBrowserOpen) {
         keepBrowserOpen = true;
-        errors.push("Manual-login cleanup has no lease authority");
+        errors.push("Manual-login cleanup has no retained lease teardown authority");
         logger(
-          "[browser] Manual-login cleanup has no lease authority; preserving Chrome resources.",
+          "[browser] Manual-login cleanup has no retained lease teardown authority; preserving Chrome resources.",
         );
       }
     }
-    if (!keepBrowserOpen) {
-      if (manualLogin) {
-        if (!manualTeardownCompleted) {
-          keepBrowserOpen = true;
-          errors.push("Manual-login teardown was not confirmed");
-          logger("[browser] Manual-login teardown was not confirmed; preserving Chrome resources.");
-        }
+    if (!keepBrowserOpen && !manualLogin) {
+      const termination = await chrome.kill().catch((terminationError: unknown) => ({
+        status: "unsafe" as const,
+        pid: chrome.pid,
+        reason:
+          terminationError instanceof Error ? terminationError.message : String(terminationError),
+      }));
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        keepBrowserOpen = true;
+        errors.push(termination.reason);
+        logger(
+          `[browser] Chrome termination was not safely confirmed; preserving its profile directory: ${termination.reason}`,
+        );
       } else {
-        const termination = await chrome.kill().catch((terminationError: unknown) => ({
-          status: "unsafe" as const,
-          pid: chrome.pid,
-          reason:
-            terminationError instanceof Error ? terminationError.message : String(terminationError),
-        }));
-        if (!isSafeChromeTerminationOutcome(termination)) {
-          keepBrowserOpen = true;
-          errors.push(termination.reason);
-          logger(
-            `[browser] Chrome termination was not safely confirmed; preserving its profile directory: ${termination.reason}`,
-          );
-        } else {
-          const removed = await removeProfileDirectoryIfIdentityMatches(
-            userDataDir,
-            chrome.processIdentity.profileDirectory,
-          ).catch(() => false);
-          if (!removed) {
-            errors.push(`Profile removal was not confirmed: ${userDataDir}`);
-            logger(`[browser] Failed to remove temporary Chrome profile ${userDataDir}.`);
-          }
+        const removed = await removeProfileDirectoryIfIdentityMatches(
+          userDataDir,
+          chrome.processIdentity.profileDirectory,
+        ).catch(() => false);
+        if (!removed) {
+          errors.push(`Profile removal was not confirmed: ${userDataDir}`);
+          logger(`[browser] Failed to remove temporary Chrome profile ${userDataDir}.`);
         }
       }
-      if (!keepBrowserOpen && !connectionClosedUnexpectedly) {
-        const totalSeconds = (Date.now() - startedAt) / 1000;
-        logger(`Cleanup ${runStatus} • ${totalSeconds.toFixed(1)}s total`);
-      }
+    }
+    if (!keepBrowserOpen && !connectionClosedUnexpectedly) {
+      const totalSeconds = (Date.now() - startedAt) / 1000;
+      logger(`Cleanup ${runStatus} • ${totalSeconds.toFixed(1)}s total`);
     }
     if (keepBrowserOpen) {
       detachKeptChromeProcess(chrome);
@@ -1636,9 +1802,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         logger(`Chrome left running on port ${chrome.port} with profile ${userDataDir}`);
       }
     }
+    const retryableRuntime = projectRetryableCleanupRuntime(pendingRuntime, {
+      targetId: closedOwnedTargetId,
+      tabLeaseId: releasedTabLeaseId,
+    });
     return errors.length > 0
-      ? pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "))
-      : completedBrowserCaptureCleanup(pendingRuntime);
+      ? pendingBrowserCaptureCleanup(retryableRuntime, errors.join("; "))
+      : completedBrowserCaptureCleanup(retryableRuntime);
   }
 
   let escapingFailure: unknown;
@@ -2132,6 +2302,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         state: providerState,
       });
       await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
+      const promptLocator = requireCommittedPromptLocator(lifecycle);
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
@@ -2163,6 +2334,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         }
       }
       return {
+        promptLocator,
         baselineTurns,
         baselineAssistantText,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
@@ -2176,8 +2348,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
     };
 
-    let baselineTurns: number | null = null;
     let baselineAssistantText: string | null = null;
+    let promptLocator: CommittedPromptEpochLocator | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
     await acquireProfileLockIfNeeded();
@@ -2194,31 +2366,40 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         prepareFallbackSubmission: () => lifecycle.resetPrompt(),
         logger,
       });
-      baselineTurns = submission.baselineTurns;
+      promptLocator = submission.promptLocator;
       baselineAssistantText = submission.baselineAssistantText;
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
       await releaseProfileLockIfHeld();
     }
-    const imageArtifactMinTurnIndex = baselineTurns;
     if (deepResearch) {
       await raceWithDisconnect(waitForResearchPlanAutoConfirm(Runtime, logger));
+      const expectedPromptTurn = promptLocator;
+      if (!expectedPromptTurn) {
+        throw new BrowserAutomationError("Deep Research prompt authority is unavailable.", {
+          stage: "prompt-epoch",
+          code: "prompt-epoch-evidence-missing",
+        });
+      }
       const researchResult = await raceWithDisconnect(
         waitForDeepResearchCompletion(
           Runtime,
           logger,
           config.timeoutMs,
-          baselineTurns,
+          expectedPromptTurn.verifiedUserTurnIndex + 1,
           Page,
           client,
           {
             ignoredTargetKeys: deepResearchTargetKeys,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+            expectedConversationId: expectedPromptTurn.conversationId,
+            expectedPromptTurn,
           },
         ),
       );
       await updateConversationHint("post-deep-research", 15_000).catch(() => false);
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
@@ -2252,6 +2433,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       if (connectionClosedUnexpectedly) {
         throw new Error("Chrome disconnected before completion");
       }
@@ -2272,9 +2454,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
       text.toLowerCase().replace(/\s+/g, " ").trim();
-    const expectedConversationId = () =>
-      lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
+    const waitForFreshAssistantResponse = async (
+      baselineNormalized: string,
+      timeoutMs: number,
+      expectedPromptTurn: CommittedPromptEpochLocator,
+    ) => {
       const baselinePrefix =
         baselineNormalized.length >= 80
           ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
@@ -2283,8 +2467,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       while (Date.now() < deadline) {
         const snapshot = await readAssistantSnapshot(
           Runtime,
-          baselineTurns ?? undefined,
-          expectedConversationId(),
+          expectedPromptTurn.verifiedUserTurnIndex + 1,
+          expectedPromptTurn.conversationId,
+          expectedPromptTurn,
         ).catch(() => null);
         const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
         if (text) {
@@ -2321,7 +2506,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     };
     const recheckDelayMs = Math.max(0, config.assistantRecheckDelayMs ?? 0);
     const recheckTimeoutMs = Math.max(0, config.assistantRecheckTimeoutMs ?? 0);
-    const attemptAssistantRecheck = async () => {
+    const attemptAssistantRecheck = async (expectedPromptTurn: CommittedPromptEpochLocator) => {
       if (!recheckDelayMs) return null;
       logger(
         `[browser] Assistant response timed out; waiting ${formatElapsed(recheckDelayMs)} before rechecking conversation.`,
@@ -2373,13 +2558,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                 Page,
                 timeoutMs,
                 logger,
-                baselineTurns ?? undefined,
-                expectedConversationId(),
+                expectedPromptTurn.verifiedUserTurnIndex + 1,
+                expectedPromptTurn.conversationId,
+                expectedPromptTurn,
               ),
             timeoutMs,
             logger,
-            minTurnIndex: baselineTurns ?? undefined,
-            expectedConversationId: expectedConversationId(),
+            minTurnIndex: expectedPromptTurn.verifiedUserTurnIndex + 1,
+            expectedConversationId: expectedPromptTurn.conversationId,
+            expectedPromptTurn,
             imageOutputRequested,
           }),
         ),
@@ -2396,6 +2583,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       turnPrompt: string,
       label: string,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
+      const expectedPromptTurn = promptLocator;
+      if (!expectedPromptTurn) {
+        throw new BrowserAutomationError("Assistant response prompt authority is unavailable.", {
+          stage: "prompt-epoch",
+          code: "prompt-epoch-evidence-missing",
+        });
+      }
       let turnAnswer: AssistantAnswer;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
@@ -2409,20 +2603,24 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                   Page,
                   config.timeoutMs,
                   logger,
-                  baselineTurns ?? undefined,
-                  expectedConversationId(),
+                  expectedPromptTurn.verifiedUserTurnIndex + 1,
+                  expectedPromptTurn.conversationId,
+                  expectedPromptTurn,
                 ),
               timeoutMs: config.timeoutMs,
               logger,
-              minTurnIndex: baselineTurns ?? undefined,
-              expectedConversationId: expectedConversationId(),
+              minTurnIndex: expectedPromptTurn.verifiedUserTurnIndex + 1,
+              expectedConversationId: expectedPromptTurn.conversationId,
+              expectedPromptTurn,
               imageOutputRequested,
             }),
           ),
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
-          const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
+          const rechecked = await attemptAssistantRecheckOrRethrow(() =>
+            attemptAssistantRecheck(expectedPromptTurn),
+          );
           if (rechecked) {
             turnAnswer = rechecked;
           } else {
@@ -2466,7 +2664,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           (baselinePrefix.length > 0 && normalizedAnswer.startsWith(baselinePrefix));
         if (isBaseline) {
           logger("Detected stale assistant response; waiting for new response...");
-          const refreshed = await waitForFreshAssistantResponse(baselineNormalized, 15_000);
+          const refreshed = await waitForFreshAssistantResponse(
+            baselineNormalized,
+            15_000,
+            expectedPromptTurn,
+          );
           if (refreshed) {
             turnAnswer = refreshed;
           }
@@ -2477,7 +2679,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const copiedMarkdown = await raceWithDisconnect(
         withRetries(
           async () => {
-            const attempt = await captureAssistantMarkdown(Runtime, turnAnswer.meta, logger);
+            const attempt = await captureAssistantMarkdown(
+              Runtime,
+              turnAnswer.meta,
+              logger,
+              expectedPromptTurn.conversationId,
+              expectedPromptTurn,
+            );
             if (!attempt) {
               throw new Error("copy-missing");
             }
@@ -2502,18 +2710,19 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       ({ answerText: turnAnswerText, answerMarkdown: turnAnswerMarkdown } =
         await maybeRecoverLongAssistantResponse({
           runtime: Runtime,
-          baselineTurns,
           answerText: turnAnswerText,
           answerMarkdown: turnAnswerMarkdown,
           logger,
           allowMarkdownUpdate: !copiedMarkdown,
+          expectedPromptTurn,
         }));
 
       // Final sanity check: ensure we didn't accidentally capture the user prompt instead of the assistant turn.
       const finalSnapshot = await readAssistantSnapshot(
         Runtime,
-        baselineTurns ?? undefined,
-        expectedConversationId(),
+        expectedPromptTurn.verifiedUserTurnIndex + 1,
+        expectedPromptTurn.conversationId,
+        expectedPromptTurn,
       ).catch(() => null);
       const finalText = typeof finalSnapshot?.text === "string" ? finalSnapshot.text.trim() : "";
       if (finalText && finalText !== turnPrompt.trim()) {
@@ -2554,8 +2763,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         while (Date.now() < deadline) {
           const snapshot = await readAssistantSnapshot(
             Runtime,
-            baselineTurns ?? undefined,
-            expectedConversationId(),
+            expectedPromptTurn.verifiedUserTurnIndex + 1,
+            expectedPromptTurn.conversationId,
+            expectedPromptTurn,
           ).catch(() => null);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           const isStillEcho = !text || Boolean(promptEchoMatcher?.isEcho(text));
@@ -2570,7 +2780,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               break;
             }
           }
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          await delay(300);
         }
         if (bestText) {
           logger("Recovered assistant response after detecting prompt echo");
@@ -2586,8 +2796,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         while (Date.now() < deadline) {
           const snapshot = await readAssistantSnapshot(
             Runtime,
-            baselineTurns ?? undefined,
-            expectedConversationId(),
+            expectedPromptTurn.verifiedUserTurnIndex + 1,
+            expectedPromptTurn.conversationId,
+            expectedPromptTurn,
           ).catch(() => null);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           if (text && text.length > bestText.length) {
@@ -2607,6 +2818,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           turnAnswerMarkdown = bestText;
         }
       }
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       return {
         label,
         answerText: turnAnswerText,
@@ -2644,7 +2856,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           prepareFallbackSubmission: () => lifecycle.resetPrompt(),
           logger,
         });
-        baselineTurns = submission.baselineTurns;
+        promptLocator = submission.promptLocator;
         baselineAssistantText = submission.baselineAssistantText;
       } finally {
         await releaseProfileLockIfHeld();
@@ -2677,28 +2889,41 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       // Bail out on mid-run disconnects so the session stays reattachable.
       throw new Error("Chrome disconnected before completion");
     }
+    const artifactPromptLocator = promptLocator;
+    if (!artifactPromptLocator) {
+      throw new BrowserAutomationError("Artifact prompt authority is unavailable.", {
+        stage: "prompt-epoch",
+        code: "prompt-epoch-evidence-missing",
+      });
+    }
+    const artifactMinTurnIndex = artifactPromptLocator.verifiedUserTurnIndex + 1;
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    const artifactRuntime = createPromptEpochGuardedRuntime(Runtime, artifactPromptLocator);
     const imageArtifacts = await collectGeneratedImageArtifacts({
       Browser: client.Browser,
       Client: client,
       Page,
-      Runtime,
+      Runtime: artifactRuntime,
       Network,
       logger,
-      minTurnIndex: imageArtifactMinTurnIndex,
+      minTurnIndex: artifactMinTurnIndex,
       sessionId: options.sessionId,
       generateImagePath: options.generateImagePath,
       outputPath: options.outputPath,
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
-      checkBlockingUiWarning: () =>
-        throwChatGptUiWarningIfPresent({
+      checkBlockingUiWarning: async () => {
+        await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+        await throwChatGptUiWarningIfPresent({
           Runtime,
           logger,
           stage: "image-artifact-wait",
           waitTarget: "generated image artifacts",
           runtime: buildLocalRuntimeMetadata(),
-        }),
+        });
+      },
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     answerText = imageArtifacts.answerText || answerText;
     if (imageArtifacts.markdownSuffix) {
       answerMarkdown += imageArtifacts.markdownSuffix;
@@ -2707,13 +2932,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       Browser: client.Browser,
       Client: client,
       Page,
-      Runtime,
+      Runtime: artifactRuntime,
       Network,
       answerText: [answerText, answerMarkdown, answerHtml].filter(Boolean).join("\n"),
       logger,
-      minTurnIndex: imageArtifactMinTurnIndex,
+      minTurnIndex: artifactMinTurnIndex,
       sessionId: options.sessionId,
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
     const transcriptArtifact = await saveOptionalArtifact(
@@ -2740,6 +2966,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
         fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     if (connectionClosedUnexpectedly) {
       throw new Error("Chrome disconnected before completion");
     }
@@ -3020,18 +3247,18 @@ async function waitForLogin({
 
 async function maybeRecoverLongAssistantResponse({
   runtime,
-  baselineTurns,
   answerText,
   answerMarkdown,
   logger,
   allowMarkdownUpdate,
+  expectedPromptTurn,
 }: {
   runtime: ChromeClient["Runtime"];
-  baselineTurns: number | null;
   answerText: string;
   answerMarkdown: string;
   logger: BrowserLogger;
   allowMarkdownUpdate: boolean;
+  expectedPromptTurn: CommittedPromptEpochLocator;
 }): Promise<{ answerText: string; answerMarkdown: string }> {
   // Learned: long streaming responses can still be rendering after initial capture.
   // Add a brief delay and re-poll to catch any additional content (#71).
@@ -3044,9 +3271,12 @@ async function maybeRecoverLongAssistantResponse({
   let bestLength = capturedLength;
   let bestText = answerText;
   for (let i = 0; i < 5; i++) {
-    const laterSnapshot = await readAssistantSnapshot(runtime, baselineTurns ?? undefined).catch(
-      () => null,
-    );
+    const laterSnapshot = await readAssistantSnapshot(
+      runtime,
+      expectedPromptTurn.verifiedUserTurnIndex + 1,
+      expectedPromptTurn.conversationId,
+      expectedPromptTurn,
+    ).catch(() => null);
     const laterText = typeof laterSnapshot?.text === "string" ? laterSnapshot.text.trim() : "";
     if (laterText.length > bestLength) {
       bestLength = laterText.length;
@@ -3137,7 +3367,13 @@ async function runRemoteBrowserMode(
       ownsTarget,
       profileKind: "none",
       keepBrowser: Boolean(config.keepBrowser),
-      closeOwnedTargetOnComplete: Boolean(options.closeOwnedTabOnComplete),
+      closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
+        runStatus,
+        ownsTarget,
+        keepBrowser: Boolean(config.keepBrowser),
+        closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+        preserveForRecovery: preserveBrowserOnError,
+      }),
     };
   }
 
@@ -3222,42 +3458,58 @@ async function runRemoteBrowserMode(
     });
     return disconnectAssessmentPromise;
   };
+  let closedRemoteTargetId: string | null = null;
+  let releasedRemoteTabLeaseId: string | null = null;
   async function settleRemoteResources(
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
   ): Promise<BrowserCaptureFinalizationResult> {
     const errors: string[] = [];
     const aborting = mode === "abort";
-    const shouldCloseOwnedRemoteTarget = aborting
-      ? ownsTarget
-      : shouldCloseOwnedRunTargetAfterRun({
-          runStatus,
-          ownsTarget,
-          keepBrowser: Boolean(config.keepBrowser),
-          closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
-          preserveForRecovery: preserveBrowserOnError,
-        });
+    const pendingResource = pendingRuntime.recoveryCleanupResources?.[0];
+    const pendingCleanup = pendingResource?.recoveryCleanup;
+    const pendingOwnsTarget = pendingCleanup?.ownsTarget === true;
+    const finalizeTargetCloseDecision = pendingCleanup?.closeOwnedTargetOnComplete;
+    if (!aborting && pendingOwnsTarget && typeof finalizeTargetCloseDecision !== "boolean") {
+      return pendingBrowserCaptureCleanup(
+        pendingRuntime,
+        "Owned remote Chrome target finalize disposition is missing",
+      );
+    }
+    const targetId = pendingResource?.chromeTargetId ?? null;
+    const targetCleanupCompleted = Boolean(targetId && closedRemoteTargetId === targetId);
+    const shouldCloseOwnedRemoteTarget =
+      !targetCleanupCompleted &&
+      (aborting ? pendingOwnsTarget : pendingOwnsTarget && finalizeTargetCloseDecision === true);
     if (shouldCloseOwnedRemoteTarget) {
-      if (!remoteTargetId) {
+      if (!targetId) {
         errors.push("Owned remote Chrome target cleanup metadata is incomplete");
       } else {
         const closed = await closeChromeTarget({
           port,
-          targetId: remoteTargetId,
+          targetId,
           logger,
           host,
           browserWSEndpoint,
         });
-        if (!closed) errors.push("Remote Chrome target close was not confirmed");
+        if (closed) closedRemoteTargetId = targetId;
+        else errors.push("Remote Chrome target close was not confirmed");
       }
     }
-    if (aborting && tabLease && errors.length > 0) {
-      return pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "));
+    if (errors.length > 0) {
+      return pendingBrowserCaptureCleanup(
+        projectRetryableCleanupRuntime(pendingRuntime, {
+          targetId: closedRemoteTargetId,
+          tabLeaseId: releasedRemoteTabLeaseId,
+        }),
+        errors.join("; "),
+      );
     }
     if (tabLease) {
       const handle = tabLease;
       try {
         await handle.release();
+        releasedRemoteTabLeaseId = handle.id;
         tabLease = null;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -3267,11 +3519,20 @@ async function runRemoteBrowserMode(
     }
     const totalSeconds = (Date.now() - startedAt) / 1000;
     logger(`Remote session complete • ${totalSeconds.toFixed(1)}s total`);
+    const retryableRuntime = projectRetryableCleanupRuntime(pendingRuntime, {
+      targetId: closedRemoteTargetId,
+      tabLeaseId: releasedRemoteTabLeaseId,
+    });
     return errors.length > 0
-      ? pendingBrowserCaptureCleanup(pendingRuntime, errors.join("; "))
-      : completedBrowserCaptureCleanup(pendingRuntime);
+      ? pendingBrowserCaptureCleanup(retryableRuntime, errors.join("; "))
+      : completedBrowserCaptureCleanup(retryableRuntime);
   }
 
+  let escapingFailure: unknown;
+  const rememberRemoteEscapingFailure = (error: Error): Error => {
+    escapingFailure = error;
+    return error;
+  };
   try {
     if (remoteLeaseProfileDir) {
       await mkdir(remoteLeaseProfileDir, { recursive: true });
@@ -3547,11 +3808,13 @@ async function runRemoteBrowserMode(
         state: providerState,
       });
       await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
+      const promptLocator = requireCommittedPromptLocator(lifecycle);
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
       }
       return {
+        promptLocator,
         baselineTurns,
         baselineAssistantText,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
@@ -3565,8 +3828,8 @@ async function runRemoteBrowserMode(
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
     };
 
-    let baselineTurns: number | null = null;
     let baselineAssistantText: string | null = null;
+    let promptLocator: CommittedPromptEpochLocator | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
     const submission = await runSubmissionWithRecovery({
@@ -3579,26 +3842,35 @@ async function runRemoteBrowserMode(
       prepareFallbackSubmission: () => lifecycle.resetPrompt(),
       logger,
     });
-    baselineTurns = submission.baselineTurns;
     baselineAssistantText = submission.baselineAssistantText;
+    promptLocator = submission.promptLocator;
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
-    const imageArtifactMinTurnIndex = baselineTurns;
     if (deepResearch) {
       await waitForResearchPlanAutoConfirm(Runtime, logger);
+      const expectedPromptTurn = promptLocator;
+      if (!expectedPromptTurn) {
+        throw new BrowserAutomationError("Deep Research prompt authority is unavailable.", {
+          stage: "prompt-epoch",
+          code: "prompt-epoch-evidence-missing",
+        });
+      }
       const researchResult = await waitForDeepResearchCompletion(
         Runtime,
         logger,
         config.timeoutMs,
-        baselineTurns,
+        expectedPromptTurn.verifiedUserTurnIndex + 1,
         Page,
         client,
         {
           ignoredTargetKeys: deepResearchTargetKeys,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+          expectedConversationId: expectedPromptTurn.conversationId,
+          expectedPromptTurn,
         },
       );
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
@@ -3632,6 +3904,7 @@ async function runRemoteBrowserMode(
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       if (connectionClosedUnexpectedly) {
         throw new Error("Remote Chrome disconnected before completion");
       }
@@ -3652,9 +3925,11 @@ async function runRemoteBrowserMode(
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
       text.toLowerCase().replace(/\s+/g, " ").trim();
-    const expectedConversationId = () =>
-      lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
+    const waitForFreshAssistantResponse = async (
+      baselineNormalized: string,
+      timeoutMs: number,
+      expectedPromptTurn: CommittedPromptEpochLocator,
+    ) => {
       const baselinePrefix =
         baselineNormalized.length >= 80
           ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
@@ -3663,8 +3938,9 @@ async function runRemoteBrowserMode(
       while (Date.now() < deadline) {
         const snapshot = await readAssistantSnapshot(
           Runtime,
-          baselineTurns ?? undefined,
-          expectedConversationId(),
+          expectedPromptTurn.verifiedUserTurnIndex + 1,
+          expectedPromptTurn.conversationId,
+          expectedPromptTurn,
         ).catch(() => null);
         const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
         if (text) {
@@ -3701,7 +3977,7 @@ async function runRemoteBrowserMode(
     };
     const recheckDelayMs = Math.max(0, config.assistantRecheckDelayMs ?? 0);
     const recheckTimeoutMs = Math.max(0, config.assistantRecheckTimeoutMs ?? 0);
-    const attemptAssistantRecheck = async () => {
+    const attemptAssistantRecheck = async (expectedPromptTurn: CommittedPromptEpochLocator) => {
       if (!recheckDelayMs) return null;
       logger(
         `[browser] Assistant response timed out; waiting ${formatElapsed(recheckDelayMs)} before rechecking conversation.`,
@@ -3750,13 +4026,15 @@ async function runRemoteBrowserMode(
               Page,
               timeoutMs,
               logger,
-              baselineTurns ?? undefined,
-              expectedConversationId(),
+              expectedPromptTurn.verifiedUserTurnIndex + 1,
+              expectedPromptTurn.conversationId,
+              expectedPromptTurn,
             ),
           timeoutMs,
           logger,
-          minTurnIndex: baselineTurns ?? undefined,
-          expectedConversationId: expectedConversationId(),
+          minTurnIndex: expectedPromptTurn.verifiedUserTurnIndex + 1,
+          expectedConversationId: expectedPromptTurn.conversationId,
+          expectedPromptTurn,
           imageOutputRequested,
         }),
       );
@@ -3772,6 +4050,13 @@ async function runRemoteBrowserMode(
       turnPrompt: string,
       label: string,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
+      const expectedPromptTurn = promptLocator;
+      if (!expectedPromptTurn) {
+        throw new BrowserAutomationError("Assistant response prompt authority is unavailable.", {
+          stage: "prompt-epoch",
+          code: "prompt-epoch-evidence-missing",
+        });
+      }
       let turnAnswer: AssistantAnswer;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
@@ -3784,19 +4069,23 @@ async function runRemoteBrowserMode(
                 Page,
                 config.timeoutMs,
                 logger,
-                baselineTurns ?? undefined,
-                expectedConversationId(),
+                expectedPromptTurn.verifiedUserTurnIndex + 1,
+                expectedPromptTurn.conversationId,
+                expectedPromptTurn,
               ),
             timeoutMs: config.timeoutMs,
             logger,
-            minTurnIndex: baselineTurns ?? undefined,
-            expectedConversationId: expectedConversationId(),
+            minTurnIndex: expectedPromptTurn.verifiedUserTurnIndex + 1,
+            expectedConversationId: expectedPromptTurn.conversationId,
+            expectedPromptTurn,
             imageOutputRequested,
           }),
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
-          const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
+          const rechecked = await attemptAssistantRecheckOrRethrow(() =>
+            attemptAssistantRecheck(expectedPromptTurn),
+          );
           if (rechecked) {
             turnAnswer = rechecked;
           } else {
@@ -3840,7 +4129,11 @@ async function runRemoteBrowserMode(
           (baselinePrefix.length > 0 && normalizedAnswer.startsWith(baselinePrefix));
         if (isBaseline) {
           logger("Detected stale assistant response; waiting for new response...");
-          const refreshed = await waitForFreshAssistantResponse(baselineNormalized, 15_000);
+          const refreshed = await waitForFreshAssistantResponse(
+            baselineNormalized,
+            15_000,
+            expectedPromptTurn,
+          );
           if (refreshed) {
             turnAnswer = refreshed;
           }
@@ -3848,10 +4141,15 @@ async function runRemoteBrowserMode(
       }
       let turnAnswerText = turnAnswer.text;
       const turnAnswerHtml = turnAnswer.html ?? "";
-
       const copiedMarkdown = await withRetries(
         async () => {
-          const attempt = await captureAssistantMarkdown(Runtime, turnAnswer.meta, logger);
+          const attempt = await captureAssistantMarkdown(
+            Runtime,
+            turnAnswer.meta,
+            logger,
+            expectedPromptTurn.conversationId,
+            expectedPromptTurn,
+          );
           if (!attempt) {
             throw new Error("copy-missing");
           }
@@ -3871,36 +4169,42 @@ async function runRemoteBrowserMode(
       ).catch(() => null);
 
       let turnAnswerMarkdown = copiedMarkdown ?? turnAnswerText;
+      const promptEchoMatcher = buildPromptEchoMatcher(turnPrompt);
       ({ answerText: turnAnswerText, answerMarkdown: turnAnswerMarkdown } =
         await maybeRecoverLongAssistantResponse({
           runtime: Runtime,
-          baselineTurns,
           answerText: turnAnswerText,
           answerMarkdown: turnAnswerMarkdown,
           logger,
           allowMarkdownUpdate: !copiedMarkdown,
+          expectedPromptTurn,
         }));
 
       // Final sanity check: ensure we didn't accidentally capture the user prompt instead of the assistant turn.
       const finalSnapshot = await readAssistantSnapshot(
         Runtime,
-        baselineTurns ?? undefined,
-        expectedConversationId(),
+        expectedPromptTurn.verifiedUserTurnIndex + 1,
+        expectedPromptTurn.conversationId,
+        expectedPromptTurn,
       ).catch(() => null);
       const finalText = typeof finalSnapshot?.text === "string" ? finalSnapshot.text.trim() : "";
-      if (
-        finalText &&
-        finalText !== turnAnswerMarkdown.trim() &&
-        finalText !== turnPrompt.trim() &&
-        finalText.length >= turnAnswerMarkdown.trim().length
-      ) {
-        logger("Refreshed assistant response via final DOM snapshot");
-        turnAnswerText = finalText;
-        turnAnswerMarkdown = finalText;
+      if (finalText && finalText !== turnPrompt.trim()) {
+        const trimmedMarkdown = turnAnswerMarkdown.trim();
+        const finalIsEcho = promptEchoMatcher ? promptEchoMatcher.isEcho(finalText) : false;
+        const lengthDelta = finalText.length - trimmedMarkdown.length;
+        const missingCopy = !copiedMarkdown && lengthDelta >= 0;
+        const likelyTruncatedCopy =
+          copiedMarkdown &&
+          trimmedMarkdown.length > 0 &&
+          lengthDelta >= Math.max(12, Math.floor(trimmedMarkdown.length * 0.75));
+        if ((missingCopy || likelyTruncatedCopy) && !finalIsEcho && finalText !== trimmedMarkdown) {
+          logger("Refreshed assistant response via final DOM snapshot");
+          turnAnswerText = finalText;
+          turnAnswerMarkdown = finalText;
+        }
       }
 
       // Detect prompt echo using normalized comparison (whitespace-insensitive).
-      const promptEchoMatcher = buildPromptEchoMatcher(turnPrompt);
       const alignedEcho = alignPromptEchoPair(
         turnAnswerText,
         turnAnswerMarkdown,
@@ -3922,8 +4226,9 @@ async function runRemoteBrowserMode(
         while (Date.now() < deadline) {
           const snapshot = await readAssistantSnapshot(
             Runtime,
-            baselineTurns ?? undefined,
-            expectedConversationId(),
+            expectedPromptTurn.verifiedUserTurnIndex + 1,
+            expectedPromptTurn.conversationId,
+            expectedPromptTurn,
           ).catch(() => null);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           const isStillEcho = !text || Boolean(promptEchoMatcher?.isEcho(text));
@@ -3938,7 +4243,7 @@ async function runRemoteBrowserMode(
               break;
             }
           }
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          await delay(300);
         }
         if (bestText) {
           logger("Recovered assistant response after detecting prompt echo");
@@ -3946,6 +4251,7 @@ async function runRemoteBrowserMode(
           turnAnswerMarkdown = bestText;
         }
       }
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
       return {
         label,
         answerText: turnAnswerText,
@@ -3979,7 +4285,7 @@ async function runRemoteBrowserMode(
         prepareFallbackSubmission: () => lifecycle.resetPrompt(),
         logger,
       });
-      baselineTurns = submission.baselineTurns;
+      promptLocator = submission.promptLocator;
       baselineAssistantText = submission.baselineAssistantText;
       const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
       remainingFollowUpsToCapture -= 1;
@@ -4006,28 +4312,41 @@ async function runRemoteBrowserMode(
       answerHtml = "";
     }
     const canSaveBrowserDownloadsLocally = isLocalChromeHost(host);
+    const artifactPromptLocator = promptLocator;
+    if (!artifactPromptLocator) {
+      throw new BrowserAutomationError("Artifact prompt authority is unavailable.", {
+        stage: "prompt-epoch",
+        code: "prompt-epoch-evidence-missing",
+      });
+    }
+    const artifactMinTurnIndex = artifactPromptLocator.verifiedUserTurnIndex + 1;
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    const artifactRuntime = createPromptEpochGuardedRuntime(Runtime, artifactPromptLocator);
     const imageArtifacts = await collectGeneratedImageArtifacts({
       Browser: canSaveBrowserDownloadsLocally ? client.Browser : undefined,
       Client: canSaveBrowserDownloadsLocally ? client : undefined,
       Page: canSaveBrowserDownloadsLocally ? Page : undefined,
-      Runtime,
+      Runtime: artifactRuntime,
       Network,
       logger,
-      minTurnIndex: imageArtifactMinTurnIndex,
+      minTurnIndex: artifactMinTurnIndex,
       sessionId: options.sessionId,
       generateImagePath: options.generateImagePath,
       outputPath: options.outputPath,
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
-      checkBlockingUiWarning: () =>
-        throwChatGptUiWarningIfPresent({
+      checkBlockingUiWarning: async () => {
+        await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+        await throwChatGptUiWarningIfPresent({
           Runtime,
           logger,
           stage: "image-artifact-wait",
           waitTarget: "generated image artifacts",
           runtime: buildRemoteRuntimeMetadata(),
-        }),
+        });
+      },
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     answerText = imageArtifacts.answerText || answerText;
     if (imageArtifacts.markdownSuffix) {
       answerMarkdown += imageArtifacts.markdownSuffix;
@@ -4036,13 +4355,14 @@ async function runRemoteBrowserMode(
       Browser: client.Browser,
       Client: client,
       Page,
-      Runtime,
+      Runtime: artifactRuntime,
       Network,
       answerText: [answerText, answerMarkdown, answerHtml].filter(Boolean).join("\n"),
       logger,
-      minTurnIndex: imageArtifactMinTurnIndex,
+      minTurnIndex: artifactMinTurnIndex,
       sessionId: options.sessionId,
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
     const transcriptArtifact = await saveOptionalArtifact(
@@ -4069,6 +4389,7 @@ async function runRemoteBrowserMode(
         imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
         fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
     });
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     const durationMs = Date.now() - startedAt;
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
@@ -4121,22 +4442,24 @@ async function runRemoteBrowserMode(
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      throw withInterruptedArchiveDetails(normalizedError, archive);
+      throw rememberRemoteEscapingFailure(withInterruptedArchiveDetails(normalizedError, archive));
     }
 
     const assessment = await getDisconnectAssessment();
     preserveBrowserOnError = assessment.recoverable;
     await emitRuntimeHint();
     const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
-    throw new BrowserAutomationError(
-      connectionLostMessage({ assessment, remote: true }),
-      {
-        stage: "connection-lost",
-        recoverableDisconnect: assessment.recoverable,
-        disconnectCause: connectionLostCause(assessment),
-        runtime: buildRemoteRuntimeMetadata(tabUrl),
-      },
-      normalizedError,
+    throw rememberRemoteEscapingFailure(
+      new BrowserAutomationError(
+        connectionLostMessage({ assessment, remote: true }),
+        {
+          stage: "connection-lost",
+          recoverableDisconnect: assessment.recoverable,
+          disconnectCause: connectionLostCause(assessment),
+          runtime: buildRemoteRuntimeMetadata(tabUrl),
+        },
+        normalizedError,
+      ),
     );
   } finally {
     await conversationUrlMonitor?.stop();
@@ -4153,7 +4476,8 @@ async function runRemoteBrowserMode(
     removeDialogHandler?.();
     const finalization = await lifecycle.settleIfUnpublished();
     if (finalization?.status === "pending") {
-      logger(`[browser] Remote browser cleanup remains pending: ${finalization.error}`);
+      // Unpublished remote captures must retain the same cleanup authority as local captures.
+      await Promise.reject(unpublishedCleanupPendingError(finalization, escapingFailure));
     }
   }
 }
@@ -4215,6 +4539,7 @@ async function waitForAssistantResponseWithReload(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedPromptTurn?: CommittedPromptEpochLocator,
 ) {
   try {
     return await waitForAssistantResponse(
@@ -4223,6 +4548,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      expectedPromptTurn,
     );
   } catch (error) {
     if (!shouldReloadAfterAssistantError(error)) {
@@ -4245,6 +4571,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      expectedPromptTurn,
     );
   }
 }

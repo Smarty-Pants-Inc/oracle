@@ -140,6 +140,8 @@ function requiredGeminiCookies() {
   ];
 }
 
+let runtimeEvaluate: ReturnType<typeof vi.fn>;
+
 describe("gemini-web executor", () => {
   beforeEach(() => {
     runGeminiWebWithFallback.mockClear();
@@ -196,7 +198,7 @@ describe("gemini-web executor", () => {
         },
       ),
     }));
-    const runtimeEvaluate = vi.fn(async ({ expression }: { expression?: string }) => {
+    runtimeEvaluate = vi.fn(async ({ expression }: { expression?: string }) => {
       const source = String(expression ?? "");
       if (source.includes("requiresLogin")) {
         return {
@@ -237,8 +239,7 @@ describe("gemini-web executor", () => {
             value: JSON.stringify({
               status: "done",
               text: "deep-think answer",
-              postBaselineUserQueries: ["hello"],
-              responseCount: 1,
+              causalPair: true,
             }),
           },
         };
@@ -436,6 +437,30 @@ describe("gemini-web executor", () => {
     expect(connectWithNewTab).toHaveBeenCalled();
     expect(closeTab).toHaveBeenCalled();
     expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
+  });
+
+  it("rejects Chrome evaluation exceptions from Deep Think DOM automation", async () => {
+    runtimeEvaluate.mockResolvedValueOnce({
+      result: { type: "object", subtype: "error" },
+      exceptionDetails: {
+        text: "Uncaught",
+        exception: { description: "ReferenceError: visibleSpinners is not defined" },
+      },
+    });
+    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+        log: () => {},
+      }),
+    ).rejects.toThrow(
+      "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
+    );
+    expect(closeTab).toHaveBeenCalled();
   });
 
   it("falls back to HTTP/header path for gemini deep-think when attachments are present", async () => {

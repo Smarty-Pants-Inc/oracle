@@ -129,6 +129,7 @@ describe("remote browser service", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],
@@ -730,6 +731,7 @@ describe("remote browser service", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],
@@ -798,14 +800,16 @@ describe("remote browser service", () => {
           JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
         ).toMatchObject({ state: "pending", runtime: { chromeTargetId: "disconnect-target" } });
 
-        const settlement = await httpPostJson({
-          hostname: "127.0.0.1",
-          port: server.port,
-          path: `/transactions/${transactionToken}/finalize`,
-          token: "secret",
-          body: { durablePublication: true },
+        await vi.waitFor(async () => {
+          const settlement = await httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            token: "secret",
+            body: { durablePublication: true },
+          });
+          expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
         });
-        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
         expect(finalize).toHaveBeenCalledTimes(1);
       } finally {
         continueRun.resolve();
@@ -829,6 +833,7 @@ describe("remote browser service", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],
@@ -1106,6 +1111,7 @@ describe("remote browser service", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],
@@ -2072,6 +2078,7 @@ async function seedRemoteTransaction(
                 ownsTarget: true,
                 profileKind: "temporary" as const,
                 keepBrowser: false,
+                closeOwnedTargetOnComplete: true,
               },
             },
           ],

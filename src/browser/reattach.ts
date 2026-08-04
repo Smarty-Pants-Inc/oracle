@@ -191,7 +191,17 @@ export async function resumeBrowserSession(
       if (completedSettlement) return completedSettlement;
       if (settlementInFlight) return settlementInFlight;
       settlementMode = mode;
+      settlementRuntime = bindPendingRecoveryCleanupSettlement(settlementRuntime, mode);
       settlementInFlight = (async () => {
+        try {
+          await deps.runtimeHintCb?.(settlementRuntime);
+        } catch (error) {
+          return pendingFinalization(
+            settlementRuntime,
+            `Failed to persist ${mode} cleanup authority: ${error instanceof Error ? error.message : String(error)}`,
+            mode,
+          );
+        }
         let result: ReattachFinalizationResult;
         try {
           const captureSettler =
@@ -523,6 +533,21 @@ export async function retryBrowserRecoveryCleanup(
     ) ?? []),
   ].filter((candidate): candidate is "finalize" | "abort" => Boolean(candidate));
   const persistedMode = persistedModes[0];
+  const hasCleanupAuthority = Boolean(
+    runtime.recoveryCleanupResources?.length ||
+    runtime.recoveryCleanupResult ||
+    runtime.remoteRecovery,
+  );
+  if (!mode && !persistedMode && hasCleanupAuthority) {
+    throw new BrowserAutomationError(
+      "Browser recovery cleanup has no authoritative settlement mode.",
+      {
+        stage: "browser-recovery-settlement",
+        code: "settlement-mode-missing",
+        runtime,
+      },
+    );
+  }
   const settlementMode = mode ?? persistedMode ?? "finalize";
   if (persistedModes.some((candidate) => candidate !== settlementMode)) {
     throw new BrowserAutomationError(
@@ -657,8 +682,13 @@ async function finalizeRecoveryCleanupGroup(
     for (const entry of group.entries) {
       const { resource } = entry;
       const cleanup = resource.recoveryCleanup;
-      if (!cleanup.ownsTarget || (!cleanup.closeOwnedTargetOnComplete && cleanup.keepBrowser)) {
-        continue;
+      if (!cleanup.ownsTarget) continue;
+      if (mode === "finalize") {
+        if (typeof cleanup.closeOwnedTargetOnComplete !== "boolean") {
+          addPending(entry, "Owned Chrome target finalize disposition is missing");
+          continue;
+        }
+        if (!cleanup.closeOwnedTargetOnComplete) continue;
       }
       const targetKey =
         resource.chromeTargetId ?? `missing:${recoveryCleanupResourceKey(resource)}`;
@@ -1037,13 +1067,13 @@ function recoveryCleanupResourceKey(resource: BrowserRecoveryCleanupResourceMeta
     resource.chromeHost ?? null,
     resource.chromePort ?? null,
     resource.chromeBrowserWSEndpoint ?? null,
-    resource.tabLease
-      ? [resource.tabLease.id, profileDirectoryIdentityKey(resource.tabLease.profileDirectory)]
-      : null,
+    resource.chromeProcessIdentity?.launchNonce ?? null,
+    profileDirectoryIdentityKey(resource.profileDirectoryIdentity) ?? null,
+    resource.recoveryCleanup.transport,
     resource.recoveryCleanup.ownsTarget,
     resource.recoveryCleanup.profileKind,
     resource.recoveryCleanup.keepBrowser,
-    Boolean(resource.recoveryCleanup.closeOwnedTargetOnComplete),
+    resource.recoveryCleanup.closeOwnedTargetOnComplete ?? null,
   ]);
 }
 
@@ -1244,6 +1274,12 @@ function bindPendingRecoveryCleanupSettlement(
   runtime: BrowserRuntimeMetadata,
   settlementMode: "finalize" | "abort",
 ): BrowserRuntimeMetadata {
+  const hasCleanupAuthority = Boolean(
+    runtime.recoveryCleanupResources?.length ||
+    runtime.recoveryCleanupResult ||
+    runtime.remoteRecovery,
+  );
+  if (!hasCleanupAuthority) return runtime;
   return {
     ...runtime,
     recoveryCleanupResult: {
@@ -1616,7 +1652,7 @@ async function resumeBrowserSessionViaNewChrome(
         ownsTarget: Boolean(fallbackTargetId),
         profileKind,
         keepBrowser: !ownsProcess,
-        closeOwnedTargetOnComplete: fallbackTargetId && !ownsProcess ? true : undefined,
+        closeOwnedTargetOnComplete: Boolean(fallbackTargetId),
       },
     };
     const next: BrowserRuntimeMetadata = {

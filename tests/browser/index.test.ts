@@ -39,6 +39,7 @@ describe("unpublished browser cleanup", () => {
             ownsTarget: true,
             profileKind: "copied" as const,
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         },
       ],
@@ -944,6 +945,26 @@ describe("shouldPreferSystemTmpDirForTest", () => {
 
 describe("runSubmissionWithRecoveryForTest", () => {
   test("preserves prompt-too-large fallback after a dead-composer retry", async () => {
+    const promptLocator = {
+      epoch: {
+        status: "committed" as const,
+        epochId: "epoch-1",
+        promptSha256: "a".repeat(64),
+        baselineTurns: 7,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 7,
+        verifiedUserTurnId: "turn-7",
+        verifiedUserMessageId: "message-7",
+        conversationId: "conversation-1",
+      },
+      conversationId: "conversation-1",
+      promptSha256: "a".repeat(64),
+      verifiedUserTurnIndex: 7,
+      verifiedUserTurnId: "turn-7",
+      verifiedUserMessageId: "message-7",
+      conversationUrls: [],
+    };
     const submit = vi
       .fn()
       .mockRejectedValueOnce(new BrowserAutomationError("dead composer", { code: "dead-composer" }))
@@ -952,6 +973,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
       )
       .mockResolvedValueOnce({
         baselineTurns: 7,
+        promptLocator,
         baselineAssistantText: "done",
       });
     const reloadPromptComposer = vi.fn().mockResolvedValue(undefined);
@@ -973,6 +995,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
       }),
     ).resolves.toEqual({
       baselineTurns: 7,
+      promptLocator,
       baselineAssistantText: "done",
     });
 

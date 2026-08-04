@@ -95,6 +95,7 @@ export interface BrowserRecoveryCleanupMetadata {
   ownsTarget: boolean;
   profileKind: BrowserRecoveryProfileKind;
   keepBrowser: boolean;
+  /** Exact per-run finalize decision for the owned target. Abort ignores this and closes owned targets. */
   closeOwnedTargetOnComplete?: boolean;
 }
 

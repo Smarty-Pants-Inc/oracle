@@ -33,6 +33,7 @@ function remoteRuntime(): BrowserRuntimeMetadata {
           ownsTarget: true,
           profileKind: "none",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       },
     ],
@@ -115,7 +116,9 @@ describe("BrowserRunLifecycleController", () => {
     expect(settleResources).toHaveBeenCalledTimes(1);
     expect(settleResources).toHaveBeenCalledWith(
       "finalize",
-      expect.objectContaining({ recoveryCleanupResult: { status: "pending" } }),
+      expect.objectContaining({
+        recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+      }),
     );
     expect(lifecycle.phase()).toEqual({ kind: "completed", mode: "finalize" });
     expect(persistRuntime).toHaveBeenCalledWith(
@@ -286,8 +289,7 @@ describe("BrowserRunLifecycleController", () => {
         expect.objectContaining({
           chromeTargetId: "retry-target",
           recoveryCleanupResult: {
-            status: "failed",
-            error: "target close was not confirmed",
+            status: "pending",
             settlementMode: mode,
           },
           recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
@@ -296,6 +298,88 @@ describe("BrowserRunLifecycleController", () => {
       expect(lifecycle.phase()).toEqual({ kind: "completed", mode });
     },
   );
+
+  test.each(["finalize", "abort"] as const)(
+    "persists %s authority before cleanup side effects",
+    async (mode) => {
+      const events: string[] = [];
+      const persistRuntime = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
+        events.push(`persist:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}`);
+      });
+      const settleResources = vi.fn(
+        async (settlementMode: "finalize" | "abort", runtime: BrowserRuntimeMetadata) => {
+          events.push(`cleanup:${settlementMode}`);
+          return completedBrowserCaptureCleanup(runtime);
+        },
+      );
+      const lifecycle = new BrowserRunLifecycleController({
+        getRuntime: remoteRuntime,
+        persistRuntime,
+        settleResources,
+      });
+      lifecycle.markAcquired();
+      const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
+      await lifecycle.recordPromptCommitVerification(committedVerification, identity);
+      const transaction = lifecycle.issueCapture({
+        answerText: "captured answer",
+        answerMarkdown: "captured answer",
+        tookMs: 1,
+        answerTokens: 2,
+        answerChars: 15,
+      });
+      events.length = 0;
+
+      await transaction[mode]();
+
+      expect(events).toEqual([`persist:${mode}`, `cleanup:${mode}`]);
+      expect(persistRuntime).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          recoveryCleanupResult: { status: "pending", settlementMode: mode },
+        }),
+      );
+    },
+  );
+
+  test("does not start cleanup when bound runtime persistence fails", async () => {
+    const persistenceError = new Error("session runtime store unavailable");
+    const persistRuntime = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
+      if (runtime.recoveryCleanupResult?.settlementMode === "finalize") {
+        throw persistenceError;
+      }
+    });
+    const settleResources = vi.fn(
+      async (_mode: "finalize" | "abort", runtime: BrowserRuntimeMetadata) =>
+        completedBrowserCaptureCleanup(runtime),
+    );
+    const lifecycle = new BrowserRunLifecycleController({
+      getRuntime: remoteRuntime,
+      persistRuntime,
+      settleResources,
+    });
+    lifecycle.markAcquired();
+    const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
+    await lifecycle.recordPromptCommitVerification(committedVerification, identity);
+    const transaction = lifecycle.issueCapture({
+      answerText: "captured answer",
+      answerMarkdown: "captured answer",
+      tookMs: 1,
+      answerTokens: 2,
+      answerChars: 15,
+    });
+
+    await expect(transaction.finalize()).resolves.toMatchObject({
+      status: "pending",
+      error: persistenceError.message,
+      runtime: {
+        recoveryCleanupResult: {
+          status: "failed",
+          error: persistenceError.message,
+          settlementMode: "finalize",
+        },
+      },
+    });
+    expect(settleResources).not.toHaveBeenCalled();
+  });
 
   test("binds thrown unpublished cleanup failure to finalize", async () => {
     const settleResources = vi.fn(async () => {
@@ -311,7 +395,9 @@ describe("BrowserRunLifecycleController", () => {
 
     expect(settleResources).toHaveBeenCalledWith(
       "finalize",
-      expect.objectContaining({ recoveryCleanupResult: { status: "pending" } }),
+      expect.objectContaining({
+        recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+      }),
     );
     expect(result).toMatchObject({
       status: "pending",

@@ -41,6 +41,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const killChrome = vi.fn().mockResolvedValue({ status: "stopped", pid: 4321, signal: "SIGTERM" });
   const closeConnection = vi.fn().mockResolvedValue(undefined);
+  const verifyCommittedPromptTurn = vi.fn().mockResolvedValue(undefined);
   const clearPromptComposer = vi.fn(async () => {
     composerText = "";
   });
@@ -216,6 +217,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
     isSafeChromeTerminationOutcome: vi.fn(() => true),
     terminateRecordedChromeForProfile: vi.fn().mockResolvedValue({ status: "not-running" }),
     writeOracleChromeOwner: vi.fn().mockResolvedValue(undefined),
+    removeProfileDirectoryIfIdentityMatches: vi.fn().mockResolvedValue(true),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
     clearStaleChatGptConversationCookies: vi.fn().mockResolvedValue(undefined),
@@ -276,6 +278,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       };
     }),
     verifyPromptCommitted: vi.fn(),
+    verifyCommittedPromptTurn,
   }));
   vi.doMock("../../src/browser/conversationUrlMonitor.js", () => ({
     createConversationUrlMonitor: vi.fn(() => ({
@@ -354,6 +357,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       insertText,
       closeChromeTarget,
       killChrome,
+      verifyCommittedPromptTurn,
       closeConnection,
     };
   } finally {
@@ -401,21 +405,16 @@ describe("semantic prompt epoch persistence", () => {
       expect(fixture.rejectedResetRuntime).toMatchObject({
         promptEpoch: undefined,
       });
-      const promptPersistenceError =
-        transport === "local"
-          ? (fixture.error as Error & { cause?: unknown }).cause
-          : fixture.error;
-      if (transport === "local") {
-        expect(fixture.error).toMatchObject({
-          details: {
-            stage: "browser-capture-finalization",
-            code: "unpublished-cleanup-pending",
-            runtime: {
-              promptEpoch: undefined,
-            },
+      const promptPersistenceError = (fixture.error as Error & { cause?: unknown }).cause;
+      expect(fixture.error).toMatchObject({
+        details: {
+          stage: "browser-capture-finalization",
+          code: "unpublished-cleanup-pending",
+          runtime: {
+            promptEpoch: undefined,
           },
-        });
-      }
+        },
+      });
       expect(promptPersistenceError).toMatchObject({
         details: {
           stage: "prompt-epoch-persistence",
@@ -425,6 +424,17 @@ describe("semantic prompt epoch persistence", () => {
           },
         },
       });
+      expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          epoch: fixture.committedRuntime?.promptEpoch,
+          conversationId,
+          promptSha256: promptIdentitySha256("prompt one"),
+          verifiedUserTurnIndex: 0,
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
+        }),
+      );
       expect(hasRecoverableChatGptConversation(runtime)).toBe(false);
     },
   );

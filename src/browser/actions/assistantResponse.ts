@@ -199,18 +199,21 @@ export async function verifyCommittedPromptTurn(
       const conversationId = href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
       if (conversationId !== expected.conversationId) return null;
       const turns = ${buildConversationTurnListExpression()};
+      const isUserTurn = (candidate) => {
+        if (!candidate) return false;
+        const candidateRole = String(
+          candidate.getAttribute?.('data-message-author-role') ||
+            candidate.getAttribute?.('data-turn') ||
+            candidate.dataset?.turn ||
+            '',
+        ).toLowerCase();
+        return candidateRole === 'user' || Boolean(
+          candidate.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
+        );
+      };
       const turn = turns[expected.userTurnIndex];
       if (!turn) return null;
-      const role = String(
-        turn.getAttribute?.('data-message-author-role') ||
-          turn.getAttribute?.('data-turn') ||
-          turn.dataset?.turn ||
-          '',
-      ).toLowerCase();
-      const isUser = role === 'user' || Boolean(
-        turn.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
-      );
-      if (!isUser) return null;
+      if (!isUserTurn(turn)) return null;
       const testId = turn.getAttribute?.('data-testid');
       const turnId =
         turn.getAttribute?.('data-turn-id') ||
@@ -224,6 +227,9 @@ export async function verifyCommittedPromptTurn(
         messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId || null;
       if (turnId !== expected.userTurnId) return null;
       if (messageId !== expected.userMessageId) return null;
+      for (let index = expected.userTurnIndex + 1; index < turns.length; index += 1) {
+        if (isUserTurn(turns[index])) return null;
+      }
       const text = String(turn.innerText || turn.textContent || '');
       return { text, turnId, messageId };
     })()`,
@@ -392,7 +398,22 @@ export async function waitForAssistantResponse(
     expectedConversationId,
     expectedPromptTurn,
   );
-  const candidate = refreshed ?? parsed;
+  let candidate = refreshed ?? parsed;
+  if (expectedPromptTurn) {
+    const exactCandidate = await revalidateExactAssistantCandidate(
+      Runtime,
+      candidate,
+      expectedPromptTurn,
+      expectedConversationId,
+    );
+    if (!exactCandidate) {
+      throw new BrowserAutomationError(
+        "Assistant response no longer belongs to the committed prompt epoch.",
+        { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+      );
+    }
+    candidate = exactCandidate;
+  }
   if (isGeneratedImageAssistantAnswer(candidate)) {
     logger("Captured assistant generated image response");
     return candidate;
@@ -510,6 +531,15 @@ export async function captureAssistantMarkdown(
     awaitPromise: true,
   });
   if (result?.value?.success && typeof result.value.markdown === "string") {
+    if (expectedPromptTurn) {
+      const revalidated = await revalidateExactAssistantCandidate(
+        Runtime,
+        { text: result.value.markdown, meta: exactMeta },
+        expectedPromptTurn,
+        expectedConversationId,
+      );
+      if (!revalidated) return null;
+    }
     return result.value.markdown;
   }
   const status = result?.value?.status;
@@ -764,9 +794,21 @@ async function pollAssistantCompletion(
     );
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
-      // Generated-image answers stream no text and mount no action bar; accept immediately.
+      // Generated-image answers stream no text and mount no action bar. Exact scope still
+      // requires a second turn-bound snapshot so an observer/poller result from another prompt
+      // epoch cannot take the image shortcut.
       if (isGeneratedImageAssistantAnswer(normalized)) {
-        return normalized;
+        if (!expectedPromptTurn) return normalized;
+        const revalidated = await revalidateExactAssistantCandidate(
+          Runtime,
+          normalized,
+          expectedPromptTurn,
+          expectedConversationId,
+        );
+        if (revalidated && isGeneratedImageAssistantAnswer(revalidated)) return revalidated;
+        gate = createTerminalGateState(Date.now());
+        await delay(400);
+        continue;
       }
       const [stopVisible, barVisible, thinkingActivity] = await Promise.all([
         isStopButtonVisible(Runtime),
@@ -789,7 +831,15 @@ async function pollAssistantCompletion(
       );
       gate = decision.state;
       if (decision.terminal) {
-        return normalized;
+        if (!expectedPromptTurn) return normalized;
+        const revalidated = await revalidateExactAssistantCandidate(
+          Runtime,
+          normalized,
+          expectedPromptTurn,
+          expectedConversationId,
+        );
+        if (revalidated) return revalidated;
+        gate = createTerminalGateState(Date.now());
       }
     } else {
       // The turn disappeared/reset (navigation, re-render): restart the gate so a stale
@@ -966,6 +1016,37 @@ function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
 
 function isGeneratedImageAssistantAnswer(answer: { html?: string } | null): boolean {
   return Boolean(answer?.html?.includes("/backend-api/estuary/content?id=file_"));
+}
+
+async function revalidateExactAssistantCandidate(
+  Runtime: ChromeClient["Runtime"],
+  candidate: {
+    text: string;
+    html?: string;
+    meta: { turnId?: string | null; messageId?: string | null };
+  },
+  expectedPromptTurn: CommittedPromptEpochLocator,
+  expectedConversationId?: string,
+): Promise<{
+  text: string;
+  html?: string;
+  meta: { turnId?: string | null; messageId?: string | null };
+} | null> {
+  await verifyCommittedPromptTurn(Runtime, expectedPromptTurn);
+  const exactSnapshot = await readAssistantSnapshot(
+    Runtime,
+    expectedPromptTurn.verifiedUserTurnIndex + 1,
+    expectedConversationId ?? expectedPromptTurn.conversationId,
+    expectedPromptTurn,
+  );
+  const exact = normalizeAssistantSnapshot(exactSnapshot);
+  if (!exact) return null;
+  if (candidate.meta.messageId && exact.meta.messageId !== candidate.meta.messageId) return null;
+  if (candidate.meta.turnId && exact.meta.turnId !== candidate.meta.turnId) return null;
+  if (isGeneratedImageAssistantAnswer(candidate) && !isGeneratedImageAssistantAnswer(exact)) {
+    return null;
+  }
+  return exact;
 }
 
 async function waitForCondition<T>(
@@ -1148,7 +1229,7 @@ function buildResponseObserverExpression(
                 ? extractedRaw
                 : null;
             let extracted = acceptSnapshot(extractedCandidate);
-            if (!extracted) {
+            if (!extracted && !${hasExactPromptScope}) {
               const fallbackRaw = extractFromMarkdownFallback();
               const fallbackCandidate =
                 fallbackRaw &&
@@ -1200,7 +1281,14 @@ function buildResponseObserverExpression(
 
     const waitForSettle = async (snapshot) => {
       if (String(snapshot?.html ?? '').includes('/backend-api/estuary/content?id=file_')) {
-        return snapshot;
+        if (!${hasExactPromptScope}) return snapshot;
+        const revalidated = acceptSnapshot(extractFromTurns());
+        if (!revalidated) return null;
+        if (snapshot.messageId && revalidated.messageId !== snapshot.messageId) return null;
+        if (snapshot.turnId && revalidated.turnId !== snapshot.turnId) return null;
+        return String(revalidated.html ?? '').includes('/backend-api/estuary/content?id=file_')
+          ? revalidated
+          : null;
       }
       // Learned: short answers can be 1-2 tokens; enforce longer settle windows to avoid truncation.
       // Learned: long streaming responses (esp. thinking models) can pause mid-stream;
@@ -1226,7 +1314,7 @@ function buildResponseObserverExpression(
             ? refreshedRaw
             : null;
         let refreshed = acceptSnapshot(refreshedCandidate);
-        if (!refreshed) {
+        if (!refreshed && !${hasExactPromptScope}) {
           const fallbackRaw = extractFromMarkdownFallback();
           const fallbackCandidate =
             fallbackRaw &&

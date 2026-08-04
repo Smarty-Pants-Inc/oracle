@@ -207,8 +207,15 @@ async function runGeminiDeepThinkViaBrowser(
     await Page.enable();
 
     const evaluate = async <T>(expression: string): Promise<T | undefined> => {
-      const { result } = await Runtime.evaluate({ expression, returnByValue: true });
-      return result?.value as T | undefined;
+      const evaluation = await Runtime.evaluate({ expression, returnByValue: true });
+      if (evaluation.exceptionDetails) {
+        const detail =
+          evaluation.exceptionDetails.exception?.description ??
+          evaluation.exceptionDetails.text ??
+          "unknown exception";
+        throw new Error(`Gemini Deep Think DOM evaluation failed: ${detail}`);
+      }
+      return evaluation.result?.value as T | undefined;
     };
 
     log?.("[gemini-web] Navigating to gemini.google.com...");

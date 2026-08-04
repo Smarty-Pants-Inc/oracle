@@ -251,6 +251,7 @@ describe("resumeBrowserSession", () => {
           ownsTarget: true,
           profileKind: "temporary",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       ),
     );
@@ -724,6 +725,7 @@ describe("resumeBrowserSession", () => {
             ownsTarget: true,
             profileKind: "manual-login",
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         }),
       ]);
@@ -922,6 +924,7 @@ describe("resumeBrowserSession", () => {
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         ),
       );
@@ -1094,7 +1097,11 @@ describe("resumeBrowserSession", () => {
         },
       ),
     );
-    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const settlementEvents: string[] = [];
+    const finalize = vi.fn(async () => {
+      settlementEvents.push("cleanup:finalize");
+      return { status: "completed" as const, runtime: {} };
+    });
     const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
     const transaction = {
       answerText: "remote answer",
@@ -1112,7 +1119,11 @@ describe("resumeBrowserSession", () => {
       answerText: "local fallback",
       answerMarkdown: "local fallback",
     }));
-    const runtimeHintCb = vi.fn(async () => undefined);
+    const runtimeHintCb = vi.fn(async (hintedRuntime: BrowserRuntimeMetadata) => {
+      settlementEvents.push(
+        `persist:${hintedRuntime.recoveryCleanupResult?.settlementMode ?? "unbound"}`,
+      );
+    });
     const release = vi.fn(async () => undefined);
 
     const result = await resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
@@ -1141,6 +1152,12 @@ describe("resumeBrowserSession", () => {
     expect(listTargets).not.toHaveBeenCalled();
     expect(recoverSession).not.toHaveBeenCalled();
     expect((await result.finalize()).status).toBe("completed");
+    expect(settlementEvents).toEqual(["persist:finalize", "cleanup:finalize"]);
+    expect(runtimeHintCb).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+      }),
+    );
     expect(finalize).toHaveBeenCalledOnce();
     expect(abort).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledOnce();
@@ -1169,6 +1186,7 @@ describe("recovery resource finalization", () => {
           ownsTarget: true,
           profileKind: "temporary",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       ),
     );
@@ -1354,6 +1372,7 @@ describe("recovery resource finalization", () => {
           ownsTarget: true,
           profileKind: "temporary",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       ),
     );
@@ -1488,6 +1507,7 @@ describe("recovery resource finalization", () => {
         ownsTarget: true,
         profileKind: "temporary" as const,
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     };
     const currentResource = {
@@ -1562,6 +1582,7 @@ describe("recovery resource finalization", () => {
           ownsTarget: true,
           profileKind: "manual-login",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       };
       const currentResource: BrowserRecoveryCleanupResourceMetadata = {
@@ -1629,6 +1650,7 @@ describe("recovery resource finalization", () => {
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     };
     const currentResource: BrowserRecoveryCleanupResourceMetadata = {
@@ -1642,6 +1664,7 @@ describe("recovery resource finalization", () => {
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     };
     try {
@@ -1722,6 +1745,7 @@ describe("recovery resource finalization", () => {
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     };
     const currentResource: BrowserRecoveryCleanupResourceMetadata = {
@@ -1735,6 +1759,7 @@ describe("recovery resource finalization", () => {
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
       },
     };
     try {
@@ -1791,6 +1816,7 @@ describe("recovery resource finalization", () => {
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         ),
       ),
@@ -1807,6 +1833,59 @@ describe("recovery resource finalization", () => {
       logger: expect.any(Function),
     });
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+  });
+  test.each([
+    { mode: "finalize" as const, expectedCloses: 0 },
+    { mode: "abort" as const, expectedCloses: 1 },
+  ])(
+    "$mode keeps reused-process disposition separate from owned-target disposition",
+    async ({ mode, expectedCloses }) => {
+      const closeChromeTarget = vi.fn(async () => true);
+      const runtime = withRecoveryCleanup(
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromeTargetId: "reused-owner-target",
+        },
+        {
+          transport: "local",
+          ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: true,
+          closeOwnedTargetOnComplete: false,
+        },
+      );
+
+      await expect(
+        finalizeRecoveredRuntime(runtime, vi.fn() as BrowserLogger, { closeChromeTarget }, mode),
+      ).resolves.toMatchObject({ status: "completed" });
+      expect(closeChromeTarget).toHaveBeenCalledTimes(expectedCloses);
+    },
+  );
+
+  test("fails closed when an owned target lacks its persisted finalize disposition", async () => {
+    const closeChromeTarget = vi.fn(async () => true);
+    const runtime = withRecoveryCleanup(
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "missing-finalize-disposition",
+      },
+      {
+        transport: "local",
+        ownsTarget: true,
+        profileKind: "none",
+        keepBrowser: true,
+      },
+    );
+
+    await expect(
+      finalizeRecoveredRuntime(runtime, vi.fn() as BrowserLogger, { closeChromeTarget }),
+    ).resolves.toMatchObject({
+      status: "pending",
+      error: expect.stringContaining("finalize disposition is missing"),
+    });
+    expect(closeChromeTarget).not.toHaveBeenCalled();
   });
 
   test("keeps service-backed remote cleanup authority-gated", async () => {
@@ -1832,6 +1911,7 @@ describe("recovery resource finalization", () => {
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         ),
       ),
@@ -1868,6 +1948,7 @@ describe("recovery resource finalization", () => {
           ownsTarget: true,
           profileKind: "none",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       ),
     );
@@ -1936,7 +2017,11 @@ describe("recovery resource finalization", () => {
           {
             userDataDir: profileDir,
             chromeProcessIdentity: await physicalChromeProcessIdentity(profileDir),
-            recoveryCleanupResult: { status: "failed", error: "previous termination failure" },
+            recoveryCleanupResult: {
+              status: "failed",
+              error: "previous termination failure",
+              settlementMode: "finalize",
+            },
           },
           {
             transport: "local",
@@ -2119,6 +2204,7 @@ describe("recovery resource finalization", () => {
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
           },
         ),
       ),
@@ -2148,6 +2234,7 @@ describe("recovery resource finalization", () => {
               ownsTarget: true,
               profileKind: "none",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           }),
         ],
@@ -2192,6 +2279,7 @@ describe("recovery resource finalization", () => {
           ownsTarget: true,
           profileKind: "none",
           keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
         },
       ),
     );
@@ -2282,11 +2370,12 @@ describe("recovery resource finalization", () => {
               ownsTarget: true,
               profileKind: "none",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],
       };
-      const closeChromeTarget = vi.fn(async () => false);
+      const closeChromeTarget = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
       const result = await retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, {
         acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
@@ -2313,8 +2402,44 @@ describe("recovery resource finalization", () => {
       ).rejects.toMatchObject({
         details: { code: "settlement-mode-conflict" },
       });
+      await expect(
+        retryBrowserRecoveryCleanup(result.runtime, vi.fn() as BrowserLogger, {
+          acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
+          recoveryCleanup: { closeChromeTarget },
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+      expect(closeChromeTarget).toHaveBeenCalledTimes(2);
     },
   );
+
+  test("rejects cleanup authority without a persisted or explicit settlement mode", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResult: { status: "failed", error: "controller crashed before binding" },
+      recoveryCleanupResources: [
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromeTargetId: "unbound-owned-target",
+          recoveryCleanup: {
+            transport: "local",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: false,
+          },
+        },
+      ],
+    };
+    const acquireRecoveryLock = vi.fn();
+
+    await expect(
+      retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, { acquireRecoveryLock }),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: { code: "settlement-mode-missing", runtime },
+    });
+    expect(acquireRecoveryLock).not.toHaveBeenCalled();
+  });
 
   test("rejects a generic local settlement mode that conflicts with a remote copy", async () => {
     const runtime: BrowserRuntimeMetadata = {

@@ -676,6 +676,7 @@ describe("browser reattach end-to-end (simulated)", () => {
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
             },
           },
         ],

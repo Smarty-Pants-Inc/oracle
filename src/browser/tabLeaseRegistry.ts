@@ -60,6 +60,8 @@ export interface BrowserLeaseLivenessDeps {
 interface BrowserTabLeaseDeps extends BrowserLeaseLivenessDeps {
   now?: () => number;
   pid?: number;
+  // Test seam for the Windows-only null-generation exception; production callers omit it.
+  platform?: NodeJS.Platform;
 }
 interface BrowserTabLeaseAuthority {
   readonly requestedPath: string;
@@ -77,6 +79,21 @@ export type BrowserLeaseTeardownOutcome =
       reason: "active-leases" | "registry-unavailable" | "teardown-unsafe";
       error?: string;
     };
+export type BrowserTabLeaseTeardownSettlement =
+  | {
+      status: "completed";
+      disposition: "teardown-completed" | "active-lease-handoff";
+    }
+  | {
+      status: "preserved";
+      reason: "active-leases" | "registry-unavailable" | "teardown-unsafe";
+      error?: string;
+    };
+
+export interface BrowserTabLeaseTeardownAuthority {
+  readonly leaseReleased: boolean;
+  settle: (teardown: () => Promise<boolean>) => Promise<BrowserTabLeaseTeardownSettlement>;
+}
 
 export function normalizeMaxConcurrentTabs(value: unknown): number {
   if (value === undefined || value === null) {
@@ -114,7 +131,7 @@ export async function acquireBrowserTabLease(
   // generation stays active while liveness cannot prove that PID dead; injected and foreign PIDs
   // must retain a verified generation to prevent unsafe reclamation.
   const permitsUnverifiedCurrentProcess =
-    process.platform === "win32" &&
+    (deps.platform ?? process.platform) === "win32" &&
     pid === process.pid &&
     deps.readProcessStartIdentity === undefined;
   if (
@@ -184,6 +201,102 @@ export async function acquireBrowserTabLease(
     }
     await delay(timeoutMs > 0 ? Math.min(pollMs, timeoutMs - elapsed) : pollMs);
   }
+}
+export function retainBrowserTabLeaseTeardownAuthority(
+  profileDir: string,
+  lease: Pick<BrowserTabLease, "id" | "profileDirectory">,
+  options: BrowserLeaseLivenessDeps & { logger?: BrowserLogger } = {},
+): BrowserTabLeaseTeardownAuthority {
+  const authority: BrowserTabLeaseAuthority = {
+    requestedPath: profileDir,
+    profileDirectory: lease.profileDirectory,
+  };
+  type Phase =
+    | "leased"
+    | "released"
+    | "teardown-completed"
+    | "handoff-pending-confirmation"
+    | "completed"
+    | "handed-off";
+  let phase: Phase = "leased";
+
+  const unavailable = (error: unknown): BrowserTabLeaseTeardownSettlement => {
+    const message = error instanceof Error ? error.message : String(error);
+    options.logger?.(
+      `[browser] Lease registry unavailable during teardown; preserving Chrome resources: ${message}`,
+    );
+    return { status: "preserved", reason: "registry-unavailable", error: message };
+  };
+
+  return {
+    get leaseReleased() {
+      return phase !== "leased";
+    },
+    settle: async (teardown) => {
+      if (phase === "completed") {
+        return { status: "completed", disposition: "teardown-completed" };
+      }
+      if (phase === "handed-off") {
+        return { status: "completed", disposition: "active-lease-handoff" };
+      }
+
+      try {
+        const result = await withRegistryLock(authority, async () => {
+          const registry = await readRegistryStrict(authority);
+          const active = await pruneStaleLeases(registry.leases, options);
+          if (active.length !== registry.leases.length) {
+            await writeRegistry(authority, { version: 1, leases: active });
+          }
+
+          if (phase === "teardown-completed") {
+            return { status: "completed", disposition: "teardown-completed" } as const;
+          }
+          if (phase === "handoff-pending-confirmation") {
+            return { status: "completed", disposition: "active-lease-handoff" } as const;
+          }
+
+          const leaseWasActive = active.some((entry) => entry.id === lease.id);
+          const remaining = active.filter((entry) => entry.id !== lease.id);
+          if (phase === "leased") {
+            if (leaseWasActive) {
+              await writeRegistry(authority, { version: 1, leases: remaining });
+            }
+            phase = "released";
+            if (leaseWasActive && remaining.length > 0) {
+              phase = "handoff-pending-confirmation";
+              return { status: "completed", disposition: "active-lease-handoff" } as const;
+            }
+          }
+
+          if (remaining.length > 0) {
+            return { status: "preserved", reason: "active-leases" } as const;
+          }
+
+          await assertTabLeaseAuthority(authority, "lease-authorized browser teardown");
+          try {
+            if (!(await teardown())) {
+              return { status: "preserved", reason: "teardown-unsafe" } as const;
+            }
+          } catch (error) {
+            return {
+              status: "preserved",
+              reason: "teardown-unsafe",
+              error: error instanceof Error ? error.message : String(error),
+            } as const;
+          }
+          phase = "teardown-completed";
+          return { status: "completed", disposition: "teardown-completed" } as const;
+        });
+
+        if (result.status === "completed") {
+          phase = result.disposition === "teardown-completed" ? "completed" : "handed-off";
+        }
+        return result;
+      } catch (error) {
+        return unavailable(error);
+      }
+    },
+  };
 }
 
 export async function updateBrowserTabLease(

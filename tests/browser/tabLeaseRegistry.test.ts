@@ -8,8 +8,21 @@ import {
   acquireBrowserTabLease,
   hasOtherActiveBrowserTabLeases,
   normalizeMaxConcurrentTabs,
+  retainBrowserTabLeaseTeardownAuthority,
   teardownBrowserResourcesIfNoActiveLeases,
 } from "../../src/browser/tabLeaseRegistry.js";
+import {
+  BrowserRunLifecycleController,
+  completedBrowserCaptureCleanup,
+  pendingBrowserCaptureCleanup,
+} from "../../src/browser/runLifecycle.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+
+const CANONICAL_TEMP_ROOT = await realpath(os.tmpdir());
+
+function makeTempDir(prefix: string): Promise<string> {
+  return mkdtemp(path.join(CANONICAL_TEMP_ROOT, prefix));
+}
 
 describe("tabLeaseRegistry", () => {
   test("normalizes the concurrent tab limit", () => {
@@ -20,14 +33,15 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("rejects an injected null process generation without publishing a lease", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       await expect(
         acquireBrowserTabLease(
           dir,
           { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "missing-generation" },
           {
-            pid: 123_456,
+            pid: process.pid,
+            platform: "win32",
             readProcessStartIdentity: async () => null,
           },
         ),
@@ -41,11 +55,11 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("permits a default current-Windows lease with a null process generation", async () => {
-    const dir = await mkdtemp(path.join(await realpath(os.tmpdir()), "oracle-tab-leases-"));
-    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    const dir = await makeTempDir("oracle-tab-leases-");
     const readIdentity = vi.fn(async () => null);
     try {
-      Object.defineProperty(process, "platform", { value: "win32" });
+      // Keep the host platform intact so the filesystem lock still exercises a real Darwin
+      // process generation; inject only the platform decision owned by the tab-lease layer.
       vi.resetModules();
       vi.doMock("../../src/browser/filesystemLock.js", async (importOriginal) => {
         const actual = await importOriginal<typeof FilesystemLockModule>();
@@ -55,7 +69,11 @@ describe("tabLeaseRegistry", () => {
       const { acquireBrowserTabLease: acquireWindowsBrowserTabLease } =
         await import("../../src/browser/tabLeaseRegistry.js");
 
-      const lease = await acquireWindowsBrowserTabLease(dir, { timeoutMs: 500 });
+      const lease = await acquireWindowsBrowserTabLease(
+        dir,
+        { timeoutMs: 500 },
+        { platform: "win32" },
+      );
       await lease.update({ chromeTargetId: "current-windows-null-generation" });
       const registry = JSON.parse(
         await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
@@ -68,13 +86,12 @@ describe("tabLeaseRegistry", () => {
     } finally {
       vi.doUnmock("../../src/browser/filesystemLock.js");
       vi.resetModules();
-      if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
       await rm(dir, { recursive: true, force: true });
     }
   });
 
   test("retains a live null-generation lease and prunes it only after its pid is dead", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     const registryPath = path.join(dir, "oracle-tab-leases.json");
     const nullGenerationLease = {
       id: "null-generation-owner",
@@ -122,7 +139,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("queues when the max concurrent tab limit is reached", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       let signalWaiting: () => void = () => undefined;
       const waitingForSlot = new Promise<void>((resolve) => {
@@ -184,7 +201,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("drops stale leases owned by dead pids", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const stale = await acquireBrowserTabLease(
         dir,
@@ -224,7 +241,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("drops a live pid lease when its process-start identity changed", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       await acquireBrowserTabLease(
         dir,
@@ -259,7 +276,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("retains a live matching lease after more than six hours", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     const sevenHoursAgo = Date.now() - 7 * 60 * 60 * 1000;
     try {
       await acquireBrowserTabLease(
@@ -297,7 +314,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("detects other active leases before releasing a shared Chrome owner", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const first = await acquireBrowserTabLease(dir, {
         maxConcurrentTabs: 3,
@@ -322,7 +339,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("runs cleanup exactly once when concurrent runs release their final lease", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const first = await acquireBrowserTabLease(dir, {
         maxConcurrentTabs: 3,
@@ -359,7 +376,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("does not repeat final-lease cleanup when the same lease is released twice", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
       const cleanup = vi.fn(async () => undefined);
@@ -382,7 +399,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("blocks a new lease until final-lease cleanup completes", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const current = await acquireBrowserTabLease(dir, {
         maxConcurrentTabs: 3,
@@ -440,8 +457,132 @@ describe("tabLeaseRegistry", () => {
     }
   });
 
+  test.each(["finalize", "abort"] as const)(
+    "retries failed last-lease teardown in the same %s settlement",
+    async (mode) => {
+      const dir = await makeTempDir("oracle-tab-lease-teardown-retry-");
+      try {
+        const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+        const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease);
+        let teardownAttempts = 0;
+        const runtime = {
+          userDataDir: dir,
+          recoveryCleanupResources: [
+            {
+              userDataDir: dir,
+              profileDirectoryIdentity: lease.profileDirectory,
+              tabLease: { id: lease.id, profileDirectory: lease.profileDirectory },
+              recoveryCleanup: {
+                transport: "local" as const,
+                ownsTarget: false,
+                profileKind: "manual-login" as const,
+                keepBrowser: false,
+              },
+            },
+          ],
+        };
+        const lifecycle = new BrowserRunLifecycleController({
+          getRuntime: () => runtime,
+          settleResources: async (_settlementMode, pendingRuntime) => {
+            const outcome = await teardownAuthority.settle(async () => {
+              teardownAttempts += 1;
+              return teardownAttempts > 1;
+            });
+            return outcome.status === "completed"
+              ? completedBrowserCaptureCleanup(pendingRuntime)
+              : pendingBrowserCaptureCleanup(
+                  pendingRuntime,
+                  outcome.error ?? `Manual-login cleanup preserved resources (${outcome.reason})`,
+                );
+          },
+        });
+        lifecycle.markAcquired();
+        const identity = await lifecycle.beginPromptDispatch("retry teardown", 0, 0, 0);
+        await lifecycle.recordPromptCommitVerification(
+          {
+            committedTurns: 1,
+            promptSha256: promptIdentitySha256("retry teardown"),
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+            conversationId: "cleanup-retry",
+          },
+          identity,
+        );
+        const transaction = lifecycle.issueCapture({
+          answerText: "captured",
+          answerMarkdown: "captured",
+          tookMs: 1,
+          answerTokens: 1,
+          answerChars: 8,
+        });
+
+        const first = await transaction[mode]();
+        expect(first).toMatchObject({
+          status: "pending",
+          runtime: {
+            recoveryCleanupResult: { status: "failed", settlementMode: mode },
+          },
+        });
+        expect(teardownAuthority.leaseReleased).toBe(true);
+        expect(
+          JSON.parse(await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8")),
+        ).toMatchObject({ leases: [] });
+
+        const second = await transaction[mode]();
+        const cached = await transaction[mode]();
+        expect(second).toMatchObject({ status: "completed" });
+        expect(cached).toBe(second);
+        expect(teardownAttempts).toBe(2);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("retains failed teardown authority when another lease appears before retry", async () => {
+    const dir = await makeTempDir("oracle-tab-lease-teardown-race-");
+    try {
+      const first = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, first);
+      let teardownAttempts = 0;
+      await expect(
+        teardownAuthority.settle(async () => {
+          teardownAttempts += 1;
+          return false;
+        }),
+      ).resolves.toMatchObject({ status: "preserved", reason: "teardown-unsafe" });
+
+      const second = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      await expect(
+        teardownAuthority.settle(async () => {
+          teardownAttempts += 1;
+          return true;
+        }),
+      ).resolves.toEqual({ status: "preserved", reason: "active-leases" });
+      expect(teardownAttempts).toBe(1);
+
+      await second.release();
+      await expect(
+        teardownAuthority.settle(async () => {
+          teardownAttempts += 1;
+          return true;
+        }),
+      ).resolves.toEqual({ status: "completed", disposition: "teardown-completed" });
+      await expect(
+        teardownAuthority.settle(async () => {
+          teardownAttempts += 1;
+          return true;
+        }),
+      ).resolves.toEqual({ status: "completed", disposition: "teardown-completed" });
+      expect(teardownAttempts).toBe(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("runs teardown only while the registry is empty and locked", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const seed = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
       await seed.release();
@@ -480,7 +621,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("preserves resources when another lease is active", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     try {
       const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
       const teardown = vi.fn(async () => true);
@@ -496,7 +637,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("does not treat a torn registry as zero leases during acquire", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     const registryPath = path.join(dir, "oracle-tab-leases.json");
     const tornRegistry = '{"version":1,"leases":[';
     try {
@@ -512,7 +653,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("keeps update and release fail-closed after registry corruption", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const dir = await makeTempDir("oracle-tab-leases-");
     const registryPath = path.join(dir, "oracle-tab-leases.json");
     const tornRegistry = '{"version":1,"leases":[{"id":';
     try {
@@ -528,8 +669,8 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("fails closed for missing or malformed registry state", async () => {
-    const missingDir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
-    const malformedDir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const missingDir = await makeTempDir("oracle-tab-leases-");
+    const malformedDir = await makeTempDir("oracle-tab-leases-");
     try {
       const teardown = vi.fn(async () => true);
       await expect(
@@ -547,7 +688,7 @@ describe("tabLeaseRegistry", () => {
   });
 
   test("never updates or releases a lease through a retargeted profile path", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-lease-retarget-"));
+    const root = await makeTempDir("oracle-tab-lease-retarget-");
     const profileDir = path.join(root, "profile");
     const movedProfileDir = path.join(root, "moved-profile");
     await mkdir(profileDir);

@@ -13,7 +13,6 @@ interface GeminiPromptBaseline {
   userQueryCount: number;
   responseCount: number;
   normalizedPrompt: string;
-  verifiedUserQueryCount?: number;
 }
 
 interface GeminiDomProviderState {
@@ -278,30 +277,68 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
   while (Date.now() < responseDeadline) {
     const payload = await ctx.evaluate<string>(
       `(() => {
-        const userQueries = Array.from(document.querySelectorAll(${userQuerySel}));
-        const postBaselineUserQueries = userQueries
-          .slice(${baseline.userQueryCount})
-          .map((turn) => turn.querySelector(${userQueryTextSel})?.textContent?.trim() ?? turn.textContent?.trim() ?? '');
-        const turns = Array.from(document.querySelectorAll(${responseTurnSel}));
-        const postBaselineTurns = turns.slice(${baseline.responseCount});
-        const completed = postBaselineTurns
-          .map((turn) => {
-            const footer = turn.querySelector(${responseCompleteSel});
-            const text = turn.querySelector(${responseTextSel})?.textContent?.trim() ?? '';
+        const normalize = (value) => String(value ?? '')
+          .toLowerCase()
+          .replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ')
+          .replace(/\`\`\`/g, ' ')
+          .replace(/\`([^\`]*)\`/g, '$1')
+          .replace(/\\s+/g, ' ')
+          .trim();
+        const userTurns = Array.from(document.querySelectorAll(${userQuerySel}));
+        const responseTurns = Array.from(document.querySelectorAll(${responseTurnSel}));
+        const entries = [
+          ...userTurns.map((node, index) => ({
+            node,
+            kind: 'user',
+            postBaseline: index >= ${baseline.userQueryCount},
+            text: node.querySelector(${userQueryTextSel})?.textContent?.trim() ?? node.textContent?.trim() ?? '',
+          })),
+          ...responseTurns.map((node, index) => {
+            const text = node.querySelector(${responseTextSel})?.textContent?.trim() ?? '';
             const lower = text.toLowerCase();
-            return { footer, text, isPlaceholder: lower.includes('generating your response') || lower.includes('check back later') || lower.includes("i'm on it") };
-          })
+            return {
+              node,
+              kind: 'response',
+              postBaseline: index >= ${baseline.responseCount},
+              text,
+              completed: Boolean(node.querySelector(${responseCompleteSel})) && text.length > 0 &&
+                !lower.includes('generating your response') &&
+                !lower.includes('check back later') &&
+                !lower.includes("i'm on it"),
+            };
+          }),
+        ].sort((left, right) => {
+          if (left.node === right.node) return 0;
+          return left.node.compareDocumentPosition(right.node) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+        });
+        const completed = entries
+          .filter((entry) => entry.kind === 'response' && entry.postBaseline && entry.completed)
           .reverse()
-          .find((turn) => Boolean(turn.footer) && turn.text.length > 0 && !turn.isPlaceholder);
+          .find((entry) => {
+            for (let index = entries.indexOf(entry) - 1; index >= 0; index -= 1) {
+              const preceding = entries[index];
+              if (preceding.kind !== 'user') continue;
+              return preceding.postBaseline && normalize(preceding.text) === ${JSON.stringify(baseline.normalizedPrompt)};
+            }
+            return false;
+          });
         if (completed) {
-          return JSON.stringify({ status: 'done', text: completed.text, postBaselineUserQueries, responseCount: turns.length });
+          return JSON.stringify({ status: 'done', text: completed.text, causalPair: true });
         }
-        const lastTurn = postBaselineTurns[postBaselineTurns.length - 1];
-        const spinners = lastTurn?.querySelectorAll(${spinnerSel}) ?? [];
+        const postBaselineResponses = entries.filter(
+          (entry) => entry.kind === 'response' && entry.postBaseline,
+        );
+        const lastTurn = postBaselineResponses[postBaselineResponses.length - 1]?.node;
+        const visibleSpinners = Array.from(lastTurn?.querySelectorAll(${spinnerSel}) ?? []).filter((spinner) => {
+          if (spinner.hidden || spinner.getAttribute?.('aria-hidden') === 'true') return false;
+          const rect = typeof spinner.getBoundingClientRect === 'function'
+            ? spinner.getBoundingClientRect()
+            : null;
+          return !rect || (rect.width > 0 && rect.height > 0);
+        });
         return JSON.stringify({
-          status: postBaselineTurns.length === 0 ? 'waiting' : visibleSpinners.length > 0 ? 'generating' : 'streaming',
-          postBaselineUserQueries,
-          responseCount: turns.length,
+          status: postBaselineResponses.length === 0 ? 'waiting' : visibleSpinners.length > 0 ? 'generating' : 'streaming',
+          causalPair: false,
         });
       })()`,
     );
@@ -310,24 +347,10 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
       const parsed = JSON.parse(payload ?? "{}") as {
         status?: string;
         text?: string;
-        postBaselineUserQueries?: unknown;
-        responseCount?: unknown;
+        causalPair?: unknown;
       };
-      const matchingUserTurnOffset = Array.isArray(parsed.postBaselineUserQueries)
-        ? parsed.postBaselineUserQueries.findIndex(
-            (query) =>
-              typeof query === "string" &&
-              normalizePromptForIdentity(query) === baseline.normalizedPrompt,
-          )
-        : -1;
-      const hasExactUserTurn = matchingUserTurnOffset >= 0;
-      if (hasExactUserTurn && baseline.verifiedUserQueryCount === undefined) {
-        baseline.verifiedUserQueryCount = baseline.userQueryCount + matchingUserTurnOffset + 1;
-      }
       if (
-        baseline.verifiedUserQueryCount !== undefined &&
-        typeof parsed.responseCount === "number" &&
-        parsed.responseCount > baseline.responseCount &&
+        parsed.causalPair === true &&
         parsed.status === "done" &&
         typeof parsed.text === "string" &&
         parsed.text.length > 0
@@ -337,7 +360,8 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
       }
       const now = Date.now();
       if (now - lastLog > 10_000) {
-        const status = hasExactUserTurn ? (parsed.status ?? "unknown") : "awaiting exact user turn";
+        const status =
+          parsed.causalPair === true ? (parsed.status ?? "unknown") : "awaiting causal pair";
         ctx.log?.(`[gemini-web] Deep Think still generating... (${status})`);
         lastLog = now;
       }

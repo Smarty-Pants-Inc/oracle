@@ -219,6 +219,7 @@ function createRecoveredConversationCleanup({
         ownsTarget: Boolean(target),
         profileKind: ownsProcess ? "manual-login" : "none",
         keepBrowser: !ownsProcess,
+        closeOwnedTargetOnComplete: Boolean(target),
       },
     };
   };

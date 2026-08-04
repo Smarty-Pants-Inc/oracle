@@ -77,6 +77,7 @@ async function withRemoteLateDisconnectFixture(
     error: unknown;
     browserAutomationError: BrowserAutomationErrorConstructor;
     archiveChatGptConversation: Mock;
+    verifyCommittedPromptTurn: Mock;
     closeRemoteConnection: Mock;
     closeChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
@@ -85,6 +86,7 @@ async function withRemoteLateDisconnectFixture(
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let providerObservedDispatchStart = false;
+  let assistantResponseAvailable = false;
   const closeRemoteConnection = vi.fn().mockResolvedValue(undefined);
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
@@ -103,6 +105,7 @@ async function withRemoteLateDisconnectFixture(
     await Promise.resolve();
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
+  const verifyCommittedPromptTurn = vi.fn().mockResolvedValue(undefined);
 
   vi.resetModules();
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
@@ -126,8 +129,22 @@ async function withRemoteLateDisconnectFixture(
     ensureChatMode: vi.fn().mockResolvedValue("unchanged"),
     installJavaScriptDialogAutoDismissal: vi.fn(() => vi.fn()),
     clearPromptComposer: vi.fn().mockResolvedValue(undefined),
-    readAssistantSnapshot: vi.fn().mockResolvedValue(null),
-    waitForAssistantResponse: vi.fn().mockResolvedValue({ text: "completed answer", meta: {} }),
+    readAssistantSnapshot: vi.fn(async () =>
+      assistantResponseAvailable
+        ? {
+            text: "completed answer",
+            html: "<p>completed answer</p>",
+            turnIndex: 1,
+            turnId: "assistant-turn-1",
+            messageId: "assistant-message-1",
+          }
+        : null,
+    ),
+    verifyCommittedPromptTurn,
+    waitForAssistantResponse: vi.fn(async () => {
+      assistantResponseAvailable = true;
+      return { text: "completed answer", meta: {} };
+    }),
     captureAssistantMarkdown: vi.fn().mockResolvedValue("completed answer"),
   }));
   vi.doMock("../../src/browser/conversationUrlMonitor.js", () => ({
@@ -221,6 +238,7 @@ async function withRemoteLateDisconnectFixture(
       closeRemoteConnection,
       closeChromeTarget,
       probeChromeTargetLiveness,
+      verifyCommittedPromptTurn,
       providerObservedDispatchStart,
     });
   } finally {
@@ -536,6 +554,15 @@ describe("recoverable disconnect lifecycle", () => {
   test("recovers a committed remote target when it disconnects during the final archive await", async () => {
     await withRemoteLateDisconnectFixture("created", async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ evaluate: expect.any(Function) }),
+        expect.objectContaining({
+          conversationId: targetId,
+          verifiedUserTurnIndex: 0,
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
+        }),
+      );
       expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
       expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
       expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
@@ -593,6 +620,15 @@ describe("recoverable disconnect lifecycle", () => {
 
   test("records an attached remote fallback target as user-owned", async () => {
     await withRemoteLateDisconnectFixture("attached", async (fixture) => {
+      expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ evaluate: expect.any(Function) }),
+        expect.objectContaining({
+          conversationId: targetId,
+          verifiedUserTurnIndex: 0,
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
+        }),
+      );
       expect(fixture.error).toMatchObject({
         details: {
           stage: "connection-lost",

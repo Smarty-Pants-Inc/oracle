@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   ensureModelSelection,
   waitForAssistantResponse,
+  verifyCommittedPromptTurn,
   uploadAttachmentFile,
   waitForAttachmentCompletion,
   navigateToChatGPT,
@@ -14,6 +15,7 @@ import {
   ensureChatGptScopeRetained,
 } from "../../src/browser/pageActions.js";
 import { isAnswerNowPlaceholderText } from "../../src/browser/actions/assistantResponse.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 import { createContext, Script } from "node:vm";
 import {
   buildCloudflareInterstitialExpressionForTest,
@@ -28,6 +30,31 @@ import type { ChromeClient } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 const logger = vi.fn();
+const committedPromptLocator = (
+  prompt: string,
+): Parameters<typeof verifyCommittedPromptTurn>[1] => {
+  const promptSha256 = promptIdentitySha256(prompt);
+  return {
+    epoch: {
+      status: "committed",
+      epochId: "epoch-original",
+      promptSha256,
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationId: "conversation-1",
+    },
+    conversationId: "conversation-1",
+    promptSha256,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "turn-0",
+    verifiedUserMessageId: "message-0",
+    conversationUrls: ["https://chatgpt.com/c/conversation-1"],
+  };
+};
 
 beforeEach(() => {
   logger.mockClear();
@@ -1580,6 +1607,125 @@ describe("waitForAssistantResponse", () => {
     expect(isAnswerNowPlaceholderText("thinking")).toBe(true);
     expect(isAnswerNowPlaceholderText("reasoning")).toBe(true);
     expect(isAnswerNowPlaceholderText("final architecture review")).toBe(false);
+  });
+
+  test("committed prompt identity rejects any later user turn", async () => {
+    class FakeTurn {
+      readonly dataset: Record<string, string>;
+      readonly id: string;
+
+      constructor(
+        private readonly role: "user" | "assistant",
+        readonly innerText: string,
+        index: number,
+      ) {
+        this.dataset = {
+          turn: role,
+          turnId: `turn-${index}`,
+          messageId: `message-${index}`,
+        };
+        this.id = `conversation-turn-${index}`;
+      }
+
+      get textContent(): string {
+        return this.innerText;
+      }
+
+      getAttribute(name: string): string | null {
+        if (name === "data-message-author-role" || name === "data-turn") return this.role;
+        if (name === "data-turn-id") return this.dataset.turnId;
+        if (name === "data-message-id") return this.dataset.messageId;
+        if (name === "data-testid") return this.id;
+        return null;
+      }
+
+      matches(selector: string): boolean {
+        return selector === "[data-message-id]";
+      }
+
+      querySelector(selector: string): FakeTurn | null {
+        if (selector.includes('data-message-author-role="user"') && this.role === "user") {
+          return this;
+        }
+        return null;
+      }
+    }
+
+    const prompt = "original prompt";
+    const locator = committedPromptLocator(prompt);
+    const turns = [new FakeTurn("user", prompt, 0), new FakeTurn("assistant", "answer", 1)];
+    const runtime = {
+      evaluate: vi.fn().mockImplementation(async (params: { expression?: string }) => {
+        const context = createContext({
+          document: { querySelectorAll: () => turns },
+          location: { href: "https://chatgpt.com/c/conversation-1" },
+        });
+        return {
+          result: { value: new Script(String(params.expression ?? "")).runInContext(context) },
+        };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(verifyCommittedPromptTurn(runtime, locator)).resolves.toBeUndefined();
+    turns.push(new FakeTurn("user", "later unrelated prompt", 2));
+    await expect(verifyCommittedPromptTurn(runtime, locator)).rejects.toThrow(
+      /committed prompt epoch/,
+    );
+  });
+
+  test("rejects an observer-delivered generated image from another prompt turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const prompt = "original prompt";
+      const locator = committedPromptLocator(prompt);
+      const foreignImage = {
+        text: "Generated image.",
+        html: '<img src="/backend-api/estuary/content?id=file_foreign">',
+        messageId: "message-foreign",
+        turnId: "turn-foreign",
+      };
+      let observerExpression = "";
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          if (params.awaitPromise) {
+            observerExpression = String(params.expression ?? "");
+            return { result: { type: "object", value: foreignImage } };
+          }
+          const expression = String(params.expression ?? "");
+          if (expression.includes("const expected =") && expression.includes("userTurnIndex")) {
+            return {
+              result: {
+                value: {
+                  text: prompt,
+                  turnId: locator.verifiedUserTurnId,
+                  messageId: locator.verifiedUserMessageId,
+                },
+              },
+            };
+          }
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: null } };
+          }
+          return { result: { value: false } };
+        });
+      const promise = waitForAssistantResponse(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        30_000,
+        logger,
+        locator.verifiedUserTurnIndex + 1,
+        locator.conversationId,
+        locator,
+      );
+      const assertion = expect(promise).rejects.toThrow(/committed prompt epoch/);
+      await vi.advanceTimersByTimeAsync(7_000);
+      await assertion;
+      expect(observerExpression).toContain("if (!extracted && !true)");
+      expect(observerExpression).toContain("if (!refreshed && !true)");
+      expect(observerExpression).toContain("if (!true) return snapshot");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("returns captured assistant payload", async () => {
