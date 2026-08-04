@@ -8,6 +8,7 @@ import { delay } from "./utils.js";
 const LOCK_OWNER_FILENAME = "owner.json";
 const LOCK_MUTATION_DIRECTORY_SUFFIX = ".mutations";
 const LOCK_MUTATION_REQUEST_PREFIX = "request-";
+const LOCK_MUTATION_PREPARATION_PREFIX = ".preparing-";
 const LOCK_MUTATION_TICKET_FILENAME = "ticket";
 const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
@@ -53,7 +54,8 @@ export interface CrashRecoverableFilesystemLockDeps {
   beforeLockPublication?: (preparedLockPath: string) => Promise<void>;
   beforeStaleLockQuarantine?: () => Promise<void>;
   afterStaleLockQuarantine?: (quarantinedLockPath: string) => Promise<void>;
-  beforeMutationRequestOwnerWrite?: (requestPath: string) => Promise<void>;
+  beforeMutationRequestOwnerWrite?: (preparedPath: string, requestPath: string) => Promise<void>;
+  beforeMutationRequestTicketPublication?: (requestPath: string, ticket: number) => Promise<void>;
   beforeMutationRequestRemoval?: (requestPath: string) => Promise<void>;
 }
 interface FilesystemLockGeneration {
@@ -69,7 +71,8 @@ interface FilesystemLockMutationOptions {
   readLiveness: (pid: number) => ProcessLiveness;
   readProcessIdentity: (pid: number) => Promise<string | null>;
   createNonce: () => string;
-  beforeRequestOwnerWrite?: (requestPath: string) => Promise<void>;
+  beforeRequestOwnerWrite?: (preparedPath: string, requestPath: string) => Promise<void>;
+  beforeTicketPublication?: (requestPath: string, ticket: number) => Promise<void>;
   beforeRequestRemoval?: (requestPath: string) => Promise<void>;
 }
 
@@ -163,6 +166,7 @@ export async function acquireCrashRecoverableFilesystemLock(
     readProcessIdentity: readProcessStartIdentity,
     createNonce,
     beforeRequestOwnerWrite: deps.beforeMutationRequestOwnerWrite,
+    beforeTicketPublication: deps.beforeMutationRequestTicketPublication,
     beforeRequestRemoval: deps.beforeMutationRequestRemoval,
   };
 
@@ -384,9 +388,9 @@ async function lockPathExists(lockPath: string): Promise<boolean> {
   }
 }
 
-// A stable sibling directory hosts unique mutation requests. A request joins ordering only when
-// its complete ticket is atomically published after its owner; ticket ties use the unique name.
-// Stale ready requests are reclaimed only through their unique path.
+// A complete owner-bearing request is atomically published as a ticketless doorway before it
+// chooses a ticket. Every later contender waits on that live doorway; published tickets then
+// order requests, with the unique request name breaking concurrent ticket ties.
 async function acquireFilesystemLockMutationLease(
   lockPath: string,
   options: FilesystemLockMutationOptions,
@@ -394,33 +398,39 @@ async function acquireFilesystemLockMutationLease(
   whileWaiting?: () => Promise<void>,
 ): Promise<FilesystemLockMutationLease | null> {
   const mutationRootPath = `${lockPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`;
+  let preparedRequestPath: string | undefined;
   let removalState: FilesystemLockMutationRequestRemovalState | undefined;
   let acquired = false;
   try {
-    const requestPath = await createFilesystemLockMutationRequest(mutationRootPath, options.owner);
+    const preparedRequest = await createPreparedFilesystemLockMutationRequest(
+      mutationRootPath,
+      options.owner,
+    );
+    preparedRequestPath = preparedRequest.preparedPath;
+    await writeFilesystemLockMutationOwner(
+      preparedRequest.preparedPath,
+      preparedRequest.requestPath,
+      options.owner,
+      options.beforeRequestOwnerWrite,
+    );
+    await renameLockPath(preparedRequest.preparedPath, preparedRequest.requestPath);
+    preparedRequestPath = undefined;
     removalState = {
-      requestPath,
-      expectedGeneration: await snapshotFilesystemLockGeneration(requestPath),
+      requestPath: preparedRequest.requestPath,
+      expectedGeneration: { ownerRaw: `${JSON.stringify(options.owner)}\n` },
     };
-    try {
-      await writeFilesystemLockMutationOwner(
-        requestPath,
-        options.owner,
-        options.beforeRequestOwnerWrite,
-      );
-    } catch (error) {
-      removalState.expectedGeneration = await snapshotFilesystemLockGeneration(requestPath);
-      throw error;
-    }
-    removalState.expectedGeneration = { ownerRaw: `${JSON.stringify(options.owner)}\n` };
-    const ticket = await writeFilesystemLockMutationTicket(mutationRootPath, requestPath);
-    const requestName = path.basename(requestPath);
+    const ticket = await writeFilesystemLockMutationTicket(
+      mutationRootPath,
+      preparedRequest.requestPath,
+      options.beforeTicketPublication,
+    );
+    const requestName = path.basename(preparedRequest.requestPath);
 
     for (;;) {
       if (
         !(await hasPrecedingFilesystemLockMutationRequest(
           mutationRootPath,
-          requestPath,
+          preparedRequest.requestPath,
           requestName,
           ticket,
           options,
@@ -462,13 +472,16 @@ async function acquireFilesystemLockMutationLease(
       // orphan a live queue head until process exit.
       await removeFilesystemLockMutationRequestBeforeReturning(removalState, options);
     }
+    if (preparedRequestPath !== undefined) {
+      await removeLockPath(preparedRequestPath);
+    }
   }
 }
 
-async function createFilesystemLockMutationRequest(
+async function createPreparedFilesystemLockMutationRequest(
   mutationRootPath: string,
   owner: FilesystemLockOwnerRecord,
-): Promise<string> {
+): Promise<{ preparedPath: string; requestPath: string }> {
   for (;;) {
     try {
       await mkdir(mutationRootPath);
@@ -476,9 +489,15 @@ async function createFilesystemLockMutationRequest(
       if (readErrorCode(error) !== "EEXIST") throw error;
     }
     try {
-      return await mkdtemp(
-        path.join(mutationRootPath, `${LOCK_MUTATION_REQUEST_PREFIX}${owner.ownerNonce}-`),
-      );
+      return {
+        preparedPath: await mkdtemp(
+          path.join(mutationRootPath, `${LOCK_MUTATION_PREPARATION_PREFIX}${owner.ownerNonce}-`),
+        ),
+        requestPath: path.join(
+          mutationRootPath,
+          `${LOCK_MUTATION_REQUEST_PREFIX}${owner.ownerNonce}`,
+        ),
+      };
     } catch (error) {
       if (readErrorCode(error) !== "ENOENT") throw error;
     }
@@ -486,13 +505,14 @@ async function createFilesystemLockMutationRequest(
 }
 
 async function writeFilesystemLockMutationOwner(
+  preparedPath: string,
   requestPath: string,
   owner: FilesystemLockOwnerRecord,
-  beforeWrite?: (requestPath: string) => Promise<void>,
+  beforeWrite?: (preparedPath: string, requestPath: string) => Promise<void>,
 ): Promise<void> {
-  const handle = await open(path.join(requestPath, LOCK_OWNER_FILENAME), "wx", 0o600);
+  const handle = await open(path.join(preparedPath, LOCK_OWNER_FILENAME), "wx", 0o600);
   try {
-    await beforeWrite?.(requestPath);
+    await beforeWrite?.(preparedPath, requestPath);
     await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
   } finally {
     await handle.close();
@@ -502,6 +522,7 @@ async function writeFilesystemLockMutationOwner(
 async function writeFilesystemLockMutationTicket(
   mutationRootPath: string,
   requestPath: string,
+  beforePublication?: (requestPath: string, ticket: number) => Promise<void>,
 ): Promise<number> {
   let maximumTicket = 0;
   for (const candidatePath of await listFilesystemLockMutationRequests(mutationRootPath)) {
@@ -523,6 +544,7 @@ async function writeFilesystemLockMutationTicket(
   } finally {
     await handle.close();
   }
+  await beforePublication?.(requestPath, ticket);
   await renameLockPath(preparedTicketPath, ticketPath);
   return ticket;
 }
@@ -581,15 +603,9 @@ async function hasFilesystemLockMutationRequests(lockPath: string): Promise<bool
 }
 
 async function listFilesystemLockMutationRequests(mutationRootPath: string): Promise<string[]> {
-  const requests: string[] = [];
-  for (const entry of await readdir(mutationRootPath)) {
-    if (!entry.startsWith(LOCK_MUTATION_REQUEST_PREFIX) || entry.includes(".stale-")) continue;
-    const candidatePath = path.join(mutationRootPath, entry);
-    if ((await readFilesystemLockMutationTicket(candidatePath)) !== null) {
-      requests.push(candidatePath);
-    }
-  }
-  return requests;
+  return (await readdir(mutationRootPath))
+    .filter((entry) => entry.startsWith(LOCK_MUTATION_REQUEST_PREFIX) && !entry.includes(".stale-"))
+    .map((entry) => path.join(mutationRootPath, entry));
 }
 
 async function readFilesystemLockMutationTicket(requestPath: string): Promise<number | null> {
@@ -604,16 +620,6 @@ async function readFilesystemLockMutationTicket(requestPath: string): Promise<nu
   if (!/^[1-9]\d*$/u.test(normalized)) return null;
   const ticket = Number(normalized);
   return Number.isSafeInteger(ticket) ? ticket : null;
-}
-async function snapshotFilesystemLockGeneration(
-  lockPath: string,
-): Promise<FilesystemLockGeneration> {
-  try {
-    return { ownerRaw: await readFile(path.join(lockPath, LOCK_OWNER_FILENAME), "utf8") };
-  } catch (error) {
-    if (readErrorCode(error) !== "ENOENT") throw error;
-    return { ownerRaw: null, lastMutationMs: await readLockLastMutationMs(lockPath) };
-  }
 }
 
 async function removeFilesystemLockMutationRequestBeforeReturning(

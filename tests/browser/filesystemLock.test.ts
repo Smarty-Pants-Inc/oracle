@@ -436,6 +436,7 @@ describe("crash-recoverable filesystem lock", () => {
     const contenderReady = new Promise<void>((resolve) => {
       markContenderReady = resolve;
     });
+    let stalledPreparedPath: string | undefined;
     let stalledRequestPath: string | undefined;
     let stalledLock: CrashRecoverableFilesystemLock | undefined;
     let contenderLock: CrashRecoverableFilesystemLock | undefined;
@@ -461,7 +462,8 @@ describe("crash-recoverable filesystem lock", () => {
         readProcessLiveness: () => "alive",
         readProcessStartIdentity: async (pid) =>
           pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
-        beforeMutationRequestOwnerWrite: async (requestPath) => {
+        beforeMutationRequestOwnerWrite: async (preparedPath, requestPath) => {
+          stalledPreparedPath = preparedPath;
           stalledRequestPath = requestPath;
           markOwnerWriteBlocked();
           await allowOwnerWrite;
@@ -472,11 +474,10 @@ describe("crash-recoverable filesystem lock", () => {
     let contenderAcquire: Promise<CrashRecoverableFilesystemLock> | undefined;
     try {
       await ownerWriteBlocked;
+      expect(stalledPreparedPath).toBeDefined();
       expect(stalledRequestPath).toBeDefined();
-      expect(await readFile(path.join(stalledRequestPath!, "owner.json"), "utf8")).toBe("");
-      await expect(stat(path.join(stalledRequestPath!, "ticket"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+      expect(await readFile(path.join(stalledPreparedPath!, "owner.json"), "utf8")).toBe("");
+      await expect(stat(stalledRequestPath!)).rejects.toMatchObject({ code: "ENOENT" });
 
       contenderAcquire = acquireCrashRecoverableFilesystemLock(
         lockPath,
@@ -493,8 +494,9 @@ describe("crash-recoverable filesystem lock", () => {
         },
       );
       await contenderReady;
-      expect((await stat(stalledRequestPath!)).isDirectory()).toBe(true);
-      expect(await readFile(path.join(stalledRequestPath!, "owner.json"), "utf8")).toBe("");
+      expect((await stat(stalledPreparedPath!)).isDirectory()).toBe(true);
+      expect(await readFile(path.join(stalledPreparedPath!, "owner.json"), "utf8")).toBe("");
+      await expect(stat(stalledRequestPath!)).rejects.toMatchObject({ code: "ENOENT" });
 
       resumeOwnerWrite();
       await vi.waitFor(async () => {
@@ -522,6 +524,125 @@ describe("crash-recoverable filesystem lock", () => {
       );
       await contenderLock?.release().catch(() => undefined);
       await stalledLock?.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test("serializes equal tickets behind a complete doorway", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const mutationRootPath = `${lockPath}.mutations`;
+    const originalPid = 56_056;
+    const firstPid = 57_057;
+    const secondPid = 58_058;
+    let resumeFirstTicket!: () => void;
+    const allowFirstTicket = new Promise<void>((resolve) => {
+      resumeFirstTicket = resolve;
+    });
+    let markFirstTicketBlocked!: () => void;
+    const firstTicketBlocked = new Promise<void>((resolve) => {
+      markFirstTicketBlocked = resolve;
+    });
+    let resumeFirstMutation!: () => void;
+    const allowFirstMutation = new Promise<void>((resolve) => {
+      resumeFirstMutation = resolve;
+    });
+    let markFirstMutationReady!: () => void;
+    const firstMutationReady = new Promise<void>((resolve) => {
+      markFirstMutationReady = resolve;
+    });
+    let firstNonceIndex = 0;
+    let secondNonceIndex = 0;
+    const firstNonces = ["first-lock", "000-first-request", "first-quarantine"];
+    const secondNonces = ["second-lock", "fff-second-request", "second-quarantine"];
+    const identities: Record<number, string> = {
+      [originalPid]: "original-start",
+      [firstPid]: "first-start",
+      [secondPid]: "second-start",
+    };
+    let firstLock: CrashRecoverableFilesystemLock | undefined;
+    let secondLock: CrashRecoverableFilesystemLock | undefined;
+    let secondSettled = false;
+    await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: originalPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+      },
+    );
+    const firstAcquire = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      { timeoutMs: 5_000, pollMs: 10 },
+      {
+        pid: firstPid,
+        randomUUID: () => firstNonces[firstNonceIndex++] ?? `first-${firstNonceIndex}`,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) =>
+          pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        beforeMutationRequestTicketPublication: async (_requestPath, ticket) => {
+          expect(ticket).toBe(1);
+          markFirstTicketBlocked();
+          await allowFirstTicket;
+        },
+        beforeStaleLockQuarantine: async () => {
+          markFirstMutationReady();
+          await allowFirstMutation;
+        },
+      },
+    );
+
+    let secondAcquire: Promise<CrashRecoverableFilesystemLock> | undefined;
+    try {
+      await firstTicketBlocked;
+      const firstRequestPath = path.join(mutationRootPath, "request-000-first-request");
+      const secondRequestPath = path.join(mutationRootPath, "request-fff-second-request");
+      expect(await readFile(path.join(firstRequestPath, "owner.json"), "utf8")).not.toBe("");
+      await expect(stat(path.join(firstRequestPath, "ticket"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      secondAcquire = acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 5_000, pollMs: 10 },
+        {
+          pid: secondPid,
+          randomUUID: () => secondNonces[secondNonceIndex++] ?? `second-${secondNonceIndex}`,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) =>
+            pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        },
+      ).finally(() => {
+        secondSettled = true;
+      });
+      void secondAcquire.catch(() => undefined);
+      await vi.waitFor(async () => {
+        expect(await readFile(path.join(secondRequestPath, "ticket"), "utf8")).toBe("1\n");
+      });
+      expect(secondSettled).toBe(false);
+
+      resumeFirstTicket();
+      await firstMutationReady;
+      expect(await readFile(path.join(firstRequestPath, "ticket"), "utf8")).toBe("1\n");
+      expect(secondSettled).toBe(false);
+
+      resumeFirstMutation();
+      firstLock = await firstAcquire;
+      expect(secondSettled).toBe(false);
+      await firstLock.release();
+      firstLock = undefined;
+
+      secondLock = await secondAcquire;
+      await secondLock.release();
+      secondLock = undefined;
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(mutationRootPath)).toEqual([]);
+    } finally {
+      resumeFirstTicket();
+      resumeFirstMutation();
+      await Promise.allSettled([firstAcquire, secondAcquire].filter(Boolean) as Promise<unknown>[]);
+      await secondLock?.release().catch(() => undefined);
+      await firstLock?.release().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
   });
