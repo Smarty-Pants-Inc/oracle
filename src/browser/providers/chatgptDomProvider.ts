@@ -14,7 +14,7 @@ interface ChatgptDomProviderState {
   baselineTurns?: number | null;
   attachmentNames?: AttachmentReadyExpectation[];
   committedTurns?: number | null;
-  onPromptSubmitted?: () => Promise<void> | void;
+  onPromptDispatchStarted?: () => Promise<void> | void;
 }
 
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
@@ -44,7 +44,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       baselineTurns: state.baselineTurns ?? undefined,
       inputTimeoutMs: state.inputTimeoutMs ?? undefined,
       attachmentTimeoutMs: state.attachmentTimeoutMs ?? undefined,
-      onPromptSubmitted: state.onPromptSubmitted,
+      onPromptDispatchStarted: state.onPromptDispatchStarted,
     },
     ctx.prompt,
     state.logger,

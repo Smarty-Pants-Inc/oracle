@@ -87,6 +87,16 @@ export interface BrowserSessionConfig {
   resumeConversationUrl?: string | null;
 }
 
+export type BrowserRecoveryProfileKind = "temporary" | "manual-login" | "copied" | "none";
+
+export interface BrowserRecoveryCleanupMetadata {
+  transport: "local" | "remote";
+  ownsTarget: boolean;
+  profileKind: BrowserRecoveryProfileKind;
+  keepBrowser: boolean;
+  closeOwnedTargetOnComplete?: boolean;
+}
+
 export interface BrowserRuntimeMetadata {
   browserTransport?: "cdp";
   chromePid?: number;
@@ -98,8 +108,10 @@ export interface BrowserRuntimeMetadata {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
-  /** True after Oracle has submitted the prompt to ChatGPT. */
+  /** True only after Oracle has semantically verified the current prompt in ChatGPT. */
   promptSubmitted?: boolean;
+  /** Authority required to retire resources after a recovered run reaches a terminal result. */
+  recoveryCleanup?: BrowserRecoveryCleanupMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }

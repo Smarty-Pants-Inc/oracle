@@ -18,6 +18,7 @@ import {
   registerTerminationHooks,
   positionChromeWindowOffscreen,
   connectToRemoteChrome,
+  connectToRemoteChromeTarget,
   connectWithNewTab,
   closeTab,
   createChromePageTarget,
@@ -44,6 +45,7 @@ import {
   waitForAttachmentCompletion,
   waitForUserTurnAttachments,
   readAssistantSnapshot,
+  verifyPromptCommitted,
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
@@ -57,7 +59,8 @@ import {
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
-import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
+import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -185,6 +188,120 @@ function shouldKeepLocalBrowserOpen(options: {
   if (options.usingCopiedProfile) return false;
   return options.effectiveKeepBrowser || options.preserveBrowserOnError;
 }
+
+type PromptDispatchState = {
+  status: "idle" | "ambiguous" | "committed";
+  prompt?: string;
+  baselineTurns?: number;
+};
+
+type ChromeDisconnectAssessment = {
+  liveness: Awaited<ReturnType<typeof probeChromeTargetLiveness>>;
+  targetReachable: boolean;
+  promptCommitted: boolean;
+  recoverable: boolean;
+};
+
+async function assessChromeDisconnect(options: {
+  host: string;
+  port: number;
+  targetId?: string | null;
+  browserWSEndpoint?: string;
+  dispatch: PromptDispatchState;
+  recoveryAllowed: boolean;
+  logger: BrowserLogger;
+}): Promise<ChromeDisconnectAssessment> {
+  const liveness: Awaited<ReturnType<typeof probeChromeTargetLiveness>> =
+    await probeChromeTargetLiveness({
+      host: options.host,
+      port: options.port,
+      targetId: options.targetId,
+      browserWSEndpoint: options.browserWSEndpoint,
+    }).catch((error) => ({
+      endpointReachable: false,
+      targetFound: null,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  const targetId = options.targetId?.trim();
+  const targetReachable = Boolean(targetId) && isRecoverableChromeDisconnect(liveness);
+  let promptCommitted = options.dispatch.status === "committed";
+
+  if (
+    targetReachable &&
+    options.dispatch.status === "ambiguous" &&
+    options.dispatch.prompt &&
+    targetId
+  ) {
+    let connection: Awaited<ReturnType<typeof connectToRemoteChromeTarget>> | null = null;
+    try {
+      connection = await connectToRemoteChromeTarget(options.host, options.port, options.logger, {
+        targetId,
+        browserWSEndpoint: options.browserWSEndpoint,
+        closeTargetOnDispose: false,
+      });
+      await connection.client.Runtime.enable();
+      await verifyPromptCommitted(
+        connection.client.Runtime,
+        options.dispatch.prompt,
+        15_000,
+        options.logger,
+        options.dispatch.baselineTurns,
+      );
+      promptCommitted = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      options.logger(`[browser] Could not verify prompt commit after disconnect: ${message}`);
+    } finally {
+      await connection?.close().catch(() => undefined);
+    }
+  }
+
+  return {
+    liveness,
+    targetReachable,
+    promptCommitted,
+    recoverable: targetReachable && promptCommitted && options.recoveryAllowed,
+  };
+}
+
+function connectionLostMessage(options: {
+  assessment: ChromeDisconnectAssessment;
+  remote?: boolean;
+  copiedProfile?: boolean;
+}): string {
+  if (options.assessment.recoverable) {
+    return connectionLostUserMessage({ recoverable: true, remote: options.remote });
+  }
+  if (options.assessment.targetReachable) {
+    if (options.copiedProfile) {
+      return "Chrome DevTools disconnected after prompt dispatch; copy-profile runs cannot be reattached, so Oracle is closing the owned browser and removing the copied profile.";
+    }
+    if (!options.assessment.promptCommitted) {
+      return `${options.remote ? "Remote Chrome" : "Chrome"} DevTools disconnected before Oracle could verify that the current prompt was committed; the target will not be retained.`;
+    }
+  }
+  return connectionLostUserMessage({ recoverable: false, remote: options.remote });
+}
+
+function connectionLostCause(
+  assessment: ChromeDisconnectAssessment,
+  copiedProfile = false,
+):
+  | "cdp-client-disconnect"
+  | "chrome-closed"
+  | "prompt-commit-unverified"
+  | "copied-profile-not-reattachable" {
+  if (!assessment.targetReachable) return "chrome-closed";
+  if (copiedProfile) return "copied-profile-not-reattachable";
+  if (!assessment.promptCommitted) return "prompt-commit-unverified";
+  return "cdp-client-disconnect";
+}
+
+type RecoverableDisconnectDetails = {
+  stage?: string;
+  recoverableDisconnect?: boolean;
+  runtime?: BrowserRuntimeMetadata;
+};
 
 export function shouldPreserveBrowserOnErrorForTest(error: unknown, headless: boolean): boolean {
   return shouldPreserveBrowserOnError(error, headless);
@@ -1069,6 +1186,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const runtimeHintCb = options.runtimeHintCb;
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
+  let ownsTarget = true;
+  let promptDispatch: PromptDispatchState = { status: "idle" };
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let tabLease: BrowserTabLease | null = null;
@@ -1087,6 +1206,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       conversationId,
       promptSubmitted,
       userDataDir,
+      recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
       controllerPid: process.pid,
     };
     try {
@@ -1102,10 +1222,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Failed to persist runtime hint: ${message}`);
     }
   };
-  const markPromptSubmitted = async (): Promise<void> => {
-    if (promptSubmitted) {
-      return;
-    }
+  const markPromptDispatchStarted = async (
+    prompt: string,
+    baselineTurns: number | null,
+  ): Promise<void> => {
+    promptDispatch = {
+      status: "ambiguous",
+      prompt,
+      baselineTurns:
+        typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
+          ? baselineTurns
+          : undefined,
+    };
+    promptSubmitted = false;
+    await emitRuntimeHint();
+  };
+  const markPromptCommitted = async (): Promise<void> => {
+    promptDispatch = { ...promptDispatch, status: "committed" };
     promptSubmitted = true;
     await emitRuntimeHint();
     void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
@@ -1171,6 +1304,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     ? manualProfileDir
     : await mkdtemp(path.join(await resolveUserDataBaseDir(), "oracle-browser-"));
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
+  function buildLocalRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
+    return {
+      transport: "local",
+      ownsTarget,
+      profileKind: manualLogin ? "manual-login" : usingCopiedProfile ? "copied" : "temporary",
+      keepBrowser: effectiveKeepBrowser,
+      closeOwnedTargetOnComplete: Boolean(options.closeOwnedTabOnComplete),
+    };
+  }
   if (manualLogin) {
     // Learned: manual login reuses a persistent profile so cookies/SSO survive.
     await mkdir(userDataDir, { recursive: true });
@@ -1258,7 +1400,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let client: ChromeClient | null = null;
   let browserRuntime: ChromeClient["Runtime"] | null = null;
   let isolatedTargetId: string | null = null;
-  let ownsTarget = true;
   const startedAt = Date.now();
   let answerText = "";
   let answerMarkdown = "";
@@ -1269,6 +1410,33 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let removeDialogHandler: (() => void) | null = null;
   let appliedCookies = 0;
   let preserveBrowserOnError = false;
+  let disconnectAssessmentPromise: Promise<ChromeDisconnectAssessment> | null = null;
+  const buildLocalRuntimeMetadata = (
+    tabUrl = lastUrl,
+    submitted = promptSubmitted,
+  ): BrowserRuntimeMetadata => ({
+    chromePid: chrome.pid,
+    chromePort: chrome.port,
+    chromeHost,
+    userDataDir,
+    chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
+    tabUrl,
+    conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+    promptSubmitted: submitted,
+    recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
+    controllerPid: process.pid,
+  });
+  const getDisconnectAssessment = (): Promise<ChromeDisconnectAssessment> => {
+    disconnectAssessmentPromise ??= assessChromeDisconnect({
+      host: chromeHost,
+      port: chrome.port,
+      targetId: lastTargetId ?? isolatedTargetId,
+      dispatch: promptDispatch,
+      recoveryAllowed: !usingCopiedProfile,
+      logger,
+    });
+    return disconnectAssessmentPromise;
+  };
 
   try {
     try {
@@ -1315,42 +1483,33 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const disconnectPromise = new Promise<never>((_, reject) => {
       client?.on("disconnect", () => {
         connectionClosedUnexpectedly = true;
-        void (async () => {
-          const liveness = await probeChromeTargetLiveness({
-            host: chromeHost,
-            port: chrome.port,
-            targetId: lastTargetId ?? isolatedTargetId,
-          });
-          const recoverable = isRecoverableChromeDisconnect(liveness);
-          if (recoverable) {
+        void getDisconnectAssessment().then((assessment) => {
+          if (assessment.recoverable) {
             logger(
-              "CDP client disconnected; Chrome/target still reachable. Leaving run recoverable for reattach.",
+              "CDP client disconnected; Chrome/target still reachable and the prompt is committed. Leaving run recoverable for reattach.",
+            );
+          } else if (assessment.targetReachable) {
+            logger(
+              usingCopiedProfile
+                ? "CDP client disconnected; copy-profile runs are not retained."
+                : "CDP client disconnected before prompt commit could be verified; cleaning up the run.",
             );
           } else {
             logger("Chrome window closed; attempting to abort run.");
           }
+          const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
           reject(
-            new BrowserAutomationError(connectionLostUserMessage({ recoverable }), {
-              stage: "connection-lost",
-              recoverableDisconnect: recoverable,
-              disconnectCause: recoverable ? "cdp-client-disconnect" : "chrome-closed",
-              runtime: {
-                chromePid: chrome.pid,
-                chromePort: chrome.port,
-                chromeHost,
-                userDataDir,
-                chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
-                tabUrl: liveness.matchedUrl ?? lastUrl,
-                conversationId:
-                  (liveness.matchedUrl ?? lastUrl)
-                    ? extractConversationIdFromUrl(liveness.matchedUrl ?? lastUrl ?? "")
-                    : undefined,
-                promptSubmitted,
-                controllerPid: process.pid,
+            new BrowserAutomationError(
+              connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
+              {
+                stage: "connection-lost",
+                recoverableDisconnect: assessment.recoverable,
+                disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
+                runtime: buildLocalRuntimeMetadata(tabUrl, assessment.promptCommitted),
               },
-            }),
+            ),
           );
-        })();
+        });
       });
     });
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
@@ -1728,7 +1887,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
-        onPromptSubmitted: markPromptSubmitted,
+        onPromptDispatchStarted: () => markPromptDispatchStarted(prompt, baselineTurns),
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -1741,7 +1900,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         log: logger,
         state: providerState,
       });
-      await markPromptSubmitted();
+      await markPromptCommitted();
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
@@ -1829,7 +1988,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         ),
       );
       await updateConversationHint("post-deep-research", 15_000).catch(() => false);
-      runStatus = "complete";
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
@@ -1863,6 +2021,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
+      if (connectionClosedUnexpectedly) {
+        throw new Error("Chrome disconnected before completion");
+      }
+      runStatus = "complete";
       return {
         answerText: researchResult.text,
         answerMarkdown: researchResult.text,
@@ -1881,6 +2043,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         tabUrl: lastUrl,
         conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
         promptSubmitted,
+        recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
         controllerPid: process.pid,
       };
     }
@@ -1973,17 +2136,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               sessionStatus: "needs_login",
               validationReason: sessionValid.reason,
             },
-            runtime: {
-              chromePid: chrome.pid,
-              chromePort: chrome.port,
-              chromeHost,
-              userDataDir,
-              chromeTargetId: lastTargetId,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            },
+            runtime: buildLocalRuntimeMetadata(),
           },
         );
       }
@@ -2062,17 +2215,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                 sessionId: options.sessionId,
               },
             ).catch(() => undefined);
-            const runtime = {
-              chromePid: chrome.pid,
-              chromePort: chrome.port,
-              chromeHost,
-              userDataDir,
-              chromeTargetId: lastTargetId,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            };
+            const runtime = buildLocalRuntimeMetadata();
             throw await createAssistantTimeoutError({
               Runtime,
               logger,
@@ -2317,17 +2460,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
           stage: "image-artifact-wait",
           waitTarget: "generated image artifacts",
-          runtime: {
-            chromePid: chrome.pid,
-            chromePort: chrome.port,
-            chromeHost,
-            userDataDir,
-            chromeTargetId: lastTargetId,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-            promptSubmitted,
-            controllerPid: process.pid,
-          },
+          runtime: buildLocalRuntimeMetadata(),
         }),
     });
     answerText = imageArtifacts.answerText || answerText;
@@ -2371,6 +2504,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
         fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
     });
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Chrome disconnected before completion");
+    }
     runStatus = "complete";
     const durationMs = Date.now() - startedAt;
     const answerChars = answerText.length;
@@ -2397,6 +2533,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       tabUrl: lastUrl,
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       promptSubmitted,
+      recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
       controllerPid: process.pid,
     };
   } catch (error) {
@@ -2416,16 +2553,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         );
       }
       preserveBrowserOnError = true;
-      const runtime = {
-        chromePid: chrome.pid,
-        chromePort: chrome.port,
-        chromeHost,
-        userDataDir,
-        chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
-        promptSubmitted,
-        controllerPid: process.pid,
-      };
+      const runtime = buildLocalRuntimeMetadata();
       const reuseProfileHint =
         `oracle --engine browser --browser-manual-login ` +
         `--browser-manual-login-profile-dir ${JSON.stringify(userDataDir)}`;
@@ -2499,39 +2627,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Chrome connection lost before completion: ${normalizedError.message}`);
       logger(normalizedError.stack);
     }
+    const assessment = await getDisconnectAssessment();
+    promptSubmitted = assessment.promptCommitted;
+    preserveBrowserOnError = assessment.recoverable;
     await emitRuntimeHint();
-    if (
-      normalizedError instanceof BrowserAutomationError &&
-      (normalizedError.details as { stage?: string } | undefined)?.stage === "connection-lost"
-    ) {
-      throw normalizedError;
-    }
-    const liveness = await probeChromeTargetLiveness({
-      host: chromeHost,
-      port: chrome.port,
-      targetId: lastTargetId ?? isolatedTargetId,
-    });
-    const recoverable = isRecoverableChromeDisconnect(liveness);
+    const connectionLostDetails =
+      normalizedError instanceof BrowserAutomationError
+        ? (normalizedError.details as RecoverableDisconnectDetails | undefined)
+        : undefined;
+    const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
     throw new BrowserAutomationError(
-      connectionLostUserMessage({ recoverable }),
+      connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
       {
+        ...connectionLostDetails,
         stage: "connection-lost",
-        recoverableDisconnect: recoverable,
-        disconnectCause: recoverable ? "cdp-client-disconnect" : "chrome-closed",
-        runtime: {
-          chromePid: chrome.pid,
-          chromePort: chrome.port,
-          chromeHost,
-          userDataDir,
-          chromeTargetId: lastTargetId,
-          tabUrl: liveness.matchedUrl ?? lastUrl,
-          conversationId:
-            (liveness.matchedUrl ?? lastUrl)
-              ? extractConversationIdFromUrl(liveness.matchedUrl ?? lastUrl ?? "")
-              : undefined,
-          promptSubmitted,
-          controllerPid: process.pid,
-        },
+        recoverableDisconnect: assessment.recoverable,
+        disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
+        runtime: buildLocalRuntimeMetadata(tabUrl, assessment.promptCommitted),
       },
       normalizedError,
     );
@@ -2654,14 +2766,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     removeDialogHandler?.();
     removeTerminationHooks?.();
     if (!keepBrowserOpen) {
-      if (!connectionClosedUnexpectedly) {
-        try {
-          if (!terminatedRecordedChrome) {
-            await chrome.kill();
-          }
-        } catch {
-          // ignore kill failures
+      try {
+        if (!terminatedRecordedChrome) {
+          await chrome.kill();
         }
+      } catch {
+        // ignore kill failures
       }
       if (manualLogin) {
         const shouldCleanup = await shouldCleanupManualLoginProfileState(
@@ -3039,29 +3149,48 @@ async function runRemoteBrowserMode(
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
+  let promptDispatch: PromptDispatchState = { status: "idle" };
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
+  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
+  const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
+
+  function buildRemoteRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
+    return {
+      transport: "remote",
+      ownsTarget,
+      profileKind: "none",
+      keepBrowser: Boolean(config.keepBrowser),
+      closeOwnedTargetOnComplete: Boolean(options.closeOwnedTabOnComplete),
+    };
+  }
+
+  const buildRemoteRuntimeMetadata = (
+    tabUrl = lastUrl,
+    submitted = promptSubmitted,
+  ): BrowserRuntimeMetadata => ({
+    browserTransport: "cdp",
+    chromePort: port,
+    chromeHost: host,
+    chromeBrowserWSEndpoint: browserWSEndpoint,
+    chromeProfileRoot,
+    chromeTargetId: remoteTargetId ?? undefined,
+    tabUrl,
+    conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
+    promptSubmitted: submitted,
+    recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
+    controllerPid: process.pid,
+  });
+
   const runtimeHintCb = options.runtimeHintCb;
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
     try {
-      await runtimeHintCb(
-        {
-          chromePort: port,
-          chromeHost: host,
-          chromeBrowserWSEndpoint: browserWSEndpoint,
-          chromeProfileRoot,
-          chromeTargetId: remoteTargetId ?? undefined,
-          tabUrl: lastUrl,
-          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-          promptSubmitted,
-          controllerPid: process.pid,
-        },
-        modelSelectionEvidence,
-      );
+      await runtimeHintCb(buildRemoteRuntimeMetadata(), modelSelectionEvidence);
       await tabLease?.update({
         chromeHost: host,
         chromePort: port,
@@ -3073,14 +3202,28 @@ async function runRemoteBrowserMode(
       logger(`Failed to persist runtime hint: ${message}`);
     }
   };
-  const markPromptSubmitted = async (): Promise<void> => {
-    if (promptSubmitted) {
-      return;
-    }
+  const markPromptDispatchStarted = async (
+    prompt: string,
+    baselineTurns: number | null,
+  ): Promise<void> => {
+    promptDispatch = {
+      status: "ambiguous",
+      prompt,
+      baselineTurns:
+        typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
+          ? baselineTurns
+          : undefined,
+    };
+    promptSubmitted = false;
+    await emitRuntimeHint();
+  };
+  const markPromptCommitted = async (): Promise<void> => {
+    promptDispatch = { ...promptDispatch, status: "committed" };
     promptSubmitted = true;
     await emitRuntimeHint();
     void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
   };
+
   const startedAt = Date.now();
   let answerText = "";
   let answerMarkdown = "";
@@ -3091,9 +3234,19 @@ async function runRemoteBrowserMode(
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
-  const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
-  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
-  const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
+  let disconnectAssessmentPromise: Promise<ChromeDisconnectAssessment> | null = null;
+  const getDisconnectAssessment = (): Promise<ChromeDisconnectAssessment> => {
+    disconnectAssessmentPromise ??= assessChromeDisconnect({
+      host,
+      port,
+      targetId: remoteTargetId,
+      browserWSEndpoint,
+      dispatch: promptDispatch,
+      recoveryAllowed: true,
+      logger,
+    });
+    return disconnectAssessmentPromise;
+  };
 
   try {
     const remoteLeaseProfileDir = config.browserTabRef
@@ -3147,10 +3300,10 @@ async function runRemoteBrowserMode(
       });
     }
     await emitRuntimeHint();
-    const markConnectionLost = () => {
+    client.on("disconnect", () => {
       connectionClosedUnexpectedly = true;
-    };
-    client.on("disconnect", markConnectionLost);
+      void getDisconnectAssessment();
+    });
     const { Network, Page, Runtime, Input, DOM, Target } = client;
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
@@ -3339,7 +3492,7 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
-        onPromptSubmitted: markPromptSubmitted,
+        onPromptDispatchStarted: () => markPromptDispatchStarted(prompt, baselineTurns),
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -3352,7 +3505,7 @@ async function runRemoteBrowserMode(
         log: logger,
         state: providerState,
       });
-      await markPromptSubmitted();
+      await markPromptCommitted();
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
@@ -3439,6 +3592,9 @@ async function runRemoteBrowserMode(
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
+      if (connectionClosedUnexpectedly) {
+        throw new Error("Remote Chrome disconnected before completion");
+      }
       runStatus = "complete";
       return {
         answerText: researchResult.text,
@@ -3456,6 +3612,7 @@ async function runRemoteBrowserMode(
         tabUrl: lastUrl,
         conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
         promptSubmitted,
+        recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
         controllerPid: process.pid,
       };
     }
@@ -3545,17 +3702,7 @@ async function runRemoteBrowserMode(
               sessionStatus: "needs_login",
               validationReason: sessionValid.reason,
             },
-            runtime: {
-              chromeHost: host,
-              chromePort: port,
-              chromeBrowserWSEndpoint: browserWSEndpoint,
-              chromeProfileRoot,
-              chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            },
+            runtime: buildRemoteRuntimeMetadata(),
           },
         );
       }
@@ -3632,17 +3779,7 @@ async function runRemoteBrowserMode(
                 sessionId: options.sessionId,
               },
             ).catch(() => undefined);
-            const runtime = {
-              chromePort: port,
-              chromeHost: host,
-              chromeBrowserWSEndpoint: browserWSEndpoint,
-              chromeProfileRoot,
-              chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            };
+            const runtime = buildRemoteRuntimeMetadata();
             throw await createAssistantTimeoutError({
               Runtime,
               logger,
@@ -3842,17 +3979,7 @@ async function runRemoteBrowserMode(
           logger,
           stage: "image-artifact-wait",
           waitTarget: "generated image artifacts",
-          runtime: {
-            chromePort: port,
-            chromeHost: host,
-            chromeBrowserWSEndpoint: browserWSEndpoint,
-            chromeProfileRoot,
-            chromeTargetId: remoteTargetId ?? undefined,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-            promptSubmitted,
-            controllerPid: process.pid,
-          },
+          runtime: buildRemoteRuntimeMetadata(),
         }),
     });
     answerText = imageArtifacts.answerText || answerText;
@@ -3900,6 +4027,9 @@ async function runRemoteBrowserMode(
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
 
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Remote Chrome disconnected before completion");
+    }
     runStatus = "complete";
     return {
       answerText,
@@ -3919,6 +4049,7 @@ async function runRemoteBrowserMode(
       tabUrl: lastUrl,
       conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
       promptSubmitted,
+      recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
       artifacts: savedArtifacts,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
@@ -3959,33 +4090,21 @@ async function runRemoteBrowserMode(
       throw withInterruptedArchiveDetails(normalizedError, archive);
     }
 
-    const liveness = await probeChromeTargetLiveness({
-      host,
-      port,
-      targetId: remoteTargetId,
-      browserWSEndpoint,
-    });
-    const recoverable = isRecoverableChromeDisconnect(liveness);
-    preserveBrowserOnError = recoverable && promptSubmitted;
-    throw new BrowserAutomationError(connectionLostUserMessage({ recoverable, remote: true }), {
-      stage: "connection-lost",
-      recoverableDisconnect: recoverable,
-      disconnectCause: recoverable ? "cdp-client-disconnect" : "chrome-closed",
-      runtime: {
-        chromeHost: host,
-        chromePort: port,
-        chromeBrowserWSEndpoint: browserWSEndpoint,
-        chromeProfileRoot,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: liveness.matchedUrl ?? lastUrl,
-        conversationId:
-          (liveness.matchedUrl ?? lastUrl)
-            ? extractConversationIdFromUrl(liveness.matchedUrl ?? lastUrl ?? "")
-            : undefined,
-        promptSubmitted,
-        controllerPid: process.pid,
+    const assessment = await getDisconnectAssessment();
+    promptSubmitted = assessment.promptCommitted;
+    preserveBrowserOnError = assessment.recoverable;
+    await emitRuntimeHint();
+    const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
+    throw new BrowserAutomationError(
+      connectionLostMessage({ assessment, remote: true }),
+      {
+        stage: "connection-lost",
+        recoverableDisconnect: assessment.recoverable,
+        disconnectCause: connectionLostCause(assessment),
+        runtime: buildRemoteRuntimeMetadata(tabUrl, assessment.promptCommitted),
       },
-    });
+      normalizedError,
+    );
   } finally {
     await conversationUrlMonitor?.stop();
     try {

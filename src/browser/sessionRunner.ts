@@ -318,6 +318,7 @@ export async function runBrowserSessionExecution(
       conversationId: browserResult.conversationId,
       promptSubmitted: browserResult.promptSubmitted,
       controllerPid: browserResult.controllerPid ?? process.pid,
+      recoveryCleanup: browserResult.recoveryCleanup,
     },
     archive: browserResult.archive,
     modelSelection,

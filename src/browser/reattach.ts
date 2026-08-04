@@ -19,12 +19,14 @@ import {
   positionChromeWindowOffscreen,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
+  closeTab,
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
-import { cleanupStaleProfileState } from "./profileState.js";
+import { cleanupStaleProfileState, terminateRecordedChromeForProfile } from "./profileState.js";
+import { hasOtherActiveBrowserTabLeases } from "./tabLeaseRegistry.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
   pickTarget,
@@ -42,6 +44,14 @@ import {
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 
+export interface ReattachCleanupDeps {
+  closeTab?: typeof closeTab;
+  terminateRecordedChromeForProfile?: typeof terminateRecordedChromeForProfile;
+  cleanupStaleProfileState?: typeof cleanupStaleProfileState;
+  hasOtherActiveBrowserTabLeases?: typeof hasOtherActiveBrowserTabLeases;
+  removeProfile?: (profileDir: string) => Promise<void>;
+}
+
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
   connect?: (options?: unknown) => Promise<ChromeClient>;
@@ -54,6 +64,7 @@ export interface ReattachDeps {
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
   promptPreview?: string;
+  recoveryCleanup?: ReattachCleanupDeps;
 }
 
 export interface ReattachResult {
@@ -78,9 +89,15 @@ export async function resumeBrowserSession(
     await close?.().catch(() => undefined);
   };
 
+  const recover = async (): Promise<ReattachResult> => {
+    const result = await recoverSession(runtime, config);
+    await finalizeRecoveredRuntime(runtime, logger, deps.recoveryCleanup);
+    return result;
+  };
+
   if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
     logger("No running Chrome detected; reopening browser to locate the session.");
-    return recoverSession(runtime, config);
+    return recover();
   }
 
   try {
@@ -201,6 +218,7 @@ export async function resumeBrowserSession(
         "Reattach Deep Research response timed out",
       );
       await closeAttached();
+      await finalizeRecoveredRuntime(liveRuntime, logger, deps.recoveryCleanup);
       return {
         answerText: researchResult.text,
         answerMarkdown: researchResult.text,
@@ -229,6 +247,7 @@ export async function resumeBrowserSession(
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
     await closeAttached();
+    await finalizeRecoveredRuntime(liveRuntime, logger, deps.recoveryCleanup);
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
     await closeAttached();
@@ -236,7 +255,61 @@ export async function resumeBrowserSession(
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
     );
-    return recoverSession(runtime, config);
+    return recover();
+  }
+}
+
+async function finalizeRecoveredRuntime(
+  runtime: BrowserRuntimeMetadata,
+  logger: BrowserLogger,
+  deps: ReattachCleanupDeps = {},
+): Promise<void> {
+  const cleanup = runtime.recoveryCleanup;
+  if (!cleanup) {
+    return;
+  }
+
+  const profileDir = runtime.userDataDir ?? runtime.chromeProfileRoot;
+  const host = runtime.chromeHost ?? "127.0.0.1";
+  const closeOwnedTarget = deps.closeTab ?? closeTab;
+  const terminateChrome =
+    deps.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile;
+  const cleanupProfileState = deps.cleanupStaleProfileState ?? cleanupStaleProfileState;
+  const hasOtherLeases = deps.hasOtherActiveBrowserTabLeases ?? hasOtherActiveBrowserTabLeases;
+  const removeProfile =
+    deps.removeProfile ??
+    (async (directory: string) => {
+      await rm(directory, { recursive: true, force: true });
+    });
+
+  const shouldCloseTarget =
+    cleanup.ownsTarget && (Boolean(cleanup.closeOwnedTargetOnComplete) || !cleanup.keepBrowser);
+  if (shouldCloseTarget && runtime.chromePort && runtime.chromeTargetId) {
+    await closeOwnedTarget(runtime.chromePort, runtime.chromeTargetId, logger, host).catch(
+      () => undefined,
+    );
+  }
+
+  if (cleanup.transport !== "local" || cleanup.keepBrowser || !profileDir) {
+    return;
+  }
+
+  if (cleanup.profileKind === "manual-login") {
+    // A reattach owns no lease itself; every live entry therefore belongs to another run.
+    const otherActiveLeases = await hasOtherLeases(profileDir, "").catch(() => false);
+    if (otherActiveLeases) {
+      logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
+      return;
+    }
+  }
+
+  await terminateChrome(profileDir, logger).catch(() => false);
+  if (cleanup.profileKind === "manual-login") {
+    await cleanupProfileState(profileDir, logger, { lockRemovalMode: "never" }).catch(
+      () => undefined,
+    );
+  } else if (cleanup.profileKind === "temporary" || cleanup.profileKind === "copied") {
+    await removeProfile(profileDir).catch(() => undefined);
   }
 }
 
@@ -470,4 +543,5 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   readPromptPreviewTurnIndex,
+  finalizeRecoveredRuntime,
 };

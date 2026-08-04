@@ -269,8 +269,11 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
-  test("marks prompt submitted before commit verification finishes", async () => {
-    const onPromptSubmitted = vi.fn();
+  test("marks prompt dispatch before commit verification", async () => {
+    const events: string[] = [];
+    const onPromptDispatchStarted = vi.fn(() => {
+      events.push("dispatch");
+    });
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) {
@@ -287,6 +290,7 @@ describe("promptComposer", () => {
         if (expression.includes("button.scrollIntoView")) {
           return { result: { value: { status: "clicked" } } };
         }
+        events.push("verify");
         return {
           result: {
             value: {
@@ -313,13 +317,14 @@ describe("promptComposer", () => {
         runtime: runtime as never,
         input: input as never,
         baselineTurns: 0,
-        onPromptSubmitted,
+        onPromptDispatchStarted,
       },
       "hello",
       logger as never,
     );
 
-    expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(onPromptDispatchStarted).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["dispatch", "verify"]);
   });
 
   test("waits for a delayed trusted click without issuing a second send", async () => {

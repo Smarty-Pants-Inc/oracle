@@ -39,7 +39,7 @@ export async function submitPrompt(
     baselineTurns?: number | null;
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
-    onPromptSubmitted?: () => Promise<void> | void;
+    onPromptDispatchStarted?: () => Promise<void> | void;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -213,6 +213,7 @@ export async function submitPrompt(
     );
   }
 
+  await deps.onPromptDispatchStarted?.();
   const clicked = await attemptSendButton(
     runtime,
     input,
@@ -235,7 +236,6 @@ export async function submitPrompt(
   } else {
     logger("Clicked send button");
   }
-  await deps.onPromptSubmitted?.();
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
@@ -779,7 +779,7 @@ function sendButtonTimeoutMs(
     : 45_000;
 }
 
-async function verifyPromptCommitted(
+export async function verifyPromptCommitted(
   Runtime: ChromeClient["Runtime"],
   prompt: string,
   timeoutMs: number,

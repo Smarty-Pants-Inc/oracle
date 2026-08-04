@@ -6,6 +6,7 @@ import type {
   BrowserRuntimeMetadata,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
+import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
@@ -189,6 +190,7 @@ export interface BrowserRunResult {
   conversationId?: string;
   promptSubmitted?: boolean;
   controllerPid?: number;
+  recoveryCleanup?: BrowserRecoveryCleanupMetadata;
 }
 
 export type ResolvedBrowserConfig = Required<
