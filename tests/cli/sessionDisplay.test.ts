@@ -255,6 +255,40 @@ describe("buildReattachLine", () => {
     };
     expect(buildReattachLine(metadata)).toBeNull();
   });
+
+  test("reports retained remote recovery and finalization authority", () => {
+    const now = Date.UTC(2025, 0, 1, 12, 0, 0);
+    vi.setSystemTime(now);
+    const remoteRecovery = {
+      protocolVersion: 3,
+      host: "bridge.example:9443",
+      transactionToken: "f".repeat(64),
+      state: "pending" as const,
+    };
+    const metadata: SessionMetadata = {
+      id: "remote",
+      createdAt: new Date(now - 30_000).toISOString(),
+      status: "error",
+      mode: "browser",
+      options: {},
+      browser: { runtime: { remoteRecovery } },
+    };
+
+    expect(buildReattachLine(metadata)).toBe(
+      "Session remote retained recoverable remote browser authority from 30s ago.",
+    );
+    expect(
+      buildReattachLine({
+        ...metadata,
+        status: "completed",
+        browser: {
+          runtime: {
+            remoteRecovery: { ...remoteRecovery, settlementMode: "finalize" },
+          },
+        },
+      }),
+    ).toBe("Session remote retained pending remote browser finalization from 30s ago.");
+  });
 });
 
 describe("trimBeforeFirstAnswer", () => {
@@ -474,12 +508,21 @@ describe("attachSession rendering", () => {
   });
 
   test("retries completed browser cleanup only after a durable answer receipt", async () => {
+    const remoteRecovery = {
+      protocolVersion: 3,
+      host: "bridge.example:9443",
+      transactionToken: "a".repeat(64),
+      state: "pending" as const,
+      settlementMode: "finalize" as const,
+    };
     const pendingRuntime: BrowserRuntimeMetadata = {
+      remoteRecovery,
       recoveryCleanupResources: [
         {
           chromeHost: "127.0.0.1",
           chromePort: 9222,
           chromeTargetId: "completed-pending-target",
+          remoteRecovery,
           recoveryCleanup: {
             transport: "remote",
             ownsTarget: false,
@@ -528,6 +571,7 @@ describe("attachSession rendering", () => {
         recoveryLockPath: "/tmp/sessions/sess/browser-recovery.lock",
         isRemotePublicationAcknowledged: expect.any(Function),
       }),
+      "finalize",
     );
     expect(
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
@@ -571,6 +615,137 @@ describe("attachSession rendering", () => {
     expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
   });
 
+  test("retries persisted abort authority for an error session", async () => {
+    const remoteRecovery = {
+      protocolVersion: 3,
+      host: "bridge.example:9443",
+      transactionToken: "b".repeat(64),
+      state: "pending" as const,
+      settlementMode: "abort" as const,
+    };
+    const pendingRuntime: BrowserRuntimeMetadata = {
+      remoteRecovery,
+      recoveryCleanupResources: [
+        {
+          remoteRecovery,
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "failed", error: "abort retry" },
+    };
+    const errorMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: { runtime: pendingRuntime },
+    };
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    readSessionMetadataMock
+      .mockResolvedValueOnce(errorMeta)
+      .mockResolvedValue({ ...errorMeta, browser: { runtime: {} } });
+    readSessionLogMock.mockResolvedValue("");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: "/tmp/sessions/sess/browser-recovery.lock",
+      }),
+      "abort",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(false);
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+  });
+
+  test("reattaches a remote-only error session without local conversation or port metadata", async () => {
+    const requestIdentity = {
+      acceptedPromptSha256: ["c".repeat(64)],
+      followUpOrdinal: 0,
+      remainingFollowUps: 0 as const,
+    };
+    const remoteRecovery = {
+      protocolVersion: 3,
+      host: "bridge.example:9443",
+      transactionToken: "c".repeat(64),
+      state: "pre-receipt" as const,
+      requestIdentity,
+    };
+    const remoteOnlyRuntime: BrowserRuntimeMetadata = { remoteRecovery };
+    const remoteMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: { config: {}, runtime: remoteOnlyRuntime },
+      error: {
+        category: "browser-automation",
+        message: "remote response disconnected",
+        details: { recoverableDisconnect: true },
+      },
+    };
+    const capturedRuntime: BrowserRuntimeMetadata = {
+      ...committedPromptAuthority("remote-only-conversation"),
+      remoteRecovery: { ...remoteRecovery, state: "pending" },
+      recoveryCleanupResources: [
+        {
+          conversationId: "remote-only-conversation",
+          promptEpoch: committedPromptAuthority("remote-only-conversation").promptEpoch,
+          remoteRecovery: { ...remoteRecovery, state: "pending" },
+          recoveryCleanup: {
+            transport: "remote",
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    resumeBrowserSessionMock.mockResolvedValue({
+      answerText: "remote answer",
+      answerMarkdown: "remote answer",
+      runtime: capturedRuntime,
+      finalize,
+      abort: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
+    });
+    readSessionMetadataMock
+      .mockResolvedValueOnce(remoteMeta)
+      .mockResolvedValue({ ...remoteMeta, status: "completed", browser: { runtime: {} } });
+    readSessionLogMock.mockResolvedValue("Answer:\nremote answer");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("persisted remote browser transaction"),
+    );
+    expect(resumeBrowserSessionMock).toHaveBeenCalledWith(
+      remoteOnlyRuntime,
+      {},
+      expect.any(Function),
+      expect.objectContaining({ runtimeHintCb: expect.any(Function) }),
+    );
+    expect(finalize).toHaveBeenCalledOnce();
+  });
   test("persists a verified answer receipt before manual reattach completion and cleanup", async () => {
     const recoverableMeta: SessionMetadata = {
       ...baseMeta,

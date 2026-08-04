@@ -1,5 +1,9 @@
 import { z } from "zod";
-import type { BrowserRuntimeMetadata } from "../sessionManager.js";
+import type {
+  BrowserRemotePromptRequestIdentity,
+  BrowserRuntimeMetadata,
+} from "../sessionManager.js";
+import { promptIdentitySha256 } from "../browser/actions/promptComposer.js";
 
 export const REMOTE_TRANSACTION_PROTOCOL_VERSION = 3;
 export const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024 * 1024;
@@ -478,6 +482,23 @@ export const RemoteHealthResponseSchema = z
 export type RemoteAttachmentPayload = z.infer<typeof RemoteAttachmentPayloadSchema>;
 export type RemoteBrowserRunConfig = z.infer<typeof RemoteBrowserRunConfigSchema>;
 export type RemoteRunPayload = z.infer<typeof RemoteRunPayloadSchema>;
+
+export function buildRemotePromptRequestIdentity(
+  payload: RemoteRunPayload,
+): BrowserRemotePromptRequestIdentity {
+  const followUpPrompts = payload.options.followUpPrompts ?? [];
+  const finalFollowUp = followUpPrompts.at(-1);
+  const acceptedPrompts = finalFollowUp
+    ? [finalFollowUp]
+    : [payload.prompt, payload.fallbackSubmission?.prompt].filter(
+        (prompt): prompt is string => typeof prompt === "string",
+      );
+  return {
+    acceptedPromptSha256: [...new Set(acceptedPrompts.map(promptIdentitySha256))],
+    followUpOrdinal: followUpPrompts.length,
+    remainingFollowUps: 0,
+  };
+}
 export type RemoteArtifactCapabilities = z.infer<typeof RemoteArtifactCapabilitiesSchema>;
 export type RemoteArtifactDescriptor = z.infer<typeof RemoteArtifactDescriptorSchema>;
 export type RemoteArtifactDeliveryReceiptRequest = z.infer<

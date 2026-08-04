@@ -157,6 +157,7 @@ describe("browser reattach end-to-end (simulated)", () => {
             "browser-recovery.lock",
           ),
         }),
+        "finalize",
       );
       const persisted = await sessionStore.readSession(sessionMeta.id);
       expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");

@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { delay } from "./utils.js";
 
 const LOCK_OWNER_FILENAME = "owner.json";
@@ -10,7 +10,7 @@ const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
 const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
-const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 12_000;
 const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
 const execFileAsync = promisify(execFile);
 let currentProcessStartIdentity: string | undefined;
@@ -47,6 +47,7 @@ export interface CrashRecoverableFilesystemLockDeps {
   readProcessLiveness?: (pid: number) => ProcessLiveness;
   readProcessStartIdentity?: (pid: number) => Promise<string | null>;
   randomUUID?: () => string;
+  beforeLockPublication?: (preparedLockPath: string) => Promise<void>;
 }
 interface FilesystemLockGeneration {
   ownerRaw: string | null;
@@ -104,57 +105,63 @@ export async function acquireCrashRecoverableFilesystemLock(
     createdAt: new Date(now()).toISOString(),
   };
   const startedAt = now();
+  const parentPath = path.dirname(lockPath);
 
   if (options.createParent !== false) {
-    await mkdir(path.dirname(lockPath), { recursive: true });
+    await mkdir(parentPath, { recursive: true });
   }
-  for (;;) {
-    try {
-      await mkdir(lockPath, { recursive: false });
-      try {
-        await writeLockOwner(lockPath, owner);
-      } catch (error) {
-        await removeLockPath(lockPath);
-        await syncDirectory(path.dirname(lockPath));
-        throw error;
-      }
-      let releasePromise: Promise<void> | undefined;
-      return {
-        path: lockPath,
-        owner,
-        release: () => (releasePromise ??= releaseCrashRecoverableFilesystemLock(lockPath, owner)),
-      };
-    } catch (error) {
-      if (readErrorCode(error) !== "EEXIST") throw error;
-    }
 
-    let inspection = await inspectExistingLock(lockPath, {
-      nowMs: now(),
-      incompleteLockStaleMs,
-      readLiveness,
-      readProcessIdentity,
-    });
-    if (inspection.status === "stale") {
-      inspection = await inspectExistingLock(lockPath, {
+  let preparedLockPath: string | undefined;
+  try {
+    preparedLockPath = await mkdtemp(`${lockPath}.publishing-`);
+    await writeLockOwner(preparedLockPath, owner);
+    await deps.beforeLockPublication?.(preparedLockPath);
+
+    for (;;) {
+      if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+        preparedLockPath = undefined;
+        let releasePromise: Promise<void> | undefined;
+        return {
+          path: lockPath,
+          owner,
+          release: () =>
+            (releasePromise ??= releaseCrashRecoverableFilesystemLock(lockPath, owner)),
+        };
+      }
+
+      let inspection = await inspectExistingLock(lockPath, {
         nowMs: now(),
         incompleteLockStaleMs,
         readLiveness,
         readProcessIdentity,
       });
       if (inspection.status === "stale") {
-        await quarantineStaleLock(lockPath, createNonce(), inspection.generation);
-        continue;
+        inspection = await inspectExistingLock(lockPath, {
+          nowMs: now(),
+          incompleteLockStaleMs,
+          readLiveness,
+          readProcessIdentity,
+        });
+        if (inspection.status === "stale") {
+          await quarantineStaleLock(lockPath, createNonce(), inspection.generation);
+          continue;
+        }
       }
-    }
 
-    const elapsed = now() - startedAt;
-    if (timeoutMs === 0 || elapsed >= timeoutMs) {
-      throw new FilesystemLockBusyError(
-        lockPath,
-        inspection.status === "active" ? inspection.owner : undefined,
-      );
+      const elapsed = now() - startedAt;
+      if (timeoutMs === 0 || elapsed >= timeoutMs) {
+        throw new FilesystemLockBusyError(
+          lockPath,
+          inspection.status === "active" ? inspection.owner : undefined,
+        );
+      }
+      await delay(Math.min(pollMs, Math.max(1, timeoutMs - elapsed)));
     }
-    await delay(Math.min(pollMs, Math.max(1, timeoutMs - elapsed)));
+  } finally {
+    if (preparedLockPath !== undefined) {
+      await removeLockPath(preparedLockPath);
+      await syncDirectoryIfPresent(parentPath);
+    }
   }
 }
 
@@ -174,7 +181,7 @@ export function readProcessLiveness(pid: number): ProcessLiveness {
 export async function readProcessStartIdentity(pid: number): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   // This process cannot be replaced while this module is running. Foreign PIDs stay uncached so
-  // stale-owner checks still observe PID reuse; failed current-process lookups retry after a bounded backoff.
+  // stale-owner checks still observe PID reuse; only stable current-process absence is cached.
   if (pid !== process.pid) return readProcessStartIdentityUncached(pid);
   if (currentProcessStartIdentity !== undefined) return currentProcessStartIdentity;
   if (Date.now() < currentProcessStartIdentityRetryAfterMs) return null;
@@ -226,8 +233,34 @@ async function readProcessStartIdentityUncached(pid: number): Promise<string | n
     });
     const startedAt = String(stdout).trim().replace(/\s+/gu, " ");
     return startedAt ? `${process.platform}:${startedAt}` : null;
-  } catch {
+  } catch (error) {
+    if (isProcessIdentityTimeoutError(error)) throw error;
     return null;
+  }
+}
+
+async function publishPreparedLockGeneration(
+  preparedLockPath: string,
+  lockPath: string,
+): Promise<boolean> {
+  if (await lockPathExists(lockPath)) return false;
+  try {
+    await renameLockPath(preparedLockPath, lockPath);
+  } catch (error) {
+    if (await lockPathExists(lockPath)) return false;
+    throw error;
+  }
+  await syncDirectory(path.dirname(lockPath));
+  return true;
+}
+
+async function lockPathExists(lockPath: string): Promise<boolean> {
+  try {
+    await stat(lockPath);
+    return true;
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -575,6 +608,11 @@ async function syncDirectory(directory: string): Promise<void> {
   } finally {
     await handle.close();
   }
+}
+
+function isProcessIdentityTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  return readErrorCode(error) === "ETIMEDOUT" || (error as { killed?: unknown }).killed === true;
 }
 
 function readErrorCode(error: unknown): unknown {

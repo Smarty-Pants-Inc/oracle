@@ -1,11 +1,12 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
 } from "../../src/browser/filesystemLock.js";
+import type { CrashRecoverableFilesystemLock } from "../../src/browser/filesystemLock.js";
 
 async function agePath(targetPath: string, ageMs = 10_000): Promise<void> {
   const timestamp = new Date(Date.now() - ageMs);
@@ -246,6 +247,80 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("a stalled private publisher cannot alter a successor generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const stalledPid = 48_048;
+    const successorPid = 49_049;
+    const identities: Record<number, string> = {
+      [stalledPid]: "stalled-start",
+      [successorPid]: "successor-start",
+    };
+    let resumeStalledPublisher!: () => void;
+    const allowStalledPublisher = new Promise<void>((resolve) => {
+      resumeStalledPublisher = resolve;
+    });
+    let markStalledPublisherReady!: () => void;
+    const stalledPublisherReady = new Promise<void>((resolve) => {
+      markStalledPublisherReady = resolve;
+    });
+    let preparedLockPath: string | undefined;
+    let successor: CrashRecoverableFilesystemLock | undefined;
+
+    const stalledAcquire = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: stalledPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        beforeLockPublication: async (privatePath) => {
+          preparedLockPath = privatePath;
+          markStalledPublisherReady();
+          await allowStalledPublisher;
+        },
+      },
+    );
+
+    try {
+      await stalledPublisherReady;
+      expect(preparedLockPath).toBeDefined();
+      expect(path.dirname(preparedLockPath!)).toBe(root);
+      expect(path.basename(preparedLockPath!)).toMatch(/^recovery\.lock\.publishing-/u);
+      expect(
+        JSON.parse(await readFile(path.join(preparedLockPath!, "owner.json"), "utf8")),
+      ).toMatchObject({ pid: stalledPid, processStartIdentity: "stalled-start" });
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      successor = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          pid: successorPid,
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        },
+      );
+      const successorOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
+
+      resumeStalledPublisher();
+      await expect(stalledAcquire).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(successorOwnerRaw);
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+      expect(
+        (await readdir(root)).filter((entry) => entry.startsWith("recovery.lock.publishing-")),
+      ).toEqual([]);
+
+      await successor.release();
+      successor = undefined;
+    } finally {
+      resumeStalledPublisher();
+      await stalledAcquire.catch(() => undefined);
+      await successor?.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not reclaim a live owner when process-start identity lookup is ambiguous", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
@@ -274,6 +349,53 @@ describe("crash-recoverable filesystem lock", () => {
       await original.release();
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not negative-cache a Windows process-generation timeout", async () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    const timeoutError = Object.assign(new Error("PowerShell process probe timed out"), {
+      code: "ETIMEDOUT",
+      killed: false,
+    });
+    const killedTimeoutError = Object.assign(new Error("PowerShell process probe was killed"), {
+      code: null,
+      killed: true,
+    });
+    let attempt = 0;
+    const execFile = vi.fn();
+    const execFileAsync = vi.fn(async (..._args: unknown[]) => {
+      if (++attempt === 1) throw timeoutError;
+      if (attempt === 2) throw killedTimeoutError;
+      return { stdout: "638000000000000000", stderr: "" };
+    });
+    Object.defineProperty(execFile, Symbol.for("nodejs.util.promisify.custom"), {
+      value: execFileAsync,
+    });
+
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({ execFile }));
+      // Reloading intentionally binds this test's mocked Windows child-process boundary.
+      const { readProcessStartIdentity } = await import("../../src/browser/filesystemLock.js");
+
+      await expect(readProcessStartIdentity(process.pid)).rejects.toMatchObject({
+        code: "ETIMEDOUT",
+        killed: false,
+      });
+      await expect(readProcessStartIdentity(process.pid)).rejects.toMatchObject({
+        code: null,
+        killed: true,
+      });
+      await expect(readProcessStartIdentity(process.pid)).resolves.toBe("win32:638000000000000000");
+      expect(execFileAsync).toHaveBeenCalledTimes(3);
+      expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
+      expect(execFileAsync.mock.calls[0]?.[2]).toMatchObject({ timeout: 12_000 });
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+      if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
     }
   });
 });

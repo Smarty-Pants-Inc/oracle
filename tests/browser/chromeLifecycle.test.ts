@@ -8,11 +8,11 @@ import type {
   ChromeLaunchResult,
   StableChromeProcessHandle,
 } from "../../src/browser/chromeLifecycle.js";
-import type {
-  ChromeProcessIdentity,
-  ProfileDirectoryIdentity,
+import {
+  captureProfileDirectoryIdentity,
+  type ChromeProcessIdentity,
+  type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
-
 const cdpNewMock = vi.fn();
 const cdpCloseMock = vi.fn();
 const cdpListMock = vi.fn();
@@ -31,7 +31,7 @@ const resolveLocalChromeLaunchRoute = () => ({
   usePatchedLauncher: false,
 });
 
-function profileIdentity(userDataDir: string): ProfileDirectoryIdentity {
+function syntheticProfileIdentity(userDataDir: string): ProfileDirectoryIdentity {
   const resolvedPath = path.resolve(userDataDir);
   const canonicalPath = existsSync(resolvedPath) ? realpathSync(resolvedPath) : resolvedPath;
   const physical = existsSync(canonicalPath) ? statSync(canonicalPath, { bigint: true }) : null;
@@ -44,17 +44,48 @@ function profileIdentity(userDataDir: string): ProfileDirectoryIdentity {
   };
 }
 
+function executablePathForPlatform(platform: NodeJS.Platform): string {
+  if (platform === "win32") {
+    return String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`;
+  }
+  return platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "/usr/bin/google-chrome";
+}
+
 function processIdentity(
   userDataDir: string,
   pid: number,
   launchNonce: string,
 ): ChromeProcessIdentity {
-  const profileDirectory = profileIdentity(userDataDir);
+  const profileDirectory = syntheticProfileIdentity(userDataDir);
   return {
     pid,
     processStartTime: `launch-${pid}`,
-    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    normalizedUserDataDir: profileDirectory.canonicalPath,
+    executablePath: executablePathForPlatform(profileDirectory.platform),
+    normalizedUserDataDir:
+      profileDirectory.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
+    launchNonce,
+    profileDirectory,
+  };
+}
+
+async function physicalProcessIdentity(
+  userDataDir: string,
+  pid: number,
+  launchNonce: string,
+): Promise<ChromeProcessIdentity> {
+  const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+  return {
+    pid,
+    processStartTime: `launch-${pid}`,
+    executablePath: executablePathForPlatform(profileDirectory.platform),
+    normalizedUserDataDir:
+      profileDirectory.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
     launchNonce,
     profileDirectory,
   };
@@ -127,7 +158,7 @@ describe("hidden macOS Chrome launch", () => {
   test("retains the exact hidden-launch control authority", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const profile = profileIdentity("/tmp/oracle-hidden-profile");
+    const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-hidden-profile"));
     const identity = processIdentity(
       profile.canonicalPath,
       4321,
@@ -193,7 +224,7 @@ describe("hidden macOS Chrome launch", () => {
   test("fails closed when hidden headful launch cannot be guaranteed", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const profile = profileIdentity("/tmp/oracle-hidden-profile");
+    const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-hidden-profile"));
     await expect(
       launchChrome(
         resolveBrowserConfig({ hideWindow: true }),
@@ -208,7 +239,7 @@ describe("hidden macOS Chrome launch", () => {
     const { createIdentityBoundChromeControlKillForTest } =
       await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
-      "/tmp/oracle-hidden-profile",
+      path.join(os.tmpdir(), "oracle-hidden-profile"),
       4321,
       "11111111-1111-4111-8111-111111111112",
     );
@@ -260,7 +291,7 @@ describe("stable Chrome process authority", () => {
   test("terminates a current launch through its retained ChildProcess handle", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const profile = profileIdentity("/tmp/oracle-standard-profile");
+    const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-standard-profile"));
     const identity = processIdentity(
       profile.canonicalPath,
       5678,
@@ -321,7 +352,7 @@ describe("stable Chrome process authority", () => {
   test("rolls back identity capture failure only through the retained handle", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
-    const profile = profileIdentity("/tmp/oracle-invalid-profile");
+    const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-invalid-profile"));
     const child = retainedChildProcess(6789);
     const captureError = new Error("identity unavailable");
     await expect(
@@ -354,7 +385,7 @@ describe("stable Chrome process authority", () => {
   test("preserves the unsafe outcome when persistence rollback lacks stable authority", async () => {
     const { createOwnerBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
-      "/tmp/oracle-rollback-profile",
+      path.join(os.tmpdir(), "oracle-rollback-profile"),
       8902,
       "44444444-4444-4444-8444-444444444445",
     );
@@ -388,7 +419,7 @@ describe("stable Chrome process authority", () => {
   test("returns the retained stable kill after identity persistence", async () => {
     const { createOwnerBoundChromeKill } = await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
-      "/tmp/oracle-partial-profile",
+      path.join(os.tmpdir(), "oracle-partial-profile"),
       9012,
       "55555555-5555-4555-8555-555555555555",
     );
@@ -418,7 +449,11 @@ describe("registerTerminationHooks", () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-profile-signal-"));
     await writeFile(path.join(userDataDir, "Cookies"), "sensitive");
-    const identity = processIdentity(userDataDir, 1234, "66666666-6666-4666-8666-666666666666");
+    const identity = await physicalProcessIdentity(
+      userDataDir,
+      1234,
+      "66666666-6666-4666-8666-666666666666",
+    );
     const kill = vi.fn(async () => ({
       status: "stopped" as const,
       pid: 1234,
@@ -458,7 +493,11 @@ describe("registerTerminationHooks", () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-profile-unsafe-"));
     await writeFile(path.join(userDataDir, "authority"), "keep");
-    const identity = processIdentity(userDataDir, 1235, "77777777-7777-4777-8777-777777777777");
+    const identity = await physicalProcessIdentity(
+      userDataDir,
+      1235,
+      "77777777-7777-4777-8777-777777777777",
+    );
     const kill = vi.fn(async () => ({
       status: "unsafe" as const,
       pid: 1235,
@@ -488,8 +527,12 @@ describe("registerTerminationHooks", () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const profileState = await import("../../src/browser/profileState.js");
     const cleanupMock = vi.mocked(profileState.cleanupStaleProfileState);
-    const userDataDir = "/tmp/oracle-manual-login-profile";
-    const identity = processIdentity(userDataDir, 1236, "88888888-8888-4888-8888-888888888888");
+    const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-manual-login-profile-"));
+    const identity = await physicalProcessIdentity(
+      userDataDir,
+      1236,
+      "88888888-8888-4888-8888-888888888888",
+    );
     const kill = vi.fn(async () => ({
       status: "stopped" as const,
       pid: 1236,
@@ -502,13 +545,17 @@ describe("registerTerminationHooks", () => {
       preserveUserDataDir: true,
       onSignalHandled: () => handled.resolve(),
     });
-    process.emit("SIGINT");
-    await handled.promise;
-    removeHooks();
-    expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, {
-      lockRemovalMode: "never",
-      expectedProfileIdentity: identity.profileDirectory,
-    });
+    try {
+      process.emit("SIGINT");
+      await handled.promise;
+      expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, {
+        lockRemovalMode: "never",
+        expectedProfileIdentity: identity.profileDirectory,
+      });
+    } finally {
+      removeHooks();
+      await rm(userDataDir, { recursive: true, force: true });
+    }
   });
 });
 

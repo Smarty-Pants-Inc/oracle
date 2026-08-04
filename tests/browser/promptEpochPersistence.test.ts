@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
-import path from "node:path";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import { hasRecoverableChatGptConversation } from "../../src/browser/reattachability.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 import type * as PromptComposerModule from "../../src/browser/actions/promptComposer.js";
@@ -172,29 +172,31 @@ async function runTwoTurnResetFailure(transport: Transport) {
 
   vi.resetModules();
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-    launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => ({
-      pid: 4321,
-      port: 9230,
-      process: { unref: vi.fn() },
-      processIdentity: {
+    launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => {
+      const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+      return {
         pid: 4321,
-        processStartTime: "epoch-fixture-process-generation",
-        executablePath: "/usr/bin/google-chrome",
-        normalizedUserDataDir:
-          process.platform === "win32"
-            ? path.resolve(userDataDir).toLowerCase()
-            : path.resolve(userDataDir),
-        launchNonce: "22222222-2222-4222-8222-222222222222",
-        profileDirectory: {
-          version: 1,
-          platform: process.platform,
-          canonicalPath: path.resolve(userDataDir),
-          device: "1",
-          inode: "2",
+        port: 9230,
+        process: { unref: vi.fn() },
+        processIdentity: {
+          pid: 4321,
+          processStartTime: "epoch-fixture-process-generation",
+          executablePath:
+            profileDirectory.platform === "win32"
+              ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`
+              : profileDirectory.platform === "darwin"
+                ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                : "/usr/bin/google-chrome",
+          normalizedUserDataDir:
+            profileDirectory.platform === "win32"
+              ? profileDirectory.canonicalPath.toLowerCase()
+              : profileDirectory.canonicalPath,
+          launchNonce: "22222222-2222-4222-8222-222222222222",
+          profileDirectory,
         },
-      },
-      kill: killChrome,
-    })),
+        kill: killChrome,
+      };
+    }),
     registerTerminationHooks: vi.fn(() => vi.fn()),
     positionChromeWindowOffscreen: vi.fn().mockResolvedValue(undefined),
     connectWithNewTab: vi.fn().mockResolvedValue({ client, targetId: "epoch-target" }),
@@ -327,6 +329,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       config: {
         ...(transport === "remote" ? { remoteChrome: { host: "remote.example", port: 9333 } } : {}),
         cookieSync: false,
+        manualLogin: false,
         headless: true,
         modelStrategy: "ignore",
         archiveConversations: "never",

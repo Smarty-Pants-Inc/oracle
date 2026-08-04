@@ -194,6 +194,13 @@ function hasDurableBrowserAnswerReceipt(metadata: SessionMetadata): boolean {
   );
 }
 
+function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | undefined) {
+  return (
+    runtime?.remoteRecovery ??
+    runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)?.remoteRecovery
+  );
+}
+
 export interface ShowStatusOptions {
   hours: number;
   includeAll: boolean;
@@ -319,9 +326,15 @@ export async function attachSession(
     };
     runtime = repairedRuntime;
   }
+  const persistedRemoteRecovery = remoteRecoveryAuthority(runtime);
+  const cleanupRetryMode =
+    metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata)
+      ? "finalize"
+      : metadata.status === "error" && persistedRemoteRecovery?.settlementMode === "abort"
+        ? "abort"
+        : null;
   if (
-    metadata.status === "completed" &&
-    hasDurableBrowserAnswerReceipt(metadata) &&
+    cleanupRetryMode &&
     runtime?.recoveryCleanupResources?.length &&
     runtime.recoveryCleanupResult
   ) {
@@ -333,10 +346,15 @@ export async function attachSession(
     );
     try {
       const sessionPaths = await sessionStore.getPaths(sessionId);
-      const cleanup = await retryBrowserRecoveryCleanup(runtime, cleanupLogger, {
-        recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
-        isRemotePublicationAcknowledged: () => true,
-      });
+      const cleanup = await retryBrowserRecoveryCleanup(
+        runtime,
+        cleanupLogger,
+        {
+          recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+          isRemotePublicationAcknowledged: () => cleanupRetryMode === "finalize",
+        },
+        cleanupRetryMode,
+      );
       await sessionStore.updateSession(sessionId, {
         browser: { ...metadata.browser, runtime: cleanup.runtime },
       });
@@ -357,10 +375,14 @@ export async function attachSession(
   const workerAlive = isProcessAlive(metadata.lifecycle?.workerPid);
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
   const hasIncompleteCapture = metadata.response?.incompleteReason === "incomplete-capture";
+  const remoteRecovery = remoteRecoveryAuthority(runtime);
+  const hasResumableRemoteAuthority = Boolean(remoteRecovery && !remoteRecovery.settlementMode);
   const statusAllowsReattach =
     metadata.status === "running" ||
-    (metadata.status === "error" && (hasChromeDisconnect || hasIncompleteCapture));
+    (metadata.status === "error" &&
+      (hasChromeDisconnect || hasIncompleteCapture || hasResumableRemoteAuthority));
   const hasFallbackSessionInfo = Boolean(
+    hasResumableRemoteAuthority ||
     runtime?.chromePort ||
     runtime?.chromeBrowserWSEndpoint ||
     runtime?.chromeProfileRoot ||
@@ -376,9 +398,11 @@ export async function attachSession(
     );
   const completedDeepResearchPlaceholder =
     metadata.status === "completed" && deepResearchPlaceholderCapture;
-  const hasRecoverableConversation = hasRecoverableChatGptConversation(runtime);
+  const hasRecoverableConversation =
+    hasResumableRemoteAuthority || hasRecoverableChatGptConversation(runtime);
   const disconnectRecoveryAuthorized =
     !hasChromeDisconnect ||
+    hasResumableRemoteAuthority ||
     (metadata.error?.details as { recoverableDisconnect?: boolean } | undefined)
       ?.recoverableDisconnect === true;
   const explicitlyNonRecoverable =
@@ -392,19 +416,24 @@ export async function attachSession(
     !explicitlyNonRecoverable &&
     disconnectRecoveryAuthorized &&
     !workerAlive &&
-    (hasChromeDisconnect ||
+    (hasResumableRemoteAuthority ||
+      hasChromeDisconnect ||
       hasIncompleteCapture ||
       completedDeepResearchPlaceholder ||
       (runtime?.controllerPid && !controllerAlive));
 
   if (canReattach) {
-    const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
-    const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
-    console.log(
-      chalk.yellow(
-        `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
-      ),
-    );
+    if (hasResumableRemoteAuthority) {
+      console.log(chalk.yellow("Attempting to resume the persisted remote browser transaction..."));
+    } else {
+      const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
+      const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
+      console.log(
+        chalk.yellow(
+          `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
+        ),
+      );
+    }
     let reattachResult: ReattachResult | null = null;
     let answerPublished = false;
     let answerReceipt: DurableBrowserAnswerReceipt | undefined;
@@ -425,6 +454,12 @@ export async function attachSession(
         {
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
           isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
+          runtimeHintCb: async (latestRuntime) => {
+            authoritativeRuntime = latestRuntime;
+            await sessionStore.updateSession(sessionId, {
+              browser: { ...metadata.browser, runtime: latestRuntime },
+            });
+          },
         },
       );
       authoritativeRuntime = reattachResult.runtime;
@@ -948,6 +983,13 @@ export function buildReattachLine(metadata: SessionMetadata): string | null {
   }
   if (metadata.status === "running") {
     return `Session ${metadata.id} reattached, request started ${elapsedLabel} ago.`;
+  }
+  const remoteRecovery = remoteRecoveryAuthority(metadata.browser?.runtime);
+  if (metadata.status === "error" && remoteRecovery) {
+    return `Session ${metadata.id} retained recoverable remote browser authority from ${elapsedLabel} ago.`;
+  }
+  if (metadata.status === "completed" && remoteRecovery?.settlementMode === "finalize") {
+    return `Session ${metadata.id} retained pending remote browser finalization from ${elapsedLabel} ago.`;
   }
   return null;
 }

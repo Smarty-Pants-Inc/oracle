@@ -103,11 +103,19 @@ export interface BrowserRecoveryCleanupResultMetadata {
   error?: string;
 }
 
+export interface BrowserRemotePromptRequestIdentity {
+  acceptedPromptSha256: string[];
+  followUpOrdinal: number;
+  remainingFollowUps: 0;
+}
+
 export interface BrowserRemoteRecoveryMetadata {
   protocolVersion: number;
   host: string;
   transactionToken: string;
-  state: "pending" | "recoverable-error";
+  state: "pre-receipt" | "pending" | "recoverable-error";
+  requestIdentity?: BrowserRemotePromptRequestIdentity;
+  settlementMode?: "finalize" | "abort";
 }
 export interface BrowserRecoveryTabLeaseMetadata {
   id: string;

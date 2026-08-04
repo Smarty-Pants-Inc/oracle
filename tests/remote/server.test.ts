@@ -6,11 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { createRemoteServer } from "../../src/remote/server.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   createRemoteBrowserExecutor,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
+import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   MAX_REMOTE_ATTACHMENT_BYTES,
@@ -230,6 +232,17 @@ describe("remote browser service", () => {
         state: "pending",
         result: { answerText: "hi" },
         runtime: { chromePort: 9222, chromeTargetId: "remote-target" },
+        requestIdentity: {
+          acceptedPromptSha256: [promptIdentitySha256("follow up")],
+          followUpOrdinal: 1,
+          remainingFollowUps: 0,
+        },
+        browserConfig: {
+          chatgptUrl: "https://chatgpt.com/",
+          remoteChrome: null,
+          attachRunning: false,
+        },
+        leaseExpiresAt: expect.any(String),
       });
       await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
       await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
@@ -249,6 +262,9 @@ describe("remote browser service", () => {
       expect(finalizedRecord).not.toHaveProperty("artifacts");
       expect(finalizedRecord).not.toHaveProperty("settlementMode");
       expect(finalizedRecord).not.toHaveProperty("publicationAcknowledgedAt");
+      expect(finalizedRecord).not.toHaveProperty("requestIdentity");
+      expect(finalizedRecord).not.toHaveProperty("browserConfig");
+      expect(finalizedRecord).not.toHaveProperty("leaseExpiresAt");
       expect(JSON.stringify(finalizedRecord)).not.toContain("remote-target");
       expect(JSON.stringify(finalizedRecord)).not.toContain("answerText");
 
@@ -1055,6 +1071,650 @@ describe("remote browser service", () => {
       }
     },
   );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "captures a recoverable answer after controller restart using journaled host authority",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-restart-capture-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      let transactionToken = "";
+      const prompt = "recover after restart";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "restart-target",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "restart-target",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanup: {
+              transport: "local",
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+            },
+          },
+        ],
+      };
+      const first = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async () => {
+            throw new BrowserAutomationError("Browser disconnected", {
+              stage: "wait-for-answer",
+              recoverableDisconnect: true,
+              runtime,
+            });
+          },
+        },
+      );
+      try {
+        const caught = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${first.port}`,
+          token: "secret",
+        })({ prompt, config: {} }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(caught).toMatchObject({ details: { recoverableDisconnect: true } });
+        transactionToken = remoteRecoveryTransactionToken(caught);
+      } finally {
+        await first.close();
+      }
+
+      const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      const resumeBrowser = vi.fn(
+        async (
+          journaledRuntime: BrowserRunTransaction["runtime"],
+          browserConfig: BrowserSessionConfig | undefined,
+        ) => {
+          expect(journaledRuntime).toMatchObject({
+            chromePort: 9222,
+            chromeTargetId: "restart-target",
+          });
+          expect(browserConfig).toMatchObject({
+            chatgptUrl: "https://chatgpt.com/",
+            remoteChrome: null,
+            attachRunning: false,
+          });
+          return {
+            answerText: "recovered answer",
+            answerMarkdown: "recovered answer",
+            runtime: journaledRuntime,
+            finalize,
+            abort,
+          };
+        },
+      );
+      const restarted = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { transactionStoreDir, resumeBrowser },
+      );
+      try {
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "transaction",
+            transaction: {
+              state: "pending",
+              result: { answerText: "recovered answer" },
+            },
+          },
+        });
+        expect(JSON.stringify(retry.json)).not.toContain("restart-target");
+        expect(JSON.stringify(retry.json)).not.toContain("9222");
+        expect(resumeBrowser).toHaveBeenCalledOnce();
+
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/finalize`,
+          token: "secret",
+          body: { durablePublication: true },
+        });
+        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        expect(finalize).toHaveBeenCalledOnce();
+        expect(abort).not.toHaveBeenCalled();
+      } finally {
+        await restarted.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "rejects and aborts a recovered answer with mismatched committed request identity",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-identity-mismatch-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      let transactionToken = "";
+      const prompt = "identity-bound prompt";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+      };
+      const mismatchedRuntime: BrowserRunTransaction["runtime"] = {
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch("different prompt"),
+      };
+      const abort = vi.fn(async () => ({
+        status: "completed" as const,
+        runtime: mismatchedRuntime,
+      }));
+      const resumeBrowser = vi.fn(async () => ({
+        answerText: "wrong answer",
+        answerMarkdown: "wrong answer",
+        runtime: mismatchedRuntime,
+        finalize: vi.fn(async () => ({ status: "completed" as const, runtime: mismatchedRuntime })),
+        abort,
+      }));
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          resumeBrowser,
+          runBrowser: async () => {
+            throw new BrowserAutomationError("Browser disconnected", {
+              stage: "wait-for-answer",
+              recoverableDisconnect: true,
+              runtime,
+            });
+          },
+        },
+      );
+      try {
+        const caught = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        })({ prompt, config: {} }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(caught).toMatchObject({ details: { recoverableDisconnect: true } });
+        transactionToken = remoteRecoveryTransactionToken(caught);
+
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "error",
+            error: { code: "remote-prompt-authority-mismatch", recoverableDisconnect: false },
+          },
+        });
+        expect(abort).toHaveBeenCalledOnce();
+        const record = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+        }).then((store) => store.read(transactionToken));
+        expect(record).toMatchObject({ state: "failed" });
+        expect(record).not.toHaveProperty("requestIdentity");
+        expect(record).not.toHaveProperty("browserConfig");
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "serializes concurrent authenticated retries into one browser recovery",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retry-single-flight-"));
+      let transactionToken = "";
+      const prompt = "single flight recovery";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+      };
+      const recoveryStarted = createDeferred<void>();
+      const releaseRecovery = createDeferred<void>();
+      const resumeBrowser = vi.fn(async () => {
+        recoveryStarted.resolve();
+        await releaseRecovery.promise;
+        return {
+          answerText: "one answer",
+          answerMarkdown: "one answer",
+          runtime,
+          finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
+          abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
+        };
+      });
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir: path.join(tmpDir, "transactions"),
+          resumeBrowser,
+          runBrowser: async () => {
+            throw new BrowserAutomationError("Browser disconnected", {
+              stage: "wait-for-answer",
+              recoverableDisconnect: true,
+              runtime,
+            });
+          },
+        },
+      );
+      try {
+        const caught = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        })({ prompt, config: {} }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(caught).toMatchObject({ details: { recoverableDisconnect: true } });
+        transactionToken = remoteRecoveryTransactionToken(caught);
+
+        const retryRequest = () =>
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "secret",
+            body: {},
+          });
+        const firstRetry = retryRequest();
+        await recoveryStarted.promise;
+        const secondRetry = retryRequest();
+        releaseRecovery.resolve();
+        const responses = await Promise.all([firstRetry, secondRetry]);
+        expect(responses).toEqual([
+          expect.objectContaining({
+            statusCode: 200,
+            json: expect.objectContaining({ status: "transaction" }),
+          }),
+          expect.objectContaining({
+            statusCode: 200,
+            json: expect.objectContaining({ status: "transaction" }),
+          }),
+        ]);
+        expect(resumeBrowser).toHaveBeenCalledOnce();
+      } finally {
+        releaseRecovery.resolve();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "serializes direct settlement against active browser work",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-settlement-gate-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const now = Date.now();
+      const transactionStoreNow = () => now;
+      const store = await openSeedTransactionStore(transactionStoreDir, 5_000, transactionStoreNow);
+      const settlementToken = "e".repeat(64);
+      const runToken = "f".repeat(64);
+      const settlementRuntime = await seedRemoteTransaction(store, settlementToken, {
+        prompt: "settlement waits for browser authority",
+      });
+      if (!settlementRuntime) throw new Error("missing seeded settlement runtime");
+      const runStarted = createDeferred<void>();
+      const releaseRun = createDeferred<void>();
+      const retryCleanup = vi.fn(
+        async (
+          runtime: BrowserRunTransaction["runtime"],
+          _logger: unknown,
+          _deps: unknown,
+          mode?: "finalize" | "abort",
+        ) => {
+          if (!mode) throw new Error("missing settlement mode");
+          return { status: "completed" as const, runtime };
+        },
+      );
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: TEST_CONTROLLER_GENERATION,
+          transactionLeaseDurationMs: 5_000,
+          transactionStoreNow,
+          leaseSweepIntervalMs: 1_000,
+          retryCleanup,
+          runBrowser: async (options) => {
+            runStarted.resolve();
+            await releaseRun.promise;
+            return browserTransaction(options.prompt, {
+              answerText: "active answer",
+              answerMarkdown: "active answer",
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 13,
+            });
+          },
+        },
+      );
+      try {
+        const runRequest = httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${runToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        await runStarted.promise;
+        const busySettlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${settlementToken}/abort`,
+          token: "secret",
+          body: {},
+        });
+        expect(busySettlement).toMatchObject({ statusCode: 409, json: { error: "busy" } });
+        expect(retryCleanup).not.toHaveBeenCalled();
+
+        releaseRun.resolve();
+        await expect(runRequest).resolves.toMatchObject({ statusCode: 200 });
+        const settled = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${settlementToken}/abort`,
+          token: "secret",
+          body: {},
+        });
+        expect(settled).toMatchObject({ statusCode: 200, json: { state: "aborted" } });
+        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
+      } finally {
+        releaseRun.resolve();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "settles expired authority in abort or finalize mode and redacts pre-authority runs",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-expired-leases-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const leaseDurationMs = 20;
+      let now = Date.now();
+      const transactionStoreNow = () => now;
+      const store = await openSeedTransactionStore(
+        transactionStoreDir,
+        leaseDurationMs,
+        transactionStoreNow,
+      );
+      const abortToken = "7".repeat(64);
+      const preAuthorityToken = "8".repeat(64);
+      const finalizeToken = "9".repeat(64);
+      const unacknowledgedFinalizeToken = "a".repeat(64);
+      await seedRemoteTransaction(store, abortToken, {
+        prompt: "expired running authority",
+        state: "running",
+      });
+      await seedRemoteTransaction(store, preAuthorityToken, {
+        prompt: "expired before authority",
+        state: "running",
+        runtime: null,
+      });
+      await seedRemoteTransaction(store, finalizeToken, {
+        prompt: "expired finalize cleanup",
+        settlementMode: "finalize",
+        publicationAcknowledged: true,
+      });
+      await seedRemoteTransaction(store, unacknowledgedFinalizeToken, {
+        prompt: "expired unacknowledged finalize cleanup",
+        settlementMode: "finalize",
+      });
+      now += leaseDurationMs + 1;
+      const cleanupModes: Array<"finalize" | "abort"> = [];
+      const retryCleanup = vi.fn(
+        async (
+          runtime: BrowserRunTransaction["runtime"],
+          _logger: unknown,
+          _deps: unknown,
+          mode?: "finalize" | "abort",
+        ) => {
+          if (!mode) throw new Error("missing settlement mode");
+          cleanupModes.push(mode);
+          return { status: "completed" as const, runtime };
+        },
+      );
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: TEST_CONTROLLER_GENERATION,
+          transactionLeaseDurationMs: leaseDurationMs,
+          transactionStoreNow,
+          leaseSweepIntervalMs: 1_000,
+          retryCleanup,
+        },
+      );
+      try {
+        expect(cleanupModes).toEqual(["abort", "finalize"]);
+        expect(await store.read(abortToken)).toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+        });
+        const failed = await store.read(preAuthorityToken);
+        expect(failed).toMatchObject({ state: "failed" });
+        expect(failed).not.toHaveProperty("runtime");
+        expect(failed).not.toHaveProperty("requestIdentity");
+        expect(failed).not.toHaveProperty("browserConfig");
+        expect(await store.read(finalizeToken)).toMatchObject({ state: "finalized" });
+        expect(await store.read(unacknowledgedFinalizeToken)).toMatchObject({
+          state: "pending",
+          settlementMode: "finalize",
+        });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "retains pending expired cleanup, retries it periodically, and clears the timer on close",
+    async () => {
+      vi.useFakeTimers();
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-pending-sweep-"));
+      try {
+        const transactionStoreDir = path.join(tmpDir, "transactions");
+        const leaseDurationMs = 15;
+        const transactionToken = "b".repeat(64);
+        let now = Date.now();
+        const transactionStoreNow = () => now;
+        const store = await openSeedTransactionStore(
+          transactionStoreDir,
+          leaseDurationMs,
+          transactionStoreNow,
+        );
+        await seedRemoteTransaction(store, transactionToken, {
+          prompt: "pending cleanup retention",
+          settlementMode: "abort",
+        });
+        now += leaseDurationMs + 1;
+        const retryCleanup = vi.fn(
+          async (
+            runtime: BrowserRunTransaction["runtime"],
+            _logger: unknown,
+            _deps: unknown,
+            mode?: "finalize" | "abort",
+          ) => {
+            if (!mode) throw new Error("missing settlement mode");
+            return {
+              status: "pending" as const,
+              runtime: {
+                ...runtime,
+                recoveryCleanupResult: { status: "failed" as const, error: `${mode} pending` },
+              },
+              error: `${mode} pending`,
+            };
+          },
+        );
+        const server = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+          {
+            transactionStoreDir,
+            controllerGeneration: TEST_CONTROLLER_GENERATION,
+            transactionLeaseDurationMs: leaseDurationMs,
+            transactionStoreNow,
+            leaseSweepIntervalMs: 5,
+            retryCleanup,
+          },
+        );
+        try {
+          expect(retryCleanup).toHaveBeenCalledOnce();
+          now += leaseDurationMs + 1;
+          await vi.advanceTimersByTimeAsync(5);
+          await vi.waitFor(() => {
+            expect(retryCleanup.mock.calls.length).toBeGreaterThanOrEqual(2);
+          });
+          expect(retryCleanup.mock.calls.every((call) => call[3] === "abort")).toBe(true);
+          expect(await store.read(transactionToken)).toMatchObject({
+            state: "pending",
+            settlementMode: "abort",
+            finalization: { status: "pending" },
+          });
+
+          await server.close();
+          const attemptsAfterClose = retryCleanup.mock.calls.length;
+          now += leaseDurationMs * 3;
+          await vi.advanceTimersByTimeAsync(leaseDurationMs * 3);
+          expect(retryCleanup).toHaveBeenCalledTimes(attemptsAfterClose);
+        } finally {
+          await server.close();
+        }
+      } finally {
+        vi.useRealTimers();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "renews authenticated retry, artifact, receipt, and settlement requests only after auth",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-auth-renewal-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "c".repeat(64);
+      let now = Date.now();
+      const transactionStoreNow = () => now;
+      const store = await openSeedTransactionStore(transactionStoreDir, 5_000, transactionStoreNow);
+      await seedRemoteTransaction(store, transactionToken, { prompt: "renew exact lease" });
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: TEST_CONTROLLER_GENERATION,
+          transactionLeaseDurationMs: 5_000,
+          transactionStoreNow,
+          leaseSweepIntervalMs: 1_000,
+        },
+      );
+      try {
+        const initialLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        const unauthorizedRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/retry`,
+          body: {},
+        });
+        expect(unauthorizedRetry.statusCode).toBe(401);
+        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(initialLease);
+
+        now += 10;
+        const authenticatedRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(authenticatedRetry.statusCode).toBe(200);
+        const retryLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        expect(Date.parse(retryLease ?? "")).toBeGreaterThan(Date.parse(initialLease ?? ""));
+
+        const unauthorizedArtifact = await httpGetJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact`,
+        });
+        expect(unauthorizedArtifact.statusCode).toBe(401);
+        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(retryLease);
+
+        now += 10;
+        const authenticatedArtifact = await httpGetJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact`,
+          token: "secret",
+        });
+        expect(authenticatedArtifact.statusCode).toBe(404);
+        const artifactLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        expect(Date.parse(artifactLease ?? "")).toBeGreaterThan(Date.parse(retryLease ?? ""));
+
+        const unauthorizedReceipt = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact/receipt`,
+          body: { sha256: "d".repeat(64), byteSize: 1 },
+        });
+        expect(unauthorizedReceipt.statusCode).toBe(401);
+        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(artifactLease);
+
+        now += 10;
+        const receipt = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact/receipt`,
+          token: "secret",
+          body: { sha256: "d".repeat(64), byteSize: 1 },
+        });
+        expect(receipt.statusCode).toBe(404);
+        const receiptLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        expect(Date.parse(receiptLease ?? "")).toBeGreaterThan(Date.parse(artifactLease ?? ""));
+
+        const unauthorizedSettlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/finalize`,
+          body: {},
+        });
+        expect(unauthorizedSettlement.statusCode).toBe(401);
+        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(receiptLease);
+
+        now += 10;
+        const invalidSettlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/finalize`,
+          token: "secret",
+          body: {},
+        });
+        expect(invalidSettlement.statusCode).toBe(400);
+        const settlementLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        expect(Date.parse(settlementLease ?? "")).toBeGreaterThan(Date.parse(receiptLease ?? ""));
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "holds one crash-recoverable controller lock per durable transaction store",
     async () => {
@@ -1352,6 +2012,108 @@ function remoteRunPayload() {
     browserConfig: {},
     options: {},
   };
+}
+
+const TEST_CONTROLLER_GENERATION = "server-test-controller";
+
+async function openSeedTransactionStore(
+  directory: string,
+  leaseDurationMs: number,
+  now: () => number,
+) {
+  return await RemoteTransactionStore.open({
+    directory,
+    controllerGeneration: TEST_CONTROLLER_GENERATION,
+    leaseDurationMs,
+    now,
+  });
+}
+
+async function seedRemoteTransaction(
+  store: RemoteTransactionStore,
+  transactionToken: string,
+  options: {
+    prompt: string;
+    state?: "running" | "pending" | "recoverable-error";
+    runtime?: BrowserRunTransaction["runtime"] | null;
+    settlementMode?: "finalize" | "abort";
+    publicationAcknowledged?: boolean;
+  },
+) {
+  const state = options.state ?? "pending";
+  const runtime =
+    options.runtime === null
+      ? undefined
+      : (options.runtime ?? {
+          conversationId: "remote-conversation",
+          promptEpoch: committedPromptEpoch(options.prompt),
+          recoveryCleanupResources: [
+            {
+              chromeTargetId: `target-${transactionToken.slice(0, 8)}`,
+              conversationId: "remote-conversation",
+              promptEpoch: committedPromptEpoch(options.prompt),
+              recoveryCleanup: {
+                transport: "local" as const,
+                ownsTarget: true,
+                profileKind: "temporary" as const,
+                keepBrowser: false,
+              },
+            },
+          ],
+        });
+  const now = new Date().toISOString();
+  await store.create({
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    transactionToken,
+    runId: `run-${transactionToken.slice(0, 8)}`,
+    createdAt: now,
+    updatedAt: now,
+    state,
+    requestIdentity: {
+      acceptedPromptSha256: [promptIdentitySha256(options.prompt)],
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+    },
+    browserConfig: {
+      chatgptUrl: "https://chatgpt.com",
+      url: "https://chatgpt.com",
+      remoteChrome: null,
+      attachRunning: false,
+    },
+    ...(runtime ? { runtime } : {}),
+    ...(state === "pending"
+      ? {
+          result: {
+            answerText: "durable answer",
+            answerMarkdown: "durable answer",
+            tookMs: 1,
+            answerTokens: 2,
+            answerChars: 14,
+          },
+        }
+      : {}),
+    ...(options.settlementMode ? { settlementMode: options.settlementMode } : {}),
+    ...(options.publicationAcknowledged
+      ? { publicationAcknowledgedAt: new Date().toISOString() }
+      : {}),
+  });
+  return runtime;
+}
+
+function remoteRecoveryTransactionToken(error: unknown): string {
+  if (!(error instanceof BrowserAutomationError)) {
+    throw new Error("Expected recoverable BrowserAutomationError");
+  }
+  const remoteRecovery = error.details?.remoteRecovery as
+    | { transactionToken?: unknown }
+    | undefined;
+  if (
+    typeof remoteRecovery?.transactionToken !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(remoteRecovery.transactionToken)
+  ) {
+    throw new Error("Recoverable error is missing exact remote transaction authority");
+  }
+  return remoteRecovery.transactionToken;
 }
 
 async function readIncomingBody(

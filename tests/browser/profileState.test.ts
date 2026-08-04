@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -20,35 +20,50 @@ import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
 
-function chromeIdentity(
+function syntheticWindowsChromeIdentity(
   userDataDir: string,
   overrides: Partial<ChromeProcessIdentity> = {},
 ): ChromeProcessIdentity {
-  const usesWindowsPathRules =
-    process.platform === "win32" ||
-    /^[a-z]:[\\/]/iu.test(userDataDir) ||
-    userDataDir.startsWith("\\\\");
-  const pathApi = usesWindowsPathRules ? path.win32 : path;
-  const resolvedUserDataDir = pathApi.resolve(userDataDir);
-  const existsLocally = existsSync(resolvedUserDataDir);
-  const canonicalPath = existsLocally ? realpathSync(resolvedUserDataDir) : resolvedUserDataDir;
-  const physical = existsLocally ? statSync(canonicalPath, { bigint: true }) : null;
-  const platform = usesWindowsPathRules ? "win32" : process.platform;
+  const canonicalPath = path.win32.resolve(userDataDir);
   return {
     pid: 4242,
     processStartTime: "process-generation-s",
-    executablePath: usesWindowsPathRules
-      ? String.raw`c:\program files\google\chrome\application\chrome.exe`
-      : "/usr/bin/google-chrome",
-    normalizedUserDataDir: platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath,
+    executablePath: path.win32
+      .resolve(String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`)
+      .toLowerCase(),
+    normalizedUserDataDir: canonicalPath.toLowerCase(),
     launchNonce: PROCESS_NONCE_S,
     profileDirectory: {
       version: 1,
-      platform,
+      platform: "win32",
       canonicalPath,
-      device: physical?.dev.toString() ?? "1",
-      inode: physical?.ino.toString() ?? "1",
+      device: "1",
+      inode: "1",
     },
+    ...overrides,
+  };
+}
+
+async function physicalChromeIdentity(
+  userDataDir: string,
+  overrides: Partial<ChromeProcessIdentity> = {},
+): Promise<ChromeProcessIdentity> {
+  const profileDirectory = await profileState.captureProfileDirectoryIdentity(userDataDir);
+  return {
+    pid: 4242,
+    processStartTime: "process-generation-s",
+    executablePath:
+      process.platform === "win32"
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`
+        : process.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome",
+    normalizedUserDataDir:
+      profileDirectory.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
+    launchNonce: PROCESS_NONCE_S,
+    profileDirectory,
     ...overrides,
   };
 }
@@ -94,7 +109,7 @@ describe("profileState", () => {
       }
 
       // Alive pid => keep locks and the one atomic owner record.
-      const aliveIdentity = chromeIdentity(dir, { pid: process.pid });
+      const aliveIdentity = await physicalChromeIdentity(dir, { pid: process.pid });
       await profileState.writeOracleChromeOwner(dir, {
         port: 12345,
         processIdentity: aliveIdentity,
@@ -114,7 +129,7 @@ describe("profileState", () => {
       const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
       await once(child, "exit");
       if (!child.pid) throw new Error("Exited child never published a pid");
-      const deadIdentity = chromeIdentity(dir, { pid: child.pid });
+      const deadIdentity = await physicalChromeIdentity(dir, { pid: child.pid });
       await profileState.writeOracleChromeOwner(dir, {
         port: 12345,
         processIdentity: deadIdentity,
@@ -139,7 +154,7 @@ describe("profileState", () => {
   test("never signals a re-used pid after userspace identity verification", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
     try {
-      const identity = chromeIdentity(dir);
+      const identity = await physicalChromeIdentity(dir);
       await profileState.writeOracleChromeOwner(dir, { port: 12345, processIdentity: identity });
       const originalSnapshot = {
         pid: identity.pid,
@@ -218,7 +233,7 @@ describe("profileState", () => {
   });
 
   test("captures a macOS Chrome executable from its physical text vnode", async () => {
-    const userDataDir = "/tmp/oracle-mac-profile";
+    const userDataDir = path.join(os.tmpdir(), "oracle-mac-profile");
     const profileDirectory = {
       version: 1 as const,
       platform: "darwin" as const,
@@ -263,7 +278,7 @@ describe("profileState", () => {
 
   test("crash recovery without stable authority remains pending and never taskkills", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
-    const identity = chromeIdentity(profileDir);
+    const identity = syntheticWindowsChromeIdentity(profileDir);
     const terminationCalls: Array<{ file: string; args: string[] }> = [];
     await expect(
       profileState.terminateRecordedChromeForProfileForTest(profileDir, identity, undefined, {
@@ -439,7 +454,7 @@ describe("profileState", () => {
     const movedDir = path.join(root, "moved-profile");
     try {
       await mkdir(profileDir);
-      const identity = chromeIdentity(profileDir);
+      const identity = await physicalChromeIdentity(profileDir);
       await rename(profileDir, movedDir);
       await mkdir(profileDir);
       await expect(

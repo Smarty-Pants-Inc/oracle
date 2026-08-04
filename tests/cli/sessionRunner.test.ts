@@ -1240,7 +1240,7 @@ describe("performSessionRun", () => {
         {
           chromeTargetId: "remote-finalize-target",
           remoteRecovery: {
-            protocolVersion: 2,
+            protocolVersion: 3,
             host: "bridge.example:9443",
             transactionToken: "a".repeat(64),
             state: "pending",
@@ -1255,7 +1255,7 @@ describe("performSessionRun", () => {
       ],
       recoveryCleanupResult: { status: "pending" },
       remoteRecovery: {
-        protocolVersion: 2,
+        protocolVersion: 3,
         host: "bridge.example:9443",
         transactionToken: "a".repeat(64),
         state: "pending",
@@ -1849,6 +1849,54 @@ describe("performSessionRun", () => {
       status: "error",
       response: { status: "error", incompleteReason: "chrome-disconnected" },
     });
+  });
+
+  test("retains remote-only pre-receipt authority and prints reattach guidance", async () => {
+    const remoteRuntime: BrowserRuntimeMetadata = {
+      remoteRecovery: {
+        protocolVersion: 3,
+        host: "bridge.example:9443",
+        transactionToken: "d".repeat(64),
+        state: "pre-receipt",
+        requestIdentity: {
+          acceptedPromptSha256: ["e".repeat(64)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+      },
+    };
+    const automationError = new BrowserAutomationError(
+      "Remote browser response disconnected before the durable receipt.",
+      {
+        stage: "remote-retry",
+        recoverableDisconnect: true,
+        runtime: remoteRuntime,
+      },
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/remote browser response disconnected/i);
+
+    const logLines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logLines).toContain("oracle session sess-1 --render");
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: {
+        runtime: remoteRuntime,
+      },
+    });
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
   });
 
   test("marks a non-recoverable disconnect as an error without reattach", async () => {

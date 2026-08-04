@@ -69,6 +69,15 @@ async function createPendingStore(root: string, transactionToken: string) {
     createdAt,
     updatedAt: createdAt,
     state: "pending",
+    requestIdentity: {
+      acceptedPromptSha256: ["a".repeat(64)],
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+    },
+    browserConfig: {
+      chatgptUrl: "https://chatgpt.com",
+      url: "https://chatgpt.com",
+    },
     runtime,
     result: capturedResult,
   });
@@ -141,6 +150,9 @@ describe("RemoteTransactionCoordinator", () => {
       expect(finalizedRecord).not.toHaveProperty("artifacts");
       expect(finalizedRecord).not.toHaveProperty("settlementMode");
       expect(finalizedRecord).not.toHaveProperty("publicationAcknowledgedAt");
+      expect(finalizedRecord).not.toHaveProperty("requestIdentity");
+      expect(finalizedRecord).not.toHaveProperty("browserConfig");
+      expect(finalizedRecord).not.toHaveProperty("leaseExpiresAt");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -162,7 +174,6 @@ describe("RemoteTransactionCoordinator", () => {
               birthtimeNs: "3",
               ctimeNs: "4",
             },
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
             descriptor: {
               artifactId: "artifact-1",
               runId: "run-1",
@@ -211,6 +222,46 @@ describe("RemoteTransactionCoordinator", () => {
         coordinator.settle({ transactionToken, mode: "finalize", durablePublication: true }),
       ).resolves.toMatchObject({ record: { state: "finalized" } });
       expect(finalize).toHaveBeenCalledOnce();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retries durable cleanup with the exact persisted settlement mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-cleanup-mode-"));
+    const abortToken = "1".repeat(64);
+    const finalizeToken = "2".repeat(64);
+    try {
+      const store = await createPendingStore(root, abortToken);
+      await createPendingStore(root, finalizeToken);
+      const retryCleanup = vi.fn(
+        async (_runtime: BrowserRunTransaction["runtime"], _mode: "finalize" | "abort") => ({
+          status: "completed" as const,
+          runtime,
+        }),
+      );
+      const coordinator = new RemoteTransactionCoordinator({
+        transactionStore: store,
+        retryCleanup,
+      });
+
+      await expect(
+        coordinator.settle({
+          transactionToken: abortToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).resolves.toMatchObject({ record: { state: "aborted" } });
+      await expect(
+        coordinator.settle({
+          transactionToken: finalizeToken,
+          mode: "finalize",
+          durablePublication: true,
+        }),
+      ).resolves.toMatchObject({ record: { state: "finalized" } });
+
+      expect(retryCleanup).toHaveBeenNthCalledWith(1, runtime, "abort");
+      expect(retryCleanup).toHaveBeenNthCalledWith(2, runtime, "finalize");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

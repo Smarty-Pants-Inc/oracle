@@ -7,8 +7,17 @@ import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
+const nonterminalAuthority = {
+  requestIdentity: {
+    acceptedPromptSha256: ["8".repeat(64)],
+    followUpOrdinal: 0,
+    remainingFollowUps: 0 as const,
+  },
+  browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+};
+
 describe("RemoteArtifactStore", () => {
-  test("restores authorization after restart and requires an idempotent delivery receipt", async () => {
+  test("keeps artifacts authorized across thirty minutes until transaction settlement", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-store-"));
     const sessionsRoot = path.join(root, "sessions");
     const artifactDirectory = path.join(sessionsRoot, "session-1", "artifacts");
@@ -17,7 +26,8 @@ describe("RemoteArtifactStore", () => {
     const transactionToken = "c".repeat(64);
     const payload = Buffer.from("durable artifact", "utf8");
     const sha256 = createHash("sha256").update(payload).digest("hex");
-    const createdAt = new Date().toISOString();
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    const createdAt = new Date(now).toISOString();
 
     try {
       await mkdir(artifactDirectory, { recursive: true });
@@ -25,6 +35,7 @@ describe("RemoteArtifactStore", () => {
       const firstTransactionStore = await RemoteTransactionStore.open({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-1",
+        now: () => now,
       });
       await firstTransactionStore.create({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -33,10 +44,12 @@ describe("RemoteArtifactStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "pending",
+        ...nonterminalAuthority,
       });
       const firstArtifactStore = new RemoteArtifactStore({
         transactionStore: firstTransactionStore,
         sessionsRoot,
+        now: () => now,
       });
       const registrations = await firstArtifactStore.prepareRequiredArtifacts({
         transactionToken,
@@ -70,19 +83,23 @@ describe("RemoteArtifactStore", () => {
           birthtimeNs: expect.any(String),
           ctimeNs: expect.any(String),
         },
-        expiresAt: expect.any(String),
       });
+      expect(registration).not.toHaveProperty("expiresAt");
       await expect(firstArtifactStore.requiredDeliveriesComplete(transactionToken)).resolves.toBe(
         false,
       );
 
+      now += 31 * 60 * 1000;
+
       const restartedTransactionStore = await RemoteTransactionStore.open({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-2",
+        now: () => now,
       });
       const restartedArtifactStore = new RemoteArtifactStore({
         transactionStore: restartedTransactionStore,
         sessionsRoot,
+        now: () => now,
       });
       const opened = await restartedArtifactStore.openForDelivery(
         transactionToken,
@@ -122,6 +139,16 @@ describe("RemoteArtifactStore", () => {
           },
         ],
       });
+      await restartedTransactionStore.update(transactionToken, (record) => {
+        record.state = "aborted";
+        record.settlementMode = "abort";
+      });
+      await expect(
+        restartedArtifactStore.openForDelivery(
+          transactionToken,
+          registration.descriptor.artifactId,
+        ),
+      ).resolves.toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -148,6 +175,7 @@ describe("RemoteArtifactStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "pending",
+        ...nonterminalAuthority,
       });
       const artifactStore = new RemoteArtifactStore({ transactionStore, sessionsRoot });
       const registrations = await artifactStore.prepareRequiredArtifacts({

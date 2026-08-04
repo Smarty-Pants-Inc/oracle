@@ -25,7 +25,10 @@ export interface RemoteTransactionSettlementOutcome {
 
 export interface RemoteTransactionCoordinatorOptions {
   transactionStore: RemoteTransactionStore;
-  retryCleanup: (runtime: BrowserRuntimeMetadata) => Promise<BrowserCaptureFinalizationResult>;
+  retryCleanup: (
+    runtime: BrowserRuntimeMetadata,
+    mode: "finalize" | "abort",
+  ) => Promise<BrowserCaptureFinalizationResult>;
   activeTransactions?: Map<string, BrowserRunTransaction>;
 }
 
@@ -33,6 +36,7 @@ export class RemoteTransactionCoordinator {
   readonly #transactionStore: RemoteTransactionStore;
   readonly #retryCleanup: (
     runtime: BrowserRuntimeMetadata,
+    mode: "finalize" | "abort",
   ) => Promise<BrowserCaptureFinalizationResult>;
   readonly #activeTransactions: Map<string, BrowserRunTransaction>;
 
@@ -75,7 +79,7 @@ export class RemoteTransactionCoordinator {
             "Transaction did not capture an answer or recoverable browser authority",
           );
         }
-        if (record.state === "recoverable-error" && params.mode === "finalize") {
+        if (record.state === "recoverable-error" && !record.result && params.mode === "finalize") {
           throw new RemoteTransactionConflictError(
             409,
             "transaction_has_no_capture",
@@ -135,7 +139,7 @@ export class RemoteTransactionCoordinator {
           ? await active[params.mode]().catch((error) =>
               pendingFinalization(runtimeBeforeSettlement, error),
             )
-          : await this.#retryCleanup(runtimeBeforeSettlement).catch((error) =>
+          : await this.#retryCleanup(runtimeBeforeSettlement, params.mode).catch((error) =>
               pendingFinalization(runtimeBeforeSettlement, error),
             );
 

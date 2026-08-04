@@ -2,7 +2,10 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
-import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+import {
+  REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+} from "../../src/remote/types.js";
 import {
   RemoteTransactionCapacityError,
   RemoteTransactionStore,
@@ -19,6 +22,15 @@ const committedPromptEpoch = {
   verifiedUserTurnId: "user-turn-1",
   verifiedUserMessageId: "user-message-1",
   conversationId: "conversation-1",
+};
+
+const nonterminalAuthority = {
+  requestIdentity: {
+    acceptedPromptSha256: ["9".repeat(64)],
+    followUpOrdinal: 0,
+    remainingFollowUps: 0 as const,
+  },
+  browserConfig: { chatgptUrl: "https://chatgpt.com/" },
 };
 
 function restartError(hadRuntimeAuthority: boolean) {
@@ -50,6 +62,7 @@ describe("RemoteTransactionStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "running",
+        ...nonterminalAuthority,
       });
       await firstController.journalRuntime(transactionToken, {
         chromeTargetId: "target-1",
@@ -128,6 +141,7 @@ describe("RemoteTransactionStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "running",
+        ...nonterminalAuthority,
       });
 
       const restartedController = await RemoteTransactionStore.open({
@@ -155,7 +169,7 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
-  test("rejects new transactions before side effects when record capacity is exhausted", async () => {
+  test("counts captured pending transactions against the bounded record limit", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-record-capacity-"));
     const createdAt = new Date().toISOString();
     try {
@@ -169,7 +183,8 @@ describe("RemoteTransactionStore", () => {
         runId: "run-capacity-1",
         createdAt,
         updatedAt: createdAt,
-        state: "running",
+        state: "pending",
+        ...nonterminalAuthority,
       });
       await expect(
         store.create({
@@ -178,7 +193,8 @@ describe("RemoteTransactionStore", () => {
           runId: "run-capacity-2",
           createdAt,
           updatedAt: createdAt,
-          state: "running",
+          state: "pending",
+          ...nonterminalAuthority,
         }),
       ).rejects.toMatchObject({
         name: "RemoteTransactionCapacityError",
@@ -203,9 +219,128 @@ describe("RemoteTransactionStore", () => {
           createdAt,
           updatedAt: createdAt,
           state: "running",
+          ...nonterminalAuthority,
         }),
       ).rejects.toBeInstanceOf(RemoteTransactionCapacityError);
       await expect(store.list()).resolves.toHaveLength(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("charges sixteen abandoned captured records by actual bytes instead of running reservation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-captured-capacity-"));
+    const createdAt = new Date().toISOString();
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      for (let index = 0; index < 16; index += 1) {
+        await store.create({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          transactionToken: index.toString(16).padStart(64, "0"),
+          runId: `captured-${index}`,
+          createdAt,
+          updatedAt: createdAt,
+          state: "pending",
+          ...nonterminalAuthority,
+          result: {
+            answerText: "captured",
+            answerMarkdown: "captured",
+            tookMs: 1,
+            answerTokens: 1,
+            answerChars: 8,
+          },
+        });
+      }
+
+      const runningToken = "f".repeat(64);
+      await expect(
+        store.create({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          transactionToken: runningToken,
+          runId: "running-after-captures",
+          createdAt,
+          updatedAt: createdAt,
+          state: "running",
+          ...nonterminalAuthority,
+        }),
+      ).resolves.toBeUndefined();
+
+      const records = await store.list();
+      expect(records).toHaveLength(17);
+      expect(records.filter((record) => record.state === "pending")).toHaveLength(16);
+      expect(records.find((record) => record.transactionToken === runningToken)).toMatchObject({
+        capacityReservationBytes: REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
+      });
+      expect(records.find((record) => record.state === "pending")).not.toHaveProperty(
+        "capacityReservationBytes",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("renews leases only on explicit persistence and lists expired records deterministically", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-lease-"));
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    const createdAt = new Date(now).toISOString();
+    const passiveToken = "1".repeat(64);
+    const secondExpiredToken = "4".repeat(64);
+    const renewedToken = "2".repeat(64);
+    const persistedToken = "3".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: root,
+        leaseDurationMs: 1_000,
+        now: () => now,
+      });
+      for (const [transactionToken, runId] of [
+        [secondExpiredToken, "expired-second"],
+        [passiveToken, "expired-first"],
+        [renewedToken, "renewed"],
+        [persistedToken, "persisted"],
+      ] as const) {
+        await store.create({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          transactionToken,
+          runId,
+          createdAt,
+          updatedAt: createdAt,
+          state: "pending",
+          ...nonterminalAuthority,
+        });
+      }
+      const runningToken = "5".repeat(64);
+      await store.create({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken: runningToken,
+        runId: "runtime-journal",
+        createdAt,
+        updatedAt: createdAt,
+        state: "running",
+        ...nonterminalAuthority,
+      });
+      const initialRuntimeLease = (await store.read(runningToken))?.leaseExpiresAt;
+      const initialPassiveLease = (await store.read(passiveToken))?.leaseExpiresAt;
+
+      now += 500;
+      await store.read(passiveToken);
+      const renewed = await store.renewLease(renewedToken);
+      await store.update(persistedToken, () => undefined);
+      const journaled = await store.journalRuntime(runningToken, {
+        chromeTargetId: "runtime-target",
+      });
+      expect(Date.parse(renewed.leaseExpiresAt ?? "")).toBe(now + 1_000);
+      expect(journaled.leaseExpiresAt).not.toBe(initialRuntimeLease);
+
+      now += 501;
+      await expect(store.listExpiredNonterminalRecords()).resolves.toEqual([
+        expect.objectContaining({ transactionToken: passiveToken }),
+        expect.objectContaining({ transactionToken: secondExpiredToken }),
+      ]);
+      expect((await store.read(passiveToken))?.leaseExpiresAt).toBe(initialPassiveLease);
+      await expect(store.renewLease(passiveToken)).rejects.toThrow(
+        "Cannot renew an expired remote transaction lease",
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -224,6 +359,11 @@ describe("RemoteTransactionStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "pending",
+        ...nonterminalAuthority,
+        browserConfig: {
+          ...nonterminalAuthority.browserConfig,
+          manualLoginProfileDir: "/private/server/manual-profile",
+        },
         result: {
           answerText: "sensitive answer",
           answerMarkdown: "sensitive answer",
@@ -258,7 +398,6 @@ describe("RemoteTransactionStore", () => {
               birthtimeNs: "3",
               ctimeNs: "4",
             },
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
             deliveryReceipt: {
               receiptId: "receipt-1",
               deliveredAt: createdAt,
@@ -297,10 +436,15 @@ describe("RemoteTransactionStore", () => {
       expect(terminalRecord).not.toHaveProperty("artifacts");
       expect(terminalRecord).not.toHaveProperty("settlementMode");
       expect(terminalRecord).not.toHaveProperty("publicationAcknowledgedAt");
+      expect(terminalRecord).not.toHaveProperty("requestIdentity");
+      expect(terminalRecord).not.toHaveProperty("browserConfig");
+      expect(terminalRecord).not.toHaveProperty("leaseExpiresAt");
       const raw = await readFile(store.recordPath(transactionToken), "utf8");
       expect(raw).not.toContain("sensitive answer");
       expect(raw).not.toContain("/private/server");
       expect(raw).not.toContain("secret-target");
+      expect(raw).not.toContain("acceptedPromptSha256");
+      expect(raw).not.toContain("manual-profile");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -324,6 +468,7 @@ describe("RemoteTransactionStore", () => {
         createdAt,
         updatedAt: createdAt,
         state: "running",
+        ...nonterminalAuthority,
       });
       await first.update(transactionToken, (record) => {
         record.state = "failed";

@@ -39,6 +39,7 @@ import {
   MAX_REMOTE_REQUEST_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   REMOTE_TRANSACTION_TOKEN_PATTERN,
+  buildRemotePromptRequestIdentity,
   RemoteAbortRequestSchema,
   RemoteArtifactDeliveryReceiptRequestSchema,
   RemoteFinalizeRequestSchema,
@@ -53,16 +54,20 @@ import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { getOracleHomeDir } from "../oracleHome.js";
-import { normalizeChatgptUrl } from "../browser/utils.js";
+import { normalizeChatgptUrl, estimateTokenCount } from "../browser/utils.js";
 import { sanitizeArtifactFilename, sanitizeArtifactMimeType } from "../browser/artifacts.js";
-import { promptIdentitySha256 } from "../browser/actions/promptComposer.js";
 import type {
+  BrowserRemotePromptRequestIdentity,
   BrowserRuntimeMetadata,
   BrowserSessionConfig,
   SessionArtifact,
 } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { retryBrowserRecoveryCleanup } from "../browser/reattach.js";
+import {
+  resumeBrowserSession,
+  retryBrowserRecoveryCleanup,
+  type ReattachResult,
+} from "../browser/reattach.js";
 import { acquireManualChromeOwner } from "../browser/manualChromeOwner.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
@@ -71,6 +76,7 @@ import {
   type DurableRemoteAutomationError,
   RemoteTransactionCapacityError,
   type RemoteTransactionRecord,
+  type ReconcileRemoteTransactionResult,
   RemoteTransactionStore,
 } from "./transactionStore.js";
 import {
@@ -93,9 +99,13 @@ export interface RemoteServerOptions {
 
 interface RemoteServerDeps {
   runBrowser?: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  resumeBrowser?: typeof resumeBrowserSession;
   transactionStoreDir?: string;
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
   controllerGeneration?: string;
+  transactionLeaseDurationMs?: number;
+  transactionStoreNow?: () => number;
+  leaseSweepIntervalMs?: number;
 }
 
 interface RemoteServerInstance {
@@ -142,6 +152,7 @@ export async function createRemoteServer(
   const bindHost = options.host ?? "127.0.0.1";
   assertLoopbackRemoteBind(bindHost);
   const runBrowser = deps.runBrowser ?? runBrowserMode;
+  const resumeBrowser = deps.resumeBrowser ?? resumeBrowserSession;
   const retryCleanup = deps.retryCleanup ?? retryBrowserRecoveryCleanup;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
@@ -157,10 +168,25 @@ export async function createRemoteServer(
     : (_formatter: (msg: string) => string, msg: string) => msg;
   const transactionStoreDir =
     deps.transactionStoreDir ?? path.join(getOracleHomeDir(), "remote-transactions");
-  const transactionStore = await RemoteTransactionStore.open({
-    directory: transactionStoreDir,
-    controllerGeneration: deps.controllerGeneration,
-  });
+  const controllerGeneration = deps.controllerGeneration ?? randomUUID();
+  const controllerLock = await acquireCrashRecoverableFilesystemLock(
+    path.join(transactionStoreDir, ".controller.lock"),
+    {
+      sessionId: `remote-controller:${controllerGeneration}`,
+    },
+  );
+  let transactionStore: RemoteTransactionStore;
+  try {
+    transactionStore = await RemoteTransactionStore.open({
+      directory: transactionStoreDir,
+      leaseDurationMs: deps.transactionLeaseDurationMs,
+      now: deps.transactionStoreNow,
+      controllerGeneration,
+    });
+  } catch (error) {
+    await controllerLock.release().catch(() => undefined);
+    throw error;
+  }
   const artifactStore = new RemoteArtifactStore({
     transactionStore,
     sessionsRoot: path.join(getOracleHomeDir(), "sessions"),
@@ -172,20 +198,55 @@ export async function createRemoteServer(
   const transactionCoordinator = new RemoteTransactionCoordinator({
     transactionStore,
     activeTransactions,
-    retryCleanup: (runtime) => retryCleanup(runtime, cleanupLogger),
+    retryCleanup: (runtime, mode) => retryCleanup(runtime, cleanupLogger, {}, mode),
   });
-  const controllerLock = await acquireCrashRecoverableFilesystemLock(
-    path.join(transactionStoreDir, ".controller.lock"),
-    {
-      createParent: false,
-      sessionId: `remote-controller:${transactionStore.controllerGeneration}`,
-    },
-  );
-  let reconciled: Awaited<ReturnType<typeof transactionStore.reconcileStaleRunningRecords>>;
+
+  // Remote Chrome and lease settlement are single-flight. Per-record work is additionally
+  // serialized by RemoteTransactionStore.
+  let browserWorkBusy = false;
+  let sweepInFlight: Promise<void> | null = null;
+  const runBrowserWork = async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (browserWorkBusy) {
+      throw new RemoteTransactionConflictError(
+        409,
+        "busy",
+        "Remote browser authority is already in use",
+      );
+    }
+    browserWorkBusy = true;
+    try {
+      return await operation();
+    } finally {
+      browserWorkBusy = false;
+    }
+  };
+  const sweepExpiredAuthority = async (waitForExisting = false): Promise<void> => {
+    if (sweepInFlight) {
+      if (waitForExisting) await sweepInFlight;
+      return;
+    }
+    if (browserWorkBusy) return;
+    browserWorkBusy = true;
+    const sweep = sweepExpiredRemoteTransactions({
+      transactionStore,
+      transactionCoordinator,
+      logger,
+    });
+    sweepInFlight = sweep;
+    try {
+      await sweep;
+    } finally {
+      if (sweepInFlight === sweep) sweepInFlight = null;
+      browserWorkBusy = false;
+    }
+  };
+
+  let reconciled: ReconcileRemoteTransactionResult[];
   try {
     reconciled = await transactionStore.reconcileStaleRunningRecords({
       buildError: buildControllerRestartError,
     });
+    await sweepExpiredAuthority(true);
   } catch (error) {
     await controllerLock.release().catch(() => undefined);
     throw error;
@@ -195,9 +256,6 @@ export async function createRemoteServer(
       `[serve] Reconciled stale running transaction ${record.transactionToken.slice(0, 12)} (${record.state}).`,
     );
   }
-
-  // Remote Chrome is single-flight, while captured transactions remain independently settleable.
-  let busy = false;
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -243,6 +301,7 @@ export async function createRemoteServer(
           req,
           res,
           artifactStore,
+          transactionStore,
           transactionToken: artifactReceiptMatch.transactionToken,
           artifactId: artifactReceiptMatch.artifactId,
         });
@@ -256,6 +315,7 @@ export async function createRemoteServer(
           res,
           authToken,
           artifactStore,
+          transactionStore,
           logger,
           verbose,
           transactionToken: artifactMatch.transactionToken,
@@ -279,7 +339,8 @@ export async function createRemoteServer(
           return;
         }
         if (transactionMatch.action === "run") {
-          if (busy) {
+          await sweepExpiredAuthority(true);
+          if (browserWorkBusy) {
             if (verbose) {
               logger(
                 `[serve] Busy: rejecting new run from ${formatSocket(req)} while another run is active`,
@@ -288,7 +349,7 @@ export async function createRemoteServer(
             sendJson(res, 409, { error: "busy" });
             return;
           }
-          busy = true;
+          browserWorkBusy = true;
           try {
             await handleRemoteRunRequest({
               req,
@@ -303,7 +364,7 @@ export async function createRemoteServer(
               transactionCoordinator,
             });
           } finally {
-            busy = false;
+            browserWorkBusy = false;
           }
           return;
         }
@@ -312,7 +373,12 @@ export async function createRemoteServer(
             req,
             res,
             transactionStore,
+            artifactStore,
+            transactionCoordinator,
             transactionToken: transactionMatch.transactionToken,
+            resumeBrowser,
+            runBrowserWork,
+            logger: cleanupLogger,
           });
           return;
         }
@@ -321,7 +387,9 @@ export async function createRemoteServer(
           res,
           transactionToken: transactionMatch.transactionToken,
           mode: transactionMatch.action,
+          transactionStore,
           transactionCoordinator,
+          runBrowserWork,
         });
         return;
       }
@@ -360,6 +428,23 @@ export async function createRemoteServer(
     await controllerLock.release().catch(() => undefined);
     throw new Error("Unable to determine server address.");
   }
+  const leaseSweepIntervalMs = deps.leaseSweepIntervalMs ?? 30_000;
+  if (!Number.isSafeInteger(leaseSweepIntervalMs) || leaseSweepIntervalMs <= 0) {
+    const closeDeferred = createDeferred<void>();
+    server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
+    await closeDeferred.promise.catch(() => undefined);
+    await controllerLock.release().catch(() => undefined);
+    throw new Error("Invalid remote transaction lease sweep interval");
+  }
+  const leaseSweepTimer = setInterval(() => {
+    void sweepExpiredAuthority().catch((error) => {
+      logger(
+        `[serve] Expired transaction sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }, leaseSweepIntervalMs);
+  leaseSweepTimer.unref();
+
   const boundEndpoint = address.address.includes(":")
     ? `[${address.address}]:${address.port}`
     : `${address.address}:${address.port}`;
@@ -368,14 +453,19 @@ export async function createRemoteServer(
   logger(color(chalk.yellowBright, `Access token: ${authToken}`));
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
+  let closed = false;
   return {
     port: address.port,
     token: authToken,
     async close() {
+      if (closed) return;
+      closed = true;
+      clearInterval(leaseSweepTimer);
       try {
         const closeDeferred = createDeferred<void>();
         server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
         await closeDeferred.promise;
+        await sweepInFlight?.catch(() => undefined);
       } finally {
         await controllerLock.release();
       }
@@ -421,6 +511,11 @@ async function handleRemoteRunRequest(params: {
     });
     return;
   }
+  const requestIdentity = buildRemotePromptRequestIdentity(payload);
+  const effectiveBrowserConfig = buildEffectiveRemoteBrowserConfig(
+    payload.browserConfig,
+    params.options,
+  );
 
   const existing = await params.transactionStore.read(params.transactionToken);
   if (existing) {
@@ -442,6 +537,8 @@ async function handleRemoteRunRequest(params: {
       createdAt: now,
       updatedAt: now,
       state: "running",
+      requestIdentity,
+      browserConfig: effectiveBrowserConfig,
     });
   } catch (error) {
     if (error instanceof RemoteTransactionCapacityError) {
@@ -500,10 +597,6 @@ async function handleRemoteRunRequest(params: {
       };
     }
 
-    const effectiveBrowserConfig = buildEffectiveRemoteBrowserConfig(
-      payload.browserConfig,
-      params.options,
-    );
     if (params.verbose && params.options.manualLoginDefault) {
       params.logger(
         `[serve] Enforcing manual-login profile at ${params.options.manualLoginProfileDir ?? "default"} for remote run ${runId}`,
@@ -531,7 +624,7 @@ async function handleRemoteRunRequest(params: {
     assertBrowserRunTransaction(capture);
     const capturedTransaction = capture;
     const result = browserRunResultFromTransaction(capturedTransaction);
-    assertCapturedPromptIdentity(payload, result, capturedTransaction.runtime);
+    assertCapturedPromptIdentity(requestIdentity, result, capturedTransaction.runtime);
     const fileArtifacts: SessionArtifact[] = [
       ...(result.savedFiles ?? []),
       ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
@@ -596,6 +689,11 @@ async function handleRemoteRunRequest(params: {
             rawError,
           );
     const failedCapture = capture;
+    if (failedCapture) {
+      await params.transactionStore.update(params.transactionToken, (current) => {
+        current.settlementMode = "abort";
+      });
+    }
     const failedCleanup = failedCapture
       ? await failedCapture
           .abort()
@@ -711,8 +809,25 @@ async function serveRemoteTransactionRetry(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
   transactionStore: RemoteTransactionStore;
+  artifactStore: RemoteArtifactStore;
+  transactionCoordinator: RemoteTransactionCoordinator;
   transactionToken: string;
+  resumeBrowser: typeof resumeBrowserSession;
+  runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
+  logger: BrowserLogger;
 }): Promise<void> {
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
   try {
     const raw = await readRequestBody(params.req, 4096);
     RemoteRetryRequestSchema.parse(raw ? JSON.parse(raw) : {});
@@ -720,32 +835,161 @@ async function serveRemoteTransactionRetry(params: {
     sendJson(params.res, 400, { error: "invalid_retry_request" });
     return;
   }
-  const record = await params.transactionStore.read(params.transactionToken);
-  if (!record) {
-    sendJson(params.res, 404, { error: "transaction_not_found" });
-    return;
+
+  try {
+    const outcome = await params.transactionStore.withTransactionRecord(
+      params.transactionToken,
+      async (record, persist) => {
+        if (record.state === "running") {
+          return { statusCode: 202, body: { status: "running" as const } };
+        }
+        if (record.state === "finalized" || record.state === "aborted") {
+          return {
+            statusCode: 409,
+            body: {
+              error: "transaction_already_settled",
+              state: record.state,
+              transactionToken: record.transactionToken,
+            },
+          };
+        }
+        if (record.result) {
+          const response: RemoteTransactionRetryResponse = {
+            status: "transaction",
+            transaction: remoteTransactionPayload(record),
+          };
+          return { statusCode: 200, body: response };
+        }
+        if (record.state !== "recoverable-error" || !record.runtime || record.settlementMode) {
+          const response: RemoteTransactionRetryResponse = {
+            status: "error",
+            error: remoteBrowserAutomationError(record),
+          };
+          return { statusCode: 200, body: response };
+        }
+
+        const recoveryRuntime = record.runtime;
+        return await params.runBrowserWork(async () => {
+          const recoveryStartedAt = Date.now();
+          let recovered: ReattachResult;
+          try {
+            recovered = await params.resumeBrowser(
+              recoveryRuntime,
+              record.browserConfig,
+              params.logger,
+            );
+          } catch (rawError) {
+            const error =
+              rawError instanceof BrowserAutomationError
+                ? rawError
+                : new BrowserAutomationError(
+                    rawError instanceof Error ? rawError.message : "Remote browser recovery failed",
+                    { stage: "remote-answer-recovery" },
+                    rawError,
+                  );
+            record.runtime = browserRuntimeFromError(error) ?? record.runtime;
+            record.error = serializeDurableBrowserAutomationError(error, true);
+            record.finalization = undefined;
+            await persist();
+            const response: RemoteTransactionRetryResponse = {
+              status: "error",
+              error: remoteBrowserAutomationError(record),
+            };
+            return { statusCode: 200, body: response };
+          }
+
+          const capture = browserTransactionFromRecoveredSession(
+            recovered,
+            Date.now() - recoveryStartedAt,
+          );
+          const result = browserRunResultFromTransaction(capture);
+          try {
+            assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
+            const fileArtifacts: SessionArtifact[] = [
+              ...(result.savedFiles ?? []),
+              ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+            ];
+            const registrations = await params.artifactStore.prepareRequiredArtifacts({
+              transactionToken: record.transactionToken,
+              runId: record.runId,
+              artifacts: fileArtifacts,
+            });
+            if (
+              registrations.some(
+                (registration) =>
+                  registration.transactionToken !== record.transactionToken ||
+                  registration.descriptor.runId !== record.runId,
+              )
+            ) {
+              throw new Error(
+                "Recovered remote artifact registration identity does not match capture",
+              );
+            }
+            record.state = "pending";
+            record.result = projectRemotePublicResult(result);
+            record.runtime = capture.runtime;
+            record.modelSelection = result.modelSelection;
+            record.artifacts = registrations;
+            record.error = undefined;
+            record.finalization = undefined;
+            await persist();
+          } catch (rawError) {
+            const error =
+              rawError instanceof BrowserAutomationError
+                ? rawError
+                : new BrowserAutomationError(
+                    rawError instanceof Error
+                      ? rawError.message
+                      : "Recovered remote capture could not be durably published.",
+                    {
+                      stage: "remote-answer-publication",
+                      code: "remote-answer-publication-failed",
+                    },
+                    rawError,
+                  );
+            record.state = "recoverable-error";
+            record.settlementMode = "abort";
+            record.runtime = capture.runtime;
+            record.result = undefined;
+            record.modelSelection = undefined;
+            record.artifacts = undefined;
+            record.finalization = undefined;
+            record.error = serializeDurableBrowserAutomationError(error, true);
+            await persist();
+            const finalization = await capture
+              .abort()
+              .catch((cleanupError) => pendingCleanupResult(capture.runtime, cleanupError));
+            record.runtime = finalization.runtime;
+            record.finalization = finalization;
+            record.error = serializeDurableBrowserAutomationError(
+              error,
+              finalization.status === "pending",
+            );
+            record.state = finalization.status === "completed" ? "failed" : "recoverable-error";
+            await persist();
+            const response: RemoteTransactionRetryResponse = {
+              status: "error",
+              error: remoteBrowserAutomationError(record),
+            };
+            return { statusCode: 200, body: response };
+          }
+          params.transactionCoordinator.registerActive(record.transactionToken, capture);
+          const response: RemoteTransactionRetryResponse = {
+            status: "transaction",
+            transaction: remoteTransactionPayload(record),
+          };
+          return { statusCode: 200, body: response };
+        });
+      },
+    );
+    sendJson(params.res, outcome.statusCode, outcome.body);
+  } catch (error) {
+    if (error instanceof RemoteTransactionConflictError) {
+      sendJson(params.res, error.statusCode, { error: error.code, message: error.message });
+      return;
+    }
+    throw error;
   }
-  let response: RemoteTransactionRetryResponse;
-  if (record.state === "running") {
-    response = { status: "running" };
-    sendJson(params.res, 202, response);
-    return;
-  }
-  if (record.state === "finalized" || record.state === "aborted") {
-    sendJson(params.res, 409, {
-      error: "transaction_already_settled",
-      state: record.state,
-      transactionToken: record.transactionToken,
-    });
-    return;
-  }
-  if (!record.result) {
-    response = { status: "error", error: remoteBrowserAutomationError(record) };
-    sendJson(params.res, 200, response);
-    return;
-  }
-  response = { status: "transaction", transaction: remoteTransactionPayload(record) };
-  sendJson(params.res, 200, response);
 }
 
 async function serveRemoteTransactionSettlement(params: {
@@ -753,8 +997,22 @@ async function serveRemoteTransactionSettlement(params: {
   res: http.ServerResponse;
   transactionToken: string;
   mode: "finalize" | "abort";
+  transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
+  runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
 }): Promise<void> {
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
   let durablePublication = false;
   try {
     const raw = await readRequestBody(params.req, 4096);
@@ -770,11 +1028,16 @@ async function serveRemoteTransactionSettlement(params: {
   }
 
   try {
-    const outcome = await params.transactionCoordinator.settle({
-      transactionToken: params.transactionToken,
-      mode: params.mode,
-      durablePublication,
-    });
+    const settle = () =>
+      params.transactionCoordinator.settle({
+        transactionToken: params.transactionToken,
+        mode: params.mode,
+        durablePublication,
+      });
+    const outcome =
+      renewed.state === "finalized" || renewed.state === "aborted" || renewed.state === "failed"
+        ? await settle()
+        : await params.runBrowserWork(settle);
     sendJson(params.res, 200, settlementResponse(outcome.record, outcome.finalization));
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {
@@ -787,6 +1050,124 @@ async function serveRemoteTransactionSettlement(params: {
     }
     throw error;
   }
+}
+
+function browserTransactionFromRecoveredSession(
+  recovered: ReattachResult,
+  tookMs: number,
+): BrowserRunTransaction {
+  const extended = recovered as ReattachResult & Partial<BrowserRunResult>;
+  return {
+    ...extended,
+    answerText: recovered.answerText,
+    answerMarkdown: recovered.answerMarkdown,
+    tookMs:
+      typeof extended.tookMs === "number" && Number.isFinite(extended.tookMs)
+        ? extended.tookMs
+        : Math.max(0, tookMs),
+    answerTokens:
+      typeof extended.answerTokens === "number" && Number.isSafeInteger(extended.answerTokens)
+        ? extended.answerTokens
+        : estimateTokenCount(recovered.answerMarkdown || recovered.answerText),
+    answerChars: recovered.answerText.length,
+    conversationId: recovered.runtime.conversationId,
+    runtime: recovered.runtime,
+    finalize: recovered.finalize,
+    abort: recovered.abort,
+  };
+}
+
+async function renewAuthenticatedTransactionLease(
+  transactionStore: RemoteTransactionStore,
+  transactionToken: string,
+): Promise<RemoteTransactionRecord | "expired" | null> {
+  try {
+    return await transactionStore.renewLease(transactionToken);
+  } catch (error) {
+    const latest = await transactionStore.read(transactionToken);
+    if (!latest) return null;
+    if (latest.state === "finalized" || latest.state === "aborted" || latest.state === "failed") {
+      return latest;
+    }
+    if (error instanceof Error && error.message.includes("expired remote transaction lease")) {
+      return "expired";
+    }
+    throw error;
+  }
+}
+
+async function sweepExpiredRemoteTransactions(params: {
+  transactionStore: RemoteTransactionStore;
+  transactionCoordinator: RemoteTransactionCoordinator;
+  logger: (message: string) => void;
+}): Promise<void> {
+  for (const candidate of await params.transactionStore.listExpiredNonterminalRecords()) {
+    const settlement = await params.transactionStore.withTransactionRecord(
+      candidate.transactionToken,
+      async (record, persist) => {
+        if (
+          record.leaseExpiresAt !== candidate.leaseExpiresAt ||
+          record.state === "finalized" ||
+          record.state === "aborted" ||
+          record.state === "failed"
+        ) {
+          return null;
+        }
+        let recordChanged = false;
+        if (record.state === "running") {
+          const hadRuntimeAuthority = Boolean(record.runtime);
+          record.state = hadRuntimeAuthority ? "recoverable-error" : "failed";
+          record.error = buildExpiredLeaseError(record, hadRuntimeAuthority);
+          recordChanged = true;
+          if (!hadRuntimeAuthority) {
+            await persist();
+            return null;
+          }
+        }
+        const mode = record.settlementMode ?? "abort";
+        if (!record.settlementMode) {
+          record.settlementMode = mode;
+          recordChanged = true;
+        }
+        if (recordChanged) await persist();
+        return {
+          mode,
+          durablePublication: mode === "finalize" && Boolean(record.publicationAcknowledgedAt),
+        };
+      },
+    );
+    if (!settlement) continue;
+    try {
+      const outcome = await params.transactionCoordinator.settle({
+        transactionToken: candidate.transactionToken,
+        mode: settlement.mode,
+        durablePublication: settlement.durablePublication,
+      });
+      params.logger(
+        `[serve] Expired transaction ${candidate.transactionToken.slice(0, 12)} settled as ${outcome.record.state}.`,
+      );
+    } catch (error) {
+      params.logger(
+        `[serve] Expired transaction ${candidate.transactionToken.slice(0, 12)} remains pending: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+function buildExpiredLeaseError(
+  record: RemoteTransactionRecord,
+  hadRuntimeAuthority: boolean,
+): DurableRemoteAutomationError {
+  return {
+    name: "BrowserAutomationError",
+    category: "browser-automation",
+    message: hadRuntimeAuthority
+      ? `Remote transaction lease expired while run ${record.runId} still owned browser authority.`
+      : `Remote transaction lease expired before run ${record.runId} journaled browser authority.`,
+    code: hadRuntimeAuthority ? "remote-transaction-lease-expired" : "remote-lease-pre-authority",
+    stage: "remote-transaction-lease",
+    recoverableDisconnect: hadRuntimeAuthority,
+  };
 }
 
 function settlementResponse(
@@ -929,27 +1310,17 @@ function browserRunResultFromTransaction(transaction: BrowserRunTransaction): Br
   return result;
 }
 function assertCapturedPromptIdentity(
-  payload: RemoteRunPayload,
+  requestIdentity: BrowserRemotePromptRequestIdentity,
   result: BrowserRunResult,
   runtime: BrowserRuntimeMetadata,
 ): void {
   const epoch = runtime.promptEpoch;
-  const followUpPrompts = payload.options.followUpPrompts ?? [];
-  const finalPrompt = followUpPrompts.at(-1);
-  const acceptedPromptDigests = new Set(
-    (finalPrompt
-      ? [finalPrompt]
-      : [payload.prompt, payload.fallbackSubmission?.prompt].filter(
-          (prompt): prompt is string => typeof prompt === "string",
-        )
-    ).map(promptIdentitySha256),
-  );
   const conversationId = result.conversationId?.trim();
   if (
     epoch?.status !== "committed" ||
-    !acceptedPromptDigests.has(epoch.promptSha256) ||
-    epoch.followUpOrdinal !== followUpPrompts.length ||
-    epoch.remainingFollowUps !== 0 ||
+    !requestIdentity.acceptedPromptSha256.includes(epoch.promptSha256) ||
+    epoch.followUpOrdinal !== requestIdentity.followUpOrdinal ||
+    epoch.remainingFollowUps !== requestIdentity.remainingFollowUps ||
     !conversationId ||
     conversationId !== epoch.conversationId ||
     runtime.conversationId !== epoch.conversationId
@@ -1196,6 +1567,7 @@ async function serveRemoteArtifact(params: {
   res: http.ServerResponse;
   authToken: string;
   artifactStore: RemoteArtifactStore;
+  transactionStore: RemoteTransactionStore;
   logger: (message: string) => void;
   verbose: boolean;
   transactionToken: string;
@@ -1211,6 +1583,18 @@ async function serveRemoteArtifact(params: {
       "/transactions/.../artifacts/...",
     )
   ) {
+    return;
+  }
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
     return;
   }
 
@@ -1259,9 +1643,23 @@ async function serveRemoteArtifactReceipt(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
   artifactStore: RemoteArtifactStore;
+  transactionStore: RemoteTransactionStore;
   transactionToken: string;
   artifactId: string;
 }): Promise<void> {
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
+
   let body: RemoteArtifactDeliveryReceiptRequest;
   try {
     const raw = await readRequestBody(params.req, 4096);

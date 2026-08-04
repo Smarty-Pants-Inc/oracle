@@ -1,10 +1,11 @@
-import { access, realpath, rm, stat } from "node:fs/promises";
+import { access, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
 import type { BrowserRecoveryCleanupMetadata } from "../../src/sessionManager.js";
 import {
+  captureProfileDirectoryIdentity,
   readOracleChromeOwner,
   type ChromeProcessIdentity,
 } from "../../src/browser/profileState.js";
@@ -27,22 +28,22 @@ async function chromeProcessIdentity(
   userDataDir: string,
   pid = 1234,
 ): Promise<ChromeProcessIdentity> {
-  const resolvedUserDataDir = await realpath(userDataDir);
-  const physicalProfile = await stat(resolvedUserDataDir, { bigint: true });
+  const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
   return {
     pid,
     processStartTime: "disconnect-fixture-process-generation",
-    executablePath: "/usr/bin/google-chrome",
+    executablePath:
+      profileDirectory.platform === "win32"
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`
+        : profileDirectory.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome",
     normalizedUserDataDir:
-      process.platform === "win32" ? resolvedUserDataDir.toLowerCase() : resolvedUserDataDir,
+      profileDirectory.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
     launchNonce: "33333333-3333-4333-8333-333333333333",
-    profileDirectory: {
-      version: 1 as const,
-      platform: process.platform,
-      canonicalPath: resolvedUserDataDir,
-      device: physicalProfile.dev.toString(),
-      inode: physicalProfile.ino.toString(),
-    },
+    profileDirectory,
   };
 }
 
@@ -206,6 +207,7 @@ async function withRemoteLateDisconnectFixture(
       config: {
         remoteChrome: { host: "remote.example", port: 9333 },
         cookieSync: false,
+        manualLogin: false,
         headless: true,
         modelStrategy: "ignore",
         archiveConversations: "always",

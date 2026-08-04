@@ -112,6 +112,7 @@ export interface ReattachDeps {
   acquireRecoveryLock?: (lockPath: string) => Promise<ReattachRecoveryLock>;
   isRemotePublicationAcknowledged?: () => boolean;
   resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
+  runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
 }
 
 export type ReattachFinalizationResult = BrowserCaptureFinalizationResult;
@@ -123,6 +124,12 @@ export interface ReattachResult {
   finalize: () => Promise<ReattachFinalizationResult>;
   abort: () => Promise<ReattachFinalizationResult>;
 }
+function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata) {
+  return (
+    runtime.remoteRecovery ??
+    runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)?.remoteRecovery
+  );
+}
 
 export async function resumeBrowserSession(
   runtime: BrowserRuntimeMetadata,
@@ -130,9 +137,11 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
-  const promptLocator = requireCommittedPromptEpochLocator(runtime);
-  const promptEpoch = promptLocator.epoch;
-  const minAssistantTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
+  const initialRemoteRecovery = remoteRecoveryAuthority(runtime);
+  const promptLocator =
+    initialRemoteRecovery && !runtime.promptEpoch
+      ? null
+      : requireCommittedPromptEpochLocator(runtime);
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);
   let lockHeld = true;
@@ -158,9 +167,10 @@ export async function resumeBrowserSession(
   ): ReattachResult => {
     const runtimeForCapture = capture.runtime ?? authoritativeRuntime;
     const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
-    assertSameCommittedPromptEpoch(promptLocator, captureLocator);
+    if (promptLocator) assertSameCommittedPromptEpoch(promptLocator, captureLocator);
     const capturedRuntime = markRecoveryCleanupPending(runtimeForCapture);
-    let settlementMode: "finalize" | "abort" | null = null;
+    let settlementMode: "finalize" | "abort" | null =
+      remoteRecoveryAuthority(capturedRuntime)?.settlementMode ?? null;
     let settlementRuntime = capturedRuntime;
     let settlementInFlight: Promise<ReattachFinalizationResult> | null = null;
     let completedSettlement: ReattachFinalizationResult | null = null;
@@ -194,8 +204,14 @@ export async function resumeBrowserSession(
                 mode,
               );
         } catch (error) {
+          const errorRuntime =
+            error instanceof BrowserAutomationError &&
+            typeof error.details?.runtime === "object" &&
+            error.details.runtime !== null
+              ? (error.details.runtime as BrowserRuntimeMetadata)
+              : settlementRuntime;
           result = pendingFinalization(
-            settlementRuntime,
+            errorRuntime,
             error instanceof Error ? error.message : String(error),
           );
         }
@@ -234,7 +250,7 @@ export async function resumeBrowserSession(
   };
 
   try {
-    if (runtime.remoteRecovery) {
+    if (initialRemoteRecovery) {
       const configured = deps.recoveryCleanup?.resolveRemoteRecoveryConfig
         ? await deps.recoveryCleanup.resolveRemoteRecoveryConfig()
         : resolveRemoteServiceConfig({
@@ -248,6 +264,7 @@ export async function resumeBrowserSession(
         configuredHost: configured.host ?? "",
         authToken: configured.token,
         log: logger,
+        runtimeHintCb: deps.runtimeHintCb,
       });
       return buildResult(
         {
@@ -260,6 +277,14 @@ export async function resumeBrowserSession(
         transaction.runtime,
       );
     }
+    if (!promptLocator) {
+      throw new BrowserAutomationError(
+        "Local browser reattach requires a committed prompt epoch.",
+        { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+      );
+    }
+    const promptEpoch = promptLocator.epoch;
+    const minAssistantTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
     if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
       logger("No running Chrome detected; reopening browser to locate the session.");
       return await recover();
@@ -474,7 +499,26 @@ export async function retryBrowserRecoveryCleanup(
     | "acquireRecoveryLock"
     | "isRemotePublicationAcknowledged"
   > = {},
+  mode?: "finalize" | "abort",
 ): Promise<ReattachFinalizationResult> {
+  const persistedModes = [
+    runtime.remoteRecovery?.settlementMode,
+    ...(runtime.recoveryCleanupResources?.map(
+      (resource) => resource.remoteRecovery?.settlementMode,
+    ) ?? []),
+  ].filter((candidate): candidate is "finalize" | "abort" => Boolean(candidate));
+  const persistedMode = persistedModes[0];
+  const settlementMode = mode ?? persistedMode ?? "finalize";
+  if (persistedModes.some((candidate) => candidate !== settlementMode)) {
+    throw new BrowserAutomationError(
+      `Browser recovery is already bound to ${persistedMode} settlement.`,
+      {
+        stage: "browser-recovery-settlement",
+        code: "settlement-mode-conflict",
+        runtime,
+      },
+    );
+  }
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);
   let result: ReattachFinalizationResult;
@@ -486,16 +530,25 @@ export async function retryBrowserRecoveryCleanup(
         ...deps.recoveryCleanup,
         isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
       },
-      "finalize",
+      settlementMode,
     );
   } catch (error) {
-    result = pendingFinalization(runtime, error instanceof Error ? error.message : String(error));
+    const errorRuntime =
+      error instanceof BrowserAutomationError &&
+      typeof error.details?.runtime === "object" &&
+      error.details.runtime !== null
+        ? (error.details.runtime as BrowserRuntimeMetadata)
+        : runtime;
+    result = pendingFinalization(
+      errorRuntime,
+      error instanceof Error ? error.message : String(error),
+    );
   }
   try {
     await recoveryLock.release();
   } catch (error) {
     return pendingFinalization(
-      runtime,
+      result.runtime,
       `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
@@ -793,6 +846,11 @@ async function finalizeRemoteRecoveryCleanupGroup(
   });
   if (!authority) {
     return pending("Remote cleanup transaction authority is missing.");
+  }
+  if (authority.settlementMode && authority.settlementMode !== mode) {
+    return pending(
+      `Remote recovery is already bound to ${authority.settlementMode} settlement; refusing ${mode}.`,
+    );
   }
   if (mode === "finalize" && deps.isRemotePublicationAcknowledged?.() !== true) {
     return pending("Remote settlement requires durable answer publication acknowledgment.");
@@ -1132,10 +1190,13 @@ function rebuildPendingCleanupRuntime(
     seen.add(key);
     resources.push(entry.resource);
   }
+  const remoteRecovery =
+    resources.find((resource) => resource.remoteRecovery)?.remoteRecovery ?? runtime.remoteRecovery;
   return {
     ...runtime,
     recoveryCleanupResources: resources,
     recoveryCleanupResult: { status: "failed", error },
+    remoteRecovery,
   };
 }
 

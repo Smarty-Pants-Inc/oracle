@@ -15,13 +15,11 @@ import {
   RemoteTransactionStore,
 } from "./transactionStore.js";
 
-const DEFAULT_REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
-
 export interface RemoteArtifactStoreOptions {
   transactionStore: RemoteTransactionStore;
   sessionsRoot: string;
-  artifactTtlMs?: number;
   maximumArtifactBytes?: number;
+  now?: () => number;
 }
 
 export interface OpenRemoteArtifact {
@@ -32,14 +30,14 @@ export interface OpenRemoteArtifact {
 export class RemoteArtifactStore {
   readonly #transactionStore: RemoteTransactionStore;
   readonly #sessionsRoot: string;
-  readonly #artifactTtlMs: number;
   readonly #maximumArtifactBytes: number;
+  readonly #now: () => number;
 
   constructor(options: RemoteArtifactStoreOptions) {
     this.#transactionStore = options.transactionStore;
     this.#sessionsRoot = options.sessionsRoot;
-    this.#artifactTtlMs = options.artifactTtlMs ?? DEFAULT_REMOTE_ARTIFACT_TTL_MS;
     this.#maximumArtifactBytes = options.maximumArtifactBytes ?? MAX_REMOTE_ARTIFACT_BYTES;
+    this.#now = options.now ?? Date.now;
   }
 
   async prepareRequiredArtifacts(params: {
@@ -73,8 +71,8 @@ export class RemoteArtifactStore {
       (artifact) => artifact.descriptor.artifactId === artifactId,
     );
     if (!registration) return null;
-    if (Date.now() > Date.parse(registration.expiresAt)) {
-      throw new RemoteArtifactUnavailableError("artifact_expired");
+    if (!record.leaseExpiresAt || this.#now() >= Date.parse(record.leaseExpiresAt)) {
+      throw new RemoteArtifactUnavailableError("transaction_lease_expired");
     }
 
     const currentCanonicalPath = await this.resolveContainedArtifactPath(
@@ -126,6 +124,9 @@ export class RemoteArtifactStore {
       .digest("hex");
     let receipt: DurableRemoteArtifactDeliveryReceipt | undefined;
     await this.#transactionStore.update(params.transactionToken, (record) => {
+      if (!record.leaseExpiresAt || this.#now() >= Date.parse(record.leaseExpiresAt)) {
+        throw new RemoteArtifactUnavailableError("transaction_lease_expired");
+      }
       const registration = record.artifacts?.find(
         (artifact) => artifact.descriptor.artifactId === params.artifactId,
       );
@@ -149,7 +150,7 @@ export class RemoteArtifactStore {
       }
       receipt = {
         receiptId,
-        deliveredAt: new Date().toISOString(),
+        deliveredAt: new Date(this.#now()).toISOString(),
         byteSize: params.byteSize,
         sha256: params.sha256,
       };
@@ -218,7 +219,6 @@ export class RemoteArtifactStore {
         transactionToken: params.transactionToken,
         canonicalPath,
         fileIdentity: fileIdentityFromStat(fileStat),
-        expiresAt: new Date(Date.now() + this.#artifactTtlMs).toISOString(),
       };
     } finally {
       await handle.close();

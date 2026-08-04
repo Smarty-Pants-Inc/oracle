@@ -573,24 +573,28 @@ export async function performSessionRun({
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
-    const browserCanReattach = !browserConfig?.copyProfileSource;
+    const errorBrowserRuntime = (
+      userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined
+    )?.runtime;
+    const browserCanReattach =
+      !browserConfig?.copyProfileSource ||
+      Boolean(remoteRecoveryAuthority(errorBrowserRuntime ?? currentBrowser?.runtime));
     let reattachGuidanceLogged = false;
     const logBrowserReattachGuidance = (
       runtime: BrowserRuntimeMetadata | null | undefined,
     ): void => {
       if (reattachGuidanceLogged || mode !== "browser") return;
-      if (!hasRecoverableChatGptConversation(runtime)) return;
+      if (!hasBrowserRecoveryAuthority(runtime)) return;
       reattachGuidanceLogged = true;
       log(formatBrowserReattachGuidance(sessionMeta.id));
     };
     if (connectionLost && mode === "browser" && browserCanReattach) {
-      const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
-        ?.runtime;
+      const runtime = errorBrowserRuntime;
       const recoverableRuntime = runtime ?? currentBrowser?.runtime;
       const recoverableDisconnect =
         (userError.details as { recoverableDisconnect?: boolean } | undefined)
           ?.recoverableDisconnect === true;
-      const hasRecoveryAuthority = hasRecoverableChatGptConversation(recoverableRuntime);
+      const hasRecoveryAuthority = hasResumableBrowserAuthority(recoverableRuntime);
       if (!recoverableDisconnect || !hasRecoveryAuthority) {
         log(
           dim(
@@ -678,8 +682,7 @@ export async function performSessionRun({
       return;
     }
     if (assistantTimeout && mode === "browser" && browserCanReattach) {
-      const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
-        ?.runtime;
+      const runtime = errorBrowserRuntime;
       log(dim("Assistant response timed out; marking capture incomplete for reattach."));
       const timeoutResponse = {
         status: "incomplete",
@@ -693,7 +696,7 @@ export async function performSessionRun({
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       const autoRuntime = runtime ?? currentBrowser?.runtime;
       const willAutoReattach =
-        autoReattachIntervalMs > 0 && hasRecoverableChatGptConversation(autoRuntime);
+        autoReattachIntervalMs > 0 && hasResumableBrowserAuthority(autoRuntime);
       if (willAutoReattach) {
         if (modelForStatus) {
           await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -782,9 +785,7 @@ export async function performSessionRun({
       log(dim(`Transport: ${transportLine}`));
     }
     const browserRuntime =
-      mode === "browser" && browserCanReattach
-        ? (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime
-        : undefined;
+      mode === "browser" && browserCanReattach ? errorBrowserRuntime : undefined;
     if (!cloudflareChallenge && browserCanReattach) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
     }
@@ -842,6 +843,25 @@ function mergeArtifacts(
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined) {
+  return (
+    runtime?.remoteRecovery ??
+    runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)?.remoteRecovery
+  );
+}
+
+function hasBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
+  return Boolean(remoteRecoveryAuthority(runtime)) || hasRecoverableChatGptConversation(runtime);
+}
+
+function hasResumableBrowserAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
+  const remoteRecovery = remoteRecoveryAuthority(runtime);
+  return (
+    Boolean(remoteRecovery && !remoteRecovery.settlementMode) ||
+    hasRecoverableChatGptConversation(runtime)
+  );
 }
 
 function providerFailureContextForModel(
@@ -1273,6 +1293,16 @@ async function autoReattachUntilComplete({
       reattachResult = await resumeBrowserSession(runtime, reattachConfig, logger, {
         recoveryLockPath,
         isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
+        runtimeHintCb: async (latestRuntime) => {
+          authoritativeRuntime = latestRuntime;
+          await sessionStore.updateSession(sessionMeta.id, {
+            browser: {
+              ...browserMetadata,
+              config: browserConfig,
+              runtime: latestRuntime,
+            },
+          });
+        },
       });
       captureSucceeded = true;
       authoritativeRuntime = reattachResult.runtime;
