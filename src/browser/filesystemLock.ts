@@ -14,7 +14,7 @@ const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
 const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
-const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 12_000;
+const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
 const execFileAsync = promisify(execFile);
 let currentProcessStartIdentity: string | undefined;
@@ -25,7 +25,7 @@ export type ProcessLiveness = "alive" | "dead" | "unknown";
 export interface FilesystemLockOwnerRecord {
   version: 1;
   pid: number;
-  processStartIdentity: string;
+  processStartIdentity: string | null;
   ownerNonce: string;
   createdAt: string;
   sessionId?: string;
@@ -128,7 +128,14 @@ export async function acquireCrashRecoverableFilesystemLock(
     options.incompleteLockStaleMs ?? DEFAULT_INCOMPLETE_STALE_MS,
   );
   const processStartIdentity = await readProcessIdentity(pid);
-  if (!processStartIdentity) {
+  // A timed-out Windows probe for the real current process must not make recovery unbounded. The
+  // null generation keeps the lock fail-closed while that PID is alive and becomes stale only
+  // after liveness proves it dead. Explicit/test process identities still require a generation.
+  const permitsUnverifiedCurrentProcess =
+    process.platform === "win32" &&
+    pid === process.pid &&
+    deps.readProcessStartIdentity === undefined;
+  if (!processStartIdentity && !permitsUnverifiedCurrentProcess) {
     throw new Error(
       `Cannot acquire crash-recoverable filesystem lock at ${lockPath} without a stable process generation for pid ${pid}`,
     );
@@ -142,7 +149,7 @@ export async function acquireCrashRecoverableFilesystemLock(
     createdAt: new Date(now()).toISOString(),
   };
   const mutationProcessStartIdentity = await readProcessStartIdentity(process.pid);
-  if (!mutationProcessStartIdentity) {
+  if (!mutationProcessStartIdentity && process.platform !== "win32") {
     throw new Error(
       `Cannot coordinate crash-recoverable filesystem lock mutations at ${lockPath} without a stable process generation for pid ${process.pid}`,
     );
@@ -357,8 +364,7 @@ async function readProcessStartIdentityUncached(pid: number): Promise<string | n
     });
     const startedAt = String(stdout).trim().replace(/\s+/gu, " ");
     return startedAt ? `${process.platform}:${startedAt}` : null;
-  } catch (error) {
-    if (isProcessIdentityTimeoutError(error)) throw error;
+  } catch {
     return null;
   }
 }
@@ -853,9 +859,11 @@ async function inspectExistingLock(
       const liveness = options.readLiveness(owner.pid);
       if (liveness === "dead") return { status: "stale", generation: { ownerRaw: raw } };
       if (liveness === "unknown") return { status: "active", owner };
-      const observedIdentity = await options.readProcessIdentity(owner.pid);
-      if (observedIdentity !== null && owner.processStartIdentity !== observedIdentity) {
-        return { status: "stale", generation: { ownerRaw: raw } };
+      if (owner.processStartIdentity !== null) {
+        const observedIdentity = await options.readProcessIdentity(owner.pid);
+        if (observedIdentity !== null && owner.processStartIdentity !== observedIdentity) {
+          return { status: "stale", generation: { ownerRaw: raw } };
+        }
       }
       return { status: "active", owner };
     }
@@ -1030,8 +1038,8 @@ function parseLockOwner(raw: string): FilesystemLockOwnerRecord | null {
       return null;
     }
     if (
-      typeof parsed.processStartIdentity !== "string" ||
-      parsed.processStartIdentity.length === 0
+      parsed.processStartIdentity !== null &&
+      (typeof parsed.processStartIdentity !== "string" || parsed.processStartIdentity.length === 0)
     ) {
       return null;
     }
@@ -1131,11 +1139,6 @@ async function syncDirectory(directory: string): Promise<void> {
   } finally {
     await handle.close();
   }
-}
-
-function isProcessIdentityTimeoutError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  return readErrorCode(error) === "ETIMEDOUT" || (error as { killed?: unknown }).killed === true;
 }
 
 function readErrorCode(error: unknown): unknown {

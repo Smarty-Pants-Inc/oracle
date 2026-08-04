@@ -786,26 +786,23 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test("does not negative-cache a Windows process-generation timeout", async () => {
+  test("backs off after a Windows process-generation timeout without negative-caching success", async () => {
     const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
     const timeoutError = Object.assign(new Error("PowerShell process probe timed out"), {
       code: "ETIMEDOUT",
       killed: false,
     });
-    const killedTimeoutError = Object.assign(new Error("PowerShell process probe was killed"), {
-      code: null,
-      killed: true,
-    });
     let attempt = 0;
+    let now = 1_000;
     const execFile = vi.fn();
     const execFileAsync = vi.fn(async (..._args: unknown[]) => {
       if (++attempt === 1) throw timeoutError;
-      if (attempt === 2) throw killedTimeoutError;
       return { stdout: "638000000000000000", stderr: "" };
     });
     Object.defineProperty(execFile, Symbol.for("nodejs.util.promisify.custom"), {
       value: execFileAsync,
     });
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
 
     try {
       Object.defineProperty(process, "platform", { value: "win32" });
@@ -814,22 +811,53 @@ describe("crash-recoverable filesystem lock", () => {
       // Reloading intentionally binds this test's mocked Windows child-process boundary.
       const { readProcessStartIdentity } = await import("../../src/browser/filesystemLock.js");
 
-      await expect(readProcessStartIdentity(process.pid)).rejects.toMatchObject({
-        code: "ETIMEDOUT",
-        killed: false,
-      });
-      await expect(readProcessStartIdentity(process.pid)).rejects.toMatchObject({
-        code: null,
-        killed: true,
-      });
+      await expect(readProcessStartIdentity(process.pid)).resolves.toBeNull();
+      await expect(readProcessStartIdentity(process.pid)).resolves.toBeNull();
+      now += 5_000;
       await expect(readProcessStartIdentity(process.pid)).resolves.toBe("win32:638000000000000000");
-      expect(execFileAsync).toHaveBeenCalledTimes(3);
+      await expect(readProcessStartIdentity(process.pid)).resolves.toBe("win32:638000000000000000");
+      expect(execFileAsync).toHaveBeenCalledTimes(2);
       expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
-      expect(execFileAsync.mock.calls[0]?.[2]).toMatchObject({ timeout: 12_000 });
+      expect(execFileAsync.mock.calls[0]?.[2]).toMatchObject({ timeout: 2_000 });
     } finally {
+      nowSpy.mockRestore();
       vi.doUnmock("node:child_process");
       vi.resetModules();
       if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+    }
+  });
+
+  test("preserves a null-generation lock while its owner pid is alive", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    let ownerAlive = true;
+    try {
+      await mkdir(lockPath);
+      await writeFile(
+        path.join(lockPath, "owner.json"),
+        `${JSON.stringify({
+          version: 1,
+          pid: 62_062,
+          processStartIdentity: null,
+          ownerNonce: "timed-out-current-owner",
+          createdAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
+      const deps = {
+        pid: 63_063,
+        readProcessLiveness: (pid: number) =>
+          pid === 62_062 && ownerAlive ? ("alive" as const) : ("dead" as const),
+        readProcessStartIdentity: async () => "replacement-start",
+      };
+      await expect(
+        acquireCrashRecoverableFilesystemLock(lockPath, {}, deps),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      ownerAlive = false;
+      const replacement = await acquireCrashRecoverableFilesystemLock(lockPath, {}, deps);
+      await replacement.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
