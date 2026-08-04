@@ -235,6 +235,33 @@ describe("promptComposer", () => {
     }
   });
 
+  test("checks an enabled attachment send button even when secondary evidence is stale", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("const expected =")) {
+          return { result: { value: false } };
+        }
+        return { result: { value: { status: "point", x: 10, y: 20 } } };
+      });
+      const input = { dispatchMouseEvent: vi.fn().mockResolvedValue(undefined) };
+      const pending = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        ["first.md", "second.md"],
+        300,
+      );
+      const assertion = expect(pending).resolves.toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      await assertion;
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("only attachment sends get the longer send-button deadline", () => {
     expect(promptComposer.sendButtonTimeoutMs()).toBe(20_000);
     expect(promptComposer.sendButtonTimeoutMs([])).toBe(20_000);

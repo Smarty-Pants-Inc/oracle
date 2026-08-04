@@ -953,10 +953,11 @@ function shouldCloseOwnedRunTargetAfterRun(options: {
   ownsTarget: boolean;
   keepBrowser: boolean;
   closeOwnedTabOnComplete?: boolean;
+  preserveForRecovery?: boolean;
 }): boolean {
   return (
-    options.runStatus === "complete" &&
     options.ownsTarget &&
+    !(options.runStatus === "attempted" && options.preserveForRecovery) &&
     (Boolean(options.closeOwnedTabOnComplete) || !options.keepBrowser)
   );
 }
@@ -2551,6 +2552,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       ownsTarget,
       keepBrowser: effectiveKeepBrowser,
       closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+      preserveForRecovery: preserveBrowserOnError,
     });
     let keepBrowserOpen = shouldKeepLocalBrowserOpen({
       effectiveKeepBrowser,
@@ -3085,6 +3087,7 @@ async function runRemoteBrowserMode(
   let answerHtml = "";
   let connectionClosedUnexpectedly = false;
   let runStatus: "attempted" | "complete" = "attempted";
+  let preserveBrowserOnError = false;
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
@@ -3929,6 +3932,7 @@ async function runRemoteBrowserMode(
     const normalizedError = error instanceof Error ? error : new Error(String(error));
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
+    const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
 
     if (!socketClosed) {
       const archive = browserRuntime
@@ -3944,6 +3948,10 @@ async function runRemoteBrowserMode(
         lastUrl = archive.conversationUrl;
         await emitRuntimeHint();
       }
+      preserveBrowserOnError =
+        promptSubmitted ||
+        preservedErrorKind === "cloudflare-challenge" ||
+        (preservedErrorKind === "reattachable-capture" && archive?.archived !== true);
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
@@ -3958,6 +3966,7 @@ async function runRemoteBrowserMode(
       browserWSEndpoint,
     });
     const recoverable = isRecoverableChromeDisconnect(liveness);
+    preserveBrowserOnError = recoverable && promptSubmitted;
     throw new BrowserAutomationError(connectionLostUserMessage({ recoverable, remote: true }), {
       stage: "connection-lost",
       recoverableDisconnect: recoverable,
@@ -3996,6 +4005,7 @@ async function runRemoteBrowserMode(
       ownsTarget,
       keepBrowser: keepRemoteBrowser,
       closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+      preserveForRecovery: preserveBrowserOnError,
     });
     const closeOwnedRemoteTarget = async () => {
       if (!shouldCloseOwnedRemoteTarget || !remoteTargetId) {

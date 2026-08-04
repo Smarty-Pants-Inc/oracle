@@ -696,17 +696,9 @@ async function attemptSendButton(
   // shorter historical deadline.
   const timeoutMs = sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs);
   const deadline = Date.now() + timeoutMs;
+  // Attachment upload completion is verified before this step. Treat ChatGPT's enabled
+  // send control as authoritative instead of blocking on a second, drift-prone DOM matcher.
   while (Date.now() < deadline) {
-    if (needAttachment) {
-      const ready = await Runtime.evaluate({
-        expression: buildAttachmentReadyExpression(attachmentNames),
-        returnByValue: true,
-      });
-      if (!ready?.result?.value) {
-        await delay(150);
-        continue;
-      }
-    }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
       | { status?: "clicked" | "missing" | "point"; x?: number; y?: number }
@@ -731,6 +723,12 @@ async function attemptSendButton(
     await delay(100);
   }
   if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
+    const attachmentEvidence = await Runtime.evaluate({
+      expression: buildAttachmentReadyExpression(attachmentNames),
+      returnByValue: true,
+    })
+      .then((response) => Boolean(response?.result?.value))
+      .catch(() => null);
     throw new BrowserAutomationError(
       `Attachments never reached a clickable send button after ${Math.ceil(
         timeoutMs / 1000,
@@ -739,6 +737,7 @@ async function attemptSendButton(
         stage: "submit-prompt",
         code: "attachment-send-not-ready",
         attachmentNames,
+        attachmentEvidence,
         timeoutMs,
       },
     );

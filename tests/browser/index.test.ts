@@ -149,7 +149,7 @@ describe("browser run target cleanup", () => {
     ).toBe(true);
   });
 
-  test("does not close attached or incomplete targets", () => {
+  test("does not close attached targets", () => {
     expect(
       __test__.shouldCloseOwnedRunTargetAfterRun({
         runStatus: "complete",
@@ -158,12 +158,27 @@ describe("browser run target cleanup", () => {
         closeOwnedTabOnComplete: true,
       }),
     ).toBe(false);
+  });
+
+  test("closes owned incomplete targets by default", () => {
     expect(
       __test__.shouldCloseOwnedRunTargetAfterRun({
         runStatus: "attempted",
         ownsTarget: true,
         keepBrowser: false,
         closeOwnedTabOnComplete: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("keeps owned incomplete targets only for explicit recovery", () => {
+    expect(
+      __test__.shouldCloseOwnedRunTargetAfterRun({
+        runStatus: "attempted",
+        ownsTarget: true,
+        keepBrowser: false,
+        closeOwnedTabOnComplete: true,
+        preserveForRecovery: true,
       }),
     ).toBe(false);
   });
