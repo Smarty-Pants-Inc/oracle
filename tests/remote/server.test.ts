@@ -972,9 +972,14 @@ describe("remote browser service", () => {
           ],
           remoteRecovery: { state: "pending" },
         });
-        expect(JSON.stringify(transaction.runtime)).not.toContain("wss-authority");
-        expect(JSON.stringify(transaction.runtime)).not.toContain("wss-target");
-        expect(JSON.stringify(transaction.runtime)).not.toContain("9222");
+        expect(transaction.runtime).not.toHaveProperty("chromePort");
+        expect(transaction.runtime).not.toHaveProperty("chromeBrowserWSEndpoint");
+        expect(transaction.runtime).not.toHaveProperty("chromeTargetId");
+        for (const resource of transaction.runtime.recoveryCleanupResources ?? []) {
+          expect(resource).not.toHaveProperty("chromePort");
+          expect(resource).not.toHaveProperty("chromeBrowserWSEndpoint");
+          expect(resource).not.toHaveProperty("chromeTargetId");
+        }
         const finalization = await transaction.finalize();
         expect(finalization).toMatchObject({ status: "completed" });
         expect(finalization.runtime.recoveryCleanupResources).toBeUndefined();
