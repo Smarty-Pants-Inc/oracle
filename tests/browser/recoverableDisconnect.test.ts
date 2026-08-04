@@ -575,7 +575,7 @@ describe("recoverable disconnect lifecycle", () => {
                 }),
                 tabLease: undefined,
                 recoveryCleanup: {
-                  transport: "remote",
+                  transport: "local",
                   ownsTarget: true,
                   profileKind: "none",
                   keepBrowser: false,
@@ -617,7 +617,7 @@ describe("recoverable disconnect lifecycle", () => {
                 }),
                 tabLease: undefined,
                 recoveryCleanup: {
-                  transport: "remote",
+                  transport: "local",
                   ownsTarget: false,
                   profileKind: "none",
                   keepBrowser: false,

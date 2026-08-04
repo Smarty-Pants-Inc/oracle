@@ -1061,6 +1061,10 @@ describe("remote browser service", () => {
         }
         const runtime = caught.details?.runtime as BrowserRunTransaction["runtime"] | undefined;
         if (!runtime?.remoteRecovery) throw new Error("missing remote recovery authority");
+        expect(runtime.remoteRecovery).not.toHaveProperty("settlementMode");
+        expect(runtime.recoveryCleanupResources?.[0]?.remoteRecovery).not.toHaveProperty(
+          "settlementMode",
+        );
 
         await expect(
           settleRemoteBrowserRecovery({
@@ -1202,7 +1206,7 @@ describe("remote browser service", () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "rejects and aborts a recovered answer with mismatched committed request identity",
+    "projects abort authority after recovered capture failure with pending cleanup",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-identity-mismatch-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -1217,8 +1221,9 @@ describe("remote browser service", () => {
         promptEpoch: committedPromptEpoch("different prompt"),
       };
       const abort = vi.fn(async () => ({
-        status: "completed" as const,
+        status: "pending" as const,
         runtime: mismatchedRuntime,
+        error: "abort cleanup remains pending",
       }));
       const resumeBrowser = vi.fn(async () => ({
         answerText: "wrong answer",
@@ -1262,17 +1267,22 @@ describe("remote browser service", () => {
         expect(retry).toMatchObject({
           statusCode: 200,
           json: {
-            status: "error",
-            error: { code: "remote-prompt-authority-mismatch", recoverableDisconnect: false },
+            error: {
+              code: "remote-prompt-authority-mismatch",
+              recoverableDisconnect: true,
+              settlementMode: "abort",
+            },
           },
         });
         expect(abort).toHaveBeenCalledOnce();
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
         }).then((store) => store.read(transactionToken));
-        expect(record).toMatchObject({ state: "failed" });
-        expect(record).not.toHaveProperty("requestIdentity");
-        expect(record).not.toHaveProperty("browserConfig");
+        expect(record).toMatchObject({
+          state: "recoverable-error",
+          settlementMode: "abort",
+          finalization: { status: "pending" },
+        });
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });

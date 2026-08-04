@@ -106,6 +106,28 @@ describe("remote public protocol schemas", () => {
       RemoteBrowserAutomationErrorSchema.safeParse({
         name: "BrowserAutomationError",
         category: "browser-automation",
+        message: "abort-bound disconnect",
+        recoverableDisconnect: true,
+        recoveryToken: transactionToken,
+        settlementMode: "abort",
+        runtime: { promptEpoch, cleanup: { status: "pending" } },
+      }).success,
+    ).toBe(true);
+    expect(
+      RemoteBrowserAutomationErrorSchema.safeParse({
+        name: "BrowserAutomationError",
+        category: "browser-automation",
+        message: "invalid bound disconnect",
+        recoverableDisconnect: true,
+        recoveryToken: transactionToken,
+        settlementMode: "resume",
+        runtime: { promptEpoch, cleanup: { status: "pending" } },
+      }).success,
+    ).toBe(false);
+    expect(
+      RemoteBrowserAutomationErrorSchema.safeParse({
+        name: "BrowserAutomationError",
+        category: "browser-automation",
         message: "disconnected",
         recoverableDisconnect: true,
         recoveryToken: transactionToken,

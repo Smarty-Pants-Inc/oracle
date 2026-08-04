@@ -262,7 +262,11 @@ export function createRemoteBrowserExecutor({ host, token, deadlines }: RemoteEx
           interruption: error,
           deadlines: resolvedDeadlines,
         });
-      } else if (error instanceof BrowserAutomationError && !error.details?.runtime) {
+      } else if (
+        error instanceof BrowserAutomationError &&
+        !error.details?.runtime &&
+        error.details?.code !== "remote-settlement-mode-conflict"
+      ) {
         const runtime = unresolvedRemoteTransactionRuntime(preReceiptAuthority, error.message);
         throw new BrowserAutomationError(
           error.message,
@@ -666,7 +670,9 @@ async function recoverRemoteRunTransaction(params: {
       return retry.transaction;
     } catch (error) {
       if (error instanceof BrowserAutomationError) {
-        if (error.details?.runtime) throw error;
+        if (error.details?.runtime || error.details?.code === "remote-settlement-mode-conflict") {
+          throw error;
+        }
         const runtime = unresolvedRemoteTransactionRuntime(
           recoveryAuthority("recoverable-error"),
           error.message,
@@ -1226,13 +1232,29 @@ function rehydrateRemoteBrowserError(
     });
   }
   const transactionToken = expectedTransactionToken ?? error.recoveryToken;
+  if (
+    error.settlementMode &&
+    authority.settlementMode &&
+    error.settlementMode !== authority.settlementMode
+  ) {
+    return new BrowserAutomationError(
+      "Remote recovery settlement mode conflicts with persisted authority.",
+      {
+        stage: "remote-protocol",
+        code: "remote-settlement-mode-conflict",
+        transactionToken,
+        recoverableDisconnect: false,
+      },
+    );
+  }
+  const settlementMode = error.settlementMode ?? authority.settlementMode;
   const remoteRecovery: BrowserRemoteRecoveryMetadata = {
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     host,
     transactionToken,
     state: "recoverable-error",
     requestIdentity: authority.requestIdentity,
-    settlementMode: authority.settlementMode,
+    ...(settlementMode ? { settlementMode } : {}),
   };
   const runtime = projectRemoteRuntime(error.runtime, remoteRecovery);
   if (expectedTransactionToken && error.recoveryToken !== expectedTransactionToken) {

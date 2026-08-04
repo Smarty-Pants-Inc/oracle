@@ -712,6 +712,7 @@ async function handleRemoteRunRequest(params: {
       durableError,
       recoverableRuntime,
       params.transactionToken,
+      failedCapture ? "abort" : undefined,
     );
     await params.transactionStore.update(params.transactionToken, (current) => {
       current.state = recoverableRuntime ? "recoverable-error" : "failed";
@@ -1394,6 +1395,7 @@ function projectRemoteBrowserAutomationError(
   error: DurableRemoteAutomationError,
   runtime: BrowserRuntimeMetadata | undefined,
   transactionToken: string,
+  settlementMode?: "finalize" | "abort",
 ): RemoteBrowserAutomationErrorPayload {
   if (error.recoverableDisconnect && runtime) {
     return RemoteBrowserAutomationErrorSchema.parse({
@@ -1404,6 +1406,7 @@ function projectRemoteBrowserAutomationError(
       stage: publicProtocolLabel(error.stage),
       recoverableDisconnect: true,
       recoveryToken: transactionToken,
+      settlementMode,
       runtime: projectRemotePublicRuntime(runtime, "pending"),
     });
   }
@@ -1429,6 +1432,7 @@ function remoteBrowserAutomationError(
       record.error,
       record.runtime,
       record.transactionToken,
+      record.settlementMode,
     );
   }
   if (record.state === "failed" && record.terminalAudit) {

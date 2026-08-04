@@ -46,6 +46,36 @@ export interface ManualChromeOwnerDeps {
   writeOwner?: typeof writeOracleChromeOwner;
 }
 
+export type ManualChromeOwnerSettlement =
+  | { status: "terminated" }
+  | { status: "preserved" }
+  | { status: "unsafe"; reason: string };
+
+export async function settleManualChromeOwner(
+  profileDir: string,
+  owner: ManualChromeOwner,
+  logger: BrowserLogger,
+  deps: Pick<ManualChromeOwnerDeps, "cleanupProfileState"> = {},
+): Promise<ManualChromeOwnerSettlement> {
+  if (owner.source !== "launched") return { status: "preserved" };
+
+  const termination = await owner.chrome.kill().catch((error: unknown) => ({
+    status: "unsafe" as const,
+    pid: owner.chrome.pid,
+    reason: error instanceof Error ? error.message : String(error),
+  }));
+  if (!isSafeChromeTerminationOutcome(termination)) {
+    return { status: "unsafe", reason: termination.reason };
+  }
+  const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
+    lockRemovalMode: "never",
+    expectedProfileIdentity: owner.processIdentity.profileDirectory,
+  });
+  return cleaned
+    ? { status: "terminated" }
+    : { status: "unsafe", reason: "Manual-login profile cleanup was not confirmed" };
+}
+
 /**
  * Acquire the one canonical Chrome process for a persistent manual-login profile.
  * The atomic Oracle owner record is authoritative; DevToolsActivePort is only a discovery hint.

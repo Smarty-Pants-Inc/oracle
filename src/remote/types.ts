@@ -366,6 +366,7 @@ const RemoteRecoverableErrorSchema = z
     stage: z.string().min(1).max(128).optional(),
     recoverableDisconnect: z.literal(true),
     recoveryToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
+    settlementMode: z.enum(["finalize", "abort"]).optional(),
     runtime: z
       .object({
         promptEpoch: RemoteCommittedPromptEpochSchema.optional(),

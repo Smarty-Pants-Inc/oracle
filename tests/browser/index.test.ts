@@ -103,6 +103,23 @@ describe("recoverable disconnect policy", () => {
     ).toBe(true);
   });
 
+  test.each([
+    ["launched", false],
+    ["recorded", true],
+    ["rediscovered", true],
+  ] as const)(
+    "preserves %s manual-login owners only when recovery lacks kill authority",
+    (ownerSource, expected) => {
+      expect(
+        __test__.shouldPreserveLocalOwnerForRecovery({
+          effectiveKeepBrowser: false,
+          manualLogin: true,
+          ownerSource,
+        }),
+      ).toBe(expected);
+    },
+  );
+
   test("keeps the completed conversation tab when keepBrowser is enabled", () => {
     expect(
       __test__.shouldCloseOwnedRunTargetAfterRun({

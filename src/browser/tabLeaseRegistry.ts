@@ -28,7 +28,7 @@ const WINDOWS_REGISTRY_MUTATION_TIMEOUT_MS = 1_000;
 export interface BrowserTabLeaseRecord {
   id: string;
   pid: number;
-  processStartIdentity: string;
+  processStartIdentity: string | null;
   sessionId?: string;
   chromeHost?: string;
   chromePort?: number;
@@ -110,7 +110,17 @@ export async function acquireBrowserTabLease(
   const leaseProcessStartIdentity = await (
     deps.readProcessStartIdentity ?? readProcessStartIdentity
   )(pid);
-  if (!leaseProcessStartIdentity) {
+  // A timed-out Windows probe for the real current process must not block manual login. The null
+  // generation stays active while liveness cannot prove that PID dead; injected and foreign PIDs
+  // must retain a verified generation to prevent unsafe reclamation.
+  const permitsUnverifiedCurrentProcess =
+    process.platform === "win32" &&
+    pid === process.pid &&
+    deps.readProcessStartIdentity === undefined;
+  if (
+    !leaseProcessStartIdentity &&
+    !(leaseProcessStartIdentity === null && permitsUnverifiedCurrentProcess)
+  ) {
     throw new Error(
       `Cannot acquire crash-recoverable browser tab lease without a stable process generation for pid ${pid}`,
     );
@@ -428,7 +438,7 @@ async function pruneStaleLeases(
   for (const lease of leases) {
     const liveness = readLiveness(lease.pid);
     if (liveness === "dead") continue;
-    if (liveness === "alive") {
+    if (lease.processStartIdentity !== null && liveness === "alive") {
       let observedIdentityPromise = observedProcessIdentities.get(lease.pid);
       if (!observedIdentityPromise) {
         observedIdentityPromise = readStartIdentity(lease.pid);
@@ -449,8 +459,9 @@ function isLeaseRecord(value: unknown): value is BrowserTabLeaseRecord {
     typeof record.id === "string" &&
     record.id.length > 0 &&
     Number.isInteger(record.pid) &&
-    typeof record.processStartIdentity === "string" &&
-    record.processStartIdentity.length > 0 &&
+    (record.processStartIdentity === null ||
+      (typeof record.processStartIdentity === "string" &&
+        record.processStartIdentity.length > 0)) &&
     record.pid > 0 &&
     typeof record.createdAt === "string" &&
     Number.isFinite(Date.parse(record.createdAt)) &&

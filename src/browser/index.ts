@@ -26,7 +26,11 @@ import {
   closeChromeTarget,
   closeBlankChromeTabs,
 } from "./chromeLifecycle.js";
-import { acquireManualChromeOwner, type ManualChromeOwner } from "./manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  settleManualChromeOwner,
+  type ManualChromeOwner,
+} from "./manualChromeOwner.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import {
   navigateToChatGPT,
@@ -69,10 +73,8 @@ import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.j
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import type { ProfileRunLock } from "./profileState.js";
 import {
-  cleanupStaleProfileState,
   acquireProfileRunLock,
   isSafeChromeTerminationOutcome,
-  terminateRecordedChromeForProfile,
   removeProfileDirectoryIfIdentityMatches,
   writeOracleChromeOwner,
 } from "./profileState.js";
@@ -192,6 +194,16 @@ function shouldKeepLocalBrowserOpen(options: {
 }): boolean {
   if (options.usingCopiedProfile) return false;
   return options.effectiveKeepBrowser || options.preserveBrowserOnError;
+}
+
+function shouldPreserveLocalOwnerForRecovery(options: {
+  effectiveKeepBrowser: boolean;
+  manualLogin: boolean;
+  ownerSource: ManualChromeOwner["source"];
+}): boolean {
+  return (
+    options.effectiveKeepBrowser || (options.manualLogin && options.ownerSource !== "launched")
+  );
 }
 
 type ChromeDisconnectAssessment = {
@@ -1259,7 +1271,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       transport: "local",
       ownsTarget,
       profileKind: manualLogin ? "manual-login" : usingCopiedProfile ? "copied" : "temporary",
-      keepBrowser: effectiveKeepBrowser,
+      keepBrowser: shouldPreserveLocalOwnerForRecovery({
+        effectiveKeepBrowser,
+        manualLogin,
+        ownerSource: chromeOwnerSource,
+      }),
       closeOwnedTargetOnComplete: Boolean(options.closeOwnedTabOnComplete),
     };
   }
@@ -1523,27 +1539,16 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               );
             }
             if (!keepBrowserOpen && manualLogin) {
-              const termination = await terminateRecordedChromeForProfile(
-                userDataDir,
-                chrome.processIdentity,
-                logger,
-              );
-              if (!isSafeChromeTerminationOutcome(termination)) {
+              const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
+              if (settlement.status === "unsafe") {
                 keepBrowserOpen = true;
-                errors.push(termination.reason);
-                logger(`[browser] Preserving shared Chrome resources: ${termination.reason}`);
+                errors.push(settlement.reason);
+                logger(`[browser] Preserving shared Chrome resources: ${settlement.reason}`);
                 return;
               }
-              const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
-                lockRemovalMode: "never",
-                expectedProfileIdentity: chrome.processIdentity.profileDirectory,
-              });
-              if (!cleaned) {
+              if (settlement.status === "preserved") {
                 keepBrowserOpen = true;
-                errors.push("Manual-login profile cleanup was not confirmed");
-                logger(
-                  "[browser] Manual-login profile cleanup was not confirmed; preserving state.",
-                );
+                logger("[browser] Reused canonical Chrome owner; leaving shared Chrome running.");
                 return;
               }
               manualTeardownCompleted = true;
@@ -3097,7 +3102,7 @@ async function runRemoteBrowserMode(
 
   function buildRemoteRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
     return {
-      transport: "remote",
+      transport: "local",
       ownsTarget,
       profileKind: "none",
       keepBrowser: Boolean(config.keepBrowser),
@@ -4144,6 +4149,7 @@ export const __test__ = {
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,
   shouldKeepLocalBrowserOpen,
+  shouldPreserveLocalOwnerForRecovery,
   waitForAssistantResponseWithReload,
 };
 export { syncCookies } from "./cookies.js";

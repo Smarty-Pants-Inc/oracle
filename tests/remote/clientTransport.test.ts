@@ -329,6 +329,122 @@ describe("remote client transport deadlines", () => {
     }
   });
 
+  it("rehydrates an abort-bound recoverable error into both recovery authorities", async () => {
+    const server = http.createServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (!transactionToken) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      await readJson(req);
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end(
+        `${JSON.stringify({
+          type: "error",
+          error: {
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "remote capture cleanup is pending",
+            recoverableDisconnect: true,
+            recoveryToken: transactionToken,
+            settlementMode: "abort",
+            runtime: { cleanup: { status: "pending" } },
+          },
+        })}\n`,
+      );
+    });
+    const port = await listen(server);
+    try {
+      const caught = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "secret",
+      })({ prompt: "abort-bound error", config: {} }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(caught).toMatchObject({
+        name: "BrowserAutomationError",
+        details: {
+          recoverableDisconnect: true,
+          remoteRecovery: { settlementMode: "abort" },
+          runtime: {
+            remoteRecovery: { settlementMode: "abort" },
+            recoveryCleanupResources: [{ remoteRecovery: { settlementMode: "abort" } }],
+          },
+        },
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("rejects a wire settlement mode that conflicts with persisted recovery authority", async () => {
+    const transactionToken = "f".repeat(64);
+    const server = http.createServer(async (req, res) => {
+      if (req.url !== `/transactions/${transactionToken}/retry`) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      await readJson(req);
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          status: "error",
+          error: {
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "remote capture cleanup is pending",
+            recoverableDisconnect: true,
+            recoveryToken: transactionToken,
+            settlementMode: "abort",
+            runtime: { cleanup: { status: "pending" } },
+          },
+        }),
+      );
+    });
+    const port = await listen(server);
+    const authority = {
+      protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+      host: `127.0.0.1:${port}`,
+      transactionToken,
+      state: "recoverable-error" as const,
+      settlementMode: "finalize" as const,
+    };
+    try {
+      await expect(
+        resumeRemoteBrowserTransaction({
+          runtime: {
+            remoteRecovery: authority,
+            recoveryCleanupResources: [
+              {
+                remoteRecovery: authority,
+                recoveryCleanup: {
+                  transport: "remote",
+                  ownsTarget: false,
+                  profileKind: "none",
+                  keepBrowser: false,
+                },
+              },
+            ],
+          },
+          configuredHost: `127.0.0.1:${port}`,
+          authToken: "secret",
+        }),
+      ).rejects.toMatchObject({
+        name: "BrowserAutomationError",
+        details: {
+          stage: "remote-protocol",
+          code: "remote-settlement-mode-conflict",
+          recoverableDisconnect: false,
+        },
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
   it("binds request identity to the final accepted prompt and follow-up ordinal", () => {
     expect(
       buildRemotePromptRequestIdentity({

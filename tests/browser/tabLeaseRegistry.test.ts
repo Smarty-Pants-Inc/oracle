@@ -1,8 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { readProcessStartIdentity } from "../../src/browser/filesystemLock.js";
+import type * as FilesystemLockModule from "../../src/browser/filesystemLock.js";
 import {
   acquireBrowserTabLease,
   hasOtherActiveBrowserTabLeases,
@@ -18,7 +19,7 @@ describe("tabLeaseRegistry", () => {
     expect(normalizeMaxConcurrentTabs("nope")).toBe(3);
   });
 
-  test("fails without publishing a lease when process generation is unavailable", async () => {
+  test("rejects an injected null process generation without publishing a lease", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
     try {
       await expect(
@@ -34,6 +35,87 @@ describe("tabLeaseRegistry", () => {
       await expect(
         readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
       ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("permits a default current-Windows lease with a null process generation", async () => {
+    const dir = await mkdtemp(path.join(await realpath(os.tmpdir()), "oracle-tab-leases-"));
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    const readIdentity = vi.fn(async () => null);
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      vi.resetModules();
+      vi.doMock("../../src/browser/filesystemLock.js", async (importOriginal) => {
+        const actual = await importOriginal<typeof FilesystemLockModule>();
+        return { ...actual, readProcessStartIdentity: readIdentity };
+      });
+      // Reloading is required so this test binds the default identity import to the Windows timeout mock.
+      const { acquireBrowserTabLease: acquireWindowsBrowserTabLease } =
+        await import("../../src/browser/tabLeaseRegistry.js");
+
+      const lease = await acquireWindowsBrowserTabLease(dir, { timeoutMs: 500 });
+      await lease.update({ chromeTargetId: "current-windows-null-generation" });
+      const registry = JSON.parse(
+        await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ id: string; processStartIdentity: string | null }> };
+      expect(readIdentity).toHaveBeenCalledWith(process.pid);
+      expect(registry.leases).toEqual([
+        expect.objectContaining({ id: lease.id, processStartIdentity: null }),
+      ]);
+      await lease.release();
+    } finally {
+      vi.doUnmock("../../src/browser/filesystemLock.js");
+      vi.resetModules();
+      if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("retains a live null-generation lease and prunes it only after its pid is dead", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-tab-leases-"));
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    const nullGenerationLease = {
+      id: "null-generation-owner",
+      pid: 76_543,
+      processStartIdentity: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({ version: 1, leases: [nullGenerationLease] }),
+        "utf8",
+      );
+
+      await expect(
+        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "replacement-generation",
+        }),
+      ).resolves.toBe(true);
+      await expect(readFile(registryPath, "utf8")).resolves.toContain(
+        '"processStartIdentity":null',
+      );
+
+      await expect(
+        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+          readProcessLiveness: () => "unknown",
+          readProcessStartIdentity: async () => "replacement-generation",
+        }),
+      ).resolves.toBe(true);
+      await expect(readFile(registryPath, "utf8")).resolves.toContain(
+        '"processStartIdentity":null',
+      );
+      await expect(
+        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+          readProcessLiveness: () => "dead",
+          readProcessStartIdentity: async () => "replacement-generation",
+        }),
+      ).resolves.toBe(false);
+      await expect(readFile(registryPath, "utf8")).resolves.toContain('"leases": []');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

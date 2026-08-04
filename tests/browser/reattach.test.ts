@@ -1626,6 +1626,80 @@ describe("recovery resource finalization", () => {
     }
   });
 
+  test("settles a direct remote-CDP owned target locally without remote transaction authority", async () => {
+    const closeChromeTarget = vi.fn(async () => true);
+    const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
+    const result = await finalizeRecoveredRuntime(
+      withCommittedPromptEpoch(
+        withRecoveryCleanup(
+          {
+            chromeHost: "remote.example.test",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: "wss://remote.example.test/devtools/browser/direct",
+            chromeTargetId: "direct-owned-target",
+          },
+          {
+            transport: "local",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        ),
+      ),
+      vi.fn() as BrowserLogger,
+      { closeChromeTarget, terminateRecordedChromeForProfile },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(closeChromeTarget).toHaveBeenCalledWith({
+      host: "remote.example.test",
+      port: 9222,
+      browserWSEndpoint: "wss://remote.example.test/devtools/browser/direct",
+      targetId: "direct-owned-target",
+      logger: expect.any(Function),
+    });
+    expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+  });
+
+  test("keeps service-backed remote cleanup authority-gated", async () => {
+    const closeChromeTarget = vi.fn(async () => true);
+    const resolveRemoteRecoveryConfig = vi.fn(async () => ({
+      host: "remote.example.test:9443",
+      token: "configured-auth-secret",
+    }));
+    const settleRemoteBrowserRecovery = vi.fn(async () => ({
+      status: "completed" as const,
+      runtime: {},
+    }));
+    const result = await finalizeRecoveredRuntime(
+      withCommittedPromptEpoch(
+        withRecoveryCleanup(
+          {
+            chromeHost: "remote.example.test",
+            chromePort: 9222,
+            chromeTargetId: "service-owned-target",
+          },
+          {
+            transport: "remote",
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        ),
+      ),
+      vi.fn() as BrowserLogger,
+      { closeChromeTarget, resolveRemoteRecoveryConfig, settleRemoteBrowserRecovery },
+    );
+
+    expect(result).toMatchObject({
+      status: "pending",
+      error: expect.stringContaining("Remote cleanup transaction authority is missing"),
+    });
+    expect(closeChromeTarget).not.toHaveBeenCalled();
+    expect(resolveRemoteRecoveryConfig).not.toHaveBeenCalled();
+    expect(settleRemoteBrowserRecovery).not.toHaveBeenCalled();
+  });
+
   test("settles remote cleanup once without direct host Chrome operations", async () => {
     const remoteRecovery = {
       protocolVersion: 3,

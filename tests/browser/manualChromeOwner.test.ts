@@ -5,7 +5,9 @@ import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import {
   acquireManualChromeOwner,
+  settleManualChromeOwner,
   type BrowserChrome,
+  type ManualChromeOwner,
 } from "../../src/browser/manualChromeOwner.js";
 import {
   acquireProfileRunLock,
@@ -479,6 +481,63 @@ describe("manual Chrome owner acquisition", () => {
         ),
       ).rejects.toBe(releaseError);
       expect(stableKill).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("manual Chrome owner settlement", () => {
+  test.each(["launched", "recorded", "rediscovered"] as const)(
+    "settles a %s owner using only retained authority",
+    async (source) => {
+      const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-settlement-"));
+      try {
+        const identity = await chromeIdentity(
+          profileDir,
+          43_216,
+          "00000000-0000-4000-8000-000000000007",
+        );
+        const chrome = launchedChrome(identity.pid, 45_684, identity);
+        const cleanupProfileState = vi.fn(async () => true);
+        const owner: ManualChromeOwner = { chrome, processIdentity: identity, source };
+
+        await expect(
+          settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+        ).resolves.toEqual({ status: source === "launched" ? "terminated" : "preserved" });
+        expect(chrome.kill).toHaveBeenCalledTimes(source === "launched" ? 1 : 0);
+        expect(cleanupProfileState).toHaveBeenCalledTimes(source === "launched" ? 1 : 0);
+      } finally {
+        await fs.rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("preserves a launched owner when exact termination is unsafe", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-unsafe-settlement-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_217,
+        "00000000-0000-4000-8000-000000000008",
+      );
+      const chrome = launchedChrome(identity.pid, 45_685, identity);
+      vi.mocked(chrome.kill).mockResolvedValue({
+        status: "unsafe",
+        pid: identity.pid,
+        reason: "exact process handle was lost",
+      });
+      const cleanupProfileState = vi.fn(async () => true);
+
+      await expect(
+        settleManualChromeOwner(
+          profileDir,
+          { chrome, processIdentity: identity, source: "launched" },
+          logger,
+          { cleanupProfileState },
+        ),
+      ).resolves.toEqual({ status: "unsafe", reason: "exact process handle was lost" });
+      expect(cleanupProfileState).not.toHaveBeenCalled();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
