@@ -5,6 +5,7 @@
 ### Fixed
 
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
+- Browser: submit uploaded prompts whenever ChatGPT exposes an enabled send button even if secondary attachment evidence is stale, and close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 
 ## 0.17.0 — 2026-08-02
 

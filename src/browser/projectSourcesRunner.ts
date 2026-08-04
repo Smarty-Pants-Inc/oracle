@@ -255,7 +255,7 @@ export async function runBrowserProjectSources(
     } catch {
       // ignore close failures
     }
-    if (completed && isolatedTargetId && chrome?.port) {
+    if (!effectiveKeepBrowser && isolatedTargetId && chrome?.port) {
       await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
     }
 
