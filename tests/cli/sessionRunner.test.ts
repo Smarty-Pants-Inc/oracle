@@ -1292,7 +1292,11 @@ describe("performSessionRun", () => {
         runtime: {
           chromeTargetId: "remote-finalize-target",
           remoteRecovery: { transactionToken: "a".repeat(64), state: "pending" },
-          recoveryCleanupResult: { status: "pending" },
+          recoveryCleanupResult: {
+            status: "failed",
+            error: expect.stringContaining("bridge temporarily unavailable"),
+            settlementMode: "finalize",
+          },
         },
       },
     });
@@ -1495,7 +1499,11 @@ describe("performSessionRun", () => {
               recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
             }),
           ],
-          recoveryCleanupResult: { status: "failed", error: "target retained for retry" },
+          recoveryCleanupResult: {
+            status: "failed",
+            error: "target retained for retry",
+            settlementMode: "abort",
+          },
         },
       },
     });
@@ -2077,6 +2085,73 @@ describe("performSessionRun", () => {
     expect(reattach.abort).not.toHaveBeenCalled();
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain("Auto-reattach succeeded; session marked completed.");
+  });
+
+  test("persists copied-profile cleanup authority even though capture reattach is ineligible", async () => {
+    const cleanupRuntime: BrowserRuntimeMetadata = {
+      chromePid: 123,
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      userDataDir: "/tmp/copied-profile",
+      recoveryCleanupResources: [
+        {
+          chromePid: 123,
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          userDataDir: "/tmp/copied-profile",
+          recoveryCleanup: {
+            transport: "local",
+            ownsTarget: true,
+            profileKind: "copied",
+            keepBrowser: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "profile removal was not confirmed",
+        settlementMode: "finalize",
+      },
+    };
+    const originalFailure = new Error("assistant capture failed");
+    const automationError = new BrowserAutomationError(
+      "Browser cleanup remains pending: profile removal was not confirmed",
+      {
+        stage: "browser-capture-finalization",
+        code: "unpublished-cleanup-pending",
+        runtime: cleanupRuntime,
+        cleanupError: "profile removal was not confirmed",
+      },
+      originalFailure,
+    );
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, copyProfileSource: "/tmp/source-profile" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toBe(automationError);
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: { runtime: cleanupRuntime },
+      error: {
+        category: "browser-automation",
+        details: { code: "unpublished-cleanup-pending", runtime: cleanupRuntime },
+      },
+    });
+    expect(resumeBrowserSession).not.toHaveBeenCalled();
+    expect(log.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(
+      "oracle session sess-1 --render",
+    );
   });
 
   test("marks copied-profile connection loss as non-reattachable", async () => {

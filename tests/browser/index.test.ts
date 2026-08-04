@@ -27,6 +27,49 @@ describe("background-only browser policy", () => {
   });
 });
 
+describe("unpublished browser cleanup", () => {
+  test("escapes with retryable runtime and preserves the browser failure as cause", () => {
+    const originalFailure = new Error("assistant capture failed");
+    const runtime = {
+      recoveryCleanupResources: [
+        {
+          userDataDir: "/tmp/copied-profile",
+          recoveryCleanup: {
+            transport: "local" as const,
+            ownsTarget: true,
+            profileKind: "copied" as const,
+            keepBrowser: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed" as const,
+        error: "profile removal was not confirmed",
+        settlementMode: "finalize" as const,
+      },
+    };
+
+    const error = __test__.unpublishedCleanupPendingError(
+      {
+        status: "pending",
+        runtime,
+        error: "profile removal was not confirmed",
+      },
+      originalFailure,
+    );
+
+    expect(error).toMatchObject({
+      details: {
+        stage: "browser-capture-finalization",
+        code: "unpublished-cleanup-pending",
+        runtime,
+        cleanupError: "profile removal was not confirmed",
+      },
+    });
+    expect((error as Error & { cause?: unknown }).cause).toBe(originalFailure);
+  });
+});
+
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {
     const error = new BrowserAutomationError("Cloudflare challenge detected.", {

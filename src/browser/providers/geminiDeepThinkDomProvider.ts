@@ -1,3 +1,4 @@
+import { normalizePromptForIdentity } from "../actions/promptComposer.js";
 import type {
   PromptCommitEvidence,
   ProviderDomAdapter,
@@ -8,9 +9,17 @@ import { joinSelectors } from "../providerDomFlow.js";
 const UI_TIMEOUT_MS = 60_000;
 const RESPONSE_TIMEOUT_MS = 10 * 60_000;
 
+interface GeminiPromptBaseline {
+  userQueryCount: number;
+  responseCount: number;
+  normalizedPrompt: string;
+  verifiedUserQueryCount?: number;
+}
+
 interface GeminiDomProviderState {
   inputTimeoutMs?: number;
   timeoutMs?: number;
+  geminiPromptBaseline?: GeminiPromptBaseline;
 }
 
 export const GEMINI_DEEP_THINK_SELECTORS = {
@@ -61,6 +70,46 @@ function readTimeouts(ctx: ProviderDomFlowContext): {
       ? Math.max(1_000, state.timeoutMs)
       : RESPONSE_TIMEOUT_MS;
   return { uiTimeoutMs, responseTimeoutMs };
+}
+function requireGeminiState(ctx: ProviderDomFlowContext): GeminiDomProviderState {
+  if (!ctx.state) {
+    throw new Error(
+      "Gemini Deep Think DOM flow requires provider state to bind its response to the submitted prompt.",
+    );
+  }
+  return ctx.state as GeminiDomProviderState;
+}
+
+function parsePromptBaseline(payload: string | undefined, prompt: string): GeminiPromptBaseline {
+  try {
+    const parsed = JSON.parse(payload ?? "{}") as {
+      userQueryCount?: unknown;
+      responseCount?: unknown;
+    };
+    if (
+      !Number.isSafeInteger(parsed.userQueryCount) ||
+      !Number.isSafeInteger(parsed.responseCount) ||
+      (parsed.userQueryCount as number) < 0 ||
+      (parsed.responseCount as number) < 0
+    ) {
+      throw new Error("invalid counts");
+    }
+    return {
+      userQueryCount: parsed.userQueryCount as number,
+      responseCount: parsed.responseCount as number,
+      normalizedPrompt: normalizePromptForIdentity(prompt),
+    };
+  } catch {
+    throw new Error("Failed to capture Gemini DOM baselines before submitting the prompt.");
+  }
+}
+
+function requirePromptBaseline(ctx: ProviderDomFlowContext): GeminiPromptBaseline {
+  const baseline = requireGeminiState(ctx).geminiPromptBaseline;
+  if (!baseline) {
+    throw new Error("Gemini Deep Think response polling requires a pre-dispatch prompt baseline.");
+  }
+  return baseline;
 }
 
 async function waitForUi(ctx: ProviderDomFlowContext): Promise<void> {
@@ -180,6 +229,16 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
   ctx.log?.("[gemini-web] Sending prompt...");
   const inputSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.input);
   const sendButtonSelectors = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.sendButton);
+  const userQuerySelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
+  const responseTurnSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseTurn);
+  const baselinePayload = await ctx.evaluate<string>(
+    `(() => JSON.stringify({
+      userQueryCount: document.querySelectorAll(${userQuerySelector}).length,
+      responseCount: document.querySelectorAll(${responseTurnSelector}).length,
+    }))()`,
+  );
+  requireGeminiState(ctx).geminiPromptBaseline = parsePromptBaseline(baselinePayload, ctx.prompt);
+
   const sendResult = await ctx.evaluate<string>(
     `(() => {
       const btn = document.querySelector(${sendButtonSelectors});
@@ -208,6 +267,9 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
   const responseTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseText);
   const responseCompleteSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseComplete);
   const spinnerSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.spinner);
+  const userQuerySel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
+  const userQueryTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQueryText);
+  const baseline = requirePromptBaseline(ctx);
   const { responseTimeoutMs } = readTimeouts(ctx);
   const responseDeadline = Date.now() + responseTimeoutMs;
   let lastLog = 0;
@@ -216,41 +278,71 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
   while (Date.now() < responseDeadline) {
     const payload = await ctx.evaluate<string>(
       `(() => {
-        const turns = document.querySelectorAll(${responseTurnSel});
-        if (turns.length === 0) return JSON.stringify({ status: 'waiting' });
-        const lastTurn = turns[turns.length - 1];
-        const footer = lastTurn.querySelector(${responseCompleteSel});
-        const content = lastTurn.querySelector(${responseTextSel});
-        const text = content?.textContent?.trim() ?? '';
-        const lower = text.toLowerCase();
-        if (lower.includes('generating your response') || lower.includes('check back later') || lower.includes("i'm on it")) {
-          return JSON.stringify({ status: 'generating' });
+        const userQueries = Array.from(document.querySelectorAll(${userQuerySel}));
+        const postBaselineUserQueries = userQueries
+          .slice(${baseline.userQueryCount})
+          .map((turn) => turn.querySelector(${userQueryTextSel})?.textContent?.trim() ?? turn.textContent?.trim() ?? '');
+        const turns = Array.from(document.querySelectorAll(${responseTurnSel}));
+        const postBaselineTurns = turns.slice(${baseline.responseCount});
+        const completed = postBaselineTurns
+          .map((turn) => {
+            const footer = turn.querySelector(${responseCompleteSel});
+            const text = turn.querySelector(${responseTextSel})?.textContent?.trim() ?? '';
+            const lower = text.toLowerCase();
+            return { footer, text, isPlaceholder: lower.includes('generating your response') || lower.includes('check back later') || lower.includes("i'm on it") };
+          })
+          .reverse()
+          .find((turn) => Boolean(turn.footer) && turn.text.length > 0 && !turn.isPlaceholder);
+        if (completed) {
+          return JSON.stringify({ status: 'done', text: completed.text, postBaselineUserQueries, responseCount: turns.length });
         }
-        if (footer && text.length > 0) {
-          return JSON.stringify({ status: 'done', text });
-        }
-        const spinners = lastTurn.querySelectorAll(${spinnerSel});
-        const visibleSpinners = Array.from(spinners).filter((s) => s instanceof HTMLElement && s.offsetParent !== null);
-        if (text.length > 0 && visibleSpinners.length === 0 && !footer) {
-          return JSON.stringify({ status: 'streaming' });
-        }
-        return JSON.stringify({ status: 'generating' });
+        const lastTurn = postBaselineTurns[postBaselineTurns.length - 1];
+        const spinners = lastTurn?.querySelectorAll(${spinnerSel}) ?? [];
+        return JSON.stringify({
+          status: postBaselineTurns.length === 0 ? 'waiting' : visibleSpinners.length > 0 ? 'generating' : 'streaming',
+          postBaselineUserQueries,
+          responseCount: turns.length,
+        });
       })()`,
     );
 
     try {
-      const parsed = JSON.parse(payload ?? "{}") as { status?: string; text?: string };
-      if (parsed.status === "done" && typeof parsed.text === "string" && parsed.text.length > 0) {
+      const parsed = JSON.parse(payload ?? "{}") as {
+        status?: string;
+        text?: string;
+        postBaselineUserQueries?: unknown;
+        responseCount?: unknown;
+      };
+      const matchingUserTurnOffset = Array.isArray(parsed.postBaselineUserQueries)
+        ? parsed.postBaselineUserQueries.findIndex(
+            (query) =>
+              typeof query === "string" &&
+              normalizePromptForIdentity(query) === baseline.normalizedPrompt,
+          )
+        : -1;
+      const hasExactUserTurn = matchingUserTurnOffset >= 0;
+      if (hasExactUserTurn && baseline.verifiedUserQueryCount === undefined) {
+        baseline.verifiedUserQueryCount = baseline.userQueryCount + matchingUserTurnOffset + 1;
+      }
+      if (
+        baseline.verifiedUserQueryCount !== undefined &&
+        typeof parsed.responseCount === "number" &&
+        parsed.responseCount > baseline.responseCount &&
+        parsed.status === "done" &&
+        typeof parsed.text === "string" &&
+        parsed.text.length > 0
+      ) {
         responseText = parsed.text;
         break;
       }
       const now = Date.now();
       if (now - lastLog > 10_000) {
-        ctx.log?.(`[gemini-web] Deep Think still generating... (${parsed.status ?? "unknown"})`);
+        const status = hasExactUserTurn ? (parsed.status ?? "unknown") : "awaiting exact user turn";
+        ctx.log?.(`[gemini-web] Deep Think still generating... (${status})`);
         lastLog = now;
       }
     } catch {
-      // ignore parse errors while polling
+      // Ignore malformed DOM probes while polling.
     }
     await ctx.delay(3_000);
   }

@@ -101,6 +101,7 @@ export interface BrowserRecoveryCleanupMetadata {
 export interface BrowserRecoveryCleanupResultMetadata {
   status: "pending" | "failed";
   error?: string;
+  settlementMode?: "finalize" | "abort";
 }
 
 export interface BrowserRemotePromptRequestIdentity {

@@ -327,11 +327,16 @@ export async function attachSession(
     runtime = repairedRuntime;
   }
   const persistedRemoteRecovery = remoteRecoveryAuthority(runtime);
+  const persistedCleanupMode = runtime?.recoveryCleanupResult?.settlementMode;
+  const completedCleanupAcknowledged =
+    metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata);
   const cleanupRetryMode =
-    metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata)
+    completedCleanupAcknowledged &&
+    (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
       ? "finalize"
-      : metadata.status === "error" && persistedRemoteRecovery?.settlementMode === "abort"
-        ? "abort"
+      : metadata.status === "error"
+        ? (persistedCleanupMode ??
+          (persistedRemoteRecovery?.settlementMode === "abort" ? "abort" : null))
         : null;
   if (
     cleanupRetryMode &&
@@ -351,7 +356,8 @@ export async function attachSession(
         cleanupLogger,
         {
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
-          isRemotePublicationAcknowledged: () => cleanupRetryMode === "finalize",
+          isRemotePublicationAcknowledged: () =>
+            completedCleanupAcknowledged && cleanupRetryMode === "finalize",
         },
         cleanupRetryMode,
       );

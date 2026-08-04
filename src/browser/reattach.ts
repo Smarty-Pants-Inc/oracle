@@ -28,7 +28,11 @@ import {
   closeChromeTarget,
   type RemoteChromeConnection,
 } from "./chromeLifecycle.js";
-import { acquireManualChromeOwner, type BrowserChrome } from "./manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  type BrowserChrome,
+  type ManualChromeOwnerSource,
+} from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
@@ -169,9 +173,11 @@ export async function resumeBrowserSession(
     const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
     if (promptLocator) assertSameCommittedPromptEpoch(promptLocator, captureLocator);
     const capturedRuntime = markRecoveryCleanupPending(runtimeForCapture);
-    let settlementMode: "finalize" | "abort" | null =
-      remoteRecoveryAuthority(capturedRuntime)?.settlementMode ?? null;
     let settlementRuntime = capturedRuntime;
+    let settlementMode: "finalize" | "abort" | null =
+      capturedRuntime.recoveryCleanupResult?.settlementMode ??
+      remoteRecoveryAuthority(capturedRuntime)?.settlementMode ??
+      null;
     let settlementInFlight: Promise<ReattachFinalizationResult> | null = null;
     let completedSettlement: ReattachFinalizationResult | null = null;
 
@@ -213,7 +219,14 @@ export async function resumeBrowserSession(
           result = pendingFinalization(
             errorRuntime,
             error instanceof Error ? error.message : String(error),
+            mode,
           );
+        }
+        if (result.status !== "completed") {
+          result = {
+            ...result,
+            runtime: bindPendingRecoveryCleanupSettlement(result.runtime, mode),
+          };
         }
         settlementRuntime = result.runtime;
         if (result.status !== "completed") return result;
@@ -223,6 +236,7 @@ export async function resumeBrowserSession(
           return pendingFinalization(
             settlementRuntime,
             `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+            mode,
           );
         }
         completedSettlement = result;
@@ -502,6 +516,7 @@ export async function retryBrowserRecoveryCleanup(
   mode?: "finalize" | "abort",
 ): Promise<ReattachFinalizationResult> {
   const persistedModes = [
+    runtime.recoveryCleanupResult?.settlementMode,
     runtime.remoteRecovery?.settlementMode,
     ...(runtime.recoveryCleanupResources?.map(
       (resource) => resource.remoteRecovery?.settlementMode,
@@ -542,6 +557,7 @@ export async function retryBrowserRecoveryCleanup(
     result = pendingFinalization(
       errorRuntime,
       error instanceof Error ? error.message : String(error),
+      settlementMode,
     );
   }
   try {
@@ -550,6 +566,7 @@ export async function retryBrowserRecoveryCleanup(
     return pendingFinalization(
       result.runtime,
       `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+      settlementMode,
     );
   }
   return result;
@@ -590,7 +607,7 @@ async function finalizeRecoveredRuntime(
   }
 
   const error = [...new Set(errors)].join("; ") || "Browser recovery cleanup remains pending";
-  const pendingRuntime = rebuildPendingCleanupRuntime(runtime, pending, error);
+  const pendingRuntime = rebuildPendingCleanupRuntime(runtime, pending, error, mode);
   return { status: "pending", runtime: pendingRuntime, error };
 }
 
@@ -888,7 +905,7 @@ async function finalizeRemoteRecoveryCleanupGroup(
     conversationId: resource.conversationId,
     promptEpoch: resource.promptEpoch,
     recoveryCleanupResources: remoteResources,
-    recoveryCleanupResult: { status: "pending" },
+    recoveryCleanupResult: { status: "pending", settlementMode: mode },
     remoteRecovery: authority,
   };
   let result: BrowserCaptureFinalizationResult;
@@ -1180,6 +1197,7 @@ function rebuildPendingCleanupRuntime(
   runtime: BrowserRuntimeMetadata,
   entries: RecoveryCleanupEntry[],
   error: string,
+  settlementMode: "finalize" | "abort",
 ): BrowserRuntimeMetadata {
   const ordered = [...entries].sort((left, right) => left.order - right.order);
   const resources: BrowserRecoveryCleanupResourceMetadata[] = [];
@@ -1195,7 +1213,7 @@ function rebuildPendingCleanupRuntime(
   return {
     ...runtime,
     recoveryCleanupResources: resources,
-    recoveryCleanupResult: { status: "failed", error },
+    recoveryCleanupResult: { status: "failed", error, settlementMode },
     remoteRecovery,
   };
 }
@@ -1212,18 +1230,47 @@ async function cleanupProfileAbsent(profileDir: string): Promise<boolean> {
 
 function markRecoveryCleanupPending(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
   if (!runtime.recoveryCleanupResources?.length) return runtime;
-  return { ...runtime, recoveryCleanupResult: { status: "pending" } };
+  const settlementMode = runtime.recoveryCleanupResult?.settlementMode;
+  return {
+    ...runtime,
+    recoveryCleanupResult: {
+      status: "pending",
+      ...(settlementMode ? { settlementMode } : {}),
+    },
+  };
+}
+
+function bindPendingRecoveryCleanupSettlement(
+  runtime: BrowserRuntimeMetadata,
+  settlementMode: "finalize" | "abort",
+): BrowserRuntimeMetadata {
+  return {
+    ...runtime,
+    recoveryCleanupResult: {
+      status: runtime.recoveryCleanupResult?.status ?? "pending",
+      ...(runtime.recoveryCleanupResult?.error
+        ? { error: runtime.recoveryCleanupResult.error }
+        : {}),
+      settlementMode,
+    },
+  };
 }
 
 function pendingFinalization(
   runtime: BrowserRuntimeMetadata,
   error: string,
+  settlementMode?: "finalize" | "abort",
 ): ReattachFinalizationResult {
+  const persistedMode = settlementMode ?? runtime.recoveryCleanupResult?.settlementMode;
   return {
     status: "pending",
     runtime: {
       ...runtime,
-      recoveryCleanupResult: { status: "failed", error },
+      recoveryCleanupResult: {
+        status: "failed",
+        error,
+        ...(persistedMode ? { settlementMode: persistedMode } : {}),
+      },
     },
     error,
   };
@@ -1530,6 +1577,7 @@ async function resumeBrowserSessionViaNewChrome(
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
   const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
+  let manualChromeOwnerSource: ManualChromeOwnerSource | null = null;
   let fallbackLease: BrowserTabLease | null = null;
   let chrome: BrowserChrome | null = null;
   let fallbackTargetId: string | null = null;
@@ -1537,7 +1585,9 @@ async function resumeBrowserSessionViaNewChrome(
   let client: ChromeClient | null = null;
   let closeFallbackConnection: (() => Promise<void>) | null = null;
   const refreshFallbackRuntime = (): BrowserRuntimeMetadata => {
-    const ownsProcess = Boolean(chrome && !resolved.keepBrowser);
+    const ownsProcess = Boolean(
+      chrome && !resolved.keepBrowser && (!manualLogin || manualChromeOwnerSource === "launched"),
+    );
     const hasNewAuthority = !manualLogin || Boolean(fallbackLease || chrome || fallbackTargetId);
     const profileKind = ownsProcess
       ? manualLogin
@@ -1565,7 +1615,8 @@ async function resumeBrowserSessionViaNewChrome(
         transport: "local",
         ownsTarget: Boolean(fallbackTargetId),
         profileKind,
-        keepBrowser: profileKind === "none" ? true : Boolean(resolved.keepBrowser),
+        keepBrowser: !ownsProcess,
+        closeOwnedTargetOnComplete: fallbackTargetId && !ownsProcess ? true : undefined,
       },
     };
     const next: BrowserRuntimeMetadata = {
@@ -1611,6 +1662,7 @@ async function resumeBrowserSessionViaNewChrome(
         `reattach-${process.pid}`,
       );
       chrome = owner.chrome;
+      manualChromeOwnerSource = owner.source;
     } else {
       chrome = await launchChrome(resolved, userDataDir, logger);
     }
@@ -1784,6 +1836,7 @@ async function resumeBrowserSessionViaNewChrome(
       cleanupResult = pendingFinalization(
         authorityRuntime,
         cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        "abort",
       );
     }
     if (cleanupResult.status === "pending") {

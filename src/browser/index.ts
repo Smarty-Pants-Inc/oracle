@@ -932,6 +932,22 @@ function withInterruptedArchiveDetails(error: Error, archive: BrowserArchiveResu
   );
 }
 
+function unpublishedCleanupPendingError(
+  finalization: Extract<BrowserCaptureFinalizationResult, { status: "pending" }>,
+  cause?: unknown,
+): BrowserAutomationError {
+  return new BrowserAutomationError(
+    `Browser cleanup remains pending: ${finalization.error}`,
+    {
+      stage: "browser-capture-finalization",
+      code: "unpublished-cleanup-pending",
+      runtime: finalization.runtime,
+      cleanupError: finalization.error,
+    },
+    cause,
+  );
+}
+
 export function maybeArchiveCompletedConversationForTest(
   args: Parameters<typeof maybeArchiveCompletedConversation>[0],
 ): Promise<BrowserArchiveResult> {
@@ -1625,6 +1641,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       : completedBrowserCaptureCleanup(pendingRuntime);
   }
 
+  let escapingFailure: unknown;
+  const rememberEscapingFailure = (error: Error): Error => {
+    escapingFailure = error;
+    return error;
+  };
   try {
     try {
       if (config.browserTabRef) {
@@ -2744,6 +2765,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     return lifecycle.issueCapture(result);
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
+    escapingFailure = normalizedError;
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
     const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
@@ -2752,10 +2774,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         logger(
           "Cloudflare challenge detected; closing Chrome and removing the copied profile because copy-profile runs cannot be retained.",
         );
-        throw new BrowserAutomationError(
-          "Cloudflare challenge detected. Copy-profile runs cannot be retained; complete the check in the source Chrome profile, then rerun.",
-          { stage: "cloudflare-challenge", reattachable: false },
-          normalizedError,
+        throw rememberEscapingFailure(
+          new BrowserAutomationError(
+            "Cloudflare challenge detected. Copy-profile runs cannot be retained; complete the check in the source Chrome profile, then rerun.",
+            { stage: "cloudflare-challenge", reattachable: false },
+            normalizedError,
+          ),
         );
       }
       preserveBrowserOnError = true;
@@ -2766,14 +2790,16 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await emitRuntimeHint();
       logger("Cloudflare challenge detected; leaving browser open so you can complete the check.");
       logger(`Reuse this browser profile with: ${reuseProfileHint}`);
-      throw new BrowserAutomationError(
-        "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.",
-        {
-          stage: "cloudflare-challenge",
-          runtime,
-          reuseProfileHint,
-        },
-        normalizedError,
+      throw rememberEscapingFailure(
+        new BrowserAutomationError(
+          "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.",
+          {
+            stage: "cloudflare-challenge",
+            runtime,
+            reuseProfileHint,
+          },
+          normalizedError,
+        ),
       );
     }
     if (preservedErrorKind === "reattachable-capture") {
@@ -2785,7 +2811,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           normalizedError instanceof BrowserAutomationError
             ? { ...normalizedError.details, runtime: undefined, reattachable: false }
             : { stage: "assistant-recheck", reattachable: false };
-        throw new BrowserAutomationError(normalizedError.message, details, normalizedError);
+        throw rememberEscapingFailure(
+          new BrowserAutomationError(normalizedError.message, details, normalizedError),
+        );
       }
       const archive =
         !socketClosed && browserRuntime
@@ -2807,7 +2835,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           ? "Assistant capture incomplete; archived conversation and closing browser."
           : "Assistant capture incomplete; leaving browser open for reattach.",
       );
-      throw withInterruptedArchiveDetails(normalizedError, archive);
+      throw rememberEscapingFailure(withInterruptedArchiveDetails(normalizedError, archive));
     }
     if (!socketClosed) {
       const archive = browserRuntime
@@ -2827,7 +2855,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      throw withInterruptedArchiveDetails(normalizedError, archive);
+      throw rememberEscapingFailure(withInterruptedArchiveDetails(normalizedError, archive));
     }
     if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
       logger(`Chrome connection lost before completion: ${normalizedError.message}`);
@@ -2854,16 +2882,18 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         ? (normalizedError.details as RecoverableDisconnectDetails | undefined)
         : undefined;
     const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
-    throw new BrowserAutomationError(
-      connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
-      {
-        ...connectionLostDetails,
-        stage: "connection-lost",
-        recoverableDisconnect: assessment.recoverable,
-        disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
-        runtime: buildLocalRuntimeMetadata(tabUrl),
-      },
-      normalizedError,
+    throw rememberEscapingFailure(
+      new BrowserAutomationError(
+        connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
+        {
+          ...connectionLostDetails,
+          stage: "connection-lost",
+          recoverableDisconnect: assessment.recoverable,
+          disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
+          runtime: buildLocalRuntimeMetadata(tabUrl),
+        },
+        normalizedError,
+      ),
     );
   } finally {
     await conversationUrlMonitor?.stop();
@@ -2878,7 +2908,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     removeTerminationHooks?.();
     const finalization = await lifecycle.settleIfUnpublished();
     if (finalization?.status === "pending") {
-      logger(`[browser] Browser cleanup remains pending: ${finalization.error}`);
+      // Cleanup authority deliberately supersedes the run outcome; the original failure is its cause.
+      await Promise.reject(unpublishedCleanupPendingError(finalization, escapingFailure));
     }
   }
 }
@@ -4137,6 +4168,7 @@ export const __test__ = {
   classifyChatGptUiWarningText,
   collectChatGptUiWarnings,
   createAssistantTimeoutError,
+  unpublishedCleanupPendingError,
   detachKeptChromeProcess,
   formatManualLoginSetupCommand,
   isAssistantResponseTimeoutError,

@@ -5,6 +5,10 @@ import type { Stats } from "node:fs";
 import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import {
+  bindBrowserCaptureCleanupSettlement,
+  pendingBrowserCaptureCleanup,
+} from "../browser/runLifecycle.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
 
@@ -106,13 +110,17 @@ export async function publishBrowserCapture<T>(
 
   let finalization: BrowserCaptureFinalizationResult;
   try {
-    finalization = await options.transaction.finalize();
+    finalization = bindBrowserCaptureCleanupSettlement(
+      await options.transaction.finalize(),
+      "finalize",
+    );
   } catch (finalizeError) {
-    finalization = {
-      status: "pending",
-      runtime: runtimeFromBrowserError(finalizeError) ?? options.transaction.runtime,
-      error: `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`,
-    };
+    const cleanupError = `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`;
+    finalization = pendingBrowserCaptureCleanup(
+      runtimeFromBrowserError(finalizeError) ?? options.transaction.runtime,
+      cleanupError,
+      "finalize",
+    );
   }
 
   try {
@@ -142,9 +150,14 @@ async function abortFailedBrowserCapture<T>(
 ): Promise<never> {
   let abortion: BrowserCaptureFinalizationResult;
   try {
-    abortion = await options.transaction.abort();
+    abortion = bindBrowserCaptureCleanupSettlement(await options.transaction.abort(), "abort");
   } catch (abortError) {
-    const runtime = runtimeFromBrowserError(abortError) ?? options.transaction.runtime;
+    const cleanupError = `Browser cleanup abort failed and remains retryable: ${formatError(abortError)}`;
+    const runtime = pendingBrowserCaptureCleanup(
+      runtimeFromBrowserError(abortError) ?? options.transaction.runtime,
+      cleanupError,
+      "abort",
+    ).runtime;
     await persistAbortRuntime(options, runtime, publicationError, receipt, abortError);
     throw new BrowserAutomationError(
       `Browser answer publication failed (${formatError(publicationError)}); capture abort failed and remains retryable: ${formatError(abortError)}`,

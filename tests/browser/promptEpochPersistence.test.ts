@@ -401,7 +401,22 @@ describe("semantic prompt epoch persistence", () => {
       expect(fixture.rejectedResetRuntime).toMatchObject({
         promptEpoch: undefined,
       });
-      expect(fixture.error).toMatchObject({
+      const promptPersistenceError =
+        transport === "local"
+          ? (fixture.error as Error & { cause?: unknown }).cause
+          : fixture.error;
+      if (transport === "local") {
+        expect(fixture.error).toMatchObject({
+          details: {
+            stage: "browser-capture-finalization",
+            code: "unpublished-cleanup-pending",
+            runtime: {
+              promptEpoch: undefined,
+            },
+          },
+        });
+      }
+      expect(promptPersistenceError).toMatchObject({
         details: {
           stage: "prompt-epoch-persistence",
           code: "prompt-epoch-persistence-failed",

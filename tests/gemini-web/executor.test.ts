@@ -209,6 +209,13 @@ describe("gemini-web executor", () => {
           },
         };
       }
+      if (source.includes("userQueryCount: document.querySelectorAll")) {
+        return {
+          result: {
+            value: JSON.stringify({ userQueryCount: 0, responseCount: 0 }),
+          },
+        };
+      }
       if (source.includes("toolbox-drawer-button")) {
         return { result: { value: "clicked" } };
       }
@@ -227,7 +234,12 @@ describe("gemini-web executor", () => {
       if (source.includes("response-footer") && source.includes("status: 'done'")) {
         return {
           result: {
-            value: JSON.stringify({ status: "done", text: "deep-think answer" }),
+            value: JSON.stringify({
+              status: "done",
+              text: "deep-think answer",
+              postBaselineUserQueries: ["hello"],
+              responseCount: 1,
+            }),
           },
         };
       }

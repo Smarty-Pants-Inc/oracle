@@ -784,8 +784,15 @@ export async function performSessionRun({
     if (transportLine) {
       log(dim(`Transport: ${transportLine}`));
     }
+    const cleanupErrorRuntime =
+      errorBrowserRuntime?.recoveryCleanupResources?.length &&
+      errorBrowserRuntime.recoveryCleanupResult
+        ? errorBrowserRuntime
+        : undefined;
     const browserRuntime =
-      mode === "browser" && browserCanReattach ? errorBrowserRuntime : undefined;
+      mode === "browser" && (browserCanReattach || cleanupErrorRuntime)
+        ? errorBrowserRuntime
+        : undefined;
     if (!cloudflareChallenge && browserCanReattach) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
     }

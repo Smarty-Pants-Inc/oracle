@@ -154,6 +154,84 @@ function withCommittedPromptEpoch(
   };
 }
 
+type ManualOwnerSource = "launched" | "recorded" | "rediscovered";
+
+async function resumeFallbackWithManualOwner(profileDir: string, source: ManualOwnerSource) {
+  const processIdentity = await physicalChromeProcessIdentity(profileDir);
+  const closeChromeTarget = vi.fn(async () => true);
+  const terminateRecordedChromeForProfile = vi.fn(async () => ({
+    status: "stopped" as const,
+    pid: processIdentity.pid,
+    signal: "SIGTERM" as const,
+  }));
+  const cleanupStaleProfileState = vi.fn(async () => true);
+  const Runtime = {
+    enable: vi.fn(async () => undefined),
+    evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("document.readyState")) return { result: { value: "complete" } };
+      if (expression.includes("/api/auth/session")) {
+        return { result: { value: { ok: true, status: 200, sessionAuthenticated: true } } };
+      }
+      if (expression.includes("const selectors =")) return { result: { value: true } };
+      return { result: { value: false } };
+    }),
+  };
+  const client = {
+    Runtime,
+    DOM: { enable: vi.fn(async () => undefined) },
+    Page: { enable: vi.fn(async () => undefined), navigate: vi.fn(async () => undefined) },
+    Network: { getAllCookies: vi.fn(async () => ({ cookies: [] })) },
+    Target: { getTargets: vi.fn(async () => ({ targetInfos: [] })) },
+    close: vi.fn(async () => undefined),
+  } as unknown as ChromeClient;
+  const owner = {
+    chrome: {
+      pid: processIdentity.pid,
+      port: 9222,
+      host: "127.0.0.1",
+      remoteDebuggingPipes: undefined,
+      processIdentity,
+      kill: vi.fn(async () => ({ status: "stopped" as const, pid: processIdentity.pid })),
+    },
+    processIdentity,
+    source,
+  };
+
+  const result = await resumeBrowserSession(
+    withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/test-conversation" }),
+    {
+      manualLogin: true,
+      manualLoginProfileDir: profileDir,
+      timeoutMs: 1_000,
+    },
+    vi.fn() as BrowserLogger,
+    {
+      acquireManualChromeOwner: vi.fn(async () => owner) as never,
+      createRecoveryTarget: vi.fn(async () => "fallback-owned-target"),
+      connectRecoveryTarget: vi.fn(async () => ({
+        client,
+        targetId: "fallback-owned-target",
+        ownership: "created" as const,
+        close: vi.fn(async () => undefined),
+      })) as never,
+      waitForConversationHydration: vi.fn(async () => 1),
+      verifyCommittedPromptTurn: vi.fn(async () => undefined),
+      waitForAssistantResponse: vi.fn(async () => ({
+        text: "fallback answer",
+        html: "",
+        meta: { messageId: "assistant-2", turnId: "turn-2" },
+      })),
+      captureAssistantMarkdown: vi.fn(async () => "fallback markdown"),
+      recoveryCleanup: {
+        closeChromeTarget,
+        terminateRecordedChromeForProfile,
+        cleanupStaleProfileState,
+      },
+    },
+  );
+  return { result, closeChromeTarget, terminateRecordedChromeForProfile, cleanupStaleProfileState };
+}
+
 describe("resumeBrowserSession", () => {
   test("selects target and captures markdown via stubs", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-profile-"));
@@ -626,6 +704,76 @@ describe("resumeBrowserSession", () => {
     expect(recoverSession).toHaveBeenCalled();
     await result.abort();
   });
+
+  test("fallback reattach tears down a launched manual-login Chrome owner", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-launched-owner-"));
+    try {
+      const {
+        result,
+        closeChromeTarget,
+        terminateRecordedChromeForProfile,
+        cleanupStaleProfileState,
+      } = await resumeFallbackWithManualOwner(profileDir, "launched");
+
+      expect(result.runtime.recoveryCleanupResources).toEqual([
+        expect.objectContaining({
+          chromeTargetId: "fallback-owned-target",
+          tabLease: expect.any(Object),
+          recoveryCleanup: {
+            transport: "local",
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+          },
+        }),
+      ]);
+      await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(closeChromeTarget).toHaveBeenCalledWith(
+        expect.objectContaining({ targetId: "fallback-owned-target" }),
+      );
+      expect(terminateRecordedChromeForProfile).toHaveBeenCalledOnce();
+      expect(cleanupStaleProfileState).toHaveBeenCalledOnce();
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["recorded", "rediscovered"] as const)(
+    "fallback reattach preserves a %s manual-login Chrome owner while cleaning its target and lease",
+    async (source) => {
+      const profileDir = await mkdtemp(path.join(os.tmpdir(), `oracle-reattach-${source}-owner-`));
+      try {
+        const {
+          result,
+          closeChromeTarget,
+          terminateRecordedChromeForProfile,
+          cleanupStaleProfileState,
+        } = await resumeFallbackWithManualOwner(profileDir, source);
+
+        expect(result.runtime.recoveryCleanupResources).toEqual([
+          expect.objectContaining({
+            chromeTargetId: "fallback-owned-target",
+            tabLease: expect.any(Object),
+            recoveryCleanup: {
+              transport: "local",
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: true,
+              closeOwnedTargetOnComplete: true,
+            },
+          }),
+        ]);
+        await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+        expect(closeChromeTarget).toHaveBeenCalledWith(
+          expect.objectContaining({ targetId: "fallback-owned-target" }),
+        );
+        expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+        expect(cleanupStaleProfileState).not.toHaveBeenCalled();
+      } finally {
+        await rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("tries live reattach from browser websocket metadata before falling back", async () => {
     const runtime = withCommittedPromptEpoch({
@@ -2108,6 +2256,85 @@ describe("recovery resource finalization", () => {
         { acquireRecoveryLock },
         "abort",
       ),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: { code: "settlement-mode-conflict", runtime },
+    });
+    expect(acquireRecoveryLock).not.toHaveBeenCalled();
+  });
+
+  test.each(["finalize", "abort"] as const)(
+    "retries local cleanup using its persisted %s settlement mode",
+    async (settlementMode) => {
+      const runtime: BrowserRuntimeMetadata = {
+        recoveryCleanupResult: {
+          status: "failed",
+          error: "interrupted settlement",
+          settlementMode,
+        },
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "owned-local-target",
+            recoveryCleanup: {
+              transport: "local",
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: false,
+            },
+          },
+        ],
+      };
+      const closeChromeTarget = vi.fn(async () => false);
+
+      const result = await retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, {
+        acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
+        recoveryCleanup: { closeChromeTarget },
+      });
+
+      expect(result).toMatchObject({
+        status: "pending",
+        runtime: {
+          recoveryCleanupResult: {
+            status: "failed",
+            settlementMode,
+          },
+        },
+      });
+      expect(closeChromeTarget).toHaveBeenCalledOnce();
+      await expect(
+        retryBrowserRecoveryCleanup(
+          result.runtime,
+          vi.fn() as BrowserLogger,
+          { acquireRecoveryLock: vi.fn() },
+          settlementMode === "finalize" ? "abort" : "finalize",
+        ),
+      ).rejects.toMatchObject({
+        details: { code: "settlement-mode-conflict" },
+      });
+    },
+  );
+
+  test("rejects a generic local settlement mode that conflicts with a remote copy", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "interrupted local settlement",
+        settlementMode: "abort",
+      },
+      remoteRecovery: {
+        protocolVersion: 3,
+        host: "remote.example.test:9443",
+        transactionToken: "f".repeat(64),
+        state: "pending",
+        settlementMode: "finalize",
+      },
+    };
+    const acquireRecoveryLock = vi.fn();
+
+    await expect(
+      retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, { acquireRecoveryLock }),
     ).rejects.toMatchObject({
       name: "BrowserAutomationError",
       details: { code: "settlement-mode-conflict", runtime },

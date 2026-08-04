@@ -113,11 +113,51 @@ export function completedBrowserCaptureCleanup(
 export function pendingBrowserCaptureCleanup(
   runtime: BrowserRuntimeMetadata,
   error: string,
+  settlementMode?: BrowserCaptureSettlementMode,
 ): BrowserCaptureFinalizationResult {
+  const hasCleanupAuthority = Boolean(
+    runtime.recoveryCleanupResources?.length ||
+    runtime.recoveryCleanupResult ||
+    runtime.remoteRecovery,
+  );
   return {
     status: "pending",
-    runtime: { ...runtime, recoveryCleanupResult: { status: "failed", error } },
+    runtime: hasCleanupAuthority
+      ? {
+          ...runtime,
+          recoveryCleanupResult: {
+            status: "failed",
+            error,
+            ...(settlementMode ? { settlementMode } : {}),
+          },
+        }
+      : runtime,
     error,
+  };
+}
+
+export function bindBrowserCaptureCleanupSettlement(
+  result: BrowserCaptureFinalizationResult,
+  settlementMode: BrowserCaptureSettlementMode,
+): BrowserCaptureFinalizationResult {
+  if (result.status === "completed") return result;
+  const hasCleanupAuthority = Boolean(
+    result.runtime.recoveryCleanupResources?.length ||
+    result.runtime.recoveryCleanupResult ||
+    result.runtime.remoteRecovery,
+  );
+  if (!hasCleanupAuthority) return result;
+  const cleanupResult = result.runtime.recoveryCleanupResult;
+  return {
+    ...result,
+    runtime: {
+      ...result.runtime,
+      recoveryCleanupResult: {
+        status: cleanupResult?.status ?? "failed",
+        error: cleanupResult?.error ?? result.error,
+        settlementMode,
+      },
+    },
   };
 }
 
@@ -432,14 +472,16 @@ export class BrowserRunLifecycleController {
         pendingBrowserCaptureCleanup(
           runtime,
           error instanceof Error ? error.message : String(error),
+          mode,
         ),
       )
       .then((result) => {
+        const boundResult = bindBrowserCaptureCleanupSettlement(result, mode);
         this.state =
-          result.status === "completed"
-            ? { kind: "completed", mode, result }
-            : { kind: "cleanup-pending", mode, result };
-        return result;
+          boundResult.status === "completed"
+            ? { kind: "completed", mode, result: boundResult }
+            : { kind: "cleanup-pending", mode, result: boundResult };
+        return boundResult;
       });
     this.state = { kind: "settling", mode, runtime, completion };
     return completion;

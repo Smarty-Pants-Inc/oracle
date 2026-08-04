@@ -251,6 +251,11 @@ describe("BrowserRunLifecycleController", () => {
         runtime: {
           chromeTargetId: "retry-target",
           recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
+          recoveryCleanupResult: {
+            status: "failed",
+            error: "target close was not confirmed",
+            settlementMode: mode,
+          },
         },
       });
       expect(lifecycle.phase()).toEqual({
@@ -283,6 +288,7 @@ describe("BrowserRunLifecycleController", () => {
           recoveryCleanupResult: {
             status: "failed",
             error: "target close was not confirmed",
+            settlementMode: mode,
           },
           recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
         }),
@@ -290,4 +296,38 @@ describe("BrowserRunLifecycleController", () => {
       expect(lifecycle.phase()).toEqual({ kind: "completed", mode });
     },
   );
+
+  test("binds thrown unpublished cleanup failure to finalize", async () => {
+    const settleResources = vi.fn(async () => {
+      throw new Error("profile removal was not confirmed");
+    });
+    const lifecycle = new BrowserRunLifecycleController({
+      getRuntime: remoteRuntime,
+      settleResources,
+    });
+    lifecycle.markAcquired();
+
+    const result = await lifecycle.settleIfUnpublished();
+
+    expect(settleResources).toHaveBeenCalledWith(
+      "finalize",
+      expect.objectContaining({ recoveryCleanupResult: { status: "pending" } }),
+    );
+    expect(result).toMatchObject({
+      status: "pending",
+      error: "profile removal was not confirmed",
+      runtime: {
+        recoveryCleanupResult: {
+          status: "failed",
+          error: "profile removal was not confirmed",
+          settlementMode: "finalize",
+        },
+      },
+    });
+    expect(lifecycle.phase()).toEqual({
+      kind: "cleanup-pending",
+      mode: "finalize",
+      error: "profile removal was not confirmed",
+    });
+  });
 });

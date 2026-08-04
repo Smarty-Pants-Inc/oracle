@@ -532,7 +532,7 @@ describe("attachSession rendering", () => {
           },
         },
       ],
-      recoveryCleanupResult: { status: "pending" },
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
     };
     const completedMeta: SessionMetadata = {
       ...baseMeta,
@@ -597,7 +597,7 @@ describe("attachSession rendering", () => {
           },
         },
       ],
-      recoveryCleanupResult: { status: "pending" },
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
     };
     readSessionMetadataMock.mockResolvedValue({
       ...baseMeta,
@@ -637,7 +637,11 @@ describe("attachSession rendering", () => {
           },
         },
       ],
-      recoveryCleanupResult: { status: "failed", error: "abort retry" },
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "abort retry",
+        settlementMode: "abort",
+      },
     };
     const errorMeta: SessionMetadata = {
       ...baseMeta,
@@ -671,6 +675,66 @@ describe("attachSession rendering", () => {
     ).toBe(false);
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
   });
+
+  test.each(["finalize", "abort"] as const)(
+    "retries persisted local %s cleanup for an error session without acknowledging remote publication",
+    async (settlementMode) => {
+      const pendingRuntime: BrowserRuntimeMetadata = {
+        chromePid: 123,
+        chromePort: 9222,
+        userDataDir: "/tmp/copied-profile",
+        recoveryCleanupResources: [
+          {
+            chromePid: 123,
+            chromePort: 9222,
+            userDataDir: "/tmp/copied-profile",
+            recoveryCleanup: {
+              transport: "local",
+              ownsTarget: true,
+              profileKind: "copied",
+              keepBrowser: false,
+            },
+          },
+        ],
+        recoveryCleanupResult: {
+          status: "failed",
+          error: `${settlementMode} retry`,
+          settlementMode,
+        },
+      };
+      const errorMeta: SessionMetadata = {
+        ...baseMeta,
+        status: "error",
+        mode: "browser",
+        browser: { runtime: pendingRuntime },
+      };
+      retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+      readSessionMetadataMock
+        .mockResolvedValueOnce(errorMeta)
+        .mockResolvedValue({ ...errorMeta, browser: { runtime: {} } });
+      readSessionLogMock.mockResolvedValue("");
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      await attachSession("sess", {
+        suppressMetadata: true,
+        renderPrompt: false,
+        renderMarkdown: false,
+      });
+
+      expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+        pendingRuntime,
+        expect.any(Function),
+        expect.objectContaining({
+          recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        }),
+        settlementMode,
+      );
+      expect(
+        retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+      ).toBe(false);
+      expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    },
+  );
 
   test("reattaches a remote-only error session without local conversation or port metadata", async () => {
     const requestIdentity = {
@@ -905,7 +969,7 @@ describe("attachSession rendering", () => {
       expect.objectContaining({ status: "completed" }),
     ]);
     const authorityUpdateIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
-      ([, patch]) => patch.browser?.runtime === recoverableMeta.browser?.runtime,
+      ([, patch]) => patch.browser?.runtime?.recoveryCleanupResult?.settlementMode === "abort",
     );
     expect(authorityUpdateIndex).toBeGreaterThanOrEqual(0);
     expect(
