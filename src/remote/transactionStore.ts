@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type {
   BrowserModelSelectionEvidence,
@@ -192,14 +192,23 @@ export class RemoteTransactionStore {
       await this.pruneExpiredTerminalRecords();
       await this.assertCapacity(contents.byteLength, undefined, persisted.capacityReservationBytes);
       const targetPath = this.recordPath(persisted.transactionToken);
-      const handle = await open(targetPath, "wx", 0o600);
+      const tempPath = path.join(
+        this.directory,
+        `.${persisted.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+      );
       try {
-        await handle.writeFile(contents);
-        await handle.sync();
+        const handle = await open(tempPath, "wx", 0o600);
+        try {
+          await handle.writeFile(contents);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await link(tempPath, targetPath);
+        await syncDirectory(this.directory);
       } finally {
-        await handle.close();
+        await rm(tempPath, { force: true });
       }
-      await syncDirectory(this.directory);
     });
   }
 

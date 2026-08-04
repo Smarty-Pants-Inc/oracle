@@ -724,8 +724,8 @@ async function handleRemoteRunRequest(params: {
       `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
     );
   } finally {
-    if (!params.res.destroyed && !params.res.writableEnded) params.res.end();
     if (runDir) await rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+    if (!params.res.destroyed && !params.res.writableEnded) params.res.end();
   }
 }
 

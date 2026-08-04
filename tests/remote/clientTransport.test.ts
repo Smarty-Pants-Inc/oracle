@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createRemoteBrowserExecutor,
   resumeRemoteBrowserTransaction,
@@ -16,6 +16,7 @@ import {
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
+import * as sessionManager from "../../src/sessionManager.js";
 
 function committedPromptEpoch(prompt: string) {
   return {
@@ -654,6 +655,16 @@ describe("remote client transport deadlines", () => {
       "artifacts",
       "artifact-artifact-1.bin",
     );
+    const artifactsDirectory = path.dirname(finalPath);
+    const sessionDirectory = path.dirname(artifactsDirectory);
+    const durabilityEvents: string[] = [];
+    const originalSyncDirectory = sessionManager.syncDirectoryIfSupported;
+    const syncDirectory = vi
+      .spyOn(sessionManager, "syncDirectoryIfSupported")
+      .mockImplementation(async (directory) => {
+        durabilityEvents.push(`sync:${directory}`);
+        await originalSyncDirectory(directory);
+      });
     let artifactGets = 0;
     let receiptCount = 0;
     let observedAtReceipt: { contents: Buffer; mode: number; partExists: boolean } | undefined;
@@ -674,6 +685,7 @@ describe("remote client transport deadlines", () => {
         return;
       }
       if (req.method === "POST" && req.url?.endsWith("/artifacts/artifact-1/receipt")) {
+        durabilityEvents.push("receipt");
         await readJson(req);
         let partExists = true;
         await access(`${finalPath}.part`).catch(() => {
@@ -707,6 +719,14 @@ describe("remote client transport deadlines", () => {
       await executor({ prompt: "artifact durable", config: {}, sessionId: "durable-artifact" });
       expect(observedAtReceipt?.contents).toEqual(payload);
       expect(observedAtReceipt?.partExists).toBe(false);
+      const receiptIndex = durabilityEvents.indexOf("receipt");
+      expect(receiptIndex).toBeGreaterThanOrEqual(0);
+      const parentSessionSyncIndex = durabilityEvents.indexOf(`sync:${sessionDirectory}`);
+      const artifactsSyncIndex = durabilityEvents.indexOf(`sync:${artifactsDirectory}`);
+      expect(parentSessionSyncIndex).toBeGreaterThanOrEqual(0);
+      expect(artifactsSyncIndex).toBeGreaterThanOrEqual(0);
+      expect(parentSessionSyncIndex).toBeLessThan(receiptIndex);
+      expect(artifactsSyncIndex).toBeLessThan(receiptIndex);
       if (process.platform !== "win32") expect(observedAtReceipt?.mode).toBe(0o600);
       await executor({ prompt: "artifact durable", config: {}, sessionId: "durable-artifact" });
       expect(artifactGets).toBe(1);
@@ -715,6 +735,7 @@ describe("remote client transport deadlines", () => {
       setOracleHomeDirOverrideForTest(null);
       await close(server);
       await rm(oracleHome, { recursive: true, force: true });
+      syncDirectory.mockRestore();
     }
   });
 });

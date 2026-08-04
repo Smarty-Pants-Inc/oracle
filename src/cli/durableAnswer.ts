@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { open, readFile, mkdir } from "node:fs/promises";
+import { open, mkdir, lstat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
@@ -33,7 +34,7 @@ export async function persistDurableBrowserAnswer(
   await mkdir(artifactsDir, { recursive: true });
   await syncDirectoryIfSupported(paths.dir);
   const answerPath = path.join(artifactsDir, `browser-answer-${sha256}.md`);
-  await ensureDurableFile(answerPath, payload);
+  const verified = await ensureDurableFile(answerPath, payload);
 
   if (options.logHeader) {
     const logPayload = Buffer.from(`${options.logHeader}\nAnswer:\n${options.answer}\n`, "utf8");
@@ -44,7 +45,6 @@ export async function persistDurableBrowserAnswer(
     }
   }
 
-  const verified = await readFile(answerPath);
   const verifiedSha256 = createHash("sha256").update(verified).digest("hex");
   if (!verified.equals(payload) || verifiedSha256 !== sha256) {
     throw new Error(`Durable browser answer verification failed: ${answerPath}`);
@@ -212,15 +212,59 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<void> {
+async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<Buffer> {
+  let entry: Stats;
   try {
-    const existing = await readFile(targetPath);
-    if (existing.equals(payload)) return;
-    throw new Error(`Durable browser answer hash collision: ${targetPath}`);
+    entry = await lstat(targetPath);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
+    await writeDurableFile(targetPath, payload);
+    entry = await lstat(targetPath);
   }
-  await writeDurableFile(targetPath, payload);
+  if (!entry.isFile()) {
+    throw new Error(`Durable browser answer is not a regular file: ${targetPath}`);
+  }
+
+  const handle = await open(targetPath, "r+");
+  try {
+    const before = await handle.stat();
+    if (!isUnchangedFile(entry, before)) {
+      throw new Error(`Durable browser answer path changed during verification: ${targetPath}`);
+    }
+    const existing = await handle.readFile();
+    const afterRead = await handle.stat();
+    if (!isUnchangedFile(before, afterRead)) {
+      throw new Error(`Durable browser answer changed during verification: ${targetPath}`);
+    }
+    if (!existing.equals(payload)) {
+      throw new Error(`Durable browser answer hash collision: ${targetPath}`);
+    }
+    await handle.sync();
+    const afterSync = await handle.stat();
+    if (!isUnchangedFile(before, afterSync)) {
+      throw new Error(`Durable browser answer changed during verification: ${targetPath}`);
+    }
+    await syncDirectoryIfSupported(path.dirname(targetPath));
+    const named = await lstat(targetPath);
+    if (!isUnchangedFile(afterSync, named)) {
+      throw new Error(`Durable browser answer path changed during verification: ${targetPath}`);
+    }
+    return existing;
+  } finally {
+    await handle.close();
+  }
+}
+
+function isUnchangedFile(
+  before: { dev: number; ino: number; size: number; mtimeMs: number },
+  after: { dev: number; ino: number; size: number; mtimeMs: number },
+): boolean {
+  return (
+    after.dev === before.dev &&
+    after.ino === before.ino &&
+    after.size === before.size &&
+    after.mtimeMs === before.mtimeMs
+  );
 }
 
 async function writeDurableFile(targetPath: string, payload: Buffer): Promise<void> {

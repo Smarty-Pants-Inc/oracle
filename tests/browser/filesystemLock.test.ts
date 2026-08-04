@@ -174,75 +174,166 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test("preserves a replacement generation classified after the stale owner was read", async () => {
+  test("serializes replacement and exact-owner release after the second stale inspection", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
+    const mutationRootPath = `${lockPath}.mutations`;
     const originalPid = 46_046;
-    const replacementPid = 47_047;
-    let releaseSecondInspection!: () => void;
-    const allowSecondInspection = new Promise<void>((resolve) => {
-      releaseSecondInspection = resolve;
+    const reclaimerPid = 47_047;
+    const replacementPid = 48_048;
+    let resumeBeforeQuarantine!: () => void;
+    const allowQuarantine = new Promise<void>((resolve) => {
+      resumeBeforeQuarantine = resolve;
     });
-    let markSecondInspectionStarted!: () => void;
-    const secondInspectionStarted = new Promise<void>((resolve) => {
-      markSecondInspectionStarted = resolve;
+    let markBeforeQuarantine!: () => void;
+    const beforeQuarantine = new Promise<void>((resolve) => {
+      markBeforeQuarantine = resolve;
     });
+    let resumeAfterQuarantine!: () => void;
+    const allowQuarantineCompletion = new Promise<void>((resolve) => {
+      resumeAfterQuarantine = resolve;
+    });
+    let markAfterQuarantine!: () => void;
+    const afterQuarantine = new Promise<void>((resolve) => {
+      markAfterQuarantine = resolve;
+    });
+    let markReplacementPrepared!: () => void;
+    const replacementPrepared = new Promise<void>((resolve) => {
+      markReplacementPrepared = resolve;
+    });
+    let quarantinedPath: string | undefined;
+    let reclaimerLock: CrashRecoverableFilesystemLock | undefined;
+    let replacement: CrashRecoverableFilesystemLock | undefined;
+    let releaseAttempt: Promise<void> | undefined;
+    let replacementAcquire: Promise<CrashRecoverableFilesystemLock> | undefined;
+    let reclaimerRemovalAttempts = 0;
+
+    const identities: Record<number, string> = {
+      [originalPid]: "original-start",
+      [reclaimerPid]: "reclaimer-start",
+      [replacementPid]: "replacement-start",
+    };
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: originalPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+      },
+    );
+    const reclaimer = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        pid: reclaimerPid,
+        readProcessLiveness: () => "alive",
+        readProcessStartIdentity: async (pid) =>
+          pid === originalPid ? "reused-original-pid" : (identities[pid] ?? null),
+        beforeStaleLockQuarantine: async () => {
+          markBeforeQuarantine();
+          await allowQuarantine;
+        },
+        afterStaleLockQuarantine: async (stalePath) => {
+          quarantinedPath = stalePath;
+          markAfterQuarantine();
+          await allowQuarantineCompletion;
+        },
+        beforeMutationRequestRemoval: async () => {
+          reclaimerRemovalAttempts += 1;
+          if (reclaimerRemovalAttempts === 1) {
+            throw new Error("injected mutation request cleanup failure");
+          }
+        },
+      },
+    );
 
     try {
-      const original = await acquireCrashRecoverableFilesystemLock(
-        lockPath,
-        {},
-        {
-          pid: originalPid,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async () => "original-start",
-        },
-      );
+      await beforeQuarantine;
+      const originalOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
 
-      let originalIdentityReads = 0;
-      const racingAcquire = acquireCrashRecoverableFilesystemLock(
+      replacementAcquire = acquireCrashRecoverableFilesystemLock(
         lockPath,
-        {},
-        {
-          pid: 48_048,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) => {
-            if (pid === originalPid) {
-              originalIdentityReads += 1;
-              if (originalIdentityReads === 2) {
-                markSecondInspectionStarted();
-                await allowSecondInspection;
-              }
-              return "reused-original-pid";
-            }
-            if (pid === replacementPid) return "replacement-start";
-            return "racing-contender-start";
-          },
-        },
-      );
-      await secondInspectionStarted;
-
-      const replacement = await acquireCrashRecoverableFilesystemLock(
-        lockPath,
-        {},
+        { timeoutMs: 5_000, pollMs: 10 },
         {
           pid: replacementPid,
           readProcessLiveness: () => "alive",
           readProcessStartIdentity: async (pid) =>
-            pid === originalPid ? "reused-original-pid" : "replacement-start",
+            pid === originalPid ? "reused-original-pid" : (identities[pid] ?? null),
+          beforeLockPublication: async () => {
+            markReplacementPrepared();
+          },
         },
       );
-      releaseSecondInspection();
+      await replacementPrepared;
+      await vi.waitFor(async () => {
+        const requests = (await readdir(mutationRootPath)).filter((entry) =>
+          entry.startsWith("request-"),
+        );
+        expect(requests).toHaveLength(2);
+      });
+      expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(originalOwnerRaw);
 
-      await expect(racingAcquire).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      resumeBeforeQuarantine();
+      await afterQuarantine;
+      expect(quarantinedPath).toBeDefined();
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await stat(quarantinedPath!)).isDirectory()).toBe(true);
+
+      let releaseSettled = false;
+      releaseAttempt = original.release().finally(() => {
+        releaseSettled = true;
+      });
+      void releaseAttempt.catch(() => undefined);
+      await vi.waitFor(async () => {
+        const requests = (await readdir(mutationRootPath)).filter((entry) =>
+          entry.startsWith("request-"),
+        );
+        expect(requests).toHaveLength(3);
+      });
+      expect(releaseSettled).toBe(false);
+
+      resumeAfterQuarantine();
+      reclaimerLock = await reclaimer;
+      await expect(releaseAttempt).rejects.toThrow(/ownership changed/i);
+
+      await expect(reclaimerLock.release()).resolves.toBeUndefined();
+      expect(reclaimerRemovalAttempts).toBe(1);
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(
+        (await readdir(mutationRootPath)).filter((entry) => entry.startsWith("request-")),
+      ).toHaveLength(2);
+
+      await expect(reclaimerLock.release()).resolves.toBeUndefined();
+      expect(reclaimerRemovalAttempts).toBe(2);
+      await expect(reclaimerLock.release()).resolves.toBeUndefined();
+      expect(reclaimerRemovalAttempts).toBe(2);
+      reclaimerLock = undefined;
+
+      replacement = await replacementAcquire;
       const observedOwner = JSON.parse(
         await readFile(path.join(lockPath, "owner.json"), "utf8"),
       ) as { ownerNonce: string };
       expect(observedOwner.ownerNonce).toBe(replacement.owner.ownerNonce);
-      await expect(original.release()).rejects.toThrow(/ownership changed/i);
+      expect(
+        (await readdir(root)).filter(
+          (entry) => entry.startsWith("recovery.lock.stale-") || entry.includes(".released-"),
+        ),
+      ).toEqual([]);
+
       await replacement.release();
+      await replacement.release();
+      replacement = undefined;
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(mutationRootPath)).toEqual([]);
     } finally {
-      releaseSecondInspection();
+      resumeBeforeQuarantine();
+      resumeAfterQuarantine();
+      await Promise.allSettled(
+        [reclaimer, replacementAcquire, releaseAttempt].filter(Boolean) as Promise<unknown>[],
+      );
+      await replacement?.release().catch(() => undefined);
+      await reclaimerLock?.release().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
   });

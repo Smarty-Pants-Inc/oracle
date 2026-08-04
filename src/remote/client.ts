@@ -465,6 +465,7 @@ async function streamRemoteRun(params: {
   const deferred = createDeferred<RemoteRunTransactionPayload>();
   let settled = false;
   let receipt: RemoteRunTransactionPayload | null = null;
+  let terminalError: BrowserAutomationError | null = null;
   let deadlineGuard: RequestDeadlineGuard | null = null;
   const finish = (error?: unknown) => {
     if (settled) return;
@@ -549,14 +550,12 @@ async function streamRemoteRun(params: {
               } else if (event.type === "transaction") {
                 assertRemoteTransactionOwnership(event.transaction, params.transactionToken);
                 receipt = event.transaction;
-                finish();
-                res.destroy();
-                return;
               } else {
-                finish(
-                  rehydrateRemoteBrowserError(event.error, params.host, params.transactionToken, {
-                    requestIdentity: params.requestIdentity,
-                  }),
+                terminalError = rehydrateRemoteBrowserError(
+                  event.error,
+                  params.host,
+                  params.transactionToken,
+                  { requestIdentity: params.requestIdentity },
                 );
               }
             } catch (error) {
@@ -584,9 +583,9 @@ async function streamRemoteRun(params: {
           );
         }
       });
-      res.on("end", () => finish());
-      res.on("aborted", () => finish(new Error("Remote response aborted")));
-      res.on("error", finish);
+      res.on("end", () => finish(terminalError ?? undefined));
+      res.on("aborted", () => finish(terminalError ?? new Error("Remote response aborted")));
+      res.on("error", (error) => finish(terminalError ?? error));
     },
   );
   deadlineGuard = attachRequestDeadlines(req, {
@@ -1354,6 +1353,7 @@ async function transferRemoteArtifact(params: {
   const sessionId = params.sessionId ?? params.descriptor.runId;
   const artifactsDir = resolveSessionArtifactsDir(sessionId);
   await mkdir(artifactsDir, { recursive: true });
+  await syncDirectoryIfSupported(path.dirname(artifactsDir));
   const sourceFilename = sanitizeArtifactFilename(
     params.descriptor.filename,
     `artifact-${params.descriptor.artifactId}.bin`,

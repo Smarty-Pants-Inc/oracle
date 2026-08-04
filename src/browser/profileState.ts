@@ -37,6 +37,9 @@ const ORACLE_CHROME_OWNER_FILENAME = "oracle-chrome-owner.json";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
 
 const execFileAsync = promisify(execFile);
+// Process identity gates destructive cleanup, so an unavailable probe must fail closed rather than
+// permit an unbounded subprocess to stall recovery.
+const PROCESS_IDENTITY_COMMAND_TIMEOUT_MS = 12_000;
 
 type ProcessCommandExecutor = (file: string, args: string[]) => Promise<{ stdout: string }>;
 
@@ -45,6 +48,7 @@ const executeProcessCommand: ProcessCommandExecutor = async (file, args) => {
     encoding: "utf8",
     windowsHide: true,
     maxBuffer: 10 * 1024 * 1024,
+    timeout: PROCESS_IDENTITY_COMMAND_TIMEOUT_MS,
   });
   return { stdout: String(stdout ?? "") };
 };
@@ -663,9 +667,7 @@ export async function findRunningChromeDebugTargetForProfile(
   try {
     const [activePort, { stdout }] = await Promise.all([
       readDevToolsPort(userDataDir),
-      execFileAsync("ps", ["-ax", "-o", "pid=", "-o", "command="], {
-        maxBuffer: 10 * 1024 * 1024,
-      }),
+      executeProcessCommand("ps", ["-ax", "-o", "pid=", "-o", "command="]),
     ]);
     return findChromeDebugTargetForProfileFromProcessList(
       String(stdout ?? ""),
@@ -684,9 +686,7 @@ export async function findRunningChromeProcessForProfile(
 ): Promise<{ pid: number } | null> {
   if (process.platform === "win32") return null;
   try {
-    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=", "-o", "command="], {
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const { stdout } = await executeProcessCommand("ps", ["-ax", "-o", "pid=", "-o", "command="]);
     for (const line of String(stdout ?? "").split("\n")) {
       const match = line.match(/^\s*(\d+)\s+(.+)$/u);
       if (!match) continue;
@@ -1342,11 +1342,10 @@ async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
   }
 
   try {
-    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "command="], {
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    const lines = String(stdout ?? "").split("\n");
-    return lines.some((command) => isChromeCommandForUserDataDir(command, userDataDir));
+    const { stdout } = await executeProcessCommand("ps", ["-ax", "-o", "command="]);
+    return stdout
+      .split("\n")
+      .some((command) => isChromeCommandForUserDataDir(command, userDataDir));
   } catch {
     return true;
   }

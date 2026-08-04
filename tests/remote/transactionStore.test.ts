@@ -1,7 +1,8 @@
 import os from "node:os";
 import path from "node:path";
+import * as fs from "node:fs/promises";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -224,6 +225,68 @@ describe("RemoteTransactionStore", () => {
       ).rejects.toBeInstanceOf(RemoteTransactionCapacityError);
       await expect(store.list()).resolves.toHaveLength(0);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test("never exposes a partial create record or overwrites an existing token", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-atomic-create-"));
+    const interruptedToken = "0".repeat(64);
+    const duplicateToken = "f".repeat(64);
+    const createdAt = new Date().toISOString();
+    const actualFs = await vi.importActual<typeof fs>("node:fs/promises");
+    const link = vi.fn(actualFs.link);
+    link.mockRejectedValueOnce(
+      Object.assign(new Error("publication interrupted"), { code: "EINTR" }),
+    );
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, link }));
+    // Static imports cannot rebind the built-in ESM export; reload this test-isolated module.
+    const { RemoteTransactionStore: IsolatedRemoteTransactionStore } =
+      await import("../../src/remote/transactionStore.js");
+    try {
+      const store = await IsolatedRemoteTransactionStore.open({ directory: root });
+      await expect(
+        store.create({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          transactionToken: interruptedToken,
+          runId: "interrupted-create",
+          createdAt,
+          updatedAt: createdAt,
+          state: "pending",
+          ...nonterminalAuthority,
+        }),
+      ).rejects.toMatchObject({ code: "EINTR" });
+      await expect(fs.access(store.recordPath(interruptedToken))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(await fs.readdir(root)).toEqual([]);
+
+      await store.create({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken: duplicateToken,
+        runId: "original-create",
+        createdAt,
+        updatedAt: createdAt,
+        state: "pending",
+        ...nonterminalAuthority,
+      });
+      const original = await readFile(store.recordPath(duplicateToken), "utf8");
+      await expect(
+        store.create({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          transactionToken: duplicateToken,
+          runId: "replacement-attempt",
+          createdAt,
+          updatedAt: createdAt,
+          state: "pending",
+          ...nonterminalAuthority,
+        }),
+      ).rejects.toMatchObject({ code: "EEXIST" });
+      await expect(readFile(store.recordPath(duplicateToken), "utf8")).resolves.toBe(original);
+      expect(await fs.readdir(root)).toEqual([`${duplicateToken}.json`]);
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
       await rm(root, { recursive: true, force: true });
     }
   });

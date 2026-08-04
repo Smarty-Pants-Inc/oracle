@@ -300,6 +300,56 @@ describe("profileState", () => {
     expect(terminationCalls).toEqual([]);
   });
 
+  test("bounds default process inspections and preserves authority after a command timeout", async () => {
+    const timeoutError = Object.assign(new Error("process probe timed out"), {
+      code: "ETIMEDOUT",
+      killed: true,
+    });
+    const execFile = vi.fn();
+    const execFileAsync = vi.fn(async (..._args: unknown[]) => {
+      throw timeoutError;
+    });
+    Object.defineProperty(execFile, Symbol.for("nodejs.util.promisify.custom"), {
+      value: execFileAsync,
+    });
+    const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
+    const identity = syntheticWindowsChromeIdentity(profileDir);
+    let cleanupDir: string | undefined;
+
+    try {
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({ execFile }));
+      // A static import already binds the real executor; reload to bind this test's timed-out boundary.
+      const timedProfileState = await import("../../src/browser/profileState.js");
+
+      await expect(
+        timedProfileState.inspectChromeProcessIdentityForTest(profileDir, identity, {
+          platform: "win32",
+          verifyProfileIdentity: async () => true,
+          isProcessAlive: () => true,
+        }),
+      ).resolves.toBe("unavailable");
+
+      cleanupDir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-timeout-"));
+      await writeNativeDevToolsFixture(cleanupDir, 12345);
+      await expect(timedProfileState.cleanupStaleProfileState(cleanupDir)).resolves.toBe(false);
+      expect(existsSync(path.join(cleanupDir, "DevToolsActivePort"))).toBe(true);
+
+      expect(execFileAsync.mock.calls).toHaveLength(2);
+      expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
+      expect(execFileAsync.mock.calls[1]?.[0]).toBe(
+        process.platform === "win32" ? "powershell.exe" : "ps",
+      );
+      for (const [, , options] of execFileAsync.mock.calls) {
+        expect(options).toMatchObject({ timeout: 12_000 });
+      }
+    } finally {
+      if (cleanupDir) await rm(cleanupDir, { recursive: true, force: true });
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
   test.runIf(process.platform === "linux")(
     "captures and verifies a real Linux process through procfs generation data",
     async () => {

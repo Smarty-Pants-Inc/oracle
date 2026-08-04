@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -11,6 +11,7 @@ import {
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import { sessionStore } from "../../src/sessionStore.js";
+import * as sessionManager from "../../src/sessionManager.js";
 
 const tempDirectories: string[] = [];
 
@@ -50,6 +51,54 @@ describe("persistDurableBrowserAnswer", () => {
     expect(await readFile(receipt.artifact.path, "utf8")).toBe(answer);
     expect(await readFile(sessionPaths.log, "utf8")).toBe(
       `[reattach] captured assistant response from existing Chrome tab\nAnswer:\n${answer}\n`,
+    );
+  });
+
+  test("fsyncs an existing matching answer and its parent before returning its receipt", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-durable-answer-"));
+    tempDirectories.push(directory);
+    const sessionPaths = {
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    };
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue(sessionPaths);
+    const answer = "retryable answer";
+    const hash = createHash("sha256").update(Buffer.from(answer, "utf8")).digest("hex");
+    const artifactsDirectory = path.join(directory, "artifacts");
+    await mkdir(artifactsDirectory, { recursive: true });
+    await writeFile(path.join(artifactsDirectory, `browser-answer-${hash}.md`), answer);
+    const syncDirectory = vi.spyOn(sessionManager, "syncDirectoryIfSupported");
+
+    const receipt = await persistDurableBrowserAnswer({ sessionId: "session-1", answer });
+
+    expect(receipt.artifact.path).toBe(path.join(artifactsDirectory, `browser-answer-${hash}.md`));
+    expect(syncDirectory).toHaveBeenCalledWith(artifactsDirectory);
+  });
+
+  test("rejects a pre-existing answer path substituted with a symlink", async () => {
+    if (process.platform === "win32") return;
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-durable-answer-"));
+    tempDirectories.push(directory);
+    const sessionPaths = {
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    };
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue(sessionPaths);
+    const answer = "captured answer";
+    const hash = createHash("sha256").update(Buffer.from(answer, "utf8")).digest("hex");
+    const artifactsDirectory = path.join(directory, "artifacts");
+    const sourcePath = path.join(directory, "answer-source.md");
+    const answerPath = path.join(artifactsDirectory, `browser-answer-${hash}.md`);
+    await mkdir(artifactsDirectory, { recursive: true });
+    await writeFile(sourcePath, answer);
+    await symlink(sourcePath, answerPath);
+
+    await expect(persistDurableBrowserAnswer({ sessionId: "session-1", answer })).rejects.toThrow(
+      "Durable browser answer is not a regular file",
     );
   });
 

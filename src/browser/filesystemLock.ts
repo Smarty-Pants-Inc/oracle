@@ -2,10 +2,13 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { delay } from "./utils.js";
 
 const LOCK_OWNER_FILENAME = "owner.json";
+const LOCK_MUTATION_DIRECTORY_SUFFIX = ".mutations";
+const LOCK_MUTATION_REQUEST_PREFIX = "request-";
+const LOCK_MUTATION_TICKET_FILENAME = "ticket";
 const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
@@ -48,10 +51,34 @@ export interface CrashRecoverableFilesystemLockDeps {
   readProcessStartIdentity?: (pid: number) => Promise<string | null>;
   randomUUID?: () => string;
   beforeLockPublication?: (preparedLockPath: string) => Promise<void>;
+  beforeStaleLockQuarantine?: () => Promise<void>;
+  afterStaleLockQuarantine?: (quarantinedLockPath: string) => Promise<void>;
+  beforeMutationRequestRemoval?: (requestPath: string) => Promise<void>;
 }
 interface FilesystemLockGeneration {
   ownerRaw: string | null;
   lastMutationMs?: number;
+}
+
+interface FilesystemLockMutationOptions {
+  owner: FilesystemLockOwnerRecord;
+  now: () => number;
+  pollMs: number;
+  incompleteLockStaleMs: number;
+  readLiveness: (pid: number) => ProcessLiveness;
+  readProcessIdentity: (pid: number) => Promise<string | null>;
+  createNonce: () => string;
+  beforeRequestRemoval?: (requestPath: string) => Promise<void>;
+}
+
+interface FilesystemLockMutationLease {
+  release: () => Promise<void>;
+}
+
+interface FilesystemLockReleaseState {
+  mutationLease?: FilesystemLockMutationLease;
+  detachedPath?: string;
+  canonicalReleased: boolean;
 }
 
 type FilesystemLockInspection =
@@ -104,12 +131,70 @@ export async function acquireCrashRecoverableFilesystemLock(
     sessionId: options.sessionId,
     createdAt: new Date(now()).toISOString(),
   };
+  const mutationProcessStartIdentity = await readProcessStartIdentity(process.pid);
+  if (!mutationProcessStartIdentity) {
+    throw new Error(
+      `Cannot coordinate crash-recoverable filesystem lock mutations at ${lockPath} without a stable process generation for pid ${process.pid}`,
+    );
+  }
+  const mutationOwner: FilesystemLockOwnerRecord = {
+    version: 1,
+    pid: process.pid,
+    processStartIdentity: mutationProcessStartIdentity,
+    ownerNonce: createNonce(),
+    createdAt: new Date(now()).toISOString(),
+  };
   const startedAt = now();
+  const mutationDeadlineMs = timeoutMs === 0 ? startedAt : startedAt + timeoutMs;
   const parentPath = path.dirname(lockPath);
+  const mutationOptions: FilesystemLockMutationOptions = {
+    owner: mutationOwner,
+    now,
+    pollMs,
+    incompleteLockStaleMs,
+    readLiveness: readProcessLiveness,
+    readProcessIdentity: readProcessStartIdentity,
+    createNonce,
+    beforeRequestRemoval: deps.beforeMutationRequestRemoval,
+  };
 
   if (options.createParent !== false) {
     await mkdir(parentPath, { recursive: true });
   }
+
+  const completeAcquisition = (
+    mutationLease?: FilesystemLockMutationLease,
+  ): CrashRecoverableFilesystemLock => {
+    const releaseState: FilesystemLockReleaseState = {
+      mutationLease,
+      canonicalReleased: false,
+    };
+    let released = false;
+    let releaseInFlight: Promise<void> | undefined;
+    return {
+      path: lockPath,
+      owner,
+      release: () => {
+        if (released) return Promise.resolve();
+        if (releaseInFlight) return releaseInFlight;
+        let attempt!: Promise<void>;
+        attempt = (async () => {
+          try {
+            released = await releaseCrashRecoverableFilesystemLock(
+              lockPath,
+              owner,
+              mutationOptions,
+              releaseState,
+            );
+          } finally {
+            if (releaseInFlight === attempt) releaseInFlight = undefined;
+          }
+        })();
+        releaseInFlight = attempt;
+        return attempt;
+      },
+    };
+  };
 
   let preparedLockPath: string | undefined;
   try {
@@ -118,15 +203,12 @@ export async function acquireCrashRecoverableFilesystemLock(
     await deps.beforeLockPublication?.(preparedLockPath);
 
     for (;;) {
-      if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+      if (
+        !(await hasFilesystemLockMutationRequests(lockPath)) &&
+        (await publishPreparedLockGeneration(preparedLockPath, lockPath))
+      ) {
         preparedLockPath = undefined;
-        let releasePromise: Promise<void> | undefined;
-        return {
-          path: lockPath,
-          owner,
-          release: () =>
-            (releasePromise ??= releaseCrashRecoverableFilesystemLock(lockPath, owner)),
-        };
+        return completeAcquisition();
       }
 
       let inspection = await inspectExistingLock(lockPath, {
@@ -135,19 +217,48 @@ export async function acquireCrashRecoverableFilesystemLock(
         readLiveness,
         readProcessIdentity,
       });
+      let attemptedReclamation = false;
       if (inspection.status === "stale") {
-        inspection = await inspectExistingLock(lockPath, {
-          nowMs: now(),
-          incompleteLockStaleMs,
-          readLiveness,
-          readProcessIdentity,
-        });
-        if (inspection.status === "stale") {
-          await quarantineStaleLock(lockPath, createNonce(), inspection.generation);
-          continue;
+        const mutationLease = await acquireFilesystemLockMutationLease(
+          lockPath,
+          mutationOptions,
+          mutationDeadlineMs,
+        );
+        if (mutationLease === null) throw new FilesystemLockBusyError(lockPath);
+        let retainMutationLease = false;
+        try {
+          if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+            retainMutationLease = true;
+            preparedLockPath = undefined;
+            return completeAcquisition(mutationLease);
+          }
+          inspection = await inspectExistingLock(lockPath, {
+            nowMs: now(),
+            incompleteLockStaleMs,
+            readLiveness,
+            readProcessIdentity,
+          });
+          if (inspection.status === "stale") {
+            await deps.beforeStaleLockQuarantine?.();
+            await quarantineStaleLock(
+              lockPath,
+              createNonce(),
+              inspection.generation,
+              deps.afterStaleLockQuarantine,
+            );
+            attemptedReclamation = true;
+            if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+              retainMutationLease = true;
+              preparedLockPath = undefined;
+              return completeAcquisition(mutationLease);
+            }
+          }
+        } finally {
+          if (!retainMutationLease) await mutationLease.release();
         }
       }
 
+      if (attemptedReclamation) continue;
       const elapsed = now() - startedAt;
       if (timeoutMs === 0 || elapsed >= timeoutMs) {
         throw new FilesystemLockBusyError(
@@ -264,45 +375,403 @@ async function lockPathExists(lockPath: string): Promise<boolean> {
   }
 }
 
-async function releaseCrashRecoverableFilesystemLock(
+// A stable sibling directory hosts unique mutation requests. Published tickets order requests;
+// concurrent ticket ties use the unique request name, and an owner without a ticket is a doorway
+// that every contender waits for. Stale requests are reclaimed only through their unique path.
+async function acquireFilesystemLockMutationLease(
   lockPath: string,
-  expectedOwner: FilesystemLockOwnerRecord,
+  options: FilesystemLockMutationOptions,
+  deadlineMs?: number,
+  whileWaiting?: () => Promise<void>,
+): Promise<FilesystemLockMutationLease | null> {
+  const mutationRootPath = `${lockPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`;
+  let requestPath: string | undefined;
+  let acquired = false;
+  try {
+    requestPath = await createFilesystemLockMutationRequest(mutationRootPath, options.owner);
+    await writeFilesystemLockMutationOwner(requestPath, options.owner);
+    const ticket = await writeFilesystemLockMutationTicket(mutationRootPath, requestPath);
+    const requestName = path.basename(requestPath);
+
+    for (;;) {
+      if (
+        !(await hasPrecedingFilesystemLockMutationRequest(
+          mutationRootPath,
+          requestPath,
+          requestName,
+          ticket,
+          options,
+        ))
+      ) {
+        acquired = true;
+        const removalState: {
+          requestPath: string;
+          quarantinedPath?: string;
+        } = { requestPath: requestPath! };
+        let released = false;
+        let releaseInFlight: Promise<void> | undefined;
+        return {
+          release: () => {
+            if (released) return Promise.resolve();
+            if (releaseInFlight) return releaseInFlight;
+            let attempt!: Promise<void>;
+            attempt = (async () => {
+              try {
+                await removeFilesystemLockMutationRequest(removalState, options);
+                released = true;
+              } finally {
+                if (releaseInFlight === attempt) releaseInFlight = undefined;
+              }
+            })();
+            releaseInFlight = attempt;
+            return attempt;
+          },
+        };
+      }
+      await whileWaiting?.();
+
+      if (deadlineMs !== undefined && options.now() >= deadlineMs) return null;
+      const waitMs =
+        deadlineMs === undefined
+          ? options.pollMs
+          : Math.min(options.pollMs, Math.max(1, deadlineMs - options.now()));
+      await delay(waitMs);
+    }
+  } finally {
+    if (!acquired && requestPath !== undefined) {
+      await removeFilesystemLockMutationRequest({ requestPath }, options);
+    }
+  }
+}
+
+async function createFilesystemLockMutationRequest(
+  mutationRootPath: string,
+  owner: FilesystemLockOwnerRecord,
+): Promise<string> {
+  for (;;) {
+    try {
+      await mkdir(mutationRootPath);
+    } catch (error) {
+      if (readErrorCode(error) !== "EEXIST") throw error;
+    }
+    try {
+      return await mkdtemp(
+        path.join(mutationRootPath, `${LOCK_MUTATION_REQUEST_PREFIX}${owner.ownerNonce}-`),
+      );
+    } catch (error) {
+      if (readErrorCode(error) !== "ENOENT") throw error;
+    }
+  }
+}
+
+async function writeFilesystemLockMutationOwner(
+  requestPath: string,
+  owner: FilesystemLockOwnerRecord,
 ): Promise<void> {
-  const owner = await readLockOwnerForRelease(lockPath);
-  if (owner === null) return;
-  if (!sameLockOwner(owner, expectedOwner)) {
-    throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
+  const handle = await open(path.join(requestPath, LOCK_OWNER_FILENAME), "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeFilesystemLockMutationTicket(
+  mutationRootPath: string,
+  requestPath: string,
+): Promise<number> {
+  let maximumTicket = 0;
+  for (const candidatePath of await listFilesystemLockMutationRequests(mutationRootPath)) {
+    maximumTicket = Math.max(
+      maximumTicket,
+      (await readFilesystemLockMutationTicket(candidatePath)) ?? 0,
+    );
+  }
+  if (maximumTicket >= Number.MAX_SAFE_INTEGER) {
+    throw new Error(`Filesystem lock mutation ticket space exhausted at ${mutationRootPath}`);
   }
 
-  const releasedPath = `${lockPath}.released-${expectedOwner.ownerNonce}`;
+  const ticket = maximumTicket + 1;
+  const ticketPath = path.join(requestPath, LOCK_MUTATION_TICKET_FILENAME);
+  const handle = await open(ticketPath, "wx", 0o600);
   try {
-    await renameLockPath(lockPath, releasedPath);
+    await handle.writeFile(`${ticket}\n`, "utf8");
+  } finally {
+    await handle.close();
+  }
+  return ticket;
+}
+
+async function hasPrecedingFilesystemLockMutationRequest(
+  mutationRootPath: string,
+  ownRequestPath: string,
+  ownRequestName: string,
+  ownTicket: number,
+  options: FilesystemLockMutationOptions,
+): Promise<boolean> {
+  for (const candidatePath of await listFilesystemLockMutationRequests(mutationRootPath)) {
+    if (candidatePath === ownRequestPath) continue;
+    const inspection = await inspectExistingLock(candidatePath, {
+      nowMs: options.now(),
+      incompleteLockStaleMs: options.incompleteLockStaleMs,
+      readLiveness: options.readLiveness,
+      readProcessIdentity: options.readProcessIdentity,
+    });
+    if (inspection.status === "stale") {
+      const reclaimed = await quarantineFilesystemLockMutationRequest(
+        candidatePath,
+        options.createNonce(),
+        inspection.generation,
+      );
+      if (!reclaimed && (await lockPathExists(candidatePath))) return true;
+      continue;
+    }
+
+    const candidateTicket = await readFilesystemLockMutationTicket(candidatePath);
+    if (candidateTicket === null) {
+      if (await lockPathExists(candidatePath)) return true;
+      continue;
+    }
+    const candidateName = path.basename(candidatePath);
+    if (
+      candidateTicket < ownTicket ||
+      (candidateTicket === ownTicket && candidateName < ownRequestName)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function hasFilesystemLockMutationRequests(lockPath: string): Promise<boolean> {
+  try {
+    return (await readdir(`${lockPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`)).some(
+      (entry) => entry.startsWith(LOCK_MUTATION_REQUEST_PREFIX) && !entry.includes(".stale-"),
+    );
   } catch (error) {
-    if (readErrorCode(error) === "ENOENT") return;
+    if (readErrorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function listFilesystemLockMutationRequests(mutationRootPath: string): Promise<string[]> {
+  const entries = await readdir(mutationRootPath);
+  return entries
+    .filter((entry) => entry.startsWith(LOCK_MUTATION_REQUEST_PREFIX) && !entry.includes(".stale-"))
+    .sort()
+    .map((entry) => path.join(mutationRootPath, entry));
+}
+
+async function readFilesystemLockMutationTicket(requestPath: string): Promise<number | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path.join(requestPath, LOCK_MUTATION_TICKET_FILENAME), "utf8");
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  const normalized = raw.trim();
+  if (!/^[1-9]\d*$/u.test(normalized)) return null;
+  const ticket = Number(normalized);
+  return Number.isSafeInteger(ticket) ? ticket : null;
+}
+
+async function removeFilesystemLockMutationRequest(
+  state: { requestPath: string; quarantinedPath?: string },
+  options: FilesystemLockMutationOptions,
+): Promise<void> {
+  if (state.quarantinedPath === undefined) {
+    await options.beforeRequestRemoval?.(state.requestPath);
+    const quarantinedPath = `${state.requestPath}.stale-${options.owner.ownerNonce}`;
+    try {
+      await renameLockPath(state.requestPath, quarantinedPath);
+    } catch (error) {
+      if (readErrorCode(error) !== "ENOENT") throw error;
+      if (!(await lockPathExists(quarantinedPath))) return;
+    }
+    state.quarantinedPath = quarantinedPath;
+  }
+
+  const quarantinedPath = state.quarantinedPath;
+  let generationMatches: boolean;
+  try {
+    generationMatches = await lockGenerationMatches(quarantinedPath, {
+      ownerRaw: `${JSON.stringify(options.owner)}\n`,
+    });
+  } catch (error) {
+    await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
+    state.quarantinedPath = undefined;
+    throw error;
+  }
+  if (!generationMatches) {
+    await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
+    state.quarantinedPath = undefined;
+    throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
+  }
+
+  await removeLockPath(quarantinedPath);
+  state.quarantinedPath = undefined;
+}
+
+// Mutation requests coordinate only live processes. They need atomic visibility and exact-owner
+// deletion, but not crash durability: after a machine crash no coordinating process survives.
+async function quarantineFilesystemLockMutationRequest(
+  requestPath: string,
+  nonce: string,
+  expectedGeneration: FilesystemLockGeneration,
+): Promise<boolean> {
+  const quarantinedPath = `${requestPath}.stale-${nonce}`;
+  try {
+    await renameLockPath(requestPath, quarantinedPath);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return false;
     throw error;
   }
 
-  const releasedOwner = await readLockOwnerForRelease(releasedPath);
-  if (releasedOwner === null) {
-    await syncDirectoryIfPresent(path.dirname(lockPath));
-    return;
+  let generationMatches: boolean;
+  try {
+    generationMatches = await lockGenerationMatches(quarantinedPath, expectedGeneration);
+  } catch (error) {
+    await restoreFilesystemLockMutationRequest(requestPath, quarantinedPath);
+    throw error;
   }
-  if (!sameLockOwner(releasedOwner, expectedOwner)) {
-    try {
-      await renameLockPath(releasedPath, lockPath);
-      await syncDirectory(path.dirname(lockPath));
-    } catch (restoreError) {
-      throw new Error(
-        `Filesystem lock ownership changed at ${lockPath}; unexpected lock preserved at ${releasedPath}`,
-        { cause: restoreError },
-      );
-    }
-    throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
+  if (!generationMatches) {
+    await restoreFilesystemLockMutationRequest(requestPath, quarantinedPath);
+    return false;
   }
 
-  await syncDirectoryIfPresent(path.dirname(lockPath));
-  await removeLockPath(releasedPath);
-  await syncDirectoryIfPresent(path.dirname(lockPath));
+  await removeLockPath(quarantinedPath);
+  return true;
+}
+
+async function restoreFilesystemLockMutationRequest(
+  requestPath: string,
+  quarantinedPath: string,
+): Promise<void> {
+  try {
+    await renameLockPath(quarantinedPath, requestPath);
+  } catch (error) {
+    throw new Error(
+      `Filesystem lock mutation generation changed at ${requestPath}; unexpected request preserved at ${quarantinedPath}`,
+      { cause: error },
+    );
+  }
+}
+
+async function releaseCrashRecoverableFilesystemLock(
+  lockPath: string,
+  expectedOwner: FilesystemLockOwnerRecord,
+  mutationOptions: FilesystemLockMutationOptions,
+  state: FilesystemLockReleaseState,
+): Promise<boolean> {
+  if (state.mutationLease === undefined) {
+    const rejectChangedOwner = async (): Promise<void> => {
+      const owner = await readLockOwnerForRelease(lockPath);
+      if (owner !== null && !sameLockOwner(owner, expectedOwner)) {
+        throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
+      }
+    };
+    await rejectChangedOwner();
+    const mutationLease = await acquireFilesystemLockMutationLease(
+      lockPath,
+      mutationOptions,
+      undefined,
+      rejectChangedOwner,
+    );
+    if (mutationLease === null) {
+      throw new Error(`Cannot serialize filesystem lock release at ${lockPath}`);
+    }
+    state.mutationLease = mutationLease;
+  }
+
+  if (!state.canonicalReleased) {
+    try {
+      const owner = await readLockOwnerForRelease(lockPath);
+      if (owner === null) {
+        state.canonicalReleased = true;
+      } else {
+        if (!sameLockOwner(owner, expectedOwner)) {
+          throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
+        }
+
+        const releasedPath = `${lockPath}.released-${expectedOwner.ownerNonce}`;
+        try {
+          await renameLockPath(lockPath, releasedPath);
+          state.canonicalReleased = true;
+          state.detachedPath = releasedPath;
+        } catch (error) {
+          if (readErrorCode(error) !== "ENOENT") throw error;
+          state.canonicalReleased = true;
+        }
+      }
+    } catch (error) {
+      const mutationLease = state.mutationLease;
+      try {
+        await mutationLease.release();
+        state.mutationLease = undefined;
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Filesystem lock release failed before canonical removal at ${lockPath}`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  if (state.detachedPath !== undefined) {
+    const detachedPath = state.detachedPath;
+    let releasedOwner: FilesystemLockOwnerRecord | null;
+    try {
+      releasedOwner = await readLockOwnerForRelease(detachedPath);
+    } catch {
+      return false;
+    }
+    if (releasedOwner === null) {
+      state.detachedPath = undefined;
+    } else if (!sameLockOwner(releasedOwner, expectedOwner)) {
+      try {
+        await renameLockPath(detachedPath, lockPath);
+        await syncDirectory(path.dirname(lockPath));
+      } catch {
+        return false;
+      }
+      state.detachedPath = undefined;
+      state.canonicalReleased = false;
+      const error = new Error(`Filesystem lock ownership changed at ${lockPath}`);
+      const mutationLease = state.mutationLease;
+      try {
+        await mutationLease.release();
+        state.mutationLease = undefined;
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Filesystem lock ownership changed and mutation cleanup failed at ${lockPath}`,
+        );
+      }
+      throw error;
+    } else {
+      try {
+        await syncDirectoryIfPresent(path.dirname(lockPath));
+        await removeLockPath(detachedPath);
+        await syncDirectoryIfPresent(path.dirname(lockPath));
+        state.detachedPath = undefined;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  const mutationLease = state.mutationLease;
+  if (mutationLease !== undefined) {
+    try {
+      await mutationLease.release();
+      state.mutationLease = undefined;
+    } catch {
+      return false;
+    }
+  }
+  return state.canonicalReleased && state.detachedPath === undefined;
 }
 
 async function inspectExistingLock(
@@ -385,6 +854,7 @@ async function quarantineStaleLock(
   lockPath: string,
   nonce: string,
   expectedGeneration: FilesystemLockGeneration,
+  afterQuarantine?: (quarantinedLockPath: string) => Promise<void>,
 ): Promise<boolean> {
   const stalePath = `${lockPath}.stale-${nonce}`;
   try {
@@ -394,6 +864,12 @@ async function quarantineStaleLock(
     throw error;
   }
   await syncDirectory(path.dirname(lockPath));
+  try {
+    await afterQuarantine?.(stalePath);
+  } catch (error) {
+    await restoreUnexpectedLockGeneration(lockPath, stalePath);
+    throw error;
+  }
 
   let generationMatches: boolean;
   try {
