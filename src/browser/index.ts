@@ -1541,17 +1541,56 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       modelSelectionEvidence,
     );
   };
+  const localAcquisitionLeaseCleanupPendingError = (
+    acquisitionError: unknown,
+    releaseError: unknown,
+  ): BrowserAutomationError => {
+    const acquisitionMessage =
+      acquisitionError instanceof Error ? acquisitionError.message : String(acquisitionError);
+    const releaseMessage =
+      releaseError instanceof Error ? releaseError.message : String(releaseError);
+    const cleanupError = `Browser tab lease release failed during local acquisition cleanup: ${releaseMessage}`;
+    const runtime = pendingBrowserCaptureCleanup(
+      buildLocalAcquisitionRuntime("tab-lease"),
+      cleanupError,
+      "abort",
+    ).runtime;
+    return new BrowserAutomationError(
+      `Local browser acquisition failed (${acquisitionMessage}); tab lease cleanup remains retryable: ${releaseMessage}`,
+      {
+        stage: "browser-acquisition",
+        code: "tab-lease-cleanup-pending",
+        runtime,
+        cleanupError,
+      },
+      new AggregateError(
+        [acquisitionError, releaseError],
+        "Local browser acquisition and tab lease cleanup both failed",
+      ),
+    );
+  };
 
   await persistLocalAcquisition(manualLogin ? "tab-lease" : "chrome-process");
   if (manualLogin) {
-    tabLease = await acquireBrowserTabLease(userDataDir, {
+    const acquiredTabLease = await acquireBrowserTabLease(userDataDir, {
       maxConcurrentTabs: config.maxConcurrentTabs,
       timeoutMs: config.timeoutMs,
       logger,
       sessionId: options.sessionId,
       leaseId: acquisitionLeaseId,
     });
-    await persistLocalAcquisition("chrome-process");
+    tabLease = acquiredTabLease;
+    try {
+      await persistLocalAcquisition("chrome-process");
+    } catch (persistenceError) {
+      try {
+        await acquiredTabLease.release();
+        tabLease = null;
+      } catch (releaseError) {
+        throw localAcquisitionLeaseCleanupPendingError(persistenceError, releaseError);
+      }
+      throw persistenceError;
+    }
   }
 
   let acquiredChrome: ManualChromeOwner | null = null;
@@ -1583,10 +1622,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       acquiredChrome,
     );
   } catch (error) {
+    let tabLeaseReleaseError: unknown = null;
     if (tabLease) {
       const handle = tabLease;
-      tabLease = null;
-      await handle.release().catch(() => undefined);
+      try {
+        await handle.release();
+        tabLease = null;
+      } catch (releaseError) {
+        tabLeaseReleaseError = releaseError;
+      }
     }
     if (acquiredChrome) {
       if (manualLogin) {
@@ -1613,6 +1657,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(
         `[browser] Copy-profile acquisition failed without a confirmed safe Chrome termination outcome; preserving ${userDataDir}.`,
       );
+    }
+    if (tabLeaseReleaseError) {
+      throw localAcquisitionLeaseCleanupPendingError(error, tabLeaseReleaseError);
     }
     throw error;
   }
@@ -3735,7 +3782,6 @@ async function runRemoteBrowserMode(
         chromePort: port,
         leaseId: acquisitionLeaseId,
       });
-      await persistRemoteRuntime("chrome-target");
     }
     if (config.browserTabRef) {
       const attached = await connectToExistingChatGptTab({
@@ -3752,6 +3798,7 @@ async function runRemoteBrowserMode(
         `Attached to existing remote ChatGPT tab ${attached.targetId}${attached.tab.url ? ` (${attached.tab.url})` : ""}`,
       );
     } else {
+      await persistRemoteRuntime("chrome-target");
       connection = await connectToRemoteChrome(
         host,
         port,

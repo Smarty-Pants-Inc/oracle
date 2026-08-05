@@ -20,7 +20,7 @@ import {
   buildConversationDebugExpression,
 } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
-import { promptIdentitySha256 } from "./promptComposer.js";
+import { buildReadUserPromptTextExpression, promptIdentitySha256 } from "./promptComposer.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -202,6 +202,7 @@ export async function verifyCommittedPromptTurn(
       if (conversationId !== expected.conversationId) return null;
       const turns = ${buildConversationTurnListExpression()};
       ${buildConversationTurnIdentityExpression()}
+      ${buildReadUserPromptTextExpression()}
       const turn = turns[expected.userTurnIndex];
       if (!turn) return null;
       if (!isUserTurn(turn)) return null;
@@ -212,8 +213,8 @@ export async function verifyCommittedPromptTurn(
       for (let index = expected.userTurnIndex + 1; index < turns.length; index += 1) {
         if (isUserTurn(turns[index])) return null;
       }
-      const text = String(turn.innerText || turn.textContent || '');
-      return { text, turnId, messageId };
+      const text = readUserPromptText(turn);
+      return text === null ? null : { text, turnId, messageId };
     })()`,
     returnByValue: true,
   });
@@ -1484,8 +1485,9 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       const userTurns = Array.from(scope.querySelectorAll(USER_TURN_SELECTOR));
       return userTurns[userTurns.length - 1] ?? null;
     };
+    ${buildReadUserPromptTextExpression()}
     const lastUser = collectLastUser(root) || collectLastUser(document);
-    const userText = lastUser ? normalize(lastUser.innerText || lastUser.textContent || '') : '';
+    const userText = lastUser ? normalize(readUserPromptText(lastUser) || '') : '';
     const isAfterCurrentUser = (node) => {
       if (!lastUser || typeof lastUser.compareDocumentPosition !== 'function') return false;
       // Node.DOCUMENT_POSITION_FOLLOWING = 4. Use the numeric bit so the injected expression

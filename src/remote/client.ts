@@ -1,7 +1,7 @@
 import http from "node:http";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, rm, stat, unlink } from "node:fs/promises";
 import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
 import type {
   BrowserAttachment,
@@ -92,6 +92,22 @@ class RemoteTransportInterruption extends Error {
     this.name = "RemoteTransportInterruption";
   }
 }
+
+interface ArtifactFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+class ArtifactDescriptorMismatchError extends Error {
+  constructor(
+    message: string,
+    readonly identity: ArtifactFileIdentity,
+  ) {
+    super(message);
+    this.name = "ArtifactDescriptorMismatchError";
+  }
+}
+
 function resolveRemoteTransportDeadlines(
   configured: RemoteTransportDeadlines | undefined,
   browserTimeoutMs?: number,
@@ -1384,10 +1400,19 @@ async function transferRemoteArtifact(params: {
     params.descriptor.artifactId,
   )}`;
 
-  let verified = await verifyAndSyncArtifactFile(finalPath, params.descriptor).catch((error) => {
-    if (readErrorCode(error) === "ENOENT") return null;
-    throw error;
-  });
+  let verified: { size: number; sha256: string } | null;
+  try {
+    verified = await verifyAndSyncArtifactFile(finalPath, params.descriptor);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") {
+      verified = null;
+    } else if (error instanceof ArtifactDescriptorMismatchError) {
+      await quarantineStaleArtifactFile(finalPath, error.identity);
+      verified = null;
+    } else {
+      throw error;
+    }
+  }
   if (verified) {
     await syncDirectoryIfSupported(artifactsDir);
     params.log?.(`[browser] Reusing verified artifact ${sourceFilename}.`);
@@ -1565,11 +1590,27 @@ async function verifyAndSyncArtifactFile(
   artifactPath: string,
   descriptor: RemoteArtifactDescriptor,
 ): Promise<{ size: number; sha256: string }> {
+  const entry = await lstat(artifactPath);
+  if (entry.isSymbolicLink() || !entry.isFile() || entry.nlink !== 1) {
+    throw new Error("local artifact cache path is not an unlinked regular file");
+  }
+  const identity = { dev: entry.dev, ino: entry.ino };
   const handle = await open(artifactPath, "r+");
   try {
     const before = await handle.stat();
-    if (!before.isFile() || before.size !== descriptor.byteSize) {
-      throw new Error("local artifact does not match the durable descriptor");
+    if (
+      !before.isFile() ||
+      before.nlink !== 1 ||
+      before.dev !== identity.dev ||
+      before.ino !== identity.ino
+    ) {
+      throw new Error("local artifact cache path changed before durability verification");
+    }
+    if (before.size !== descriptor.byteSize) {
+      throw new ArtifactDescriptorMismatchError(
+        "local artifact size does not match the durable descriptor",
+        identity,
+      );
     }
     const hash = createHash("sha256");
     const input = handle.createReadStream({ autoClose: false, start: 0 });
@@ -1578,6 +1619,7 @@ async function verifyAndSyncArtifactFile(
     if (
       after.dev !== before.dev ||
       after.ino !== before.ino ||
+      after.nlink !== before.nlink ||
       after.size !== before.size ||
       after.mtimeMs !== before.mtimeMs
     ) {
@@ -1585,7 +1627,10 @@ async function verifyAndSyncArtifactFile(
     }
     const sha256 = hash.digest("hex");
     if (sha256 !== descriptor.sha256) {
-      throw new Error("local artifact sha256 does not match the durable descriptor");
+      throw new ArtifactDescriptorMismatchError(
+        "local artifact sha256 does not match the durable descriptor",
+        identity,
+      );
     }
     await handle.chmod(0o600);
     await handle.sync();
@@ -1593,6 +1638,47 @@ async function verifyAndSyncArtifactFile(
   } finally {
     await handle.close();
   }
+}
+
+async function quarantineStaleArtifactFile(
+  artifactPath: string,
+  expectedIdentity: ArtifactFileIdentity,
+): Promise<void> {
+  const entry = await lstat(artifactPath).catch((error) => {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (entry === null) return;
+  if (
+    entry.isSymbolicLink() ||
+    !entry.isFile() ||
+    entry.nlink !== 1 ||
+    entry.dev !== expectedIdentity.dev ||
+    entry.ino !== expectedIdentity.ino
+  ) {
+    throw new Error("local artifact cache path changed before stale replacement");
+  }
+
+  const quarantinePath = `${artifactPath}.stale-${randomBytes(12).toString("hex")}`;
+  try {
+    await rename(artifactPath, quarantinePath);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return;
+    throw error;
+  }
+
+  const quarantined = await lstat(quarantinePath);
+  if (
+    quarantined.isSymbolicLink() ||
+    !quarantined.isFile() ||
+    quarantined.nlink !== 1 ||
+    quarantined.dev !== expectedIdentity.dev ||
+    quarantined.ino !== expectedIdentity.ino
+  ) {
+    throw new Error("local artifact cache path changed during stale replacement");
+  }
+  await unlink(quarantinePath);
+  await syncDirectoryIfSupported(path.dirname(artifactPath));
 }
 
 function readErrorCode(error: unknown): string | undefined {

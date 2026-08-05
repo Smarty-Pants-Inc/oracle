@@ -224,11 +224,36 @@ export async function createRemoteServer(
     },
   });
 
-  // Remote Chrome and lease settlement are single-flight. Per-record work is additionally
-  // serialized by RemoteTransactionStore.
+  // Each admitted controller request holds a permit through its full route dispatch. Remote Chrome
+  // and lease settlement are single-flight; per-record work is additionally serialized by the store.
   let browserWorkBusy = false;
   let browserWorkIdle: { promise: Promise<void>; resolve: () => void } | null = null;
   let sweepInFlight: Promise<void> | null = null;
+  let controllerOperationCount = 0;
+  let controllerOperationsIdle: { promise: Promise<void>; resolve: () => void } | null = null;
+  const admitControllerOperation = (): (() => void) | null => {
+    if (closing) return null;
+    if (controllerOperationCount === 0) controllerOperationsIdle = Promise.withResolvers<void>();
+    controllerOperationCount += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      controllerOperationCount -= 1;
+      if (controllerOperationCount === 0) {
+        const idle = controllerOperationsIdle;
+        controllerOperationsIdle = null;
+        idle?.resolve();
+      }
+    };
+  };
+  const waitForControllerOperationsToDrain = async (): Promise<void> => {
+    while (controllerOperationCount > 0) {
+      const idle = controllerOperationsIdle;
+      if (!idle) throw new Error("Remote controller operation drain lost its completion signal");
+      await idle.promise;
+    }
+  };
   const startBrowserWork = (allowDuringClose = false): void => {
     if (closing && !allowDuringClose) {
       throw new RemoteTransactionConflictError(
@@ -315,6 +340,7 @@ export async function createRemoteServer(
   }
 
   server.on("request", async (req, res) => {
+    let releaseControllerOperation: (() => void) | null = null;
     try {
       if (req.method === "GET" && req.url === "/status") {
         logger("[serve] Health check /status");
@@ -331,7 +357,9 @@ export async function createRemoteServer(
         });
         return;
       }
-      if (closing) {
+
+      releaseControllerOperation = admitControllerOperation();
+      if (!releaseControllerOperation) {
         sendJson(res, 503, { error: "server_closing" });
         return;
       }
@@ -453,7 +481,6 @@ export async function createRemoteServer(
 
       res.statusCode = 404;
       res.end();
-      return;
     } catch (error) {
       logger(`[serve] Request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) {
@@ -461,6 +488,8 @@ export async function createRemoteServer(
       } else if (!res.destroyed) {
         res.end();
       }
+    } finally {
+      releaseControllerOperation?.();
     }
   });
   const listenDeferred = Promise.withResolvers<void>();
@@ -511,6 +540,7 @@ export async function createRemoteServer(
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
   const closeRemoteServer = async (): Promise<void> => {
+    await waitForControllerOperationsToDrain();
     await waitForBrowserWorkToDrain();
     startBrowserWork(true);
     try {
@@ -1116,6 +1146,14 @@ async function serveRemoteTransactionRetry(params: {
           recoveryRuntime,
           record.browserConfig,
           params.logger,
+          {
+            runtimeHintCb: async (runtime) => {
+              await params.transactionStore.journalRecoveryRuntime(
+                record.transactionToken,
+                runtime,
+              );
+            },
+          },
         );
       } catch (rawError) {
         const error =

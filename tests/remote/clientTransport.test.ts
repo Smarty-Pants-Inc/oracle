@@ -2,7 +2,7 @@ import http from "node:http";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
   createRemoteBrowserExecutor,
@@ -203,7 +203,7 @@ describe("remote client transport deadlines", () => {
       res.end();
     });
     const port = await listen(server);
-    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-transport-"));
+    const oracleHome = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-transport-"));
     setOracleHomeDirOverrideForTest(oracleHome);
     try {
       const error = await createRemoteBrowserExecutor({
@@ -227,7 +227,7 @@ describe("remote client transport deadlines", () => {
     } finally {
       setOracleHomeDirOverrideForTest(null);
       await close(server);
-      await rm(oracleHome, { recursive: true, force: true });
+      await fsPromises.rm(oracleHome, { recursive: true, force: true });
     }
   });
 
@@ -877,8 +877,10 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("posts artifact receipts only after a 0600 durable final artifact exists", async () => {
-    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-durable-artifact-"));
+  it("replaces a corrupt cached artifact before posting its durable receipt", async () => {
+    const oracleHome = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "oracle-remote-durable-artifact-"),
+    );
     setOracleHomeDirOverrideForTest(oracleHome);
     const payload = Buffer.from("durable artifact");
     const descriptor = {
@@ -901,6 +903,8 @@ describe("remote client transport deadlines", () => {
     );
     const artifactsDirectory = path.dirname(finalPath);
     const sessionDirectory = path.dirname(artifactsDirectory);
+    await fsPromises.mkdir(artifactsDirectory, { recursive: true });
+    await fsPromises.writeFile(finalPath, "corrupt artifact");
     const durabilityEvents: string[] = [];
     const originalSyncDirectory = sessionManager.syncDirectoryIfSupported;
     const syncDirectory = vi
@@ -932,12 +936,12 @@ describe("remote client transport deadlines", () => {
         durabilityEvents.push("receipt");
         await readJson(req);
         let partExists = true;
-        await access(`${finalPath}.part`).catch(() => {
+        await fsPromises.access(`${finalPath}.part`).catch(() => {
           partExists = false;
         });
         observedAtReceipt = {
-          contents: await readFile(finalPath),
-          mode: (await stat(finalPath)).mode & 0o777,
+          contents: await fsPromises.readFile(finalPath),
+          mode: (await fsPromises.stat(finalPath)).mode & 0o777,
           partExists,
         };
         receiptCount += 1;
@@ -978,8 +982,89 @@ describe("remote client transport deadlines", () => {
     } finally {
       setOracleHomeDirOverrideForTest(null);
       await close(server);
-      await rm(oracleHome, { recursive: true, force: true });
+      await fsPromises.rm(oracleHome, { recursive: true, force: true });
       syncDirectory.mockRestore();
+    }
+  });
+
+  it("propagates unrelated cached-artifact I/O failures without downloading", async () => {
+    const oracleHome = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "oracle-remote-artifact-io-"),
+    );
+    setOracleHomeDirOverrideForTest(oracleHome);
+    const payload = Buffer.from("artifact");
+    const descriptor = {
+      artifactId: "artifact-io",
+      runId: "run-1",
+      kind: "file" as const,
+      filename: "result.bin",
+      byteSize: payload.byteLength,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+      sourceUrlKind: "browser-download" as const,
+      transferStatus: "ready" as const,
+      required: true,
+    };
+    const finalPath = path.join(
+      oracleHome,
+      "sessions",
+      "artifact-io",
+      "artifacts",
+      "artifact-artifact-io.bin",
+    );
+    const artifactsDirectory = path.dirname(finalPath);
+    await fsPromises.mkdir(artifactsDirectory, { recursive: true });
+    await fsPromises.writeFile(finalPath, "corrupt!");
+    let artifactGets = 0;
+    const server = http.createServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (transactionToken) {
+        const request = await readJson(req);
+        res.setHeader("content-type", "application/x-ndjson");
+        res.end(
+          `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
+        );
+        return;
+      }
+      if (req.method === "GET" && req.url?.includes("/artifacts/artifact-io")) {
+        artifactGets += 1;
+        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+        res.end(payload);
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    const originalSyncDirectory = sessionManager.syncDirectoryIfSupported;
+    let injectedFailure = false;
+    const syncDirectory = vi
+      .spyOn(sessionManager, "syncDirectoryIfSupported")
+      .mockImplementation(async (directory) => {
+        await originalSyncDirectory(directory);
+        if (directory === artifactsDirectory && !injectedFailure) {
+          injectedFailure = true;
+          throw Object.assign(new Error("injected artifact cache I/O failure"), { code: "EIO" });
+        }
+      });
+    try {
+      const error = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "secret",
+        deadlines,
+      })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" }).then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+      expect(error).toMatchObject({
+        name: "BrowserAutomationError",
+        details: { stage: "remote-artifact-transfer" },
+      });
+      expect(artifactGets).toBe(0);
+    } finally {
+      syncDirectory.mockRestore();
+      setOracleHomeDirOverrideForTest(null);
+      await close(server);
+      await fsPromises.rm(oracleHome, { recursive: true, force: true });
     }
   });
 });

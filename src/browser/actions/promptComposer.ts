@@ -45,6 +45,58 @@ export function buildPromptIdentityNormalizationExpression(): string {
   };`;
 }
 
+/**
+ * Build the browser-side reader for the authored portion of a user turn.
+ *
+ * Turn containers also carry presentation chrome (for example, “You said:”),
+ * action controls, and attachment tiles. They are deliberately not prompt
+ * identity authority. A missing or ambiguous content root fails closed.
+ */
+export function buildReadUserPromptTextExpression(): string {
+  return `const readUserPromptText = (turn) => {
+    if (!turn || typeof turn.querySelectorAll !== 'function') return null;
+    const USER_SCOPE_SELECTOR = '[data-message-author-role="user"], [data-turn="user"]';
+    const CONTENT_SELECTOR = [
+      '[data-message-content]',
+      '[data-testid="user-message"]',
+      '[data-testid*="user-message"]',
+      '[data-testid="user-turn-content"]',
+      '[data-testid*="user-turn-content"]',
+      '[class*="whitespace-pre-wrap"]',
+      '.whitespace-pre-wrap',
+      '.markdown',
+    ].join(', ');
+    const EXCLUDED_SELECTOR = [
+      'button',
+      '[role="button"]',
+      '[data-testid*="action"]',
+      '[data-testid*="attachment"]',
+      '[data-testid*="upload"]',
+      '[data-testid*="file"]',
+      '[aria-label*="attachment"]',
+      '[aria-label*="file"]',
+    ].join(', ');
+    const isUserScope = (node) => node?.matches?.(USER_SCOPE_SELECTOR);
+    const scopes = isUserScope(turn)
+      ? [turn]
+      : Array.from(turn.querySelectorAll(USER_SCOPE_SELECTOR));
+    if (scopes.length !== 1) return null;
+    const scope = scopes[0];
+    if (!scope || typeof scope.querySelectorAll !== 'function') return null;
+    const isExcluded = (node) => Boolean(node?.closest?.(EXCLUDED_SELECTOR));
+    const candidates = [
+      ...(scope.matches?.(CONTENT_SELECTOR) ? [scope] : []),
+      ...Array.from(scope.querySelectorAll(CONTENT_SELECTOR)),
+    ].filter((node) => !isExcluded(node));
+    const leaves = candidates.filter(
+      (candidate) => !candidates.some((other) => other !== candidate && candidate.contains?.(other)),
+    );
+    if (leaves.length !== 1) return null;
+    const text = leaves[0]?.innerText ?? leaves[0]?.textContent;
+    return typeof text === 'string' ? text : null;
+  };`;
+}
+
 export function promptIdentitySha256(prompt: string): string {
   return createHash("sha256").update(normalizePromptForIdentity(prompt), "utf8").digest("hex");
 }
@@ -845,6 +897,7 @@ export async function verifyPromptCommitted(
     const baseline = ${baseline};
     ${buildPromptIdentityNormalizationExpression()}
     ${buildConversationTurnIdentityExpression()}
+    ${buildReadUserPromptTextExpression()}
     const normalizedPrompt = ${encodedPrompt};
     const articles = ${buildConversationTurnListExpression()};
     const readValue = (node) => {
@@ -865,8 +918,9 @@ export async function verifyPromptCommitted(
     for (let index = baseline; index < articles.length; index += 1) {
       const node = articles[index];
       if (!isUserTurn(node)) continue;
-      const text = normalizePromptIdentity(node?.innerText || node?.textContent || '');
-      if (!matchesPrompt(text)) continue;
+      const promptText = readUserPromptText(node);
+      const text = promptText === null ? null : normalizePromptIdentity(promptText);
+      if (text === null || !matchesPrompt(text)) continue;
       matchedUserTurnIndex = index;
       matchedUserTurnId = readTurnId(node);
       matchedUserMessageId = readMessageId(node);
@@ -885,7 +939,10 @@ export async function verifyPromptCommitted(
     const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
     const href = typeof location === 'object' && location.href ? location.href : '';
     const conversationId = href.match(/\\/c\\/([^/?#]+)/)?.[1] ?? null;
-    const normalizedTurns = articles.map((node) => normalizePromptIdentity(node?.innerText));
+    const normalizedTurns = articles.map((node) => {
+      const promptText = readUserPromptText(node);
+      return promptText === null ? '' : normalizePromptIdentity(promptText);
+    });
     return {
       baseline,
       matchedUserTurnIndex,

@@ -174,6 +174,10 @@ type RemoteTransactionTransition =
       modelSelection?: BrowserModelSelectionEvidence;
     }
   | {
+      type: "journal-recovery-runtime";
+      runtime: BrowserRuntimeMetadata;
+    }
+  | {
       type: "publish-capture";
       runId: string;
       result: RemotePublicRunResult;
@@ -369,6 +373,23 @@ export class RemoteTransactionStore {
     ).record;
   }
 
+  /**
+   * Replaces the durable recovery runtime during an unbound recovery attempt.
+   * This is deliberately separate from `journalRuntime`, which is only valid
+   * while the initial capture is running.
+   */
+  async journalRecoveryRuntime(
+    transactionToken: string,
+    runtime: BrowserRuntimeMetadata,
+  ): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(transactionToken, {
+        type: "journal-recovery-runtime",
+        runtime,
+      })
+    ).record;
+  }
+
   async publishCapture(params: {
     transactionToken: string;
     runId: string;
@@ -550,6 +571,24 @@ export class RemoteTransactionStore {
         record.modelSelection = transition.modelSelection;
         return { persist: true };
       }
+      case "journal-recovery-runtime": {
+        if (record.state !== "recoverable-error") {
+          throw new Error(
+            `Cannot journal recovery runtime for transaction in state ${record.state}`,
+          );
+        }
+        if (record.controllerGeneration !== this.controllerGeneration) {
+          throw new Error(
+            "Cannot journal recovery runtime from a stale remote controller generation",
+          );
+        }
+        if (record.settlementMode) {
+          throw new Error("Cannot journal recovery runtime after cleanup settlement is bound");
+        }
+        record.runtime = transition.runtime;
+        record.runtimeJournaledAt = this.nowIso();
+        return { persist: true };
+      }
       case "publish-capture": {
         if (
           record.state !== "running" &&
@@ -595,16 +634,9 @@ export class RemoteTransactionStore {
           throw new Error("Failure recoverability must match durable runtime authority");
         }
         record.controllerGeneration = this.controllerGeneration;
-        record.state = transition.runtime ? "recoverable-error" : "failed";
         record.runtime = transition.runtime;
         record.runtimeJournaledAt = transition.runtime ? this.nowIso() : undefined;
-        record.result = undefined;
-        record.modelSelection = undefined;
-        record.artifacts = undefined;
-        record.error = transition.error;
-        record.settlementMode = undefined;
-        record.publicationAcknowledgedAt = undefined;
-        record.finalization = undefined;
+        projectRunningRecordToFailure(record, transition.error);
         return { persist: true };
       }
       case "record-artifact-delivery": {
@@ -747,8 +779,7 @@ export class RemoteTransactionStore {
           throw new Error("Controller reconciliation error does not match runtime authority");
         }
         record.controllerGeneration = this.controllerGeneration;
-        record.state = hadRuntimeAuthority ? "recoverable-error" : "failed";
-        record.error = error;
+        const state = projectRunningRecordToFailure(record, error);
         record.restartRecovery = {
           previousControllerGeneration,
           reconciledAt: this.nowIso(),
@@ -759,7 +790,7 @@ export class RemoteTransactionStore {
           outcome: {
             transactionToken: record.transactionToken,
             previousControllerGeneration,
-            state: record.state,
+            state,
             hadRuntimeAuthority,
           } satisfies ReconcileRemoteTransactionResult,
         };
@@ -778,8 +809,7 @@ export class RemoteTransactionStore {
           if (error.recoverableDisconnect !== hadRuntimeAuthority) {
             throw new Error("Expired transaction error does not match runtime authority");
           }
-          record.state = hadRuntimeAuthority ? "recoverable-error" : "failed";
-          record.error = error;
+          projectRunningRecordToFailure(record, error);
           if (!hadRuntimeAuthority) return { persist: true, outcome: null };
         }
         const mode = record.settlementMode ?? "abort";
@@ -1044,6 +1074,21 @@ function serializeRecord(record: RemoteTransactionRecord): Buffer {
 
 function isTerminalState(state: RemoteTransactionState): state is RemoteTerminalTransactionState {
   return state === "finalized" || state === "aborted" || state === "failed";
+}
+
+function projectRunningRecordToFailure(
+  record: RemoteTransactionRecord,
+  error: DurableRemoteAutomationError,
+): "recoverable-error" | "failed" {
+  const state = record.runtime ? "recoverable-error" : "failed";
+  record.state = state;
+  record.result = undefined;
+  record.modelSelection = undefined;
+  record.artifacts = undefined;
+  record.error = error;
+  record.publicationAcknowledgedAt = undefined;
+  record.finalization = undefined;
+  return state;
 }
 
 function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: string): void {

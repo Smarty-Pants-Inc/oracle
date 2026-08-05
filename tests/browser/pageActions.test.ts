@@ -1614,6 +1614,13 @@ describe("waitForAssistantResponse", () => {
     class FakeTurn {
       readonly dataset: Record<string, string>;
       readonly id: string;
+      readonly promptContent: {
+        innerText: string;
+        textContent: string;
+        matches: (selector: string) => boolean;
+        closest: () => null;
+        contains: () => false;
+      };
 
       constructor(
         private readonly role: "user" | "assistant",
@@ -1626,6 +1633,13 @@ describe("waitForAssistantResponse", () => {
           messageId: `message-${index}`,
         };
         this.id = `conversation-turn-${index}`;
+        this.promptContent = {
+          innerText,
+          textContent: innerText,
+          matches: (selector) => selector.includes("[data-message-content]"),
+          closest: () => null,
+          contains: () => false,
+        };
       }
 
       get textContent(): string {
@@ -1641,7 +1655,10 @@ describe("waitForAssistantResponse", () => {
       }
 
       matches(selector: string): boolean {
-        return selector === "[data-message-id]";
+        return (
+          selector === "[data-message-id]" ||
+          (this.role === "user" && selector.includes('[data-message-author-role="user"]'))
+        );
       }
 
       querySelector(selector: string): FakeTurn | null {
@@ -1649,6 +1666,12 @@ describe("waitForAssistantResponse", () => {
           return this;
         }
         return null;
+      }
+
+      querySelectorAll(selector: string): Array<typeof this.promptContent> {
+        return this.role === "user" && selector.includes("[data-message-content]")
+          ? [this.promptContent]
+          : [];
       }
     }
 

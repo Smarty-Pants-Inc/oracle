@@ -9,10 +9,8 @@ import type {
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
 import {
-  BrowserCaptureSettlementController,
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
-  createBrowserRunTransaction,
   markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
   type BrowserCaptureSettlementAdapters,
@@ -54,7 +52,6 @@ const GEMINI_REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"] as const;
 interface GeminiCookieLoadResult {
   cookieMap: Record<string, string>;
   warnings: string[];
-  cleanupSession?: GeminiBrowserSession;
 }
 
 function estimateTokenCount(text: string): number {
@@ -126,39 +123,6 @@ function createGeminiRunLifecycle(
   });
 }
 
-async function createGeminiBrowserTransaction(
-  result: BrowserRunResult,
-  sessions: GeminiBrowserSession[],
-  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
-): Promise<BrowserRunTransaction> {
-  if (sessions.length === 0) return createSettledGeminiTransaction(result);
-
-  const pendingRuntime = markBrowserCaptureCleanupPending(combineGeminiSessionRuntime(sessions));
-  const settlement = new BrowserCaptureSettlementController(
-    createGeminiSettlementAdapters(sessions, persistRuntime),
-    pendingRuntime,
-  );
-  try {
-    await persistRuntime?.(pendingRuntime);
-  } catch (cause) {
-    const abort = await settlement.settle("abort");
-    const cleanupDetail =
-      abort.status === "completed"
-        ? "unpublished resources were aborted"
-        : `cleanup remains retryable: ${abort.error ?? "unknown cleanup failure"}`;
-    throw new BrowserAutomationError(
-      `Failed to durably persist Gemini browser cleanup authority before returning capture; ${cleanupDetail}.`,
-      {
-        stage: "gemini-browser-publication",
-        code: "gemini-browser-runtime-persistence-failed",
-        runtime: abort.runtime,
-      },
-      cause,
-    );
-  }
-  return createBrowserRunTransaction(result, settlement);
-}
-
 async function throwAfterGeminiSessionCleanup(
   error: unknown,
   sessions: GeminiBrowserSession[],
@@ -173,6 +137,23 @@ async function throwAfterGeminiSessionCleanup(
   ).runtime;
   throw new BrowserAutomationError(
     `${message}; Gemini browser cleanup remains retryable: ${cleanupError}`,
+    { stage: "gemini-browser-cleanup", runtime },
+    error,
+  );
+}
+
+function throwAfterGeminiCookieCaptureCleanupFailure(
+  error: unknown,
+  session: GeminiBrowserSession,
+): never {
+  const cleanupError = error instanceof Error ? error.message : String(error);
+  const runtime = pendingBrowserCaptureCleanup(
+    combineGeminiSessionRuntime([session]),
+    cleanupError,
+    "abort",
+  ).runtime;
+  throw new BrowserAutomationError(
+    `Gemini cookie capture succeeded but browser cleanup remains retryable: ${cleanupError}`,
     { stage: "gemini-browser-cleanup", runtime },
     error,
   );
@@ -245,11 +226,12 @@ async function loadGeminiCookiesFromCDP(
   log?: BrowserLogger,
 ): Promise<GeminiCookieLoadResult> {
   const session = await openGeminiBrowserSession({
-    browserConfig,
+    browserConfig: { ...browserConfig, keepBrowser: false },
     keepBrowserDefault: false,
     purpose: "Gemini manual-login cookie extraction (no keychain)",
     log,
   });
+  let cookieMap: Record<string, string> = {};
   try {
     const client = session.client;
     const { Network, Page } = client;
@@ -264,7 +246,6 @@ async function loadGeminiCookiesFromCDP(
     const pollIntervalMs = 2_000;
     const deadline = Date.now() + pollTimeoutMs;
     let lastNotice = 0;
-    let cookieMap: Record<string, string> = {};
 
     while (Date.now() < deadline) {
       const { cookies } = await Network.getCookies({ urls: GEMINI_CDP_COOKIE_URLS });
@@ -272,7 +253,7 @@ async function loadGeminiCookiesFromCDP(
 
       if (hasRequiredGeminiCookies(cookieMap)) {
         log?.(`[gemini-web] Extracted ${Object.keys(cookieMap).length} Gemini cookie(s) via CDP.`);
-        return { cookieMap, warnings: [], cleanupSession: session };
+        break;
       }
 
       const now = Date.now();
@@ -286,10 +267,21 @@ async function loadGeminiCookiesFromCDP(
       await delay(pollIntervalMs);
     }
 
-    throw new Error("Timed out waiting for Google sign-in (5 minutes). Please sign in and retry.");
+    if (!hasRequiredGeminiCookies(cookieMap)) {
+      throw new Error(
+        "Timed out waiting for Google sign-in (5 minutes). Please sign in and retry.",
+      );
+    }
   } catch (error) {
     return throwAfterGeminiSessionCleanup(error, [session]);
   }
+
+  try {
+    await session.close();
+  } catch (error) {
+    throwAfterGeminiCookieCaptureCleanupFailure(error, session);
+  }
+  return { cookieMap, warnings: [] };
 }
 
 async function runGeminiDeepThinkViaBrowser(
@@ -498,7 +490,6 @@ async function loadGeminiCookies(
     return {
       cookieMap: { ...cdpResult.cookieMap, ...inlineResult.cookieMap },
       warnings: [...inlineResult.warnings, ...cdpResult.warnings],
-      cleanupSession: cdpResult.cleanupSession,
     };
   }
 
@@ -572,11 +563,7 @@ export function createGeminiWebExecutor(
           preferManualNoKeychain: useNoKeychainPath,
         });
         if (!hasRequiredGeminiCookies(cookieResult.cookieMap)) {
-          const error = new Error(formatGeminiCookieError(cookieResult.warnings));
-          if (cookieResult.cleanupSession) {
-            return throwAfterGeminiSessionCleanup(error, [cookieResult.cleanupSession]);
-          }
-          throw error;
+          throw new Error(formatGeminiCookieError(cookieResult.warnings));
         }
 
         const configTimeout =
@@ -681,11 +668,6 @@ export function createGeminiWebExecutor(
               image_count: out.images.length,
             };
           }
-        } catch (error) {
-          if (cookieResult.cleanupSession) {
-            return throwAfterGeminiSessionCleanup(error, [cookieResult.cleanupSession]);
-          }
-          throw error;
         } finally {
           clearTimeout(timeout);
         }
@@ -705,17 +687,13 @@ export function createGeminiWebExecutor(
         const tookMs = Date.now() - startTime;
         log?.(`[gemini-web] Completed in ${tookMs}ms`);
 
-        return createGeminiBrowserTransaction(
-          {
-            answerText,
-            answerMarkdown,
-            tookMs,
-            answerTokens: estimateTokenCount(answerText),
-            answerChars: answerText.length,
-          },
-          cookieResult.cleanupSession ? [cookieResult.cleanupSession] : [],
-          runOptions.runtimeHintCb,
-        );
+        return createSettledGeminiTransaction({
+          answerText,
+          answerMarkdown,
+          tookMs,
+          answerTokens: estimateTokenCount(answerText),
+          answerChars: answerText.length,
+        });
       },
     };
 

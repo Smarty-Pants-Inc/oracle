@@ -1,16 +1,28 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repoRoot = process.cwd();
 const tmpRoot = mkdtempSync(join(tmpdir(), "oracle-packed-cli-"));
+const npmUserConfigPath = join(tmpRoot, "user-npmrc");
+const npmGlobalConfigPath = join(tmpRoot, "global-npmrc");
+writeFileSync(npmUserConfigPath, "");
+writeFileSync(npmGlobalConfigPath, "");
+const npmEnvironment = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.toLowerCase().startsWith("npm_config_")),
+  ),
+  NPM_CONFIG_GLOBALCONFIG: npmGlobalConfigPath,
+  NPM_CONFIG_USERCONFIG: npmUserConfigPath,
+};
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, {
     cwd: options.cwd ?? repoRoot,
     encoding: "utf8",
     stdio: options.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
+    env: options.env ?? process.env,
   });
 }
 
@@ -23,9 +35,10 @@ try {
 
   const installDir = join(tmpRoot, "install");
   mkdirSync(installDir);
-  run("npm", ["init", "-y"], { cwd: installDir });
+  run("npm", ["init", "-y"], { cwd: installDir, env: npmEnvironment });
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(tmpRoot, tarball)], {
     cwd: installDir,
+    env: npmEnvironment,
   });
   const cliPath = join(
     installDir,

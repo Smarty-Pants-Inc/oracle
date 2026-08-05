@@ -414,6 +414,40 @@ describe("profileState", () => {
     }
   });
 
+  test("rejects a cross-boot Linux PID/start-tick collision while accepting the recorded boot", async () => {
+    const userDataDir = "/tmp/oracle-linux-generation";
+    const identity = {
+      pid: 4321,
+      processStartTime: "linux:11111111-1111-4111-8111-111111111111:987654",
+      executablePath: "/usr/bin/google-chrome",
+      normalizedUserDataDir: userDataDir,
+      launchNonce: "00000000-0000-4000-8000-000000009876",
+      profileDirectory: {
+        version: 1 as const,
+        platform: "linux" as const,
+        canonicalPath: userDataDir,
+        device: "1",
+        inode: "2",
+      },
+    } satisfies ChromeProcessIdentity;
+    const verifyWithBoot = (bootId: string) =>
+      profileState.verifyChromeProcessIdentityForTest(userDataDir, identity, {
+        platform: "linux",
+        readOwner: async () => ({ port: 45_678, processIdentity: identity }),
+        readProcessSnapshot: async () => ({
+          pid: identity.pid,
+          processStartTime: `linux:${bootId}:987654`,
+          executablePath: identity.executablePath,
+          commandLine: `${identity.executablePath} --user-data-dir=${userDataDir}`,
+        }),
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+      });
+
+    await expect(verifyWithBoot("11111111-1111-4111-8111-111111111111")).resolves.toBe(true);
+    await expect(verifyWithBoot("22222222-2222-4222-8222-222222222222")).resolves.toBe(false);
+  });
+
   test.runIf(process.platform === "linux")(
     "captures and verifies a real Linux process through procfs generation data",
     async () => {
@@ -439,11 +473,16 @@ describe("profileState", () => {
         if (!child.pid) throw new Error("Linux Chrome fixture did not expose a pid");
         const identity = await profileState.captureChromeProcessIdentity(profileDir, child.pid);
         expect(identity.executablePath).toBe(chromeExecutable);
-        expect(identity.processStartTime).toMatch(/^linux-proc-start-ticks:\d+$/u);
+        expect(identity.processStartTime).toMatch(
+          /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/u,
+        );
         await profileState.writeOracleChromeOwner(profileDir, {
           port: 45678,
           processIdentity: identity,
         });
+        expect(
+          JSON.parse(await readFile(path.join(profileDir, "oracle-chrome-owner.json"), "utf8")),
+        ).toMatchObject({ processIdentity: { processStartTime: identity.processStartTime } });
         await expect(profileState.verifyChromeProcessIdentity(profileDir, identity)).resolves.toBe(
           true,
         );

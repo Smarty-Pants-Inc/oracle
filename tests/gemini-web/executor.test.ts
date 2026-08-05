@@ -456,6 +456,93 @@ describe("gemini-web executor", () => {
     expect(getCookies).not.toHaveBeenCalled();
   });
 
+  it("settles the manual CDP session before executing the HTTP Gemini request", async () => {
+    const events: string[] = [];
+    closeTab.mockImplementationOnce(async () => {
+      events.push("close-target");
+      return true;
+    });
+    teardownSettle.mockImplementationOnce(async (teardown: () => Promise<boolean>) => {
+      events.push("release-lease");
+      teardownState.leaseReleased = true;
+      return (await teardown())
+        ? { status: "completed", disposition: "teardown-completed" }
+        : { status: "preserved", reason: "teardown-unsafe" };
+    });
+    killChrome.mockImplementationOnce(async () => {
+      events.push("terminate-owner");
+      return { status: "stopped", pid: 12345, signal: "CONTROL_CHANNEL" };
+    });
+    runGeminiWebWithFallback.mockImplementationOnce(async () => {
+      events.push("http-request");
+      return {
+        rawResponseText: "",
+        text: "ok",
+        thoughts: null,
+        metadata: null,
+        images: [],
+        effectiveModel: "gemini-3.1-pro",
+      };
+    });
+
+    const result = await createGeminiWebExecutor({})({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: true },
+      log: () => {},
+    });
+
+    expect(result.answerText).toBe("ok");
+    expect(events).toEqual(["close-target", "release-lease", "terminate-owner", "http-request"]);
+    expect(result.runtime.recoveryCleanupResources).toBeUndefined();
+    expect(result.runtime.recoveryCleanupResult).toBeUndefined();
+  });
+
+  it("returns exact retryable launched-owner authority when manual CDP cleanup fails", async () => {
+    killChrome.mockResolvedValueOnce({
+      status: "unsafe",
+      pid: 12345,
+      reason: "termination failed",
+    });
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: false },
+        log: () => {},
+      }),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        stage: "gemini-browser-cleanup",
+        runtime: {
+          recoveryCleanupResult: {
+            status: "failed",
+            settlementMode: "abort",
+            error: expect.stringContaining("could not safely terminate Chrome"),
+          },
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              chromePid: 12345,
+              chromeProcessIdentity: expect.objectContaining({
+                pid: 12345,
+                launchNonce: "executor-test-owner",
+              }),
+              tabLease: undefined,
+              recoveryCleanup: expect.objectContaining({
+                ownsTarget: false,
+                keepBrowser: false,
+              }),
+            }),
+          ],
+        },
+      },
+    });
+    expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
+  });
+
   it("includes cookie read warnings in the missing-cookie error", async () => {
     getCookies.mockImplementationOnce(async () => ({
       cookies: [],
@@ -619,66 +706,6 @@ describe("gemini-web executor", () => {
       "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
     );
     expect(closeTab).toHaveBeenCalled();
-  });
-
-  it("binds abort authority when capture persistence and abort persistence both fail", async () => {
-    const exec = createGeminiWebExecutor({});
-
-    await expect(
-      exec({
-        prompt: "hello",
-        attachments: [],
-        config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: false },
-        runtimeHintCb: async () => {
-          throw new Error("session store unavailable");
-        },
-        log: () => {},
-      }),
-    ).rejects.toMatchObject({
-      details: {
-        code: "gemini-browser-runtime-persistence-failed",
-        runtime: {
-          recoveryCleanupResult: {
-            status: "failed",
-            error: "session store unavailable",
-            settlementMode: "abort",
-          },
-          recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "target-1" })],
-        },
-      },
-    });
-    expect(closeTab).not.toHaveBeenCalled();
-    expect(killChrome).not.toHaveBeenCalled();
-  });
-
-  it("aborts unpublished browser resources when retrying abort persistence succeeds", async () => {
-    const runtimeHintCb = vi
-      .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
-      .mockRejectedValueOnce(new Error("session store unavailable"));
-    const exec = createGeminiWebExecutor({});
-
-    await expect(
-      exec({
-        prompt: "hello",
-        attachments: [],
-        config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: false },
-        runtimeHintCb,
-        log: () => {},
-      }),
-    ).rejects.toMatchObject({
-      details: {
-        code: "gemini-browser-runtime-persistence-failed",
-      },
-    });
-    expect(runtimeHintCb).toHaveBeenCalledTimes(2);
-    expect(runtimeHintCb).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
-      }),
-    );
-    expect(closeTab).toHaveBeenCalledTimes(1);
-    expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
   it("binds abort mode and rejects later finalize without duplicate teardown", async () => {

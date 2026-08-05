@@ -17,11 +17,11 @@ const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
 const LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS = 1_000;
 const LOCK_RELEASE_MUTATION_TIMEOUT_MS = 1_000;
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
-const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
+const WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS = 3;
+const WINDOWS_PROCESS_IDENTITY_RETRY_MS = 50;
 const execFileAsync = promisify(execFile);
 let currentProcessStartIdentity: string | undefined;
 let currentProcessStartIdentityPromise: Promise<string | null> | undefined;
-let currentProcessStartIdentityRetryAfterMs = 0;
 export type ProcessLiveness = "alive" | "dead" | "unknown";
 export interface FilesystemLockProcessIdentityProvider {
   readonly platform: NodeJS.Platform;
@@ -63,6 +63,7 @@ export interface CrashRecoverableFilesystemLockDeps {
   beforeMutationRequestOwnerWrite?: (preparedPath: string, requestPath: string) => Promise<void>;
   beforeMutationRequestTicketPublication?: (requestPath: string, ticket: number) => Promise<void>;
   beforeMutationRequestRemoval?: (requestPath: string) => Promise<void>;
+  beforeReleasedLockRemoval?: (isolatedRootPath: string) => Promise<void>;
 }
 interface FilesystemLockGeneration {
   ownerRaw: string | null;
@@ -95,6 +96,7 @@ interface FilesystemLockMutationRequestRemovalState {
 interface FilesystemLockReleaseState {
   mutationLease?: FilesystemLockMutationLease;
   detachedPath?: string;
+  isolatedRemovalRootPath?: string;
   canonicalReleased: boolean;
 }
 
@@ -145,14 +147,9 @@ export async function acquireCrashRecoverableFilesystemLock(
     100,
     options.incompleteLockStaleMs ?? DEFAULT_INCOMPLETE_STALE_MS,
   );
-  const processStartIdentity = await readProcessIdentity(pid);
-  // A timed-out Windows probe for the real current process must not make recovery unbounded. The
-  // null generation keeps the lock fail-closed while that PID is alive and becomes stale only
-  // after liveness proves it dead. Injected providers must still report a stable generation.
-  const permitsUnverifiedCurrentProcess =
-    processIdentityProvider === realProcessIdentityProvider &&
-    processIdentityProvider.platform === "win32";
-  if (!processStartIdentity && !permitsUnverifiedCurrentProcess) {
+  const processStartIdentity =
+    await readStableProcessStartIdentityForAcquisition(processIdentityProvider);
+  if (!processStartIdentity) {
     throw new Error(
       `Cannot acquire crash-recoverable filesystem lock at ${lockPath} without a stable process generation for pid ${pid}`,
     );
@@ -215,6 +212,7 @@ export async function acquireCrashRecoverableFilesystemLock(
               owner,
               mutationOptions,
               releaseState,
+              deps.beforeReleasedLockRemoval,
             );
             released = true;
           } finally {
@@ -307,6 +305,18 @@ export async function acquireCrashRecoverableFilesystemLock(
   }
 }
 
+async function readStableProcessStartIdentityForAcquisition(
+  provider: FilesystemLockProcessIdentityProvider,
+): Promise<string | null> {
+  const maxAttempts = provider.platform === "win32" ? WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS : 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const identity = await provider.readProcessStartIdentity(provider.pid);
+    if (identity) return identity;
+    if (attempt + 1 < maxAttempts) await delay(WINDOWS_PROCESS_IDENTITY_RETRY_MS);
+  }
+  return null;
+}
+
 const realProcessIdentityProvider: FilesystemLockProcessIdentityProvider = {
   platform: process.platform,
   pid: process.pid,
@@ -330,20 +340,14 @@ export function readProcessLiveness(pid: number): ProcessLiveness {
 export async function readProcessStartIdentity(pid: number): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   // This process cannot be replaced while this module is running. Foreign PIDs stay uncached so
-  // stale-owner checks still observe PID reuse; only stable current-process absence is cached.
+  // stale-owner checks still observe PID reuse; current-process successes alone are cached.
   if (pid !== process.pid) return readProcessStartIdentityUncached(pid);
   if (currentProcessStartIdentity !== undefined) return currentProcessStartIdentity;
-  if (Date.now() < currentProcessStartIdentityRetryAfterMs) return null;
 
   const inFlight = (currentProcessStartIdentityPromise ??= readProcessStartIdentityUncached(pid));
   try {
     const identity = await inFlight;
-    if (identity === null) {
-      currentProcessStartIdentityRetryAfterMs = Date.now() + CURRENT_PROCESS_IDENTITY_RETRY_MS;
-    } else {
-      currentProcessStartIdentity = identity;
-      currentProcessStartIdentityRetryAfterMs = 0;
-    }
+    if (identity !== null) currentProcessStartIdentity = identity;
     return identity;
   } finally {
     if (currentProcessStartIdentityPromise === inFlight) {
@@ -807,7 +811,18 @@ async function releaseCrashRecoverableFilesystemLock(
   expectedOwner: FilesystemLockOwnerRecord,
   mutationOptions: FilesystemLockMutationOptions,
   state: FilesystemLockReleaseState,
+  beforeReleasedLockRemoval?: (isolatedRootPath: string) => Promise<void>,
 ): Promise<void> {
+  // A post-isolation retry owns only its journaled private root. It must not publish another
+  // request doorway or inspect a successor that may already own the canonical lock path.
+  if (state.mutationLease === undefined && state.isolatedRemovalRootPath !== undefined) {
+    const isolatedRemovalRootPath = state.isolatedRemovalRootPath;
+    await beforeReleasedLockRemoval?.(isolatedRemovalRootPath);
+    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath);
+    state.isolatedRemovalRootPath = undefined;
+    return;
+  }
+
   if (state.mutationLease === undefined) {
     const rejectChangedOwner = async (): Promise<void> => {
       const owner = await readLockOwnerForRelease(lockPath);
@@ -866,7 +881,7 @@ async function releaseCrashRecoverableFilesystemLock(
     }
   }
 
-  if (state.detachedPath !== undefined) {
+  if (state.isolatedRemovalRootPath === undefined && state.detachedPath !== undefined) {
     const detachedPath = state.detachedPath;
     const releasedGeneration: FilesystemLockGeneration = {
       ownerRaw: `${JSON.stringify(expectedOwner)}\n`,
@@ -901,15 +916,24 @@ async function releaseCrashRecoverableFilesystemLock(
       }
       throw error;
     } else {
-      await removeIsolatedDirectoryGeneration(isolation.rootPath);
       state.detachedPath = undefined;
+      state.isolatedRemovalRootPath = isolation.rootPath;
     }
   }
 
+  // Isolation is the authority cutover: hide the public mutation request before fallible garbage
+  // collection, leaving only the recorded private root for an idempotent retry.
   const mutationLease = state.mutationLease;
   if (mutationLease !== undefined) {
     await mutationLease.release();
     state.mutationLease = undefined;
+  }
+
+  if (state.isolatedRemovalRootPath !== undefined) {
+    const isolatedRemovalRootPath = state.isolatedRemovalRootPath;
+    await beforeReleasedLockRemoval?.(isolatedRemovalRootPath);
+    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath);
+    state.isolatedRemovalRootPath = undefined;
   }
 }
 

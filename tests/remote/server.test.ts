@@ -19,6 +19,8 @@ import {
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
+import type { BrowserLogger } from "../../src/browser/types.js";
+import type { ReattachDeps } from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
   buildRemotePromptRequestIdentity,
@@ -831,6 +833,128 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
     15_000,
   );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "keeps controller authority until a disconnected receipt mutation settles",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-receipt-drain-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const controllerLockPath = path.join(transactionStoreDir, ".controller.lock");
+      const artifactPath = path.join(
+        tmpDir,
+        "sessions",
+        "receipt-session",
+        "artifacts",
+        "result.zip",
+      );
+      const artifactPayload = Buffer.from([
+        0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      ]);
+      const transactionToken = "4".repeat(64);
+      const mutationStarted = Promise.withResolvers<void>();
+      const allowMutationFailure = Promise.withResolvers<void>();
+      setOracleHomeDirOverrideForTest(tmpDir);
+      await mkdir(path.dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, artifactPayload);
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) =>
+            browserTransaction(options.prompt, {
+              answerText: "durable answer",
+              answerMarkdown: "durable answer",
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 14,
+              savedFiles: [
+                {
+                  kind: "file",
+                  path: artifactPath,
+                  label: "receipt artifact",
+                  mimeType: "application/zip",
+                  sizeBytes: artifactPayload.length,
+                  sourceUrl: "sandbox:/mnt/data/result.zip",
+                  url: "browser-download",
+                  finalUrl: "browser-download",
+                  filename: "result.zip",
+                },
+              ],
+            }),
+        },
+      );
+      const recordArtifactDelivery = vi
+        .spyOn(RemoteTransactionStore.prototype, "recordArtifactDelivery")
+        .mockImplementation(async () => {
+          mutationStarted.resolve();
+          await allowMutationFailure.promise;
+          throw new Error("simulated receipt mutation failure");
+        });
+
+      try {
+        const run = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        const transaction = run.events.find((event) => event.type === "transaction")
+          ?.transaction as
+          | { artifacts?: Array<{ artifactId: string; sha256: string; byteSize: number }> }
+          | undefined;
+        const artifact = transaction?.artifacts?.[0];
+        if (!artifact) throw new Error("missing durable artifact receipt target");
+
+        const receiptRequest = http.request({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/${artifact.artifactId}/receipt`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            authorization: "Bearer secret",
+          },
+        });
+        receiptRequest.on("error", () => {});
+        receiptRequest.end(
+          JSON.stringify({ sha256: artifact.sha256, byteSize: artifact.byteSize }),
+        );
+        await mutationStarted.promise;
+        receiptRequest.destroy();
+
+        const close = server.close();
+        let closeSettled = false;
+        void close.then(
+          () => {
+            closeSettled = true;
+          },
+          () => {
+            closeSettled = true;
+          },
+        );
+        await Promise.resolve();
+        expect(closeSettled).toBe(false);
+        expect(existsSync(controllerLockPath)).toBe(true);
+        await expect(
+          createRemoteServer(
+            { host: "127.0.0.1", port: 0, token: "another-secret", logger: () => {} },
+            { transactionStoreDir },
+          ),
+        ).rejects.toThrow();
+
+        allowMutationFailure.reject(new Error("allow simulated receipt mutation failure"));
+        await close;
+        expect(existsSync(controllerLockPath)).toBe(false);
+      } finally {
+        allowMutationFailure.resolve();
+        recordArtifactDelivery.mockRestore();
+        await server.close().catch(() => undefined);
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+  );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "keeps the bridge tunnel and controller authority until an in-flight run reaches durable shutdown handoff",
@@ -1600,7 +1724,200 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
     15_000,
   );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "durably journals each recovery acquisition hint under the current controller before continuing",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retry-runtime-hints-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const previousControllerGeneration = "controller-before-recovery";
+      const recoveryControllerGeneration = "controller-after-recovery";
+      const prompt = "recovery acquisition journal";
+      const profileDirectory = {
+        version: 1 as const,
+        platform: process.platform,
+        canonicalPath: "/tmp/oracle-retry-runtime-hints",
+        device: "1",
+        inode: "2",
+      };
+      const preIntent: BrowserRunTransaction["runtime"] = {
+        browserTransport: "cdp",
+        chromeHost: "127.0.0.1",
+        chromeProfileRoot: "/tmp/oracle-retry-runtime-hints",
+        userDataDir: "/tmp/oracle-retry-runtime-hints",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromeProfileRoot: "/tmp/oracle-retry-runtime-hints",
+            userDataDir: "/tmp/oracle-retry-runtime-hints",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            tabLease: { id: "recovery-lease", profileDirectory },
+            acquisition: {
+              generationId: "recovery-acquisition",
+              pendingResource: "tab-lease",
+              targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+            },
+            recoveryCleanup: {
+              ownsTarget: false,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: false,
+            },
+          },
+        ],
+        recoveryCleanupResult: { status: "pending" },
+      };
+      const acquiredProcess: BrowserRunTransaction["runtime"] = {
+        ...preIntent,
+        chromePid: 4242,
+        chromePort: 9222,
+        chromeProcessIdentity: {
+          pid: 4242,
+          processStartTime: "123",
+          executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          normalizedUserDataDir: "/tmp/oracle-retry-runtime-hints",
+          launchNonce: "recovery-process",
+          profileDirectory,
+        },
+        recoveryCleanupResources: [
+          {
+            ...preIntent.recoveryCleanupResources![0],
+            chromePid: 4242,
+            chromePort: 9222,
+            chromeProcessIdentity: {
+              pid: 4242,
+              processStartTime: "123",
+              executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              normalizedUserDataDir: "/tmp/oracle-retry-runtime-hints",
+              launchNonce: "recovery-process",
+              profileDirectory,
+            },
+            profileDirectoryIdentity: profileDirectory,
+            acquisition: {
+              generationId: "recovery-acquisition",
+              pendingResource: "chrome-target",
+              targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+            },
+          },
+        ],
+      };
+      const acquiredTarget: BrowserRunTransaction["runtime"] = {
+        ...acquiredProcess,
+        chromeTargetId: "recovery-target",
+        recoveryCleanupResources: [
+          {
+            ...acquiredProcess.recoveryCleanupResources![0],
+            chromeTargetId: "recovery-target",
+            acquisition: {
+              generationId: "recovery-acquisition",
+              targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+            },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const transactionToken = "7".repeat(64);
+      const previousController = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: previousControllerGeneration,
+      });
+      await seedRemoteTransaction(previousController, transactionToken, {
+        prompt,
+        state: "running",
+        runtime: preIntent,
+      });
 
+      const order: string[] = [];
+      const assertReloadedRuntime = async (
+        stage: "pre-intent" | "process" | "target",
+        runtime: BrowserRunTransaction["runtime"],
+      ) => {
+        const reloaded = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: recoveryControllerGeneration,
+        });
+        await expect(reloaded.read(transactionToken)).resolves.toMatchObject({
+          state: "recoverable-error",
+          controllerGeneration: recoveryControllerGeneration,
+          runtime,
+        });
+        order.push(`persist:${stage}`);
+      };
+      const finalize = vi.fn(async () => ({
+        status: "completed" as const,
+        runtime: acquiredTarget,
+      }));
+      const abort = vi.fn(async () => ({ status: "completed" as const, runtime: acquiredTarget }));
+      const resumeBrowser = vi.fn(
+        async (
+          _runtime: BrowserRunTransaction["runtime"],
+          _config: BrowserSessionConfig | undefined,
+          _logger: BrowserLogger,
+          deps?: ReattachDeps,
+        ) => {
+          const runtimeHintCb = deps?.runtimeHintCb;
+          if (!runtimeHintCb) throw new Error("remote retry must provide a runtime hint callback");
+          await runtimeHintCb(preIntent);
+          await assertReloadedRuntime("pre-intent", preIntent);
+          order.push("acquire:process");
+          await runtimeHintCb(acquiredProcess);
+          await assertReloadedRuntime("process", acquiredProcess);
+          order.push("acquire:target");
+          await runtimeHintCb(acquiredTarget);
+          await assertReloadedRuntime("target", acquiredTarget);
+          return {
+            answerText: "recovered answer",
+            answerMarkdown: "recovered answer",
+            conversationId: "remote-conversation",
+            runtime: acquiredTarget,
+            finalize,
+            abort,
+          };
+        },
+      );
+      const restarted = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: recoveryControllerGeneration,
+          resumeBrowser,
+        },
+      );
+      try {
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: restarted.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "secret",
+            body: {},
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 200,
+          json: { status: "transaction", transaction: { state: "pending" } },
+        });
+        expect(order).toEqual([
+          "persist:pre-intent",
+          "acquire:process",
+          "persist:process",
+          "acquire:target",
+          "persist:target",
+        ]);
+        expect(resumeBrowser).toHaveBeenCalledOnce();
+      } finally {
+        await restarted.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "projects abort authority after recovered capture failure with pending cleanup",
     async () => {
@@ -1705,7 +2022,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const identity = {
         pid: process.pid,
         processStartTime: "test-live-launched-owner",
-        executablePath: path.resolve(process.execPath),
+        executablePath:
+          process.platform === "win32"
+            ? path.resolve(process.execPath).toLowerCase()
+            : path.resolve(process.execPath),
         normalizedUserDataDir:
           process.platform === "win32"
             ? profileDirectory.canonicalPath.toLowerCase()

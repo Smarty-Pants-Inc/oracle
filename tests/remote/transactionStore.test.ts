@@ -7,6 +7,7 @@ import {
   REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
 } from "../../src/remote/types.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type {
   DurableRemoteArtifactRegistration,
   DurableRemoteAutomationError,
@@ -46,6 +47,16 @@ const runtime = {
       },
     },
   ],
+};
+
+const modelSelection = {
+  requestedModel: "GPT-5.6 Sol",
+  resolvedLabel: "GPT-5.6 Sol",
+  strategy: "select" as const,
+  status: "switched" as const,
+  verified: true,
+  source: "chatgpt-model-picker" as const,
+  capturedAt: "2026-01-01T00:00:00.000Z",
 };
 
 const capturedResult = {
@@ -436,6 +447,210 @@ describe("RemoteTransactionStore", () => {
     });
   }
 
+  test("durably replaces recovery acquisition runtime under the recovered controller", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recovery-runtime-store-"));
+    const transactionToken = "d".repeat(64);
+    const previousControllerGeneration = "controller-before-recovery";
+    const recoveryControllerGeneration = "controller-after-recovery";
+    const profileDirectory = {
+      version: 1 as const,
+      platform: process.platform,
+      canonicalPath: "/tmp/oracle-recovery-runtime",
+      device: "1",
+      inode: "2",
+    };
+    const preIntent: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      chromeHost: "127.0.0.1",
+      chromeProfileRoot: "/tmp/oracle-recovery-runtime",
+      userDataDir: "/tmp/oracle-recovery-runtime",
+      conversationId: committedPromptEpoch.conversationId,
+      promptEpoch: committedPromptEpoch,
+      recoveryCleanupResources: [
+        {
+          chromeHost: "127.0.0.1",
+          chromeProfileRoot: "/tmp/oracle-recovery-runtime",
+          userDataDir: "/tmp/oracle-recovery-runtime",
+          conversationId: committedPromptEpoch.conversationId,
+          promptEpoch: committedPromptEpoch,
+          tabLease: { id: "recovery-lease", profileDirectory },
+          acquisition: {
+            generationId: "recovery-acquisition",
+            pendingResource: "tab-lease",
+            targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+          },
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "temporary",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const acquiredProcess: BrowserRuntimeMetadata = {
+      ...preIntent,
+      chromePid: 4242,
+      chromePort: 9222,
+      chromeProcessIdentity: {
+        pid: 4242,
+        processStartTime: "123",
+        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        normalizedUserDataDir: "/tmp/oracle-recovery-runtime",
+        launchNonce: "recovery-process",
+        profileDirectory,
+      },
+      recoveryCleanupResources: [
+        {
+          ...preIntent.recoveryCleanupResources![0],
+          chromePid: 4242,
+          chromePort: 9222,
+          chromeProcessIdentity: {
+            pid: 4242,
+            processStartTime: "123",
+            executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            normalizedUserDataDir: "/tmp/oracle-recovery-runtime",
+            launchNonce: "recovery-process",
+            profileDirectory,
+          },
+          profileDirectoryIdentity: profileDirectory,
+          acquisition: {
+            generationId: "recovery-acquisition",
+            pendingResource: "chrome-target",
+            targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+          },
+        },
+      ],
+    };
+    const acquiredTarget: BrowserRuntimeMetadata = {
+      ...acquiredProcess,
+      chromeTargetId: "recovery-target",
+      recoveryCleanupResources: [
+        {
+          ...acquiredProcess.recoveryCleanupResources![0],
+          chromeTargetId: "recovery-target",
+          acquisition: {
+            generationId: "recovery-acquisition",
+            targetMarkerUrl: "about:blank#oracle-acquisition=recovery-acquisition",
+          },
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "temporary",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+    };
+    try {
+      const initial = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: previousControllerGeneration,
+      });
+      await begin(initial, transactionToken);
+      await initial.journalRuntime(transactionToken, preIntent);
+
+      const recovered = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: recoveryControllerGeneration,
+      });
+      await recovered.reconcileStaleRunningRecords({
+        buildError: (_record, hadRuntimeAuthority) => failure(hadRuntimeAuthority),
+      });
+
+      const assertDurablyReloaded = async (expected: BrowserRuntimeMetadata) => {
+        const reloaded = await RemoteTransactionStore.open({
+          directory: root,
+          controllerGeneration: recoveryControllerGeneration,
+        });
+        await expect(reloaded.read(transactionToken)).resolves.toMatchObject({
+          state: "recoverable-error",
+          controllerGeneration: recoveryControllerGeneration,
+          runtime: expected,
+          restartRecovery: {
+            previousControllerGeneration,
+            reason: "controller-generation-changed",
+          },
+          leaseExpiresAt: expect.any(String),
+        });
+        return reloaded;
+      };
+
+      await recovered.journalRecoveryRuntime(transactionToken, preIntent);
+      const afterIntent = await assertDurablyReloaded(preIntent);
+      await afterIntent.journalRecoveryRuntime(transactionToken, acquiredProcess);
+      const afterProcess = await assertDurablyReloaded(acquiredProcess);
+      await afterProcess.journalRecoveryRuntime(transactionToken, acquiredTarget);
+      await assertDurablyReloaded(acquiredTarget);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects recovery runtime journaling outside its unbound current-controller state", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recovery-runtime-reject-"));
+    const currentControllerGeneration = "controller-current";
+    const boundToken = "c".repeat(64);
+    const finalizedToken = "b".repeat(64);
+    const staleToken = "a".repeat(64);
+    try {
+      const current = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: currentControllerGeneration,
+      });
+      await begin(current, boundToken);
+      await current.journalRuntime(boundToken, runtime);
+      await current.recordRecoverableFailure({
+        transactionToken: boundToken,
+        runtime,
+        error: failure(true),
+      });
+      await current.bindSettlement({
+        transactionToken: boundToken,
+        mode: "abort",
+        durablePublication: false,
+      });
+      await expect(current.journalRecoveryRuntime(boundToken, runtime)).rejects.toThrow(
+        "Cannot journal recovery runtime after cleanup settlement is bound",
+      );
+
+      await begin(current, finalizedToken);
+      await current.journalRuntime(finalizedToken, runtime);
+      await publish(current, finalizedToken);
+      await current.bindSettlement({
+        transactionToken: finalizedToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await current.completeSettlement({
+        transactionToken: finalizedToken,
+        mode: "finalize",
+        finalization: { status: "completed", runtime },
+      });
+      await expect(current.journalRecoveryRuntime(finalizedToken, runtime)).rejects.toThrow(
+        "Cannot journal recovery runtime for transaction in state finalized",
+      );
+
+      const stale = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: "controller-stale",
+      });
+      await begin(stale, staleToken);
+      await stale.journalRuntime(staleToken, runtime);
+      await stale.recordRecoverableFailure({
+        transactionToken: staleToken,
+        runtime,
+        error: failure(true),
+      });
+      await expect(current.journalRecoveryRuntime(staleToken, runtime)).rejects.toThrow(
+        "Cannot journal recovery runtime from a stale remote controller generation",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("reconciles stale running generations according to persisted runtime authority", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-reconcile-store-"));
     const runtimeToken = "1".repeat(64);
@@ -483,7 +698,7 @@ describe("RemoteTransactionStore", () => {
         controllerGeneration: "controller-generation-1",
       });
       await begin(first, runtimeToken);
-      await first.journalRuntime(runtimeToken, runtime);
+      await first.journalRuntime(runtimeToken, runtime, modelSelection);
       await begin(first, preAuthorityToken);
       await begin(first, acquisitionToken);
       await first.journalRuntime(acquisitionToken, acquisitionRuntime);
@@ -516,11 +731,25 @@ describe("RemoteTransactionStore", () => {
           hadRuntimeAuthority: true,
         },
       ]);
-      await expect(restarted.read(runtimeToken)).resolves.toMatchObject({
+      const recoveredRuntime = await restarted.read(runtimeToken);
+      expect(recoveredRuntime).toMatchObject({
         state: "recoverable-error",
         runtime,
         restartRecovery: { previousControllerGeneration: "controller-generation-1" },
       });
+      expect(recoveredRuntime).not.toHaveProperty("modelSelection");
+      await restarted.bindSettlement({
+        transactionToken: runtimeToken,
+        mode: "abort",
+        durablePublication: false,
+      });
+      await expect(
+        restarted.completeSettlement({
+          transactionToken: runtimeToken,
+          mode: "abort",
+          finalization: { status: "completed", runtime },
+        }),
+      ).resolves.toMatchObject({ state: "aborted" });
       await expect(restarted.read(acquisitionToken)).resolves.toMatchObject({
         state: "recoverable-error",
         runtime: acquisitionRuntime,
@@ -547,7 +776,7 @@ describe("RemoteTransactionStore", () => {
         now: () => now,
       });
       await begin(store, runtimeToken);
-      await store.journalRuntime(runtimeToken, runtime);
+      await store.journalRuntime(runtimeToken, runtime, modelSelection);
       await begin(store, preAuthorityToken);
       const runtimeLease = (await store.read(runtimeToken))?.leaseExpiresAt;
       const preAuthorityLease = (await store.read(preAuthorityToken))?.leaseExpiresAt;
@@ -561,10 +790,20 @@ describe("RemoteTransactionStore", () => {
           buildError: (_record, hadRuntimeAuthority) => failure(hadRuntimeAuthority),
         }),
       ).resolves.toEqual({ mode: "abort", durablePublication: false });
-      await expect(store.read(runtimeToken)).resolves.toMatchObject({
+      const expiredRuntime = await store.read(runtimeToken);
+      expect(expiredRuntime).toMatchObject({
         state: "recoverable-error",
         settlementMode: "abort",
+        runtime,
       });
+      expect(expiredRuntime).not.toHaveProperty("modelSelection");
+      await expect(
+        store.completeSettlement({
+          transactionToken: runtimeToken,
+          mode: "abort",
+          finalization: { status: "completed", runtime },
+        }),
+      ).resolves.toMatchObject({ state: "aborted" });
       await expect(
         store.expire({
           transactionToken: preAuthorityToken,

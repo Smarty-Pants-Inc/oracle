@@ -2,6 +2,8 @@ import path from "node:path";
 import os from "node:os";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
+import type * as ManualLoginProfileModule from "../../src/browser/manualLoginProfile.js";
+import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
 import {
   __test__,
   classifyPreservedBrowserErrorForTest,
@@ -24,6 +26,79 @@ describe("background-only browser policy", () => {
     await expect(
       runBrowserMode({ prompt: "review", config: { attachRunning: true } }),
     ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
+  });
+});
+
+describe("local acquisition durability", () => {
+  test("releases a manual-login tab lease when post-acquisition persistence fails", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-local-acquisition-"));
+    const persistenceFailure = new Error("runtime persistence failed");
+    const events: string[] = [];
+    const release = vi.fn(async () => {
+      events.push("release:tab-lease");
+    });
+    const acquireBrowserTabLease = vi.fn(
+      async (profileDirectory: string, options?: { leaseId?: string }) => {
+        events.push("acquire:tab-lease");
+        return {
+          id: options?.leaseId ?? "test-lease",
+          profileDirectory: {
+            version: 1 as const,
+            platform: process.platform,
+            canonicalPath: profileDirectory,
+            device: "test-device",
+            inode: "test-inode",
+          },
+          update: vi.fn(async () => undefined),
+          release,
+        };
+      },
+    );
+    const runtimeHintCb = vi.fn(async (runtime: { recoveryCleanupResources?: unknown[] }) => {
+      const resource = runtime.recoveryCleanupResources?.at(-1) as
+        | { acquisition?: { pendingResource?: string } }
+        | undefined;
+      events.push(`persist:${resource?.acquisition?.pendingResource ?? "acquired"}`);
+      if (resource?.acquisition?.pendingResource === "chrome-process") {
+        throw persistenceFailure;
+      }
+    });
+
+    vi.resetModules();
+    vi.doMock("../../src/browser/tabLeaseRegistry.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof TabLeaseRegistryModule>()),
+      acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/manualLoginProfile.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ManualLoginProfileModule>()),
+      assertManualLoginProfileReadyForRun: vi.fn(async () => undefined),
+    }));
+
+    try {
+      // The production runner must load after this test's module mocks are installed.
+      const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        isolatedRunBrowserMode({
+          prompt: "test",
+          config: { manualLogin: true, manualLoginProfileDir: profileDir },
+          runtimeHintCb,
+        }),
+      ).rejects.toBe(persistenceFailure);
+
+      expect(events).toEqual([
+        "persist:tab-lease",
+        "acquire:tab-lease",
+        "persist:chrome-process",
+        "release:tab-lease",
+      ]);
+      expect(release).toHaveBeenCalledOnce();
+    } finally {
+      vi.doUnmock("../../src/browser/tabLeaseRegistry.js");
+      vi.doUnmock("../../src/browser/manualLoginProfile.js");
+      vi.resetModules();
+      await rm(profileDir, { recursive: true, force: true });
+    }
   });
 });
 

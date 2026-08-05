@@ -59,9 +59,10 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test("requires an injected Windows provider to report a stable generation", async () => {
+  test("boundedly retries before rejecting an unproven Windows generation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "missing-parent", "recovery.lock");
+    const readProcessStartIdentity = vi.fn(async () => null);
     try {
       await expect(
         acquireCrashRecoverableFilesystemLock(
@@ -70,14 +71,47 @@ describe("crash-recoverable filesystem lock", () => {
           {
             processIdentityProvider: createProcessIdentityProvider(
               10_004,
-              async () => null,
+              readProcessStartIdentity,
               () => "alive",
               "win32",
             ),
           },
         ),
       ).rejects.toThrow(/without a stable process generation/i);
+      expect(readProcessStartIdentity).toHaveBeenCalledTimes(3);
       await expect(stat(path.dirname(lockPath))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("publishes a Windows lock only after a retry obtains stable generation proof", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    let identityAttempt = 0;
+    const readProcessStartIdentity = vi.fn(async () => {
+      identityAttempt += 1;
+      return identityAttempt === 1 ? null : "win32-stable-start";
+    });
+    try {
+      const lock = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            10_005,
+            readProcessStartIdentity,
+            () => "alive",
+            "win32",
+          ),
+        },
+      );
+      expect(readProcessStartIdentity).toHaveBeenCalledTimes(2);
+      expect(lock.owner.processStartIdentity).toBe("win32-stable-start");
+      expect(JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"))).toMatchObject({
+        processStartIdentity: "win32-stable-start",
+      });
+      await lock.release();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -310,6 +344,81 @@ describe("crash-recoverable filesystem lock", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 10_000);
+
+  test("post-isolation cleanup failure hides mutation authority and retries one private root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-release-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const mutationRootPath = `${lockPath}.mutations`;
+    const isolatedRemovalRoots: string[] = [];
+    let failCleanup = true;
+    let mutationRequestPublications = 0;
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(
+          40_043,
+          async () => "original-start",
+        ),
+        beforeMutationRequestTicketPublication: async () => {
+          mutationRequestPublications += 1;
+        },
+        beforeReleasedLockRemoval: async (isolatedRootPath) => {
+          isolatedRemovalRoots.push(isolatedRootPath);
+          if (failCleanup) {
+            failCleanup = false;
+            throw Object.assign(new Error("injected post-isolation cleanup failure"), {
+              code: "EBUSY",
+            });
+          }
+        },
+      },
+    );
+    let successor: CrashRecoverableFilesystemLock | undefined;
+
+    try {
+      await expect(original.release()).rejects.toMatchObject({ code: "EBUSY" });
+      expect(mutationRequestPublications).toBe(1);
+      expect(isolatedRemovalRoots).toHaveLength(1);
+      const isolatedRemovalRoot = isolatedRemovalRoots[0]!;
+      expect(path.basename(isolatedRemovalRoot)).toMatch(/^\.oracle-remove-/u);
+      expect((await stat(isolatedRemovalRoot)).isDirectory()).toBe(true);
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(root)).filter((entry) => entry.includes(".released-"))).toEqual([]);
+      expect(
+        (await readdir(mutationRootPath)).filter(
+          (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+        ),
+      ).toEqual([]);
+
+      successor = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 1_000, pollMs: 10 },
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            40_044,
+            async () => "successor-start",
+          ),
+        },
+      );
+      const successorOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
+
+      await expect(original.release()).resolves.toBeUndefined();
+      expect(mutationRequestPublications).toBe(1);
+      expect(isolatedRemovalRoots).toEqual([isolatedRemovalRoot, isolatedRemovalRoot]);
+      await expect(stat(isolatedRemovalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(successorOwnerRaw);
+      await expect(original.release()).resolves.toBeUndefined();
+      expect(isolatedRemovalRoots).toEqual([isolatedRemovalRoot, isolatedRemovalRoot]);
+
+      await successor.release();
+      successor = undefined;
+    } finally {
+      await successor?.release().catch(() => undefined);
+      await original.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("post-verification mutation quarantine replacement preserves unrelated data", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-quarantine-race-"));

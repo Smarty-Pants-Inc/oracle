@@ -570,6 +570,16 @@ function parseChromeProcessIdentity(
   ) {
     return null;
   }
+  const processStartTime = record.processStartTime.trim();
+  if (
+    platform === "linux" &&
+    processStartTime.startsWith("linux:") &&
+    !/^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/iu.test(
+      processStartTime,
+    )
+  ) {
+    return null;
+  }
   const executablePath = normalizeExecutablePath(record.executablePath, platform);
   const normalizedUserDataDir = normalizeProfileArgument(record.normalizedUserDataDir, platform);
   const profileDirectory = parseProfileDirectoryIdentity(record.profileDirectory, platform);
@@ -585,7 +595,7 @@ function parseChromeProcessIdentity(
   }
   return Object.freeze({
     pid: record.pid as number,
-    processStartTime: record.processStartTime.trim(),
+    processStartTime,
     executablePath,
     normalizedUserDataDir,
     launchNonce: record.launchNonce,
@@ -898,14 +908,21 @@ async function readChromeProcessSnapshot(
     if (platform === "linux") {
       const procRoot = `/proc/${Math.trunc(pid)}`;
       const initialStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
-      if (!initialStat || initialStat.pid !== pid) return null;
+      const initialBootId = parseLinuxBootId(
+        await readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      );
+      if (!initialStat || initialStat.pid !== pid || !initialBootId) return null;
       const executablePath = await readlink(path.join(procRoot, "exe"));
       const rawCommandLine = await readFile(path.join(procRoot, "cmdline"));
       const confirmedStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
+      const confirmedBootId = parseLinuxBootId(
+        await readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      );
       if (
         !confirmedStat ||
         confirmedStat.pid !== pid ||
-        confirmedStat.startTicks !== initialStat.startTicks
+        confirmedStat.startTicks !== initialStat.startTicks ||
+        confirmedBootId !== initialBootId
       ) {
         return null;
       }
@@ -914,7 +931,7 @@ async function readChromeProcessSnapshot(
       if (commandTokens.length === 0) return null;
       return {
         pid,
-        processStartTime: `linux-proc-start-ticks:${initialStat.startTicks}`,
+        processStartTime: `linux:${initialBootId}:${initialStat.startTicks}`,
         executablePath,
         commandLine: commandTokens.map((token) => JSON.stringify(token)).join(" "),
         commandTokens,
@@ -1006,6 +1023,13 @@ function parseDarwinAuditPidVersion(raw: string, expectedPid: number): string | 
     return null;
   }
   return `darwin-audit-pidversion:${auditToken[2]}`;
+}
+
+function parseLinuxBootId(raw: string): string | null {
+  const bootId = raw.trim().toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(bootId)
+    ? bootId
+    : null;
 }
 
 function parseLinuxProcStat(raw: string): { pid: number; startTicks: string } | null {

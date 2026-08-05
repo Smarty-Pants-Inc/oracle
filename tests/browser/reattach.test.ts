@@ -853,11 +853,16 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       enable: vi.fn(async () => undefined),
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) return { result: { value: "complete" } };
+        if (expression.includes("hasChallengeScript")) {
+          return { result: { value: { shell: true } } };
+        }
+        if (expression.includes("suspicious activity detected"))
+          return { result: { value: false } };
         if (expression.includes("/api/auth/session")) {
           return { result: { value: { ok: true, status: 200, sessionAuthenticated: true } } };
         }
         if (expression.includes("const selectors =")) return { result: { value: true } };
-        return { result: { value: false } };
+        throw new Error(`Unexpected Runtime.evaluate expression: ${expression}`);
       }),
     };
     const client = {

@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   __test__ as promptComposer,
+  buildReadUserPromptTextExpression,
   clearPromptComposer,
   submitPrompt,
 } from "../../src/browser/actions/promptComposer.js";
@@ -38,7 +39,37 @@ describe("promptComposer", () => {
     expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
-  test("commits and verifies a container whose user role exists only in nested data-turn markup", async () => {
+  test("commits and revalidates only authored Markdown prompt content from a decorated user turn", async () => {
+    const submittedPrompt = "Assess `const answer = 42`.";
+    const promptContent = {
+      innerText: "Assess const answer = 42.",
+      textContent: "Assess const answer = 42.",
+      getAttribute: (name: string) => (name === "data-message-content" ? "" : null),
+      matches: (selector: string) => selector.includes("[data-message-content]"),
+      closest: () => null,
+      contains: () => false,
+    };
+    const attachmentCard = {
+      innerText: "brief.md",
+      textContent: "brief.md",
+      getAttribute(name: string) {
+        if (name === "data-message-content") return "";
+        if (name === "data-testid") return "attachment-card";
+        return null;
+      },
+      matches: (selector: string) => selector.includes("[data-message-content]"),
+      closest: (selector: string) =>
+        selector.includes('[data-testid*="attachment"]') ? attachmentCard : null,
+      contains: () => false,
+    };
+    const actionControl = {
+      innerText: "Edit",
+      textContent: "Edit",
+      getAttribute: (name: string) => (name === "data-message-content" ? "" : null),
+      matches: (selector: string) => selector.includes("[data-message-content]"),
+      closest: (selector: string) => (selector.includes("button") ? actionControl : null),
+      contains: () => false,
+    };
     const nestedUser = {
       dataset: { messageId: "nested-message" },
       getAttribute(name: string): string | null {
@@ -46,11 +77,18 @@ describe("promptComposer", () => {
         if (name === "data-message-id") return "nested-message";
         return null;
       },
+      matches: (selector: string) => selector.includes('[data-turn="user"]'),
       querySelector: () => null,
+      querySelectorAll(selector: string) {
+        return selector.includes("[data-message-content]")
+          ? [promptContent, attachmentCard, actionControl]
+          : [];
+      },
     };
     const container = {
-      innerText: "Exact nested prompt",
-      textContent: "Exact nested prompt",
+      // The outer turn text is deliberately not identity authority.
+      innerText: "You said: Assess const answer = 42. Edit brief.md",
+      textContent: "You said: Assess const answer = 42. Edit brief.md",
       dataset: { turnId: "nested-turn" },
       getAttribute(name: string): string | null {
         if (name === "data-testid") return "conversation-turn-nested";
@@ -62,6 +100,9 @@ describe("promptComposer", () => {
         if (selector.includes('[data-turn="user"]')) return nestedUser;
         if (selector === "[data-message-id]") return nestedUser;
         return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector.includes('[data-turn="user"]') ? [nestedUser] : [];
       },
     };
     const document = {
@@ -92,12 +133,11 @@ describe("promptComposer", () => {
 
     const committed = await promptComposer.verifyPromptCommitted(
       runtime as never,
-      "Exact nested prompt",
+      submittedPrompt,
       150,
       undefined,
       0,
     );
-
     const locator: CommittedPromptEpochLocator = {
       epoch: {
         status: "committed",
@@ -322,6 +362,14 @@ describe("promptComposer", () => {
     vi.useFakeTimers();
     try {
       const makeTurn = (role: "user" | "assistant", text: string, index: number) => {
+        const promptContent = {
+          innerText: text,
+          textContent: text,
+          getAttribute: (name: string) => (name === "data-message-content" ? "" : null),
+          matches: (selector: string) => selector.includes("[data-message-content]"),
+          closest: () => null,
+          contains: () => false,
+        };
         const node = {
           innerText: text,
           textContent: text,
@@ -338,7 +386,10 @@ describe("promptComposer", () => {
             return null;
           },
           matches(selector: string) {
-            return selector === "[data-message-id]";
+            return (
+              selector === "[data-message-id]" ||
+              (role === "user" && selector.includes('[data-message-author-role="user"]'))
+            );
           },
           querySelector(selector: string) {
             if (selector === "[data-message-id]") {
@@ -347,8 +398,12 @@ describe("promptComposer", () => {
                 getAttribute: () => `message-${index}`,
               };
             }
-            if (selector === '[data-message-author-role="user"]' && role === "user") return {};
             return null;
+          },
+          querySelectorAll(selector: string) {
+            return role === "user" && selector.includes("[data-message-content]")
+              ? [promptContent]
+              : [];
           },
         };
         return node;
@@ -403,6 +458,14 @@ describe("promptComposer", () => {
       const sharedPrefix = "x".repeat(120);
       const intendedPrompt = `${sharedPrefix} intended suffix`;
       const observedPrompt = `${sharedPrefix} unrelated suffix`;
+      const promptContent = {
+        innerText: observedPrompt,
+        textContent: observedPrompt,
+        getAttribute: (name: string) => (name === "data-message-content" ? "" : null),
+        matches: (selector: string) => selector.includes("[data-message-content]"),
+        closest: () => null,
+        contains: () => false,
+      };
       const turn = {
         innerText: observedPrompt,
         textContent: observedPrompt,
@@ -414,8 +477,12 @@ describe("promptComposer", () => {
           if (name === "data-message-id") return "message-0";
           return null;
         },
-        matches: (selector: string) => selector === "[data-message-id]",
+        matches: (selector: string) =>
+          selector === "[data-message-id]" ||
+          selector.includes('[data-message-author-role="user"]'),
         querySelector: () => null,
+        querySelectorAll: (selector: string) =>
+          selector.includes("[data-message-content]") ? [promptContent] : [],
       };
       const document = {
         querySelector: () => null,
@@ -454,7 +521,7 @@ describe("promptComposer", () => {
     }
   });
 
-  test("commits the exact prompt with stable data-testid and message identities", async () => {
+  test("rejects a stable user turn when its authored content subtree is missing", async () => {
     const messageNode = {
       dataset: { messageId: "message-0" },
       getAttribute: (name: string) => (name === "data-message-id" ? "message-0" : null),
@@ -500,12 +567,31 @@ describe("promptComposer", () => {
         undefined,
         0,
       ),
-    ).resolves.toMatchObject({
-      verifiedUserTurnIndex: 0,
-      verifiedUserTurnId: "conversation-turn-0",
-      verifiedUserMessageId: "message-0",
-      conversationId: "exact-conversation",
+    ).rejects.toThrow(/prompt did not appear/i);
+  });
+
+  test("rejects ambiguous authored prompt content", () => {
+    const content = (text: string) => ({
+      innerText: text,
+      textContent: text,
+      getAttribute: (name: string) => (name === "data-message-content" ? "" : null),
+      matches: (selector: string) => selector.includes("[data-message-content]"),
+      closest: () => null,
+      contains: () => false,
     });
+    const turn = {
+      matches: (selector: string) => selector.includes('[data-message-author-role="user"]'),
+      querySelectorAll: (selector: string) =>
+        selector.includes("[data-message-content]")
+          ? [content("first prompt block"), content("second prompt block")]
+          : [],
+    };
+    const readPromptText = Function(
+      "turn",
+      `${buildReadUserPromptTextExpression()} return readUserPromptText(turn);`,
+    ) as (node: typeof turn) => string | null;
+
+    expect(readPromptText(turn)).toBeNull();
   });
 
   test("attachment sends time out instead of allowing Enter fallback", async () => {
