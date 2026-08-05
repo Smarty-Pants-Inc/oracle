@@ -627,6 +627,63 @@ describe("attachSession rendering", () => {
     expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
   });
 
+  test("retries explicit abort authority for a completed recovery attempt", async () => {
+    const pendingRuntime: BrowserRuntimeMetadata = {
+      chromePid: 123,
+      chromePort: 9222,
+      userDataDir: "/tmp/recovery-profile",
+      recoveryCleanupResources: [
+        {
+          chromePid: 123,
+          chromePort: 9222,
+          userDataDir: "/tmp/recovery-profile",
+          chromeTargetId: "recovery-target",
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "recovery capture failed after target acquisition",
+        settlementMode: "abort",
+      },
+    };
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "completed",
+      mode: "browser",
+      browser: { runtime: pendingRuntime },
+    };
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    readSessionMetadataMock
+      .mockResolvedValueOnce(completedMeta)
+      .mockResolvedValue({ ...completedMeta, browser: { runtime: {} } });
+    readSessionLogMock.mockResolvedValue("");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+      }),
+      "abort",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(false);
+  });
+
   test("retries persisted abort authority for an error session", async () => {
     const remoteRecovery = {
       protocolVersion: 3,

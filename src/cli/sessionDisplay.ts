@@ -327,12 +327,14 @@ export async function attachSession(
   const completedCleanupAcknowledged =
     metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata);
   const cleanupRetryMode =
-    completedCleanupAcknowledged &&
-    (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
-      ? "finalize"
-      : metadata.status === "error"
-        ? (persistedCleanupMode ?? null)
-        : null;
+    metadata.status === "completed" && persistedCleanupMode === "abort"
+      ? "abort"
+      : completedCleanupAcknowledged &&
+          (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
+        ? "finalize"
+        : metadata.status === "error"
+          ? (persistedCleanupMode ?? null)
+          : null;
   if (cleanupRetryMode && runtime?.recoveryCleanupResult) {
     const cleanupLogger = Object.assign(
       ((message?: string) => {

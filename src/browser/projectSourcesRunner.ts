@@ -10,6 +10,7 @@ import {
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type BrowserChrome,
   type ManualChromeOwner,
@@ -22,11 +23,25 @@ import {
   navigateToChatGPT,
   ensureLoggedIn,
 } from "./pageActions.js";
-import type { BrowserLogger, ChromeClient, ResolvedBrowserConfig } from "./types.js";
+import type {
+  BrowserCaptureFinalizationResult,
+  BrowserLogger,
+  ChromeClient,
+  ResolvedBrowserConfig,
+} from "./types.js";
+import type { BrowserRuntimeMetadata } from "../sessionManager.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import {
+  OwnedBrowserResourceTransaction,
+  completedBrowserCaptureCleanup,
+  pendingBrowserCaptureCleanup,
+  type BrowserCaptureSettlementMode,
+} from "./ownedBrowserResources.js";
 import {
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   type BrowserTabLease,
+  type BrowserTabLeaseTeardownAuthority,
 } from "./tabLeaseRegistry.js";
 import {
   isSafeChromeTerminationOutcome,
@@ -107,28 +122,219 @@ export async function runBrowserProjectSources(
   }
 
   let tabLease: BrowserTabLease | null = null;
-  if (manualLogin) {
-    tabLease = await acquireBrowserTabLease(userDataDir, {
-      maxConcurrentTabs: config.maxConcurrentTabs,
-      timeoutMs: config.timeoutMs,
-      logger,
-      sessionId: "project-sources",
-    });
-  }
-
   let owner: ManualChromeOwner | null = null;
   let chrome: BrowserChrome | null = null;
   let chromeOwnerSource: ManualChromeOwnerSource | null = null;
-  let manualLeaseTeardownAuthority: ReturnType<
-    typeof retainBrowserTabLeaseTeardownAuthority
-  > | null = null;
+  let manualLeaseTeardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let isolatedTargetId: string | null = null;
   let client: ChromeClient | null = null;
   let removeTerminationHooks: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let completed = false;
+  let targetClosed = false;
+  let leaseReleased = false;
+  let ownerSettled = false;
 
+  const runtime = (): BrowserRuntimeMetadata => {
+    const chromeHost = chrome?.host ?? "127.0.0.1";
+    const targetCleanupPending = Boolean(isolatedTargetId && !targetClosed);
+    const cleanupPending = Boolean(
+      targetCleanupPending || (tabLease && !leaseReleased) || (owner && !ownerSettled),
+    );
+    const base: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      chromePid: chrome?.pid,
+      chromeProcessIdentity: owner?.processIdentity,
+      chromePort: chrome?.port,
+      chromeHost,
+      chromeProfileRoot: userDataDir,
+      userDataDir,
+      chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
+      tabUrl: projectUrl,
+      controllerPid: process.pid,
+    };
+    if (!cleanupPending) return base;
+    return {
+      ...base,
+      recoveryCleanupResources: [
+        {
+          chromePid: chrome?.pid,
+          chromeProcessIdentity: owner?.processIdentity,
+          profileDirectoryIdentity:
+            owner?.processIdentity.profileDirectory ?? tabLease?.profileDirectory,
+          chromePort: chrome?.port,
+          chromeHost,
+          chromeProfileRoot: userDataDir,
+          userDataDir,
+          chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
+          tabLease:
+            tabLease && !leaseReleased
+              ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
+              : undefined,
+          recoveryCleanup: {
+            ownsTarget: targetCleanupPending,
+            profileKind: manualLogin ? "manual-login" : "temporary",
+            keepBrowser: effectiveKeepBrowser || (manualLogin && owner?.disposition === "preserve"),
+            closeOwnedTargetOnComplete: !effectiveKeepBrowser,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+  };
+
+  const settleProjectSourcesResources = async (
+    mode: BrowserCaptureSettlementMode,
+    pendingRuntime: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> => {
+    const errors: string[] = [];
+    const cleanup = pendingRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
+    const shouldCloseTarget =
+      cleanup?.ownsTarget === true &&
+      (mode === "abort" || cleanup.closeOwnedTargetOnComplete === true);
+    if (
+      mode === "finalize" &&
+      cleanup?.ownsTarget === true &&
+      typeof cleanup.closeOwnedTargetOnComplete !== "boolean"
+    ) {
+      return pendingBrowserCaptureCleanup(
+        pendingRuntime,
+        "Project Sources target finalize disposition is missing",
+        mode,
+      );
+    }
+    await client?.close().catch(() => undefined);
+    if (shouldCloseTarget && isolatedTargetId && chrome && !targetClosed) {
+      try {
+        const closed = await closeTab(
+          chrome.port,
+          isolatedTargetId,
+          logger,
+          chrome.host ?? "127.0.0.1",
+        );
+        if (!closed)
+          errors.push(`Project Sources target close was not confirmed: ${isolatedTargetId}`);
+        else targetClosed = true;
+      } catch (error) {
+        errors.push(
+          `Project Sources target close failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (errors.length > 0) {
+      return pendingBrowserCaptureCleanup(runtime(), errors.join("; "), mode);
+    }
+
+    let keepBrowserOpen =
+      effectiveKeepBrowser || (manualLogin && owner?.disposition === "preserve");
+    if (manualLeaseTeardownAuthority && owner) {
+      let teardownError: string | null = null;
+      const ownerForSettlement = owner;
+      const outcome = await manualLeaseTeardownAuthority.settle(async () => {
+        const settlement = await settleManualChromeOwner(userDataDir, ownerForSettlement, logger);
+        if (settlement.status === "unsafe") {
+          teardownError = settlement.reason;
+          return false;
+        }
+        ownerSettled = true;
+        return true;
+      });
+      leaseReleased = manualLeaseTeardownAuthority.leaseReleased;
+      if (outcome.status === "completed" && outcome.disposition === "active-lease-handoff") {
+        keepBrowserOpen = true;
+        ownerSettled = true;
+        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
+      } else if (outcome.status === "preserved") {
+        keepBrowserOpen = true;
+        errors.push(teardownError ?? outcome.error ?? outcome.reason);
+      }
+    } else if (tabLease && !leaseReleased) {
+      try {
+        await tabLease.release();
+        leaseReleased = true;
+      } catch (error) {
+        keepBrowserOpen = true;
+        errors.push(
+          `Project Sources browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (leaseReleased && manualLogin && owner && !ownerSettled) {
+        const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
+        if (settlement.status === "unsafe") {
+          keepBrowserOpen = true;
+          errors.push(settlement.reason);
+        } else {
+          ownerSettled = true;
+          keepBrowserOpen = true;
+        }
+      }
+    }
+    if (
+      errors.length === 0 &&
+      manualLogin &&
+      !manualLeaseTeardownAuthority &&
+      leaseReleased &&
+      owner &&
+      !ownerSettled
+    ) {
+      const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
+      if (settlement.status === "unsafe") {
+        keepBrowserOpen = true;
+        errors.push(settlement.reason);
+      } else {
+        ownerSettled = true;
+        keepBrowserOpen = true;
+      }
+    }
+    if (!keepBrowserOpen && !manualLogin && chrome && !ownerSettled) {
+      const termination = await chrome.kill().catch(
+        (error: unknown): RecordedChromeTerminationOutcome => ({
+          status: "unsafe",
+          pid: chrome?.pid ?? -1,
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        keepBrowserOpen = true;
+        errors.push(termination.reason);
+      } else {
+        const removed = await removeProfileDirectoryIfIdentityMatches(
+          userDataDir,
+          chrome.processIdentity.profileDirectory,
+        ).catch(() => false);
+        if (!removed) errors.push(`Profile removal was not confirmed: ${userDataDir}`);
+        else ownerSettled = true;
+      }
+    }
+    if (keepBrowserOpen && chrome) {
+      try {
+        chrome.process?.unref?.();
+      } catch {
+        // Best effort only; retained Chrome ownership is recorded independently.
+      }
+      logger(`Chrome left running on port ${chrome.port} with profile ${userDataDir}`);
+    }
+    const projectedRuntime = runtime();
+    return errors.length > 0
+      ? pendingBrowserCaptureCleanup(projectedRuntime, [...new Set(errors)].join("; "), mode)
+      : completedBrowserCaptureCleanup(projectedRuntime);
+  };
+
+  const resources = new OwnedBrowserResourceTransaction(
+    { settleResources: settleProjectSourcesResources },
+    runtime(),
+  );
+  let result: ProjectSourcesResult | undefined;
+  let primaryError: unknown;
   try {
+    if (manualLogin) {
+      tabLease = await acquireBrowserTabLease(userDataDir, {
+        maxConcurrentTabs: config.maxConcurrentTabs,
+        timeoutMs: config.timeoutMs,
+        logger,
+        sessionId: "project-sources",
+      });
+    }
     let acquired: ManualChromeOwner;
     if (manualLogin) {
       acquired = await acquireManualChromeOwner(userDataDir, config, logger, "project-sources");
@@ -150,8 +356,10 @@ export async function runBrowserProjectSources(
     chromeOwnerSource = acquired.source;
     const chromeHost = chrome.host ?? "127.0.0.1";
     if (manualLogin && tabLease && acquired.disposition === "close-on-last-lease") {
+      const ownerForHandoff = acquired;
       manualLeaseTeardownAuthority = retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, {
         logger,
+        onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerForHandoff),
       });
     }
     if (tabLease) {
@@ -249,7 +457,7 @@ export async function runBrowserProjectSources(
     }
     const added = operation === "add" ? diffAddedProjectSources(sourcesBefore, sourcesAfter) : [];
     completed = true;
-    return {
+    result = {
       status: "ok",
       operation,
       projectUrl,
@@ -261,92 +469,30 @@ export async function runBrowserProjectSources(
       warnings,
       tookMs: Date.now() - startedAt,
     };
-  } finally {
-    removeDialogHandler?.();
-    removeTerminationHooks?.();
-    const chromeHost = chrome?.host ?? "127.0.0.1";
-    const chromeForTabClose = chrome;
-    try {
-      await client?.close();
-    } catch {
-      // ignore close failures
-    }
-    if (!effectiveKeepBrowser && isolatedTargetId && chromeForTabClose) {
-      await closeTab(chromeForTabClose.port, isolatedTargetId, logger, chromeHost).catch(
-        () => undefined,
-      );
-    }
-
-    let keepBrowserOpen =
-      effectiveKeepBrowser || (manualLogin && owner?.disposition === "preserve");
-    let manualProcessSettled = false;
-    const chromeForCleanup = chrome;
-    if (manualLeaseTeardownAuthority && chromeForCleanup && owner) {
-      const ownerForSettlement = owner;
-      const outcome = await manualLeaseTeardownAuthority.settle(async () => {
-        const settlement = await settleManualChromeOwner(userDataDir, ownerForSettlement, logger);
-        return settlement.status === "terminated";
-      });
-      if (manualLeaseTeardownAuthority.leaseReleased) tabLease = null;
-      if (outcome.status === "completed" && outcome.disposition === "teardown-completed") {
-        manualProcessSettled = true;
-      }
-      if (outcome.status === "completed" && outcome.disposition === "active-lease-handoff") {
-        keepBrowserOpen = true;
-        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-      } else if (outcome.status === "preserved") {
-        keepBrowserOpen = true;
-        logger(`[browser] Preserving shared Chrome resources: ${outcome.error ?? outcome.reason}`);
-      }
-    } else if (tabLease) {
-      const handle = tabLease;
-      tabLease = null;
-      const released = await handle
-        .release()
-        .then(() => true)
-        .catch((error: unknown) => {
-          logger(
-            `[browser] Browser lease release was unavailable; preserving shared Chrome: ${error instanceof Error ? error.message : String(error)}`,
-          );
-          return false;
-        });
-      if (!released) {
-        keepBrowserOpen = true;
-      } else if (manualLogin && owner?.disposition === "preserve") {
-        const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
-        if (settlement.status === "unsafe") {
-          keepBrowserOpen = true;
-          logger(`[browser] Preserving shared Chrome resources: ${settlement.reason}`);
-        }
-      }
-    }
-    if (!keepBrowserOpen && !manualLogin && chromeForCleanup) {
-      const termination = await chromeForCleanup.kill().catch(
-        (error: unknown): RecordedChromeTerminationOutcome => ({
-          status: "unsafe",
-          pid: chromeForCleanup.pid,
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      if (!isSafeChromeTerminationOutcome(termination)) {
-        logger(`[browser] Preserving profile and cleanup authority: ${termination.reason}`);
-      } else if (!manualLogin) {
-        const removed = await removeProfileDirectoryIfIdentityMatches(
-          userDataDir,
-          chromeForCleanup.processIdentity.profileDirectory,
-        ).catch(() => false);
-        if (!removed)
-          logger("[browser] Physical profile removal was not confirmed; preserving state.");
-      }
-    } else if (chromeForCleanup && !manualProcessSettled) {
-      try {
-        chromeForCleanup.process?.unref?.();
-      } catch {
-        // best effort
-      }
-      logger(`Chrome left running on port ${chromeForCleanup.port} with profile ${userDataDir}`);
-    }
+  } catch (error) {
+    primaryError = error;
   }
+
+  removeDialogHandler?.();
+  removeTerminationHooks?.();
+  resources.replaceRuntime(runtime());
+  const finalization = await resources.settle(completed ? "finalize" : "abort");
+  if (finalization.status === "pending") {
+    const cleanupError = new BrowserAutomationError(
+      `Project Sources browser cleanup remains retryable: ${finalization.error}`,
+      { stage: "project-sources-cleanup", runtime: finalization.runtime },
+    );
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        "Project Sources operation failed and browser cleanup remains retryable.",
+      );
+    }
+    throw cleanupError;
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (!result) throw new Error("Project Sources operation completed without a result.");
+  return result;
 }
 
 async function applyProjectSourcesCookies({

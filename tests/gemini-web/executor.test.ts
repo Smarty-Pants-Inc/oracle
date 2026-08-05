@@ -6,6 +6,7 @@ import type {
   OracleChromeOwnerRecord,
   RecordedChromeTerminationOutcome,
 } from "../../src/browser/profileState.js";
+import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "../../src/browser/profileState.js";
 import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
@@ -25,6 +26,7 @@ const {
   captureProfileDirectoryIdentity,
   acquireManualChromeOwner,
   settleManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   teardownSettle,
@@ -43,7 +45,9 @@ const {
   writeOracleChromeOwner: vi.fn(
     async (_profileDir: string, _owner: OracleChromeOwnerRecord) => undefined,
   ),
-  cleanupStaleProfileState: vi.fn(async () => true),
+  cleanupStaleProfileState: vi.fn<typeof cleanupStaleProfileStateApi>(
+    async (_profileDir, _logger, _options) => true,
+  ),
   verifyDevToolsReachable: vi.fn(async () => ({ ok: false, error: "unreachable" })),
   delay: vi.fn(async () => undefined),
   captureProfileDirectoryIdentity: vi.fn(
@@ -57,6 +61,7 @@ const {
   ),
   acquireManualChromeOwner: vi.fn(),
   settleManualChromeOwner: vi.fn(),
+  releaseManualChromeOwnerEndpointAuthority: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
   retainBrowserTabLeaseTeardownAuthority: vi.fn(),
   teardownSettle: vi.fn(),
@@ -127,6 +132,7 @@ vi.mock("../../src/browser/profileState.js", () => ({
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
   acquireManualChromeOwner,
   settleManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
 }));
 vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
@@ -182,13 +188,30 @@ describe("gemini-web executor", () => {
     captureProfileDirectoryIdentity.mockClear();
     acquireManualChromeOwner.mockReset();
     settleManualChromeOwner.mockReset();
+    releaseManualChromeOwnerEndpointAuthority.mockReset();
+    releaseManualChromeOwnerEndpointAuthority.mockImplementation(async (owner: ManualChromeOwner) =>
+      owner.endpointAuthority?.release(),
+    );
     settleManualChromeOwner.mockImplementation(
-      async (_profileDir: string, owner: ManualChromeOwner) => {
+      async (profileDir: string, owner: ManualChromeOwner) => {
         if (owner.disposition === "preserve") {
-          await owner.endpointAuthority?.release();
+          await releaseManualChromeOwnerEndpointAuthority(owner);
           return { status: "preserved" as const };
         }
-        return { status: "terminated" as const };
+        const outcome = await owner.chrome.kill();
+        if (outcome.status !== "stopped" && outcome.status !== "already-stopped") {
+          return {
+            status: "unsafe" as const,
+            reason: "reason" in outcome ? outcome.reason : "termination failed",
+          };
+        }
+        const cleaned = await cleanupStaleProfileState(profileDir, undefined, {
+          lockRemovalMode: "never",
+          expectedProfileIdentity: owner.processIdentity.profileDirectory,
+        });
+        return cleaned
+          ? { status: "terminated" as const }
+          : { status: "unsafe" as const, reason: "profile cleanup failed" };
       },
     );
     acquireBrowserTabLease.mockReset();
@@ -478,6 +501,7 @@ describe("gemini-web executor", () => {
 
   it("settles the manual CDP session before executing the HTTP Gemini request", async () => {
     const events: string[] = [];
+    const acquisitionSnapshots: BrowserRuntimeMetadata[] = [];
     closeTab.mockImplementationOnce(async () => {
       events.push("close-target");
       return true;
@@ -510,10 +534,32 @@ describe("gemini-web executor", () => {
       attachments: [],
       config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: true },
       log: () => {},
+      runtimeHintCb: async (runtime) => {
+        acquisitionSnapshots.push(runtime);
+        if (!runtime.recoveryCleanupResources?.length) events.push("persist-completed");
+      },
     });
 
     expect(result.answerText).toBe("ok");
-    expect(events).toEqual(["close-target", "release-lease", "terminate-owner", "http-request"]);
+    expect(events).toEqual([
+      "close-target",
+      "release-lease",
+      "terminate-owner",
+      "persist-completed",
+      "http-request",
+    ]);
+    expect(
+      acquisitionSnapshots
+        .map((runtime) => runtime.recoveryCleanupResources?.[0]?.acquisition?.pendingResource)
+        .filter(Boolean),
+    ).toEqual(["tab-lease", "chrome-process", "chrome-target"]);
+    expect(
+      acquisitionSnapshots.some(
+        (runtime) =>
+          runtime.recoveryCleanupResources?.[0]?.chromeTargetId === "target-1" &&
+          runtime.recoveryCleanupResources[0]?.acquisition?.pendingResource === undefined,
+      ),
+    ).toBe(true);
     expect(result.runtime.recoveryCleanupResources).toBeUndefined();
     expect(result.runtime.recoveryCleanupResult).toBeUndefined();
   });
@@ -541,7 +587,7 @@ describe("gemini-web executor", () => {
           recoveryCleanupResult: {
             status: "failed",
             settlementMode: "abort",
-            error: expect.stringContaining("could not safely terminate Chrome"),
+            error: expect.stringContaining("could not safely terminate Chrome: termination failed"),
           },
           recoveryCleanupResources: [
             expect.objectContaining({
@@ -626,20 +672,34 @@ describe("gemini-web executor", () => {
     });
     expect(closeTab).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
-    expect(events).toEqual(["persist:acquired", "persist:pending", "persist:committed"]);
+    expect(events.indexOf("persist:pending")).toBeGreaterThan(
+      events.lastIndexOf("persist:acquired"),
+    );
+    expect(events.indexOf("persist:committed")).toBeGreaterThan(events.indexOf("persist:pending"));
     expect(runtimeEvaluate).toHaveBeenCalledWith(
       expect.objectContaining({ awaitPromise: true, returnByValue: true }),
     );
 
-    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
-    expect(events).toEqual([
-      "persist:acquired",
-      "persist:pending",
-      "persist:committed",
-      "persist:committed:finalize",
-      "close-target",
-    ]);
+    const finalization = await result.finalize();
+    expect(finalization).toMatchObject({
+      status: "completed",
+      runtime: {
+        conversationId: "target-1",
+        promptEpoch: expect.objectContaining({
+          status: "committed",
+          conversationId: "target-1",
+          verifiedUserTurnId: "data-message-id:user-current",
+        }),
+      },
+    });
+    expect(events.indexOf("persist:committed:finalize")).toBeGreaterThan(
+      events.indexOf("persist:committed"),
+    );
+    expect(events.indexOf("close-target")).toBeGreaterThan(
+      events.indexOf("persist:committed:finalize"),
+    );
     expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(events.lastIndexOf("persist:committed")).toBeGreaterThan(events.indexOf("close-target"));
     expect(killChrome).toHaveBeenCalledTimes(1);
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
     expect(killChrome).toHaveBeenCalledTimes(1);
@@ -696,13 +756,16 @@ describe("gemini-web executor", () => {
         }),
       ],
     });
-    expect(events).toEqual([
-      "persist:acquired:unbound",
-      "persist:pending:unbound",
-      "persist:committed:unbound",
-      "persist:committed:finalize",
-      "close-target",
-    ]);
+    expect(events.indexOf("persist:pending:unbound")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("persist:committed:unbound")).toBeGreaterThan(
+      events.indexOf("persist:pending:unbound"),
+    );
+    expect(events.indexOf("persist:committed:abort")).toBeGreaterThan(
+      events.indexOf("persist:committed:unbound"),
+    );
+    expect(events.indexOf("close-target")).toBeGreaterThan(
+      events.indexOf("persist:committed:abort"),
+    );
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(killChrome).toHaveBeenCalledTimes(1);
   });

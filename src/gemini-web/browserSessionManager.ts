@@ -1,25 +1,35 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
-import type { BrowserRunOptions, BrowserLogger, ChromeClient } from "../browser/types.js";
+import type {
+  BrowserCaptureFinalizationResult,
+  BrowserLogger,
+  BrowserRunOptions,
+  ChromeClient,
+} from "../browser/types.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import { pendingBrowserCaptureCleanup } from "../browser/runLifecycle.js";
+import {
+  OwnedBrowserResourceTransaction,
+  completedBrowserCaptureCleanup,
+  pendingBrowserCaptureCleanup,
+  projectBrowserCaptureCleanupRuntime,
+  type BrowserCaptureSettlementMode,
+} from "../browser/ownedBrowserResources.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import {
   acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type ManualChromeOwner,
 } from "../browser/manualChromeOwner.js";
-import {
-  cleanupStaleProfileState,
-  isSafeChromeTerminationOutcome,
-  type ChromeProcessIdentity,
-  type RecordedChromeTerminationOutcome,
-} from "../browser/profileState.js";
+import { captureProfileDirectoryIdentity } from "../browser/profileState.js";
 import {
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
+  type BrowserTabLease,
+  type BrowserTabLeaseTeardownAuthority,
 } from "../browser/tabLeaseRegistry.js";
 
 export interface GeminiBrowserSession {
@@ -27,8 +37,12 @@ export interface GeminiBrowserSession {
   port: number;
   client: ChromeClient;
   targetId: string;
-  processIdentity: ChromeProcessIdentity;
+  processIdentity: ManualChromeOwner["processIdentity"];
   runtime: () => BrowserRuntimeMetadata;
+  settle: (
+    mode: BrowserCaptureSettlementMode,
+    pendingRuntime?: BrowserRuntimeMetadata,
+  ) => Promise<BrowserCaptureFinalizationResult>;
   close: () => Promise<void>;
 }
 
@@ -37,12 +51,19 @@ export interface OpenGeminiBrowserSessionInput {
   keepBrowserDefault: boolean;
   purpose: string;
   log?: BrowserLogger;
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+}
+
+function manualOwnerCleanupError(owner: ManualChromeOwner, reason: string): string {
+  return owner.source === "launched"
+    ? `Gemini launched browser owner could not safely terminate Chrome: ${reason}`
+    : `Gemini browser owner cleanup remains unsafe: ${reason}`;
 }
 
 export async function openGeminiBrowserSession(
   input: OpenGeminiBrowserSessionInput,
 ): Promise<GeminiBrowserSession> {
-  const { browserConfig, keepBrowserDefault, purpose, log } = input;
+  const { browserConfig, keepBrowserDefault, purpose, log, persistRuntime } = input;
   const logger = log ?? (() => {});
   const resolvedConfig = resolveBrowserConfig({
     ...browserConfig,
@@ -51,251 +72,295 @@ export async function openGeminiBrowserSession(
   });
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
-  const tabLease = await acquireBrowserTabLease(profileDir, {
-    maxConcurrentTabs: resolvedConfig.maxConcurrentTabs,
-    timeoutMs: resolvedConfig.timeoutMs,
-    logger,
-    sessionId: purpose,
-  });
-
-  let owner: ManualChromeOwner;
-  try {
-    owner = await acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose);
-  } catch (error) {
-    try {
-      await tabLease.release();
-    } catch (cleanupError) {
-      const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      const runtime = pendingBrowserCaptureCleanup(
-        {
-          userDataDir: profileDir,
-          chromeProfileRoot: profileDir,
-          recoveryCleanupResources: [
-            {
-              profileDirectoryIdentity: tabLease.profileDirectory,
-              userDataDir: profileDir,
-              chromeProfileRoot: profileDir,
-              tabLease: { id: tabLease.id, profileDirectory: tabLease.profileDirectory },
-              recoveryCleanup: {
-                ownsTarget: false,
-                profileKind: "manual-login",
-                keepBrowser: true,
-              },
-            },
-          ],
-          controllerPid: process.pid,
-        },
-        `Browser tab lease release failed: ${message}`,
-        "abort",
-      ).runtime;
-      throw new BrowserAutomationError(
-        `Gemini browser owner acquisition failed and lease cleanup remains retryable: ${message}`,
-        { stage: "gemini-browser-session-open", runtime },
-        error,
-      );
-    }
-    throw error;
-  }
-
-  const { chrome, processIdentity } = owner;
-  const port = chrome.port;
-  const host = chrome.host ?? "127.0.0.1";
-
+  const generationId = randomUUID();
+  const leaseId = randomUUID();
+  const targetMarkerUrl = `about:blank#oracle-acquisition=${generationId}`;
+  let profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+  let tabLease: BrowserTabLease | null = null;
+  let owner: ManualChromeOwner | null = null;
+  let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let targetId: string | null = null;
   let client: ChromeClient | null = null;
   let targetClosed = false;
   let clientClosed = false;
   let leaseReleased = false;
-  let ownerTerminated = false;
-  let profileCleaned = false;
-  let closeCompleted = false;
-  let closeAttempt: Promise<void> | null = null;
-  const teardownAuthority =
-    owner.disposition === "close-on-last-lease"
-      ? retainBrowserTabLeaseTeardownAuthority(profileDir, tabLease, { logger })
-      : null;
+  let ownerSettled = false;
 
-  const cleanupFailure = (action: string, cause?: unknown): Error => {
-    const detail =
-      cause === undefined ? "" : `: ${cause instanceof Error ? cause.message : String(cause)}`;
-    return new Error(`Gemini browser session did not settle cleanly: ${action}${detail}`);
-  };
-
-  const settleCloseOnLastLeaseOwner = async (): Promise<void> => {
-    if (!ownerTerminated) {
-      let termination: RecordedChromeTerminationOutcome;
-      try {
-        termination = await chrome.kill();
-      } catch (error) {
-        throw cleanupFailure("could not terminate its launched Chrome owner", error);
-      }
-      if (!isSafeChromeTerminationOutcome(termination)) {
-        throw cleanupFailure(`could not safely terminate Chrome: ${termination.reason}`);
-      }
-      ownerTerminated = true;
-    }
-    if (!profileCleaned) {
-      let cleaned: boolean;
-      try {
-        cleaned = await cleanupStaleProfileState(profileDir, log, {
-          lockRemovalMode: "never",
-          expectedProfileIdentity: processIdentity.profileDirectory,
-        });
-      } catch (error) {
-        throw cleanupFailure("could not clean up its terminated Chrome profile", error);
-      }
-      if (!cleaned) {
-        throw cleanupFailure("could not confirm profile cleanup");
-      }
-      profileCleaned = true;
-    }
-  };
-
-  const runtime = (): BrowserRuntimeMetadata => {
-    const targetCleanupPending = Boolean(targetId && !targetClosed);
-    const processCleanupPending = Boolean(
-      teardownAuthority && (!ownerTerminated || !profileCleaned),
+  const runtime = (
+    pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
+  ): BrowserRuntimeMetadata => {
+    const chrome = owner?.chrome;
+    const targetCleanupPending = Boolean(
+      (targetId && !targetClosed) || pendingResource === "chrome-target",
     );
-    const recoveryCleanupPending = targetCleanupPending || !leaseReleased || processCleanupPending;
+    const resourceCleanupPending = Boolean(
+      pendingResource || targetCleanupPending || !leaseReleased || (owner && !ownerSettled),
+    );
     const base: BrowserRuntimeMetadata = {
       browserTransport: "cdp",
-      chromePid: chrome.pid,
-      chromeProcessIdentity: processIdentity,
-      chromePort: port,
-      chromeHost: host,
+      chromePid: chrome?.pid,
+      chromeProcessIdentity: owner?.processIdentity,
+      chromePort: chrome?.port,
+      chromeHost: chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: profileDir,
       userDataDir: profileDir,
       chromeTargetId: targetCleanupPending ? (targetId ?? undefined) : undefined,
       controllerPid: process.pid,
     };
-    if (!recoveryCleanupPending) return base;
+    if (!resourceCleanupPending) return base;
     return {
       ...base,
       recoveryCleanupResources: [
         {
-          chromePid: chrome.pid,
-          chromeProcessIdentity: processIdentity,
-          profileDirectoryIdentity: processIdentity.profileDirectory,
-          chromePort: port,
-          chromeHost: host,
+          chromePid: chrome?.pid,
+          chromeProcessIdentity: owner?.processIdentity,
+          profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
+          chromePort: chrome?.port,
+          chromeHost: chrome?.host ?? "127.0.0.1",
           chromeProfileRoot: profileDir,
           userDataDir: profileDir,
           chromeTargetId: targetCleanupPending ? (targetId ?? undefined) : undefined,
           tabLease: !leaseReleased
-            ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
+            ? {
+                id: tabLease?.id ?? leaseId,
+                profileDirectory: tabLease?.profileDirectory ?? profileDirectory,
+              }
             : undefined,
+          acquisition: {
+            generationId,
+            processOwnerProvenance: "manual-canonical-owner",
+            ...(pendingResource ? { pendingResource } : {}),
+            targetMarkerUrl,
+          },
           recoveryCleanup: {
             ownsTarget: targetCleanupPending,
             profileKind: "manual-login",
-            keepBrowser: !processCleanupPending,
+            keepBrowser: owner
+              ? owner.disposition === "preserve"
+              : Boolean(resolvedConfig.keepBrowser),
             closeOwnedTargetOnComplete: targetCleanupPending,
           },
         },
       ],
+      recoveryCleanupResult: { status: "pending" },
     };
   };
 
-  const settle = async (): Promise<void> => {
-    if (!targetClosed && targetId) {
-      let closed: boolean;
-      try {
-        closed = await closeTab(port, targetId, logger, host);
-      } catch (error) {
-        throw cleanupFailure(`could not close target ${targetId}`, error);
-      }
-      if (!closed) {
-        throw cleanupFailure(`could not close target ${targetId}`);
-      }
-      targetClosed = true;
+  const settleResources = async (
+    mode: BrowserCaptureSettlementMode,
+    pendingRuntime: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> => {
+    const errors: string[] = [];
+    const cleanup = pendingRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
+    const shouldCloseTarget =
+      cleanup?.ownsTarget === true &&
+      (mode === "abort" || cleanup.closeOwnedTargetOnComplete === true);
+    if (
+      mode === "finalize" &&
+      cleanup?.ownsTarget === true &&
+      typeof cleanup.closeOwnedTargetOnComplete !== "boolean"
+    ) {
+      return pendingBrowserCaptureCleanup(
+        pendingRuntime,
+        "Owned Gemini target finalize disposition is missing",
+        mode,
+      );
     }
-    if (!clientClosed && client) {
+    if (shouldCloseTarget && targetId && !targetClosed) {
+      try {
+        const chrome = owner?.chrome;
+        const closed = chrome
+          ? await closeTab(chrome.port, targetId, logger, chrome.host ?? "127.0.0.1")
+          : false;
+        if (!closed) errors.push(`Gemini target close was not confirmed: ${targetId}`);
+        else targetClosed = true;
+      } catch (error) {
+        errors.push(
+          `Gemini target close failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (errors.length === 0 && client && !clientClosed) {
       try {
         await client.close();
+        clientClosed = true;
       } catch (error) {
-        throw cleanupFailure("could not close its CDP client", error);
-      }
-      clientClosed = true;
-    }
-    if (teardownAuthority) {
-      let teardownError: string | null = null;
-      const outcome = await teardownAuthority.settle(async () => {
-        try {
-          await settleCloseOnLastLeaseOwner();
-          return true;
-        } catch (error) {
-          teardownError = error instanceof Error ? error.message : String(error);
-          return false;
-        }
-      });
-      leaseReleased = teardownAuthority.leaseReleased;
-      if (outcome.status === "preserved") {
-        if (teardownError) throw new Error(teardownError);
-        throw cleanupFailure(
-          outcome.error ?? `browser owner cleanup remains pending (${outcome.reason})`,
+        errors.push(
+          `Gemini CDP client close failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-    } else if (!leaseReleased) {
-      try {
-        await tabLease.release();
-      } catch (error) {
-        throw cleanupFailure("could not release its browser tab lease", error);
+    }
+    if (
+      errors.length === 0 &&
+      tabLease &&
+      (!leaseReleased || Boolean(teardownAuthority && owner && !ownerSettled))
+    ) {
+      if (teardownAuthority && owner) {
+        let ownerError: string | null = null;
+        const ownerForSettlement = owner;
+        const outcome = await teardownAuthority.settle(async () => {
+          const settlement = await settleManualChromeOwner(profileDir, ownerForSettlement, logger);
+          if (settlement.status === "unsafe") {
+            ownerError = manualOwnerCleanupError(ownerForSettlement, settlement.reason);
+            return false;
+          }
+          ownerSettled = true;
+          return true;
+        });
+        leaseReleased = teardownAuthority.leaseReleased;
+        if (outcome.status === "preserved") {
+          errors.push(ownerError ?? outcome.error ?? outcome.reason);
+        } else if (outcome.disposition === "active-lease-handoff") {
+          ownerSettled = true;
+        }
+      } else {
+        try {
+          await tabLease.release();
+          leaseReleased = true;
+        } catch (error) {
+          errors.push(
+            `Gemini browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (leaseReleased && owner && !ownerSettled) {
+          const settlement = await settleManualChromeOwner(profileDir, owner, logger);
+          if (settlement.status === "unsafe") {
+            errors.push(manualOwnerCleanupError(owner, settlement.reason));
+          } else ownerSettled = true;
+        }
       }
-      leaseReleased = true;
+    }
+    if (errors.length === 0 && !teardownAuthority && leaseReleased && owner && !ownerSettled) {
       const settlement = await settleManualChromeOwner(profileDir, owner, logger);
       if (settlement.status === "unsafe") {
-        throw cleanupFailure(
-          `could not release its preserved Chrome authority: ${settlement.reason}`,
-        );
-      }
+        errors.push(manualOwnerCleanupError(owner, settlement.reason));
+      } else ownerSettled = true;
     }
-    closeCompleted = true;
+    const resourceRuntime = runtime();
+    return errors.length > 0
+      ? pendingBrowserCaptureCleanup(resourceRuntime, [...new Set(errors)].join("; "), mode)
+      : completedBrowserCaptureCleanup(resourceRuntime);
   };
 
-  const close = (): Promise<void> => {
-    if (closeCompleted) return Promise.resolve();
-    if (closeAttempt) return closeAttempt;
-    closeAttempt = settle().finally(() => {
-      closeAttempt = null;
-    });
-    return closeAttempt;
-  };
+  const resources = new OwnedBrowserResourceTransaction(
+    {
+      ...(persistRuntime
+        ? {
+            persistRuntime: async (nextRuntime) => persistRuntime(nextRuntime),
+            persistSettlementResult: async (nextRuntime) => persistRuntime(nextRuntime),
+          }
+        : {}),
+      settleResources,
+    },
+    runtime(),
+  );
 
   try {
-    await tabLease.update({ chromeHost: host, chromePort: port });
-    const connection = await connectWithNewTab(port, logger, "about:blank", host, {
-      fallbackToDefault: false,
-      retries: 6,
+    tabLease = await resources.journalAcquisition({
+      intentRuntime: runtime("tab-lease"),
+      acquire: () =>
+        acquireBrowserTabLease(profileDir, {
+          maxConcurrentTabs: resolvedConfig.maxConcurrentTabs,
+          timeoutMs: resolvedConfig.timeoutMs,
+          logger,
+          sessionId: purpose,
+          leaseId,
+        }),
+      acquiredRuntime: (acquiredLease) => {
+        tabLease = acquiredLease;
+        profileDirectory = acquiredLease.profileDirectory;
+        return runtime();
+      },
     });
-    if (!connection.targetId) {
-      throw new Error("Failed to create an isolated Gemini browser tab.");
+    owner = await resources.journalAcquisition({
+      intentRuntime: runtime("chrome-process"),
+      acquire: () => acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose),
+      acquiredRuntime: (acquiredOwner) => {
+        owner = acquiredOwner;
+        return runtime();
+      },
+    });
+    if (owner.disposition === "close-on-last-lease") {
+      const ownerForHandoff = owner;
+      teardownAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, tabLease, {
+        logger,
+        onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerForHandoff),
+      });
     }
+    const chrome = owner.chrome;
+    const host = chrome.host ?? "127.0.0.1";
+    await tabLease.update({ chromeHost: host, chromePort: chrome.port });
+    const connection = await resources.journalAcquisition({
+      intentRuntime: runtime("chrome-target"),
+      acquire: async () => {
+        const opened = await connectWithNewTab(chrome.port, logger, targetMarkerUrl, host, {
+          fallbackToDefault: false,
+          retries: 6,
+        });
+        if (!opened.targetId) throw new Error("Failed to create an isolated Gemini browser tab.");
+        return { client: opened.client, targetId: opened.targetId };
+      },
+      acquiredRuntime: (opened) => {
+        client = opened.client;
+        targetId = opened.targetId;
+        return runtime();
+      },
+    });
     client = connection.client;
     targetId = connection.targetId;
+    await tabLease.update({
+      chromeHost: host,
+      chromePort: chrome.port,
+      chromeTargetId: targetId,
+      tabUrl: targetMarkerUrl,
+    });
   } catch (error) {
-    try {
-      await close();
-    } catch (cleanupError) {
-      const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      const pendingRuntime = pendingBrowserCaptureCleanup(runtime(), message, "abort").runtime;
+    const cleanup = await resources.settle("abort");
+    if (cleanup.status === "pending") {
       throw new BrowserAutomationError(
-        `${error instanceof Error ? error.message : String(error)}; Gemini browser cleanup remains retryable: ${message}`,
-        { stage: "gemini-browser-session-open", runtime: pendingRuntime },
+        `${error instanceof Error ? error.message : String(error)}; Gemini browser cleanup remains retryable: ${cleanup.error}`,
+        { stage: "gemini-browser-session-open", runtime: cleanup.runtime },
         error,
       );
     }
     throw error;
   }
-  if (!client || !targetId) {
+
+  if (!owner || !client || !targetId) {
     throw new Error("Failed to establish an isolated Gemini browser session.");
   }
 
+  const settle = async (
+    mode: BrowserCaptureSettlementMode,
+    pendingRuntime?: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> => {
+    const currentRuntime = resources.runtime();
+    if (
+      pendingRuntime &&
+      currentRuntime.recoveryCleanupResources?.length &&
+      !currentRuntime.recoveryCleanupResult?.settlementMode
+    ) {
+      resources.replaceRuntime(projectBrowserCaptureCleanupRuntime(pendingRuntime, runtime()));
+    }
+    return resources.settle(mode);
+  };
+
   return {
     profileDir,
-    port,
-    processIdentity,
+    port: owner.chrome.port,
+    processIdentity: owner.processIdentity,
     client,
     targetId,
-    runtime,
-    close,
+    runtime: () => resources.runtime(),
+    settle,
+    close: async () => {
+      const result = await settle("abort");
+      if (result.status === "pending") {
+        throw new BrowserAutomationError(
+          `Gemini browser session cleanup remains retryable: ${result.error}`,
+          { stage: "gemini-browser-cleanup", runtime: result.runtime },
+        );
+      }
+    },
   };
 }

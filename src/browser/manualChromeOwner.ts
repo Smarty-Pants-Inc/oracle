@@ -55,45 +55,12 @@ export interface ManualChromeOwnerDeps {
   writeOwner?: typeof writeOracleChromeOwner;
 }
 
-export type ManualChromeOwnerSettlement =
-  | { status: "terminated" }
-  | { status: "preserved" }
-  | { status: "unsafe"; reason: string };
-
-export async function settleManualChromeOwner(
-  profileDir: string,
-  owner: ManualChromeOwner,
-  logger: BrowserLogger,
-  deps: Pick<ManualChromeOwnerDeps, "cleanupProfileState"> = {},
-): Promise<ManualChromeOwnerSettlement> {
-  if (owner.disposition === "preserve") {
-    try {
-      await owner.endpointAuthority?.release();
-      return { status: "preserved" };
-    } catch (error) {
-      return {
-        status: "unsafe",
-        reason: `Exact Chrome control channel could not be released: ${error instanceof Error ? error.message : error}`,
-      };
-    }
-  }
-
-  const termination = await owner.chrome.kill().catch((error: unknown) => ({
-    status: "unsafe" as const,
-    pid: owner.chrome.pid,
-    reason: error instanceof Error ? error.message : String(error),
-  }));
-  if (!isSafeChromeTerminationOutcome(termination)) {
-    return { status: "unsafe", reason: termination.reason };
-  }
-  const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
-    lockRemovalMode: "never",
-    expectedProfileIdentity: owner.processIdentity.profileDirectory,
-  });
-  return cleaned
-    ? { status: "terminated" }
-    : { status: "unsafe", reason: "Manual-login profile cleanup was not confirmed" };
-}
+export {
+  releaseManualChromeOwnerEndpointAuthority,
+  settleManualChromeOwner,
+  type ManualChromeOwnerSettlement,
+  type ManualChromeOwnerSettlementDeps,
+} from "./manualChromeOwnerSettlement.js";
 
 /**
  * Acquire the one canonical Chrome process for a persistent manual-login profile.
@@ -185,16 +152,39 @@ export async function acquireManualChromeOwner(
           deps,
         );
       } catch (error) {
-        const termination = await chrome.kill().catch(() => ({
+        const failures = [error instanceof Error ? error : new Error(String(error))];
+        const termination = await chrome.kill().catch((terminationError: unknown) => ({
           status: "unsafe" as const,
           pid: chrome.pid,
-          reason: "Stable Chrome launch rollback failed",
+          reason:
+            terminationError instanceof Error ? terminationError.message : String(terminationError),
         }));
-        if (isSafeChromeTerminationOutcome(termination)) {
-          await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
-            lockRemovalMode: "if_oracle_pid_dead",
-            expectedProfileIdentity: chrome.processIdentity.profileDirectory,
-          }).catch(() => false);
+        if (!isSafeChromeTerminationOutcome(termination)) {
+          failures.push(new Error(termination.reason));
+        } else {
+          try {
+            const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(
+              profileDir,
+              logger,
+              {
+                lockRemovalMode: "if_oracle_pid_dead",
+                expectedProfileIdentity: chrome.processIdentity.profileDirectory,
+              },
+            );
+            if (!cleaned) {
+              failures.push(new Error("Chrome launch rollback profile cleanup was not confirmed"));
+            }
+          } catch (cleanupError) {
+            failures.push(
+              cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)),
+            );
+          }
+        }
+        if (failures.length > 1) {
+          throw new AggregateError(
+            failures,
+            "Canonical Chrome owner acquisition rollback did not settle safely",
+          );
         }
         throw error;
       }
@@ -207,6 +197,7 @@ export async function acquireManualChromeOwner(
         processIdentity,
         source: "launched",
         disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
+        endpointAuthority: chrome.endpointAuthority,
       };
     }
   } catch (error) {

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import chalk from "chalk";
 import { sessionStore } from "../sessionStore.js";
 import type { SessionMetadata } from "../sessionStore.js";
+import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
   collectChatGptTabs,
   DEFAULT_REMOTE_CHROME_HOST,
@@ -24,6 +25,7 @@ import {
   type CommittedPromptEpochLocator,
 } from "../browser/reattachability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import type { BrowserCaptureSettlementMode } from "../browser/runLifecycle.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 
 const LIVE_POLL_MS = 2000;
@@ -269,42 +271,47 @@ async function persistHarvest(
   } catch {
     // Harvesting remains useful even when the original output artifact is unavailable.
   }
-  const browser = recoverBrowserMetadataFromHarvestForTest(meta, harvested, persistedOutput);
+  const current = await sessionStore.readSession(sessionId).catch(() => null);
+  const browser = recoverBrowserMetadataFromHarvestForTest(
+    current ?? meta,
+    harvested,
+    persistedOutput,
+  );
   await sessionStore.updateSession(sessionId, { browser });
 }
+
+async function persistRecoveredConversationRuntime(
+  sessionId: string,
+  runtime: BrowserRuntimeMetadata,
+): Promise<void> {
+  const current = await sessionStore.readSession(sessionId);
+  await sessionStore.updateSession(sessionId, {
+    browser: { ...(current?.browser ?? {}), runtime },
+  });
+}
+
 async function settleRecoveredConversationCleanup(
   sessionId: string,
   cleanup: RecoveredConversationCleanup,
+  mode: BrowserCaptureSettlementMode,
 ): Promise<void> {
-  const result = await cleanup();
-  if (result.status === "completed") return;
-
   const current = await sessionStore.readSession(sessionId).catch(() => null);
-  const previousRuntime = current?.browser?.runtime ?? {};
-  const resources = [...(previousRuntime.recoveryCleanupResources ?? [])];
-  const resourceIdentity = JSON.stringify(result.resource);
-  if (!resources.some((resource) => JSON.stringify(resource) === resourceIdentity)) {
-    resources.push(result.resource);
-  }
-  const runtime = {
-    ...previousRuntime,
-    recoveryCleanupResources: resources,
-    recoveryCleanupResult: { status: "failed" as const, error: result.error },
-  };
+  const result = await cleanup(mode, current?.browser?.runtime ?? {});
   let persistenceError: unknown = null;
   try {
-    await sessionStore.updateSession(sessionId, {
-      browser: { ...(current?.browser ?? {}), runtime },
-    });
+    await persistRecoveredConversationRuntime(sessionId, result.runtime);
   } catch (error) {
     persistenceError = error;
   }
+  if (result.status === "completed" && !persistenceError) return;
+  const cleanupError =
+    result.status === "pending" ? result.error : "completed cleanup result was not persisted";
   const persistenceSuffix = persistenceError
     ? ` Cleanup authority persistence also failed: ${persistenceError instanceof Error ? persistenceError.message : String(persistenceError)}`
     : "";
   throw new BrowserAutomationError(
-    `Recovered browser cleanup remains pending: ${result.error}.${persistenceSuffix}`,
-    { stage: "recovered-conversation-cleanup", runtime },
+    `Recovered browser ${mode} cleanup remains pending: ${cleanupError}.${persistenceSuffix}`,
+    { stage: "recovered-conversation-cleanup", runtime: result.runtime },
     persistenceError ?? undefined,
   );
 }
@@ -420,7 +427,8 @@ export async function harvestSessionBrowserOutput(
         ),
       );
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
-        existingEndpoint: recordedEndpoint ?? undefined,
+        ...(recordedEndpoint ? { existingEndpoint: recordedEndpoint } : {}),
+        persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
       harvested = await harvestChatGptTab({
@@ -436,7 +444,7 @@ export async function harvestSessionBrowserOutput(
     if (recoveredCleanup) {
       const cleanup = recoveredCleanup;
       recoveredCleanup = null;
-      await settleRecoveredConversationCleanup(sessionId, cleanup);
+      await settleRecoveredConversationCleanup(sessionId, cleanup, "finalize");
     }
     printHarvestSummary(sessionId, harvested);
     const output = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
@@ -448,7 +456,9 @@ export async function harvestSessionBrowserOutput(
     }
     return harvested;
   } finally {
-    if (recoveredCleanup) await settleRecoveredConversationCleanup(sessionId, recoveredCleanup);
+    if (recoveredCleanup) {
+      await settleRecoveredConversationCleanup(sessionId, recoveredCleanup, "abort");
+    }
   }
 }
 
@@ -494,8 +504,9 @@ export async function liveTailSessionBrowserOutput(
         ),
       );
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
-        existingEndpoint: recordedEndpoint ?? undefined,
+        ...(recordedEndpoint ? { existingEndpoint: recordedEndpoint } : {}),
         waitForReady: false,
+        persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
       endpoint = { host: recovered.host, port: recovered.port };
@@ -556,7 +567,7 @@ export async function liveTailSessionBrowserOutput(
         if (recoveredCleanup) {
           const cleanup = recoveredCleanup;
           recoveredCleanup = null;
-          await settleRecoveredConversationCleanup(sessionId, cleanup);
+          await settleRecoveredConversationCleanup(sessionId, cleanup, "finalize");
         }
         printHarvestSummary(sessionId, finalHarvest);
         const output = finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
@@ -572,6 +583,8 @@ export async function liveTailSessionBrowserOutput(
       await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
     }
   } finally {
-    if (recoveredCleanup) await settleRecoveredConversationCleanup(sessionId, recoveredCleanup);
+    if (recoveredCleanup) {
+      await settleRecoveredConversationCleanup(sessionId, recoveredCleanup, "abort");
+    }
   }
 }

@@ -1638,11 +1638,15 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     expect(listTargets).not.toHaveBeenCalled();
     expect(recoverSession).not.toHaveBeenCalled();
     expect((await result.finalize()).status).toBe("completed");
-    expect(settlementEvents).toEqual(["persist:finalize", "cleanup:finalize"]);
-    expect(runtimeHintCb).toHaveBeenLastCalledWith(
+    expect(settlementEvents).toEqual(["persist:finalize", "cleanup:finalize", "persist:unbound"]);
+    expect(runtimeHintCb).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({
         recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
       }),
+    );
+    expect(runtimeHintCb).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ recoveryCleanupResult: expect.anything() }),
     );
     expect(finalize).toHaveBeenCalledOnce();
     expect(abort).not.toHaveBeenCalled();

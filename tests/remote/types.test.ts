@@ -5,6 +5,7 @@ import {
   RemoteRunPayloadSchema,
   RemoteRunTransactionPayloadSchema,
   RemoteTransactionSettlementResponseSchema,
+  RemoteTransactionRetryResponseSchema,
 } from "../../src/remote/types.js";
 
 const transactionToken = "a".repeat(64);
@@ -141,6 +142,50 @@ describe("remote public protocol schemas", () => {
         message: "failed",
         recoverableDisconnect: false,
         recoveryToken: transactionToken,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("correlates token-bound terminal retry outcomes with completed settlement state", () => {
+    expect(
+      RemoteTransactionRetryResponseSchema.safeParse({
+        status: "terminal",
+        transactionToken,
+        outcome: {
+          state: "finalized",
+          finalization: {
+            status: "completed",
+            runtime: { promptEpoch, cleanup: { status: "completed" } },
+          },
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      RemoteTransactionRetryResponseSchema.safeParse({
+        status: "terminal",
+        transactionToken,
+        outcome: {
+          state: "finalized",
+          finalization: {
+            status: "pending",
+            runtime: { promptEpoch, cleanup: { status: "pending" } },
+            error: "still closing",
+          },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      RemoteTransactionRetryResponseSchema.safeParse({
+        status: "terminal",
+        outcome: {
+          state: "failed",
+          error: {
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "failed",
+            recoverableDisconnect: false,
+          },
+        },
       }).success,
     ).toBe(false);
   });

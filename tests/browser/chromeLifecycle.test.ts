@@ -206,6 +206,49 @@ describe("hidden macOS Chrome launch", () => {
     expect(stableKill).toHaveBeenCalledOnce();
   });
 
+  test("publishes the requested preserve disposition on the first owner write", async () => {
+    // Dynamic imports keep this launch assertion bound to Vitest's hoisted CDP mock.
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-preserved-profile"));
+    const identity = processIdentity(
+      profile.canonicalPath,
+      4322,
+      "11111111-1111-4111-8111-111111111114",
+    );
+    const hiddenMacLaunch = vi.fn(async () =>
+      chromeLaunchResult(
+        identity,
+        vi.fn(async () => ({
+          status: "stopped" as const,
+          pid: identity.pid,
+          signal: "CONTROL_CHANNEL" as const,
+        })),
+      ),
+    );
+    const writeOwner = vi.fn(async () => undefined);
+
+    await launchChrome(
+      resolveBrowserConfig({ hideWindow: true, debugPort: 9222, keepBrowser: true }),
+      profile.canonicalPath,
+      vi.fn<(message: string) => void>(),
+      {
+        platform: "darwin",
+        resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+        hiddenMacLaunch,
+        captureProfileIdentity: async () => profile,
+        writeOwner,
+      },
+    );
+
+    expect(writeOwner).toHaveBeenCalledOnce();
+    expect(writeOwner).toHaveBeenCalledWith(profile.canonicalPath, {
+      port: 9222,
+      processIdentity: identity,
+      disposition: "preserve",
+    });
+  });
+
   test("builds an open command that is hidden, backgrounded, and isolated", async () => {
     const { buildHiddenMacChromeOpenArgs } = await import("../../src/browser/chromeLifecycle.js");
     expect(
@@ -275,6 +318,48 @@ describe("hidden macOS Chrome launch", () => {
     expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
   });
 
+  test("retries control-channel release before reporting a terminal stop", async () => {
+    // Dynamic import keeps this control assertion bound to Vitest's hoisted CDP mock.
+    const { createIdentityBoundChromeControlKillForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const identity = processIdentity(
+      path.join(os.tmpdir(), "oracle-hidden-profile"),
+      4323,
+      "11111111-1111-4111-8111-111111111115",
+    );
+    const browserClose = vi.fn(async () => undefined);
+    const clientClose = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient close failure"))
+      .mockResolvedValueOnce(undefined);
+    const inspectProcessIdentity = vi
+      .fn()
+      .mockResolvedValueOnce("current" as const)
+      .mockResolvedValueOnce("exited" as const)
+      .mockResolvedValueOnce("exited" as const);
+    const kill = createIdentityBoundChromeControlKillForTest(
+      { Browser: { close: browserClose }, close: clientClose } as never,
+      identity.profileDirectory.canonicalPath,
+      identity,
+      { inspectProcessIdentity, timeoutMs: 0 },
+    );
+
+    await expect(kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: identity.pid,
+      reason: expect.stringMatching(/release failed.*transient close failure/i),
+    });
+    await expect(kill()).resolves.toMatchObject({
+      status: "stopped",
+      pid: identity.pid,
+      signal: "CONTROL_CHANNEL",
+    });
+    await expect(kill()).resolves.toMatchObject({ status: "stopped", pid: identity.pid });
+    expect(browserClose).toHaveBeenCalledOnce();
+    expect(clientClose).toHaveBeenCalledTimes(2);
+    expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
+  });
+
   test("accepts a hidden Chrome endpoint only when macOS reports the exact listener pid", async () => {
     const { verifyListeningPortOwnedByProcessForTest } =
       await import("../../src/browser/chromeLifecycle.js");
@@ -329,8 +414,33 @@ describe("hidden macOS Chrome launch", () => {
       ),
     ).rejects.toThrow(/not bound to the captured browser process generation/i);
     expect(mismatchedClientClose).toHaveBeenCalledOnce();
+    const failedValidationClose = vi.fn(async () => {
+      throw new Error("validation client close failed");
+    });
+    await expect(
+      retainChromeEndpointAuthority(
+        {
+          host: "127.0.0.1",
+          port: 64305,
+          userDataDir: identity.profileDirectory.canonicalPath,
+          processIdentity: identity,
+        },
+        {
+          discoverEndpoint,
+          connectBrowser: vi.fn(
+            async () => ({ ...mismatchedClient, close: failedValidationClose }) as never,
+          ),
+          inspectProcessIdentity,
+          resolveListeningPid,
+        },
+      ),
+    ).rejects.toThrow(/could not be validated or released safely/i);
+    expect(failedValidationClose).toHaveBeenCalledOnce();
 
-    const exactClientClose = vi.fn(async () => undefined);
+    const exactClientClose = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient endpoint release failure"))
+      .mockResolvedValueOnce(undefined);
     const exactClient = {
       Browser: {
         getVersion: vi.fn(async () => ({})),
@@ -366,14 +476,22 @@ describe("hidden macOS Chrome launch", () => {
     if (process.platform === "darwin") {
       expect(resolveListeningPid).toHaveBeenCalledWith(64305);
     }
+    await expect(authority.release()).rejects.toThrow(/transient endpoint release failure/i);
     await expect(authority.release()).resolves.toBeUndefined();
     await expect(authority.release()).resolves.toBeUndefined();
-    expect(exactClientClose).toHaveBeenCalledOnce();
+    expect(exactClientClose).toHaveBeenCalledTimes(2);
+    await expect(authority.kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: identity.pid,
+      reason: expect.stringMatching(/already released/i),
+    });
+    expect(exactClient.Browser.close).not.toHaveBeenCalled();
   });
 });
 
 describe("stable Chrome process authority", () => {
-  test("terminates a current launch through its authenticated control channel", async () => {
+  test("carries retained endpoint release authority into a current standard launch", async () => {
+    // Dynamic imports keep this launch assertion bound to Vitest's hoisted CDP mock.
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
     const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-standard-profile"));
@@ -396,7 +514,13 @@ describe("stable Chrome process authority", () => {
       pid: identity.pid,
       signal: "CONTROL_CHANNEL" as const,
     }));
-    const retainControlChannel = vi.fn(async () => exactControlKill);
+    const endpointRelease = vi.fn(async () => undefined);
+    const retainedEndpointAuthority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/standard-launch",
+      kill: exactControlKill,
+      release: endpointRelease,
+    };
+    const retainEndpointAuthority = vi.fn(async () => retainedEndpointAuthority);
 
     const launched = await launchChrome(
       { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
@@ -408,7 +532,7 @@ describe("stable Chrome process authority", () => {
         captureProfileIdentity: async () => profile,
         captureProcessIdentity: vi.fn(async () => identity),
         inspectProcessIdentity: vi.fn(async () => "current" as const),
-        retainControlChannel,
+        retainEndpointAuthority,
         writeOwner: vi.fn(async () => undefined),
       },
     );
@@ -418,16 +542,80 @@ describe("stable Chrome process authority", () => {
       pid: identity.pid,
       signal: "CONTROL_CHANNEL",
     });
-    expect(retainControlChannel).toHaveBeenCalledWith({
+    expect(retainEndpointAuthority).toHaveBeenCalledWith({
       host: "127.0.0.1",
       port: 9222,
       userDataDir: profile.canonicalPath,
       processIdentity: identity,
     });
+    expect(launched.endpointAuthority).toMatchObject({
+      browserWSEndpoint: retainedEndpointAuthority.browserWSEndpoint,
+      release: endpointRelease,
+    });
+    expect(launched.endpointAuthority?.kill).toBe(launched.kill);
     expect(exactControlKill).toHaveBeenCalledOnce();
+    expect(endpointRelease).toHaveBeenCalledOnce();
     expect(child.signalCalls).toEqual([]);
     expect(child.kill).not.toHaveBeenCalled();
     expect(legacyPidKill).not.toHaveBeenCalled();
+  });
+
+  test("rolls back before owner publication when endpoint release authority is initially unavailable", async () => {
+    // Dynamic imports keep this launch assertion bound to Vitest's hoisted CDP mock.
+    const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+    const profile = syntheticProfileIdentity(
+      path.join(os.tmpdir(), "oracle-authority-gate-profile"),
+    );
+    const identity = processIdentity(
+      profile.canonicalPath,
+      5679,
+      "22222222-2222-4222-8222-222222222223",
+    );
+    const child = retainedChildProcess(identity.pid);
+    const standardLaunch = vi.fn(async () => ({
+      pid: identity.pid,
+      port: 9223,
+      process: child,
+      remoteDebuggingPipes: null,
+      kill: vi.fn(async () => undefined),
+    }));
+    const exactControlKill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: identity.pid,
+      signal: "CONTROL_CHANNEL" as const,
+    }));
+    const rollbackRelease = vi.fn(async () => undefined);
+    const retainEndpointAuthority = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient endpoint retention failure"))
+      .mockResolvedValueOnce({
+        browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/rollback",
+        kill: exactControlKill,
+        release: rollbackRelease,
+      });
+    const writeOwner = vi.fn(async () => undefined);
+
+    await expect(
+      launchChrome(
+        { ...resolveBrowserConfig({ debugPort: 9223 }), hideWindow: false },
+        profile.canonicalPath,
+        vi.fn<(message: string) => void>(),
+        {
+          standardLaunch: standardLaunch as never,
+          resolveLaunchRoute: resolveLocalChromeLaunchRoute,
+          captureProfileIdentity: async () => profile,
+          captureProcessIdentity: vi.fn(async () => identity),
+          inspectProcessIdentity: vi.fn(async () => "current" as const),
+          retainEndpointAuthority,
+          writeOwner,
+        },
+      ),
+    ).rejects.toThrow(/did not retain exact endpoint release authority/i);
+    expect(retainEndpointAuthority).toHaveBeenCalledTimes(2);
+    expect(exactControlKill).toHaveBeenCalledOnce();
+    expect(rollbackRelease).toHaveBeenCalledOnce();
+    expect(writeOwner).not.toHaveBeenCalled();
   });
 
   test("observes the original child exit without signaling a reused pid", async () => {
@@ -448,6 +636,34 @@ describe("stable Chrome process authority", () => {
     expect(exactControlKill).not.toHaveBeenCalled();
     expect(child.kill).not.toHaveBeenCalled();
     expect(child.signalCalls).toEqual([]);
+  });
+
+  test("retries endpoint release when the retained child has already exited", async () => {
+    // Dynamic import keeps this authority assertion bound to Vitest's hoisted CDP mock.
+    const { createEndpointBoundChildProcessChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const child = retainedChildProcess(6787);
+    const exactControlKill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: child.pid,
+      reason: "must not target an exited child",
+    }));
+    const release = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient endpoint release failure"))
+      .mockResolvedValueOnce(undefined);
+    child.markExited();
+    const kill = createEndpointBoundChildProcessChromeKill(child, exactControlKill, { release });
+
+    await expect(kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: child.pid,
+      reason: expect.stringMatching(/endpoint release failed/i),
+    });
+    await expect(kill()).resolves.toEqual({ status: "already-stopped", pid: child.pid });
+    await expect(kill()).resolves.toEqual({ status: "already-stopped", pid: child.pid });
+    expect(exactControlKill).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(2);
   });
 
   test("does not treat a retained handle without a process id as safely stopped", async () => {

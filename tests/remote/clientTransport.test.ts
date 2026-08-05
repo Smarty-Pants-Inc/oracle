@@ -89,6 +89,31 @@ function remoteRecovery(runtime: BrowserRuntimeMetadata | undefined) {
     ?.remoteRecovery;
 }
 
+function recoveryRuntime(
+  host: string,
+  transactionToken: string,
+  settlementMode?: "finalize" | "abort",
+): BrowserRuntimeMetadata {
+  return {
+    conversationId: "persisted-conversation",
+    recoveryCleanupResult: {
+      status: "pending",
+      ...(settlementMode ? { settlementMode } : {}),
+    },
+    recoveryCleanupResources: [
+      {
+        remoteRecovery: {
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          host,
+          transactionToken,
+          state: "recoverable-error",
+        },
+        recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+      },
+    ],
+  };
+}
+
 const deadlines = {
   runOverallTimeoutMs: 120,
   controlOverallTimeoutMs: 80,
@@ -473,9 +498,157 @@ describe("remote client transport deadlines", () => {
         details: {
           stage: "remote-protocol",
           code: "remote-settlement-mode-conflict",
+          recoverableDisconnect: true,
+          runtime: { recoveryCleanupResult: { settlementMode: "finalize" } },
+        },
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it.each([
+    [
+      "finalized",
+      "finalize",
+      {
+        state: "finalized",
+        finalization: { status: "completed", runtime: { cleanup: { status: "completed" } } },
+      },
+      "remote-transaction-finalized",
+    ],
+    [
+      "aborted",
+      "abort",
+      {
+        state: "aborted",
+        finalization: { status: "completed", runtime: { cleanup: { status: "completed" } } },
+      },
+      "remote-transaction-aborted",
+    ],
+    [
+      "failed",
+      undefined,
+      {
+        state: "failed",
+        error: {
+          name: "BrowserAutomationError",
+          category: "browser-automation",
+          message: "remote failure",
+          code: "remote-terminal-failure",
+          recoverableDisconnect: false,
+        },
+      },
+      "remote-terminal-failure",
+    ],
+  ] as const)(
+    "consumes a retained %s retry outcome exactly once",
+    async (_state, mode, outcome, code) => {
+      const transactionToken = "1".repeat(64);
+      let retryRequests = 0;
+      const server = http.createServer(async (req, res) => {
+        if (req.url !== `/transactions/${transactionToken}/retry`) {
+          res.statusCode = 404;
+          res.end();
+          return;
+        }
+        retryRequests += 1;
+        await readJson(req);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ status: "terminal", transactionToken, outcome }));
+      });
+      const port = await listen(server);
+      const host = `127.0.0.1:${port}`;
+      try {
+        const caught = await resumeRemoteBrowserTransaction({
+          runtime: recoveryRuntime(host, transactionToken, mode),
+          configuredHost: host,
+          authToken: "secret",
+        }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(retryRequests).toBe(1);
+        expect(caught).toMatchObject({
+          name: "BrowserAutomationError",
+          details: {
+            code,
+            recoverableDisconnect: false,
+            runtime: { conversationId: "persisted-conversation" },
+          },
+        });
+        expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResources");
+        expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResult");
+      } finally {
+        await close(server);
+      }
+    },
+  );
+
+  it("treats a pruned terminal retry as definitive and clears remote authority", async () => {
+    const transactionToken = "2".repeat(64);
+    let retryRequests = 0;
+    const server = http.createServer(async (req, res) => {
+      if (req.url === `/transactions/${transactionToken}/retry`) {
+        retryRequests += 1;
+        await readJson(req);
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    const host = `127.0.0.1:${port}`;
+    try {
+      const caught = await resumeRemoteBrowserTransaction({
+        runtime: recoveryRuntime(host, transactionToken, "abort"),
+        configuredHost: host,
+        authToken: "secret",
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(retryRequests).toBe(1);
+      expect(caught).toMatchObject({
+        details: {
+          code: "remote-transaction-not-retained",
           recoverableDisconnect: false,
         },
       });
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResources");
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResult");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("stops retrying after a server conflict while preserving exact remote authority", async () => {
+    const transactionToken = "3".repeat(64);
+    let retryRequests = 0;
+    const server = http.createServer(async (req, res) => {
+      if (req.url === `/transactions/${transactionToken}/retry`) {
+        retryRequests += 1;
+        await readJson(req);
+      }
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "transaction_settlement_conflict" }));
+    });
+    const port = await listen(server);
+    const host = `127.0.0.1:${port}`;
+    try {
+      await expect(
+        resumeRemoteBrowserTransaction({
+          runtime: recoveryRuntime(host, transactionToken, "abort"),
+          configuredHost: host,
+          authToken: "secret",
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          statusCode: 409,
+          recoverableDisconnect: true,
+          runtime: { recoveryCleanupResult: { settlementMode: "abort" } },
+        },
+      });
+      expect(retryRequests).toBe(1);
     } finally {
       await close(server);
     }

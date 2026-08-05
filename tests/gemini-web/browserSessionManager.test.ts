@@ -4,6 +4,7 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { openGeminiBrowserSession } from "../../src/gemini-web/browserSessionManager.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
+import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "../../src/browser/profileState.js";
 
 type Teardown = () => Promise<boolean>;
 
@@ -12,6 +13,7 @@ const {
   closeTab,
   acquireManualChromeOwner,
   settleManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   cleanupStaleProfileState,
@@ -31,9 +33,12 @@ const {
   closeTab: vi.fn(async () => true),
   acquireManualChromeOwner: vi.fn(),
   settleManualChromeOwner: vi.fn(),
+  releaseManualChromeOwnerEndpointAuthority: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
   retainBrowserTabLeaseTeardownAuthority: vi.fn(),
-  cleanupStaleProfileState: vi.fn(async () => true),
+  cleanupStaleProfileState: vi.fn<typeof cleanupStaleProfileStateApi>(
+    async (_profileDir, _logger, _options) => true,
+  ),
   captureProfileDirectoryIdentity: vi.fn(async (profileDir: string) => ({
     version: 1,
     platform: "darwin",
@@ -67,6 +72,7 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => ({
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
   acquireManualChromeOwner,
   settleManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
 }));
 
 vi.mock("../../src/browser/profileState.js", () => ({
@@ -126,13 +132,30 @@ describe("openGeminiBrowserSession", () => {
     closeTab.mockClear();
     acquireManualChromeOwner.mockReset();
     settleManualChromeOwner.mockReset();
+    releaseManualChromeOwnerEndpointAuthority.mockReset();
+    releaseManualChromeOwnerEndpointAuthority.mockImplementation(async (owner: ManualChromeOwner) =>
+      owner.endpointAuthority?.release(),
+    );
     settleManualChromeOwner.mockImplementation(
-      async (_profileDir: string, owner: ManualChromeOwner) => {
+      async (profileDir: string, owner: ManualChromeOwner) => {
         if (owner.disposition === "preserve") {
-          await owner.endpointAuthority?.release();
+          await releaseManualChromeOwnerEndpointAuthority(owner);
           return { status: "preserved" as const };
         }
-        return { status: "terminated" as const };
+        const outcome = await owner.chrome.kill();
+        if (!isSafeChromeTerminationOutcome(outcome)) {
+          return {
+            status: "unsafe" as const,
+            reason: "reason" in outcome ? outcome.reason : "termination failed",
+          };
+        }
+        const cleaned = await cleanupStaleProfileState(profileDir, undefined, {
+          lockRemovalMode: "never",
+          expectedProfileIdentity: owner.processIdentity.profileDirectory,
+        });
+        return cleaned
+          ? { status: "terminated" as const }
+          : { status: "unsafe" as const, reason: "profile cleanup failed" };
       },
     );
     acquireBrowserTabLease.mockReset();
@@ -209,10 +232,113 @@ describe("openGeminiBrowserSession", () => {
     expect(connectWithNewTab).toHaveBeenCalledWith(
       9222,
       expect.any(Function),
-      "about:blank",
+      expect.stringMatching(/^about:blank#oracle-acquisition=/),
       "127.0.0.1",
       { fallbackToDefault: false, retries: 6 },
     );
+  });
+
+  it("journals each acquisition intent before its effect and exact identity immediately after", async () => {
+    const events: string[] = [];
+    acquireBrowserTabLease.mockImplementationOnce(async () => {
+      events.push("acquire:tab-lease");
+      return {
+        id: "lease-ordered",
+        profileDirectory: processIdentity.profileDirectory,
+        update: leaseUpdate,
+        release: leaseRelease,
+      };
+    });
+    acquireManualChromeOwner.mockImplementationOnce(async () => {
+      events.push("acquire:chrome-process");
+      return {
+        chrome: {
+          port: 9222,
+          pid: processIdentity.pid,
+          host: "127.0.0.1",
+          processIdentity,
+          kill: ownerKill,
+        },
+        processIdentity,
+        source: "launched" as const,
+        disposition: "close-on-last-lease" as const,
+      };
+    });
+    connectWithNewTab.mockImplementationOnce(async () => {
+      events.push("acquire:chrome-target");
+      return { targetId: "target-ordered", client: { close: clientClose } };
+    });
+
+    const session = await openGeminiBrowserSession({
+      browserConfig: { manualLoginProfileDir: path.join(tempRoot, "ordered-profile") },
+      keepBrowserDefault: false,
+      purpose: "Gemini ordered acquisition",
+      persistRuntime: async (runtime) => {
+        const resource = runtime.recoveryCleanupResources?.[0];
+        const pending = resource?.acquisition?.pendingResource;
+        if (pending) {
+          events.push(`persist:intent:${pending}`);
+        } else if (resource?.chromeTargetId) {
+          events.push("persist:exact:chrome-target");
+        } else if (resource?.chromeProcessIdentity) {
+          events.push("persist:exact:chrome-process");
+        } else if (resource?.tabLease) {
+          events.push("persist:exact:tab-lease");
+        }
+      },
+    });
+
+    expect(events).toEqual([
+      "persist:intent:tab-lease",
+      "acquire:tab-lease",
+      "persist:exact:tab-lease",
+      "persist:intent:chrome-process",
+      "acquire:chrome-process",
+      "persist:exact:chrome-process",
+      "persist:intent:chrome-target",
+      "acquire:chrome-target",
+      "persist:exact:chrome-target",
+    ]);
+    await session.close();
+  });
+
+  it("does not launder a directly bound abort session into finalize", async () => {
+    const session = await openGeminiBrowserSession({
+      browserConfig: { manualLoginProfileDir: path.join(tempRoot, "bound-mode-profile") },
+      keepBrowserDefault: false,
+      purpose: "Gemini exact settlement",
+    });
+
+    await expect(session.settle("abort")).resolves.toMatchObject({ status: "completed" });
+    await expect(session.settle("finalize")).rejects.toMatchObject({
+      details: {
+        code: "browser-run-lifecycle-settlement-conflict",
+        requestedMode: "finalize",
+        boundMode: "abort",
+      },
+    });
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(ownerKill).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays completed settlement without replacing runtime authority", async () => {
+    const session = await openGeminiBrowserSession({
+      browserConfig: { manualLoginProfileDir: path.join(tempRoot, "settlement-replay-profile") },
+      keepBrowserDefault: false,
+      purpose: "Gemini settlement replay",
+    });
+    const aggregateRuntime = session.runtime();
+
+    await expect(session.settle("abort", aggregateRuntime)).resolves.toMatchObject({
+      status: "completed",
+    });
+    await expect(session.settle("abort", aggregateRuntime)).resolves.toMatchObject({
+      status: "completed",
+    });
+
+    expect(aggregateRuntime.recoveryCleanupResult).toEqual({ status: "pending" });
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(ownerKill).toHaveBeenCalledTimes(1);
   });
 
   it("releases retained endpoint authority for a preserved exact owner", async () => {
@@ -255,10 +381,36 @@ describe("openGeminiBrowserSession", () => {
 
   it("hands a launched owner off without killing it when another lease is already active", async () => {
     const profileDir = path.join(tempRoot, "shared-profile");
-    teardownSettle.mockImplementationOnce(async () => {
-      teardownState.leaseReleased = true;
-      return { status: "completed", disposition: "active-lease-handoff" };
+    const endpointRelease = vi.fn(async () => undefined);
+    acquireManualChromeOwner.mockResolvedValueOnce({
+      chrome: {
+        port: 9222,
+        pid: processIdentity.pid,
+        host: "127.0.0.1",
+        processIdentity,
+        kill: ownerKill,
+      },
+      processIdentity,
+      source: "launched",
+      disposition: "close-on-last-lease",
+      endpointAuthority: { release: endpointRelease },
     });
+    retainBrowserTabLeaseTeardownAuthority.mockImplementationOnce(
+      (
+        _profileDir: string,
+        _lease: unknown,
+        options: { onActiveLeaseHandoff?: () => Promise<void> },
+      ) => ({
+        get leaseReleased() {
+          return teardownState.leaseReleased;
+        },
+        settle: async () => {
+          teardownState.leaseReleased = true;
+          await options.onActiveLeaseHandoff?.();
+          return { status: "completed", disposition: "active-lease-handoff" };
+        },
+      }),
+    );
 
     const session = await openGeminiBrowserSession({
       browserConfig: { manualLoginProfileDir: profileDir },
@@ -269,7 +421,7 @@ describe("openGeminiBrowserSession", () => {
 
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(clientClose).toHaveBeenCalledTimes(1);
-    expect(teardownSettle).toHaveBeenCalledTimes(1);
+    expect(endpointRelease).toHaveBeenCalledTimes(1);
     expect(ownerKill).not.toHaveBeenCalled();
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
@@ -314,7 +466,7 @@ describe("openGeminiBrowserSession", () => {
       keepBrowserDefault: false,
       purpose: "Gemini Deep Think",
     });
-    await expect(session.close()).rejects.toThrow("did not settle cleanly");
+    await expect(session.close()).rejects.toThrow("cleanup remains retryable");
 
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
@@ -345,7 +497,7 @@ describe("openGeminiBrowserSession", () => {
       purpose: "Gemini Deep Think",
     });
 
-    await expect(session.close()).rejects.toThrow("did not settle cleanly");
+    await expect(session.close()).rejects.toThrow("cleanup remains retryable");
     expect(ownerKill).toHaveBeenCalledTimes(1);
     expect(session.runtime().recoveryCleanupResources?.[0]?.tabLease).toBeUndefined();
 
@@ -402,7 +554,7 @@ describe("openGeminiBrowserSession", () => {
       purpose: "Gemini Deep Think",
     });
 
-    await expect(session.close()).rejects.toThrow("did not settle cleanly");
+    await expect(session.close()).rejects.toThrow("cleanup remains retryable");
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(clientClose).not.toHaveBeenCalled();
     expect(leaseRelease).not.toHaveBeenCalled();
@@ -427,7 +579,7 @@ describe("openGeminiBrowserSession", () => {
       purpose: "Gemini Deep Think",
     });
 
-    await expect(session.close()).rejects.toThrow("did not settle cleanly");
+    await expect(session.close()).rejects.toThrow("cleanup remains retryable");
     expect(ownerKill).toHaveBeenCalledTimes(1);
     expect(cleanupStaleProfileState).toHaveBeenCalledWith(profileDir, undefined, {
       lockRemovalMode: "never",

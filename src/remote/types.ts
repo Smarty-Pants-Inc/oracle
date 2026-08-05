@@ -409,14 +409,6 @@ export const RemoteRunEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("error"), error: RemoteBrowserAutomationErrorSchema }).strict(),
 ]);
 
-export const RemoteTransactionRetryResponseSchema = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("running") }).strict(),
-  z
-    .object({ status: z.literal("transaction"), transaction: RemoteRunTransactionPayloadSchema })
-    .strict(),
-  z.object({ status: z.literal("error"), error: RemoteBrowserAutomationErrorSchema }).strict(),
-]);
-
 const RemotePendingFinalizationSchema = z
   .object({
     status: z.literal("pending"),
@@ -441,6 +433,42 @@ const RemoteCompletedFinalizationSchema = z
       .strict(),
   })
   .strict();
+const RemoteTerminalRetryOutcomeSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("finalized"),
+      finalization: RemoteCompletedFinalizationSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("aborted"),
+      finalization: RemoteCompletedFinalizationSchema,
+      error: RemoteTerminalErrorSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("failed"),
+      error: RemoteTerminalErrorSchema,
+    })
+    .strict(),
+]);
+
+export const RemoteTransactionRetryResponseSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("running") }).strict(),
+  z
+    .object({ status: z.literal("transaction"), transaction: RemoteRunTransactionPayloadSchema })
+    .strict(),
+  z.object({ status: z.literal("error"), error: RemoteBrowserAutomationErrorSchema }).strict(),
+  z
+    .object({
+      status: z.literal("terminal"),
+      transactionToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
+      outcome: RemoteTerminalRetryOutcomeSchema,
+    })
+    .strict(),
+]);
 
 export const RemoteTransactionSettlementResponseSchema = z.discriminatedUnion("state", [
   z

@@ -2,6 +2,11 @@ import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserRunTransaction } from "../browserMode.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
+  pendingBrowserCaptureCleanup,
+  projectBrowserCaptureFinalization,
+} from "../browser/runLifecycle.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import {
   type RemoteTransactionRecord,
   RemoteTransactionStore,
   RemoteTransactionTransitionError,
@@ -81,20 +86,28 @@ export class RemoteTransactionCoordinator {
       }
       return { record: binding.record, finalization: binding.finalization };
     }
-    const runtime = binding.record.runtime;
-    if (!runtime) throw new Error("Bound transaction lacks runtime authority");
+    const runtime = binding.cleanupRuntime;
+    const mode = binding.record.settlementMode;
+    if (!mode) throw new Error("Bound transaction lacks exact runtime authority");
 
     const active = this.#activeTransactions.get(params.transactionToken);
-    const finalization = active
-      ? await active[params.mode]().catch((error) =>
-          pendingFinalization(runtime, params.mode, error),
-        )
-      : await this.#retryCleanup(runtime, params.mode).catch((error) =>
-          pendingFinalization(runtime, params.mode, error),
+    const rawFinalization = active
+      ? await active[mode]().catch((error) => retryableCleanupFailure(runtime, mode, error))
+      : await this.#retryCleanup(runtime, mode).catch((error) =>
+          retryableCleanupFailure(runtime, mode, error),
         );
+    const resourceFinalization =
+      rawFinalization.status === "pending"
+        ? pendingBrowserCaptureCleanup(
+            withRemoteSettlementAuthority(rawFinalization.runtime),
+            rawFinalization.error,
+            mode,
+          )
+        : rawFinalization;
+    const finalization = projectBrowserCaptureFinalization(runtime, resourceFinalization, mode);
     const record = await this.#transactionStore.completeSettlement({
       transactionToken: params.transactionToken,
-      mode: params.mode,
+      mode,
       finalization,
     });
     if (finalization.status === "completed") {
@@ -104,18 +117,29 @@ export class RemoteTransactionCoordinator {
   }
 }
 
-function pendingFinalization(
+function withRemoteSettlementAuthority(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
+  if (runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult) return runtime;
+  return { ...runtime, recoveryCleanupResult: { status: "pending" } };
+}
+
+function retryableCleanupFailure(
   runtime: BrowserRuntimeMetadata,
   mode: "finalize" | "abort",
   error: unknown,
 ): BrowserCaptureFinalizationResult {
-  const message = error instanceof Error ? error.message : String(error);
-  return {
-    status: "pending",
-    runtime: {
-      ...runtime,
-      recoveryCleanupResult: { status: "failed", settlementMode: mode, error: message },
-    },
-    error: message,
-  };
+  if (error instanceof BrowserAutomationError) {
+    const code = error.details?.code;
+    if (
+      code === "browser-run-lifecycle-settlement-conflict" ||
+      code === "settlement-mode-conflict" ||
+      code === "remote-settlement-mode-conflict"
+    ) {
+      throw error;
+    }
+  }
+  return pendingBrowserCaptureCleanup(
+    runtime,
+    error instanceof Error ? error.message : String(error),
+    mode,
+  );
 }

@@ -1,5 +1,6 @@
 import path from "node:path";
 import type {
+  BrowserCaptureFinalizationResult,
   BrowserRunOptions,
   BrowserRunResult,
   BrowserRunTransaction,
@@ -11,9 +12,9 @@ import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
 import {
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
-  markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
-  type BrowserCaptureSettlementAdapters,
+  projectBrowserCaptureCleanupRuntime,
+  type BrowserCaptureSettlementMode,
 } from "../browser/runLifecycle.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -83,34 +84,47 @@ function combineGeminiSessionRuntime(sessions: GeminiBrowserSession[]): BrowserR
   };
 }
 
-async function settleGeminiSessions(sessions: GeminiBrowserSession[]): Promise<string | null> {
+async function settleGeminiSessions(
+  sessions: GeminiBrowserSession[],
+  mode: BrowserCaptureSettlementMode,
+  pendingRuntime: BrowserRuntimeMetadata,
+): Promise<BrowserCaptureFinalizationResult> {
+  let authoritativeRuntime = pendingRuntime;
+  const pendingResources = [] as NonNullable<BrowserRuntimeMetadata["recoveryCleanupResources"]>;
   const errors: string[] = [];
   for (const session of sessions) {
     try {
-      await session.close();
+      const result = await session.settle(mode, authoritativeRuntime);
+      authoritativeRuntime = projectBrowserCaptureCleanupRuntime(
+        authoritativeRuntime,
+        result.runtime,
+      );
+      if (result.status === "pending") {
+        errors.push(result.error);
+        pendingResources.push(...(result.runtime.recoveryCleanupResources ?? []));
+      }
     } catch (error) {
+      if (
+        error instanceof BrowserAutomationError &&
+        error.details?.code === "browser-run-lifecycle-settlement-conflict"
+      ) {
+        throw error;
+      }
       errors.push(error instanceof Error ? error.message : String(error));
+      const sessionRuntime = session.runtime();
+      authoritativeRuntime = projectBrowserCaptureCleanupRuntime(
+        authoritativeRuntime,
+        sessionRuntime,
+      );
+      pendingResources.push(...(sessionRuntime.recoveryCleanupResources ?? []));
     }
   }
-  return errors.length > 0 ? [...new Set(errors)].join("; ") : null;
-}
-
-function createGeminiSettlementAdapters(
-  sessions: GeminiBrowserSession[],
-  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
-): BrowserCaptureSettlementAdapters {
-  return {
-    ...(persistRuntime
-      ? { persistRuntime: async (runtime: BrowserRuntimeMetadata) => persistRuntime(runtime) }
-      : {}),
-    settleResources: async (mode) => {
-      const error = await settleGeminiSessions(sessions);
-      const runtime = combineGeminiSessionRuntime(sessions);
-      return error
-        ? pendingBrowserCaptureCleanup(markBrowserCaptureCleanupPending(runtime, mode), error, mode)
-        : completedBrowserCaptureCleanup(runtime);
-    },
+  if (errors.length === 0) return completedBrowserCaptureCleanup(authoritativeRuntime);
+  const retryRuntime: BrowserRuntimeMetadata = {
+    ...authoritativeRuntime,
+    ...(pendingResources.length > 0 ? { recoveryCleanupResources: pendingResources } : {}),
   };
+  return pendingBrowserCaptureCleanup(retryRuntime, [...new Set(errors)].join("; "), mode);
 }
 
 function createGeminiRunLifecycle(
@@ -118,7 +132,10 @@ function createGeminiRunLifecycle(
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
 ): BrowserRunLifecycleController {
   return new BrowserRunLifecycleController({
-    ...createGeminiSettlementAdapters(sessions, persistRuntime),
+    ...(persistRuntime
+      ? { persistRuntime: async (runtime: BrowserRuntimeMetadata) => persistRuntime(runtime) }
+      : {}),
+    settleResources: (mode, pendingRuntime) => settleGeminiSessions(sessions, mode, pendingRuntime),
     getRuntime: () => combineGeminiSessionRuntime(sessions),
   });
 }
@@ -127,17 +144,13 @@ async function throwAfterGeminiSessionCleanup(
   error: unknown,
   sessions: GeminiBrowserSession[],
 ): Promise<never> {
-  const cleanupError = await settleGeminiSessions(sessions);
-  if (!cleanupError) throw error;
+  const runtime = combineGeminiSessionRuntime(sessions);
+  const cleanup = await settleGeminiSessions(sessions, "abort", runtime);
+  if (cleanup.status === "completed") throw error;
   const message = error instanceof Error ? error.message : String(error);
-  const runtime = pendingBrowserCaptureCleanup(
-    combineGeminiSessionRuntime(sessions),
-    cleanupError,
-    "abort",
-  ).runtime;
   throw new BrowserAutomationError(
-    `${message}; Gemini browser cleanup remains retryable: ${cleanupError}`,
-    { stage: "gemini-browser-cleanup", runtime },
+    `${message}; Gemini browser cleanup remains retryable: ${cleanup.error}`,
+    { stage: "gemini-browser-cleanup", runtime: cleanup.runtime },
     error,
   );
 }
@@ -146,14 +159,24 @@ function throwAfterGeminiCookieCaptureCleanupFailure(
   error: unknown,
   session: GeminiBrowserSession,
 ): never {
-  const cleanupError = error instanceof Error ? error.message : String(error);
+  const wrappedCleanupError = error instanceof Error ? error.message : String(error);
+  const errorRuntime =
+    error instanceof BrowserAutomationError &&
+    error.details?.runtime &&
+    typeof error.details.runtime === "object" &&
+    !Array.isArray(error.details.runtime)
+      ? (error.details.runtime as BrowserRuntimeMetadata)
+      : session.runtime();
+  const authoritativeRuntime = projectBrowserCaptureCleanupRuntime(session.runtime(), errorRuntime);
+  const exactCleanupError =
+    authoritativeRuntime.recoveryCleanupResult?.error ?? wrappedCleanupError;
   const runtime = pendingBrowserCaptureCleanup(
-    combineGeminiSessionRuntime([session]),
-    cleanupError,
+    authoritativeRuntime,
+    exactCleanupError,
     "abort",
   ).runtime;
   throw new BrowserAutomationError(
-    `Gemini cookie capture succeeded but browser cleanup remains retryable: ${cleanupError}`,
+    `Gemini cookie capture succeeded but browser cleanup remains retryable: ${exactCleanupError}`,
     { stage: "gemini-browser-cleanup", runtime },
     error,
   );
@@ -223,6 +246,7 @@ const GEMINI_CDP_COOKIE_URLS = [
 
 async function loadGeminiCookiesFromCDP(
   browserConfig: BrowserRunOptions["config"],
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
   log?: BrowserLogger,
 ): Promise<GeminiCookieLoadResult> {
   const session = await openGeminiBrowserSession({
@@ -230,6 +254,7 @@ async function loadGeminiCookiesFromCDP(
     keepBrowserDefault: false,
     purpose: "Gemini manual-login cookie extraction (no keychain)",
     log,
+    persistRuntime,
   });
   let cookieMap: Record<string, string> = {};
   try {
@@ -299,6 +324,7 @@ async function runGeminiDeepThinkViaBrowser(
     keepBrowserDefault: true,
     purpose: "Gemini Deep Think",
     log,
+    ...(options.persistRuntime ? { persistRuntime: options.persistRuntime } : {}),
   });
   const lifecycle = createGeminiRunLifecycle([session], options.persistRuntime);
   lifecycle.markAcquired();
@@ -474,7 +500,10 @@ function formatGeminiCookieError(warnings: string[]): string {
 async function loadGeminiCookies(
   browserConfig: BrowserRunOptions["config"],
   log?: BrowserLogger,
-  options?: { preferManualNoKeychain?: boolean },
+  options?: {
+    preferManualNoKeychain?: boolean;
+    persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+  },
 ): Promise<GeminiCookieLoadResult> {
   const inlineResult = await loadGeminiCookiesFromInline(browserConfig, log);
   const hasInlineRequired = hasRequiredGeminiCookies(inlineResult.cookieMap);
@@ -486,7 +515,7 @@ async function loadGeminiCookies(
     Boolean(browserConfig?.manualLogin) || Boolean(options?.preferManualNoKeychain);
   if (manualNoKeychain) {
     log?.("[gemini-web] Using manual-login cookie extraction path (no keychain cookie read).");
-    const cdpResult = await loadGeminiCookiesFromCDP(browserConfig, log);
+    const cdpResult = await loadGeminiCookiesFromCDP(browserConfig, options?.persistRuntime, log);
     return {
       cookieMap: { ...cdpResult.cookieMap, ...inlineResult.cookieMap },
       warnings: [...inlineResult.warnings, ...cdpResult.warnings],
@@ -561,6 +590,7 @@ export function createGeminiWebExecutor(
         const useNoKeychainPath = Boolean(runOptions.config?.manualLogin);
         const cookieResult = await loadGeminiCookies(runOptions.config, log, {
           preferManualNoKeychain: useNoKeychainPath,
+          ...(runOptions.runtimeHintCb ? { persistRuntime: runOptions.runtimeHintCb } : {}),
         });
         if (!hasRequiredGeminiCookies(cookieResult.cookieMap)) {
           throw new Error(formatGeminiCookieError(cookieResult.warnings));

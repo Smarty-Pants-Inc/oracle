@@ -295,6 +295,53 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("rejects settlement binding that conflicts with the persisted runtime mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-runtime-mode-"));
+    const transactionToken = "6".repeat(64);
+    const abortRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+    };
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      await begin(store, transactionToken);
+      await store.publishCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime: abortRuntime,
+        artifacts: [],
+      });
+
+      await expect(
+        store.bindSettlement({
+          transactionToken,
+          mode: "finalize",
+          durablePublication: true,
+        }),
+      ).rejects.toMatchObject({ code: "transaction_settlement_conflict" });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "pending",
+        runtime: { recoveryCleanupResult: { settlementMode: "abort" } },
+      });
+      await expect(
+        store.bindSettlement({
+          transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).resolves.toMatchObject({
+        status: "bound",
+        record: {
+          settlementMode: "abort",
+          runtime: { recoveryCleanupResult: { settlementMode: "abort" } },
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an unbound capture for restart and exposes only a durably bound shutdown mode", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-store-"));
     const transactionToken = "0".repeat(64);

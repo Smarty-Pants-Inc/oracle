@@ -206,7 +206,10 @@ export async function acquireBrowserTabLease(
 export function retainBrowserTabLeaseTeardownAuthority(
   profileDir: string,
   lease: Pick<BrowserTabLease, "id" | "profileDirectory">,
-  options: BrowserLeaseLivenessDeps & { logger?: BrowserLogger } = {},
+  options: BrowserLeaseLivenessDeps & {
+    logger?: BrowserLogger;
+    onActiveLeaseHandoff?: () => Promise<void>;
+  } = {},
 ): BrowserTabLeaseTeardownAuthority {
   const authority: BrowserTabLeaseAuthority = {
     requestedPath: profileDir,
@@ -253,7 +256,19 @@ export function retainBrowserTabLeaseTeardownAuthority(
             return { status: "completed", disposition: "teardown-completed" } as const;
           }
           if (phase === "handoff-pending-confirmation") {
-            return { status: "completed", disposition: "active-lease-handoff" } as const;
+            if (active.length > 0) {
+              try {
+                await options.onActiveLeaseHandoff?.();
+                return { status: "completed", disposition: "active-lease-handoff" } as const;
+              } catch (error) {
+                return {
+                  status: "preserved",
+                  reason: "teardown-unsafe",
+                  error: error instanceof Error ? error.message : String(error),
+                } as const;
+              }
+            }
+            phase = "released";
           }
 
           const leaseWasActive = active.some((entry) => entry.id === lease.id);
@@ -265,7 +280,16 @@ export function retainBrowserTabLeaseTeardownAuthority(
             phase = "released";
             if (leaseWasActive && remaining.length > 0) {
               phase = "handoff-pending-confirmation";
-              return { status: "completed", disposition: "active-lease-handoff" } as const;
+              try {
+                await options.onActiveLeaseHandoff?.();
+                return { status: "completed", disposition: "active-lease-handoff" } as const;
+              } catch (error) {
+                return {
+                  status: "preserved",
+                  reason: "teardown-unsafe",
+                  error: error instanceof Error ? error.message : String(error),
+                } as const;
+              }
             }
           }
 
@@ -621,7 +645,6 @@ async function syncDirectory(directory: string): Promise<void> {
 }
 
 function readErrorCode(error: unknown): unknown {
-  return error && typeof error === "object" && "code" in error
-    ? (error as { code?: unknown }).code
-    : undefined;
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  return error.code;
 }

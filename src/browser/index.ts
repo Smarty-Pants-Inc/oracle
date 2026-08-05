@@ -29,6 +29,7 @@ import {
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type ManualChromeOwner,
 } from "./manualChromeOwner.js";
@@ -135,6 +136,7 @@ import {
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
+  projectBrowserRetryableCleanupRuntime as projectRetryableCleanupRuntime,
   type BrowserCaptureSettlementMode,
 } from "./runLifecycle.js";
 
@@ -1231,37 +1233,6 @@ function shouldCloseOwnedRunTargetAfterRun(options: {
   );
 }
 
-function projectRetryableCleanupRuntime(
-  runtime: BrowserRuntimeMetadata,
-  completed: { targetId?: string | null; tabLeaseId?: string | null },
-): BrowserRuntimeMetadata {
-  const targetId = completed.targetId ?? null;
-  const tabLeaseId = completed.tabLeaseId ?? null;
-  if (!targetId && !tabLeaseId) return runtime;
-  const resources = runtime.recoveryCleanupResources?.map((resource) => {
-    const targetCompleted = Boolean(targetId && resource.chromeTargetId === targetId);
-    const leaseCompleted = Boolean(tabLeaseId && resource.tabLease?.id === tabLeaseId);
-    if (!targetCompleted && !leaseCompleted) return resource;
-    return {
-      ...resource,
-      ...(targetCompleted ? { chromeTargetId: undefined } : {}),
-      ...(leaseCompleted ? { tabLease: undefined } : {}),
-      recoveryCleanup: targetCompleted
-        ? {
-            ...resource.recoveryCleanup,
-            ownsTarget: false,
-            closeOwnedTargetOnComplete: undefined,
-          }
-        : resource.recoveryCleanup,
-    };
-  });
-  return {
-    ...runtime,
-    ...(targetId && runtime.chromeTargetId === targetId ? { chromeTargetId: undefined } : {}),
-    ...(resources ? { recoveryCleanupResources: resources } : {}),
-  };
-}
-
 function shouldCleanupBlankTabsAfterLastLease(options: {
   runStatus: "attempted" | "complete";
   ownsTarget: boolean;
@@ -1626,44 +1597,91 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       acquiredChrome,
     );
   } catch (error) {
-    let tabLeaseReleaseError: unknown = null;
-    if (tabLease) {
+    const cleanupErrors: unknown[] = [];
+    if (manualLogin && acquiredChrome && tabLease) {
+      if (acquiredChrome.disposition === "close-on-last-lease") {
+        const ownerForCleanup = acquiredChrome;
+        const teardown = retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, {
+          logger,
+          onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerForCleanup),
+        });
+        let ownerError: string | null = null;
+        try {
+          const outcome = await teardown.settle(async () => {
+            const settlement = await settleManualChromeOwner(userDataDir, ownerForCleanup, logger);
+            if (settlement.status === "unsafe") {
+              ownerError = settlement.reason;
+              return false;
+            }
+            return true;
+          });
+          if (teardown.leaseReleased) tabLease = null;
+          if (outcome.status === "preserved") {
+            cleanupErrors.push(ownerError ?? outcome.error ?? outcome.reason);
+          }
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      } else {
+        const handle = tabLease;
+        try {
+          await handle.release();
+          tabLease = null;
+        } catch (releaseError) {
+          cleanupErrors.push(releaseError);
+        }
+        const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
+        if (settlement.status === "unsafe") cleanupErrors.push(settlement.reason);
+      }
+    } else if (tabLease) {
       const handle = tabLease;
       try {
         await handle.release();
         tabLease = null;
       } catch (releaseError) {
-        tabLeaseReleaseError = releaseError;
+        cleanupErrors.push(releaseError);
       }
     }
-    if (acquiredChrome) {
-      if (manualLogin) {
-        await settleManualChromeOwner(userDataDir, acquiredChrome, logger).catch(() => undefined);
+    if (acquiredChrome && !manualLogin) {
+      const termination = await acquiredChrome.chrome.kill().catch((terminationError) => ({
+        status: "unsafe" as const,
+        pid: acquiredChrome?.chrome.pid ?? -1,
+        reason:
+          terminationError instanceof Error ? terminationError.message : String(terminationError),
+      }));
+      if (isSafeChromeTerminationOutcome(termination)) {
+        const removed = await removeProfileDirectoryIfIdentityMatches(
+          userDataDir,
+          acquiredChrome.processIdentity.profileDirectory,
+        ).catch(() => false);
+        if (!removed) cleanupErrors.push(`Profile removal was not confirmed: ${userDataDir}`);
       } else {
-        const termination = await acquiredChrome.chrome.kill().catch((terminationError) => ({
-          status: "unsafe" as const,
-          pid: acquiredChrome?.chrome.pid ?? -1,
-          reason:
-            terminationError instanceof Error ? terminationError.message : String(terminationError),
-        }));
-        if (isSafeChromeTerminationOutcome(termination)) {
-          await removeProfileDirectoryIfIdentityMatches(
-            userDataDir,
-            acquiredChrome.processIdentity.profileDirectory,
-          ).catch(() => false);
-        } else {
-          logger(
-            `[browser] Chrome acquisition cleanup was not safely confirmed; preserving ${userDataDir}: ${termination.reason}`,
-          );
-        }
+        cleanupErrors.push(termination.reason);
       }
-    } else if (usingCopiedProfile) {
-      logger(
-        `[browser] Copy-profile acquisition failed without a confirmed safe Chrome termination outcome; preserving ${userDataDir}.`,
+    } else if (!acquiredChrome && usingCopiedProfile) {
+      cleanupErrors.push(
+        `Copy-profile acquisition failed without a confirmed safe Chrome termination outcome; preserving ${userDataDir}`,
       );
     }
-    if (tabLeaseReleaseError) {
-      throw localAcquisitionLeaseCleanupPendingError(error, tabLeaseReleaseError);
+    if (cleanupErrors.length > 0) {
+      const cleanupMessage = cleanupErrors
+        .map((cleanupError) =>
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        )
+        .join("; ");
+      const runtime = pendingBrowserCaptureCleanup(
+        buildLocalAcquisitionRuntime(
+          config.browserTabRef ? "chrome-process" : "chrome-target",
+          acquiredChrome,
+        ),
+        cleanupMessage,
+        "abort",
+      ).runtime;
+      throw new BrowserAutomationError(
+        `${error instanceof Error ? error.message : String(error)}; local browser acquisition cleanup remains retryable: ${cleanupMessage}`,
+        { stage: "browser-acquisition", runtime },
+        new AggregateError([error, ...cleanupErrors], "Local browser acquisition cleanup failed"),
+      );
     }
     throw error;
   }
@@ -1685,7 +1703,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   }
   const manualLeaseTeardownAuthority =
     manualLogin && tabLease
-      ? retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, { logger })
+      ? retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, {
+          logger,
+          onActiveLeaseHandoff: () =>
+            releaseManualChromeOwnerEndpointAuthority(acquiredChromeOwner),
+        })
       : null;
   const buildLocalRuntimeBase = (tabUrl = lastUrl): BrowserRuntimeMetadata => ({
     chromePid: chrome.pid,
@@ -1817,9 +1839,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const targetCleanupCompleted = Boolean(targetId && closedOwnedTargetId === targetId);
     const shouldCloseOwnedRunTarget =
       !targetCleanupCompleted &&
-      (aborting
-        ? pendingOwnsTarget && manualLogin
-        : pendingOwnsTarget && finalizeTargetCloseDecision === true);
+      pendingOwnsTarget &&
+      (aborting || finalizeTargetCloseDecision === true);
     let keepBrowserOpen = aborting
       ? manualLogin && (effectiveKeepBrowser || chromeOwnerDisposition === "preserve")
       : shouldKeepLocalBrowserOpen({
@@ -3321,12 +3342,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
     }
     preserveBrowserOnError = assessment.recoverable;
+    const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
+    if (assessment.recoverable) {
+      lifecycle.publishRecovery(buildLocalRuntimeBase(tabUrl));
+    }
     await emitRuntimeHint();
     const connectionLostDetails =
       normalizedError instanceof BrowserAutomationError
         ? (normalizedError.details as RecoverableDisconnectDetails | undefined)
         : undefined;
-    const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
     throw rememberEscapingFailure(
       new BrowserAutomationError(
         connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
@@ -4708,8 +4732,11 @@ async function runRemoteBrowserMode(
 
     const assessment = await getDisconnectAssessment();
     preserveBrowserOnError = assessment.recoverable;
-    await emitRuntimeHint();
     const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
+    if (assessment.recoverable) {
+      lifecycle.publishRecovery(buildRemoteRuntimeBase(tabUrl));
+    }
+    await emitRuntimeHint();
     throw rememberRemoteEscapingFailure(
       new BrowserAutomationError(
         connectionLostMessage({ assessment, remote: true }),

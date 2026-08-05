@@ -374,7 +374,7 @@ describe("BrowserRunLifecycleController", () => {
     expect(settleResources).not.toHaveBeenCalled();
   });
 
-  test("binds thrown unpublished cleanup failure to finalize", async () => {
+  test("binds thrown unpublished cleanup failure to abort", async () => {
     const settleResources = vi.fn(async () => {
       throw new Error("profile removal was not confirmed");
     });
@@ -387,9 +387,9 @@ describe("BrowserRunLifecycleController", () => {
     const result = await lifecycle.settleIfUnpublished();
 
     expect(settleResources).toHaveBeenCalledWith(
-      "finalize",
+      "abort",
       expect.objectContaining({
-        recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
       }),
     );
     expect(result).toMatchObject({
@@ -399,7 +399,7 @@ describe("BrowserRunLifecycleController", () => {
         recoveryCleanupResult: {
           status: "failed",
           error: "profile removal was not confirmed",
-          settlementMode: "finalize",
+          settlementMode: "abort",
         },
       },
     });

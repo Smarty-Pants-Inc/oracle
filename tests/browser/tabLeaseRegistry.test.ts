@@ -540,6 +540,89 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
       }
     },
   );
+  test("retries active-lease handoff cleanup before completing authority transfer", async () => {
+    const dir = await makeTempDir("oracle-tab-lease-handoff-retry-");
+    try {
+      const first = await acquireBrowserTabLease(dir, {
+        maxConcurrentTabs: 2,
+        timeoutMs: 500,
+        sessionId: "handoff-first",
+      });
+      const second = await acquireBrowserTabLease(dir, {
+        maxConcurrentTabs: 2,
+        timeoutMs: 500,
+        sessionId: "handoff-second",
+      });
+      const handoff = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("transient endpoint release failure"))
+        .mockResolvedValueOnce(undefined);
+      const teardown = vi.fn(async () => true);
+      const authority = retainBrowserTabLeaseTeardownAuthority(dir, first, {
+        onActiveLeaseHandoff: handoff,
+      });
+
+      await expect(authority.settle(teardown)).resolves.toEqual({
+        status: "preserved",
+        reason: "teardown-unsafe",
+        error: "transient endpoint release failure",
+      });
+      expect(authority.leaseReleased).toBe(true);
+      expect(
+        JSON.parse(await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8")),
+      ).toMatchObject({ leases: [expect.objectContaining({ id: second.id })] });
+
+      await expect(authority.settle(teardown)).resolves.toEqual({
+        status: "completed",
+        disposition: "active-lease-handoff",
+      });
+      await expect(authority.settle(teardown)).resolves.toEqual({
+        status: "completed",
+        disposition: "active-lease-handoff",
+      });
+      expect(handoff).toHaveBeenCalledTimes(2);
+      expect(teardown).not.toHaveBeenCalled();
+      await second.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims last-lease teardown when a failed handoff target disappears before retry", async () => {
+    const dir = await makeTempDir("oracle-tab-lease-handoff-vanished-");
+    try {
+      const first = await acquireBrowserTabLease(dir, {
+        maxConcurrentTabs: 2,
+        timeoutMs: 500,
+      });
+      const second = await acquireBrowserTabLease(dir, {
+        maxConcurrentTabs: 2,
+        timeoutMs: 500,
+      });
+      const handoff = vi.fn(async () => {
+        throw new Error("transient endpoint release failure");
+      });
+      const teardown = vi.fn(async () => true);
+      const authority = retainBrowserTabLeaseTeardownAuthority(dir, first, {
+        onActiveLeaseHandoff: handoff,
+      });
+
+      await expect(authority.settle(teardown)).resolves.toMatchObject({
+        status: "preserved",
+        reason: "teardown-unsafe",
+      });
+      await second.release();
+      await expect(authority.settle(teardown)).resolves.toEqual({
+        status: "completed",
+        disposition: "teardown-completed",
+      });
+      expect(handoff).toHaveBeenCalledOnce();
+      expect(teardown).toHaveBeenCalledOnce();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("keeps profile cleanup lease-gated until exact Chrome generation exit is proven", async () => {
     const dir = await makeTempDir("oracle-tab-lease-exact-exit-");
     try {

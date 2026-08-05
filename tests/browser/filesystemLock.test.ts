@@ -24,6 +24,10 @@ import type {
   FilesystemLockProcessIdentityProvider,
   ProcessLiveness,
 } from "../../src/browser/filesystemLock.js";
+import {
+  retryPendingFilesystemLockReleases,
+  __test__ as releaseJournalTest,
+} from "../../src/browser/filesystemLockReleaseJournal.js";
 
 async function agePath(targetPath: string, ageMs = 10_000): Promise<void> {
   const timestamp = new Date(Date.now() - ageMs);
@@ -336,7 +340,7 @@ describe("crash-recoverable filesystem lock", () => {
 
       resumeBlocker();
       await expect(blocker).rejects.toThrow("cancel stalled mutation");
-      await expect(original.release()).resolves.toBeUndefined();
+      await expect(retryPendingFilesystemLockReleases(lockPath)).resolves.toBeUndefined();
     } finally {
       resumeBlocker();
       await blocker.catch(() => undefined);
@@ -344,6 +348,35 @@ describe("crash-recoverable filesystem lock", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 10_000);
+
+  test("adopts the exact current controller generation on the first retry after restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-restart-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const provider = createProcessIdentityProvider(40_043, async () => "controller-start");
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      { sessionId: "browser-recovery:test-generation" },
+      { processIdentityProvider: provider, randomUUID: () => "original-owner" },
+    );
+
+    try {
+      releaseJournalTest.clearRetainedFilesystemLockReleases();
+      const adopted = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {
+          sessionId: "browser-recovery:test-generation",
+          adoptCurrentProcessGeneration: true,
+        },
+        { processIdentityProvider: provider, randomUUID: () => "replacement-owner" },
+      );
+
+      expect(adopted.owner).toEqual(original.owner);
+      await adopted.release();
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("post-isolation cleanup failure hides mutation authority and retries one private root", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-release-"));

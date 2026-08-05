@@ -2534,6 +2534,55 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(failed).not.toHaveProperty("requestIdentity");
         expect(failed).not.toHaveProperty("browserConfig");
         expect(await store.read(finalizeToken)).toMatchObject({ state: "finalized" });
+
+        const abortRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${abortToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(abortRetry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "terminal",
+            transactionToken: abortToken,
+            outcome: { state: "aborted", finalization: { status: "completed" } },
+          },
+        });
+        const finalizeRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${finalizeToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(finalizeRetry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "terminal",
+            transactionToken: finalizeToken,
+            outcome: { state: "finalized", finalization: { status: "completed" } },
+          },
+        });
+        const failedRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${preAuthorityToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(failedRetry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "terminal",
+            transactionToken: preAuthorityToken,
+            outcome: { state: "failed", error: { recoverableDisconnect: false } },
+          },
+        });
+        expect(JSON.stringify([abortRetry.json, finalizeRetry.json, failedRetry.json])).not.toMatch(
+          /target-|requestIdentity|browserConfig|leaseExpiresAt/u,
+        );
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -2604,6 +2653,27 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             settlementMode: "abort",
             finalization: { status: "pending" },
           });
+          const retryResponse = await httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "secret",
+            body: {},
+          });
+          expect(retryResponse).toMatchObject({
+            statusCode: 200,
+            json: {
+              status: "error",
+              error: {
+                code: "remote-settlement-pending",
+                recoverableDisconnect: true,
+                recoveryToken: transactionToken,
+                settlementMode: "abort",
+                runtime: { cleanup: { status: "pending" } },
+              },
+            },
+          });
+          expect(JSON.stringify(retryResponse.json)).not.toMatch(/target-|chromePort|chromeHost/u);
 
           await server.close();
           const attemptsAfterClose = retryCleanup.mock.calls.length;

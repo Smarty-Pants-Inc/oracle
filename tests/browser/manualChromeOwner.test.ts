@@ -5,6 +5,7 @@ import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import {
   acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type BrowserChrome,
   type ManualChromeOwner,
@@ -70,11 +71,13 @@ function launchedChrome(
   pid: number,
   port: number,
   processIdentity: ChromeProcessIdentity,
+  endpointAuthority?: RetainedChromeEndpointAuthority,
 ): BrowserChrome {
   return {
     pid,
     port,
     processIdentity,
+    endpointAuthority,
     kill: vi.fn(async () => ({ status: "stopped", pid, signal: "SIGTERM" }) as const),
     process: undefined,
   } as unknown as BrowserChrome;
@@ -466,6 +469,53 @@ describe("manual Chrome owner acquisition", () => {
     }
   });
 
+  test.each(["termination-unsafe", "cleanup-unconfirmed"] as const)(
+    "surfaces %s during failed owner publication rollback",
+    async (failureMode) => {
+      const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-rollback-failure-"));
+      try {
+        const identity = await chromeIdentity(
+          profileDir,
+          43_224,
+          "00000000-0000-4000-8000-000000000016",
+        );
+        const chrome = launchedChrome(identity.pid, 45_692, identity);
+        if (failureMode === "termination-unsafe") {
+          vi.mocked(chrome.kill).mockResolvedValue({
+            status: "unsafe",
+            pid: identity.pid,
+            reason: "exact endpoint teardown unavailable",
+          });
+        }
+        const cleanupProfileState = vi.fn(async () => false);
+
+        await expect(
+          acquireManualChromeOwner(
+            profileDir,
+            resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
+            logger,
+            `owner-rollback-${failureMode}`,
+            {
+              cleanupProfileState,
+              discoverExactProfileChrome: vi.fn(async () => null),
+              launch: vi.fn(async () => chrome),
+              readOwner: vi.fn(async () => null),
+              writeOwner: vi.fn(async () => {
+                throw new Error("atomic owner write failed");
+              }),
+            },
+          ),
+        ).rejects.toThrow(/rollback did not settle safely/i);
+        expect(chrome.kill).toHaveBeenCalledOnce();
+        expect(cleanupProfileState).toHaveBeenCalledTimes(
+          failureMode === "cleanup-unconfirmed" ? 1 : 0,
+        );
+      } finally {
+        await fs.rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("blocks instead of launching when a reachable endpoint lacks exact profile ownership", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-unverified-owner-"));
     try {
@@ -600,6 +650,11 @@ describe("manual Chrome owner settlement", () => {
           "00000000-0000-4000-8000-000000000007",
         );
         const chrome = launchedChrome(identity.pid, 45_684, identity);
+        await writeOracleChromeOwner(profileDir, {
+          port: chrome.port,
+          processIdentity: identity,
+          disposition,
+        });
         const cleanupProfileState = vi.fn(async () => true);
         const endpointAuthority = retainedEndpointAuthority(identity, 45_684);
         const owner: ManualChromeOwner = {
@@ -622,6 +677,225 @@ describe("manual Chrome owner settlement", () => {
     },
   );
 
+  test("uses the canonical close disposition instead of a stale retained preserve policy", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-canonical-close-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_221,
+        "00000000-0000-4000-8000-000000000012",
+      );
+      const chrome = launchedChrome(identity.pid, 45_689, identity);
+      const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+      await writeOracleChromeOwner(profileDir, {
+        port: chrome.port,
+        processIdentity: identity,
+        disposition: "close-on-last-lease",
+      });
+      const cleanupProfileState = vi.fn(async () => true);
+
+      await expect(
+        settleManualChromeOwner(
+          profileDir,
+          {
+            chrome,
+            processIdentity: identity,
+            source: "recorded",
+            disposition: "preserve",
+            endpointAuthority,
+          },
+          logger,
+          { cleanupProfileState },
+        ),
+      ).resolves.toEqual({ status: "terminated" });
+      expect(chrome.kill).toHaveBeenCalledOnce();
+      expect(cleanupProfileState).toHaveBeenCalledOnce();
+      expect(endpointAuthority.release).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a failed preserve release without losing exact endpoint authority", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-release-retry-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_222,
+        "00000000-0000-4000-8000-000000000013",
+      );
+      const chrome = launchedChrome(identity.pid, 45_690, identity);
+      const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+      vi.mocked(endpointAuthority.release)
+        .mockRejectedValueOnce(new Error("transient endpoint release failure"))
+        .mockResolvedValueOnce(undefined);
+      await writeOracleChromeOwner(profileDir, {
+        port: chrome.port,
+        processIdentity: identity,
+        disposition: "preserve",
+      });
+      const owner: ManualChromeOwner = {
+        chrome,
+        processIdentity: identity,
+        source: "recorded",
+        disposition: "preserve",
+        endpointAuthority,
+      };
+      const cleanupProfileState = vi.fn(async () => true);
+
+      await expect(
+        settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+      ).resolves.toMatchObject({
+        status: "unsafe",
+        reason: expect.stringMatching(/transient endpoint release failure/i),
+      });
+      await expect(
+        settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+      ).resolves.toEqual({ status: "preserved" });
+      expect(endpointAuthority.release).toHaveBeenCalledTimes(2);
+      expect(chrome.kill).not.toHaveBeenCalled();
+      expect(cleanupProfileState).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns retryable unsafe settlement when post-termination profile cleanup throws", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-cleanup-retry-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_223,
+        "00000000-0000-4000-8000-000000000014",
+      );
+      const chrome = launchedChrome(identity.pid, 45_691, identity);
+      const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+      await writeOracleChromeOwner(profileDir, {
+        port: chrome.port,
+        processIdentity: identity,
+        disposition: "close-on-last-lease",
+      });
+      const cleanupProfileState = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("transient profile cleanup failure"))
+        .mockResolvedValueOnce(true);
+      const owner: ManualChromeOwner = {
+        chrome,
+        processIdentity: identity,
+        source: "launched",
+        disposition: "close-on-last-lease",
+        endpointAuthority,
+      };
+
+      await expect(
+        settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+      ).resolves.toMatchObject({
+        status: "unsafe",
+        reason: expect.stringMatching(/transient profile cleanup failure/i),
+      });
+      await expect(
+        settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+      ).resolves.toEqual({ status: "terminated" });
+      expect(chrome.kill).toHaveBeenCalledTimes(2);
+      expect(cleanupProfileState).toHaveBeenCalledTimes(2);
+      expect(endpointAuthority.release).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["missing", "legacy", "current-preserve"] as const)(
+    "never closes through a stale retained policy when canonical authority is %s",
+    async (canonicalState) => {
+      const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-policy-"));
+      try {
+        const identity = await chromeIdentity(
+          profileDir,
+          43_219,
+          "00000000-0000-4000-8000-000000000010",
+        );
+        const chrome = launchedChrome(identity.pid, 45_687, identity);
+        const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+        if (canonicalState === "legacy") {
+          await fs.writeFile(
+            path.join(profileDir, "oracle-chrome-owner.json"),
+            `${JSON.stringify({ port: chrome.port, processIdentity: identity })}\n`,
+            "utf8",
+          );
+        } else if (canonicalState === "current-preserve") {
+          await writeOracleChromeOwner(profileDir, {
+            port: chrome.port,
+            processIdentity: identity,
+            disposition: "preserve",
+          });
+        }
+        const cleanupProfileState = vi.fn(async () => true);
+        const owner: ManualChromeOwner = {
+          chrome,
+          processIdentity: identity,
+          source: "launched",
+          disposition: "close-on-last-lease",
+          endpointAuthority,
+        };
+
+        await expect(
+          settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
+        ).resolves.toEqual({ status: "preserved" });
+        expect(chrome.kill).not.toHaveBeenCalled();
+        expect(cleanupProfileState).not.toHaveBeenCalled();
+        expect(endpointAuthority.release).toHaveBeenCalledOnce();
+      } finally {
+        await fs.rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["mismatch", "unreadable"] as const)(
+    "keeps exact close authority pending when canonical owner state is %s",
+    async (canonicalState) => {
+      const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-pending-"));
+      try {
+        const identity = await chromeIdentity(
+          profileDir,
+          43_220,
+          "00000000-0000-4000-8000-000000000011",
+        );
+        const chrome = launchedChrome(identity.pid, 45_688, identity);
+        const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+        if (canonicalState === "mismatch") {
+          await writeOracleChromeOwner(profileDir, {
+            port: chrome.port + 1,
+            processIdentity: identity,
+            disposition: "close-on-last-lease",
+          });
+        } else {
+          await fs.writeFile(path.join(profileDir, "oracle-chrome-owner.json"), "{", "utf8");
+        }
+        const cleanupProfileState = vi.fn(async () => true);
+
+        await expect(
+          settleManualChromeOwner(
+            profileDir,
+            {
+              chrome,
+              processIdentity: identity,
+              source: "recorded",
+              disposition: "close-on-last-lease",
+              endpointAuthority,
+            },
+            logger,
+            { cleanupProfileState },
+          ),
+        ).resolves.toMatchObject({ status: "unsafe" });
+        expect(chrome.kill).not.toHaveBeenCalled();
+        expect(cleanupProfileState).not.toHaveBeenCalled();
+        expect(endpointAuthority.release).not.toHaveBeenCalled();
+      } finally {
+        await fs.rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("hands a close-on-last-lease owner from launch to exact reuse before one final kill", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-handoff-"));
     try {
@@ -630,7 +904,9 @@ describe("manual Chrome owner settlement", () => {
         43_218,
         "00000000-0000-4000-8000-000000000009",
       );
-      const launched = launchedChrome(identity.pid, 45_686, identity);
+      const launchedAuthority = retainedEndpointAuthority(identity, 45_686);
+      const reusedAuthority = retainedEndpointAuthority(identity, 45_686);
+      const launched = launchedChrome(identity.pid, 45_686, identity, launchedAuthority);
       const config = resolveBrowserConfig({
         manualLogin: true,
         manualLoginProfileDir: profileDir,
@@ -645,7 +921,6 @@ describe("manual Chrome owner settlement", () => {
         maxConcurrentTabs: 2,
         sessionId: "run-b",
       });
-      const endpointAuthority = retainedEndpointAuthority(identity, 45_686);
       const acquireDeps = {
         discoverExactProfileChrome: vi.fn(async () => null),
         launch: vi.fn(async () => launched),
@@ -660,14 +935,16 @@ describe("manual Chrome owner settlement", () => {
       );
       const ownerB = await acquireManualChromeOwner(profileDir, config, logger, "run-b", {
         ...acquireDeps,
-        retainEndpointAuthority: vi.fn(async () => endpointAuthority),
+        retainEndpointAuthority: vi.fn(async () => reusedAuthority),
       });
       expect(ownerA.source).toBe("launched");
       expect(ownerB.source).toBe("recorded");
       expect(ownerA.disposition).toBe("close-on-last-lease");
       expect(ownerB.disposition).toBe("close-on-last-lease");
 
-      const firstAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease);
+      const firstAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease, {
+        onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerA),
+      });
       const secondAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, secondLease);
       const firstTeardown = vi.fn(async () => true);
       await expect(firstAuthority.settle(firstTeardown)).resolves.toEqual({
@@ -676,7 +953,10 @@ describe("manual Chrome owner settlement", () => {
       });
       expect(firstTeardown).not.toHaveBeenCalled();
       expect(launched.kill).not.toHaveBeenCalled();
-      expect(endpointAuthority.kill).not.toHaveBeenCalled();
+      expect(launchedAuthority.kill).not.toHaveBeenCalled();
+      expect(launchedAuthority.release).toHaveBeenCalledOnce();
+      expect(reusedAuthority.kill).not.toHaveBeenCalled();
+      expect(reusedAuthority.release).not.toHaveBeenCalled();
 
       const cleanupProfileState = vi.fn(async () => true);
       const finalTeardown = vi.fn(async () => {
@@ -691,7 +971,8 @@ describe("manual Chrome owner settlement", () => {
       });
       expect(finalTeardown).toHaveBeenCalledOnce();
       expect(launched.kill).not.toHaveBeenCalled();
-      expect(endpointAuthority.kill).toHaveBeenCalledOnce();
+      expect(reusedAuthority.kill).toHaveBeenCalledOnce();
+      expect(launchedAuthority.kill).not.toHaveBeenCalled();
       expect(cleanupProfileState).toHaveBeenCalledOnce();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
@@ -707,6 +988,11 @@ describe("manual Chrome owner settlement", () => {
         "00000000-0000-4000-8000-000000000008",
       );
       const chrome = launchedChrome(identity.pid, 45_685, identity);
+      await writeOracleChromeOwner(profileDir, {
+        port: chrome.port,
+        processIdentity: identity,
+        disposition: "close-on-last-lease",
+      });
       vi.mocked(chrome.kill).mockResolvedValue({
         status: "unsafe",
         pid: identity.pid,

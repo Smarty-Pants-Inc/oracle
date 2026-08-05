@@ -17,7 +17,7 @@ function runtimeFromError(error: unknown): BrowserRuntimeMetadata {
 }
 
 describe("remote browser unpublished cleanup", () => {
-  test("surfaces finalize-bound target and lease cleanup authority and retries it", async () => {
+  test("surfaces abort-bound target and lease cleanup authority and retries it", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-cleanup-retry-"));
     const originalFailure = new Error("remote navigation failed before publication");
     const closeChromeTarget = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
@@ -102,7 +102,7 @@ describe("remote browser unpublished cleanup", () => {
             recoveryCleanupResult: {
               status: "failed",
               error: "Remote Chrome target close was not confirmed",
-              settlementMode: "finalize",
+              settlementMode: "abort",
             },
             recoveryCleanupResources: [
               expect.objectContaining({

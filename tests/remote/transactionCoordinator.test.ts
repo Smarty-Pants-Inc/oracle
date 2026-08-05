@@ -177,6 +177,48 @@ describe("RemoteTransactionCoordinator", () => {
     }
   });
 
+  test("rejects a cleanup result that attempts to replace the bound settlement mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-result-mode-"));
+    const transactionToken = "d".repeat(64);
+    const conflictingRuntime: BrowserRunTransaction["runtime"] = {
+      ...runtime,
+      recoveryCleanupResult: { status: "failed", settlementMode: "abort", error: "wrong mode" },
+    };
+    try {
+      const store = await createPendingStore(root, transactionToken);
+      const finalize = vi.fn(async () => ({
+        status: "pending" as const,
+        runtime: conflictingRuntime,
+        error: "wrong mode",
+      }));
+      const coordinator = new RemoteTransactionCoordinator({
+        transactionStore: store,
+        retryCleanup: vi.fn(async () => ({ status: "completed" as const, runtime })),
+      });
+      coordinator.registerActive(transactionToken, {
+        ...capturedResult,
+        runtime,
+        finalize,
+        abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
+      });
+
+      await expect(
+        coordinator.settle({ transactionToken, mode: "finalize", durablePublication: true }),
+      ).rejects.toMatchObject({
+        details: { code: "browser-run-lifecycle-settlement-conflict" },
+      });
+      expect(finalize).toHaveBeenCalledOnce();
+      expect(coordinator.hasActive(transactionToken)).toBe(true);
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "pending",
+        settlementMode: "finalize",
+        runtime: { recoveryCleanupResult: { settlementMode: "finalize" } },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not invoke browser finalization until required artifact receipts are durable", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-required-artifact-"));
     const transactionToken = "f".repeat(64);
