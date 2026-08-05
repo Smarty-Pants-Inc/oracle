@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { readProcessStartIdentity } from "../../src/browser/filesystemLock.js";
+import { isSafeChromeTerminationOutcome } from "../../src/browser/profileState.js";
+import { createStableChildProcessChromeKill } from "../../src/browser/chromeLifecycle.js";
 import type * as FilesystemLockModule from "../../src/browser/filesystemLock.js";
 import {
   acquireBrowserTabLease,
@@ -24,7 +26,7 @@ function makeTempDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(CANONICAL_TEMP_ROOT, prefix));
 }
 
-describe("tabLeaseRegistry", () => {
+describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
   test("normalizes the concurrent tab limit", () => {
     expect(normalizeMaxConcurrentTabs(undefined)).toBe(3);
     expect(normalizeMaxConcurrentTabs("4")).toBe(4);
@@ -538,6 +540,64 @@ describe("tabLeaseRegistry", () => {
       }
     },
   );
+  test("keeps profile cleanup lease-gated until exact Chrome generation exit is proven", async () => {
+    const dir = await makeTempDir("oracle-tab-lease-exact-exit-");
+    try {
+      const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease);
+      const exactControlKill = vi
+        .fn()
+        .mockResolvedValueOnce({
+          status: "unsafe" as const,
+          pid: 7890,
+          reason: "exact Chrome generation remained alive",
+        })
+        .mockResolvedValueOnce({
+          status: "stopped" as const,
+          pid: 7890,
+          signal: "CONTROL_CHANNEL" as const,
+        });
+      const kill = createStableChildProcessChromeKill(
+        {
+          pid: 7890,
+          exitCode: null,
+          signalCode: null,
+        },
+        exactControlKill,
+      );
+      const cleanupProfile = vi.fn(async () => undefined);
+      const teardown = async () => {
+        const termination = await kill();
+        if (!isSafeChromeTerminationOutcome(termination)) return false;
+        await cleanupProfile();
+        return true;
+      };
+
+      await expect(teardownAuthority.settle(teardown)).resolves.toEqual({
+        status: "preserved",
+        reason: "teardown-unsafe",
+      });
+      expect(teardownAuthority.leaseReleased).toBe(true);
+      expect(cleanupProfile).not.toHaveBeenCalled();
+      expect(exactControlKill).toHaveBeenCalledOnce();
+      expect(
+        JSON.parse(await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8")),
+      ).toMatchObject({ leases: [] });
+
+      await expect(teardownAuthority.settle(teardown)).resolves.toEqual({
+        status: "completed",
+        disposition: "teardown-completed",
+      });
+      await expect(teardownAuthority.settle(teardown)).resolves.toEqual({
+        status: "completed",
+        disposition: "teardown-completed",
+      });
+      expect(cleanupProfile).toHaveBeenCalledOnce();
+      expect(exactControlKill).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("retains failed teardown authority when another lease appears before retry", async () => {
     const dir = await makeTempDir("oracle-tab-lease-teardown-race-");

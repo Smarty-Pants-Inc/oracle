@@ -4,16 +4,18 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile, readFile, stat } from "node:fs/promises";
+import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   createRemoteBrowserExecutor,
+  resumeRemoteBrowserTransaction,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
+  buildRemotePromptRequestIdentity,
   MAX_REMOTE_ARTIFACT_BYTES,
   MAX_REMOTE_ATTACHMENT_BYTES,
   MAX_REMOTE_ATTACHMENTS,
@@ -22,6 +24,7 @@ import {
   MAX_REMOTE_TOTAL_ATTACHMENT_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   type RemoteArtifactDescriptor,
+  type RemoteRunPayload,
 } from "../../src/remote/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
@@ -29,6 +32,7 @@ import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.j
 import {
   captureProfileDirectoryIdentity,
   readOracleChromeOwner,
+  sameProfileDirectoryIdentity,
   writeOracleChromeOwner,
 } from "../../src/browser/profileState.js";
 
@@ -92,21 +96,7 @@ function browserTransaction(
   };
 }
 
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-describe("remote browser service", () => {
+describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "streams logs and returns results via client executor",
     async () => {
@@ -734,8 +724,8 @@ describe("remote browser service", () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-disconnect-test-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
-      const runStarted = createDeferred<void>();
-      const continueRun = createDeferred<void>();
+      const runStarted = Promise.withResolvers<void>();
+      const continueRun = Promise.withResolvers<void>();
       const runtime: BrowserRunTransaction["runtime"] = {
         chromePort: 9222,
         chromeTargetId: "disconnect-target",
@@ -834,6 +824,205 @@ describe("remote browser service", () => {
       }
     },
     15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "preserves an unacknowledged artifact capture across graceful restart and resumes delivery",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-handoff-"));
+      const oracleHome = path.join(tmpDir, "oracle-home");
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const hostArtifactPath = path.join(
+        oracleHome,
+        "sessions",
+        "host-session",
+        "artifacts",
+        "handoff-result.zip",
+      );
+      const emptyZip = Buffer.from([
+        0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      ]);
+      const payload = remoteRunPayload();
+      const requestIdentity = buildRemotePromptRequestIdentity(payload);
+      const transactionToken = "4".repeat(64);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "shutdown-handoff-target",
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "shutdown-handoff-target",
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      let first: RemoteServerInstance | undefined;
+      let restarted: RemoteServerInstance | undefined;
+      setOracleHomeDirOverrideForTest(oracleHome);
+
+      try {
+        await mkdir(path.dirname(hostArtifactPath), { recursive: true });
+        await writeFile(hostArtifactPath, emptyZip);
+        first = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+          {
+            transactionStoreDir,
+            controllerGeneration: "controller-before-graceful-shutdown",
+            runBrowser: async (options) =>
+              browserTransaction(
+                options.prompt,
+                {
+                  answerText: "restart-safe answer",
+                  answerMarkdown: "restart-safe answer",
+                  tookMs: 1,
+                  answerTokens: 2,
+                  answerChars: 19,
+                  savedFiles: [
+                    {
+                      kind: "file",
+                      path: hostArtifactPath,
+                      label: "handoff result",
+                      mimeType: "application/zip",
+                      sizeBytes: emptyZip.length,
+                      sourceUrl: "sandbox:/mnt/data/handoff-result.zip",
+                      url: "browser-download",
+                      finalUrl: "browser-download",
+                      filename: "handoff-result.zip",
+                    },
+                  ],
+                },
+                runtime,
+                { finalize, abort },
+              ),
+          },
+        );
+        const port = first.port;
+        const host = `127.0.0.1:${port}`;
+        const initial = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: payload,
+        });
+        expect(initial.statusCode).toBe(200);
+        expect(initial.events.find((event) => event.type === "transaction")).toMatchObject({
+          transaction: {
+            transactionToken,
+            state: "pending",
+            result: { answerText: "restart-safe answer" },
+            artifacts: [{ required: true }],
+          },
+        });
+
+        const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
+        const pendingBeforeClose = await readFile(recordPath, "utf8");
+        const pendingRecord = JSON.parse(pendingBeforeClose);
+        expect(pendingRecord).toMatchObject({
+          state: "pending",
+          result: { answerText: "restart-safe answer" },
+          runtime: { chromeTargetId: "shutdown-handoff-target" },
+          artifacts: [{ canonicalPath: await realpath(hostArtifactPath) }],
+        });
+        expect(pendingRecord).not.toHaveProperty("settlementMode");
+        expect(pendingRecord).not.toHaveProperty("publicationAcknowledgedAt");
+        expect(pendingRecord).not.toHaveProperty("finalization");
+
+        await first.close();
+        first = undefined;
+        expect(finalize).not.toHaveBeenCalled();
+        expect(abort).not.toHaveBeenCalled();
+        await expect(readFile(recordPath, "utf8")).resolves.toBe(pendingBeforeClose);
+
+        const retryCleanup = vi.fn(
+          async (
+            settlementRuntime: BrowserRunTransaction["runtime"],
+            _logger: unknown,
+            _deps: unknown,
+            mode?: "finalize" | "abort",
+          ) => {
+            expect(mode).toBe("finalize");
+            return { status: "completed" as const, runtime: settlementRuntime };
+          },
+        );
+        restarted = await createRemoteServer(
+          { host: "127.0.0.1", port, token: "secret", logger: () => {} },
+          {
+            transactionStoreDir,
+            controllerGeneration: "controller-after-graceful-shutdown",
+            retryCleanup,
+          },
+        );
+        const resumed = await resumeRemoteBrowserTransaction({
+          runtime: {
+            recoveryCleanupResources: [
+              {
+                remoteRecovery: {
+                  protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+                  host,
+                  transactionToken,
+                  state: "pre-receipt",
+                  requestIdentity,
+                },
+                recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+              },
+            ],
+          },
+          configuredHost: host,
+          authToken: "secret",
+          sessionId: "shutdown-handoff-client",
+        });
+        expect(resumed.answerText).toBe("restart-safe answer");
+        expect(resumed.artifacts).toHaveLength(1);
+        await expect(readFile(resumed.artifacts![0]!.path)).resolves.toEqual(emptyZip);
+        const deliveredRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        expect(deliveredRecord).toMatchObject({
+          state: "pending",
+          result: { answerText: "restart-safe answer" },
+          runtime: { chromeTargetId: "shutdown-handoff-target" },
+          artifacts: [{ deliveryReceipt: { byteSize: emptyZip.length } }],
+        });
+        expect(deliveredRecord).not.toHaveProperty("settlementMode");
+        expect(deliveredRecord).not.toHaveProperty("publicationAcknowledgedAt");
+
+        await expect(resumed.finalize()).resolves.toMatchObject({ status: "completed" });
+        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retryCleanup.mock.calls[0]?.[3]).toBe("finalize");
+        expect(finalize).not.toHaveBeenCalled();
+        expect(abort).not.toHaveBeenCalled();
+        await expect(resumed.abort()).rejects.toMatchObject({
+          name: "BrowserAutomationError",
+          details: { code: "settlement-mode-conflict" },
+        });
+        const finalizedRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        expect(finalizedRecord).toMatchObject({
+          state: "finalized",
+          terminalAudit: {
+            settlementMode: "finalize",
+            publicationAcknowledgedAt: expect.any(String),
+          },
+        });
+        expect(finalizedRecord).not.toHaveProperty("result");
+        expect(finalizedRecord).not.toHaveProperty("runtime");
+        expect(finalizedRecord).not.toHaveProperty("artifacts");
+      } finally {
+        await restarted?.close().catch(() => undefined);
+        await first?.close().catch(() => undefined);
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+    30_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1228,6 +1417,7 @@ describe("remote browser service", () => {
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1320,6 +1510,7 @@ describe("remote browser service", () => {
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1394,7 +1585,11 @@ describe("remote browser service", () => {
 
       const exactChromeCleanup = vi.fn(
         async (_recordedRuntime: BrowserRunTransaction["runtime"], recordedProfileDir: string) => {
-          expect(recordedProfileDir).toBe(profileDir);
+          const recordedProfileDirectory =
+            await captureProfileDirectoryIdentity(recordedProfileDir);
+          expect(sameProfileDirectoryIdentity(recordedProfileDirectory, profileDirectory)).toBe(
+            true,
+          );
           await expect(readOracleChromeOwner(recordedProfileDir)).resolves.toEqual({
             port: chromePort,
             processIdentity: identity,
@@ -1429,7 +1624,7 @@ describe("remote browser service", () => {
         });
         expect(exactChromeCleanup).toHaveBeenCalledWith(
           expect.objectContaining({ chromeProcessIdentity: identity }),
-          profileDir,
+          expect.any(String),
           identity,
           expect.any(Function),
         );
@@ -1457,8 +1652,8 @@ describe("remote browser service", () => {
         conversationId: "remote-conversation",
         promptEpoch: committedPromptEpoch(prompt),
       };
-      const recoveryStarted = createDeferred<void>();
-      const releaseRecovery = createDeferred<void>();
+      const recoveryStarted = Promise.withResolvers<void>();
+      const releaseRecovery = Promise.withResolvers<void>();
       const resumeBrowser = vi.fn(async () => {
         recoveryStarted.resolve();
         await releaseRecovery.promise;
@@ -1542,8 +1737,8 @@ describe("remote browser service", () => {
         prompt: "settlement waits for browser authority",
       });
       if (!settlementRuntime) throw new Error("missing seeded settlement runtime");
-      const runStarted = createDeferred<void>();
-      const releaseRun = createDeferred<void>();
+      const runStarted = Promise.withResolvers<void>();
+      const releaseRun = Promise.withResolvers<void>();
       const retryCleanup = vi.fn(
         async (
           runtime: BrowserRunTransaction["runtime"],
@@ -2016,7 +2211,7 @@ async function createFakeArtifactBridge({
       res.end(error instanceof Error ? error.message : String(error));
     });
   });
-  const listenDeferred = createDeferred<void>();
+  const listenDeferred = Promise.withResolvers<void>();
   server.once("error", listenDeferred.reject);
   server.listen(0, "127.0.0.1", listenDeferred.resolve);
   await listenDeferred.promise;
@@ -2028,7 +2223,7 @@ async function createFakeArtifactBridge({
     port: address.port,
     artifactRequests: () => artifactRequestCount,
     close: async () => {
-      const closeDeferred = createDeferred<void>();
+      const closeDeferred = Promise.withResolvers<void>();
       server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
       await closeDeferred.promise;
     },
@@ -2046,7 +2241,7 @@ async function httpGetJson({
   path: string;
   token?: string;
 }): Promise<{ statusCode: number; json: Record<string, unknown> | null }> {
-  const deferred = createDeferred<{
+  const deferred = Promise.withResolvers<{
     statusCode: number;
     json: Record<string, unknown> | null;
   }>();
@@ -2094,7 +2289,7 @@ async function httpPostJson({
   body: unknown;
 }): Promise<{ statusCode: number; json: Record<string, unknown> | null }> {
   const serialized = Buffer.from(JSON.stringify(body));
-  const deferred = createDeferred<{
+  const deferred = Promise.withResolvers<{
     statusCode: number;
     json: Record<string, unknown> | null;
   }>();
@@ -2131,6 +2326,59 @@ async function httpPostJson({
   return await deferred.promise;
 }
 
+async function httpPostNdjson({
+  hostname,
+  port,
+  path,
+  token,
+  body,
+}: {
+  hostname: string;
+  port: number;
+  path: string;
+  token?: string;
+  body: unknown;
+}): Promise<{ statusCode: number; events: Array<Record<string, unknown>> }> {
+  const serialized = Buffer.from(JSON.stringify(body));
+  const deferred = Promise.withResolvers<{
+    statusCode: number;
+    events: Array<Record<string, unknown>>;
+  }>();
+  const req = http.request(
+    {
+      hostname,
+      port,
+      path,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": serialized.byteLength,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+    },
+    (res) => {
+      readIncomingBody(res)
+        .then((responseBody) => {
+          const events = responseBody
+            .split(/\r?\n/u)
+            .filter(Boolean)
+            .map((line) => {
+              const parsed: unknown = JSON.parse(line);
+              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new Error("Remote NDJSON event is not an object");
+              }
+              return parsed as Record<string, unknown>;
+            });
+          deferred.resolve({ statusCode: res.statusCode ?? 0, events });
+        })
+        .catch(deferred.reject);
+    },
+  );
+  req.on("error", deferred.reject);
+  req.end(serialized);
+  return await deferred.promise;
+}
+
 async function postJsonAndDisconnect({
   hostname,
   port,
@@ -2145,7 +2393,7 @@ async function postJsonAndDisconnect({
   body: unknown;
 }): Promise<void> {
   const serialized = Buffer.from(JSON.stringify(body));
-  const deferred = createDeferred<void>();
+  const deferred = Promise.withResolvers<void>();
   const req = http.request(
     {
       hostname,
@@ -2168,7 +2416,7 @@ async function postJsonAndDisconnect({
   await deferred.promise;
 }
 
-function remoteRunPayload() {
+function remoteRunPayload(): RemoteRunPayload {
   return {
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     prompt: "remote test",

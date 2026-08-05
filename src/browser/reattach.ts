@@ -203,6 +203,13 @@ export async function resumeBrowserSession(
 ): Promise<ReattachResult> {
   const explicitTabRef = config?.browserTabRef?.trim() || undefined;
   const initialRemoteRecovery = remoteRecoveryAuthority(runtime);
+  if (initialRemoteRecovery && explicitTabRef) {
+    throw explicitTargetAuthorityError(
+      explicitTabRef,
+      "unsupported",
+      `Explicit browser tab ${explicitTabRef} cannot be combined with remote transaction recovery because the remote protocol cannot carry exact tab authority.`,
+    );
+  }
   const promptLocator =
     initialRemoteRecovery && !runtime.promptEpoch
       ? null

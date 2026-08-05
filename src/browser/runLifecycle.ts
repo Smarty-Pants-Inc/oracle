@@ -55,31 +55,18 @@ type BrowserRunLifecycleState =
   | { kind: "ready" }
   | { kind: "dispatching"; dispatch: PendingDispatch }
   | { kind: "capturing"; dispatch: CommittedDispatch }
-  | { kind: "caller-publication"; runtime: BrowserRuntimeMetadata }
-  | {
-      kind: "settling";
-      mode: BrowserCaptureSettlementMode;
-      runtime: BrowserRuntimeMetadata;
-      completion: Promise<BrowserCaptureFinalizationResult>;
-    }
-  | {
-      kind: "completed";
-      mode: BrowserCaptureSettlementMode;
-      result: Extract<BrowserCaptureFinalizationResult, { status: "completed" }>;
-    }
-  | {
-      kind: "cleanup-pending";
-      mode: BrowserCaptureSettlementMode;
-      result: Extract<BrowserCaptureFinalizationResult, { status: "pending" }>;
-    };
+  | { kind: "published"; settlement: BrowserCaptureSettlementController };
 
-export interface BrowserRunLifecycleAdapters {
-  getRuntime: () => BrowserRuntimeMetadata;
+export interface BrowserCaptureSettlementAdapters {
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
   settleResources: (
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
   ) => Promise<BrowserCaptureFinalizationResult>;
+}
+
+export interface BrowserRunLifecycleAdapters extends BrowserCaptureSettlementAdapters {
+  getRuntime: () => BrowserRuntimeMetadata;
   onPromptCommitted?: () => void;
 }
 
@@ -156,6 +143,110 @@ export function bindBrowserCaptureCleanupSettlement(
   };
 }
 
+type BrowserCaptureSettlementState =
+  | { kind: "published"; runtime: BrowserRuntimeMetadata }
+  | {
+      kind: "settling";
+      mode: BrowserCaptureSettlementMode;
+      runtime: BrowserRuntimeMetadata;
+      completion: Promise<BrowserCaptureFinalizationResult>;
+    }
+  | {
+      kind: "completed";
+      mode: BrowserCaptureSettlementMode;
+      result: Extract<BrowserCaptureFinalizationResult, { status: "completed" }>;
+    }
+  | {
+      kind: "cleanup-pending";
+      mode: BrowserCaptureSettlementMode;
+      result: Extract<BrowserCaptureFinalizationResult, { status: "pending" }>;
+    };
+
+export class BrowserCaptureSettlementController {
+  private state: BrowserCaptureSettlementState;
+
+  constructor(
+    private readonly adapters: BrowserCaptureSettlementAdapters,
+    runtime: BrowserRuntimeMetadata,
+  ) {
+    this.state = { kind: "published", runtime: markBrowserCaptureCleanupPending(runtime) };
+  }
+
+  runtime(): BrowserRuntimeMetadata {
+    if (this.state.kind === "published" || this.state.kind === "settling") {
+      return this.state.runtime;
+    }
+    return this.state.result.runtime;
+  }
+
+  settle(mode: BrowserCaptureSettlementMode): Promise<BrowserCaptureFinalizationResult> {
+    if (this.state.kind === "published") {
+      return this.beginSettlement(mode, this.state.runtime);
+    }
+    if (this.state.kind === "settling") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+      }
+      return this.state.completion;
+    }
+    if (this.state.kind === "cleanup-pending") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+      }
+      return this.beginSettlement(mode, this.state.result.runtime);
+    }
+    if (this.state.mode !== mode) {
+      return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
+    }
+    return Promise.resolve(this.state.result);
+  }
+
+  private beginSettlement(
+    mode: BrowserCaptureSettlementMode,
+    runtime: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> {
+    const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
+    const completion = Promise.resolve()
+      .then(async () => {
+        await this.adapters.persistRuntime?.(boundRuntime);
+        return this.adapters.settleResources(mode, boundRuntime);
+      })
+      .catch((error) =>
+        pendingBrowserCaptureCleanup(
+          boundRuntime,
+          error instanceof Error ? error.message : String(error),
+          mode,
+        ),
+      )
+      .then((result) => {
+        const boundResult = bindBrowserCaptureCleanupSettlement(result, mode);
+        this.state =
+          boundResult.status === "completed"
+            ? { kind: "completed", mode, result: boundResult }
+            : { kind: "cleanup-pending", mode, result: boundResult };
+        return boundResult;
+      });
+    this.state = { kind: "settling", mode, runtime: boundRuntime, completion };
+    return completion;
+  }
+
+  private settlementModeConflict(
+    requestedMode: BrowserCaptureSettlementMode,
+    boundMode: BrowserCaptureSettlementMode,
+  ): BrowserAutomationError {
+    return new BrowserAutomationError(
+      `Browser run transaction is already bound to ${boundMode}; ${requestedMode} is not allowed.`,
+      {
+        stage: "browser-run-lifecycle",
+        code: "browser-run-lifecycle-settlement-conflict",
+        phase: this.state.kind,
+        requestedMode,
+        boundMode,
+      },
+    );
+  }
+}
+
 function pendingPromptEpoch(
   dispatch: PendingDispatch,
 ): Extract<BrowserPromptEpoch, { status: "pending" }> {
@@ -217,6 +308,22 @@ function captureResultRuntime(
   };
 }
 
+export function createBrowserRunTransaction(
+  result: BrowserRunResult,
+  settlement: BrowserCaptureSettlementController,
+): BrowserRunTransaction {
+  const publishedRuntime = settlement.runtime();
+  return {
+    ...result,
+    ...captureResultRuntime(publishedRuntime),
+    get runtime() {
+      return settlement.runtime();
+    },
+    finalize: () => settlement.settle("finalize"),
+    abort: () => settlement.settle("abort"),
+  };
+}
+
 export class BrowserRunLifecycleController {
   private state: BrowserRunLifecycleState = { kind: "acquiring" };
 
@@ -247,11 +354,8 @@ export class BrowserRunLifecycleController {
     if (this.state.kind === "capturing") {
       return committedPromptEpoch(this.state.dispatch);
     }
-    if (this.state.kind === "caller-publication" || this.state.kind === "settling") {
-      return this.state.runtime.promptEpoch;
-    }
-    if (this.state.kind === "completed" || this.state.kind === "cleanup-pending") {
-      return this.state.result.runtime.promptEpoch;
+    if (this.state.kind === "published") {
+      return this.state.settlement.runtime().promptEpoch;
     }
     return undefined;
   }
@@ -261,6 +365,9 @@ export class BrowserRunLifecycleController {
   }
 
   runtime(base = this.adapters.getRuntime()): BrowserRuntimeMetadata {
+    if (this.state.kind === "published") {
+      return this.state.settlement.runtime();
+    }
     const epoch = this.promptEpoch();
     const conversationId =
       base.conversationId ?? (epoch?.status === "committed" ? epoch.conversationId : undefined);
@@ -384,86 +491,22 @@ export class BrowserRunLifecycleController {
     if (this.state.kind !== "capturing") {
       throw this.illegalTransition("issue captured result for caller publication");
     }
-    const pendingRuntime = markBrowserCaptureCleanupPending(this.runtime(base));
-    this.state = { kind: "caller-publication", runtime: pendingRuntime };
-    return {
-      ...result,
-      ...captureResultRuntime(pendingRuntime),
-      runtime: pendingRuntime,
-      finalize: () => this.settlePublishedCapture("finalize"),
-      abort: () => this.settlePublishedCapture("abort"),
-    };
+    const settlement = new BrowserCaptureSettlementController(
+      this.adapters,
+      markBrowserCaptureCleanupPending(this.runtime(base)),
+    );
+    this.state = { kind: "published", settlement };
+    return createBrowserRunTransaction(result, settlement);
   }
 
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
-    if (
-      this.state.kind === "caller-publication" ||
-      this.state.kind === "settling" ||
-      this.state.kind === "completed" ||
-      this.state.kind === "cleanup-pending"
-    ) {
-      return null;
-    }
-    return this.beginSettlement(
-      "finalize",
+    if (this.state.kind === "published") return null;
+    const settlement = new BrowserCaptureSettlementController(
+      this.adapters,
       markBrowserCaptureCleanupPending(this.runtime(this.adapters.getRuntime())),
     );
-  }
-
-  private settlePublishedCapture(
-    mode: BrowserCaptureSettlementMode,
-  ): Promise<BrowserCaptureFinalizationResult> {
-    if (this.state.kind === "caller-publication") {
-      return this.beginSettlement(mode, this.state.runtime);
-    }
-    if (this.state.kind === "settling") {
-      if (this.state.mode !== mode) {
-        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
-      }
-      return this.state.completion;
-    }
-    if (this.state.kind === "cleanup-pending") {
-      if (this.state.mode !== mode) {
-        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
-      }
-      return this.beginSettlement(mode, this.state.result.runtime);
-    }
-    if (this.state.kind === "completed") {
-      if (this.state.mode !== mode) {
-        return Promise.reject(this.settlementModeConflict(mode, this.state.mode));
-      }
-      return Promise.resolve(this.state.result);
-    }
-    return Promise.reject(this.illegalTransition(`settle published capture (${mode})`));
-  }
-
-  private beginSettlement(
-    mode: BrowserCaptureSettlementMode,
-    runtime: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> {
-    const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
-    const completion = Promise.resolve()
-      .then(async () => {
-        await this.adapters.persistRuntime?.(boundRuntime);
-        return this.adapters.settleResources(mode, boundRuntime);
-      })
-      .catch((error) =>
-        pendingBrowserCaptureCleanup(
-          boundRuntime,
-          error instanceof Error ? error.message : String(error),
-          mode,
-        ),
-      )
-      .then((result) => {
-        const boundResult = bindBrowserCaptureCleanupSettlement(result, mode);
-        this.state =
-          boundResult.status === "completed"
-            ? { kind: "completed", mode, result: boundResult }
-            : { kind: "cleanup-pending", mode, result: boundResult };
-        return boundResult;
-      });
-    this.state = { kind: "settling", mode, runtime: boundRuntime, completion };
-    return completion;
+    this.state = { kind: "published", settlement };
+    return settlement.settle("finalize");
   }
 
   private async persistRuntime(): Promise<void> {
@@ -486,22 +529,6 @@ export class BrowserRunLifecycleController {
     return new BrowserAutomationError(
       "Prompt commit evidence does not belong to the current prompt epoch.",
       { stage: "prompt-epoch", code: "prompt-epoch-mismatch" },
-    );
-  }
-
-  private settlementModeConflict(
-    requestedMode: BrowserCaptureSettlementMode,
-    boundMode: BrowserCaptureSettlementMode,
-  ): BrowserAutomationError {
-    return new BrowserAutomationError(
-      `Browser run transaction is already bound to ${boundMode}; ${requestedMode} is not allowed.`,
-      {
-        stage: "browser-run-lifecycle",
-        code: "browser-run-lifecycle-settlement-conflict",
-        phase: this.state.kind,
-        requestedMode,
-        boundMode,
-      },
     );
   }
 

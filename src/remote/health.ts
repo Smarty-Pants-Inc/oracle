@@ -17,20 +17,6 @@ export interface RemoteHealthResult {
   capabilities?: RemoteArtifactCapabilities;
 }
 
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
 export async function checkTcpConnection(
   host: string,
   timeoutMs = 2000,
@@ -41,7 +27,7 @@ export async function checkTcpConnection(
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-  const { promise, resolve } = createDeferred<{ ok: boolean; error?: string }>();
+  const { promise, resolve } = Promise.withResolvers<{ ok: boolean; error?: string }>();
   const socket = net.createConnection({ host: endpoint.hostname, port: endpoint.port });
   const onError = (err: Error) => {
     cleanup();
@@ -156,7 +142,7 @@ async function requestJson({
   overallTimeoutMs: number;
   idleTimeoutMs: number;
 }): Promise<{ statusCode: number; json: unknown; bodyText: string }> {
-  const { promise, resolve, reject } = createDeferred<{
+  const { promise, resolve, reject } = Promise.withResolvers<{
     statusCode: number;
     json: unknown;
     bodyText: string;

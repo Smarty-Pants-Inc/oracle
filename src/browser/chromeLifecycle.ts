@@ -34,9 +34,6 @@ export interface StableChromeProcessHandle {
   readonly pid?: number;
   readonly exitCode: number | null;
   readonly signalCode: NodeJS.Signals | null;
-  kill(signal: NodeJS.Signals): boolean;
-  once(event: "exit", listener: () => void): unknown;
-  removeListener(event: "exit", listener: () => void): unknown;
   unref?(): void;
 }
 
@@ -67,8 +64,15 @@ export interface ChromeLaunchDeps {
   hiddenMacLaunch?: typeof launchHiddenMacChrome;
   resolveLaunchRoute?: typeof resolveWslChromeLaunchRoute;
   captureProcessIdentity?: typeof captureChromeProcessIdentity;
+  inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
   captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
   writeOwner?: typeof writeOracleChromeOwner;
+  retainControlChannel?: (options: {
+    host: string;
+    port: number;
+    userDataDir: string;
+    processIdentity: ChromeProcessIdentity;
+  }) => Promise<ChromeStableKill>;
 }
 
 export async function launchChrome(
@@ -138,7 +142,7 @@ export async function launchChrome(
         );
     if (!launched.process) {
       throw new Error(
-        `Launched Chrome for ${launchUserDataDir} did not expose a retained process handle; refusing PID-based lifecycle authority.`,
+        `Launched Chrome for ${launchUserDataDir} did not expose retained process-exit observation; refusing ambiguous lifecycle authority.`,
       );
     }
     const retainedProcess = retainChromeChildProcess(launched.process);
@@ -148,7 +152,11 @@ export async function launchChrome(
       process: retainedProcess,
       remoteDebuggingPipes: launched.remoteDebuggingPipes,
       host: launched.host,
-      kill: createStableChildProcessChromeKill(retainedProcess),
+      kill: createStableChildProcessChromeKill(retainedProcess, async () => ({
+        status: "unsafe",
+        pid: retainedProcess.pid,
+        reason: "Exact Chrome control authority is unavailable before process identity capture",
+      })),
     };
   }
 
@@ -160,11 +168,35 @@ export async function launchChrome(
       profileDirectory,
       deps.captureProcessIdentity ?? captureChromeProcessIdentity,
     ));
+  const launchHost = launcher.host ?? connectHost ?? "127.0.0.1";
+  let stableKill: ChromeStableKill;
+  if (hiddenHeadfulLaunch) {
+    stableKill = launcher.kill;
+  } else {
+    if (!launcher.process) {
+      throw new Error(`Launched Chrome for ${launchUserDataDir} lost process-exit observation.`);
+    }
+    stableKill = createStableChildProcessChromeKill(
+      launcher.process,
+      await createLaunchedChromeControlKill(
+        {
+          host: launchHost,
+          port: launcher.port,
+          userDataDir: launchUserDataDir,
+          processIdentity,
+        },
+        {
+          retainControlChannel: deps.retainControlChannel,
+          inspectProcessIdentity: deps.inspectProcessIdentity,
+        },
+      ),
+    );
+  }
   if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, profileDirectory)) {
     const mismatch = new Error(
       `Physical Chrome profile authority changed during launch: ${launchUserDataDir}`,
     );
-    const rollback = await launcher.kill();
+    const rollback = await stableKill();
     if (!isSafeChromeTerminationOutcome(rollback)) {
       throw new AggregateError(
         [mismatch, new Error(rollback.reason)],
@@ -176,7 +208,7 @@ export async function launchChrome(
   const kill = await createOwnerBoundChromeKill(
     launchUserDataDir,
     { port: launcher.port, processIdentity },
-    launcher.kill,
+    stableKill,
     { writeOwner: deps.writeOwner },
   );
   if (typeof launcher.pid !== "number") {
@@ -192,7 +224,7 @@ export async function launchChrome(
     port: launcher.port,
     process: launcher.process,
     remoteDebuggingPipes: launcher.remoteDebuggingPipes,
-    host: connectHost ?? "127.0.0.1",
+    host: launchHost,
     processIdentity,
     kill,
   };
@@ -272,90 +304,143 @@ function retainChromeChildProcess(child: LaunchedChrome["process"]): StableChrom
     get signalCode() {
       return child.signalCode;
     },
-    kill: (signal) => child.kill(signal),
-    once: (event, listener) => child.once(event, listener),
-    removeListener: (event, listener) => child.removeListener(event, listener),
     unref: () => child.unref(),
   };
 }
 
 export function createStableChildProcessChromeKill(
   child: StableChromeProcessHandle,
+  exactControlKill: ChromeStableKill,
 ): ChromeStableKill {
+  return createTerminalCachingChromeKill(async () => {
+    const pid = child.pid;
+    if (!pid) {
+      return {
+        status: "unsafe",
+        reason: "Retained Chrome process handle has no stable process id",
+      };
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return { status: "already-stopped", pid };
+    }
+    const outcome = await exactControlKill();
+    if (isSafeChromeTerminationOutcome(outcome) && outcome.pid !== pid) {
+      return {
+        status: "unsafe",
+        pid,
+        reason: "Exact Chrome control channel returned a different process identity",
+      };
+    }
+    return outcome;
+  });
+}
+
+function createTerminalCachingChromeKill(attemptKill: ChromeStableKill): ChromeStableKill {
+  let completed: RecordedChromeTerminationOutcome | undefined;
   let pending: Promise<RecordedChromeTerminationOutcome> | undefined;
   return () => {
-    pending ??= terminateStableChildProcess(child);
-    return pending;
+    if (completed) return Promise.resolve(completed);
+    if (pending) return pending;
+    const attempt = Promise.resolve().then(attemptKill);
+    pending = attempt;
+    void attempt.then(
+      (outcome) => {
+        if (isSafeChromeTerminationOutcome(outcome)) completed = outcome;
+        if (pending === attempt) pending = undefined;
+      },
+      () => {
+        if (pending === attempt) pending = undefined;
+      },
+    );
+    return attempt;
   };
 }
 
-async function terminateStableChildProcess(
-  child: StableChromeProcessHandle,
-): Promise<RecordedChromeTerminationOutcome> {
-  const pid = child.pid;
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return { status: "already-stopped", pid };
-  }
-  if (!pid) {
-    return {
-      status: "unsafe",
-      reason: "Retained Chrome process handle has no stable process id",
-    };
-  }
-  const gracefulExit = waitForChildProcessExit(child, 5_000);
-  try {
-    if (!child.kill("SIGTERM") && child.exitCode === null && child.signalCode === null) {
-      return { status: "unsafe", pid, reason: "Retained Chrome process handle rejected SIGTERM" };
-    }
-  } catch (error) {
-    return {
-      status: "unsafe",
-      pid,
-      reason: error instanceof Error ? error.message : String(error),
-    };
-  }
-  if (await gracefulExit) return { status: "stopped", pid, signal: "SIGTERM" };
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return { status: "stopped", pid, signal: "SIGTERM" };
-  }
-
-  const forcedExit = waitForChildProcessExit(child, 2_000);
-  try {
-    if (!child.kill("SIGKILL") && child.exitCode === null && child.signalCode === null) {
-      return { status: "unsafe", pid, reason: "Retained Chrome process handle rejected SIGKILL" };
-    }
-  } catch (error) {
-    return {
-      status: "unsafe",
-      pid,
-      reason: error instanceof Error ? error.message : String(error),
-    };
-  }
-  return (await forcedExit)
-    ? { status: "stopped", pid, signal: "SIGKILL" }
-    : { status: "unsafe", pid, reason: "Chrome did not exit through its retained process handle" };
+interface LaunchedChromeControlKillOptions {
+  readonly host: string;
+  readonly port: number;
+  readonly userDataDir: string;
+  readonly processIdentity: ChromeProcessIdentity;
 }
 
-async function waitForChildProcessExit(
-  child: StableChromeProcessHandle,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  let resolve!: (value: boolean) => void;
-  const promise = new Promise<boolean>((resolvePromise) => {
-    resolve = resolvePromise;
+interface LaunchedChromeControlKillDeps {
+  inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
+  retainControlChannel?: NonNullable<ChromeLaunchDeps["retainControlChannel"]>;
+}
+
+async function createLaunchedChromeControlKill(
+  options: LaunchedChromeControlKillOptions,
+  deps: LaunchedChromeControlKillDeps = {},
+): Promise<ChromeStableKill> {
+  const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
+  const retain = deps.retainControlChannel ?? retainLaunchedChromeControlChannel;
+  let retainedControlKill: ChromeStableKill | undefined;
+
+  try {
+    if ((await inspect(options.userDataDir, options.processIdentity)) === "current") {
+      retainedControlKill = await retain(options);
+    }
+  } catch {
+    retainedControlKill = undefined;
+  }
+
+  return createTerminalCachingChromeKill(async () => {
+    let inspection: ChromeProcessIdentityInspection;
+    try {
+      inspection = await inspect(options.userDataDir, options.processIdentity);
+    } catch {
+      inspection = "unavailable";
+    }
+    if (inspection === "exited") {
+      return { status: "already-stopped", pid: options.processIdentity.pid };
+    }
+    if (inspection !== "current") {
+      return {
+        status: "unsafe",
+        pid: options.processIdentity.pid,
+        reason: "Exact Chrome process generation could not be reverified before control teardown",
+      };
+    }
+
+    if (!retainedControlKill) {
+      try {
+        retainedControlKill = await retain(options);
+      } catch (error) {
+        return {
+          status: "unsafe",
+          pid: options.processIdentity.pid,
+          reason: `Exact Chrome control channel is unavailable: ${error instanceof Error ? error.message : error}`,
+        };
+      }
+    }
+
+    try {
+      const outcome = await retainedControlKill();
+      if (isSafeChromeTerminationOutcome(outcome) && outcome.pid !== options.processIdentity.pid) {
+        retainedControlKill = undefined;
+        return {
+          status: "unsafe",
+          pid: options.processIdentity.pid,
+          reason: "Exact Chrome control channel returned a different process identity",
+        };
+      }
+      return outcome;
+    } catch (error) {
+      retainedControlKill = undefined;
+      return {
+        status: "unsafe",
+        pid: options.processIdentity.pid,
+        reason: `Exact Chrome control teardown failed: ${error instanceof Error ? error.message : error}`,
+      };
+    }
   });
-  const onExit = () => {
-    clearTimeout(timeout);
-    resolve(true);
-  };
-  const timeout = setTimeout(() => {
-    child.removeListener("exit", onExit);
-    resolve(child.exitCode !== null || child.signalCode !== null);
-  }, timeoutMs);
-  timeout.unref();
-  child.once("exit", onExit);
-  return await promise;
+}
+
+export async function createLaunchedChromeControlKillForTest(
+  options: LaunchedChromeControlKillOptions,
+  deps: LaunchedChromeControlKillDeps,
+): Promise<ChromeStableKill> {
+  return createLaunchedChromeControlKill(options, deps);
 }
 
 export async function positionChromeWindowOffscreen(
@@ -1343,6 +1428,44 @@ interface IdentityBoundChromeControlKillDeps {
   timeoutMs?: number;
   pollMs?: number;
 }
+async function retainLaunchedChromeControlChannel(
+  options: LaunchedChromeControlKillOptions,
+): Promise<ChromeStableKill> {
+  const endpoint = await discoverBrowserWebSocketEndpoint(options.host, options.port);
+  const client = (await CDP({ target: endpoint.browserWSEndpoint, local: true })) as ChromeClient;
+  try {
+    await client.Browser.getVersion();
+    const processResult = await client.SystemInfo.getProcessInfo();
+    if (
+      !Array.isArray(processResult.processInfo) ||
+      !processResult.processInfo.some(
+        (processInfo) =>
+          processInfo !== null &&
+          typeof processInfo === "object" &&
+          "id" in processInfo &&
+          processInfo.id === options.processIdentity.pid,
+      )
+    ) {
+      throw new Error("Chrome control channel is not bound to the captured browser process");
+    }
+    const inspection = await inspectChromeProcessIdentity(
+      options.userDataDir,
+      options.processIdentity,
+    );
+    if (inspection !== "current") {
+      throw new Error("Chrome control channel is not bound to the exact process generation");
+    }
+    return createIdentityBoundChromeControlKill(
+      client,
+      options.userDataDir,
+      options.processIdentity,
+      {},
+    );
+  } catch (error) {
+    await client.close().catch(() => undefined);
+    throw error;
+  }
+}
 
 async function retainExactChromeControlChannel(
   browserWSEndpoint: string,
@@ -1605,7 +1728,7 @@ async function launchWithCustomHost({
   host: string | null;
   requestedPort?: number;
   ignoreDefaultFlags?: boolean;
-}): Promise<LaunchedChrome & { host?: string }> {
+}): Promise<Omit<LaunchedChrome, "kill"> & { host?: string }> {
   const launcher = new Launcher({
     chromePath: chromePath ?? undefined,
     chromeFlags,
@@ -1653,7 +1776,6 @@ async function launchWithCustomHost({
     pid,
     port,
     process: chromeProcess,
-    kill: () => launcher.kill(),
     host: host ?? undefined,
     remoteDebuggingPipes,
   };

@@ -144,6 +144,17 @@ export interface ExpiredRemoteTransactionSettlement {
   mode: "finalize" | "abort";
   durablePublication: boolean;
 }
+export type RemoteTransactionControllerShutdownAction =
+  | { action: "release" | "preserve" }
+  | {
+      action: "settle";
+      mode: "finalize" | "abort";
+      durablePublication: boolean;
+    };
+
+export type RemoteTransactionControllerShutdownPlan = RemoteTransactionControllerShutdownAction & {
+  record: RemoteTransactionRecord;
+};
 
 export class RemoteTransactionTransitionError extends Error {
   constructor(
@@ -190,6 +201,7 @@ type RemoteTransactionTransition =
       mode: "finalize" | "abort";
       finalization: BrowserCaptureFinalizationResult;
     }
+  | { type: "prepare-controller-shutdown" }
   | {
       type: "reconcile-controller";
       buildError: (
@@ -430,6 +442,15 @@ export class RemoteTransactionStore {
         finalization: params.finalization,
       })
     ).record;
+  }
+  async prepareControllerShutdown(
+    transactionToken: string,
+  ): Promise<RemoteTransactionControllerShutdownPlan> {
+    const transition = await this.transition(transactionToken, {
+      type: "prepare-controller-shutdown",
+    });
+    const outcome = transition.outcome as RemoteTransactionControllerShutdownAction;
+    return { record: transition.record, ...outcome };
   }
 
   async expire(params: {
@@ -687,6 +708,31 @@ export class RemoteTransactionStore {
         }
         return { persist: true };
       }
+      case "prepare-controller-shutdown": {
+        if (isTerminalState(record.state)) {
+          return { persist: false, outcome: { action: "release" } };
+        }
+        if (record.state === "running") {
+          throw new Error("Cannot shut down while a remote transaction is still running");
+        }
+        if (!record.runtime) {
+          throw new Error("Nonterminal transaction lacks runtime authority");
+        }
+        if (!record.settlementMode) {
+          return { persist: false, outcome: { action: "preserve" } };
+        }
+        if (record.settlementMode === "finalize" && !record.publicationAcknowledgedAt) {
+          throw new Error("Finalize-bound transaction lacks durable publication acknowledgement");
+        }
+        return {
+          persist: false,
+          outcome: {
+            action: "settle",
+            mode: record.settlementMode,
+            durablePublication: record.settlementMode === "finalize",
+          },
+        };
+      }
       case "reconcile-controller": {
         if (
           record.state !== "running" ||
@@ -756,7 +802,7 @@ export class RemoteTransactionStore {
   private async withLock<T>(transactionToken: string, operation: () => Promise<T>): Promise<T> {
     this.recordPath(transactionToken);
     const prior = this.#locks.get(transactionToken) ?? Promise.resolve();
-    const gate = createPromiseGate();
+    const gate = Promise.withResolvers<void>();
     const current = prior.then(() => gate.promise);
     this.#locks.set(transactionToken, current);
     await prior;
@@ -873,7 +919,7 @@ export class RemoteTransactionStore {
 
   private async withMaintenanceLock<T>(operation: () => Promise<T>): Promise<T> {
     const prior = this.#maintenanceLock;
-    const gate = createPromiseGate();
+    const gate = Promise.withResolvers<void>();
     this.#maintenanceLock = prior.then(() => gate.promise);
     await prior;
     try {
@@ -1233,14 +1279,6 @@ function validateTerminalRemoteTransactionRecord(record: RemoteTransactionRecord
   } else if (record.finalization) {
     throw new Error("Pre-authority failed transaction cannot contain finalization state");
   }
-}
-
-function createPromiseGate(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
 }
 
 async function syncDirectory(directory: string): Promise<void> {

@@ -82,10 +82,12 @@ async function withRemoteLateDisconnectFixture(
     closeChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
     providerObservedDispatchStart: boolean;
+    committedTurnVerified: boolean;
   }) => Promise<void> | void,
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let providerObservedDispatchStart = false;
+  let committedTurnVerified = false;
   let assistantResponseAvailable = false;
   const closeRemoteConnection = vi.fn().mockResolvedValue(undefined);
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
@@ -105,7 +107,12 @@ async function withRemoteLateDisconnectFixture(
     await Promise.resolve();
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
-  const verifyCommittedPromptTurn = vi.fn().mockResolvedValue(undefined);
+  const verifyCommittedPromptTurn = vi.fn(async () => {
+    if (!providerObservedDispatchStart) {
+      throw new Error("Committed-turn verification preceded provider dispatch");
+    }
+    committedTurnVerified = true;
+  });
 
   vi.resetModules();
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
@@ -240,6 +247,7 @@ async function withRemoteLateDisconnectFixture(
       probeChromeTargetLiveness,
       verifyCommittedPromptTurn,
       providerObservedDispatchStart,
+      committedTurnVerified,
     });
   } finally {
     vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -553,6 +561,7 @@ describe("recoverable disconnect lifecycle", () => {
   test("recovers a committed remote target when it disconnects during the final archive await", async () => {
     await withRemoteLateDisconnectFixture("created", async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.committedTurnVerified).toBe(true);
       expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
         expect.objectContaining({ evaluate: expect.any(Function) }),
         expect.objectContaining({
@@ -618,6 +627,8 @@ describe("recoverable disconnect lifecycle", () => {
 
   test("records an attached remote fallback target as user-owned", async () => {
     await withRemoteLateDisconnectFixture("attached", async (fixture) => {
+      expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.committedTurnVerified).toBe(true);
       expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
         expect.objectContaining({ evaluate: expect.any(Function) }),
         expect.objectContaining({

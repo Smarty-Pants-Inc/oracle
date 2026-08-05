@@ -226,6 +226,68 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("preserves an unbound capture for restart and exposes only a durably bound shutdown mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-store-"));
+    const transactionToken = "0".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: "controller-before-shutdown",
+      });
+      await begin(store, transactionToken);
+      await publish(store, transactionToken, [registration(transactionToken)]);
+      const beforeShutdown = await readFile(store.recordPath(transactionToken), "utf8");
+
+      await expect(store.prepareControllerShutdown(transactionToken)).resolves.toMatchObject({
+        action: "preserve",
+        record: {
+          state: "pending",
+          result: capturedResult,
+          runtime,
+          artifacts: [{ descriptor: { artifactId: "artifact-1" } }],
+        },
+      });
+      await expect(readFile(store.recordPath(transactionToken), "utf8")).resolves.toBe(
+        beforeShutdown,
+      );
+
+      await store.recordArtifactDelivery({
+        transactionToken,
+        artifactId: "artifact-1",
+        receipt: {
+          receiptId: "1".repeat(64),
+          deliveredAt: new Date().toISOString(),
+          byteSize: 7,
+          sha256: "b".repeat(64),
+        },
+      });
+      await store.bindSettlement({
+        transactionToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await expect(store.prepareControllerShutdown(transactionToken)).resolves.toMatchObject({
+        action: "settle",
+        mode: "finalize",
+        durablePublication: true,
+        record: {
+          state: "pending",
+          settlementMode: "finalize",
+          publicationAcknowledgedAt: expect.any(String),
+        },
+      });
+      await expect(
+        store.bindSettlement({
+          transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).rejects.toMatchObject({ code: "transaction_settlement_conflict" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   const rejectedTransitions: Array<{
     name: string;
     setup: (store: RemoteTransactionStore, token: string) => Promise<void>;

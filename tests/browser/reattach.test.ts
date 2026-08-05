@@ -750,17 +750,19 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       cleanupOrder.push("kill");
       return { status: "stopped" as const, pid: 4321, signal: "SIGTERM" as const };
     });
-    const launchChrome = vi.fn(async (_resolved: unknown, launchedProfileDir: string) => {
-      profileDir = launchedProfileDir;
-      return {
-        pid: 4321,
-        port: 9222,
-        host: "127.0.0.1",
-        remoteDebuggingPipes: undefined,
-        processIdentity: await physicalChromeProcessIdentity(launchedProfileDir, 4321),
-        kill,
-      };
-    });
+    const acquireTemporaryChromeOwner = vi.fn(
+      async (_resolved: unknown, launchedProfileDir: string) => {
+        profileDir = launchedProfileDir;
+        return {
+          pid: 4321,
+          port: 9222,
+          host: "127.0.0.1",
+          remoteDebuggingPipes: undefined,
+          processIdentity: await physicalChromeProcessIdentity(launchedProfileDir, 4321),
+          kill,
+        };
+      },
+    );
     const Runtime = {
       enable: vi.fn(async () => undefined),
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -797,10 +799,10 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     try {
       const result = await resumeBrowserSession(
         withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/test-conversation" }),
-        { cookieSync: false, timeoutMs: 1_000 },
+        { cookieSync: false, headless: true, timeoutMs: 1_000 },
         vi.fn() as BrowserLogger,
         {
-          launchChrome: launchChrome as never,
+          launchChrome: acquireTemporaryChromeOwner as never,
           createRecoveryTarget: vi.fn(async () => "fallback-owned-target"),
           connectRecoveryTarget: vi.fn(async () => ({
             client,
@@ -822,6 +824,11 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
             removeProfile,
           },
         },
+      );
+      expect(acquireTemporaryChromeOwner).toHaveBeenCalledWith(
+        expect.objectContaining({ headless: true }),
+        expect.stringMatching(/oracle-reattach-/),
+        expect.any(Function),
       );
 
       await expect(result.abort()).resolves.toMatchObject({ status: "completed" });
@@ -1199,7 +1206,55 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     expect(recoverSession).not.toHaveBeenCalled();
   });
 
-  test("allows an explicit browser tab reference without claiming ownership", async () => {
+  test("rejects explicit target authority before remote recovery contact or persistence", async () => {
+    const remoteRecovery = {
+      protocolVersion: 3,
+      host: "remote.example.test:9443",
+      transactionToken: "e".repeat(64),
+      state: "pending" as const,
+    };
+    const runtime = withRecoveryCleanup(
+      {},
+      {
+        ownsTarget: false,
+        profileKind: "none",
+        keepBrowser: false,
+      },
+      remoteRecovery,
+    );
+    const acquireRecoveryLock = vi.fn();
+    const resolveRemoteRecoveryConfig = vi.fn();
+    const resumeRemoteBrowserTransaction = vi.fn();
+    const runtimeHintCb = vi.fn();
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { browserTabRef: "explicit-remote-target", timeoutMs: 2_000 },
+        vi.fn() as BrowserLogger,
+        {
+          acquireRecoveryLock,
+          resumeRemoteBrowserTransaction,
+          runtimeHintCb,
+          recoveryCleanup: { resolveRemoteRecoveryConfig },
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "browser-reattach-explicit-target",
+        code: "explicit-browser-tab-unsupported",
+        browserTabRef: "explicit-remote-target",
+        reattachClassification: "explicit-selector-terminal",
+      },
+    });
+
+    expect(acquireRecoveryLock).not.toHaveBeenCalled();
+    expect(resolveRemoteRecoveryConfig).not.toHaveBeenCalled();
+    expect(resumeRemoteBrowserTransaction).not.toHaveBeenCalled();
+    expect(runtimeHintCb).not.toHaveBeenCalled();
+  });
+
+  test("allows explicit-only local tab selection without claiming ownership", async () => {
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
         {
@@ -1230,6 +1285,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         }) satisfies FakeClient,
     ) as unknown as (options?: unknown) => Promise<ChromeClient>;
     const closeChromeTarget = vi.fn(async () => true);
+    const resumeRemoteBrowserTransaction = vi.fn();
 
     const result = await resumeBrowserSession(
       runtime,
@@ -1247,6 +1303,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         })),
         captureAssistantMarkdown: vi.fn(async () => "borrowed capture"),
         recoveryCleanup: { closeChromeTarget },
+        resumeRemoteBrowserTransaction,
       },
     );
 
@@ -1265,6 +1322,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     });
     expect((await result.finalize()).status).toBe("completed");
     expect(closeChromeTarget).not.toHaveBeenCalled();
+    expect(resumeRemoteBrowserTransaction).not.toHaveBeenCalled();
   });
 
   test("resumes projected pre-receipt remote authority without a local committed epoch", async () => {

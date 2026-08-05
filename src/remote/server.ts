@@ -119,24 +119,10 @@ interface RemoteServerDeps {
   leaseSweepIntervalMs?: number;
 }
 
-interface RemoteServerInstance {
+export interface RemoteServerInstance {
   port: number;
   token: string;
   close(): Promise<void>;
-}
-
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 const ARTIFACT_PROTOCOL_VERSION = 1;
@@ -443,7 +429,7 @@ export async function createRemoteServer(
       }
     }
   });
-  const listenDeferred = createDeferred<void>();
+  const listenDeferred = Promise.withResolvers<void>();
   const rejectListen = (error: Error) => listenDeferred.reject(error);
   server.once("error", rejectListen);
   try {
@@ -459,7 +445,7 @@ export async function createRemoteServer(
 
   const address = server.address();
   if (!address || typeof address === "string") {
-    const closeDeferred = createDeferred<void>();
+    const closeDeferred = Promise.withResolvers<void>();
     server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
     await closeDeferred.promise.catch(() => undefined);
     await controllerLock.release().catch(() => undefined);
@@ -467,7 +453,7 @@ export async function createRemoteServer(
   }
   const leaseSweepIntervalMs = deps.leaseSweepIntervalMs ?? 30_000;
   if (!Number.isSafeInteger(leaseSweepIntervalMs) || leaseSweepIntervalMs <= 0) {
-    const closeDeferred = createDeferred<void>();
+    const closeDeferred = Promise.withResolvers<void>();
     server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
     await closeDeferred.promise.catch(() => undefined);
     await controllerLock.release().catch(() => undefined);
@@ -505,15 +491,15 @@ export async function createRemoteServer(
         browserWorkBusy = true;
         try {
           for (const transactionToken of transactionCoordinator.activeTransactionTokens()) {
-            const record = await transactionStore.read(transactionToken);
-            if (!record) {
-              throw new Error("Remote server has live browser authority without a durable record");
+            const shutdown = await transactionStore.prepareControllerShutdown(transactionToken);
+            if (shutdown.action !== "settle") {
+              activeTransactions.delete(transactionToken);
+              continue;
             }
-            const mode = record.settlementMode ?? "abort";
             const outcome = await transactionCoordinator.settle({
               transactionToken,
-              mode,
-              durablePublication: mode === "finalize" && Boolean(record.publicationAcknowledgedAt),
+              mode: shutdown.mode,
+              durablePublication: shutdown.durablePublication,
             });
             if (outcome.finalization.status !== "completed") {
               throw new Error(
@@ -528,7 +514,7 @@ export async function createRemoteServer(
           throw new Error("Remote server cannot close while live transaction authority remains");
         }
         clearInterval(leaseSweepTimer);
-        const closeDeferred = createDeferred<void>();
+        const closeDeferred = Promise.withResolvers<void>();
         server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
         await closeDeferred.promise;
         closed = true;
@@ -1667,7 +1653,7 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
     manualLoginDefault: preferManualLogin,
     manualLoginProfileDir: manualProfileDir,
   });
-  const shutdownDeferred = createDeferred<void>();
+  const shutdownDeferred = Promise.withResolvers<void>();
   const shutdown = () => {
     console.log("Shutting down remote service...");
     server

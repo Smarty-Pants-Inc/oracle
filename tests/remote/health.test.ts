@@ -2,22 +2,9 @@ import http from "node:http";
 import { describe, expect, it } from "vitest";
 import { checkRemoteHealth } from "../../src/remote/health.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((onResolve, onReject) => {
-    resolve = onResolve;
-    reject = onReject;
-  });
-  return { promise, resolve, reject };
-}
 
 async function listen(server: http.Server): Promise<number> {
-  const { promise, resolve, reject } = createDeferred<number>();
+  const { promise, resolve, reject } = Promise.withResolvers<number>();
   server.once("error", reject);
   server.listen(0, "127.0.0.1", () => {
     const address = server.address();
@@ -28,7 +15,7 @@ async function listen(server: http.Server): Promise<number> {
 }
 
 async function close(server: http.Server): Promise<void> {
-  const { promise, resolve, reject } = createDeferred<void>();
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
   server.close((error) => (error ? reject(error) : resolve()));
   await promise;
 }

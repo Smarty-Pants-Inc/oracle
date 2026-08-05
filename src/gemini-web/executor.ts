@@ -3,15 +3,15 @@ import type {
   BrowserRunOptions,
   BrowserRunResult,
   BrowserRunTransaction,
-  BrowserCaptureFinalizationResult,
   BrowserLogger,
   CookieParam,
 } from "../browser/types.js";
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderDomFlow } from "../browser/providerDomFlow.js";
 import {
-  bindBrowserCaptureCleanupSettlement,
+  BrowserCaptureSettlementController,
   completedBrowserCaptureCleanup,
+  createBrowserRunTransaction,
   markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
 } from "../browser/runLifecycle.js";
@@ -99,66 +99,43 @@ async function settleGeminiSessions(sessions: GeminiBrowserSession[]): Promise<s
 async function createGeminiBrowserTransaction(
   result: BrowserRunResult,
   sessions: GeminiBrowserSession[],
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
 ): Promise<BrowserRunTransaction> {
   if (sessions.length === 0) return createSettledGeminiTransaction(result);
 
-  const initialError = await settleGeminiSessions(sessions);
-  if (!initialError) {
-    return createSettledGeminiTransaction(result, combineGeminiSessionRuntime(sessions));
+  const pendingRuntime = markBrowserCaptureCleanupPending(combineGeminiSessionRuntime(sessions));
+  try {
+    await persistRuntime?.(pendingRuntime);
+  } catch (cause) {
+    throw new BrowserAutomationError(
+      "Failed to durably persist Gemini browser cleanup authority before returning capture.",
+      {
+        stage: "gemini-browser-publication",
+        code: "gemini-browser-runtime-persistence-failed",
+        runtime: pendingRuntime,
+      },
+      cause,
+    );
   }
 
-  let currentRuntime = pendingBrowserCaptureCleanup(
-    combineGeminiSessionRuntime(sessions),
-    initialError,
-  ).runtime;
-  let boundMode: "finalize" | "abort" | null = null;
-  let inFlight: Promise<BrowserCaptureFinalizationResult> | null = null;
-  let completed: BrowserCaptureFinalizationResult | null = null;
-
-  const settle = (mode: "finalize" | "abort"): Promise<BrowserCaptureFinalizationResult> => {
-    if (boundMode && boundMode !== mode) {
-      return Promise.reject(
-        new BrowserAutomationError(
-          `Gemini browser transaction is already bound to ${boundMode}; ${mode} is not allowed.`,
-          { stage: "browser-run-lifecycle", code: "settlement-mode-conflict" },
-        ),
-      );
-    }
-    boundMode ??= mode;
-    if (completed) return Promise.resolve(completed);
-    if (inFlight) return inFlight;
-
-    currentRuntime = markBrowserCaptureCleanupPending(combineGeminiSessionRuntime(sessions), mode);
-    inFlight = settleGeminiSessions(sessions)
-      .then((error) =>
-        error
+  const settlement = new BrowserCaptureSettlementController(
+    {
+      persistRuntime: persistRuntime ? async (runtime) => persistRuntime(runtime) : undefined,
+      settleResources: async (mode) => {
+        const error = await settleGeminiSessions(sessions);
+        const runtime = combineGeminiSessionRuntime(sessions);
+        return error
           ? pendingBrowserCaptureCleanup(
-              markBrowserCaptureCleanupPending(combineGeminiSessionRuntime(sessions), mode),
+              markBrowserCaptureCleanupPending(runtime, mode),
               error,
               mode,
             )
-          : completedBrowserCaptureCleanup(combineGeminiSessionRuntime(sessions)),
-      )
-      .then((outcome) => bindBrowserCaptureCleanupSettlement(outcome, mode))
-      .then((outcome) => {
-        currentRuntime = outcome.runtime;
-        if (outcome.status === "completed") completed = outcome;
-        return outcome;
-      })
-      .finally(() => {
-        inFlight = null;
-      });
-    return inFlight;
-  };
-
-  return {
-    ...result,
-    get runtime() {
-      return currentRuntime;
+          : completedBrowserCaptureCleanup(runtime);
+      },
     },
-    finalize: () => settle("finalize"),
-    abort: () => settle("abort"),
-  };
+    pendingRuntime,
+  );
+  return createBrowserRunTransaction(result, settlement);
 }
 
 async function throwAfterGeminiSessionCleanup(
@@ -322,7 +299,11 @@ async function runGeminiDeepThinkViaBrowser(
     await Page.enable();
 
     const evaluate = async <T>(expression: string): Promise<T | undefined> => {
-      const evaluation = await Runtime.evaluate({ expression, returnByValue: true });
+      const evaluation = await Runtime.evaluate({
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+      });
       if (evaluation.exceptionDetails) {
         const detail =
           evaluation.exceptionDetails.exception?.description ??
@@ -525,6 +506,7 @@ export function createGeminiWebExecutor(
             answerChars: browserResult.text.length,
           },
           [browserResult.cleanupSession],
+          runOptions.runtimeHintCb,
         );
       },
     };
@@ -679,6 +661,7 @@ export function createGeminiWebExecutor(
             answerChars: answerText.length,
           },
           cookieResult.cleanupSession ? [cookieResult.cleanupSession] : [],
+          runOptions.runtimeHintCb,
         );
       },
     };

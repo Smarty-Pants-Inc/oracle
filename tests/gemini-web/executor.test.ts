@@ -6,6 +6,8 @@ import type {
   OracleChromeOwnerRecord,
   RecordedChromeTerminationOutcome,
 } from "../../src/browser/profileState.js";
+import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 
 const {
   launchChrome,
@@ -57,47 +59,48 @@ const {
   teardownState: { leaseReleased: false },
 }));
 
-const runGeminiWebWithFallback = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({
-  rawResponseText: "",
-  text: "ok",
-  thoughts: "thinking",
-  metadata: { cid: "1" },
-  images: [],
-  effectiveModel: "gemini-3.1-pro",
-}));
-
-const saveFirstGeminiImageFromOutput = vi.fn<(...args: unknown[]) => Promise<unknown>>(
-  async () => ({
+const { runGeminiWebWithFallback, saveFirstGeminiImageFromOutput } = vi.hoisted(() => ({
+  runGeminiWebWithFallback: vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({
+    rawResponseText: "",
+    text: "ok",
+    thoughts: "thinking",
+    metadata: { cid: "1" },
+    images: [],
+    effectiveModel: "gemini-3.1-pro",
+  })),
+  saveFirstGeminiImageFromOutput: vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({
     saved: true,
     imageCount: 1,
-  }),
-);
+  })),
+}));
 
 vi.mock("../../src/gemini-web/client.js", () => ({
   runGeminiWebWithFallback,
   saveFirstGeminiImageFromOutput,
 }));
 
-const getCookies = vi.fn(async () => ({
-  cookies: [
-    {
-      name: "__Secure-1PSID",
-      value: "psid",
-      domain: "google.com",
-      path: "/",
-      secure: true,
-      httpOnly: true,
-    },
-    {
-      name: "__Secure-1PSIDTS",
-      value: "psidts",
-      domain: "google.com",
-      path: "/",
-      secure: true,
-      httpOnly: true,
-    },
-  ],
-  warnings: [] as string[],
+const { getCookies } = vi.hoisted(() => ({
+  getCookies: vi.fn(async () => ({
+    cookies: [
+      {
+        name: "__Secure-1PSID",
+        value: "psid",
+        domain: "google.com",
+        path: "/",
+        secure: true,
+        httpOnly: true,
+      },
+      {
+        name: "__Secure-1PSIDTS",
+        value: "psidts",
+        domain: "google.com",
+        path: "/",
+        secure: true,
+        httpOnly: true,
+      },
+    ],
+    warnings: [] as string[],
+  })),
 }));
 vi.mock("@steipete/sweet-cookie", () => ({ getCookies }));
 vi.mock("../../src/browser/chromeLifecycle.js", () => ({
@@ -236,10 +239,16 @@ describe("gemini-web executor", () => {
           },
         };
       }
-      if (source.includes("userQueryCount: document.querySelectorAll")) {
+      if (source.includes("beforeUserCount")) {
         return {
           result: {
-            value: JSON.stringify({ userQueryCount: 0, responseCount: 0 }),
+            value: JSON.stringify({
+              userQueryCount: 0,
+              responseCount: 0,
+              sendResult: "clicked",
+              bindingStatus: "bound",
+              userStableId: "data-message-id:user-current",
+            }),
           },
         };
       }
@@ -247,18 +256,7 @@ describe("gemini-web executor", () => {
         return { result: { value: "clicked" } };
       }
       if (source.includes("beforeUserTurns")) {
-        const nonceLiteral = source.match(/value:\s*("oracle-gemini-[^"]+")/)?.[1];
-        const boundNonce = nonceLiteral ? JSON.parse(nonceLiteral) : null;
-        return {
-          result: {
-            value: JSON.stringify({
-              userQueryCount: 0,
-              responseCount: 0,
-              sendResult: "clicked",
-              boundNonce,
-            }),
-          },
-        };
+        throw new Error("Gemini submission must not use synchronous expando binding.");
       }
       if (source.includes("const ordered =")) {
         return {
@@ -269,12 +267,13 @@ describe("gemini-web executor", () => {
                   kind: "user",
                   postBaseline: true,
                   text: "hello",
-                  boundToDispatch: true,
+                  stableId: "data-message-id:user-current",
                 },
                 {
                   kind: "response",
                   postBaseline: true,
                   text: "deep-think answer",
+                  stableId: "data-message-id:response-current",
                   completionMarked: true,
                   visibleSpinner: false,
                 },
@@ -307,10 +306,10 @@ describe("gemini-web executor", () => {
         };
       }
       if (source.includes("thoughts-header-button") && source.includes("click")) {
-        return { result: { value: "no-toggle" } };
+        return { result: { value: { status: "no-toggle" } } };
       }
       if (source.includes("model-thoughts") && source.includes("textContent")) {
-        return { result: { value: "" } };
+        return { result: { value: { status: "empty", text: "" } } };
       }
       return { result: { value: null } };
     });
@@ -341,7 +340,6 @@ describe("gemini-web executor", () => {
   });
 
   it("builds a generate-image prompt with aspect ratio and passes attachments", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-exec-"));
     const outPath = path.join(tempDir, "gen.jpg");
 
@@ -375,7 +373,6 @@ describe("gemini-web executor", () => {
   });
 
   it("runs the edit flow as two calls and uses intro metadata", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-exec-"));
     const inPath = path.join(tempDir, "in.png");
     const outPath = path.join(tempDir, "out.jpg");
@@ -427,7 +424,6 @@ describe("gemini-web executor", () => {
   });
 
   it("uses chromeCookiePath when provided", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
     await exec({
       prompt: "hello",
@@ -441,7 +437,6 @@ describe("gemini-web executor", () => {
   });
 
   it("uses inline cookies when cookie sync is disabled", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
     await exec({
       prompt: "hello",
@@ -468,7 +463,6 @@ describe("gemini-web executor", () => {
       ],
     }));
 
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
 
     await expect(
@@ -483,13 +477,23 @@ describe("gemini-web executor", () => {
     );
   });
 
-  it("uses DOM automation for gemini deep-think without keychain cookie reads", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
+  it("returns recoverable pending authority before teardown and persists finalize mode first", async () => {
+    const events: string[] = [];
+    closeTab.mockImplementationOnce(async () => {
+      events.push("close-target");
+      return true;
+    });
+    const runtimeHintCb = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
+      events.push(
+        `persist:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}:${runtime.recoveryCleanupResult?.status}`,
+      );
+    });
     const exec = createGeminiWebExecutor({});
     const result = await exec({
       prompt: "hello",
       attachments: [],
       config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      runtimeHintCb,
       log: () => {},
     });
 
@@ -497,11 +501,23 @@ describe("gemini-web executor", () => {
     expect(getCookies).not.toHaveBeenCalled();
     expect(launchChrome).toHaveBeenCalled();
     expect(connectWithNewTab).toHaveBeenCalled();
-    expect(closeTab).toHaveBeenCalled();
     expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
+    expect(result.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
+    expect(result.runtime.recoveryCleanupResources?.[0]?.chromeTargetId).toBe("target-1");
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(killChrome).not.toHaveBeenCalled();
+    expect(events).toEqual(["persist:unbound:pending"]);
+    expect(runtimeEvaluate).toHaveBeenCalledWith(
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+    );
+
+    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+    expect(events).toEqual(["persist:unbound:pending", "persist:finalize:pending", "close-target"]);
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects Chrome evaluation exceptions from Deep Think DOM automation", async () => {
+  it("rejects Chrome evaluation exceptions and cleans up the unpublished session", async () => {
     runtimeEvaluate.mockResolvedValueOnce({
       result: { type: "object", subtype: "error" },
       exceptionDetails: {
@@ -509,7 +525,6 @@ describe("gemini-web executor", () => {
         exception: { description: "ReferenceError: visibleSpinners is not defined" },
       },
     });
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
 
     await expect(
@@ -525,7 +540,55 @@ describe("gemini-web executor", () => {
     expect(closeTab).toHaveBeenCalled();
   });
 
-  it("returns retryable cleanup authority when launched-owner teardown is temporarily unsafe", async () => {
+  it("returns runtime authority without teardown when pre-return persistence crashes", async () => {
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+        runtimeHintCb: async () => {
+          throw new Error("session store unavailable");
+        },
+        log: () => {},
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        code: "gemini-browser-runtime-persistence-failed",
+        runtime: {
+          recoveryCleanupResult: { status: "pending" },
+          recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "target-1" })],
+        },
+      },
+    });
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(killChrome).not.toHaveBeenCalled();
+  });
+
+  it("binds abort mode and rejects later finalize without duplicate teardown", async () => {
+    const exec = createGeminiWebExecutor({});
+    const result = await exec({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      log: () => {},
+    });
+
+    expect(closeTab).not.toHaveBeenCalled();
+    await expect(result.abort()).resolves.toMatchObject({ status: "completed" });
+    await expect(result.finalize()).rejects.toMatchObject({
+      details: {
+        code: "browser-run-lifecycle-settlement-conflict",
+        requestedMode: "finalize",
+        boundMode: "abort",
+      },
+    });
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries cleanup only through the bound finalizer when teardown is temporarily unsafe", async () => {
     killChrome
       .mockResolvedValueOnce({ status: "unsafe", pid: 12345, reason: "termination failed" })
       .mockResolvedValueOnce({ status: "stopped", pid: 12345, signal: "CONTROL_CHANNEL" });
@@ -540,7 +603,6 @@ describe("gemini-web executor", () => {
         expect(await teardown()).toBe(true);
         return { status: "completed", disposition: "teardown-completed" };
       });
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
 
     const result = await exec({
@@ -550,9 +612,11 @@ describe("gemini-web executor", () => {
       log: () => {},
     });
 
-    expect(result.answerText).toBe("deep-think answer");
-    expect(result.runtime.recoveryCleanupResult).toMatchObject({ status: "failed" });
-    expect(result.runtime.recoveryCleanupResources?.[0]?.tabLease).toBeUndefined();
+    expect(result.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
+    expect(killChrome).not.toHaveBeenCalled();
+
+    const first = await result.finalize();
+    expect(first).toMatchObject({ status: "pending" });
     expect(killChrome).toHaveBeenCalledTimes(1);
 
     await expect(result.finalize()).resolves.toMatchObject({ status: "pending" });
@@ -564,7 +628,6 @@ describe("gemini-web executor", () => {
   });
 
   it("falls back to HTTP/header path for gemini deep-think when attachments are present", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
     await exec({
       prompt: "summarize this file",
@@ -583,15 +646,16 @@ describe("gemini-web executor", () => {
   });
 
   it("keeps the launched browser alive when Deep Think uses the keep-browser default", async () => {
-    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
     const exec = createGeminiWebExecutor({});
-    await exec({
+    const result = await exec({
       prompt: "hello",
       attachments: [],
       config: { desiredModel: "gemini-3-deep-think" },
       log: () => {},
     });
 
+    expect(closeTab).not.toHaveBeenCalled();
+    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
     expect(closeTab).toHaveBeenCalledWith(9222, "target-1", expect.any(Function), "127.0.0.1");
     expect(killChrome).not.toHaveBeenCalled();
   });

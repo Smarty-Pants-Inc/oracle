@@ -32,19 +32,6 @@ function committedPromptEpoch(prompt: string) {
     conversationId: "conversation-1",
   };
 }
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((onResolve, onReject) => {
-    resolve = onResolve;
-    reject = onReject;
-  });
-  return { promise, resolve, reject };
-}
 
 function runTransactionToken(req: http.IncomingMessage): string | null {
   if (req.method !== "POST") return null;
@@ -52,7 +39,7 @@ function runTransactionToken(req: http.IncomingMessage): string | null {
 }
 
 async function listen(server: http.Server): Promise<number> {
-  const { promise, resolve, reject } = createDeferred<number>();
+  const { promise, resolve, reject } = Promise.withResolvers<number>();
   server.once("error", reject);
   server.listen(0, "127.0.0.1", () => {
     const address = server.address();
@@ -64,7 +51,7 @@ async function listen(server: http.Server): Promise<number> {
 
 async function close(server: http.Server): Promise<void> {
   server.closeAllConnections();
-  const { promise, resolve, reject } = createDeferred<void>();
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
   server.close((error) => (error ? reject(error) : resolve()));
   await promise;
 }
@@ -338,6 +325,39 @@ describe("remote client transport deadlines", () => {
       });
       expect(persistedRuntimes[0]).not.toHaveProperty("remoteRecovery");
       expect(persistedRuntimes[0]).not.toHaveProperty("recoveryCleanupResult");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("rejects explicit tab authority before remote persistence or request dispatch", async () => {
+    let requests = 0;
+    const runtimeHintCb = vi.fn();
+    const server = http.createServer((_req, res) => {
+      requests += 1;
+      res.statusCode = 500;
+      res.end();
+    });
+    const port = await listen(server);
+    const remoteHost = `127.0.0.1:${port}`;
+    try {
+      await expect(
+        createRemoteBrowserExecutor({ host: remoteHost, token: "secret", deadlines })({
+          prompt: "must preserve explicit target authority",
+          config: { browserTabRef: "explicit-target" },
+          runtimeHintCb,
+        }),
+      ).rejects.toMatchObject({
+        name: "BrowserAutomationError",
+        details: {
+          stage: "remote-request",
+          code: "explicit-browser-tab-unsupported",
+          browserTabRef: "explicit-target",
+          remoteHost,
+        },
+      });
+      expect(runtimeHintCb).not.toHaveBeenCalled();
+      expect(requests).toBe(0);
     } finally {
       await close(server);
     }
@@ -774,6 +794,84 @@ describe("remote client transport deadlines", () => {
       expect(events).not.toContain("network:abort");
       await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
       expect(events.filter((event) => event === "network:finalize")).toHaveLength(2);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("retries settlement authority persistence before any finalize request", async () => {
+    const events: string[] = [];
+    let settlementPersistenceAttempts = 0;
+    const prompt = "settlement persistence retry";
+    const server = http.createServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (transactionToken) {
+        const request = await readJson(req);
+        res.setHeader("content-type", "application/x-ndjson");
+        res.end(`${JSON.stringify(transactionEvent(transactionToken, String(request.prompt)))}\n`);
+        return;
+      }
+      const settlement = /^\/transactions\/([a-f0-9]{64})\/(finalize|abort)$/u.exec(req.url ?? "");
+      if (settlement) {
+        await readJson(req);
+        events.push(`network:${settlement[2]}`);
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            transactionToken: settlement[1],
+            state: settlement[2] === "finalize" ? "finalized" : "aborted",
+            finalization: {
+              status: "completed",
+              runtime: {
+                promptEpoch: committedPromptEpoch(prompt),
+                cleanup: { status: "completed" },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    try {
+      const transaction = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "secret",
+        deadlines,
+      })({
+        prompt,
+        config: {},
+        runtimeHintCb: async (runtime) => {
+          const mode = runtime.recoveryCleanupResult?.settlementMode;
+          if (!mode) return;
+          settlementPersistenceAttempts += 1;
+          events.push(`persist:${mode}:${settlementPersistenceAttempts}`);
+          if (settlementPersistenceAttempts === 1) {
+            throw new Error("metadata fsync failed");
+          }
+        },
+      });
+
+      await expect(transaction.finalize()).rejects.toMatchObject({
+        name: "BrowserAutomationError",
+        details: {
+          stage: "remote-runtime-persistence",
+          code: "settlement-authority-persistence-failed",
+          recoverableDisconnect: true,
+        },
+      });
+      expect(transaction.runtime.recoveryCleanupResult).not.toHaveProperty("settlementMode");
+      expect(events).toEqual(["persist:finalize:1"]);
+
+      await expect(transaction.abort()).rejects.toMatchObject({
+        details: { code: "settlement-mode-conflict" },
+      });
+      expect(events).toEqual(["persist:finalize:1"]);
+
+      await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(events).toEqual(["persist:finalize:1", "persist:finalize:2", "network:finalize"]);
     } finally {
       await close(server);
     }

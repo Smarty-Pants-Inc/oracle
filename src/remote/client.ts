@@ -83,20 +83,6 @@ interface RequestDeadlineGuard {
   watchResponse: (res: http.IncomingMessage) => void;
 }
 
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
 class RemoteTransportInterruption extends Error {
   constructor(
     message: string,
@@ -175,6 +161,18 @@ export function createRemoteBrowserExecutor({ host, token, deadlines }: RemoteEx
   return async function remoteBrowserExecutor(
     options: BrowserRunOptions,
   ): Promise<BrowserRunTransaction> {
+    const explicitTabRef = options.config?.browserTabRef?.trim();
+    if (explicitTabRef) {
+      throw new BrowserAutomationError(
+        `Explicit browser tab ${explicitTabRef} cannot be combined with remote browser execution because the remote protocol cannot carry exact tab authority.`,
+        {
+          stage: "remote-request",
+          code: "explicit-browser-tab-unsupported",
+          browserTabRef: explicitTabRef,
+          remoteHost: host,
+        },
+      );
+    }
     if (options.prompt.length > MAX_REMOTE_PROMPT_CHARS) {
       throw new BrowserAutomationError("Remote browser prompt exceeds the protocol size limit.", {
         stage: "remote-request",
@@ -470,7 +468,7 @@ async function streamRemoteRun(params: {
       transactionToken: params.transactionToken,
     });
   }
-  const deferred = createDeferred<RemoteRunTransactionPayload>();
+  const deferred = Promise.withResolvers<RemoteRunTransactionPayload>();
   let settled = false;
   let receipt: RemoteRunTransactionPayload | null = null;
   let terminalError: BrowserAutomationError | null = null;
@@ -899,7 +897,8 @@ async function buildRemoteBrowserTransaction(params: {
         }
       : null;
   let runtime = projectRemoteRuntime(params.receipt.runtime, remoteRecovery);
-  if (params.settlementMode) runtime = bindRemoteSettlementMode(runtime, params.settlementMode);
+  let selectedSettlementMode = params.settlementMode;
+  if (selectedSettlementMode) runtime = bindRemoteSettlementMode(runtime, selectedSettlementMode);
   let requiredArtifactDeliveryComplete = !params.receipt.artifacts.some(
     (descriptor) => descriptor.required,
   );
@@ -907,19 +906,19 @@ async function buildRemoteBrowserTransaction(params: {
   let settlementInFlight: Promise<BrowserCaptureFinalizationResult> | null = null;
   let completedSettlement: BrowserCaptureFinalizationResult | null = null;
   const settle = async (mode: "finalize" | "abort"): Promise<BrowserCaptureFinalizationResult> => {
-    const persistedMode = runtime.recoveryCleanupResult?.settlementMode;
-    if (persistedMode && persistedMode !== mode) {
-      throw settlementModeConflict(mode, persistedMode, runtime);
+    const authoritativeMode =
+      runtime.recoveryCleanupResult?.settlementMode ?? selectedSettlementMode;
+    if (authoritativeMode && authoritativeMode !== mode) {
+      throw settlementModeConflict(mode, authoritativeMode, runtime);
     }
     if (completedSettlement) return completedSettlement;
     if (settlementInFlight) return settlementInFlight;
     const attempt = (async (): Promise<BrowserCaptureFinalizationResult> => {
       const boundRuntime = bindRemoteSettlementMode(runtime, mode);
       if (boundRuntime !== runtime) {
-        runtime = boundRuntime;
-        transaction.runtime = runtime;
+        selectedSettlementMode ??= mode;
         try {
-          await params.options.runtimeHintCb?.(runtime, params.receipt.result.modelSelection);
+          await params.options.runtimeHintCb?.(boundRuntime, params.receipt.result.modelSelection);
         } catch (error) {
           throw new BrowserAutomationError(
             `Failed to persist remote ${mode} authority before settlement.`,
@@ -932,6 +931,8 @@ async function buildRemoteBrowserTransaction(params: {
             error,
           );
         }
+        runtime = boundRuntime;
+        transaction.runtime = runtime;
       }
       const finalization = await settleRemoteBrowserTransaction({
         hostname: params.hostname,
@@ -1287,7 +1288,7 @@ async function postRemoteJson(params: {
   operation: string;
 }): Promise<RemoteJsonResponse> {
   const body = Buffer.from(JSON.stringify(params.body));
-  const deferred = createDeferred<RemoteJsonResponse>();
+  const deferred = Promise.withResolvers<RemoteJsonResponse>();
   let deadlineGuard: RequestDeadlineGuard | null = null;
   const resolve = (response: RemoteJsonResponse) => {
     deadlineGuard?.clear();
@@ -1471,7 +1472,7 @@ async function downloadArtifactToFile(params: {
   descriptor: RemoteArtifactDescriptor;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<void> {
-  const deferred = createDeferred<void>();
+  const deferred = Promise.withResolvers<void>();
   let deadlineGuard: RequestDeadlineGuard | null = null;
   const resolve = () => {
     deadlineGuard?.clear();

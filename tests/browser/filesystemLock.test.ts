@@ -246,6 +246,14 @@ describe("crash-recoverable filesystem lock", () => {
     const replacementPrepared = new Promise<void>((resolve) => {
       markReplacementPrepared = resolve;
     });
+    let resumeReplacementTicket!: () => void;
+    const allowReplacementTicket = new Promise<void>((resolve) => {
+      resumeReplacementTicket = resolve;
+    });
+    let markReplacementRequestPublished!: () => void;
+    const replacementRequestPublished = new Promise<void>((resolve) => {
+      markReplacementRequestPublished = resolve;
+    });
     let quarantinedPath: string | undefined;
     let reclaimerLock: CrashRecoverableFilesystemLock | undefined;
     let replacement: CrashRecoverableFilesystemLock | undefined;
@@ -307,9 +315,14 @@ describe("crash-recoverable filesystem lock", () => {
           beforeLockPublication: async () => {
             markReplacementPrepared();
           },
+          beforeMutationRequestTicketPublication: async () => {
+            markReplacementRequestPublished();
+            await allowReplacementTicket;
+          },
         },
       );
       await replacementPrepared;
+      await replacementRequestPublished;
       await vi.waitFor(
         async () => {
           const requests = (await readdir(mutationRootPath)).filter((entry) =>
@@ -343,6 +356,7 @@ describe("crash-recoverable filesystem lock", () => {
       );
       expect(releaseSettled).toBe(false);
 
+      resumeReplacementTicket();
       resumeAfterQuarantine();
       reclaimerLock = await reclaimer;
       await expect(releaseAttempt).rejects.toThrow(/ownership changed/i);
@@ -351,21 +365,54 @@ describe("crash-recoverable filesystem lock", () => {
         "injected mutation request cleanup failure",
       );
       expect(reclaimerRemovalAttempts).toBe(1);
-      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      replacement = await replacementAcquire;
+      const replacementOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
+      expect(JSON.parse(replacementOwnerRaw)).toMatchObject({
+        ownerNonce: replacement.owner.ownerNonce,
+        pid: replacementPid,
+      });
+      const requestsAfterFailedCleanup = await readdir(mutationRootPath);
+      const activeRequestsAfterFailedCleanup = requestsAfterFailedCleanup.filter(
+        (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+      );
+      expect(activeRequestsAfterFailedCleanup).toHaveLength(1);
       expect(
-        (await readdir(mutationRootPath)).filter((entry) => entry.startsWith("request-")),
-      ).toHaveLength(2);
+        JSON.parse(
+          await readFile(
+            path.join(mutationRootPath, activeRequestsAfterFailedCleanup[0]!, "owner.json"),
+            "utf8",
+          ),
+        ),
+      ).toMatchObject({ pid: replacementPid });
+      const quarantinedRequestsAfterFailedCleanup = requestsAfterFailedCleanup.filter(
+        (entry) => entry.startsWith("request-") && entry.includes(".stale-"),
+      );
+      expect(quarantinedRequestsAfterFailedCleanup).toHaveLength(1);
+      expect(
+        JSON.parse(
+          await readFile(
+            path.join(mutationRootPath, quarantinedRequestsAfterFailedCleanup[0]!, "owner.json"),
+            "utf8",
+          ),
+        ),
+      ).toMatchObject({ pid: reclaimerPid });
 
       await expect(reclaimerLock.release()).resolves.toBeUndefined();
       expect(reclaimerRemovalAttempts).toBe(2);
+      await expect(readFile(path.join(lockPath, "owner.json"), "utf8")).resolves.toBe(
+        replacementOwnerRaw,
+      );
+      expect(
+        (await readdir(mutationRootPath)).filter(
+          (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+        ),
+      ).toEqual(activeRequestsAfterFailedCleanup);
       await expect(reclaimerLock.release()).resolves.toBeUndefined();
       expect(reclaimerRemovalAttempts).toBe(2);
       reclaimerLock = undefined;
 
-      replacement = await replacementAcquire;
-      const observedOwner = JSON.parse(
-        await readFile(path.join(lockPath, "owner.json"), "utf8"),
-      ) as { ownerNonce: string };
+      const observedOwner = JSON.parse(replacementOwnerRaw) as { ownerNonce: string };
       expect(observedOwner.ownerNonce).toBe(replacement.owner.ownerNonce);
       expect(
         (await readdir(root)).filter(
@@ -380,6 +427,7 @@ describe("crash-recoverable filesystem lock", () => {
       expect(await readdir(mutationRootPath)).toEqual([]);
     } finally {
       resumeBeforeQuarantine();
+      resumeReplacementTicket();
       resumeAfterQuarantine();
       await Promise.allSettled(
         [reclaimer, replacementAcquire, releaseAttempt].filter(Boolean) as Promise<unknown>[],
@@ -765,7 +813,9 @@ describe("crash-recoverable filesystem lock", () => {
           beforeMutationRequestRemoval: async () => {
             cleanupAttempts += 1;
             if (cleanupAttempts === 1) {
-              throw new Error("injected timed-out request cleanup failure");
+              throw Object.assign(new Error("injected transient request cleanup failure"), {
+                code: "EINTR",
+              });
             }
             markCleanupBlocked();
             await allowCleanup;
@@ -803,6 +853,111 @@ describe("crash-recoverable filesystem lock", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  for (const code of ["EACCES", "EROFS"] as const) {
+    test(`surfaces persistent ${code} cleanup after hiding only its exact request`, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+      const lockPath = path.join(root, "recovery.lock");
+      const mutationRootPath = `${lockPath}.mutations`;
+      const originalPid = 56_056;
+      const blockerPid = 57_057;
+      const contenderPid = 58_058;
+      let resumeBlocker!: () => void;
+      const allowBlocker = new Promise<void>((resolve) => {
+        resumeBlocker = resolve;
+      });
+      let markBlockerReady!: () => void;
+      const blockerReady = new Promise<void>((resolve) => {
+        markBlockerReady = resolve;
+      });
+      let blockerLock: CrashRecoverableFilesystemLock | undefined;
+      let cleanupAttempts = 0;
+      const identities: Record<number, string> = {
+        [originalPid]: "original-start",
+        [blockerPid]: "blocker-start",
+        [contenderPid]: "contender-start",
+      };
+      await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            originalPid,
+            async (pid) => identities[pid] ?? null,
+          ),
+        },
+      );
+      const blocker = acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: createProcessIdentityProvider(blockerPid, async (pid) =>
+            pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          ),
+          beforeStaleLockQuarantine: async () => {
+            markBlockerReady();
+            await allowBlocker;
+          },
+        },
+      );
+
+      try {
+        await blockerReady;
+        const activeBefore = (await readdir(mutationRootPath)).filter(
+          (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+        );
+        expect(activeBefore).toHaveLength(1);
+
+        await expect(
+          acquireCrashRecoverableFilesystemLock(
+            lockPath,
+            { timeoutMs: 20, pollMs: 10 },
+            {
+              processIdentityProvider: createProcessIdentityProvider(contenderPid, async (pid) =>
+                pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+              ),
+              beforeMutationRequestRemoval: async () => {
+                cleanupAttempts += 1;
+                throw Object.assign(new Error(`persistent cleanup ${code}`), { code });
+              },
+            },
+          ),
+        ).rejects.toMatchObject({ code });
+        expect(cleanupAttempts).toBe(1);
+
+        const entries = await readdir(mutationRootPath);
+        const activeAfter = entries.filter(
+          (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+        );
+        expect(activeAfter).toEqual(activeBefore);
+        expect(
+          JSON.parse(
+            await readFile(path.join(mutationRootPath, activeAfter[0]!, "owner.json"), "utf8"),
+          ),
+        ).toMatchObject({ pid: blockerPid });
+
+        const quarantined = entries.filter(
+          (entry) => entry.startsWith("request-") && entry.includes(".stale-"),
+        );
+        expect(quarantined).toHaveLength(1);
+        expect(
+          JSON.parse(
+            await readFile(path.join(mutationRootPath, quarantined[0]!, "owner.json"), "utf8"),
+          ),
+        ).toMatchObject({ pid: contenderPid });
+
+        resumeBlocker();
+        blockerLock = await blocker;
+        await blockerLock.release();
+        blockerLock = undefined;
+      } finally {
+        resumeBlocker();
+        await blocker.catch(() => undefined);
+        await blockerLock?.release().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("does not reclaim a live owner when process-start identity lookup is ambiguous", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));

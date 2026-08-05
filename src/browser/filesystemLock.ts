@@ -14,6 +14,7 @@ const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
 const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
+const LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS = 1_000;
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
 const execFileAsync = promisify(execFile);
@@ -549,14 +550,33 @@ async function writeFilesystemLockMutationTicket(
   const ticket = maximumTicket + 1;
   const ticketPath = path.join(requestPath, LOCK_MUTATION_TICKET_FILENAME);
   const preparedTicketPath = `${ticketPath}.preparing`;
-  const handle = await open(preparedTicketPath, "wx", 0o600);
+  let handle;
+  try {
+    handle = await open(preparedTicketPath, "wx", 0o600);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") {
+      throw new Error(`Filesystem lock mutation ownership changed at ${requestPath}`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
   try {
     await handle.writeFile(`${ticket}\n`, "utf8");
   } finally {
     await handle.close();
   }
   await beforePublication?.(requestPath, ticket);
-  await renameLockPath(preparedTicketPath, ticketPath);
+  try {
+    await renameLockPath(preparedTicketPath, ticketPath);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") {
+      throw new Error(`Filesystem lock mutation ownership changed at ${requestPath}`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
   return ticket;
 }
 
@@ -637,13 +657,17 @@ async function removeFilesystemLockMutationRequestBeforeReturning(
   state: FilesystemLockMutationRequestRemovalState,
   options: FilesystemLockMutationOptions,
 ): Promise<void> {
+  const deadline = Date.now() + LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS;
   for (;;) {
     try {
       await removeFilesystemLockMutationRequest(state, options);
       return;
-    } catch {
-      await delay(options.pollMs);
+    } catch (error) {
+      if (!isRetryableFilesystemLockMutationCleanupError(error) || Date.now() >= deadline) {
+        throw error;
+      }
     }
+    await delay(Math.min(options.pollMs, Math.max(1, deadline - Date.now())));
   }
 }
 
@@ -652,7 +676,6 @@ async function removeFilesystemLockMutationRequest(
   options: FilesystemLockMutationOptions,
 ): Promise<void> {
   if (state.quarantinedPath === undefined) {
-    await options.beforeRequestRemoval?.(state.requestPath);
     const quarantinedPath = `${state.requestPath}.stale-${options.owner.ownerNonce}`;
     try {
       await renameLockPath(state.requestPath, quarantinedPath);
@@ -660,26 +683,40 @@ async function removeFilesystemLockMutationRequest(
       if (readErrorCode(error) !== "ENOENT") throw error;
       if (!(await lockPathExists(quarantinedPath))) return;
     }
+
+    let generationMatches: boolean;
+    try {
+      generationMatches = await lockGenerationMatches(quarantinedPath, state.expectedGeneration);
+    } catch (error) {
+      await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
+      throw error;
+    }
+    if (!generationMatches) {
+      await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
+      throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
+    }
+    // The verified rename is the queue-release point. Later cleanup failures retain only the
+    // quarantined path, so a retry can delete it without republishing a live request.
     state.quarantinedPath = quarantinedPath;
   }
 
   const quarantinedPath = state.quarantinedPath;
-  let generationMatches: boolean;
-  try {
-    generationMatches = await lockGenerationMatches(quarantinedPath, state.expectedGeneration);
-  } catch (error) {
-    await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
-    state.quarantinedPath = undefined;
-    throw error;
-  }
-  if (!generationMatches) {
-    await restoreFilesystemLockMutationRequest(state.requestPath, quarantinedPath);
-    state.quarantinedPath = undefined;
-    throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
-  }
-
+  if (quarantinedPath === undefined) return;
+  await options.beforeRequestRemoval?.(state.requestPath);
   await removeLockPath(quarantinedPath);
   state.quarantinedPath = undefined;
+}
+
+function isRetryableFilesystemLockMutationCleanupError(error: unknown): boolean {
+  const code = readErrorCode(error);
+  return (
+    code === "EINTR" ||
+    code === "EAGAIN" ||
+    code === "EBUSY" ||
+    code === "EMFILE" ||
+    code === "ENFILE" ||
+    code === "ENOTEMPTY"
+  );
 }
 
 // Mutation requests coordinate only live processes. They need atomic visibility and exact-owner

@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { Mock } from "vitest";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { EventEmitter } from "node:events";
 import type {
   ChromeLaunchResult,
   StableChromeProcessHandle,
@@ -91,10 +91,13 @@ async function physicalProcessIdentity(
   };
 }
 
-function retainedChildProcess(
-  pid: number,
-): StableChromeProcessHandle & { signalCalls: NodeJS.Signals[] } {
-  const emitter = new EventEmitter();
+interface RetainedChildProcess extends StableChromeProcessHandle {
+  signalCalls: NodeJS.Signals[];
+  kill: Mock<(signal: NodeJS.Signals) => boolean>;
+  markExited: (exitCode?: number) => void;
+}
+
+function retainedChildProcess(pid: number): RetainedChildProcess {
   const state: { exitCode: number | null; signalCode: NodeJS.Signals | null } = {
     exitCode: null,
     signalCode: null,
@@ -111,12 +114,11 @@ function retainedChildProcess(
     signalCalls,
     kill: vi.fn((signal: NodeJS.Signals) => {
       signalCalls.push(signal);
-      state.signalCode = signal;
-      queueMicrotask(() => emitter.emit("exit"));
       return true;
     }),
-    once: (event, listener) => emitter.once(event, listener),
-    removeListener: (event, listener) => emitter.removeListener(event, listener),
+    markExited: (exitCode = 0) => {
+      state.exitCode = exitCode;
+    },
   };
 }
 
@@ -288,7 +290,7 @@ describe("hidden macOS Chrome launch", () => {
 });
 
 describe("stable Chrome process authority", () => {
-  test("terminates a current launch through its retained ChildProcess handle", async () => {
+  test("terminates a current launch through its authenticated control channel", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
     const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-standard-profile"));
@@ -306,6 +308,12 @@ describe("stable Chrome process authority", () => {
       remoteDebuggingPipes: null,
       kill: legacyPidKill,
     }));
+    const exactControlKill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: identity.pid,
+      signal: "CONTROL_CHANNEL" as const,
+    }));
+    const retainControlChannel = vi.fn(async () => exactControlKill);
 
     const launched = await launchChrome(
       { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
@@ -316,6 +324,8 @@ describe("stable Chrome process authority", () => {
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
         captureProfileIdentity: async () => profile,
         captureProcessIdentity: vi.fn(async () => identity),
+        inspectProcessIdentity: vi.fn(async () => "current" as const),
+        retainControlChannel,
         writeOwner: vi.fn(async () => undefined),
       },
     );
@@ -323,10 +333,38 @@ describe("stable Chrome process authority", () => {
     await expect(launched.kill()).resolves.toMatchObject({
       status: "stopped",
       pid: identity.pid,
-      signal: "SIGTERM",
+      signal: "CONTROL_CHANNEL",
     });
-    expect(child.signalCalls).toEqual(["SIGTERM"]);
+    expect(retainControlChannel).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      userDataDir: profile.canonicalPath,
+      processIdentity: identity,
+    });
+    expect(exactControlKill).toHaveBeenCalledOnce();
+    expect(child.signalCalls).toEqual([]);
+    expect(child.kill).not.toHaveBeenCalled();
     expect(legacyPidKill).not.toHaveBeenCalled();
+  });
+
+  test("observes the original child exit without signaling a reused pid", async () => {
+    const { createStableChildProcessChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const child = retainedChildProcess(6788);
+    const exactControlKill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: child.pid,
+      reason: "would target the reused pid",
+    }));
+    child.markExited();
+
+    await expect(createStableChildProcessChromeKill(child, exactControlKill)()).resolves.toEqual({
+      status: "already-stopped",
+      pid: 6788,
+    });
+    expect(exactControlKill).not.toHaveBeenCalled();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(child.signalCalls).toEqual([]);
   });
 
   test("does not treat a retained handle without a process id as safely stopped", async () => {
@@ -338,18 +376,106 @@ describe("stable Chrome process authority", () => {
       exitCode: null,
       signalCode: null,
       kill: signal,
-      once: vi.fn(),
-      removeListener: vi.fn(),
-    } satisfies StableChromeProcessHandle;
+    } satisfies StableChromeProcessHandle & { kill: typeof signal };
 
-    await expect(createStableChildProcessChromeKill(child)()).resolves.toMatchObject({
+    await expect(
+      createStableChildProcessChromeKill(
+        child,
+        vi.fn(async () => ({ status: "already-stopped" as const })),
+      )(),
+    ).resolves.toMatchObject({
       status: "unsafe",
       reason: expect.stringMatching(/no stable process id/i),
     });
     expect(signal).not.toHaveBeenCalled();
   });
 
-  test("rolls back identity capture failure only through the retained handle", async () => {
+  test("retries unsafe exact control teardown and caches only its safe terminal outcome", async () => {
+    const { createStableChildProcessChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const child = retainedChildProcess(6789);
+    const stopped = {
+      status: "stopped" as const,
+      pid: child.pid,
+      signal: "CONTROL_CHANNEL" as const,
+    };
+    const exactControlKill = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "unsafe" as const,
+        pid: child.pid,
+        reason: "exact exit not proven yet",
+      })
+      .mockResolvedValueOnce(stopped);
+    const kill = createStableChildProcessChromeKill(child, exactControlKill);
+
+    await expect(kill()).resolves.toMatchObject({ status: "unsafe" });
+    const safe = await kill();
+    const cached = await kill();
+    expect(safe).toBe(stopped);
+    expect(cached).toBe(stopped);
+    expect(exactControlKill).toHaveBeenCalledTimes(2);
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+  test("re-inspects after unsafe teardown and succeeds only after exact exit is proven", async () => {
+    const { createLaunchedChromeControlKillForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const identity = processIdentity(
+      path.join(os.tmpdir(), "oracle-control-retry-profile"),
+      6791,
+      "22222222-2222-4222-8222-222222222223",
+    );
+    const inspectProcessIdentity = vi
+      .fn()
+      .mockResolvedValueOnce("current" as const)
+      .mockResolvedValueOnce("current" as const)
+      .mockResolvedValueOnce("exited" as const);
+    const retainedControlKill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: identity.pid,
+      reason: "Browser.close completed but exact exit is not visible yet",
+    }));
+    const retainControlChannel = vi.fn(async () => retainedControlKill);
+    const kill = await createLaunchedChromeControlKillForTest(
+      {
+        host: "127.0.0.1",
+        port: 9222,
+        userDataDir: identity.profileDirectory.canonicalPath,
+        processIdentity: identity,
+      },
+      { inspectProcessIdentity, retainControlChannel },
+    );
+
+    await expect(kill()).resolves.toMatchObject({ status: "unsafe" });
+    const stopped = await kill();
+    const cached = await kill();
+    expect(stopped).toEqual({ status: "already-stopped", pid: identity.pid });
+    expect(cached).toBe(stopped);
+    expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
+    expect(retainControlChannel).toHaveBeenCalledOnce();
+    expect(retainedControlKill).toHaveBeenCalledOnce();
+  });
+
+  test("clears a rejected in-flight exact teardown so a retry can succeed", async () => {
+    const { createStableChildProcessChromeKill } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const child = retainedChildProcess(6790);
+    const exactControlKill = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("control transport reset"))
+      .mockResolvedValueOnce({
+        status: "already-stopped" as const,
+        pid: child.pid,
+      });
+    const kill = createStableChildProcessChromeKill(child, exactControlKill);
+
+    await expect(kill()).rejects.toThrow("control transport reset");
+    await expect(kill()).resolves.toEqual({ status: "already-stopped", pid: child.pid });
+    expect(exactControlKill).toHaveBeenCalledTimes(2);
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  test("preserves the launched process when identity capture cannot establish control authority", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
     const { resolveBrowserConfig } = await import("../../src/browser/config.js");
     const profile = syntheticProfileIdentity(path.join(os.tmpdir(), "oracle-invalid-profile"));
@@ -376,10 +502,16 @@ describe("stable Chrome process authority", () => {
         },
       ),
     ).rejects.toMatchObject({
-      message: expect.stringMatching(/capture Chrome process identity/i),
-      cause: captureError,
+      name: "AggregateError",
+      errors: [
+        captureError,
+        expect.objectContaining({
+          message: expect.stringMatching(/control authority.*unavailable/i),
+        }),
+      ],
     });
-    expect(child.signalCalls).toEqual(["SIGTERM"]);
+    expect(child.signalCalls).toEqual([]);
+    expect(child.kill).not.toHaveBeenCalled();
   });
 
   test("preserves the unsafe outcome when persistence rollback lacks stable authority", async () => {
@@ -444,7 +576,7 @@ describe("stable Chrome process authority", () => {
   });
 });
 
-describe("registerTerminationHooks", () => {
+describe("registerTerminationHooks", { timeout: 15_000 }, () => {
   test("removes a copied profile only after safe retained-handle termination", async () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
     const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-profile-signal-"));
