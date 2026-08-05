@@ -15,6 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import {
+  __test__ as filesystemLockTest,
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
   FilesystemLockReleasePendingError,
@@ -42,6 +43,31 @@ function createProcessIdentityProvider(
 ): FilesystemLockProcessIdentityProvider {
   return { platform, pid, readProcessLiveness, readProcessStartIdentity };
 }
+
+test("reads an exact Windows CIM creation generation without accepting a PID", async () => {
+  const execute = vi.fn(async (_command: string) => "2026-08-05T12:34:56.1234567Z\n");
+  const identity = await filesystemLockTest.readWindowsProcessStartIdentity(10_005, execute);
+
+  const retryIdentity = await filesystemLockTest.readWindowsProcessStartIdentity(10_005, execute);
+
+  expect(identity).toBe("win32:2026-08-05T12:34:56.1234567Z");
+  expect(retryIdentity).toBe(identity);
+  expect(execute).toHaveBeenCalledTimes(2);
+  expect(execute.mock.calls[0]?.[0]).toContain(
+    "Get-CimInstance Win32_Process -Filter 'ProcessId = 10005'",
+  );
+  expect(execute.mock.calls[0]?.[0]).toContain("$process.CreationDate.ToUniversalTime()");
+  expect(execute.mock.calls[0]?.[0]).not.toContain("Get-Process");
+
+  await expect(
+    filesystemLockTest.readWindowsProcessStartIdentity(10_005, async () => "10005"),
+  ).resolves.toBeNull();
+  await expect(
+    filesystemLockTest.readWindowsProcessStartIdentity(10_005, async () => {
+      throw new Error("CIM unavailable");
+    }),
+  ).resolves.toBeNull();
+});
 
 describe("crash-recoverable filesystem lock", () => {
   test("fails before publishing a lock when process generation is unavailable", async () => {
@@ -92,11 +118,15 @@ describe("crash-recoverable filesystem lock", () => {
   test("publishes a Windows lock only after a retry obtains stable generation proof", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
-    let identityAttempt = 0;
-    const readProcessStartIdentity = vi.fn(async () => {
-      identityAttempt += 1;
-      return identityAttempt === 1 ? null : "win32-stable-start";
+    let queryAttempt = 0;
+    const execute = vi.fn(async (_command: string) => {
+      queryAttempt += 1;
+      if (queryAttempt === 1) throw new Error("CIM startup race");
+      return "2026-08-05T12:34:56.1234567Z";
     });
+    const readProcessStartIdentity = vi.fn((pid: number) =>
+      filesystemLockTest.readWindowsProcessStartIdentity(pid, execute),
+    );
     try {
       const lock = await acquireCrashRecoverableFilesystemLock(
         lockPath,
@@ -111,9 +141,10 @@ describe("crash-recoverable filesystem lock", () => {
         },
       );
       expect(readProcessStartIdentity).toHaveBeenCalledTimes(2);
-      expect(lock.owner.processStartIdentity).toBe("win32-stable-start");
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(lock.owner.processStartIdentity).toBe("win32:2026-08-05T12:34:56.1234567Z");
       expect(JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"))).toMatchObject({
-        processStartIdentity: "win32-stable-start",
+        processStartIdentity: "win32:2026-08-05T12:34:56.1234567Z",
       });
       await lock.release();
     } finally {

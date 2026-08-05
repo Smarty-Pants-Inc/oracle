@@ -364,6 +364,39 @@ export async function readProcessStartIdentity(pid: number): Promise<string | nu
   }
 }
 
+type WindowsProcessStartIdentityExecutor = (command: string) => Promise<string>;
+
+async function readWindowsProcessStartIdentity(
+  pid: number,
+  execute: WindowsProcessStartIdentityExecutor = executeWindowsProcessStartIdentity,
+): Promise<string | null> {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // Get-Process.StartTime is unavailable for the Node process on hosted Windows runners.
+    // Win32_Process.CreationDate is the provider-backed creation timestamp and, unlike a PID,
+    // still distinguishes a later process that reuses the same numeric identifier.
+    const startTime = (
+      await execute(
+        `$ErrorActionPreference = 'Stop'; $process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction Stop; if ($null -eq $process -or $null -eq $process.CreationDate) { exit 3 }; [Console]::Out.Write($process.CreationDate.ToUniversalTime().ToString('O'))`,
+      )
+    ).trim();
+    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(startTime)
+      ? `win32:${startTime}`
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function executeWindowsProcessStartIdentity(command: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", command],
+    { encoding: "utf8", windowsHide: true, timeout: WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS },
+  );
+  return String(stdout);
+}
+
 async function readProcessStartIdentityUncached(pid: number): Promise<string | null> {
   try {
     if (process.platform === "linux") {
@@ -380,14 +413,7 @@ async function readProcessStartIdentityUncached(pid: number): Promise<string | n
       return `linux:${bootId.trim() || "unknown-boot"}:${startTicks}`;
     }
     if (process.platform === "win32") {
-      const command = `$process = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($process.StartTime.ToUniversalTime().Ticks)`;
-      const { stdout } = await execFileAsync(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-Command", command],
-        { encoding: "utf8", windowsHide: true, timeout: WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS },
-      );
-      const startTicks = String(stdout).trim();
-      return startTicks ? `win32:${startTicks}` : null;
+      return readWindowsProcessStartIdentity(pid);
     }
     const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
@@ -398,6 +424,11 @@ async function readProcessStartIdentityUncached(pid: number): Promise<string | n
     return null;
   }
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
+export const __test__ = {
+  readWindowsProcessStartIdentity,
+};
 
 async function publishPreparedLockGeneration(
   preparedLockPath: string,

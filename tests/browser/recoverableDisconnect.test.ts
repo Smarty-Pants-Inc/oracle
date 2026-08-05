@@ -367,6 +367,7 @@ async function withDisconnectFixture(
     runtimeHints: BrowserRuntimeMetadata[];
     unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
+    providerDispatchCommitVerified: boolean;
     committedTurnVerified: boolean;
   }) => Promise<void> | void,
 ): Promise<void> {
@@ -374,6 +375,7 @@ async function withDisconnectFixture(
   let profileDir = "";
   let processIdentity: ChromeProcessIdentity | null = null;
   let providerObservedDispatchStart = false;
+  let providerDispatchCommitVerified = false;
   let committedTurnVerified = false;
   let assistantResponseAvailable = false;
   let finalArchiveCompleted = false;
@@ -426,6 +428,10 @@ async function withDisconnectFixture(
     if (options.semanticProbeSucceeds === false) {
       throw new Error("prompt commit not observed");
     }
+    if (!providerObservedDispatchStart) {
+      throw new Error("Prompt-commit verification preceded provider dispatch");
+    }
+    providerDispatchCommitVerified = true;
     return {
       committedTurns: 2,
       promptSha256: promptIdentitySha256("keep this submitted conversation"),
@@ -628,6 +634,11 @@ async function withDisconnectFixture(
             options.runtimePersistenceFailsAfterCommit &&
             runtime.promptEpoch?.status === "committed"
           ) {
+            if (!providerDispatchCommitVerified) {
+              throw new Error(
+                "Committed runtime persistence rejection preceded verified provider dispatch",
+              );
+            }
             throw runtimePersistenceError;
           }
         },
@@ -653,6 +664,7 @@ async function withDisconnectFixture(
       runtimeHints,
       unhandledRejections,
       providerObservedDispatchStart,
+      providerDispatchCommitVerified,
       committedTurnVerified,
     });
   } finally {
@@ -756,6 +768,7 @@ describe("recoverable disconnect lifecycle", () => {
   test("publishes exact local recovery when committed authority persistence rejects", async () => {
     await withDisconnectFixture({ runtimePersistenceFailsAfterCommit: true }, async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.providerDispatchCommitVerified).toBe(true);
       expect(fixture.verifyPromptCommitted).toHaveBeenCalledTimes(1);
       expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
       expect(fixture.error).toMatchObject({
