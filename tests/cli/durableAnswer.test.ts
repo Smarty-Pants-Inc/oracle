@@ -174,6 +174,7 @@ describe("publishBrowserCapture", () => {
 
     expect(events).toEqual(["receipt", "prepare", "publish", "finalize", "runtime:finalized"]);
     expect(result).toEqual({
+      published: true,
       receipt,
       prepared: "prepared",
       finalization: { status: "completed", runtime: finalizedRuntime },
@@ -320,6 +321,12 @@ describe("publishBrowserCapture", () => {
       details: {
         code: "runtime-authority-persistence-failed",
         runtime: pendingRuntime,
+        publishedAnswer: { published: true, receipt },
+        finalization: {
+          status: "pending",
+          runtime: pendingRuntime,
+          error: "cleanup pending",
+        },
         cleanupStatus: "pending",
       },
     });

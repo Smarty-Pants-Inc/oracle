@@ -16,7 +16,11 @@ import {
   type BrowserCaptureSettlementMode,
 } from "../browser/ownedBrowserResources.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
+import {
+  closeChromeTargetWithExactAuthority,
+  connectWithNewTabWithExactAuthority,
+  type RetainedChromeEndpointAuthority,
+} from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import {
   acquireManualChromeOwner,
@@ -84,6 +88,7 @@ export async function openGeminiBrowserSession(
   let tabLease: BrowserTabLease | null = null;
   let owner: ManualChromeOwner | null = null;
   let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
+  let endpointAuthority: RetainedChromeEndpointAuthority | null = null;
   let targetId: string | null = null;
   let client: ChromeClient | null = null;
   let targetClosed = false;
@@ -106,7 +111,7 @@ export async function openGeminiBrowserSession(
       chromePid: chrome?.pid,
       chromeProcessIdentity: owner?.processIdentity,
       chromePort: chrome?.port,
-      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
+      chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
       chromeHost: chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: profileDir,
       userDataDir: profileDir,
@@ -122,7 +127,7 @@ export async function openGeminiBrowserSession(
           chromeProcessIdentity: owner?.processIdentity,
           profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
           chromePort: chrome?.port,
-          chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
+          chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
           chromeHost: chrome?.host ?? "127.0.0.1",
           chromeProfileRoot: profileDir,
           userDataDir: profileDir,
@@ -174,17 +179,22 @@ export async function openGeminiBrowserSession(
       );
     }
     if (shouldCloseTarget && targetId && !targetClosed) {
-      try {
-        const chrome = owner?.chrome;
-        const closed = chrome
-          ? await closeTab(chrome.port, targetId, logger, chrome.host ?? "127.0.0.1")
-          : false;
-        if (!closed) errors.push(`Gemini target close was not confirmed: ${targetId}`);
-        else targetClosed = true;
-      } catch (error) {
-        errors.push(
-          `Gemini target close failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      if (!endpointAuthority) {
+        errors.push("Owned Gemini target has no retained exact endpoint authority");
+      } else {
+        try {
+          const closed = await closeChromeTargetWithExactAuthority({
+            authority: endpointAuthority,
+            targetId,
+            logger,
+          });
+          if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
+          else errors.push(closed.reason);
+        } catch (error) {
+          errors.push(
+            `Gemini target close failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     }
     if (errors.length === 0 && client && !clientClosed) {
@@ -296,15 +306,22 @@ export async function openGeminiBrowserSession(
       });
     }
     const chrome = owner.chrome;
+    const acquiredEndpointAuthority = owner.endpointAuthority ?? chrome.endpointAuthority;
+    if (!acquiredEndpointAuthority) {
+      throw new Error("Gemini Chrome owner has no retained exact endpoint authority.");
+    }
+    endpointAuthority = acquiredEndpointAuthority;
     const host = chrome.host ?? "127.0.0.1";
     await tabLease.update({ chromeHost: host, chromePort: chrome.port });
     const connection = await resources.journalAcquisition({
       intentRuntime: runtime("chrome-target"),
       acquire: async () => {
-        const opened = await connectWithNewTab(chrome.port, logger, targetMarkerUrl, host, {
-          fallbackToDefault: false,
-          retries: 6,
-        });
+        const opened = await connectWithNewTabWithExactAuthority(
+          acquiredEndpointAuthority,
+          logger,
+          targetMarkerUrl,
+          { retries: 6 },
+        );
         if (!opened.targetId) throw new Error("Failed to create an isolated Gemini browser tab.");
         return { client: opened.client, targetId: opened.targetId };
       },

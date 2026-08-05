@@ -14,7 +14,13 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { promptIdentitySha256 } from "./actions/promptComposer.js";
-import { closeChromeTarget, connectWithNewTab } from "./chromeLifecycle.js";
+import {
+  closeChromeTarget,
+  closeChromeTargetWithExactAuthority,
+  connectWithNewTab,
+  connectWithNewTabWithExactAuthority,
+  type RetainedChromeEndpointAuthority,
+} from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { CHATGPT_URL } from "./constants.js";
 import {
@@ -53,6 +59,7 @@ export interface RecoveredConversation {
   url: string;
   ref: string;
   locator: CommittedPromptEpochLocator;
+  endpointAuthority?: RetainedChromeEndpointAuthority;
   cleanup: RecoveredConversationCleanup;
 }
 
@@ -60,6 +67,14 @@ export interface RecoveryEndpoint {
   host: string;
   port: number;
 }
+
+export interface NonOwnedRecoveryEndpoint extends RecoveryEndpoint {
+  ownership: "non-owned";
+}
+
+type RecoveryReadyEndpoint = RecoveryEndpoint & {
+  endpointAuthority?: RetainedChromeEndpointAuthority;
+};
 
 type RecoveryTarget = RecoveryEndpoint & { targetId: string };
 
@@ -121,7 +136,7 @@ export function resolveRecoveryProfileDir(meta: SessionMetadata): string {
 }
 
 async function waitForRecoveredConversationReady(
-  endpoint: RecoveryEndpoint,
+  endpoint: RecoveryReadyEndpoint,
   ref: string,
   timeoutMs: number,
   locator: CommittedPromptEpochLocator,
@@ -130,7 +145,12 @@ async function waitForRecoveredConversationReady(
   let lastError: unknown = null;
   while (Date.now() < deadline) {
     try {
-      const harvested = await harvestChatGptTab({ ...endpoint, ref });
+      const harvested = await harvestChatGptTab({
+        host: endpoint.host,
+        port: endpoint.port,
+        ref,
+        endpointAuthority: endpoint.endpointAuthority,
+      });
       if (isRecoveredConversationHarvestReady(harvested, locator)) {
         return;
       }
@@ -217,7 +237,7 @@ export async function recoverConversationTab(
   meta: SessionMetadata,
   logger: BrowserLogger,
   options: {
-    existingEndpoint?: RecoveryEndpoint;
+    existingEndpoint?: NonOwnedRecoveryEndpoint;
     readyTimeoutMs?: number;
     waitForReady?: boolean;
     persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
@@ -247,6 +267,8 @@ export async function recoverConversationTab(
   let owner: ManualChromeOwner | null = null;
   let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let target: { host: string; port: number; targetId: string } | null = null;
+  let targetEndpointAuthority: RetainedChromeEndpointAuthority | null = null;
+  let targetIsNonOwned = false;
   let targetUrl: string | undefined;
   let targetClosed = false;
   let leaseReleased = false;
@@ -268,7 +290,10 @@ export async function recoverConversationTab(
       chromePid: chrome?.pid,
       chromeProcessIdentity: owner?.processIdentity,
       chromePort: target?.port ?? chrome?.port,
-      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
+      chromeBrowserWSEndpoint:
+        targetEndpointAuthority?.browserWSEndpoint ??
+        owner?.endpointAuthority?.browserWSEndpoint ??
+        chrome?.endpointAuthority?.browserWSEndpoint,
       chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -288,7 +313,10 @@ export async function recoverConversationTab(
       chromeProcessIdentity: owner?.processIdentity,
       profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
       chromePort: target?.port ?? chrome?.port,
-      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
+      chromeBrowserWSEndpoint:
+        targetEndpointAuthority?.browserWSEndpoint ??
+        owner?.endpointAuthority?.browserWSEndpoint ??
+        chrome?.endpointAuthority?.browserWSEndpoint,
       chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -342,9 +370,21 @@ export async function recoverConversationTab(
     }
     if (target && !targetClosed && cleanup?.ownsTarget === true) {
       try {
-        const closed = await closeChromeTarget({ ...target, logger });
-        if (!closed) errors.push(`Recovered target close was not confirmed: ${target.targetId}`);
-        else targetClosed = true;
+        if (targetEndpointAuthority) {
+          const closed = await closeChromeTargetWithExactAuthority({
+            authority: targetEndpointAuthority,
+            targetId: target.targetId,
+            logger,
+          });
+          if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
+          else errors.push(closed.reason);
+        } else if (targetIsNonOwned) {
+          const closed = await closeChromeTarget({ ...target, logger });
+          if (!closed) errors.push(`Recovered target close was not confirmed: ${target.targetId}`);
+          else targetClosed = true;
+        } else {
+          errors.push("Recovered owned target has no retained exact endpoint authority");
+        }
       } catch (error) {
         errors.push(
           `Recovered target close failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -426,22 +466,32 @@ export async function recoverConversationTab(
     return resources.settle(mode);
   };
 
-  const openRecoveredTarget = async (endpoint: RecoveryEndpoint): Promise<string> => {
+  const openRecoveredTarget = async (
+    endpoint: RecoveryEndpoint,
+    endpointAuthority?: RetainedChromeEndpointAuthority,
+    nonOwned = false,
+  ): Promise<string> => {
+    if (!endpointAuthority && !nonOwned) {
+      throw new Error("Owned recovered target acquisition requires exact endpoint authority.");
+    }
     const opened = await resources.journalAcquisition({
       intentRuntime: runtime("chrome-target"),
       acquire: async () => {
-        const connection = await connectWithNewTab(
-          endpoint.port,
-          logger,
-          targetMarkerUrl,
-          endpoint.host,
-          { fallbackToDefault: false, retries: 6 },
-        );
+        const connection = endpointAuthority
+          ? await connectWithNewTabWithExactAuthority(endpointAuthority, logger, targetMarkerUrl, {
+              retries: 6,
+            })
+          : await connectWithNewTab(endpoint.port, logger, targetMarkerUrl, endpoint.host, {
+              fallbackToDefault: false,
+              retries: 6,
+            });
         if (!connection.targetId) throw new Error("Recovered Chrome target is missing an id.");
         return { client: connection.client, targetId: connection.targetId };
       },
       acquiredRuntime: (connection) => {
         target = { ...endpoint, targetId: connection.targetId };
+        targetEndpointAuthority = endpointAuthority ?? null;
+        targetIsNonOwned = nonOwned;
         targetClosed = false;
         targetUrl = targetMarkerUrl;
         return runtime();
@@ -483,7 +533,7 @@ export async function recoverConversationTab(
           `[browser] Recovery: opening saved conversation in existing Chrome at ` +
             `${options.existingEndpoint.host}:${options.existingEndpoint.port}`,
         );
-        const targetId = await openRecoveredTarget(options.existingEndpoint);
+        const targetId = await openRecoveredTarget(options.existingEndpoint, undefined, true);
         if (waitForReady) {
           await waitForRecoveredConversationReady(
             options.existingEndpoint,
@@ -512,6 +562,8 @@ export async function recoverConversationTab(
           if (!closed) throw error;
           targetClosed = true;
           target = null;
+          targetEndpointAuthority = null;
+          targetIsNonOwned = false;
           await resources.persist(runtime());
         }
         const message = error instanceof Error ? error.message : String(error);
@@ -542,9 +594,18 @@ export async function recoverConversationTab(
     }
     const host = owner.chrome.host ?? "127.0.0.1";
     const port = owner.chrome.port;
-    const targetId = await openRecoveredTarget({ host, port });
+    const endpointAuthority = owner.endpointAuthority ?? owner.chrome.endpointAuthority;
+    if (!endpointAuthority) {
+      throw new Error("Recovered Chrome owner has no retained exact endpoint authority.");
+    }
+    const targetId = await openRecoveredTarget({ host, port }, endpointAuthority);
     if (waitForReady) {
-      await waitForRecoveredConversationReady({ host, port }, targetId, readyTimeoutMs, locator);
+      await waitForRecoveredConversationReady(
+        { host, port, endpointAuthority },
+        targetId,
+        readyTimeoutMs,
+        locator,
+      );
     }
     await lease.update({
       chromeHost: host,
@@ -553,7 +614,7 @@ export async function recoverConversationTab(
       tabUrl: url,
     });
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
-    return { host, port, url, ref: targetId, locator, cleanup: settle };
+    return { host, port, url, ref: targetId, locator, endpointAuthority, cleanup: settle };
   } catch (error) {
     const cleanup = await resources.settle("abort");
     if (cleanup.status === "pending") {

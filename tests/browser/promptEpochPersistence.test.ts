@@ -59,6 +59,9 @@ async function runTwoTurnResetFailure(transport: Transport) {
   let committedRuntime: BrowserRuntimeMetadata | undefined;
   let rejectedResetTransition: PromptResetPersistenceTransition | undefined;
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
+  const closeChromeTargetWithExactAuthority = vi
+    .fn()
+    .mockResolvedValue({ status: "completed" as const });
   const killChrome = vi.fn().mockResolvedValue({ status: "stopped", pid: 4321, signal: "SIGTERM" });
   const closeConnection = vi.fn().mockResolvedValue(undefined);
   const verifyCommittedPromptTurn = vi.fn().mockResolvedValue(undefined);
@@ -216,11 +219,19 @@ async function runTwoTurnResetFailure(transport: Transport) {
           profileDirectory,
         },
         kill: killChrome,
+        endpointAuthority: {
+          browserWSEndpoint: "ws://127.0.0.1:9230/devtools/browser/epoch-fixture",
+          kill: killChrome,
+          runExactOperation: vi.fn(),
+          release: vi.fn().mockResolvedValue(undefined),
+        },
       };
     }),
     registerTerminationHooks: vi.fn(() => vi.fn()),
     positionChromeWindowOffscreen: vi.fn().mockResolvedValue(undefined),
-    connectWithNewTab: vi.fn().mockResolvedValue({ client, targetId: "epoch-target" }),
+    connectWithNewTabWithExactAuthority: vi
+      .fn()
+      .mockResolvedValue({ client, targetId: "epoch-target" }),
     connectToRemoteChrome: vi.fn().mockResolvedValue({
       client,
       targetId: "epoch-target",
@@ -229,6 +240,11 @@ async function runTwoTurnResetFailure(transport: Transport) {
     }),
     connectToRemoteChromeTarget: vi.fn(),
     closeChromeTarget,
+    closeChromeTargetWithExactAuthority,
+    closeBlankChromeTabsWithExactAuthority: vi.fn().mockResolvedValue({
+      status: "completed",
+      closedTargetIds: [],
+    }),
     closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/profileState.js", () => ({
@@ -384,6 +400,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       clearPromptComposer,
       insertText,
       closeChromeTarget,
+      closeChromeTargetWithExactAuthority,
       killChrome,
       verifyCommittedPromptTurn,
       closeConnection,
@@ -458,20 +475,28 @@ describe("semantic prompt epoch persistence", () => {
               undefined,
           ),
       ).toBe(true);
+      const abortRuntime = fixture.durablyPersistedRuntimes.find(
+        (persistedRuntime) => persistedRuntime.recoveryCleanupResult?.settlementMode === "abort",
+      );
+      expect(abortRuntime).toMatchObject({
+        promptEpoch: fixture.committedRuntime?.promptEpoch,
+        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "epoch-target",
+            acquisition: { generationId: expect.any(String) },
+            recoveryCleanup: { ownsTarget: true },
+          },
+        ],
+      });
       expect(fixture.durablyPersistedRuntimes.at(-1)).toMatchObject({
         promptEpoch: fixture.committedRuntime?.promptEpoch,
       });
-      const promptPersistenceError = (fixture.error as Error & { cause?: unknown }).cause;
+      expect(fixture.durablyPersistedRuntimes.at(-1)).not.toHaveProperty(
+        "recoveryCleanupResources",
+      );
+      expect(fixture.durablyPersistedRuntimes.at(-1)).not.toHaveProperty("recoveryCleanupResult");
       expect(fixture.error).toMatchObject({
-        details: {
-          stage: "browser-capture-finalization",
-          code: "unpublished-cleanup-pending",
-          runtime: {
-            promptEpoch: fixture.committedRuntime?.promptEpoch,
-          },
-        },
-      });
-      expect(promptPersistenceError).toMatchObject({
         details: {
           stage: "prompt-epoch-persistence",
           code: "prompt-epoch-persistence-failed",
@@ -491,10 +516,16 @@ describe("semantic prompt epoch persistence", () => {
           verifiedUserMessageId: "message-0",
         }),
       );
-      expect(hasRecoverableChatGptConversation(runtime)).toBe(true);
-      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
-      expect(fixture.killChrome).not.toHaveBeenCalled();
-      expect(fixture.closeConnection).not.toHaveBeenCalled();
+      expect(hasRecoverableChatGptConversation(runtime)).toBe(false);
+      if (transport === "local") {
+        expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+        expect(fixture.killChrome).toHaveBeenCalledOnce();
+      } else {
+        expect(fixture.closeChromeTarget).toHaveBeenCalledOnce();
+        expect(fixture.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+        expect(fixture.killChrome).not.toHaveBeenCalled();
+      }
     },
   );
 });

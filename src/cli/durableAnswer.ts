@@ -18,6 +18,15 @@ export interface DurableBrowserAnswerReceipt {
   sizeBytes: number;
 }
 
+export interface PublishedBrowserAnswerState {
+  published: true;
+  receipt: DurableBrowserAnswerReceipt;
+}
+
+export interface PublishedBrowserCaptureFailure extends PublishedBrowserAnswerState {
+  finalization: BrowserCaptureFinalizationResult;
+}
+
 export interface PersistDurableBrowserAnswerOptions {
   sessionId: string;
   answer: string;
@@ -81,8 +90,7 @@ export interface PublishBrowserCaptureOptions<T> {
   persistAnswer?: typeof persistDurableBrowserAnswer;
 }
 
-export interface PublishedBrowserCapture<T> {
-  receipt: DurableBrowserAnswerReceipt;
+export interface PublishedBrowserCapture<T> extends PublishedBrowserAnswerState {
   prepared: T;
   finalization: BrowserCaptureFinalizationResult;
 }
@@ -103,6 +111,7 @@ export async function publishBrowserCapture<T>(
   if (!receipt) {
     throw new Error("Browser capture publication completed without a durable answer receipt");
   }
+  const publishedAnswer: PublishedBrowserAnswerState = { published: true, receipt };
 
   let finalization: BrowserCaptureFinalizationResult;
   try {
@@ -128,6 +137,8 @@ export async function publishBrowserCapture<T>(
         stage: "browser-capture-finalization",
         code: "runtime-authority-persistence-failed",
         runtime: finalization.runtime,
+        publishedAnswer,
+        finalization,
         answerReceipt: receipt,
         cleanupStatus: finalization.status,
         ...(finalization.status === "pending" ? { cleanupError: finalization.error } : {}),
@@ -136,7 +147,37 @@ export async function publishBrowserCapture<T>(
     );
   }
 
-  return { receipt, prepared, finalization };
+  return { ...publishedAnswer, prepared, finalization };
+}
+
+export function publishedBrowserCaptureFailureFromError(
+  error: unknown,
+): PublishedBrowserCaptureFailure | undefined {
+  if (!(error instanceof BrowserAutomationError)) return undefined;
+  if (error.details?.code !== "runtime-authority-persistence-failed") return undefined;
+  const publishedAnswer = error.details.publishedAnswer;
+  const finalization = error.details.finalization;
+  if (!isPublishedBrowserAnswerState(publishedAnswer)) return undefined;
+  if (!isBrowserCaptureFinalizationResult(finalization)) return undefined;
+  return { ...publishedAnswer, finalization };
+}
+
+function isPublishedBrowserAnswerState(value: unknown): value is PublishedBrowserAnswerState {
+  if (!value || typeof value !== "object") return false;
+  if (!("published" in value) || value.published !== true || !("receipt" in value)) return false;
+  const receipt = value.receipt;
+  return Boolean(receipt && typeof receipt === "object" && "artifact" in receipt);
+}
+
+function isBrowserCaptureFinalizationResult(
+  value: unknown,
+): value is BrowserCaptureFinalizationResult {
+  if (!value || typeof value !== "object") return false;
+  if (!("status" in value) || !("runtime" in value)) return false;
+  return (
+    (value.status === "completed" || value.status === "pending") &&
+    Boolean(value.runtime && typeof value.runtime === "object")
+  );
 }
 
 async function abortFailedBrowserCapture<T>(

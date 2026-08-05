@@ -1,6 +1,7 @@
 import type http from "node:http";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.js";
+import { requiresCleanupOnlyCommittedPromptRecovery } from "../browser/reattachability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionManager.js";
 import { RemoteArtifactStore } from "./artifactStore.js";
@@ -88,10 +89,59 @@ export async function serveRemoteTransactionRetry(
       sendJson(params.res, 200, response);
       return;
     }
+    if (requiresCleanupOnlyCommittedPromptRecovery(record.runtime)) {
+      const outcome = await params.runBrowserWork(
+        async () =>
+          await params.transactionCoordinator.settle({
+            transactionToken: record.transactionToken,
+            mode: "abort",
+            durablePublication: false,
+          }),
+      );
+      const settled = outcome.record;
+      const response: RemoteTransactionRetryResponse =
+        settled.state === "finalized" || settled.state === "aborted" || settled.state === "failed"
+          ? terminalTransactionRetryResponse(settled)
+          : {
+              status: "error",
+              error: settled.error
+                ? remoteBrowserAutomationError(settled)
+                : remotePendingSettlementError(settled),
+            };
+      sendJson(params.res, 200, response);
+      return;
+    }
     if (record.result) {
       const response: RemoteTransactionRetryResponse = {
         status: "transaction",
         transaction: remoteTransactionPayload(record),
+      };
+      sendJson(params.res, 200, response);
+      return;
+    }
+    if (record.stagedCapture) {
+      const targetAuthorityUnavailable =
+        Boolean(record.restartRecovery) ||
+        record.error?.stage === "connection-lost" ||
+        record.error?.code === "browser-final-target-liveness-pending";
+      const published = await params.transactionStore.promoteStagedCapture({
+        transactionToken: record.transactionToken,
+        stripTargetAuthority: targetAuthorityUnavailable,
+        warning: targetAuthorityUnavailable
+          ? {
+              code: "remote-post-archive-target-unavailable",
+              message:
+                "The exact pre-archive answer was promoted because post-archive identity revalidation became impossible after the Chrome target was lost.",
+            }
+          : {
+              code: "remote-publication-retry-recovered",
+              message:
+                "The exact assistant answer was published from its durable pre-archive capture without browser recapture.",
+            },
+      });
+      const response: RemoteTransactionRetryResponse = {
+        status: "transaction",
+        transaction: remoteTransactionPayload(published),
       };
       sendJson(params.res, 200, response);
       return;

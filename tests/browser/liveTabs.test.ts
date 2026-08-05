@@ -1,7 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   buildTabInspectionExpressionForTest,
   classifyTabState,
+  connectToExistingChatGptTab,
   formatBrowserTabState,
   resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
@@ -38,6 +39,51 @@ function makeTab(overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary 
     state: "completed",
     lastAssistantMarkdown: "Answer",
     ...overrides,
+  };
+}
+
+function exactBrowserForTabs() {
+  const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+    result: {
+      value: expression.includes("currentModelLabel")
+        ? {
+            title: "Existing A",
+            url: "https://chatgpt.com/c/a",
+            currentModelLabel: "GPT-5.6 Pro",
+            stopExists: false,
+            sendExists: true,
+            promptReady: true,
+            loginButtonExists: false,
+            authenticated: true,
+            assistantCount: 0,
+            lastAssistantText: "",
+            lastUserText: "",
+            visibilityState: "visible",
+            focused: true,
+          }
+        : null,
+    },
+  }));
+  return {
+    Target: {
+      getTargets: vi.fn(async () => ({
+        targetInfos: [
+          {
+            targetId: "target-a",
+            type: "page",
+            title: "Existing A",
+            url: "https://chatgpt.com/c/a",
+          },
+        ],
+      })),
+      attachToTarget: vi.fn(async () => ({ sessionId: "session-a" })),
+      detachFromTarget: vi.fn(async () => undefined),
+    },
+    Runtime: { enable: vi.fn(async () => undefined), evaluate },
+    DOM: { enable: vi.fn(async () => undefined) },
+    on: vi.fn(),
+    once: vi.fn(),
+    removeListener: vi.fn(),
   };
 }
 
@@ -184,5 +230,89 @@ describe("liveTabs helpers", () => {
         conversationId: "def",
       }),
     ).toBe(false);
+  });
+
+  test("resolves and attaches an existing tab only through generation A authority", async () => {
+    const browserA = exactBrowserForTabs();
+    const authority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/generation-a",
+      kill: vi.fn(),
+      runExactOperation: vi.fn(async (operation: (client: never) => Promise<unknown>) => ({
+        status: "completed" as const,
+        value: await operation(browserA as never),
+      })),
+      release: vi.fn(),
+    };
+
+    const connected = await connectToExistingChatGptTab({
+      host: "127.0.0.1",
+      port: 9222,
+      ref: "current",
+      endpointAuthority: authority as never,
+    });
+
+    expect(connected.targetId).toBe("target-a");
+    expect(connected.tab.url).toBe("https://chatgpt.com/c/a");
+    expect(browserA.Target.getTargets).toHaveBeenCalledOnce();
+    expect(browserA.Target.attachToTarget).toHaveBeenCalledTimes(2);
+    await connected.client.close();
+    expect(browserA.Target.detachFromTarget).toHaveBeenCalledTimes(2);
+  });
+
+  test("attaches an explicit target ref without inspecting any other page", async () => {
+    const browserA = exactBrowserForTabs();
+    const authority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/generation-a",
+      kill: vi.fn(),
+      runExactOperation: vi.fn(async (operation: (client: never) => Promise<unknown>) => ({
+        status: "completed" as const,
+        value: await operation(browserA as never),
+      })),
+      release: vi.fn(),
+    };
+
+    const connected = await connectToExistingChatGptTab({
+      host: "127.0.0.1",
+      port: 9222,
+      ref: "target-a",
+      endpointAuthority: authority as never,
+    });
+
+    expect(connected.targetId).toBe("target-a");
+    expect(browserA.Runtime.evaluate).not.toHaveBeenCalled();
+    expect(browserA.Target.attachToTarget).toHaveBeenCalledOnce();
+  });
+
+  test("does not attach or run page effects on generation B after same-port rebinding", async () => {
+    const browserA = exactBrowserForTabs();
+    const browserB = exactBrowserForTabs();
+    let operationCount = 0;
+    const authority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/generation-a",
+      kill: vi.fn(),
+      runExactOperation: vi.fn(async (operation: (client: never) => Promise<unknown>) => {
+        operationCount += 1;
+        if (operationCount === 1) {
+          return { status: "completed" as const, value: await operation(browserA as never) };
+        }
+        return { status: "gone" as const };
+      }),
+      release: vi.fn(),
+    };
+
+    await expect(
+      connectToExistingChatGptTab({
+        host: "127.0.0.1",
+        port: 9222,
+        ref: "current",
+        endpointAuthority: authority as never,
+      }),
+    ).rejects.toThrow(/generation exited/i);
+    expect(browserA.Target.getTargets).toHaveBeenCalledOnce();
+    expect(browserA.Target.attachToTarget).not.toHaveBeenCalled();
+    expect(browserB.Target.getTargets).not.toHaveBeenCalled();
+    expect(browserB.Target.attachToTarget).not.toHaveBeenCalled();
+    expect(browserB.Runtime.enable).not.toHaveBeenCalled();
+    expect(browserB.Runtime.evaluate).not.toHaveBeenCalled();
   });
 });

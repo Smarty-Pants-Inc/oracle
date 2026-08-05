@@ -18,10 +18,10 @@ import {
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import {
   launchChrome,
-  createChromePageTarget,
   positionChromeWindowOffscreen,
-  connectToRemoteChromeTarget,
-  closeChromeTarget,
+  connectToChromeTargetWithExactAuthority,
+  closeChromeTargetWithExactAuthority,
+  requireExactChromeEndpointOperation,
   retainChromeEndpointAuthority,
   type RemoteChromeConnection,
   type RetainedChromeEndpointAuthority,
@@ -54,6 +54,7 @@ import {
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import {
   isRecoverableChatGptConversationUrl,
+  requiresCleanupOnlyCommittedPromptRecovery,
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
 } from "./reattachability.js";
@@ -251,16 +252,22 @@ export function buildCommittedConversationUrl(
 export function requireCommittedPromptEpochLocator(
   runtime: BrowserRuntimeMetadata,
 ): CommittedPromptEpochLocator {
+  if (requiresCleanupOnlyCommittedPromptRecovery(runtime)) {
+    throw new BrowserAutomationError(
+      "Browser answer reattach is unavailable because the remaining follow-up prompt queue was not durably persisted; exact abort cleanup is required.",
+      {
+        stage: "prompt-epoch",
+        code: "committed-prompt-identity-mismatch",
+        reattachClassification: "cleanup-only-abort",
+        remainingFollowUps: runtime.promptEpoch?.remainingFollowUps,
+        runtime,
+      },
+    );
+  }
   const locator = resolveCommittedPromptEpochLocator(runtime);
   if (!locator) {
     throw new BrowserAutomationError(
       "Browser reattach requires a structurally valid committed prompt epoch.",
-      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
-    );
-  }
-  if (locator.epoch.remainingFollowUps > 0) {
-    throw new BrowserAutomationError(
-      "Browser reattach cannot complete while committed follow-up prompts remain pending.",
       { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
     );
   }
@@ -290,42 +297,44 @@ export function assertSameCommittedPromptEpoch(
 }
 
 export async function createOwnedRecoveryTargetConnection(
-  chrome: Pick<BrowserChrome, "host" | "port">,
+  endpointAuthority: RetainedChromeEndpointAuthority,
   logger: BrowserLogger,
   deps: ReattachDeps,
   targetMarkerUrl?: string,
   onTargetAcquired?: (targetId: string) => void | Promise<void>,
   onTargetCleaned?: (targetId: string) => void | Promise<void>,
 ): Promise<RemoteChromeConnection> {
-  const host = chrome.host ?? "127.0.0.1";
-  const createTarget = deps.createRecoveryTarget ?? createChromePageTarget;
-  const targetId = await createTarget(chrome.port, logger, host, targetMarkerUrl);
-  if (!targetId) {
-    throw new Error("Unable to create a dedicated Chrome target for browser recovery.");
-  }
-
   let connection: RemoteChromeConnection | null = null;
+  let targetId: string | null = null;
   try {
-    await onTargetAcquired?.(targetId);
-    connection = await (deps.connectRecoveryTarget ?? connectToRemoteChromeTarget)(
-      host,
-      chrome.port,
-      logger,
-      { targetId, closeTargetOnDispose: false },
+    const result = await (
+      deps.connectRecoveryTargetWithExactAuthority ?? connectToChromeTargetWithExactAuthority
+    )({
+      authority: endpointAuthority,
+      targetUrl: targetMarkerUrl,
+      closeTargetOnDispose: false,
+    });
+    connection = requireExactChromeEndpointOperation(
+      result,
+      "Unable to acquire a dedicated recovery target through exact Chrome endpoint authority",
     );
-    if (connection.targetId !== targetId) {
-      throw new Error(
-        `Recovery target connection resolved ${connection.targetId} instead of created target ${targetId}.`,
-      );
+    targetId = connection.targetId;
+    if (connection.ownership !== "created") {
+      throw new Error(`Recovery target ${targetId} was not created by this recovery acquisition.`);
     }
-    return { ...connection, targetId, ownership: "created" };
+    await onTargetAcquired?.(targetId);
+    return connection;
   } catch (error) {
     await connection?.close().catch(() => undefined);
-    const closeTarget = deps.recoveryCleanup?.closeChromeTarget ?? closeChromeTarget;
+    if (!targetId) throw error;
+
     let cleanupError: string | null = null;
     try {
-      const closed = await closeTarget({ host, port: chrome.port, targetId, logger });
-      if (!closed) cleanupError = "created target close was not confirmed";
+      const closed = await (
+        deps.recoveryCleanup?.closeChromeTargetWithExactAuthority ??
+        closeChromeTargetWithExactAuthority
+      )({ authority: endpointAuthority, targetId, logger });
+      if (closed.status === "unsafe") cleanupError = closed.reason;
       else await onTargetCleaned?.(targetId);
     } catch (closeError) {
       cleanupError = closeError instanceof Error ? closeError.message : String(closeError);
@@ -677,8 +686,13 @@ export async function resumeBrowserSessionViaNewChrome(
     }
     await persistFallbackRuntime("chrome-target");
     const chromeHost = chrome.host ?? "127.0.0.1";
+    const recoveryEndpointAuthority =
+      manualChromeOwner?.endpointAuthority ?? chrome.endpointAuthority;
+    if (!recoveryEndpointAuthority) {
+      throw new Error("Local recovery Chrome has no retained exact endpoint authority.");
+    }
     const recoveryConnection = await createOwnedRecoveryTargetConnection(
-      chrome,
+      recoveryEndpointAuthority,
       logger,
       deps,
       fallbackTargetMarkerUrl,

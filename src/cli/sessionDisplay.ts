@@ -20,6 +20,8 @@ import {
 } from "../browser/reattach.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import {
+  hasExactPendingChromeAcquisitionAuthority,
+  hasPendingChromeAcquisitionIntent,
   hasRecoverableChatGptConversation,
   isRecoverableChatGptConversationUrl,
   resolveCommittedPromptEpochLocator,
@@ -325,19 +327,45 @@ export async function attachSession(
     };
     runtime = repairedRuntime;
   }
+  const controllerAlive = isProcessAlive(runtime?.controllerPid);
+  const workerAlive = isProcessAlive(metadata.lifecycle?.workerPid);
   const persistedCleanupMode = runtime?.recoveryCleanupResult?.settlementMode;
   const completedCleanupAcknowledged =
     metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata);
-  const cleanupRetryMode =
-    metadata.status === "completed" && persistedCleanupMode === "abort"
-      ? "abort"
-      : completedCleanupAcknowledged &&
-          (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
-        ? "finalize"
-        : metadata.status === "error"
-          ? (persistedCleanupMode ?? null)
-          : null;
-  if (cleanupRetryMode && runtime?.recoveryCleanupResult) {
+  const pendingAcquisitionIntent = hasPendingChromeAcquisitionIntent(runtime);
+  const staleAcquisitionLifecycle =
+    (metadata.status === "running" || metadata.status === "error") &&
+    !controllerAlive &&
+    !workerAlive;
+  const acquisitionOnlyCleanup =
+    metadata.mode === "browser" &&
+    staleAcquisitionLifecycle &&
+    pendingAcquisitionIntent &&
+    !hasRemoteRecoveryAuthority(runtime) &&
+    !hasRecoverableChatGptConversation(runtime);
+  const exactPendingAcquisitionAuthority = hasExactPendingChromeAcquisitionAuthority(runtime);
+  const automaticAcquisitionCleanupMode =
+    acquisitionOnlyCleanup && exactPendingAcquisitionAuthority ? "abort" : null;
+  const malformedAcquisitionOnlyCleanup =
+    acquisitionOnlyCleanup && !exactPendingAcquisitionAuthority;
+  let cleanupRetryMode: "finalize" | "abort" | null = automaticAcquisitionCleanupMode;
+  if (!cleanupRetryMode && !malformedAcquisitionOnlyCleanup) {
+    if (metadata.status === "completed" && persistedCleanupMode === "abort") {
+      cleanupRetryMode = "abort";
+    } else if (
+      completedCleanupAcknowledged &&
+      (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
+    ) {
+      cleanupRetryMode = "finalize";
+    } else if (metadata.status === "error") {
+      cleanupRetryMode = persistedCleanupMode ?? null;
+    }
+  }
+  if (
+    cleanupRetryMode &&
+    runtime &&
+    (runtime.recoveryCleanupResult || automaticAcquisitionCleanupMode)
+  ) {
     const cleanupLogger = Object.assign(
       ((message?: string) => {
         if (message) console.log(dim(message));
@@ -357,10 +385,34 @@ export async function attachSession(
         },
         cleanupRetryMode,
       );
-      await sessionStore.updateSession(sessionId, {
+      const staleRunningAcquisitionRecovered =
+        automaticAcquisitionCleanupMode !== null && metadata.status === "running";
+      const acquisitionRecoveryMessage =
+        cleanup.status === "pending"
+          ? `Browser acquisition cleanup remains pending: ${cleanup.error}`
+          : "Browser session stopped before committing a prompt; acquisition cleanup completed.";
+      const updates: Partial<SessionMetadata> = {
         browser: { ...metadata.browser, runtime: cleanup.runtime },
-      });
-      metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+        ...(staleRunningAcquisitionRecovered
+          ? {
+              status: "error",
+              completedAt: new Date().toISOString(),
+              errorMessage: acquisitionRecoveryMessage,
+              response: { status: "error", incompleteReason: "incomplete-capture" },
+              error: {
+                category: "browser-automation",
+                message: acquisitionRecoveryMessage,
+                details: {
+                  stage: "browser-acquisition-recovery",
+                  runtime: cleanup.runtime,
+                },
+              },
+            }
+          : {}),
+      };
+      await sessionStore.updateSession(sessionId, updates);
+      const updatedMetadata = { ...metadata, ...updates } as SessionMetadata;
+      metadata = (await sessionStore.readSession(sessionId)) ?? updatedMetadata;
       runtime = metadata.browser?.runtime;
       if (cleanup.status === "pending") {
         console.log(chalk.yellow(`Browser cleanup remains pending: ${cleanup.error}`));
@@ -373,8 +425,6 @@ export async function attachSession(
       );
     }
   }
-  const controllerAlive = isProcessAlive(runtime?.controllerPid);
-  const workerAlive = isProcessAlive(metadata.lifecycle?.workerPid);
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
   const hasIncompleteCapture = metadata.response?.incompleteReason === "incomplete-capture";
   const hasResumableRemoteAuthority =
@@ -939,6 +989,134 @@ export function formatTransportMetadata(metadata?: SessionTransportMetadata): st
   return `${metadata.reason} — ${label}`;
 }
 
+const TERMINAL_SAFE_DETAIL_KEYS: Record<string, true> = {
+  action: true,
+  actions: true,
+  canretry: true,
+  cause: true,
+  causes: true,
+  category: true,
+  code: true,
+  details: true,
+  elapsedms: true,
+  hint: true,
+  inputtokens: true,
+  message: true,
+  mode: true,
+  path: true,
+  reason: true,
+  remainingfollowups: true,
+  requestedmodel: true,
+  retryable: true,
+  retriable: true,
+  stage: true,
+  status: true,
+  sessionstatus: true,
+  useraction: true,
+  useractions: true,
+  validationreason: true,
+};
+
+const TERMINAL_AUTHORITY_KEY_FRAGMENTS = [
+  "runtime",
+  "transactiontoken",
+  "recoverycleanup",
+  "remoterecovery",
+  "websocket",
+  "wsendpoint",
+  "endpoint",
+  "chromepid",
+  "controllerpid",
+  "processidentity",
+  "processlaunchclaim",
+  "launchclaim",
+  "launch",
+  "claim",
+  "pid",
+  "profile",
+  "userdatadir",
+  "cookiepath",
+  "host",
+  "port",
+  "token",
+  "secret",
+  "credential",
+  "authorization",
+  "password",
+  "target",
+  "url",
+] as const;
+
+const MAX_TERMINAL_DETAIL_DEPTH = 8;
+
+function normalizedDetailKey(key: string): string {
+  return key.replace(/[^a-z0-9]/giu, "").toLowerCase();
+}
+
+function sanitizeTerminalDiagnosticText(value: string): string {
+  return value
+    .replace(/\b(?:wss?|https?):\/\/[^\s"'`),}\]]+/giu, "[redacted-endpoint]")
+    .replace(
+      /(\b(?:transaction[ _-]?token|access[ _-]?token|auth(?:orization)?|bearer|token|secret|credential|password)\b\s*[:=]\s*)[^\s,"'}\]]+/giu,
+      "$1[redacted]",
+    )
+    .replace(/\b(?:chrome|controller)\s*pid\s*[:=]?\s*\d+/giu, "[redacted-pid]")
+    .replace(
+      /\b(?:user[ _-]?data|profile(?: directory)?)\s*(?:path|dir(?:ectory)?)?\s*[:=]\s*[^\s,"'}\]]+/giu,
+      "[redacted-path]",
+    )
+    .replace(
+      /\b(?:user[ _-]?data|profile(?: directory)?)\s+(?:~\/|\/|[A-Za-z]:\\)[^\s,"'}\]]+/giu,
+      "[redacted-path]",
+    )
+    .replace(/\b[A-Za-z0-9._~+/=:-]{32,}\b/gu, "[redacted]")
+    .replace(/(?:~\/|\/(?:Users|home|tmp)\/)[^\s,"'}\]]+/gu, "[redacted-path]");
+}
+
+function projectTerminalDiagnostic(
+  value: unknown,
+  seen: WeakSet<object>,
+  depth = 0,
+): unknown | undefined {
+  if (value == null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") return sanitizeTerminalDiagnosticText(value);
+  if (typeof value !== "object" || depth >= MAX_TERMINAL_DETAIL_DEPTH || seen.has(value)) {
+    return undefined;
+  }
+
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const projected: unknown[] = [];
+    for (const entry of value) {
+      const safeEntry = projectTerminalDiagnostic(entry, seen, depth + 1);
+      if (safeEntry !== undefined) projected.push(safeEntry);
+    }
+    return projected.length > 0 ? projected : undefined;
+  }
+
+  const projected: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizedDetailKey(key);
+    if (
+      TERMINAL_AUTHORITY_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment)) ||
+      !TERMINAL_SAFE_DETAIL_KEYS[normalized]
+    ) {
+      continue;
+    }
+    const safeEntry =
+      normalized === "path" &&
+      typeof entry === "string" &&
+      (path.isAbsolute(entry) ||
+        /^[A-Za-z]:[\\/]/u.test(entry) ||
+        /(?:^|[\\/])(?:user[ _-]?data|profile)(?:[\\/]|$)/iu.test(entry))
+        ? "[redacted-path]"
+        : projectTerminalDiagnostic(entry, seen, depth + 1);
+    if (safeEntry !== undefined) projected[key] = safeEntry;
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
 export function formatUserErrorMetadata(metadata?: SessionUserErrorMetadata): string | null {
   if (!metadata) {
     return null;
@@ -948,10 +1126,15 @@ export function formatUserErrorMetadata(metadata?: SessionUserErrorMetadata): st
     parts.push(metadata.category);
   }
   if (metadata.message) {
-    parts.push(`message=${metadata.message}`);
+    parts.push(`message=${sanitizeTerminalDiagnosticText(metadata.message)}`);
   }
-  if (metadata.details && Object.keys(metadata.details).length > 0) {
-    parts.push(`details=${JSON.stringify(metadata.details)}`);
+  const projected = metadata.details
+    ? projectTerminalDiagnostic(metadata.details, new WeakSet())
+    : undefined;
+  const details =
+    projected && !Array.isArray(projected) ? (projected as Record<string, unknown>) : null;
+  if (details) {
+    parts.push(`details=${JSON.stringify(details)}`);
   }
   return parts.length > 0 ? parts.join(" | ") : null;
 }

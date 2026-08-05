@@ -1,6 +1,7 @@
 import CDP from "chrome-remote-interface";
 import { createHash } from "node:crypto";
 import type { SessionMetadata, BrowserHarvestState } from "../sessionStore.js";
+import type { ChromeClient } from "./types.js";
 import {
   ANSWER_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
@@ -16,6 +17,13 @@ import {
 } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
+import type { RetainedChromeEndpointAuthority } from "./chromeEndpointAuthority.js";
+import {
+  connectToChromeTargetWithExactAuthority,
+  createChromePageTargetWithExactAuthority,
+  listChromeTargetsWithExactAuthority,
+  requireExactChromeEndpointOperation,
+} from "./chromeTargetConnection.js";
 
 export const DEFAULT_REMOTE_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_REMOTE_CHROME_PORT = 9222;
@@ -34,7 +42,21 @@ export interface ChromeTarget {
 interface HostPort {
   host?: string;
   port?: number;
+  endpointAuthority?: RetainedChromeEndpointAuthority;
 }
+
+interface NormalizedRawChromeEndpoint {
+  host: string;
+  port: number;
+}
+
+interface NormalizedOwnedChromeEndpoint {
+  host: string;
+  port: number;
+  endpointAuthority: RetainedChromeEndpointAuthority;
+}
+
+type NormalizedHostPort = NormalizedRawChromeEndpoint | NormalizedOwnedChromeEndpoint;
 
 export interface ChatGptTabSummary {
   host?: string;
@@ -69,18 +91,18 @@ export interface ChatGptTabSummary {
   lastAssistantTurnId?: string;
 }
 
-interface ResolveChatGptTabOptions extends HostPort {
+type ResolveChatGptTabOptions = HostPort & {
   ref?: string;
-}
+};
 
-interface InspectChatGptTabOptions extends HostPort {
+type InspectChatGptTabOptions = HostPort & {
   target: ChromeTarget;
-}
+};
 
-interface HarvestChatGptTabOptions extends ResolveChatGptTabOptions {
+type HarvestChatGptTabOptions = ResolveChatGptTabOptions & {
   target?: ChromeTarget;
   stallWindowMs?: number;
-}
+};
 
 const noopLogger = Object.assign((_message: string) => {}, {}) as ((message: string) => void) & {
   verbose?: boolean;
@@ -96,11 +118,13 @@ function trimToSnippet(text: string, max = 140): string {
   return `${normalized.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
-function normalizeHostPort(input: HostPort = {}): Required<HostPort> {
-  return {
-    host: input.host ?? DEFAULT_REMOTE_CHROME_HOST,
-    port: input.port ?? DEFAULT_REMOTE_CHROME_PORT,
-  };
+function normalizeHostPort(input: HostPort = {}): NormalizedHostPort {
+  const host = input.host ?? DEFAULT_REMOTE_CHROME_HOST;
+  const port = input.port ?? DEFAULT_REMOTE_CHROME_PORT;
+  if (input.endpointAuthority) {
+    return { host, port, endpointAuthority: input.endpointAuthority };
+  }
+  return { host, port };
 }
 
 function normalizeUrl(value: unknown): string {
@@ -274,22 +298,43 @@ export function buildTabInspectionExpressionForTest(): string {
 }
 
 export async function listChatGptTargets(options: HostPort = {}): Promise<ChromeTarget[]> {
-  const { host, port } = normalizeHostPort(options);
-  const targets = (await CDP.List({ host, port })) as ChromeTarget[];
+  const endpoint = normalizeHostPort(options);
+  const targets =
+    "endpointAuthority" in endpoint
+      ? requireExactChromeEndpointOperation(
+          await listChromeTargetsWithExactAuthority(endpoint.endpointAuthority),
+          "Unable to list ChatGPT tabs through exact Chrome endpoint authority",
+        )
+      : ((await CDP.List({ host: endpoint.host, port: endpoint.port })) as ChromeTarget[]);
   return targets.filter(isChatGptTarget);
 }
 
 export async function openChatGptTarget(
   options: HostPort & { url?: string } = {},
 ): Promise<string> {
-  const { host, port } = normalizeHostPort(options);
+  const endpoint = normalizeHostPort(options);
   const url = options.url ?? "https://chatgpt.com/";
-  const target = await CDP.New({ host, port, url });
+  if ("endpointAuthority" in endpoint) {
+    return requireExactChromeEndpointOperation(
+      await createChromePageTargetWithExactAuthority(endpoint.endpointAuthority, url),
+      "Unable to create a ChatGPT tab through exact Chrome endpoint authority",
+    );
+  }
+  const target = await CDP.New({ host: endpoint.host, port: endpoint.port, url });
   return target.id;
 }
 
-async function connectToTarget(host: string, port: number, targetId: string) {
-  const client = await CDP({ host, port, target: targetId });
+async function connectToTarget(endpoint: NormalizedHostPort, targetId: string) {
+  const client =
+    "endpointAuthority" in endpoint
+      ? requireExactChromeEndpointOperation(
+          await connectToChromeTargetWithExactAuthority({
+            authority: endpoint.endpointAuthority,
+            targetId,
+          }),
+          `Unable to attach to ChatGPT target ${targetId} through exact Chrome endpoint authority`,
+        ).client
+      : await CDP({ host: endpoint.host, port: endpoint.port, target: targetId });
   const { Runtime, DOM } = client;
   if (Runtime?.enable) {
     await Runtime.enable();
@@ -303,14 +348,15 @@ async function connectToTarget(host: string, port: number, targetId: string) {
 export async function inspectChatGptTab(
   options: InspectChatGptTabOptions,
 ): Promise<ChatGptTabSummary> {
-  const { host, port } = normalizeHostPort(options);
+  const endpoint = normalizeHostPort(options);
+  const { host, port } = endpoint;
   const target = options.target;
   const targetId = extractTargetId(target);
   if (!targetId) {
     throw new Error("inspectChatGptTab requires a target with targetId.");
   }
 
-  const client = await connectToTarget(host, port, targetId);
+  const client = await connectToTarget(endpoint, targetId);
   try {
     const { Runtime } = client;
     const evaluation = await Runtime.evaluate({
@@ -432,9 +478,9 @@ export function classifyTabState(
 }
 
 export async function collectChatGptTabs(options: HostPort = {}): Promise<ChatGptTabSummary[]> {
-  const { host, port } = normalizeHostPort(options);
-  const targets = await listChatGptTargets({ host, port });
-  return collectChatGptTabsFromTargets(host, port, targets);
+  const endpoint = normalizeHostPort(options);
+  const targets = await listChatGptTargets(options);
+  return collectChatGptTabsFromTargets(endpoint, targets);
 }
 
 function resolveChatGptTabFromSummaries(
@@ -540,14 +586,14 @@ export function summaryFromTargetForTest(
 }
 
 async function collectChatGptTabsFromTargets(
-  host: string,
-  port: number,
+  endpoint: NormalizedHostPort,
   targets: ChromeTarget[],
 ): Promise<ChatGptTabSummary[]> {
+  const { host, port } = endpoint;
   const summaries: ChatGptTabSummary[] = [];
   for (const target of targets) {
     try {
-      const summary = await inspectChatGptTab({ host, port, target });
+      const summary = await inspectChatGptTab({ ...endpoint, target });
       summaries.push(summary);
     } catch (error) {
       summaries.push({
@@ -587,49 +633,53 @@ async function collectChatGptTabsFromTargets(
 export async function resolveChatGptTab(
   options: ResolveChatGptTabOptions = {},
 ): Promise<ChatGptTabSummary> {
-  const { host, port } = normalizeHostPort(options);
-  const targets = await listChatGptTargets({ host, port });
+  const endpoint = normalizeHostPort(options);
+  const targets = await listChatGptTargets(options);
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
   if (exactTarget) {
-    return inspectChatGptTab({ host, port, target: exactTarget });
+    return inspectChatGptTab({ ...endpoint, target: exactTarget });
   }
-  const summaries = await collectChatGptTabsFromTargets(host, port, targets);
+  const summaries = await collectChatGptTabsFromTargets(endpoint, targets);
   return resolveChatGptTabFromSummaries(summaries, options.ref);
 }
 
 export async function connectToExistingChatGptTab(
   options: ResolveChatGptTabOptions = {},
-): Promise<{ client: Awaited<ReturnType<typeof CDP>>; targetId: string; tab: ChatGptTabSummary }> {
-  const { host, port } = normalizeHostPort(options);
-  const targets = await listChatGptTargets({ host, port });
+): Promise<{ client: ChromeClient; targetId: string; tab: ChatGptTabSummary }> {
+  const endpoint = normalizeHostPort(options);
+  const targets = await listChatGptTargets(options);
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
   if (exactTarget) {
     const targetId = extractTargetId(exactTarget);
     if (!targetId) {
       throw new Error("Resolved ChatGPT tab is missing a target id.");
     }
-    const client = await connectToTarget(host, port, targetId);
-    return { client, targetId, tab: summaryFromTarget(host, port, exactTarget) };
+    const client = await connectToTarget(endpoint, targetId);
+    return {
+      client,
+      targetId,
+      tab: summaryFromTarget(endpoint.host, endpoint.port, exactTarget),
+    };
   }
-  const tab = await resolveChatGptTab({ host, port, ref: options.ref });
-  const client = await connectToTarget(host, port, tab.targetId);
+  const summaries = await collectChatGptTabsFromTargets(endpoint, targets);
+  const tab = resolveChatGptTabFromSummaries(summaries, options.ref);
+  const client = await connectToTarget(endpoint, tab.targetId);
   return { client, targetId: tab.targetId, tab };
 }
 
 export async function harvestChatGptTab(
   options: HarvestChatGptTabOptions = {},
 ): Promise<ChatGptTabSummary> {
-  const { host, port } = normalizeHostPort(options);
+  const endpoint = normalizeHostPort(options);
   const resolved = options.target
-    ? await inspectChatGptTab({ host, port, target: options.target })
-    : await resolveChatGptTab({ host, port, ref: options.ref });
-  const client = await connectToTarget(host, port, resolved.targetId);
+    ? await inspectChatGptTab({ ...endpoint, target: options.target })
+    : await resolveChatGptTab({ ...endpoint, ref: options.ref });
+  const client = await connectToTarget(endpoint, resolved.targetId);
   try {
     const { Runtime } = client;
     const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
     const nowSummary = await inspectChatGptTab({
-      host,
-      port,
+      ...endpoint,
       target: {
         targetId: resolved.targetId,
         title: resolved.title,
@@ -681,8 +731,7 @@ export async function harvestChatGptTab(
       const firstFingerprint = harvested.fingerprint;
       await delay(options.stallWindowMs);
       const followup = await inspectChatGptTab({
-        host,
-        port,
+        ...endpoint,
         target: {
           targetId: harvested.targetId,
           title: harvested.title,

@@ -20,6 +20,7 @@ import {
 export const DEFAULT_MAX_CONCURRENT_CHATGPT_TABS = 3;
 const REGISTRY_FILENAME = "oracle-tab-leases.json";
 const REGISTRY_LOCK_DIRNAME = "oracle-tab-leases.lock";
+const CURRENT_REGISTRY_VERSION = 2;
 const DEFAULT_POLL_MS = 1000;
 const REGISTRY_LOCK_TIMEOUT_MS = 10_000;
 const WINDOWS_REGISTRY_MUTATION_RETRY_MS = 10;
@@ -37,19 +38,37 @@ export interface BrowserTabLeaseRecord {
   createdAt: string;
   updatedAt: string;
 }
+export interface BrowserTabLeaseReleaseOptions {
+  onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
+}
 
 export interface BrowserTabLease {
-  id: string;
+  readonly id: string;
   readonly profileDirectory: ProfileDirectoryIdentity;
-  release: (options?: {
-    onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
-  }) => Promise<void>;
+  release: (options?: BrowserTabLeaseReleaseOptions) => Promise<void>;
   update: (patch: Partial<BrowserTabLeaseRecord>) => Promise<void>;
 }
 
+/** The exact-base v1 record shape, which had no process generation. */
+interface LegacyBrowserTabLeaseRecord extends Omit<BrowserTabLeaseRecord, "processStartIdentity"> {
+  processStartIdentity?: never;
+}
+
+type BrowserTabLeaseRegistryRecord = BrowserTabLeaseRecord | LegacyBrowserTabLeaseRecord;
+
 interface BrowserTabLeaseRegistryFile {
+  version: typeof CURRENT_REGISTRY_VERSION;
+  leases: BrowserTabLeaseRegistryRecord[];
+}
+
+interface LegacyBrowserTabLeaseRegistryFile {
   version: 1;
-  leases: BrowserTabLeaseRecord[];
+  leases: BrowserTabLeaseRegistryRecord[];
+}
+
+interface BrowserTabLeaseRegistryRead {
+  registry: BrowserTabLeaseRegistryFile;
+  requiresMigration: boolean;
 }
 
 export interface BrowserLeaseLivenessDeps {
@@ -151,11 +170,11 @@ export async function acquireBrowserTabLease(
 
   for (;;) {
     const acquired = await withRegistryLock(authority, async () => {
-      const registry = await readRegistryForAcquire(authority);
+      const { registry, requiresMigration } = await readRegistryForAcquire(authority);
       const active = await pruneStaleLeases(registry.leases, deps);
       if (active.length >= maxConcurrentTabs) {
-        if (active.length !== registry.leases.length) {
-          await writeRegistry(authority, { version: 1, leases: active });
+        if (requiresMigration || active.length !== registry.leases.length) {
+          await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
         }
         return null;
       }
@@ -170,7 +189,10 @@ export async function acquireBrowserTabLease(
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      await writeRegistry(authority, { version: 1, leases: [...active, lease] });
+      await writeRegistry(authority, {
+        version: CURRENT_REGISTRY_VERSION,
+        leases: [...active, lease],
+      });
       return lease;
     });
 
@@ -181,9 +203,10 @@ export async function acquireBrowserTabLease(
       return {
         id: leaseId,
         profileDirectory: authority.profileDirectory,
-        release: async (releaseOptions) =>
+        release: async (releaseOptions?: BrowserTabLeaseReleaseOptions) =>
           releaseBrowserTabLeaseWithAuthority(authority, leaseId, options.logger, releaseOptions),
-        update: async (patch) => updateBrowserTabLeaseWithAuthority(authority, leaseId, patch),
+        update: async (patch: Partial<BrowserTabLeaseRecord>) =>
+          updateBrowserTabLeaseWithAuthority(authority, leaseId, patch),
       };
     }
 
@@ -246,10 +269,10 @@ export function retainBrowserTabLeaseTeardownAuthority(
 
       try {
         const result = await withRegistryLock(authority, async () => {
-          const registry = await readRegistryStrict(authority);
+          const { registry, requiresMigration } = await readRegistryStrict(authority);
           const active = await pruneStaleLeases(registry.leases, options);
-          if (active.length !== registry.leases.length) {
-            await writeRegistry(authority, { version: 1, leases: active });
+          if (requiresMigration || active.length !== registry.leases.length) {
+            await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
           }
 
           if (phase === "teardown-completed") {
@@ -275,7 +298,10 @@ export function retainBrowserTabLeaseTeardownAuthority(
           const remaining = active.filter((entry) => entry.id !== lease.id);
           if (phase === "leased") {
             if (leaseWasActive) {
-              await writeRegistry(authority, { version: 1, leases: remaining });
+              await writeRegistry(authority, {
+                version: CURRENT_REGISTRY_VERSION,
+                leases: remaining,
+              });
             }
             phase = "released";
             if (leaseWasActive && remaining.length > 0) {
@@ -339,9 +365,9 @@ async function updateBrowserTabLeaseWithAuthority(
   patch: Partial<BrowserTabLeaseRecord>,
 ): Promise<void> {
   await withRegistryLock(authority, async () => {
-    const registry = await readRegistryStrict(authority);
+    const { registry } = await readRegistryStrict(authority);
     const leases = registry.leases.map((lease) => {
-      if (lease.id !== leaseId) return lease;
+      if (lease.id !== leaseId || !isLeaseRecord(lease)) return lease;
       const updated = {
         ...lease,
         ...patch,
@@ -354,7 +380,7 @@ async function updateBrowserTabLeaseWithAuthority(
       if (!isLeaseRecord(updated)) throw new Error("Invalid browser tab lease update");
       return updated;
     });
-    await writeRegistry(authority, { version: 1, leases });
+    await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases });
   });
 }
 
@@ -362,10 +388,7 @@ export async function releaseBrowserTabLease(
   profileDir: string,
   leaseId: string,
   logger?: BrowserLogger,
-  options: {
-    onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
-    expectedProfileIdentity?: ProfileDirectoryIdentity;
-  } = {},
+  options: BrowserTabLeaseReleaseOptions & BrowserTabLeaseAuthorityOptions = {},
 ): Promise<void> {
   const authority = await captureTabLeaseAuthority(profileDir, options);
   await releaseBrowserTabLeaseWithAuthority(authority, leaseId, logger, options);
@@ -375,15 +398,15 @@ async function releaseBrowserTabLeaseWithAuthority(
   authority: BrowserTabLeaseAuthority,
   leaseId: string,
   logger?: BrowserLogger,
-  options: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> } = {},
+  options: BrowserTabLeaseReleaseOptions = {},
 ): Promise<void> {
   const released = await withRegistryLock(authority, async () => {
-    const registry = await readRegistryStrict(authority);
+    const { registry, requiresMigration } = await readRegistryStrict(authority);
     const active = await pruneStaleLeases(registry.leases, {});
     const leaseWasActive = active.some((lease) => lease.id === leaseId);
     const leases = active.filter((lease) => lease.id !== leaseId);
-    if (leases.length !== registry.leases.length) {
-      await writeRegistry(authority, { version: 1, leases });
+    if (requiresMigration || leases.length !== registry.leases.length) {
+      await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases });
     }
     if (!leaseWasActive) return false;
     await assertTabLeaseAuthority(authority, "final browser lease cleanup");
@@ -400,10 +423,10 @@ export async function hasOtherActiveBrowserTabLeases(
 ): Promise<boolean> {
   const authority = await captureTabLeaseAuthority(profileDir, options);
   return withRegistryLock(authority, async () => {
-    const registry = await readRegistryStrict(authority);
+    const { registry, requiresMigration } = await readRegistryStrict(authority);
     const active = await pruneStaleLeases(registry.leases, options);
-    if (active.length !== registry.leases.length) {
-      await writeRegistry(authority, { version: 1, leases: active });
+    if (requiresMigration || active.length !== registry.leases.length) {
+      await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
     }
     return active.some((lease) => lease.id !== leaseId);
   });
@@ -418,10 +441,10 @@ export async function teardownBrowserResourcesIfNoActiveLeases(
   try {
     const authority = await captureTabLeaseAuthority(profileDir, options);
     return await withRegistryLock(authority, async () => {
-      const registry = await readRegistryStrict(authority);
+      const { registry, requiresMigration } = await readRegistryStrict(authority);
       const active = await pruneStaleLeases(registry.leases, options);
-      if (active.length !== registry.leases.length) {
-        await writeRegistry(authority, { version: 1, leases: active });
+      if (requiresMigration || active.length !== registry.leases.length) {
+        await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
       }
       if (active.length > 0) {
         return { status: "preserved", reason: "active-leases" };
@@ -496,13 +519,16 @@ async function withRegistryLock<T>(
 
 async function readRegistryForAcquire(
   authority: BrowserTabLeaseAuthority,
-): Promise<BrowserTabLeaseRegistryFile> {
+): Promise<BrowserTabLeaseRegistryRead> {
   try {
     return await readRegistryStrict(authority);
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") {
       await assertTabLeaseAuthority(authority, "browser tab lease registry initialization");
-      return { version: 1, leases: [] };
+      return {
+        registry: { version: CURRENT_REGISTRY_VERSION, leases: [] },
+        requiresMigration: false,
+      };
     }
     throw error;
   }
@@ -510,19 +536,31 @@ async function readRegistryForAcquire(
 
 async function readRegistryStrict(
   authority: BrowserTabLeaseAuthority,
-): Promise<BrowserTabLeaseRegistryFile> {
+): Promise<BrowserTabLeaseRegistryRead> {
   await assertTabLeaseAuthority(authority, "browser tab lease registry read");
   const raw = await readFile(registryPath(authority), "utf8");
   await assertTabLeaseAuthority(authority, "browser tab lease registry read");
-  const parsed = JSON.parse(raw) as BrowserTabLeaseRegistryFile;
-  if (parsed.version !== 1 || !Array.isArray(parsed.leases)) {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object") {
     throw new Error("Invalid browser tab lease registry");
   }
-  const leases = parsed.leases.filter(isLeaseRecord);
-  if (leases.length !== parsed.leases.length) {
+  const candidate = parsed as { version?: unknown; leases?: unknown };
+  const version = candidate.version;
+  if ((version !== 1 && version !== CURRENT_REGISTRY_VERSION) || !Array.isArray(candidate.leases)) {
+    throw new Error("Invalid browser tab lease registry");
+  }
+  const leases = candidate.leases.filter(isRegistryLeaseRecord);
+  if (leases.length !== candidate.leases.length) {
     throw new Error("Invalid browser tab lease record");
   }
-  return { version: 1, leases };
+  const file: BrowserTabLeaseRegistryFile | LegacyBrowserTabLeaseRegistryFile = {
+    version,
+    leases,
+  };
+  return {
+    registry: { version: CURRENT_REGISTRY_VERSION, leases: file.leases },
+    requiresMigration: file.version === 1,
+  };
 }
 
 async function writeRegistry(
@@ -566,17 +604,17 @@ function registryPath(authority: BrowserTabLeaseAuthority): string {
 }
 
 async function pruneStaleLeases(
-  leases: BrowserTabLeaseRecord[],
+  leases: BrowserTabLeaseRegistryRecord[],
   deps: BrowserLeaseLivenessDeps,
-): Promise<BrowserTabLeaseRecord[]> {
+): Promise<BrowserTabLeaseRegistryRecord[]> {
   const readLiveness = deps.readProcessLiveness ?? readProcessLiveness;
   const readStartIdentity = deps.readProcessStartIdentity ?? readProcessStartIdentity;
   const observedProcessIdentities = new Map<number, Promise<string | null>>();
-  const active: BrowserTabLeaseRecord[] = [];
+  const active: BrowserTabLeaseRegistryRecord[] = [];
   for (const lease of leases) {
     const liveness = readLiveness(lease.pid);
     if (liveness === "dead") continue;
-    if (lease.processStartIdentity !== null && liveness === "alive") {
+    if (isLeaseRecord(lease) && lease.processStartIdentity !== null && liveness === "alive") {
       let observedIdentityPromise = observedProcessIdentities.get(lease.pid);
       if (!observedIdentityPromise) {
         observedIdentityPromise = readStartIdentity(lease.pid);
@@ -590,16 +628,33 @@ async function pruneStaleLeases(
   return active;
 }
 
+function isRegistryLeaseRecord(value: unknown): value is BrowserTabLeaseRegistryRecord {
+  return isLeaseRecord(value) || isLegacyLeaseRecord(value);
+}
+
 function isLeaseRecord(value: unknown): value is BrowserTabLeaseRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as BrowserTabLeaseRecord;
   return (
+    hasValidLeaseRecordFields(record) &&
+    (record.processStartIdentity === null ||
+      (typeof record.processStartIdentity === "string" && record.processStartIdentity.length > 0))
+  );
+}
+
+function isLegacyLeaseRecord(value: unknown): value is LegacyBrowserTabLeaseRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as LegacyBrowserTabLeaseRecord;
+  return !("processStartIdentity" in record) && hasValidLeaseRecordFields(record);
+}
+
+function hasValidLeaseRecordFields(
+  record: Omit<BrowserTabLeaseRecord, "processStartIdentity">,
+): boolean {
+  return (
     typeof record.id === "string" &&
     record.id.length > 0 &&
     Number.isInteger(record.pid) &&
-    (record.processStartIdentity === null ||
-      (typeof record.processStartIdentity === "string" &&
-        record.processStartIdentity.length > 0)) &&
     record.pid > 0 &&
     typeof record.createdAt === "string" &&
     Number.isFinite(Date.parse(record.createdAt)) &&

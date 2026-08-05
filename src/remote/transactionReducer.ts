@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
@@ -6,6 +7,8 @@ import type {
   DurableRemoteArtifactDeliveryReceipt,
   DurableRemoteArtifactRegistration,
   DurableRemoteAutomationError,
+  DurableRemoteCaptureWarning,
+  DurableRemoteStagedCapture,
   ExpiredRemoteTransactionSettlement,
   ReconcileRemoteTransactionResult,
   RemoteTransactionControllerShutdownAction,
@@ -40,6 +43,32 @@ interface RemoteTransactionTransitionDefinitions {
   };
   "persist-settlement-runtime": {
     params: { runtime: BrowserRuntimeMetadata };
+    outcome: undefined;
+  };
+  "stage-capture": {
+    params: {
+      runId: string;
+      result: RemotePublicRunResult;
+      runtime: BrowserRuntimeMetadata;
+      modelSelection?: BrowserModelSelectionEvidence;
+      artifacts: DurableRemoteArtifactRegistration[];
+    };
+    outcome: undefined;
+  };
+  "promote-staged-capture": {
+    params: {
+      result?: RemotePublicRunResult;
+      runtime?: BrowserRuntimeMetadata;
+      warning?: DurableRemoteCaptureWarning;
+      stripTargetAuthority: boolean;
+    };
+    outcome: undefined;
+  };
+  "invalidate-staged-capture": {
+    params: {
+      runtime?: BrowserRuntimeMetadata;
+      error: DurableRemoteAutomationError;
+    };
     outcome: undefined;
   };
   "publish-capture": {
@@ -192,6 +221,111 @@ const reducers: RemoteTransactionReducers = {
     record.runtimeJournaledAt = context.nowIso();
     return { persist: true, outcome: undefined };
   },
+  "stage-capture": (record, transition, context) => {
+    if (record.state !== "running") {
+      throw new Error(`Cannot stage capture from transaction state ${record.state}`);
+    }
+    assertCurrentController(record, context, "stage capture");
+    if (record.runId !== transition.runId) {
+      throw new Error("Remote capture run identity changed before durable staging");
+    }
+    assertStagedPromptIdentity(record, transition.runtime);
+    assertArtifactRegistrationsOwned(record, transition.artifacts);
+    const stagedCapture: DurableRemoteStagedCapture = {
+      result: transition.result,
+      runtime: transition.runtime,
+      modelSelection: transition.modelSelection,
+      artifacts: transition.artifacts.length > 0 ? transition.artifacts : undefined,
+      stagedAt: context.nowIso(),
+    };
+    if (record.stagedCapture) {
+      const existing = record.stagedCapture;
+      assertCapturePromotionMatchesStage(existing, stagedCapture.result, stagedCapture.runtime);
+      if (
+        !isDeepStrictEqual(
+          captureModelSelectionIdentity(existing.modelSelection),
+          captureModelSelectionIdentity(stagedCapture.modelSelection),
+        )
+      ) {
+        throw new RemoteTransactionTransitionError(
+          "staged_capture_conflict",
+          "Remote transaction staged capture model evidence changed",
+        );
+      }
+      if (
+        existing.artifacts?.length &&
+        stagedCapture.artifacts?.length &&
+        !isDeepStrictEqual(existing.artifacts, stagedCapture.artifacts)
+      ) {
+        throw new RemoteTransactionTransitionError(
+          "staged_capture_conflict",
+          "Remote transaction staged capture artifacts changed",
+        );
+      }
+      const enriched: DurableRemoteStagedCapture = {
+        ...stagedCapture,
+        result: mergeCaptureWarnings(existing.result, stagedCapture.result),
+        artifacts: stagedCapture.artifacts ?? existing.artifacts,
+        stagedAt: existing.stagedAt,
+      };
+      if (isDeepStrictEqual(existing, enriched)) {
+        return { persist: false, outcome: undefined };
+      }
+      record.stagedCapture = enriched;
+      record.runtime = enriched.runtime;
+      record.runtimeJournaledAt = context.nowIso();
+      record.modelSelection = enriched.modelSelection;
+      return { persist: true, outcome: undefined };
+    }
+    record.stagedCapture = stagedCapture;
+    record.runtime = transition.runtime;
+    record.runtimeJournaledAt = context.nowIso();
+    record.modelSelection = transition.modelSelection;
+    return { persist: true, outcome: undefined };
+  },
+  "promote-staged-capture": (record, transition, context) => {
+    if (record.state === "pending" && record.result && record.runtime && !record.stagedCapture) {
+      return { persist: false, outcome: undefined };
+    }
+    if (
+      record.state !== "running" &&
+      !(record.state === "recoverable-error" && !record.settlementMode)
+    ) {
+      throw new Error(`Cannot promote staged capture from transaction state ${record.state}`);
+    }
+    if (record.state === "running") assertCurrentController(record, context, "promote capture");
+    const staged = record.stagedCapture;
+    if (!staged) throw new Error("Remote transaction does not contain a staged capture");
+    const result = transition.result ?? staged.result;
+    const runtime = transition.runtime ?? staged.runtime;
+    assertCapturePromotionMatchesStage(staged, result, runtime);
+    commitCapture(
+      record,
+      mergeCaptureWarnings(staged.result, result, transition.warning),
+      transition.stripTargetAuthority ? projectRuntimeAfterTargetLoss(runtime) : runtime,
+      staged.modelSelection,
+      staged.artifacts ?? [],
+      context,
+    );
+    return { persist: true, outcome: undefined };
+  },
+  "invalidate-staged-capture": (record, transition, context) => {
+    if (record.state !== "running" && record.state !== "recoverable-error") {
+      throw new Error(`Cannot invalidate staged capture from transaction state ${record.state}`);
+    }
+    assertCurrentController(record, context, "invalidate staged capture");
+    if (record.settlementMode) {
+      throw new Error("Cannot invalidate a capture after cleanup settlement is bound");
+    }
+    if (Boolean(transition.runtime) !== transition.error.recoverableDisconnect) {
+      throw new Error("Capture invalidation recoverability must match runtime authority");
+    }
+    record.controllerGeneration = context.controllerGeneration;
+    record.runtime = transition.runtime;
+    record.runtimeJournaledAt = transition.runtime ? context.nowIso() : undefined;
+    projectRunningRecordToFailure(record, transition.error, true);
+    return { persist: true, outcome: undefined };
+  },
   "publish-capture": (record, transition, context) => {
     if (
       record.state !== "running" &&
@@ -205,19 +339,31 @@ const reducers: RemoteTransactionReducers = {
     if (record.runId !== transition.runId) {
       throw new Error("Remote capture run identity changed before durable commit");
     }
+    assertStagedPromptIdentity(record, transition.runtime);
     assertArtifactRegistrationsOwned(record, transition.artifacts);
-    record.controllerGeneration = context.controllerGeneration;
-    record.state = "pending";
-    record.result = transition.result;
-    record.runtime = transition.runtime;
-    record.runtimeJournaledAt = context.nowIso();
-    record.modelSelection = transition.modelSelection;
-    record.artifacts = transition.artifacts.length > 0 ? transition.artifacts : undefined;
-    record.error = undefined;
-    record.settlementMode = undefined;
-    record.publicationAcknowledgedAt = undefined;
-    record.finalization = undefined;
-    record.restartRecovery = undefined;
+    let result = transition.result;
+    if (record.stagedCapture) {
+      assertCapturePromotionMatchesStage(
+        record.stagedCapture,
+        transition.result,
+        transition.runtime,
+      );
+      if (!isDeepStrictEqual(record.stagedCapture.artifacts ?? [], transition.artifacts)) {
+        throw new RemoteTransactionTransitionError(
+          "staged_capture_artifact_mismatch",
+          "Published capture artifacts do not match the exact staged capture",
+        );
+      }
+      result = mergeCaptureWarnings(record.stagedCapture.result, transition.result);
+    }
+    commitCapture(
+      record,
+      result,
+      transition.runtime,
+      transition.modelSelection,
+      transition.artifacts,
+      context,
+    );
     return { persist: true, outcome: undefined };
   },
   "record-failure": (record, transition, context) => {
@@ -327,7 +473,7 @@ const reducers: RemoteTransactionReducers = {
         ? record.runtime
         : { ...record.runtime, recoveryCleanupResult: { status: "pending" as const } };
     record.runtime = markBrowserCaptureCleanupPending(cleanupRuntime, transition.mode);
-    return { persist: true, outcome: { status: "bound", cleanupRuntime } };
+    return { persist: true, outcome: { status: "bound", cleanupRuntime: record.runtime } };
   },
   "complete-settlement": (record, transition, context) => {
     if (record.settlementMode !== transition.mode) {
@@ -377,8 +523,13 @@ const reducers: RemoteTransactionReducers = {
     };
   },
   "reconcile-controller": (record, transition, context) => {
+    const staleRunning = record.state === "running";
+    const staleStagedRecovery =
+      record.state === "recoverable-error" &&
+      Boolean(record.stagedCapture) &&
+      !record.settlementMode;
     if (
-      record.state !== "running" ||
+      (!staleRunning && !staleStagedRecovery) ||
       record.controllerGeneration === context.controllerGeneration
     ) {
       return { persist: false, outcome: null };
@@ -390,7 +541,13 @@ const reducers: RemoteTransactionReducers = {
       throw new Error("Controller reconciliation error does not match runtime authority");
     }
     record.controllerGeneration = context.controllerGeneration;
-    const state = projectRunningRecordToFailure(record, error);
+    let state: "recoverable-error" | "failed";
+    if (staleRunning) {
+      state = projectRunningRecordToFailure(record, error);
+    } else {
+      record.error = error;
+      state = "recoverable-error";
+    }
     record.restartRecovery = {
       previousControllerGeneration,
       reconciledAt: context.nowIso(),
@@ -494,15 +651,171 @@ function completedSettlement(
   return record.finalization;
 }
 
+function assertStagedPromptIdentity(
+  record: Pick<RemoteTransactionRecord, "requestIdentity">,
+  runtime: BrowserRuntimeMetadata,
+): void {
+  const epoch = runtime.promptEpoch;
+  if (
+    epoch?.status !== "committed" ||
+    !record.requestIdentity.acceptedPromptSha256.includes(epoch.promptSha256) ||
+    epoch.followUpOrdinal !== record.requestIdentity.followUpOrdinal ||
+    epoch.remainingFollowUps !== record.requestIdentity.remainingFollowUps ||
+    runtime.conversationId !== epoch.conversationId
+  ) {
+    throw new RemoteTransactionTransitionError(
+      "staged_capture_identity_mismatch",
+      "Staged remote capture does not match the exact prompt and conversation identity",
+    );
+  }
+}
+
+function assertCapturePromotionMatchesStage(
+  staged: DurableRemoteStagedCapture,
+  result: RemotePublicRunResult,
+  runtime: BrowserRuntimeMetadata,
+): void {
+  const stagedCore = captureAnswerIdentity(staged.result);
+  const resultCore = captureAnswerIdentity(result);
+  const stagedEpoch = staged.runtime.promptEpoch;
+  const promotedEpoch = runtime.promptEpoch;
+  if (
+    !isDeepStrictEqual(stagedCore, resultCore) ||
+    stagedEpoch?.status !== "committed" ||
+    promotedEpoch?.status !== "committed" ||
+    !isDeepStrictEqual(stagedEpoch, promotedEpoch) ||
+    staged.runtime.conversationId !== runtime.conversationId ||
+    runtime.conversationId !== promotedEpoch.conversationId
+  ) {
+    throw new RemoteTransactionTransitionError(
+      "staged_capture_identity_mismatch",
+      "Published remote capture does not match the exact staged answer identity",
+    );
+  }
+}
+
+function captureAnswerIdentity(result: RemotePublicRunResult) {
+  return {
+    answerText: result.answerText,
+    answerMarkdown: result.answerMarkdown,
+    answerHtml: result.answerHtml ?? null,
+    modelSelection: captureModelSelectionIdentity(result.modelSelection),
+    answerTokens: result.answerTokens,
+    answerChars: result.answerChars,
+  };
+}
+
+function captureModelSelectionIdentity(modelSelection: BrowserModelSelectionEvidence | undefined) {
+  if (!modelSelection) return null;
+  return {
+    requestedModel: modelSelection.requestedModel ?? null,
+    resolvedLabel: modelSelection.resolvedLabel ?? null,
+    strategy: modelSelection.strategy ?? null,
+    status: modelSelection.status,
+    verified: modelSelection.verified,
+    source: modelSelection.source,
+    capturedAt: modelSelection.capturedAt,
+  };
+}
+
+function mergeCaptureWarnings(
+  staged: RemotePublicRunResult,
+  result: RemotePublicRunResult,
+  warning?: DurableRemoteCaptureWarning,
+): RemotePublicRunResult {
+  const warnings = [...(staged.warnings ?? []), ...(result.warnings ?? [])];
+  if (warning) warnings.push({ ...warning, severity: "warning" });
+  const uniqueWarnings = warnings.filter(
+    (candidate, index) =>
+      warnings.findIndex(
+        (other) => other.code === candidate.code && other.message === candidate.message,
+      ) === index,
+  );
+  const boundedWarnings = uniqueWarnings.slice(-64);
+  return {
+    ...result,
+    warnings: boundedWarnings.length > 0 ? boundedWarnings : undefined,
+  };
+}
+
+function commitCapture(
+  record: RemoteTransactionRecord,
+  result: RemotePublicRunResult,
+  runtime: BrowserRuntimeMetadata,
+  modelSelection: BrowserModelSelectionEvidence | undefined,
+  artifacts: DurableRemoteArtifactRegistration[],
+  context: RemoteTransactionReducerContext,
+): void {
+  record.controllerGeneration = context.controllerGeneration;
+  record.state = "pending";
+  record.result = result;
+  record.runtime = runtime;
+  record.runtimeJournaledAt = context.nowIso();
+  record.modelSelection = modelSelection;
+  record.artifacts = artifacts.length > 0 ? artifacts : undefined;
+  record.stagedCapture = undefined;
+  record.error = undefined;
+  record.settlementMode = undefined;
+  record.publicationAcknowledgedAt = undefined;
+  record.finalization = undefined;
+  record.restartRecovery = undefined;
+}
+
+function projectRuntimeAfterTargetLoss(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
+  const projected: BrowserRuntimeMetadata = { ...runtime };
+  delete projected.chromeTargetId;
+  const remainingResources: NonNullable<BrowserRuntimeMetadata["recoveryCleanupResources"]> = [];
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    if (!resource.chromeTargetId) {
+      remainingResources.push(resource);
+      continue;
+    }
+    const hasNonTargetAuthority = Boolean(
+      resource.chromePid ||
+      resource.chromeProcessIdentity ||
+      resource.profileDirectoryIdentity ||
+      resource.userDataDir ||
+      resource.tabLease,
+    );
+    if (!hasNonTargetAuthority) continue;
+    remainingResources.push({
+      ...resource,
+      chromeTargetId: undefined,
+      recoveryCleanup: {
+        ...resource.recoveryCleanup,
+        ownsTarget: false,
+        closeOwnedTargetOnComplete: false,
+      },
+    });
+  }
+  if (remainingResources.length > 0) {
+    projected.recoveryCleanupResources = remainingResources;
+  } else {
+    delete projected.browserTransport;
+    delete projected.chromePid;
+    delete projected.chromeProcessIdentity;
+    delete projected.chromePort;
+    delete projected.chromeHost;
+    delete projected.chromeBrowserWSEndpoint;
+    delete projected.chromeProfileRoot;
+    delete projected.userDataDir;
+    delete projected.recoveryCleanupResources;
+    delete projected.recoveryCleanupResult;
+  }
+  return projected;
+}
+
 function projectRunningRecordToFailure(
   record: RemoteTransactionRecord,
   error: DurableRemoteAutomationError,
+  discardStagedCapture = false,
 ): "recoverable-error" | "failed" {
   const state = record.runtime ? "recoverable-error" : "failed";
   record.state = state;
   record.result = undefined;
   record.modelSelection = undefined;
   record.artifacts = undefined;
+  if (discardStagedCapture) record.stagedCapture = undefined;
   record.error = error;
   record.publicationAcknowledgedAt = undefined;
   record.finalization = undefined;

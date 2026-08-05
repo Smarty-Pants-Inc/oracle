@@ -1,5 +1,15 @@
 import path from "node:path";
+import {
+  canonicalFilesystemLockPath,
+  filesystemLockReleaseKey,
+  replayPendingIsolatedDirectoryRemovals,
+} from "./filesystemLockPrimitives.js";
 
+export {
+  canonicalFilesystemLockPath,
+  filesystemLockReleaseKey,
+  replayPendingIsolatedDirectoryRemovals,
+};
 export interface FilesystemLockReleaseGeneration {
   pid: number;
   processStartIdentity: string | null;
@@ -22,23 +32,6 @@ type RetainedReleaseEntry = RetainedFilesystemLockRelease & {
 };
 
 const retainedReleases = new Map<string, RetainedReleaseEntry>();
-
-export function canonicalFilesystemLockPath(lockPath: string): string {
-  return path.resolve(lockPath);
-}
-export function filesystemLockReleaseKey(
-  lockPath: string,
-  generation: FilesystemLockReleaseGeneration,
-): string {
-  return JSON.stringify([
-    canonicalFilesystemLockPath(lockPath),
-    generation.pid,
-    generation.processStartIdentity,
-    generation.ownerNonce,
-    generation.createdAt ?? null,
-    generation.sessionId ?? null,
-  ]);
-}
 
 export function retainFilesystemLockRelease(
   lockPath: string,
@@ -81,6 +74,8 @@ export function retainFilesystemLockRelease(
 
 export async function retryPendingFilesystemLockReleases(lockPath: string): Promise<void> {
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
+  await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath);
+  await replayPendingIsolatedDirectoryRemovals(`${canonicalPath}.mutations`);
   const pending = [...retainedReleases.values()].filter(
     (entry) => entry.lockPath === canonicalPath && entry.pending,
   );

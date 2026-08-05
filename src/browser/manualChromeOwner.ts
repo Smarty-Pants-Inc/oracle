@@ -78,6 +78,7 @@ export async function acquireManualChromeOwner(
   const lockTimeoutMs = Math.max(1, config.profileLockTimeoutMs ?? 1);
   const launchLock = await acquireLock(profileDir, {
     timeoutMs: lockTimeoutMs,
+    pollMs: 50,
     logger,
     sessionId,
   });

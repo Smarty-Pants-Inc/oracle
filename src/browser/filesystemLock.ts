@@ -1,10 +1,12 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { promisify } from "node:util";
 import { mkdir, mkdtemp, open, readFile, readdir, stat } from "node:fs/promises";
+import { createPlatformProcessGenerationProvider } from "./platformProcessGeneration.js";
 import { delay } from "./utils.js";
-import { retainFilesystemLockRelease } from "./filesystemLockReleaseJournal.js";
+import {
+  retainFilesystemLockRelease,
+  retryPendingFilesystemLockReleases,
+} from "./filesystemLockReleaseJournal.js";
 import {
   inspectExistingLock,
   isolateDirectoryGenerationForRemoval,
@@ -33,10 +35,10 @@ const LOCK_MUTATION_TICKET_FILENAME = "ticket";
 const DEFAULT_POLL_MS = 50;
 const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS = 1_000;
-const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS = 3;
 const WINDOWS_PROCESS_IDENTITY_RETRY_MS = 50;
-const execFileAsync = promisify(execFile);
+const WINDOWS_PROCESS_IDENTITY_ACQUISITION_TIMEOUT_MS = 12_000;
+const platformProcessGenerationProvider = createPlatformProcessGenerationProvider();
 let currentProcessStartIdentity: string | undefined;
 let currentProcessStartIdentityPromise: Promise<string | null> | undefined;
 export type ProcessLiveness = "alive" | "dead" | "unknown";
@@ -44,7 +46,7 @@ export interface FilesystemLockProcessIdentityProvider {
   readonly platform: NodeJS.Platform;
   readonly pid: number;
   readonly readProcessLiveness: (pid: number) => ProcessLiveness;
-  readonly readProcessStartIdentity: (pid: number) => Promise<string | null>;
+  readonly readProcessStartIdentity: (pid: number, timeoutMs?: number) => Promise<string | null>;
 }
 
 export interface FilesystemLockOwnerRecord {
@@ -86,6 +88,13 @@ export interface CrashRecoverableFilesystemLockDeps {
 export interface FilesystemLockGeneration {
   ownerRaw: string | null;
   lastMutationMs?: number;
+  legacyFile?: {
+    raw: string;
+    device: string;
+    inode: string;
+    birthtimeNs: string;
+    size: string;
+  };
 }
 
 export interface FilesystemLockMutationOptions {
@@ -196,6 +205,7 @@ export async function acquireCrashRecoverableFilesystemLock(
   if (options.createParent !== false) {
     await mkdir(parentPath, { recursive: true });
   }
+  await retryPendingFilesystemLockReleases(lockPath);
 
   const completeAcquisition = (
     acquiredOwner: FilesystemLockOwnerRecord,
@@ -316,11 +326,22 @@ export async function acquireCrashRecoverableFilesystemLock(
 async function readStableProcessStartIdentityForAcquisition(
   provider: FilesystemLockProcessIdentityProvider,
 ): Promise<string | null> {
-  const maxAttempts = provider.platform === "win32" ? WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS : 1;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const identity = await provider.readProcessStartIdentity(provider.pid);
+  if (provider.platform !== "win32") return provider.readProcessStartIdentity(provider.pid);
+
+  const deadlineMs = Date.now() + WINDOWS_PROCESS_IDENTITY_ACQUISITION_TIMEOUT_MS;
+  for (let attempt = 0; attempt < WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS; attempt += 1) {
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) return null;
+    const identity = await provider.readProcessStartIdentity(
+      provider.pid,
+      Math.max(1, remainingMs),
+    );
     if (identity) return identity;
-    if (attempt + 1 < maxAttempts) await delay(WINDOWS_PROCESS_IDENTITY_RETRY_MS);
+    if (attempt + 1 < WINDOWS_PROCESS_IDENTITY_MAX_ATTEMPTS) {
+      const delayMs = Math.min(WINDOWS_PROCESS_IDENTITY_RETRY_MS, deadlineMs - Date.now());
+      if (delayMs <= 0) return null;
+      await delay(delayMs);
+    }
   }
   return null;
 }
@@ -345,14 +366,20 @@ export function readProcessLiveness(pid: number): ProcessLiveness {
   }
 }
 
-export async function readProcessStartIdentity(pid: number): Promise<string | null> {
+export async function readProcessStartIdentity(
+  pid: number,
+  timeoutMs?: number,
+): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   // This process cannot be replaced while this module is running. Foreign PIDs stay uncached so
   // stale-owner checks still observe PID reuse; current-process successes alone are cached.
-  if (pid !== process.pid) return readProcessStartIdentityUncached(pid);
+  if (pid !== process.pid) {
+    return platformProcessGenerationProvider.readProcessGeneration(pid, timeoutMs);
+  }
   if (currentProcessStartIdentity !== undefined) return currentProcessStartIdentity;
 
-  const inFlight = (currentProcessStartIdentityPromise ??= readProcessStartIdentityUncached(pid));
+  const inFlight = (currentProcessStartIdentityPromise ??=
+    platformProcessGenerationProvider.readProcessGeneration(pid, timeoutMs));
   try {
     const identity = await inFlight;
     if (identity !== null) currentProcessStartIdentity = identity;
@@ -363,72 +390,6 @@ export async function readProcessStartIdentity(pid: number): Promise<string | nu
     }
   }
 }
-
-type WindowsProcessStartIdentityExecutor = (command: string) => Promise<string>;
-
-async function readWindowsProcessStartIdentity(
-  pid: number,
-  execute: WindowsProcessStartIdentityExecutor = executeWindowsProcessStartIdentity,
-): Promise<string | null> {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    // Get-Process.StartTime is unavailable for the Node process on hosted Windows runners.
-    // Win32_Process.CreationDate is the provider-backed creation timestamp and, unlike a PID,
-    // still distinguishes a later process that reuses the same numeric identifier.
-    const startTime = (
-      await execute(
-        `$ErrorActionPreference = 'Stop'; $process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction Stop; if ($null -eq $process -or $null -eq $process.CreationDate) { exit 3 }; [Console]::Out.Write($process.CreationDate.ToUniversalTime().ToString('O'))`,
-      )
-    ).trim();
-    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(startTime)
-      ? `win32:${startTime}`
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-async function executeWindowsProcessStartIdentity(command: string): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", command],
-    { encoding: "utf8", windowsHide: true, timeout: WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS },
-  );
-  return String(stdout);
-}
-
-async function readProcessStartIdentityUncached(pid: number): Promise<string | null> {
-  try {
-    if (process.platform === "linux") {
-      const processStat = await readFile(`/proc/${pid}/stat`, "utf8");
-      const commandEnd = processStat.lastIndexOf(")");
-      if (commandEnd < 0) return null;
-      const fields = processStat
-        .slice(commandEnd + 1)
-        .trim()
-        .split(/\s+/u);
-      const startTicks = fields[19];
-      if (!startTicks) return null;
-      const bootId = await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => "");
-      return `linux:${bootId.trim() || "unknown-boot"}:${startTicks}`;
-    }
-    if (process.platform === "win32") {
-      return readWindowsProcessStartIdentity(pid);
-    }
-    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf8",
-    });
-    const startedAt = String(stdout).trim().replace(/\s+/gu, " ");
-    return startedAt ? `${process.platform}:${startedAt}` : null;
-  } catch {
-    return null;
-  }
-}
-
-// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
-export const __test__ = {
-  readWindowsProcessStartIdentity,
-};
 
 async function publishPreparedLockGeneration(
   preparedLockPath: string,

@@ -5,6 +5,8 @@ import { describe, expect, test, vi } from "vitest";
 import type * as ManualLoginProfileModule from "../../src/browser/manualLoginProfile.js";
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
 import type * as ChromeLifecycleModule from "../../src/browser/chromeLifecycle.js";
+import type * as ProfileStateModule from "../../src/browser/profileState.js";
+import type * as ProfileCopyModule from "../../src/browser/profileCopy.js";
 import {
   __test__,
   classifyPreservedBrowserErrorForTest,
@@ -21,7 +23,6 @@ import {
 } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
-import { __test__ as reattachTest } from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
@@ -43,6 +44,7 @@ describe("local acquisition durability", () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-local-acquisition-"));
     const persistenceFailure = new Error("runtime persistence failed");
     const events: string[] = [];
+    const runtimeHints: BrowserRuntimeMetadata[] = [];
     const release = vi.fn(async () => {
       events.push("release:tab-lease");
     });
@@ -51,24 +53,37 @@ describe("local acquisition durability", () => {
         events.push("acquire:tab-lease");
         return {
           id: options?.leaseId ?? "test-lease",
-          profileDirectory: {
-            version: 1 as const,
-            platform: process.platform,
-            canonicalPath: profileDirectory,
-            device: "test-device",
-            inode: "test-inode",
-          },
+          profileDirectory: await captureProfileDirectoryIdentity(profileDirectory),
           update: vi.fn(async () => undefined),
           release,
         };
       },
     );
-    const runtimeHintCb = vi.fn(async (runtime: { recoveryCleanupResources?: unknown[] }) => {
-      const resource = runtime.recoveryCleanupResources?.at(-1) as
-        | { acquisition?: { pendingResource?: string } }
-        | undefined;
-      events.push(`persist:${resource?.acquisition?.pendingResource ?? "acquired"}`);
-      if (resource?.acquisition?.pendingResource === "chrome-process") {
+    const releaseBrowserTabLease = vi.fn(
+      async (
+        _profileDirectory: string,
+        _leaseId: string,
+        _logger: BrowserLogger,
+        options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> },
+      ) => {
+        await release();
+        await options?.onRelease?.({ isLastLease: true });
+      },
+    );
+    let rejectedInitialProcessJournal = false;
+    const runtimeHintCb = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
+      runtimeHints.push(structuredClone(runtime));
+      const resource = runtime.recoveryCleanupResources?.at(-1);
+      const mode = runtime.recoveryCleanupResult?.settlementMode;
+      events.push(
+        `persist:${resource?.acquisition?.pendingResource ?? "acquired"}${mode ? `:${mode}` : ""}`,
+      );
+      if (
+        resource?.acquisition?.pendingResource === "chrome-process" &&
+        !mode &&
+        !rejectedInitialProcessJournal
+      ) {
+        rejectedInitialProcessJournal = true;
         throw persistenceFailure;
       }
     });
@@ -77,7 +92,17 @@ describe("local acquisition durability", () => {
     vi.doMock("../../src/browser/tabLeaseRegistry.js", async (importOriginal) => ({
       ...(await importOriginal<typeof TabLeaseRegistryModule>()),
       acquireBrowserTabLease,
+      releaseBrowserTabLease,
       retainBrowserTabLeaseTeardownAuthority: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/profileState.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ProfileStateModule>()),
+      verifyProfileDirectoryIdentity: vi.fn(async () => true),
+      readOracleChromeOwner: vi.fn(async () => null),
+      inspectRunningChromeProcessesForLaunchClaim: vi.fn(async () => ({
+        exactMatches: [],
+        conflictingProfilePids: [],
+      })),
     }));
     vi.doMock("../../src/browser/manualLoginProfile.js", async (importOriginal) => ({
       ...(await importOriginal<typeof ManualLoginProfileModule>()),
@@ -99,14 +124,255 @@ describe("local acquisition durability", () => {
         "persist:tab-lease",
         "acquire:tab-lease",
         "persist:chrome-process",
+        "persist:chrome-process:abort",
         "release:tab-lease",
+        "persist:acquired",
       ]);
+      const initialResource = runtimeHints[0]?.recoveryCleanupResources?.at(-1);
+      const abortRuntime = runtimeHints.find(
+        (runtime) => runtime.recoveryCleanupResult?.settlementMode === "abort",
+      );
+      const abortResource = abortRuntime?.recoveryCleanupResources?.at(-1);
+      const acquisitionGenerationId = initialResource?.acquisition?.generationId;
+      if (!acquisitionGenerationId || !abortRuntime || !abortResource) {
+        throw new Error("Manual-login acquisition abort authority was not journaled");
+      }
+      expect(abortResource.acquisition).toMatchObject({
+        generationId: acquisitionGenerationId,
+        pendingResource: "chrome-process",
+        processLaunchClaim: { generationId: acquisitionGenerationId },
+      });
+      expect(abortRuntime.recoveryCleanupResult).toMatchObject({
+        status: "failed",
+        settlementMode: "abort",
+      });
+      expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
+      expect(runtimeHints.at(-1)?.recoveryCleanupResult).toBeUndefined();
       expect(release).toHaveBeenCalledOnce();
+      expect(releaseBrowserTabLease).toHaveBeenCalledOnce();
     } finally {
       vi.doUnmock("../../src/browser/tabLeaseRegistry.js");
+      vi.doUnmock("../../src/browser/profileState.js");
       vi.doUnmock("../../src/browser/manualLoginProfile.js");
       vi.resetModules();
       await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("removes the exact temporary profile when profile copy fails after journaling", async () => {
+    const copyFailure = new Error("profile copy interrupted");
+    const runtimeHints: BrowserRuntimeMetadata[] = [];
+    const events: string[] = [];
+    let profileDir: string | undefined;
+    const removeProfile = vi.fn(async () => true);
+    const launchChrome = vi.fn();
+    const copyChromeProfile = vi.fn(async (_source: string, destination: string) => {
+      profileDir = destination;
+      events.push("copy-profile");
+      throw copyFailure;
+    });
+
+    vi.resetModules();
+    vi.doMock("../../src/browser/profileCopy.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ProfileCopyModule>()),
+      copyChromeProfile,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeLifecycleModule>()),
+      launchChrome,
+    }));
+    vi.doMock("../../src/browser/profileState.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ProfileStateModule>()),
+      verifyProfileDirectoryIdentity: vi.fn(async () => true),
+      readOracleChromeOwner: vi.fn(async () => null),
+      inspectRunningChromeProcessesForLaunchClaim: vi.fn(async () => ({
+        exactMatches: [],
+        conflictingProfilePids: [],
+      })),
+      removeProfileDirectoryIfIdentityMatches: removeProfile,
+    }));
+
+    try {
+      // This test intentionally reloads the runner so the profile-copy failure is injected.
+      const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        isolatedRunBrowserMode({
+          prompt: "test",
+          config: {
+            cookieSync: false,
+            copyProfileSource: path.join(os.tmpdir(), "oracle-copy-profile-source"),
+          },
+          runtimeHintCb: async (runtime) => {
+            runtimeHints.push(structuredClone(runtime));
+            const resource = runtime.recoveryCleanupResources?.at(-1);
+            const mode = runtime.recoveryCleanupResult?.settlementMode;
+            events.push(
+              `persist:${resource?.acquisition?.pendingResource ?? "acquired"}${mode ? `:${mode}` : ""}`,
+            );
+          },
+        }),
+      ).rejects.toBe(copyFailure);
+
+      expect(events).toEqual([
+        "persist:chrome-process",
+        "copy-profile",
+        "persist:chrome-process:abort",
+        "persist:acquired",
+      ]);
+      const initialRuntime = runtimeHints[0];
+      const initialResource = initialRuntime?.recoveryCleanupResources?.at(-1);
+      expect(initialResource).toMatchObject({
+        acquisition: { pendingResource: "chrome-process" },
+        recoveryCleanup: { profileKind: "copied", keepBrowser: false },
+      });
+      const abortRuntime = runtimeHints.find(
+        (runtime) => runtime.recoveryCleanupResult?.settlementMode === "abort",
+      );
+      const abortResource = abortRuntime?.recoveryCleanupResources?.at(-1);
+      const acquisitionGenerationId = initialResource?.acquisition?.generationId;
+      if (!acquisitionGenerationId || !abortRuntime || !abortResource) {
+        throw new Error("Copy-profile acquisition abort authority was not journaled");
+      }
+      expect(abortResource.acquisition).toMatchObject({
+        generationId: acquisitionGenerationId,
+        pendingResource: "chrome-process",
+        processLaunchClaim: { generationId: acquisitionGenerationId },
+      });
+      expect(abortRuntime.recoveryCleanupResult).toMatchObject({
+        status: "failed",
+        settlementMode: "abort",
+      });
+      expect(launchChrome).not.toHaveBeenCalled();
+      expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
+      expect(runtimeHints.at(-1)?.recoveryCleanupResult).toBeUndefined();
+      if (!profileDir || !initialResource?.profileDirectoryIdentity) {
+        throw new Error("Copy-profile acquisition identity was not journaled");
+      }
+      expect(removeProfile).toHaveBeenCalledWith(
+        profileDir,
+        initialResource.profileDirectoryIdentity,
+      );
+    } finally {
+      vi.doUnmock("../../src/browser/profileCopy.js");
+      vi.doUnmock("../../src/browser/chromeLifecycle.js");
+      vi.doUnmock("../../src/browser/profileState.js");
+      vi.resetModules();
+      if (profileDir) await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("persists abort authority before cleaning an owner whose target journal fails", async () => {
+    const journalFailure = new Error("target acquisition journal failed");
+    const runtimeHints: BrowserRuntimeMetadata[] = [];
+    const events: string[] = [];
+    let profileDir: string | undefined;
+    let ownerIdentity: ChromeProcessIdentity | undefined;
+    let rejectedTargetJournal = false;
+    const kill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: 515_151,
+      signal: "CONTROL_CHANNEL" as const,
+    }));
+    const removeProfile = vi.fn(async () => true);
+
+    vi.resetModules();
+    vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeLifecycleModule>()),
+      launchChrome: vi.fn(
+        async (
+          _config: unknown,
+          userDataDir: string,
+          _logger: BrowserLogger,
+          deps?: { launchClaim?: ChromeProcessLaunchClaim },
+        ) => {
+          profileDir = userDataDir;
+          const launchClaim = deps?.launchClaim;
+          if (!launchClaim) throw new Error("launch claim was not supplied");
+          const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+          ownerIdentity = {
+            pid: 515_151,
+            processStartTime: "published-owner-generation",
+            executablePath:
+              process.platform === "win32"
+                ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
+                : process.platform === "darwin"
+                  ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                  : "/usr/bin/google-chrome",
+            normalizedUserDataDir:
+              process.platform === "win32"
+                ? profileDirectory.canonicalPath.toLowerCase()
+                : profileDirectory.canonicalPath,
+            launchNonce: launchClaim.nonce,
+            launchClaim,
+            profileDirectory,
+          };
+          return {
+            pid: ownerIdentity.pid,
+            port: 9222,
+            process: undefined,
+            remoteDebuggingPipes: null,
+            host: "127.0.0.1",
+            kill,
+            processIdentity: ownerIdentity,
+          };
+        },
+      ),
+    }));
+    vi.doMock("../../src/browser/profileState.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ProfileStateModule>()),
+      removeProfileDirectoryIfIdentityMatches: removeProfile,
+    }));
+
+    try {
+      // This test intentionally reloads the runner so the post-owner journal can fail.
+      const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        isolatedRunBrowserMode({
+          prompt: "test",
+          config: { cookieSync: false, manualLogin: false },
+          runtimeHintCb: async (runtime) => {
+            runtimeHints.push(structuredClone(runtime));
+            const resource = runtime.recoveryCleanupResources?.at(-1);
+            const mode = runtime.recoveryCleanupResult?.settlementMode;
+            events.push(
+              `persist:${resource?.acquisition?.pendingResource ?? "acquired"}${mode ? `:${mode}` : ""}`,
+            );
+            if (
+              resource?.acquisition?.pendingResource === "chrome-target" &&
+              !mode &&
+              !rejectedTargetJournal
+            ) {
+              rejectedTargetJournal = true;
+              throw journalFailure;
+            }
+          },
+        }),
+      ).rejects.toBe(journalFailure);
+
+      expect(events).toEqual([
+        "persist:chrome-process",
+        "persist:chrome-target",
+        "persist:chrome-process:abort",
+        "persist:acquired",
+      ]);
+      const abortRuntime = runtimeHints.find(
+        (runtime) => runtime.recoveryCleanupResult?.settlementMode === "abort",
+      );
+      expect(abortRuntime?.recoveryCleanupResources?.at(-1)).toMatchObject({
+        chromeProcessIdentity: ownerIdentity,
+        acquisition: { pendingResource: "chrome-process" },
+        recoveryCleanup: { ownsTarget: false, keepBrowser: false },
+      });
+      expect(kill).toHaveBeenCalledOnce();
+      if (!profileDir || !ownerIdentity)
+        throw new Error("Published owner authority was not captured");
+      expect(removeProfile).toHaveBeenCalledWith(profileDir, ownerIdentity.profileDirectory);
+      expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
+    } finally {
+      vi.doUnmock("../../src/browser/chromeLifecycle.js");
+      vi.doUnmock("../../src/browser/profileState.js");
+      vi.resetModules();
+      if (profileDir) await rm(profileDir, { recursive: true, force: true });
     }
   });
 
@@ -116,10 +382,25 @@ describe("local acquisition durability", () => {
     let profileDir: string | undefined;
     let ownerIdentity: ChromeProcessIdentity | undefined;
     let launchClaim: ChromeProcessLaunchClaim | undefined;
+    const endpointKill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: 424_242,
+      signal: "CONTROL_CHANNEL" as const,
+    }));
+    const releaseEndpointAuthority = vi.fn(async () => undefined);
+    const retainedEndpointAuthority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recovered-launch",
+      kill: endpointKill,
+      release: releaseEndpointAuthority,
+    };
+    const retainChromeEndpointAuthority = vi.fn(async () => retainedEndpointAuthority);
+    const writeOracleChromeOwner = vi.fn(async () => undefined);
+    const removeProfile = vi.fn(async () => true);
 
     vi.resetModules();
     vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
       ...(await importOriginal<typeof ChromeLifecycleModule>()),
+      retainChromeEndpointAuthority,
       launchChrome: vi.fn(
         async (
           _config: unknown,
@@ -152,9 +433,36 @@ describe("local acquisition durability", () => {
         },
       ),
     }));
+    vi.doMock("../../src/browser/profileState.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ProfileStateModule>()),
+      verifyProfileDirectoryIdentity: vi.fn(async () => true),
+      readOracleChromeOwner: vi.fn(async () => null),
+      inspectRunningChromeProcessesForLaunchClaim: vi.fn(
+        async (_candidateDir: string, claim: ChromeProcessLaunchClaim) => {
+          expect(claim).toEqual(launchClaim);
+          return {
+            exactMatches: [{ pid: 424_242, port: 9222 }],
+            conflictingProfilePids: [],
+          };
+        },
+      ),
+      captureChromeProcessIdentity: vi.fn(
+        async (candidateDir: string, pid: number, claim: ChromeProcessLaunchClaim) => {
+          expect(candidateDir).toBe(profileDir);
+          expect(pid).toBe(424_242);
+          expect(claim).toEqual(launchClaim);
+          if (!ownerIdentity) throw new Error("launched Chrome identity was not captured");
+          return ownerIdentity;
+        },
+      ),
+      inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
+      writeOracleChromeOwner,
+      verifyChromeProcessIdentity: vi.fn(async () => true),
+      removeProfileDirectoryIfIdentityMatches: removeProfile,
+    }));
 
     try {
-      // This test intentionally loads the runner after installing its module mock.
+      // This test intentionally loads the runner after installing its module mocks.
       const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
       await expect(
         isolatedRunBrowserMode({
@@ -166,11 +474,29 @@ describe("local acquisition durability", () => {
         }),
       ).rejects.toBe(interruption);
 
-      const crashRuntime = runtimeHints.at(-1);
-      if (!crashRuntime) throw new Error("Chrome process acquisition intent was not persisted");
-      const crashResource = crashRuntime.recoveryCleanupResources?.at(-1);
-      expect(crashResource).toMatchObject({
+      const initialRuntime = runtimeHints.find(
+        (runtime) =>
+          runtime.recoveryCleanupResources?.at(-1)?.acquisition?.pendingResource ===
+            "chrome-process" && !runtime.recoveryCleanupResult?.settlementMode,
+      );
+      const abortRuntime = runtimeHints.find(
+        (runtime) =>
+          runtime.recoveryCleanupResources?.at(-1)?.acquisition?.pendingResource ===
+            "chrome-process" && runtime.recoveryCleanupResult?.settlementMode === "abort",
+      );
+      const completedRuntime = runtimeHints.at(-1);
+      if (!initialRuntime || !abortRuntime || !completedRuntime) {
+        throw new Error("Chrome acquisition transaction journal was incomplete");
+      }
+      const initialResource = initialRuntime.recoveryCleanupResources?.at(-1);
+      const abortResource = abortRuntime.recoveryCleanupResources?.at(-1);
+      const acquisitionGenerationId = initialResource?.acquisition?.generationId;
+      if (!acquisitionGenerationId || !abortResource) {
+        throw new Error("Recovered Chrome acquisition generation authority was not journaled");
+      }
+      expect(initialResource).toMatchObject({
         acquisition: {
+          generationId: acquisitionGenerationId,
           pendingResource: "chrome-process",
           processOwnerProvenance: "temporary-launch",
           processLaunchClaim: launchClaim,
@@ -178,64 +504,36 @@ describe("local acquisition durability", () => {
         },
         recoveryCleanup: { keepBrowser: false },
       });
-      expect(crashResource?.chromeProcessIdentity).toBeUndefined();
-      if (!profileDir || !ownerIdentity || !launchClaim) {
+      expect(abortResource.acquisition).toMatchObject({
+        generationId: acquisitionGenerationId,
+        pendingResource: "chrome-process",
+        processLaunchClaim: launchClaim,
+      });
+      expect(
+        initialRuntime.recoveryCleanupResources?.at(-1)?.chromeProcessIdentity,
+      ).toBeUndefined();
+      expect(abortRuntime.recoveryCleanupResult).toMatchObject({
+        status: "failed",
+        settlementMode: "abort",
+      });
+      if (!profileDir || !ownerIdentity) {
         throw new Error("launched Chrome test authority was not captured");
       }
-      const persistedProfileDir = profileDir;
-      const persistedOwnerIdentity = ownerIdentity;
-      const persistedLaunchClaim = launchClaim;
 
-      const endpointKill = vi.fn(async () => ({
-        status: "stopped" as const,
-        pid: persistedOwnerIdentity.pid,
-        signal: "CONTROL_CHANNEL" as const,
-      }));
-      const releaseEndpointAuthority = vi.fn(async () => undefined);
-      const retainChromeEndpointAuthority = vi.fn(async () => ({
-        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recovered-launch",
-        kill: endpointKill,
-        release: releaseEndpointAuthority,
-      }));
-      const writeOracleChromeOwner = vi.fn(async () => undefined);
-      const removeProfile = vi.fn(async () => true);
-      const recoveryLogger: BrowserLogger = vi.fn((_message: string) => {});
-      const recovery = await reattachTest.finalizeRecoveredRuntime(crashRuntime, recoveryLogger, {
-        verifyProfileDirectoryIdentity: vi.fn(async () => true),
-        readOracleChromeOwner: vi.fn(async () => null),
-        inspectRunningChromeProcessesForLaunchClaim: vi.fn(async (_candidateDir, claim) => {
-          expect(claim).toEqual(persistedLaunchClaim);
-          return {
-            exactMatches: [{ pid: persistedOwnerIdentity.pid, port: 9222 }],
-            conflictingProfilePids: [],
-          };
-        }),
-        captureChromeProcessIdentity: vi.fn(async (candidateDir, pid, claim) => {
-          expect(candidateDir).toBe(persistedProfileDir);
-          expect(pid).toBe(persistedOwnerIdentity.pid);
-          expect(claim).toEqual(persistedLaunchClaim);
-          return persistedOwnerIdentity;
-        }),
-        inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
-        retainChromeEndpointAuthority,
-        writeOracleChromeOwner,
-        verifyChromeProcessIdentity: vi.fn(async () => true),
-        removeProfile,
-      });
-
-      expect(writeOracleChromeOwner).toHaveBeenCalledWith(persistedProfileDir, {
+      expect(writeOracleChromeOwner).toHaveBeenCalledWith(profileDir, {
         port: 9222,
-        processIdentity: persistedOwnerIdentity,
+        processIdentity: ownerIdentity,
         disposition: "close-on-last-lease",
       });
       expect(retainChromeEndpointAuthority).toHaveBeenCalledTimes(2);
       expect(endpointKill).toHaveBeenCalledOnce();
       expect(releaseEndpointAuthority).toHaveBeenCalledTimes(2);
-      expect(recovery.status).toBe("completed");
-      expect(recovery.runtime.recoveryCleanupResources).toBeUndefined();
-      expect(removeProfile).toHaveBeenCalledWith(persistedProfileDir);
+      expect(completedRuntime.recoveryCleanupResources).toBeUndefined();
+      expect(completedRuntime.recoveryCleanupResult).toBeUndefined();
+      expect(removeProfile).toHaveBeenCalledWith(profileDir, ownerIdentity.profileDirectory);
     } finally {
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
+      vi.doUnmock("../../src/browser/profileState.js");
       vi.resetModules();
       if (profileDir) await rm(profileDir, { recursive: true, force: true });
     }

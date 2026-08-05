@@ -22,6 +22,18 @@ const authority = {
 const runtime = {
   chromeTargetId: "target-1",
   conversationId: "conversation-1",
+  promptEpoch: {
+    status: "committed" as const,
+    epochId: "epoch-1",
+    promptSha256: "8".repeat(64),
+    baselineTurns: 0,
+    followUpOrdinal: 0,
+    remainingFollowUps: 0,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "turn-1",
+    verifiedUserMessageId: "message-1",
+    conversationId: "conversation-1",
+  },
 };
 
 const capturedResult = {

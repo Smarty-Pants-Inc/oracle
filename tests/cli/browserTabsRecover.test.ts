@@ -88,6 +88,13 @@ const recoveredRuntime: BrowserRuntimeMetadata = {
   recoveryCleanupResult: { status: "pending" },
 };
 
+const recoveredEndpointAuthority = {
+  browserWSEndpoint: "ws://127.0.0.1:53999/devtools/browser/generation-a",
+  kill: vi.fn(),
+  runExactOperation: vi.fn(),
+  release: vi.fn(),
+};
+
 function completedCleanupRuntime(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
   const completed = { ...runtime };
   delete completed.recoveryCleanupResources;
@@ -132,6 +139,7 @@ describe("browser recovery cleanup", () => {
           port: 53999,
           url: "https://chatgpt.com/c/saved-conversation",
           ref: "recovered-target",
+          endpointAuthority: recoveredEndpointAuthority,
           cleanup,
         };
       },
@@ -163,11 +171,15 @@ describe("browser recovery cleanup", () => {
     ).resolves.toEqual(completedHarvest);
 
     expect(recoverConversationTab).toHaveBeenCalledWith(baseMeta, expect.any(Function), {
-      existingEndpoint: { host: "127.0.0.1", port: 9223 },
       persistRuntime: expect.any(Function),
     });
     expect(harvestChatGptTab).toHaveBeenLastCalledWith(
-      expect.objectContaining({ host: "127.0.0.1", port: 53999, ref: "recovered-target" }),
+      expect.objectContaining({
+        host: "127.0.0.1",
+        port: 53999,
+        ref: "recovered-target",
+        endpointAuthority: recoveredEndpointAuthority,
+      }),
     );
     expect(cleanup).toHaveBeenCalledWith(
       "finalize",
@@ -216,6 +228,7 @@ describe("browser recovery cleanup", () => {
             port: 53999,
             url: "https://chatgpt.com/c/saved-conversation",
             ref: "recovered-target",
+            endpointAuthority: recoveredEndpointAuthority,
             cleanup,
           };
         },
@@ -271,6 +284,7 @@ describe("browser recovery cleanup", () => {
             port: 53999,
             url: "https://chatgpt.com/c/saved-conversation",
             ref: "recovered-target",
+            endpointAuthority: recoveredEndpointAuthority,
             cleanup,
           };
         },
@@ -333,6 +347,7 @@ describe("browser recovery cleanup", () => {
             port: 53999,
             url: "https://chatgpt.com/c/saved-conversation",
             ref: "recovered-target",
+            endpointAuthority: recoveredEndpointAuthority,
             cleanup,
           };
         },

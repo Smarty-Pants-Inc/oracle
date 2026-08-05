@@ -2,11 +2,12 @@ import { mkdtemp, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  closeTab,
-  connectWithNewTab,
+  closeChromeTargetWithExactAuthority,
+  connectWithNewTabWithExactAuthority,
   launchChrome,
   positionChromeWindowOffscreen,
   registerTerminationHooks,
+  type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
@@ -14,7 +15,6 @@ import {
   settleManualChromeOwner,
   type BrowserChrome,
   type ManualChromeOwner,
-  type ManualChromeOwnerSource,
 } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
@@ -65,6 +65,19 @@ import {
 import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
+
+async function connectOwnedProjectSourcesTarget(
+  endpointAuthority: RetainedChromeEndpointAuthority,
+  logger: BrowserLogger,
+  retries: number,
+) {
+  return await connectWithNewTabWithExactAuthority(endpointAuthority, logger, "about:blank", {
+    retries,
+    retryDelayMs: 500,
+  });
+}
+
+export const connectOwnedProjectSourcesTargetForTest = connectOwnedProjectSourcesTarget;
 
 export async function runBrowserProjectSources(
   request: ProjectSourcesRequest,
@@ -124,7 +137,7 @@ export async function runBrowserProjectSources(
   let tabLease: BrowserTabLease | null = null;
   let owner: ManualChromeOwner | null = null;
   let chrome: BrowserChrome | null = null;
-  let chromeOwnerSource: ManualChromeOwnerSource | null = null;
+  let endpointAuthority: RetainedChromeEndpointAuthority | null = null;
   let manualLeaseTeardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let isolatedTargetId: string | null = null;
   let client: ChromeClient | null = null;
@@ -147,6 +160,7 @@ export async function runBrowserProjectSources(
       chromeProcessIdentity: owner?.processIdentity,
       chromePort: chrome?.port,
       chromeHost,
+      chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
       chromeProfileRoot: userDataDir,
       userDataDir,
       chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
@@ -164,6 +178,7 @@ export async function runBrowserProjectSources(
             owner?.processIdentity.profileDirectory ?? tabLease?.profileDirectory,
           chromePort: chrome?.port,
           chromeHost,
+          chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
           chromeProfileRoot: userDataDir,
           userDataDir,
           chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
@@ -205,20 +220,22 @@ export async function runBrowserProjectSources(
     }
     await client?.close().catch(() => undefined);
     if (shouldCloseTarget && isolatedTargetId && chrome && !targetClosed) {
-      try {
-        const closed = await closeTab(
-          chrome.port,
-          isolatedTargetId,
-          logger,
-          chrome.host ?? "127.0.0.1",
-        );
-        if (!closed)
-          errors.push(`Project Sources target close was not confirmed: ${isolatedTargetId}`);
-        else targetClosed = true;
-      } catch (error) {
-        errors.push(
-          `Project Sources target close failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      if (!endpointAuthority) {
+        errors.push("Project Sources target has no retained exact endpoint authority");
+      } else {
+        try {
+          const closed = await closeChromeTargetWithExactAuthority({
+            authority: endpointAuthority,
+            targetId: isolatedTargetId,
+            logger,
+          });
+          if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
+          else errors.push(closed.reason);
+        } catch (error) {
+          errors.push(
+            `Project Sources target close failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     }
     if (errors.length > 0) {
@@ -353,7 +370,10 @@ export async function runBrowserProjectSources(
     }
     owner = acquired;
     chrome = acquired.chrome;
-    chromeOwnerSource = acquired.source;
+    endpointAuthority = acquired.endpointAuthority ?? chrome.endpointAuthority ?? null;
+    if (!endpointAuthority) {
+      throw new Error("Project Sources Chrome has no retained exact endpoint authority.");
+    }
     const chromeHost = chrome.host ?? "127.0.0.1";
     if (manualLogin && tabLease && acquired.disposition === "close-on-last-lease") {
       const ownerForHandoff = acquired;
@@ -377,13 +397,12 @@ export async function runBrowserProjectSources(
       },
     );
 
-    const strictTabIsolation = Boolean(manualLogin && chromeOwnerSource !== "launched");
     const devtoolsRetries = manualLogin ? 6 : 0;
-    const connection = await connectWithNewTab(chrome.port, logger, "about:blank", chromeHost, {
-      fallbackToDefault: !strictTabIsolation,
-      retries: devtoolsRetries,
-      retryDelayMs: 500,
-    });
+    const connection = await connectOwnedProjectSourcesTarget(
+      endpointAuthority,
+      logger,
+      devtoolsRetries,
+    );
     client = connection.client;
     isolatedTargetId = connection.targetId ?? null;
     if (tabLease && isolatedTargetId) {

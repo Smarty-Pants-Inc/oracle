@@ -69,7 +69,7 @@ const capturedResult = {
 
 const authority = {
   requestIdentity: {
-    acceptedPromptSha256: ["9".repeat(64)],
+    acceptedPromptSha256: ["a".repeat(64)],
     followUpOrdinal: 0,
     remainingFollowUps: 0 as const,
   },
@@ -337,6 +337,104 @@ describe("RemoteTransactionStore", () => {
           runtime: { recoveryCleanupResult: { settlementMode: "abort" } },
         },
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("failure recording preserves an exact staged capture for publication retry", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-failure-"));
+    const transactionToken = "5".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      await begin(store, transactionToken);
+      await store.stageCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime,
+      });
+      await expect(
+        store.recordRecoverableFailure({
+          transactionToken,
+          runtime,
+          error: failure(true),
+        }),
+      ).resolves.toMatchObject({
+        state: "recoverable-error",
+        result: undefined,
+        stagedCapture: {
+          result: capturedResult,
+          runtime,
+          stagedAt: expect.any(String),
+        },
+      });
+      await expect(
+        store.promoteStagedCapture({
+          transactionToken,
+          warning: {
+            code: "remote-publication-retry-recovered",
+            message: "Published from the durable exact staged capture.",
+          },
+        }),
+      ).resolves.toMatchObject({
+        state: "pending",
+        result: {
+          answerText: "captured",
+          warnings: [
+            {
+              code: "remote-publication-retry-recovered",
+              severity: "warning",
+              message: "Published from the durable exact staged capture.",
+            },
+          ],
+        },
+        stagedCapture: undefined,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps exact staged identity stable across JSON omission of optional fields", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-json-"));
+    const transactionToken = "6".repeat(64);
+    const optionalModelSelection = { ...modelSelection, requestedModel: undefined };
+    const result = {
+      ...capturedResult,
+      answerHtml: undefined,
+      modelSelection: optionalModelSelection,
+    };
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      await begin(store, transactionToken);
+      await store.stageCapture({
+        transactionToken,
+        runId: "run-1",
+        result,
+        runtime,
+        modelSelection: optionalModelSelection,
+      });
+      await expect(
+        store.stageCapture({
+          transactionToken,
+          runId: "run-1",
+          result,
+          runtime,
+          modelSelection: optionalModelSelection,
+        }),
+      ).resolves.toMatchObject({ state: "running", stagedCapture: { result: capturedResult } });
+      await expect(
+        store.publishCapture({
+          transactionToken,
+          runId: "run-1",
+          result,
+          runtime,
+          modelSelection: optionalModelSelection,
+        }),
+      ).resolves.toMatchObject({ state: "pending", result: capturedResult });
+      const published = await store.read(transactionToken);
+      expect(published).not.toHaveProperty("stagedCapture");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -392,15 +392,13 @@ export class BrowserRunLifecycleController {
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
     if (this.state.kind === "published") return null;
     if (this.state.kind === "capturing" && this.promptResetPersistenceFailure) {
-      const runtime = markBrowserCaptureCleanupPending(this.runtime(this.adapters.getRuntime()));
+      const runtime = markBrowserCaptureCleanupPending(
+        this.runtime(this.adapters.getRuntime()),
+        "abort",
+      );
       const settlement = new BrowserCaptureSettlementController(this.adapters, runtime);
       this.state = { kind: "published", settlement };
-      return {
-        status: "pending",
-        runtime: settlement.runtime(),
-        error:
-          "Verified prompt authority could not be reset durably; answer capture and cleanup remain pending.",
-      };
+      return settlement.settle("abort");
     }
     const settlement = new BrowserCaptureSettlementController(
       this.adapters,

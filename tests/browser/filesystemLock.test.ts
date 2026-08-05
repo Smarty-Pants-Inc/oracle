@@ -15,10 +15,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import {
-  __test__ as filesystemLockTest,
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
   FilesystemLockReleasePendingError,
+  isolateDirectoryGenerationForRemoval,
+  removeIsolatedDirectoryGeneration,
 } from "../../src/browser/filesystemLock.js";
 import type {
   CrashRecoverableFilesystemLock,
@@ -29,6 +30,7 @@ import {
   retryPendingFilesystemLockReleases,
   __test__ as releaseJournalTest,
 } from "../../src/browser/filesystemLockReleaseJournal.js";
+import { createPlatformProcessGenerationProvider } from "../../src/browser/platformProcessGeneration.js";
 
 async function agePath(targetPath: string, ageMs = 10_000): Promise<void> {
   const timestamp = new Date(Date.now() - ageMs);
@@ -45,28 +47,153 @@ function createProcessIdentityProvider(
 }
 
 test("reads an exact Windows CIM creation generation without accepting a PID", async () => {
-  const execute = vi.fn(async (_command: string) => "2026-08-05T12:34:56.1234567Z\n");
-  const identity = await filesystemLockTest.readWindowsProcessStartIdentity(10_005, execute);
-
-  const retryIdentity = await filesystemLockTest.readWindowsProcessStartIdentity(10_005, execute);
+  const execute = vi.fn(async (_file: string, _args: string[]) => ({
+    stdout: "2026-08-05T12:34:56.1234567Z\n",
+  }));
+  const provider = createPlatformProcessGenerationProvider({ platform: "win32", execute });
+  const identity = await provider.readProcessGeneration(10_005);
+  const retryIdentity = await provider.readProcessGeneration(10_005);
 
   expect(identity).toBe("win32:2026-08-05T12:34:56.1234567Z");
   expect(retryIdentity).toBe(identity);
   expect(execute).toHaveBeenCalledTimes(2);
-  expect(execute.mock.calls[0]?.[0]).toContain(
+  expect(execute.mock.calls[0]?.[0]).toBe("powershell.exe");
+  expect(execute.mock.calls[0]?.[1]?.at(-1)).toContain(
     "Get-CimInstance Win32_Process -Filter 'ProcessId = 10005'",
   );
-  expect(execute.mock.calls[0]?.[0]).toContain("$process.CreationDate.ToUniversalTime()");
-  expect(execute.mock.calls[0]?.[0]).not.toContain("Get-Process");
+  expect(execute.mock.calls[0]?.[1]?.at(-1)).toContain("$process.CreationDate.ToUniversalTime()");
+  expect(execute.mock.calls[0]?.[1]?.at(-1)).not.toContain("Get-Process");
 
   await expect(
-    filesystemLockTest.readWindowsProcessStartIdentity(10_005, async () => "10005"),
+    createPlatformProcessGenerationProvider({
+      platform: "win32",
+      execute: async () => ({ stdout: "10005" }),
+    }).readProcessGeneration(10_005),
   ).resolves.toBeNull();
   await expect(
-    filesystemLockTest.readWindowsProcessStartIdentity(10_005, async () => {
-      throw new Error("CIM unavailable");
-    }),
+    createPlatformProcessGenerationProvider({
+      platform: "win32",
+      execute: async () => {
+        throw new Error("CIM unavailable");
+      },
+    }).readProcessGeneration(10_005),
   ).resolves.toBeNull();
+});
+
+test("uses the Darwin audit pidversion rather than second-resolution lstart", async () => {
+  let pidVersion = 7001;
+  const execute = vi.fn(async (file: string) => {
+    if (file !== "/usr/bin/lsappinfo") throw new Error(`Unexpected process query: ${file}`);
+    return {
+      stdout: `"Google Chrome" ASN:0x0-0x1234: pid = 4321 token=[sess=100020 pid=4321 uid:501,501,501 g:20,20 pV:${pidVersion}]\n`,
+    };
+  });
+  const provider = createPlatformProcessGenerationProvider({ platform: "darwin", execute });
+
+  const original = await provider.readProcessGeneration(4321);
+  pidVersion = 7002; // Same synthetic lstart second; the audit pidversion is the generation.
+  const replacement = await provider.readProcessGeneration(4321);
+
+  expect(original).toBe("darwin-audit-pidversion:7001");
+  expect(replacement).toBe("darwin-audit-pidversion:7002");
+  expect(replacement).not.toBe(original);
+  expect(execute.mock.calls.every(([file]) => file === "/usr/bin/lsappinfo")).toBe(true);
+});
+
+test("fails closed for malformed or mismatched Darwin audit identity", async () => {
+  for (const stdout of [
+    "pid = 4321 token=[pid=4321 pV:not-a-number]",
+    "pid = 4321 token=[pid=9876 pV:7001]",
+    "pid = 9876 token=[pid=4321 pV:7001]",
+  ]) {
+    const provider = createPlatformProcessGenerationProvider({
+      platform: "darwin",
+      execute: async () => ({ stdout }),
+    });
+    await expect(provider.readProcessGeneration(4321)).resolves.toBeNull();
+  }
+});
+
+test("uses the kernel microsecond launch generation for an ordinary Darwin CLI process", async () => {
+  const execute = vi.fn(async (file: string, _args: string[]) => {
+    if (file === "/usr/bin/lsappinfo") return { stdout: "" };
+    if (file === "/usr/bin/python3") return { stdout: "4321:1785945427:287123\n" };
+    throw new Error(`Unexpected process query: ${file}`);
+  });
+  const provider = createPlatformProcessGenerationProvider({ platform: "darwin", execute });
+
+  await expect(provider.readProcessGeneration(4321)).resolves.toBe(
+    "darwin-kernel-start:1785945427:287123",
+  );
+  expect(execute).toHaveBeenNthCalledWith(1, "/usr/bin/lsappinfo", ["info", "4321"]);
+  expect(execute.mock.calls[1]?.[0]).toBe("/usr/bin/python3");
+  expect(execute.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(["-c", "4321"]));
+});
+
+test("uses sample launch time only when the fast kernel probe is unavailable", async () => {
+  const sampleOutput = [
+    "Analysis of sampling node (pid 4321) every 1000 milliseconds",
+    "Process:         node [4321]",
+    "Launch Time:     2026-08-05 11:57:07.287 -0400",
+  ].join("\n");
+  const execute = vi.fn(async (file: string) => {
+    if (file === "/usr/bin/lsappinfo" || file === "/usr/bin/python3") return { stdout: "" };
+    if (file === "/usr/bin/sample") return { stdout: sampleOutput };
+    throw new Error(`Unexpected process query: ${file}`);
+  });
+  const provider = createPlatformProcessGenerationProvider({ platform: "darwin", execute });
+
+  await expect(provider.readProcessGeneration(4321)).resolves.toBe(
+    "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
+  );
+  expect(execute.mock.calls.map(([file]) => file)).toEqual([
+    "/usr/bin/lsappinfo",
+    "/usr/bin/python3",
+    "/usr/bin/sample",
+  ]);
+  expect(execute).toHaveBeenNthCalledWith(3, "/usr/bin/sample", [
+    "4321",
+    "1",
+    "1",
+    "-file",
+    "/dev/stdout",
+  ]);
+
+  const mismatchedProvider = createPlatformProcessGenerationProvider({
+    platform: "darwin",
+    execute: async (file) => ({
+      stdout:
+        file === "/usr/bin/lsappinfo" || file === "/usr/bin/python3"
+          ? ""
+          : sampleOutput.replace("[4321]", "[9876]"),
+    }),
+  });
+  await expect(mismatchedProvider.readProcessGeneration(4321)).resolves.toBeNull();
+});
+
+test("keeps Linux boot-id and start-ticks as a stable exact generation", async () => {
+  const bootId = "11111111-1111-4111-8111-111111111111";
+  const statForStartTicks = (startTicks: string) => {
+    const fields = Array.from({ length: 20 }, () => "0");
+    fields[0] = "S";
+    fields[19] = startTicks;
+    return `4321 (chrome) ${fields.join(" ")}`;
+  };
+  const statReads = [statForStartTicks("987654"), statForStartTicks("987654")];
+  const provider = createPlatformProcessGenerationProvider({
+    platform: "linux",
+    readFile: async (file) => (file.endsWith("/stat") ? (statReads.shift() ?? "") : `${bootId}\n`),
+  });
+
+  await expect(provider.readProcessGeneration(4321)).resolves.toBe(`linux:${bootId}:987654`);
+
+  const replacementReads = [statForStartTicks("987654"), statForStartTicks("987655")];
+  const replacementProvider = createPlatformProcessGenerationProvider({
+    platform: "linux",
+    readFile: async (file) =>
+      file.endsWith("/stat") ? (replacementReads.shift() ?? "") : `${bootId}\n`,
+  });
+  await expect(replacementProvider.readProcessGeneration(4321)).resolves.toBeNull();
 });
 
 describe("crash-recoverable filesystem lock", () => {
@@ -89,10 +216,45 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test("boundedly retries before rejecting an unproven Windows generation", async () => {
+  test("publishes a Darwin lock for an ordinary CLI process generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const generationProvider = createPlatformProcessGenerationProvider({
+      platform: "darwin",
+      execute: async (file) => {
+        if (file === "/usr/bin/lsappinfo") return { stdout: "" };
+        if (file === "/usr/bin/python3") return { stdout: "4321:1785945427:287123\n" };
+        throw new Error(`Unexpected process query: ${file}`);
+      },
+    });
+    try {
+      const lock = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            4321,
+            generationProvider.readProcessGeneration,
+            () => "alive",
+            "darwin",
+          ),
+        },
+      );
+      expect(lock.owner.processStartIdentity).toBe("darwin-kernel-start:1785945427:287123");
+      await lock.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retries Windows generation proof within one bounded acquisition budget", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "missing-parent", "recovery.lock");
-    const readProcessStartIdentity = vi.fn(async () => null);
+    const budgets: number[] = [];
+    const readProcessStartIdentity = vi.fn(async (_pid: number, timeoutMs?: number) => {
+      budgets.push(timeoutMs ?? 0);
+      return null;
+    });
     try {
       await expect(
         acquireCrashRecoverableFilesystemLock(
@@ -109,6 +271,11 @@ describe("crash-recoverable filesystem lock", () => {
         ),
       ).rejects.toThrow(/without a stable process generation/i);
       expect(readProcessStartIdentity).toHaveBeenCalledTimes(3);
+      expect(budgets).toHaveLength(3);
+      expect(budgets[0]).toBeLessThanOrEqual(12_000);
+      expect(budgets[0]).toBeGreaterThan(0);
+      expect(budgets[1]).toBeLessThan(budgets[0]!);
+      expect(budgets[2]).toBeLessThan(budgets[1]!);
       await expect(stat(path.dirname(lockPath))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -119,13 +286,19 @@ describe("crash-recoverable filesystem lock", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
     let queryAttempt = 0;
-    const execute = vi.fn(async (_command: string) => {
-      queryAttempt += 1;
-      if (queryAttempt === 1) throw new Error("CIM startup race");
-      return "2026-08-05T12:34:56.1234567Z";
+    const execute = vi.fn(
+      async (_file: string, _args: string[], _options?: { timeoutMs?: number }) => {
+        queryAttempt += 1;
+        if (queryAttempt === 1) throw new Error("CIM startup race");
+        return { stdout: "2026-08-05T12:34:56.1234567Z" };
+      },
+    );
+    const generationProvider = createPlatformProcessGenerationProvider({
+      platform: "win32",
+      execute,
     });
-    const readProcessStartIdentity = vi.fn((pid: number) =>
-      filesystemLockTest.readWindowsProcessStartIdentity(pid, execute),
+    const readProcessStartIdentity = vi.fn((pid: number, timeoutMs?: number) =>
+      generationProvider.readProcessGeneration(pid, timeoutMs),
     );
     try {
       const lock = await acquireCrashRecoverableFilesystemLock(
@@ -142,6 +315,9 @@ describe("crash-recoverable filesystem lock", () => {
       );
       expect(readProcessStartIdentity).toHaveBeenCalledTimes(2);
       expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute.mock.calls[1]?.[2]?.timeoutMs).toBeLessThan(
+        execute.mock.calls[0]?.[2]?.timeoutMs ?? 0,
+      );
       expect(lock.owner.processStartIdentity).toBe("win32:2026-08-05T12:34:56.1234567Z");
       expect(JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"))).toMatchObject({
         processStartIdentity: "win32:2026-08-05T12:34:56.1234567Z",
@@ -455,6 +631,7 @@ describe("crash-recoverable filesystem lock", () => {
         ),
       ).toEqual([]);
 
+      releaseJournalTest.clearRetainedFilesystemLockReleases();
       successor = await acquireCrashRecoverableFilesystemLock(
         lockPath,
         { timeoutMs: 1_000, pollMs: 10 },
@@ -465,21 +642,161 @@ describe("crash-recoverable filesystem lock", () => {
           ),
         },
       );
-      const successorOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
-
-      await expect(original.release()).resolves.toBeUndefined();
       expect(mutationRequestPublications).toBe(1);
-      expect(isolatedRemovalRoots).toEqual([isolatedRemovalRoot, isolatedRemovalRoot]);
+      expect(isolatedRemovalRoots).toEqual([isolatedRemovalRoot]);
       await expect(stat(isolatedRemovalRoot)).rejects.toMatchObject({ code: "ENOENT" });
-      expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(successorOwnerRaw);
+      expect(
+        (await readdir(root)).filter((entry) => entry.endsWith(".cleanup-journal.json")),
+      ).toEqual([]);
+      const successorOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
       await expect(original.release()).resolves.toBeUndefined();
-      expect(isolatedRemovalRoots).toEqual([isolatedRemovalRoot, isolatedRemovalRoot]);
+      expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(successorOwnerRaw);
 
       await successor.release();
       successor = undefined;
     } finally {
       await successor?.release().catch(() => undefined);
       await original.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(process.platform !== "win32")(
+    "bound helper deletes only the attested root generation after pathname substitution",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-"));
+      const candidatePath = path.join(root, "candidate");
+      const movedRootPath = path.join(root, "moved-isolation-root");
+      await mkdir(path.join(candidatePath, "nested"), { recursive: true });
+      await writeFile(path.join(candidatePath, "nested", "owned-marker"), "delete");
+      try {
+        const isolation = await isolateDirectoryGenerationForRemoval(
+          candidatePath,
+          async (generationPath) => (await stat(generationPath)).isDirectory(),
+        );
+        expect(isolation.status).toBe("isolated");
+        if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+
+        await expect(
+          removeIsolatedDirectoryGeneration(isolation.rootPath, {
+            afterChildAttestation: async (isolatedRootPath) => {
+              await rename(isolatedRootPath, movedRootPath);
+              await mkdir(isolatedRootPath);
+              await writeFile(path.join(isolatedRootPath, "replacement-marker"), "preserve");
+            },
+          }),
+        ).rejects.toThrow(/identity changed/i);
+
+        await expect(stat(path.join(movedRootPath, "generation"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(
+          readFile(path.join(isolation.rootPath, "replacement-marker"), "utf8"),
+        ).resolves.toBe("preserve");
+        await expect(
+          retryPendingFilesystemLockReleases(path.join(root, "recovery.lock")),
+        ).resolves.toBeUndefined();
+        await expect(
+          readFile(path.join(isolation.rootPath, "replacement-marker"), "utf8"),
+        ).resolves.toBe("preserve");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("malformed isolated cleanup journals fail closed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-cleanup-journal-"));
+    const lockPath = path.join(root, "recovery.lock");
+    try {
+      await mkdir(lockPath);
+      const isolation = await isolateDirectoryGenerationForRemoval(
+        lockPath,
+        async () => true,
+        lockPath,
+      );
+      expect(isolation.status).toBe("isolated");
+      if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+      const journalPath = `${isolation.rootPath}.cleanup-journal.json`;
+      await writeFile(journalPath, "{not-json", "utf8");
+      await expect(retryPendingFilesystemLockReleases(lockPath)).rejects.toThrow(
+        /malformed cleanup authority json/i,
+      );
+      await expect(readFile(journalPath, "utf8")).resolves.toBe("{not-json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("legacy file quarantine replacement is preserved instead of deleted", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-legacy-race-"));
+    const lockPath = path.join(root, "oracle-automation.lock");
+    const movedLegacyPath = path.join(root, "moved-legacy-lock");
+    const legacyPid = 41_041;
+    const legacyRaw = `${JSON.stringify({
+      pid: legacyPid,
+      lockId: "dead-legacy-generation",
+      createdAt: new Date().toISOString(),
+      sessionId: "legacy-session",
+    })}\n`;
+    const replacementRaw = `${JSON.stringify({
+      pid: process.pid,
+      lockId: "replacement-generation",
+      createdAt: new Date().toISOString(),
+      sessionId: "replacement-session",
+    })}\n`;
+    try {
+      await writeFile(lockPath, legacyRaw, "utf8");
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          { timeoutMs: 150, pollMs: 10 },
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              40_045,
+              async () => "current-generation",
+              (pid) => (pid === legacyPid ? "dead" : "alive"),
+            ),
+            afterStaleLockQuarantine: async (quarantinedPath) => {
+              await rename(quarantinedPath, movedLegacyPath);
+              await writeFile(quarantinedPath, replacementRaw, "utf8");
+            },
+          },
+        ),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      await expect(readFile(movedLegacyPath, "utf8")).resolves.toBe(legacyRaw);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe(replacementRaw);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("legacy file with unknown pid liveness remains authoritative", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-legacy-unknown-"));
+    const lockPath = path.join(root, "oracle-automation.lock");
+    const legacyRaw = `${JSON.stringify({
+      pid: 51_051,
+      lockId: "unknown-legacy-generation",
+      createdAt: new Date().toISOString(),
+      sessionId: "unknown-session",
+    })}\n`;
+    try {
+      await writeFile(lockPath, legacyRaw, "utf8");
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          { timeoutMs: 100, pollMs: 10 },
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              40_046,
+              async () => "current-generation",
+              () => "unknown",
+            ),
+          },
+        ),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe(legacyRaw);
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1383,7 +1700,11 @@ describe("crash-recoverable filesystem lock", () => {
           processStartIdentity: currentStartIdentity,
         });
         expect(readProcessLiveness).toHaveBeenCalledWith(originalPid);
-        expect(readProcessStartIdentity).toHaveBeenCalledWith(currentPid);
+        if (platform === "win32") {
+          expect(readProcessStartIdentity).toHaveBeenCalledWith(currentPid, expect.any(Number));
+        } else {
+          expect(readProcessStartIdentity).toHaveBeenCalledWith(currentPid);
+        }
         expect(readProcessStartIdentity).toHaveBeenCalledWith(originalPid);
         await lock.release();
       } finally {

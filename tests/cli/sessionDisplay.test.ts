@@ -107,6 +107,51 @@ function committedPromptAuthority(conversationId: string): BrowserRuntimeMetadat
   };
 }
 
+function pendingChromeProcessAcquisitionRuntime(): BrowserRuntimeMetadata {
+  const userDataDir = path.resolve("/tmp/oracle-display-acquisition");
+  const generationId = "70000000-0000-4000-8000-000000000007";
+  return {
+    browserTransport: "cdp",
+    chromePid: 7_777,
+    chromeHost: "127.0.0.1",
+    chromeProfileRoot: userDataDir,
+    userDataDir,
+    recoveryCleanupResources: [
+      {
+        chromePid: 7_777,
+        chromeHost: "127.0.0.1",
+        chromeProfileRoot: userDataDir,
+        userDataDir,
+        profileDirectoryIdentity: {
+          version: 1,
+          platform: process.platform,
+          canonicalPath: userDataDir,
+          device: "1",
+          inode: "2",
+        },
+        acquisition: {
+          generationId,
+          pendingResource: "chrome-process",
+          processOwnerProvenance: "temporary-launch",
+          processLaunchClaim: {
+            version: 1,
+            generationId,
+            nonce: "80000000-0000-4000-8000-000000000008",
+          },
+          processOwnerDisposition: "close-on-last-lease",
+        },
+        recoveryCleanup: {
+          ownsTarget: false,
+          profileKind: "temporary",
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: false,
+        },
+      },
+    ],
+    recoveryCleanupResult: { status: "pending" },
+  };
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   process.exitCode = undefined;
@@ -196,6 +241,78 @@ describe("formatUserErrorMetadata", () => {
         details: { path: "foo.txt" },
       }),
     ).toBe('file-validation | message=Too big | details={"path":"foo.txt"}');
+  });
+
+  test("projects persisted recovery authority out of terminal diagnostics", () => {
+    const transactionToken = "transaction-token-keep-in-metadata-only-1234567890";
+    const remoteHost = "bridge-recovery.internal.example";
+    const websocketEndpoint = "ws://127.0.0.1:9222/devtools/browser/recovery-secret";
+    const profilePath = "/Users/alice/Library/Application Support/Chrome/recovery-profile";
+    const processLaunchClaim = "launch-claim-keep-in-metadata-only";
+
+    const formatted = formatUserErrorMetadata({
+      category: "browser-automation",
+      message: `Chrome disconnected at ${websocketEndpoint}; transactionToken=${transactionToken}`,
+      details: {
+        stage: "connection-lost",
+        cause: "The browser connection closed before the answer was captured.",
+        status: "recoverable-error",
+        userAction: "Run oracle session sess to retry capture.",
+        runtime: {
+          chromePid: 424_242,
+          chromeBrowserWSEndpoint: websocketEndpoint,
+          userDataDir: profilePath,
+          chromeProcessIdentity: { pid: 424_242, processLaunchClaim },
+          recoveryCleanupResources: [
+            {
+              remoteRecovery: { host: remoteHost, transactionToken },
+              acquisition: { processLaunchClaim },
+            },
+          ],
+        },
+        details: {
+          RUNTIME: {
+            recoveryCleanupResources: [
+              {
+                remoteRecovery: { Host: remoteHost, Transaction_Token: transactionToken },
+                chromePid: 424_242,
+                chromeBrowserWSEndpoint: websocketEndpoint,
+                userDataDir: profilePath,
+                acquisition: { processLaunchClaim },
+              },
+            ],
+          },
+          causes: [
+            {
+              StAtUs: "recoverable-error",
+              ChRoMe_BrOwSeR_Ws_EnDpOiNt: websocketEndpoint,
+              ChRoMe_PiD: 424_242,
+              UsEr_DaTa_DiR: profilePath,
+              PrOcEsS_LaUnCh_ClAiM: processLaunchClaim,
+              ReCoVeRy_CleanUp_Resources: [
+                { remoteRecovery: { host: remoteHost, transactionToken } },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(formatted).toContain('stage":"connection-lost');
+    expect(formatted).toContain('cause":"The browser connection closed');
+    expect(formatted).toContain('status":"recoverable-error');
+    expect(formatted).toContain('userAction":"Run oracle session sess');
+    expect(formatted).toContain('StAtUs":"recoverable-error');
+    expect(formatted).toContain("[redacted-endpoint]");
+    expect(formatted).toContain("transactionToken=[redacted]");
+    expect(formatted).not.toContain(transactionToken);
+    expect(formatted).not.toContain(remoteHost);
+    expect(formatted).not.toContain(websocketEndpoint);
+    expect(formatted).not.toContain(profilePath);
+    expect(formatted).not.toContain(processLaunchClaim);
+    expect(formatted).not.toContain("424242");
+    expect(formatted).not.toContain("runtime");
+    expect(formatted).not.toContain("recoveryCleanupResources");
   });
 });
 
@@ -524,7 +641,7 @@ describe("attachSession rendering", () => {
     );
   });
 
-  test("retries completed browser cleanup only after a durable answer receipt", async () => {
+  test("retries completed cleanup after a durable receipt without restoring status", async () => {
     const remoteRecovery = {
       protocolVersion: 3,
       host: "bridge.example:9443",
@@ -596,6 +713,10 @@ describe("attachSession rendering", () => {
     expect(sessionStoreMock.updateSession).toHaveBeenCalledWith("sess", {
       browser: { runtime: settledRuntime },
     });
+    expect(
+      sessionStoreMock.updateSession.mock.calls.every(([, patch]) => patch.status === undefined),
+    ).toBe(true);
+    expect(sessionStoreMock.updateModelRun).not.toHaveBeenCalled();
   });
 
   test("does not settle completed browser cleanup without a durable answer receipt", async () => {
@@ -629,6 +750,54 @@ describe("attachSession rendering", () => {
     });
 
     expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+  });
+
+  test("aborts exact epoch-less acquisition cleanup for a stale running session", async () => {
+    const pendingRuntime = pendingChromeProcessAcquisitionRuntime();
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      browser: { config: {}, runtime: pendingRuntime },
+    };
+    const recoveredMeta: SessionMetadata = {
+      ...runningMeta,
+      status: "error",
+      browser: { config: {}, runtime: {} },
+      errorMessage:
+        "Browser session stopped before committing a prompt; acquisition cleanup completed.",
+    };
+    retryBrowserRecoveryCleanupMock.mockResolvedValueOnce({ status: "completed", runtime: {} });
+    readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValue(recoveredMeta);
+    readSessionLogMock.mockResolvedValue("");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+      }),
+      "abort",
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({
+        status: "error",
+        browser: { config: {}, runtime: {} },
+        error: expect.objectContaining({
+          category: "browser-automation",
+          details: expect.objectContaining({ stage: "browser-acquisition-recovery", runtime: {} }),
+        }),
+      }),
+    );
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
   });
 
   test("retries explicit abort authority for a completed recovery attempt", async () => {

@@ -49,7 +49,7 @@ describe("hasRecoverableChatGptConversation", () => {
     ).toBe(true);
   });
 
-  test("requires matching current prompt authority but preserves committed turns before follow-ups", () => {
+  test("requires matching final-turn prompt authority", () => {
     expect(hasRecoverableChatGptConversation({ conversationId: "abc" })).toBe(false);
     expect(
       hasRecoverableChatGptConversation(
@@ -60,6 +60,8 @@ describe("hasRecoverableChatGptConversation", () => {
       tabUrl: "https://chatgpt.com/c/abc",
     });
     pendingFollowUp.promptEpoch.remainingFollowUps = 1;
+    expect(hasRecoverableChatGptConversation(pendingFollowUp)).toBe(false);
+    pendingFollowUp.promptEpoch.remainingFollowUps = 0;
     expect(hasRecoverableChatGptConversation(pendingFollowUp)).toBe(true);
   });
 

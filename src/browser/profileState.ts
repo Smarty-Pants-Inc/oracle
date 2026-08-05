@@ -1,13 +1,16 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { lstat, open, readFile, rename, rm } from "node:fs/promises";
+import { lstat, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   type CrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
+} from "./filesystemLock.js";
+import {
   isolateDirectoryGenerationForRemoval,
   removeIsolatedDirectoryGeneration,
-} from "./filesystemLock.js";
+  replayPendingIsolatedDirectoryRemovals,
+} from "./filesystemLockPrimitives.js";
 import {
   assertProfileDirectoryIdentity,
   captureProfileDirectoryIdentity,
@@ -34,6 +37,17 @@ export * from "./chromeProcessIdentity.js";
 const ORACLE_CHROME_OWNER_FILENAME = "oracle-chrome-owner.json";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
 
+async function canonicalProfileRemovalPath(userDataDir: string): Promise<string | null> {
+  const resolvedPath = path.resolve(userDataDir);
+  let canonicalParentPath: string;
+  try {
+    canonicalParentPath = await realpath(path.dirname(resolvedPath));
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  return path.join(canonicalParentPath, path.basename(resolvedPath));
+}
 export type ChromeOwnerDisposition = "preserve" | "close-on-last-lease";
 
 export interface OracleChromeOwnerRecord {
@@ -47,6 +61,7 @@ interface RemoveProfileDirectoryDeps {
   beforeQuarantineRename?: () => void | Promise<void>;
   beforeQuarantineDelete?: (quarantinePath: string) => void | Promise<void>;
   afterQuarantineIdentityVerification?: (quarantinePath: string) => void | Promise<void>;
+  afterRemovalChildAttestation?: (isolatedRootPath: string) => void | Promise<void>;
 }
 
 export async function removeProfileDirectoryIfIdentityMatches(
@@ -64,11 +79,18 @@ export async function removeProfileDirectoryIfIdentityMatchesForTest(
   return removeProfileDirectoryIfIdentityMatchesWithDeps(userDataDir, expected, deps);
 }
 
+export async function replayPendingProfileDirectoryRemovals(userDataDir: string): Promise<void> {
+  const canonicalPath = await canonicalProfileRemovalPath(userDataDir);
+  if (canonicalPath === null) return;
+  await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath);
+}
+
 async function removeProfileDirectoryIfIdentityMatchesWithDeps(
   userDataDir: string,
   expected: ProfileDirectoryIdentity,
   deps: RemoveProfileDirectoryDeps,
 ): Promise<boolean> {
+  if (!(await pathExists(expected.canonicalPath))) return true;
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
   const profileInUse = deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir;
   if (await profileInUse(expected.canonicalPath)) return false;
@@ -113,9 +135,12 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
         generationPath,
         Object.freeze({ ...expected, canonicalPath: path.resolve(generationPath) }),
       ),
+    expected.canonicalPath,
   );
   if (isolation.status !== "isolated") return false;
-  await removeIsolatedDirectoryGeneration(isolation.rootPath);
+  await removeIsolatedDirectoryGeneration(isolation.rootPath, {
+    afterChildAttestation: deps.afterRemovalChildAttestation,
+  });
   return true;
 }
 
@@ -139,6 +164,15 @@ export async function readOracleChromeOwner(
     if (readErrorCode(error) === "ENOENT") return null;
     throw error;
   }
+  return readOracleChromeOwnerForProfile(userDataDir, profile);
+}
+
+// The caller's captured profile is the pre-read authority. The post-read assertion closes the
+// replacement race without recapturing the same physical directory generation.
+async function readOracleChromeOwnerForProfile(
+  userDataDir: string,
+  profile: ProfileDirectoryIdentity,
+): Promise<OracleChromeOwnerRecord | null> {
   const ownerPath = path.join(profile.canonicalPath, ORACLE_CHROME_OWNER_FILENAME);
   let raw: string;
   try {
@@ -446,6 +480,7 @@ export async function acquireProfileRunLock(
 interface CleanupStaleProfileStateDeps {
   captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
   verifyProfileIdentity?: typeof verifyProfileDirectoryIdentity;
+  isChromeUsingUserDataDir?: typeof isChromeUsingUserDataDir;
   beforeDestructiveCleanup?: () => void | Promise<void>;
 }
 
@@ -481,6 +516,14 @@ async function cleanupStaleProfileStateWithDeps(
   },
   deps: CleanupStaleProfileStateDeps,
 ): Promise<boolean> {
+  try {
+    await replayPendingProfileDirectoryRemovals(userDataDir);
+  } catch (error) {
+    logger?.(
+      `Refusing stale profile cleanup because pending deletion replay failed: ${error instanceof Error ? error.message : error}`,
+    );
+    return false;
+  }
   const captureProfile = deps.captureProfileIdentity ?? captureProfileDirectoryIdentity;
   const verifyProfile = deps.verifyProfileIdentity ?? verifyProfileDirectoryIdentity;
   let profile: ProfileDirectoryIdentity;
@@ -499,7 +542,7 @@ async function cleanupStaleProfileStateWithDeps(
   if (lockRemovalMode === "if_oracle_pid_dead") {
     let owner: OracleChromeOwnerRecord | null;
     try {
-      owner = await readOracleChromeOwner(profile.canonicalPath);
+      owner = await readOracleChromeOwnerForProfile(userDataDir, profile);
     } catch (error) {
       logger?.(
         `Refusing stale profile cleanup because Chrome owner authority is unreadable: ${error instanceof Error ? error.message : error}`,
@@ -512,7 +555,7 @@ async function cleanupStaleProfileStateWithDeps(
       return false;
     }
   }
-  if (await isChromeUsingUserDataDir(profile.canonicalPath)) {
+  if (await (deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir)(profile.canonicalPath)) {
     logger?.("Detected running Chrome using this profile; preserving profile state");
     return false;
   }

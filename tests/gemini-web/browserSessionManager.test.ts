@@ -9,8 +9,8 @@ import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "..
 type Teardown = () => Promise<boolean>;
 
 const {
-  connectWithNewTab,
-  closeTab,
+  connectWithNewTabWithExactAuthority,
+  closeChromeTargetWithExactAuthority,
   acquireManualChromeOwner,
   settleManualChromeOwner,
   releaseManualChromeOwnerEndpointAuthority,
@@ -30,8 +30,8 @@ const {
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS,
   normalizeMaxConcurrentTabs,
 } = vi.hoisted(() => ({
-  connectWithNewTab: vi.fn(),
-  closeTab: vi.fn(async () => true),
+  connectWithNewTabWithExactAuthority: vi.fn(),
+  closeChromeTargetWithExactAuthority: vi.fn(),
   acquireManualChromeOwner: vi.fn(),
   settleManualChromeOwner: vi.fn(),
   releaseManualChromeOwnerEndpointAuthority: vi.fn(),
@@ -71,8 +71,8 @@ const {
 }));
 
 vi.mock("../../src/browser/chromeLifecycle.js", () => ({
-  connectWithNewTab,
-  closeTab,
+  connectWithNewTabWithExactAuthority,
+  closeChromeTargetWithExactAuthority,
 }));
 
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
@@ -113,6 +113,12 @@ describe("openGeminiBrowserSession", () => {
       inode: "1",
     },
   };
+  const endpointAuthority = {
+    browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/generation-a",
+    kill: vi.fn(),
+    runExactOperation: vi.fn(),
+    release: vi.fn(async () => undefined),
+  };
 
   beforeEach(async () => {
     tempRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-profile-"));
@@ -135,8 +141,9 @@ describe("openGeminiBrowserSession", () => {
     clientClose.mockReset();
     clientClose.mockResolvedValue(undefined);
 
-    connectWithNewTab.mockReset();
-    closeTab.mockClear();
+    connectWithNewTabWithExactAuthority.mockReset();
+    closeChromeTargetWithExactAuthority.mockReset();
+    closeChromeTargetWithExactAuthority.mockResolvedValue({ status: "completed" as const });
     acquireManualChromeOwner.mockReset();
     settleManualChromeOwner.mockReset();
     releaseManualChromeOwnerEndpointAuthority.mockReset();
@@ -188,6 +195,7 @@ describe("openGeminiBrowserSession", () => {
       processIdentity,
       source: "launched",
       disposition: "close-on-last-lease",
+      endpointAuthority,
     });
     acquireBrowserTabLease.mockResolvedValue({
       id: "lease-1",
@@ -195,7 +203,7 @@ describe("openGeminiBrowserSession", () => {
       update: leaseUpdate,
       release: leaseRelease,
     });
-    connectWithNewTab.mockResolvedValue({
+    connectWithNewTabWithExactAuthority.mockResolvedValue({
       targetId: "target-1",
       client: { close: clientClose },
     });
@@ -252,13 +260,58 @@ describe("openGeminiBrowserSession", () => {
       processOwnerDisposition: "close-on-last-lease",
     });
     expect(leaseUpdate).toHaveBeenCalledWith({ chromeHost: "127.0.0.1", chromePort: 9222 });
-    expect(connectWithNewTab).toHaveBeenCalledWith(
-      9222,
+    expect(connectWithNewTabWithExactAuthority).toHaveBeenCalledWith(
+      endpointAuthority,
       expect.any(Function),
       expect.stringMatching(/^about:blank#oracle-acquisition=/),
-      "127.0.0.1",
-      { fallbackToDefault: false, retries: 6 },
+      { retries: 6 },
     );
+  });
+  it("does not acquire a Gemini target from generation B after same-port rebinding", async () => {
+    const generationBCreateTarget = vi.fn();
+    const generationBAttachTarget = vi.fn();
+    const generationAAuthority = {
+      ...endpointAuthority,
+      runExactOperation: vi.fn(async (_operation: () => Promise<unknown>) => ({
+        status: "gone" as const,
+      })),
+    };
+    acquireManualChromeOwner.mockResolvedValueOnce({
+      chrome: {
+        port: 9222,
+        pid: processIdentity.pid,
+        host: "127.0.0.1",
+        processIdentity,
+        kill: ownerKill,
+        endpointAuthority: generationAAuthority,
+      },
+      processIdentity,
+      source: "launched",
+      disposition: "close-on-last-lease",
+      endpointAuthority: generationAAuthority,
+    });
+    connectWithNewTabWithExactAuthority.mockImplementationOnce(
+      async (authority: typeof generationAAuthority) => {
+        const result = await authority.runExactOperation(async () => {
+          generationBCreateTarget();
+          generationBAttachTarget();
+          return undefined;
+        });
+        if (result.status === "gone") throw new Error("Exact Chrome process generation exited");
+        throw new Error("Unexpected exact authority result");
+      },
+    );
+
+    await expect(
+      openGeminiBrowserSession({
+        browserConfig: { manualLoginProfileDir: path.join(tempRoot, "same-port-profile") },
+        keepBrowserDefault: false,
+        purpose: "Gemini same-port authority",
+      }),
+    ).rejects.toThrow(/generation exited/i);
+    expect(generationBCreateTarget).not.toHaveBeenCalled();
+    expect(generationBAttachTarget).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
   });
 
   it("journals each acquisition intent before its effect and exact identity immediately after", async () => {
@@ -285,9 +338,10 @@ describe("openGeminiBrowserSession", () => {
         processIdentity,
         source: "launched" as const,
         disposition: "close-on-last-lease" as const,
+        endpointAuthority,
       };
     });
-    connectWithNewTab.mockImplementationOnce(async () => {
+    connectWithNewTabWithExactAuthority.mockImplementationOnce(async () => {
       events.push("acquire:chrome-target");
       return { targetId: "target-ordered", client: { close: clientClose } };
     });
@@ -340,7 +394,7 @@ describe("openGeminiBrowserSession", () => {
         boundMode: "abort",
       },
     });
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(ownerKill).toHaveBeenCalledTimes(1);
   });
 
@@ -360,7 +414,7 @@ describe("openGeminiBrowserSession", () => {
     });
 
     expect(aggregateRuntime.recoveryCleanupResult).toEqual({ status: "pending" });
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(ownerKill).toHaveBeenCalledTimes(1);
   });
 
@@ -378,7 +432,7 @@ describe("openGeminiBrowserSession", () => {
       processIdentity,
       source: "recorded",
       disposition: "preserve",
-      endpointAuthority: { release: endpointRelease },
+      endpointAuthority: { ...endpointAuthority, release: endpointRelease },
     });
 
     const session = await openGeminiBrowserSession({
@@ -389,7 +443,11 @@ describe("openGeminiBrowserSession", () => {
     await session.close();
 
     expect(session.processIdentity).toBe(processIdentity);
-    expect(closeTab).toHaveBeenCalledWith(9333, "target-1", expect.any(Function), "127.0.0.1");
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith({
+      authority: expect.objectContaining({ release: endpointRelease }),
+      targetId: "target-1",
+      logger: expect.any(Function),
+    });
     expect(leaseRelease).toHaveBeenCalledTimes(1);
     expect(settleManualChromeOwner).toHaveBeenCalledWith(
       profileDir,
@@ -416,7 +474,7 @@ describe("openGeminiBrowserSession", () => {
       processIdentity,
       source: "launched",
       disposition: "close-on-last-lease",
-      endpointAuthority: { release: endpointRelease },
+      endpointAuthority: { ...endpointAuthority, release: endpointRelease },
     });
     retainBrowserTabLeaseTeardownAuthority.mockImplementationOnce(
       (
@@ -442,7 +500,7 @@ describe("openGeminiBrowserSession", () => {
     });
     await Promise.all([session.close(), session.close()]);
 
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(clientClose).toHaveBeenCalledTimes(1);
     expect(endpointRelease).toHaveBeenCalledTimes(1);
     expect(ownerKill).not.toHaveBeenCalled();
@@ -462,6 +520,7 @@ describe("openGeminiBrowserSession", () => {
       processIdentity,
       source: "recorded",
       disposition: "close-on-last-lease",
+      endpointAuthority,
     });
     const session = await openGeminiBrowserSession({
       browserConfig: { manualLoginProfileDir: profileDir },
@@ -535,7 +594,7 @@ describe("openGeminiBrowserSession", () => {
 
   it("attaches durable cleanup authority when session opening cannot settle", async () => {
     const profileDir = path.join(tempRoot, "open-failure-profile");
-    connectWithNewTab.mockRejectedValueOnce(new Error("connection failed"));
+    connectWithNewTabWithExactAuthority.mockRejectedValueOnce(new Error("connection failed"));
     ownerKill.mockResolvedValueOnce({
       status: "unsafe",
       pid: processIdentity.pid,
@@ -570,7 +629,9 @@ describe("openGeminiBrowserSession", () => {
 
   it("retries target closure before releasing controller or lease authority", async () => {
     const profileDir = path.join(tempRoot, "close-retry-profile");
-    closeTab.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    closeChromeTargetWithExactAuthority
+      .mockResolvedValueOnce({ status: "unsafe", reason: "target close was not confirmed" })
+      .mockResolvedValueOnce({ status: "completed" });
     const session = await openGeminiBrowserSession({
       browserConfig: { manualLoginProfileDir: profileDir },
       keepBrowserDefault: false,
@@ -578,7 +639,7 @@ describe("openGeminiBrowserSession", () => {
     });
 
     await expect(session.close()).rejects.toThrow("cleanup remains retryable");
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(clientClose).not.toHaveBeenCalled();
     expect(leaseRelease).not.toHaveBeenCalled();
     expect(ownerKill).not.toHaveBeenCalled();
@@ -586,7 +647,7 @@ describe("openGeminiBrowserSession", () => {
     await expect(session.close()).resolves.toBeUndefined();
     await expect(session.close()).resolves.toBeUndefined();
 
-    expect(closeTab).toHaveBeenCalledTimes(2);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(2);
     expect(clientClose).toHaveBeenCalledTimes(1);
     expect(teardownSettle).toHaveBeenCalledTimes(1);
     expect(ownerKill).toHaveBeenCalledTimes(1);

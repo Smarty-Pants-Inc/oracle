@@ -252,18 +252,24 @@ describe("BrowserRunLifecycleController", () => {
     await expect(lifecycle.beginPromptDispatch("follow up", 2, 1, 0)).rejects.toMatchObject({
       details: { code: "browser-run-lifecycle-transition-invalid", phase: "capturing" },
     });
-    await expect(lifecycle.settleIfUnpublished()).resolves.toMatchObject({
-      status: "pending",
+    const settlement = await lifecycle.settleIfUnpublished();
+    expect(settlement).toMatchObject({
+      status: "completed",
       runtime: {
         promptEpoch: expect.objectContaining({
           status: "committed",
           verifiedUserTurnId: "turn-0",
           verifiedUserMessageId: "message-0",
         }),
-        recoveryCleanupResult: { status: "pending" },
       },
     });
-    expect(settleResources).not.toHaveBeenCalled();
+    expect(settlement?.runtime).not.toHaveProperty("recoveryCleanupResult");
+    expect(settleResources).toHaveBeenCalledWith(
+      "abort",
+      expect.objectContaining({
+        promptEpoch: expect.objectContaining({ status: "committed" }),
+      }),
+    );
   });
 
   test.each([

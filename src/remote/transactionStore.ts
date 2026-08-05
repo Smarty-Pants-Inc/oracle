@@ -8,7 +8,11 @@ import type {
   BrowserRuntimeMetadata,
   BrowserSessionConfig,
 } from "../sessionManager.js";
-import type { RemoteArtifactDescriptor, RemotePublicRunResult } from "./types.js";
+import {
+  RemotePublicRunResultSchema,
+  type RemoteArtifactDescriptor,
+  type RemotePublicRunResult,
+} from "./types.js";
 import {
   MAX_REMOTE_TRANSACTION_RECORDS,
   MAX_REMOTE_TRANSACTION_STORE_BYTES,
@@ -86,6 +90,18 @@ export interface DurableRemoteTerminalAudit {
   errorCode?: string;
   errorStage?: string;
 }
+export interface DurableRemoteCaptureWarning {
+  code: string;
+  message: string;
+}
+
+export interface DurableRemoteStagedCapture {
+  result: RemotePublicRunResult;
+  runtime: BrowserRuntimeMetadata;
+  modelSelection?: BrowserModelSelectionEvidence;
+  artifacts?: DurableRemoteArtifactRegistration[];
+  stagedAt: string;
+}
 
 export interface RemoteControllerRestartRecovery {
   previousControllerGeneration: string;
@@ -110,6 +126,7 @@ export interface RemoteTransactionRecord {
   runtimeJournaledAt?: string;
   modelSelection?: BrowserModelSelectionEvidence;
   artifacts?: DurableRemoteArtifactRegistration[];
+  stagedCapture?: DurableRemoteStagedCapture;
   error?: DurableRemoteAutomationError;
   settlementMode?: "finalize" | "abort";
   publicationAcknowledgedAt?: string;
@@ -352,6 +369,44 @@ export class RemoteTransactionStore {
     ).record;
   }
 
+  async stageCapture(params: {
+    transactionToken: string;
+    runId: string;
+    result: RemotePublicRunResult;
+    runtime: BrowserRuntimeMetadata;
+    modelSelection?: BrowserModelSelectionEvidence;
+    artifacts?: DurableRemoteArtifactRegistration[];
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "stage-capture",
+        runId: params.runId,
+        result: params.result,
+        runtime: params.runtime,
+        modelSelection: params.modelSelection,
+        artifacts: params.artifacts ?? [],
+      })
+    ).record;
+  }
+
+  async promoteStagedCapture(params: {
+    transactionToken: string;
+    result?: RemotePublicRunResult;
+    runtime?: BrowserRuntimeMetadata;
+    warning?: DurableRemoteCaptureWarning;
+    stripTargetAuthority?: boolean;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "promote-staged-capture",
+        result: params.result,
+        runtime: params.runtime,
+        warning: params.warning,
+        stripTargetAuthority: params.stripTargetAuthority ?? false,
+      })
+    ).record;
+  }
+
   async publishCapture(params: {
     transactionToken: string;
     runId: string;
@@ -368,6 +423,20 @@ export class RemoteTransactionStore {
         runtime: params.runtime,
         modelSelection: params.modelSelection,
         artifacts: params.artifacts ?? [],
+      })
+    ).record;
+  }
+
+  async invalidateStagedCapture(params: {
+    transactionToken: string;
+    runtime?: BrowserRuntimeMetadata;
+    error: DurableRemoteAutomationError;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "invalidate-staged-capture",
+        runtime: params.runtime,
+        error: params.error,
       })
     ).record;
   }
@@ -458,10 +527,12 @@ export class RemoteTransactionStore {
   }): Promise<ReconcileRemoteTransactionResult[]> {
     const results: ReconcileRemoteTransactionResult[] = [];
     for (const candidate of await this.list()) {
-      if (
-        candidate.state !== "running" ||
-        candidate.controllerGeneration === this.controllerGeneration
-      ) {
+      const requiresReconciliation =
+        candidate.state === "running" ||
+        (candidate.state === "recoverable-error" &&
+          Boolean(candidate.stagedCapture) &&
+          !candidate.settlementMode);
+      if (!requiresReconciliation || candidate.controllerGeneration === this.controllerGeneration) {
         continue;
       }
       const transition = await this.transition(candidate.transactionToken, {
@@ -753,6 +824,7 @@ function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: strin
   record.runtimeJournaledAt = undefined;
   record.modelSelection = undefined;
   record.artifacts = undefined;
+  record.stagedCapture = undefined;
   record.error = undefined;
   record.settlementMode = undefined;
   record.publicationAcknowledgedAt = undefined;
@@ -824,10 +896,12 @@ function validateRemoteTransactionRecord(
   }
   if (record.finalization) validatePendingFinalization(record.finalization);
   assertArtifactRegistrationsOwned(record, record.artifacts ?? []);
+  if (record.stagedCapture) validateStagedCapture(record);
 
   switch (record.state) {
     case "running":
       if (
+        (record.stagedCapture && !record.runtime) ||
         record.result ||
         record.artifacts ||
         record.error ||
@@ -840,7 +914,13 @@ function validateRemoteTransactionRecord(
       }
       return;
     case "pending":
-      if (!record.runtime || !record.result || record.error || record.restartRecovery) {
+      if (
+        !record.runtime ||
+        !record.result ||
+        record.stagedCapture ||
+        record.error ||
+        record.restartRecovery
+      ) {
         throw new Error("Pending remote transaction requires runtime and captured result only");
       }
       if (!record.settlementMode) {
@@ -887,6 +967,26 @@ function validateRemoteTransactionRecord(
       return;
   }
 }
+function validateStagedCapture(record: RemoteTransactionRecord): void {
+  const staged = record.stagedCapture;
+  if (!staged) return;
+  const epoch = staged.runtime?.promptEpoch;
+  if (
+    !Number.isFinite(Date.parse(staged.stagedAt)) ||
+    !staged.runtime ||
+    typeof staged.runtime !== "object" ||
+    Array.isArray(staged.runtime) ||
+    epoch?.status !== "committed" ||
+    !record.requestIdentity.acceptedPromptSha256.includes(epoch.promptSha256) ||
+    epoch.followUpOrdinal !== record.requestIdentity.followUpOrdinal ||
+    epoch.remainingFollowUps !== record.requestIdentity.remainingFollowUps ||
+    staged.runtime.conversationId !== epoch.conversationId
+  ) {
+    throw new Error("Staged remote capture lacks exact prompt and conversation identity");
+  }
+  RemotePublicRunResultSchema.parse(staged.result);
+  assertArtifactRegistrationsOwned(record, staged.artifacts ?? []);
+}
 
 function validatePendingFinalization(finalization: BrowserCaptureFinalizationResult): void {
   if (
@@ -920,6 +1020,7 @@ function validateTerminalRemoteTransactionRecord(record: RemoteTransactionRecord
     record.runtimeJournaledAt ||
     record.modelSelection ||
     record.artifacts ||
+    record.stagedCapture ||
     record.error ||
     record.settlementMode ||
     record.publicationAcknowledgedAt ||

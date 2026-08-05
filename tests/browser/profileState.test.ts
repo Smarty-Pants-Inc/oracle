@@ -13,11 +13,15 @@ import {
   readdir,
   rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
-import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
+import type {
+  ChromeProcessIdentity,
+  OracleChromeOwnerRecord,
+} from "../../src/browser/profileState.js";
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
 
@@ -77,6 +81,17 @@ async function writeNativeDevToolsFixture(userDataDir: string, port: number): Pr
   );
 }
 
+async function writeOracleChromeOwnerFixture(
+  userDataDir: string,
+  owner: OracleChromeOwnerRecord,
+): Promise<void> {
+  await writeFile(
+    path.join(userDataDir, "oracle-chrome-owner.json"),
+    `${JSON.stringify(owner)}\n`,
+    "utf8",
+  );
+}
+
 describe("profileState", () => {
   test("reads Chrome-native DevToolsActivePort without publishing Oracle-owned copies", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
@@ -111,14 +126,17 @@ describe("profileState", () => {
 
       // Alive pid => keep locks and the one atomic owner record.
       const aliveIdentity = await physicalChromeIdentity(dir, { pid: process.pid });
-      await profileState.writeOracleChromeOwner(dir, {
+      await writeOracleChromeOwnerFixture(dir, {
         port: 12345,
         processIdentity: aliveIdentity,
         disposition: "preserve",
       });
-      await profileState.cleanupStaleProfileState(dir, undefined, {
-        lockRemovalMode: "if_oracle_pid_dead",
-      });
+      await profileState.cleanupStaleProfileStateForTest(
+        dir,
+        undefined,
+        { lockRemovalMode: "if_oracle_pid_dead" },
+        { isChromeUsingUserDataDir: async () => false },
+      );
       expect(existsSync(path.join(dir, "DevToolsActivePort"))).toBe(true);
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(true);
@@ -132,7 +150,7 @@ describe("profileState", () => {
       await once(child, "exit");
       if (!child.pid) throw new Error("Exited child never published a pid");
       const deadIdentity = await physicalChromeIdentity(dir, { pid: child.pid });
-      await profileState.writeOracleChromeOwner(dir, {
+      await writeOracleChromeOwnerFixture(dir, {
         port: 12345,
         processIdentity: deadIdentity,
         disposition: "close-on-last-lease",
@@ -143,9 +161,12 @@ describe("profileState", () => {
         processIdentity: deadIdentity,
         disposition: "close-on-last-lease",
       });
-      await profileState.cleanupStaleProfileState(dir, undefined, {
-        lockRemovalMode: "if_oracle_pid_dead",
-      });
+      await profileState.cleanupStaleProfileStateForTest(
+        dir,
+        undefined,
+        { lockRemovalMode: "if_oracle_pid_dead" },
+        { isChromeUsingUserDataDir: async () => false },
+      );
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(false);
       }
@@ -433,8 +454,16 @@ describe("profileState", () => {
       expect(execFileAsync.mock.calls).toHaveLength(2);
       expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
       expect(execFileAsync.mock.calls[1]?.[0]).toBe(
-        process.platform === "win32" ? "powershell.exe" : "ps",
+        process.platform === "win32" ? "powershell.exe" : "/usr/bin/pgrep",
       );
+      if (process.platform !== "win32") {
+        expect(execFileAsync.mock.calls[1]?.[1]).toEqual([
+          "-i",
+          "-f",
+          "--",
+          expect.stringContaining(path.resolve(cleanupDir)),
+        ]);
+      }
       for (const [, , options] of execFileAsync.mock.calls) {
         expect(options).toMatchObject({ timeout: 12_000 });
       }
@@ -686,6 +715,106 @@ describe("profileState", () => {
     }
   });
 
+  test.runIf(process.platform !== "win32")(
+    "profile deletion stays bound to the attested isolation root after substitution",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-bound-delete-"));
+      const profileDir = path.join(root, "profile");
+      const movedRootPath = path.join(root, "moved-isolation-root");
+      await mkdir(path.join(profileDir, "nested"), { recursive: true });
+      await writeFile(path.join(profileDir, "nested", "owned-marker"), "delete");
+      try {
+        const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+        let isolatedRootPath: string | undefined;
+        await expect(
+          profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+            isChromeUsingUserDataDir: async () => false,
+            afterRemovalChildAttestation: async (rootPath) => {
+              isolatedRootPath = rootPath;
+              await rename(rootPath, movedRootPath);
+              await mkdir(rootPath);
+              await writeFile(path.join(rootPath, "replacement-marker"), "preserve");
+            },
+          }),
+        ).rejects.toThrow(/identity changed/i);
+        expect(isolatedRootPath).toBeDefined();
+        await expect(stat(path.join(movedRootPath, "generation"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(
+          readFile(path.join(isolatedRootPath ?? "", "replacement-marker"), "utf8"),
+        ).resolves.toBe("preserve");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("profile deletion replays a durable post-isolation cleanup after restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-replay-"));
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir);
+    await writeFile(path.join(profileDir, "owned-marker"), "delete");
+    try {
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+          afterRemovalChildAttestation: async () => {
+            throw new Error("simulated crash after isolation");
+          },
+        }),
+      ).rejects.toThrow("simulated crash after isolation");
+      expect((await readdir(root)).some((entry) => entry.endsWith(".cleanup-journal.json"))).toBe(
+        true,
+      );
+
+      await expect(profileState.replayPendingProfileDirectoryRemovals(profileDir)).resolves.toBe(
+        undefined,
+      );
+      expect(
+        (await readdir(root)).filter((entry) => entry.endsWith(".cleanup-journal.json")),
+      ).toEqual([]);
+      expect(existsSync(profileDir)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("profile deletion replay is a no-op when the parent directory is absent", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-missing-parent-"));
+    const profileDir = path.join(root, "missing", "profile");
+    try {
+      await expect(profileState.replayPendingProfileDirectoryRemovals(profileDir)).resolves.toBe(
+        undefined,
+      );
+      await expect(profileState.cleanupStaleProfileState(profileDir)).resolves.toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("unrelated pending cleanup journals do not block exact profile deletion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-unrelated-replay-"));
+    const profileDir = path.join(root, "profile");
+    const unrelatedJournal = path.join(root, ".oracle-remove-unrelated.cleanup-journal.json");
+    await mkdir(profileDir);
+    await writeFile(path.join(profileDir, "owned-marker"), "delete");
+    await writeFile(unrelatedJournal, "not-json");
+    try {
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+        }),
+      ).resolves.toBe(true);
+      expect(existsSync(profileDir)).toBe(false);
+      expect(existsSync(unrelatedJournal)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("profile persistence rejects a renamed and replaced directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-persist-retarget-"));
     const profileDir = path.join(root, "profile");
@@ -823,6 +952,75 @@ describe("profileState", () => {
       expect(lock).not.toBeNull();
       await lock?.release();
       expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("migrates the exact dead legacy profile lock file before directory publication", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-legacy-lock-"));
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    await once(child, "exit");
+    if (!child.pid) throw new Error("Missing child pid");
+    const lockPath = path.join(dir, "oracle-automation.lock");
+    const legacyRaw = `${JSON.stringify({
+      pid: child.pid,
+      lockId: "legacy-lock-generation",
+      createdAt: new Date().toISOString(),
+      sessionId: "legacy-session",
+    })}\n`;
+    try {
+      await writeFile(lockPath, legacyRaw, "utf8");
+      const lock = await profileState.acquireProfileRunLock(dir, {
+        timeoutMs: 500,
+        pollMs: 50,
+        sessionId: "replacement-session",
+      });
+      expect(lock).not.toBeNull();
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+      await lock?.release();
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an exact legacy profile lock while its pid is alive", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-legacy-live-"));
+    const lockPath = path.join(dir, "oracle-automation.lock");
+    const legacyRaw = `${JSON.stringify({
+      pid: process.pid,
+      lockId: "live-legacy-lock",
+      createdAt: new Date().toISOString(),
+      sessionId: "live-legacy-session",
+    })}\n`;
+    try {
+      await writeFile(lockPath, legacyRaw, "utf8");
+      await expect(
+        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
+      ).rejects.toThrow(/profile lock/i);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe(legacyRaw);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a legacy profile lock with unknown fields", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-legacy-schema-"));
+    const lockPath = path.join(dir, "oracle-automation.lock");
+    const raw = `${JSON.stringify({
+      pid: 61_061,
+      lockId: "unknown-schema-lock",
+      createdAt: new Date().toISOString(),
+      sessionId: "unknown-schema-session",
+      extraAuthority: true,
+    })}\n`;
+    try {
+      await writeFile(lockPath, raw, "utf8");
+      await expect(
+        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
+      ).rejects.toThrow(/profile lock/i);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe(raw);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

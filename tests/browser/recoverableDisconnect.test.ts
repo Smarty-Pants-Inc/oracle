@@ -33,6 +33,8 @@ type DisconnectFixtureOptions = {
   ownerPublicationFailsAfterCapture?: boolean;
   targetExitsDuringFinalArchive?: boolean;
   finalIdentityChangesAfterArchive?: boolean;
+  archiveNavigatesToNonConversationRoute?: boolean;
+  archiveNavigatesToDifferentConversation?: boolean;
 };
 
 type RemoteDisconnectFixtureOptions = {
@@ -40,6 +42,7 @@ type RemoteDisconnectFixtureOptions = {
   disconnectDuringFinalArchive?: boolean;
   runtimePersistenceFailsAfterCommit?: boolean;
   targetExitsDuringFinalArchive?: boolean;
+  archiveNavigatesToNonConversationRoute?: boolean;
 };
 
 async function captureUnhandledRejections<T>(
@@ -86,9 +89,14 @@ async function chromeProcessIdentity(
   };
 }
 
-function createClient(options: { onDisconnect?: (handler: () => void) => void }) {
+function createClient(options: {
+  onDisconnect?: (handler: () => void) => void;
+  currentUrl?: () => string;
+}) {
   const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
-    result: { value: expression === "location.href" ? conversationUrl : 0 },
+    result: {
+      value: expression === "location.href" ? (options.currentUrl?.() ?? conversationUrl) : 0,
+    },
   }));
 
   return {
@@ -126,12 +134,15 @@ async function withRemoteLateDisconnectFixture(
     unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
     committedTurnVerified: boolean;
+    postArchiveIdentityVerifications: number;
   }) => Promise<void> | void,
   options: RemoteDisconnectFixtureOptions = {},
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let providerObservedDispatchStart = false;
   let committedTurnVerified = false;
+  let currentUrl = conversationUrl;
+  let postArchiveIdentityVerifications = 0;
   let assistantResponseAvailable = false;
   const runtimePersistenceError = new Error("remote runtime persistence unavailable");
   const runtimeHints: BrowserRuntimeMetadata[] = [];
@@ -143,11 +154,12 @@ async function withRemoteLateDisconnectFixture(
     matchedUrl: options.targetExitsDuringFinalArchive ? undefined : conversationUrl,
   });
   const client = createClient({
+    currentUrl: () => currentUrl,
     onDisconnect: (handler) => {
       disconnectHandler = handler;
     },
   });
-  const recoveryClient = createClient({});
+  const recoveryClient = createClient({ currentUrl: () => currentUrl });
   const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
     client: recoveryClient,
     targetId,
@@ -155,7 +167,7 @@ async function withRemoteLateDisconnectFixture(
     close: vi.fn().mockResolvedValue(undefined),
   });
   const archiveChatGptConversation = vi.fn(async () => {
-    // The archive await is the last await before the completion atomicity check.
+    if (options.archiveNavigatesToNonConversationRoute) currentUrl = "https://chatgpt.com/";
     if (!options.disconnectDuringSubmission && options.disconnectDuringFinalArchive !== false) {
       disconnectHandler?.();
     }
@@ -163,6 +175,10 @@ async function withRemoteLateDisconnectFixture(
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
   const verifyCommittedPromptTurn = vi.fn(async () => {
+    if (currentUrl !== conversationUrl && !currentUrl.includes(`/c/${targetId}`)) {
+      postArchiveIdentityVerifications += 1;
+      throw new Error("committed turn unavailable after archive navigation");
+    }
     if (!providerObservedDispatchStart) {
       throw new Error("Committed-turn verification preceded provider dispatch");
     }
@@ -332,6 +348,7 @@ async function withRemoteLateDisconnectFixture(
       committedTurnVerified,
       runtimeHints,
       unhandledRejections,
+      postArchiveIdentityVerifications,
     });
   } finally {
     vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -369,6 +386,7 @@ async function withDisconnectFixture(
     providerObservedDispatchStart: boolean;
     providerDispatchCommitVerified: boolean;
     committedTurnVerified: boolean;
+    postArchiveIdentityVerifications: number;
   }) => Promise<void> | void,
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
@@ -379,15 +397,28 @@ async function withDisconnectFixture(
   let committedTurnVerified = false;
   let assistantResponseAvailable = false;
   let finalArchiveCompleted = false;
+  let currentUrl = conversationUrl;
+  let postArchiveIdentityVerifications = 0;
   const ownerPublicationError = new Error("local Chrome owner publication unavailable");
   const writeOracleChromeOwner = vi.fn();
   const archiveChatGptConversation = vi.fn(async () => {
+    if (options.archiveNavigatesToNonConversationRoute) currentUrl = "https://chatgpt.com/";
+    if (options.archiveNavigatesToDifferentConversation) {
+      currentUrl = "https://chatgpt.com/c/a-different-conversation";
+    }
     if (options.disconnectDuringFinalArchive) disconnectHandler?.();
     await Promise.resolve();
     finalArchiveCompleted = true;
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
   const verifyCommittedPromptTurn = vi.fn(async () => {
+    if (finalArchiveCompleted && currentUrl !== conversationUrl) {
+      postArchiveIdentityVerifications += 1;
+      if (options.archiveNavigatesToDifferentConversation) {
+        throw new Error("committed turn identity changed after archive navigation");
+      }
+      throw new Error("committed turn unavailable after archive navigation");
+    }
     if (options.finalIdentityChangesAfterArchive && finalArchiveCompleted) {
       throw new Error("committed turn identity changed after archive");
     }
@@ -442,11 +473,12 @@ async function withDisconnectFixture(
     };
   });
   const primaryClient = createClient({
+    currentUrl: () => currentUrl,
     onDisconnect: (handler) => {
       disconnectHandler = handler;
     },
   });
-  const recoveryClient = createClient({});
+  const recoveryClient = createClient({ currentUrl: () => currentUrl });
   const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
     client: recoveryClient,
     targetId,
@@ -487,13 +519,16 @@ async function withDisconnectFixture(
           endpointAuthority: {
             browserWSEndpoint: "ws://127.0.0.1:9230/devtools/browser/disconnect-fixture",
             kill,
+            runExactOperation: vi.fn(),
             release: vi.fn().mockResolvedValue(undefined),
           },
         };
       },
     ),
     registerTerminationHooks: vi.fn(() => vi.fn()),
-    connectWithNewTab: vi.fn().mockResolvedValue({ client: primaryClient, targetId }),
+    connectWithNewTabWithExactAuthority: vi
+      .fn()
+      .mockResolvedValue({ client: primaryClient, targetId }),
     connectToRemoteChromeTarget,
     closeChromeTarget,
     closeChromeTargetWithExactAuthority,
@@ -551,7 +586,12 @@ async function withDisconnectFixture(
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
     runProviderSubmissionFlow: vi.fn(() => {
       providerObservedDispatchStart = true;
-      if (options.disconnectDuringFinalArchive || options.finalIdentityChangesAfterArchive) {
+      if (
+        options.disconnectDuringFinalArchive ||
+        options.finalIdentityChangesAfterArchive ||
+        options.archiveNavigatesToNonConversationRoute ||
+        options.archiveNavigatesToDifferentConversation
+      ) {
         return Promise.resolve({
           status: "committed" as const,
           verification: {
@@ -621,7 +661,10 @@ async function withDisconnectFixture(
           headless: true,
           modelStrategy: "ignore",
           archiveConversations:
-            options.disconnectDuringFinalArchive || options.finalIdentityChangesAfterArchive
+            options.disconnectDuringFinalArchive ||
+            options.finalIdentityChangesAfterArchive ||
+            options.archiveNavigatesToNonConversationRoute ||
+            options.archiveNavigatesToDifferentConversation
               ? "always"
               : "never",
           ...(options.copiedProfile
@@ -666,6 +709,7 @@ async function withDisconnectFixture(
       providerObservedDispatchStart,
       providerDispatchCommitVerified,
       committedTurnVerified,
+      postArchiveIdentityVerifications,
     });
   } finally {
     if (profileDir) {
@@ -931,6 +975,34 @@ describe("recoverable disconnect lifecycle", () => {
     });
   }, 30_000);
 
+  test("publishes a preverified local answer when confirmed archive navigation leaves its conversation", async () => {
+    await withDisconnectFixture(
+      { archiveNavigatesToNonConversationRoute: true },
+      async (fixture) => {
+        expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+        expect(fixture.postArchiveIdentityVerifications).toBe(0);
+        expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          answerText: "completed answer",
+          archive: { archived: true },
+        });
+      },
+    );
+  }, 30_000);
+
+  test("rejects a different conversation after a confirmed archive navigation", async () => {
+    await withDisconnectFixture(
+      { archiveNavigatesToDifferentConversation: true },
+      async (fixture) => {
+        expect(fixture.postArchiveIdentityVerifications).toBe(1);
+        expect(fixture.error).toMatchObject({
+          message: "committed turn identity changed after archive navigation",
+        });
+        expect(fixture.error).not.toHaveProperty("answerText");
+      },
+    );
+  }, 30_000);
+
   test("does not publish an answer after final committed-turn identity is lost", async () => {
     await withDisconnectFixture({ finalIdentityChangesAfterArchive: true }, async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
@@ -1093,6 +1165,22 @@ describe("recoverable disconnect lifecycle", () => {
         expect(fixture.unhandledRejections).toEqual([]);
       },
       { disconnectDuringFinalArchive: false, runtimePersistenceFailsAfterCommit: true },
+    );
+  });
+
+  test("publishes a preverified remote answer when confirmed archive navigation leaves its conversation", async () => {
+    await withRemoteLateDisconnectFixture(
+      "created",
+      async (fixture) => {
+        expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+        expect(fixture.postArchiveIdentityVerifications).toBe(0);
+        expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          answerText: "completed answer",
+          archive: { archived: true },
+        });
+      },
+      { archiveNavigatesToNonConversationRoute: true, disconnectDuringFinalArchive: false },
     );
   });
 

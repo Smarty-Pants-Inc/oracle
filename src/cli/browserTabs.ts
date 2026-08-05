@@ -18,6 +18,7 @@ import {
   isRecoveredConversationHarvestReady,
   recoveredConversationHarvestMatchesPromptEpoch,
   recoverConversationTab,
+  type RecoveredConversation,
   type RecoveredConversationCleanup,
 } from "../browser/recoverConversation.js";
 import {
@@ -399,6 +400,7 @@ export async function harvestSessionBrowserOutput(
   }
   const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
+  const remoteRecoveryEndpoint = meta.browser?.config?.remoteChrome ? recordedEndpoint : null;
   const initialEndpoint = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
     port: DEFAULT_REMOTE_CHROME_PORT,
@@ -427,7 +429,9 @@ export async function harvestSessionBrowserOutput(
         ),
       );
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
-        ...(recordedEndpoint ? { existingEndpoint: recordedEndpoint } : {}),
+        ...(remoteRecoveryEndpoint
+          ? { existingEndpoint: { ...remoteRecoveryEndpoint, ownership: "non-owned" as const } }
+          : {}),
         persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
@@ -435,6 +439,7 @@ export async function harvestSessionBrowserOutput(
         host: recovered.host,
         port: recovered.port,
         ref: recovered.ref,
+        endpointAuthority: recovered.endpointAuthority,
         stallWindowMs: options.stallWindowMs,
       });
     }
@@ -472,6 +477,7 @@ export async function liveTailSessionBrowserOutput(
   }
   const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
+  const remoteRecoveryEndpoint = meta.browser?.config?.remoteChrome ? recordedEndpoint : null;
   let endpoint = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
     port: DEFAULT_REMOTE_CHROME_PORT,
@@ -479,6 +485,7 @@ export async function liveTailSessionBrowserOutput(
   let browserTabRef = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
   let recoveredCleanup: RecoveredConversationCleanup | null = null;
+  let recoveredEndpointAuthority: RecoveredConversation["endpointAuthority"];
   const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
   let lastHash: string | null = null;
   let unchangedSince = Date.now();
@@ -504,13 +511,16 @@ export async function liveTailSessionBrowserOutput(
         ),
       );
       const recovered = await recoverConversationTab(meta, (line) => console.log(line), {
-        ...(recordedEndpoint ? { existingEndpoint: recordedEndpoint } : {}),
+        ...(remoteRecoveryEndpoint
+          ? { existingEndpoint: { ...remoteRecoveryEndpoint, ownership: "non-owned" as const } }
+          : {}),
         waitForReady: false,
         persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
       endpoint = { host: recovered.host, port: recovered.port };
       browserTabRef = recovered.ref;
+      recoveredEndpointAuthority = recovered.endpointAuthority;
       requireRecoveredContent = true;
       recoveredContentDeadlineMs = Date.now() + stallThresholdMs;
     }
@@ -520,6 +530,7 @@ export async function liveTailSessionBrowserOutput(
         host: endpoint.host,
         port: endpoint.port,
         ref: browserTabRef,
+        endpointAuthority: recoveredEndpointAuthority,
       });
       assertHarvestMatchesPromptEpoch(harvested, promptLocator);
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";

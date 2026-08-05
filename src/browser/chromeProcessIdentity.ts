@@ -11,6 +11,10 @@ import {
   type ProfileDirectoryIdentity,
 } from "./profileDirectoryAuthority.js";
 import { readDevToolsPort } from "./profileDevToolsState.js";
+import {
+  createPlatformProcessGenerationProvider,
+  type ProcessGenerationCommandExecutor,
+} from "./platformProcessGeneration.js";
 
 export interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
@@ -30,7 +34,7 @@ const execFileAsync = promisify(execFile);
 // permit an unbounded subprocess to stall recovery.
 const PROCESS_IDENTITY_COMMAND_TIMEOUT_MS = 12_000;
 
-type ProcessCommandExecutor = (file: string, args: string[]) => Promise<{ stdout: string }>;
+type ProcessCommandExecutor = ProcessGenerationCommandExecutor;
 
 const executeProcessCommand: ProcessCommandExecutor = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, {
@@ -630,11 +634,11 @@ async function readChromeProcessSnapshot(
     }
 
     if (platform !== "darwin") return null;
-    const readDarwinProcessGeneration = async (): Promise<string | null> => {
-      const { stdout } = await execute("/usr/bin/lsappinfo", ["info", String(Math.trunc(pid))]);
-      return parseDarwinAuditPidVersion(stdout, pid);
-    };
-    const processStartTime = await readDarwinProcessGeneration();
+    const processGenerationProvider = createPlatformProcessGenerationProvider({
+      platform,
+      execute,
+    });
+    const processStartTime = await processGenerationProvider.readProcessGeneration(pid);
     const { stdout: executableFiles } = await execute("/usr/sbin/lsof", [
       "-nP",
       "-a",
@@ -661,7 +665,7 @@ async function readChromeProcessSnapshot(
       "command=",
     ]);
     const commandLine = commandOutput.trim();
-    const confirmedStartTime = await readDarwinProcessGeneration();
+    const confirmedStartTime = await processGenerationProvider.readProcessGeneration(pid);
     if (
       !processStartTime ||
       processStartTime !== confirmedStartTime ||
@@ -674,22 +678,6 @@ async function readChromeProcessSnapshot(
   } catch {
     return null;
   }
-}
-
-function parseDarwinAuditPidVersion(raw: string, expectedPid: number): string | null {
-  const processPid = raw.match(/\bpid\s*=\s*(\d+)\b/u)?.[1];
-  const auditToken = raw.match(
-    /\btoken=\[[^\]\r\n]*\bpid=(\d+)\b[^\]\r\n]*\bpV:(\d+)\b[^\]\r\n]*\]/u,
-  );
-  if (
-    processPid !== String(expectedPid) ||
-    auditToken?.[1] !== String(expectedPid) ||
-    !auditToken[2] ||
-    !/^\d+$/u.test(auditToken[2])
-  ) {
-    return null;
-  }
-  return `darwin-audit-pidversion:${auditToken[2]}`;
 }
 
 function parseLinuxBootId(raw: string): string | null {
@@ -870,12 +858,66 @@ export async function isChromeUsingUserDataDir(userDataDir: string): Promise<boo
     }
   }
 
+  const commands = await listPosixChromeProcessCommands(userDataDir);
+  return (
+    commands === null ||
+    commands.some((command) => isChromeCommandForUserDataDir(command, userDataDir))
+  );
+}
+
+const POSIX_PROCESS_QUERY_BATCH_SIZE = 64;
+
+// Narrow by the exact profile argument before hydrating commands. pgrep is only a candidate
+// filter; the tokenizer below remains the authority for executable and argument equality.
+
+async function listPosixChromeProcessCommands(
+  userDataDir: string,
+): Promise<readonly string[] | null> {
+  const searchPattern = buildPosixChromeProfileSearchPattern(userDataDir);
+  if (searchPattern === null) return null;
+  let pidOutput: string;
   try {
-    const { stdout } = await executeProcessCommand("ps", ["-ax", "-o", "command="]);
-    return stdout
-      .split("\n")
-      .some((command) => isChromeCommandForUserDataDir(command, userDataDir));
-  } catch {
-    return true;
+    ({ stdout: pidOutput } = await executeProcessCommand("/usr/bin/pgrep", [
+      "-i",
+      "-f",
+      "--",
+      searchPattern,
+    ]));
+  } catch (error) {
+    return readProcessCommandExitCode(error) === 1 ? [] : null;
   }
+
+  const pidLines = pidOutput.trim() ? pidOutput.trim().split(/\r?\n/u) : [];
+  if (pidLines.length === 0 || pidLines.some((line) => !/^[1-9]\d*$/u.test(line))) return null;
+  const pids = [...new Set(pidLines.map((line) => Number.parseInt(line, 10)))];
+  if (pids.some((pid) => !Number.isSafeInteger(pid))) return null;
+
+  const commands: string[] = [];
+  for (let offset = 0; offset < pids.length; offset += POSIX_PROCESS_QUERY_BATCH_SIZE) {
+    const batch = pids.slice(offset, offset + POSIX_PROCESS_QUERY_BATCH_SIZE);
+    try {
+      const { stdout } = await executeProcessCommand("/bin/ps", [
+        "-ww",
+        "-p",
+        batch.join(","),
+        "-o",
+        "command=",
+      ]);
+      commands.push(...stdout.split(/\r?\n/u).filter(Boolean));
+    } catch (error) {
+      if (readProcessCommandExitCode(error) !== 1) return null;
+    }
+  }
+  return commands;
+}
+
+function buildPosixChromeProfileSearchPattern(userDataDir: string): string | null {
+  const normalized = normalizeProfileArgument(userDataDir, process.platform);
+  if (normalized === null || /[\0\r\n]/u.test(normalized)) return null;
+  const escaped = normalized.replace(/[\\.^$|?*+()[\]{}]/gu, "\\$&");
+  return `--user-data-dir(=|[[:space:]]+)["']?${escaped}["']?([[:space:]]|$)`;
+}
+
+function readProcessCommandExitCode(error: unknown): unknown {
+  return error && typeof error === "object" && "code" in error ? error.code : undefined;
 }

@@ -298,8 +298,22 @@ describe("RemoteTransactionCoordinator", () => {
         }),
       ).resolves.toMatchObject({ record: { state: "finalized" } });
 
-      expect(retryCleanup).toHaveBeenNthCalledWith(1, runtime, "abort");
-      expect(retryCleanup).toHaveBeenNthCalledWith(2, runtime, "finalize");
+      expect(retryCleanup).toHaveBeenNthCalledWith(
+        1,
+        {
+          ...runtime,
+          recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+        },
+        "abort",
+      );
+      expect(retryCleanup).toHaveBeenNthCalledWith(
+        2,
+        {
+          ...runtime,
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        },
+        "finalize",
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

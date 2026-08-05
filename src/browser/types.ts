@@ -153,6 +153,11 @@ export interface BrowserRunOptions {
     hint: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
   ) => void | Promise<void>;
+  /** Persist an exact prompt-verified capture before archive or other destructive transitions. */
+  preArchiveCaptureCb?: (
+    result: BrowserRunResult,
+    runtime: BrowserRuntimeMetadata,
+  ) => void | Promise<void>;
 }
 
 export interface BrowserArchiveResult {

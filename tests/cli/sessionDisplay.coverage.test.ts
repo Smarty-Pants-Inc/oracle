@@ -218,9 +218,27 @@ describe("sessionDisplay helpers", () => {
     ).toContain("response=resp");
     expect(formatTransportMetadata({ reason: "client-timeout" })).toContain("client timeout");
     expect(formatTransportMetadata({ reason: "unknown" })).toContain("unknown transport failure");
-    expect(
-      formatUserErrorMetadata({ category: "input", message: "bad", details: { field: "prompt" } }),
-    ).toContain("details");
+    const unsupportedDetails = formatUserErrorMetadata({
+      category: "input",
+      message: "bad",
+      details: { x: 1 },
+    });
+    expect(unsupportedDetails).toBe("input | message=bad");
+
+    const recoveryEndpoint = "wss://recovery.internal.example/devtools/browser/secret";
+    const projectedDetails = formatUserErrorMetadata({
+      category: "input",
+      message: "bad",
+      details: {
+        stage: "input-validation",
+        code: "invalid-prompt",
+        runtime: { websocketEndpoint: recoveryEndpoint },
+      },
+    });
+    expect(projectedDetails).toContain('"stage":"input-validation"');
+    expect(projectedDetails).toContain('"code":"invalid-prompt"');
+    expect(projectedDetails).not.toContain("runtime");
+    expect(projectedDetails).not.toContain(recoveryEndpoint);
 
     const started = new Date(Date.now() - 1500).toISOString();
     const reattachMeta: SessionMetadata = {

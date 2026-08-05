@@ -12,9 +12,9 @@ import {
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import {
   launchChrome,
-  createChromePageTarget,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
+  connectToChromeTargetWithExactAuthority,
 } from "./chromeLifecycle.js";
 import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
@@ -73,8 +73,7 @@ export interface ReattachDeps {
   launchChrome?: typeof launchChrome;
   acquireBrowserTabLease?: typeof acquireBrowserTabLease;
   acquireManualChromeOwner?: typeof acquireManualChromeOwner;
-  createRecoveryTarget?: typeof createChromePageTarget;
-  connectRecoveryTarget?: typeof connectToRemoteChromeTarget;
+  connectRecoveryTargetWithExactAuthority?: typeof connectToChromeTargetWithExactAuthority;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,

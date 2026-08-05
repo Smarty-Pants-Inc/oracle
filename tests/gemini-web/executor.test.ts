@@ -9,13 +9,14 @@ import type {
 import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "../../src/browser/profileState.js";
 import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
+import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLifecycle.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 const {
   launchChrome,
-  connectWithNewTab,
-  closeTab,
+  connectWithNewTabWithExactAuthority,
+  closeChromeTargetWithExactAuthority,
   killChrome,
   resolveBrowserConfig,
   readDevToolsPort,
@@ -33,8 +34,8 @@ const {
   teardownState,
 } = vi.hoisted(() => ({
   launchChrome: vi.fn(),
-  connectWithNewTab: vi.fn(),
-  closeTab: vi.fn(async () => true),
+  connectWithNewTabWithExactAuthority: vi.fn(),
+  closeChromeTargetWithExactAuthority: vi.fn(async () => ({ status: "completed" as const })),
   killChrome: vi.fn<() => Promise<RecordedChromeTerminationOutcome>>(async () => ({
     status: "stopped" as const,
     pid: 12345,
@@ -114,8 +115,8 @@ const { getCookies } = vi.hoisted(() => ({
 vi.mock("@steipete/sweet-cookie", () => ({ getCookies }));
 vi.mock("../../src/browser/chromeLifecycle.js", () => ({
   launchChrome,
-  connectWithNewTab,
-  closeTab,
+  connectWithNewTabWithExactAuthority,
+  closeChromeTargetWithExactAuthority,
 }));
 vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
@@ -181,8 +182,8 @@ describe("gemini-web executor", () => {
     saveFirstGeminiImageFromOutput.mockClear();
     getCookies.mockClear();
     launchChrome.mockReset();
-    connectWithNewTab.mockReset();
-    closeTab.mockClear();
+    connectWithNewTabWithExactAuthority.mockReset();
+    closeChromeTargetWithExactAuthority.mockReset();
     resolveBrowserConfig.mockClear();
     readDevToolsPort.mockReset();
     writeOracleChromeOwner.mockClear();
@@ -261,11 +262,18 @@ describe("gemini-web executor", () => {
           disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
         };
         await writeOracleChromeOwner(profileDir, ownerRecord);
+        const endpointAuthority: RetainedChromeEndpointAuthority = {
+          browserWSEndpoint: `ws://127.0.0.1:${chrome.port}/devtools/browser/${ownerRecord.processIdentity.launchNonce}`,
+          kill: chrome.kill,
+          runExactOperation: vi.fn(),
+          release: vi.fn(async () => undefined),
+        };
         return {
-          chrome: { ...chrome, processIdentity: ownerRecord.processIdentity },
+          chrome: { ...chrome, processIdentity: ownerRecord.processIdentity, endpointAuthority },
           processIdentity: ownerRecord.processIdentity,
           source: "launched" as const,
           disposition: ownerRecord.disposition,
+          endpointAuthority,
         };
       },
     );
@@ -362,7 +370,7 @@ describe("gemini-web executor", () => {
       }
       return { result: { value: null } };
     });
-    connectWithNewTab.mockResolvedValue({
+    connectWithNewTabWithExactAuthority.mockResolvedValue({
       targetId: "target-1",
       client: {
         Runtime: {
@@ -380,6 +388,7 @@ describe("gemini-web executor", () => {
         close: vi.fn(async () => undefined),
       },
     });
+    closeChromeTargetWithExactAuthority.mockResolvedValue({ status: "completed" });
     readDevToolsPort.mockResolvedValue(null);
     verifyDevToolsReachable.mockResolvedValue({ ok: false, error: "unreachable" });
   });
@@ -507,9 +516,9 @@ describe("gemini-web executor", () => {
   it("settles the manual CDP session before executing the HTTP Gemini request", async () => {
     const events: string[] = [];
     const acquisitionSnapshots: BrowserRuntimeMetadata[] = [];
-    closeTab.mockImplementationOnce(async () => {
+    closeChromeTargetWithExactAuthority.mockImplementationOnce(async () => {
       events.push("close-target");
-      return true;
+      return { status: "completed" };
     });
     teardownSettle.mockImplementationOnce(async (teardown: () => Promise<boolean>) => {
       events.push("release-lease");
@@ -638,9 +647,9 @@ describe("gemini-web executor", () => {
 
   it("persists acquisition, pending dispatch, and exact commit before publishing capture", async () => {
     const events: string[] = [];
-    closeTab.mockImplementationOnce(async () => {
+    closeChromeTargetWithExactAuthority.mockImplementationOnce(async () => {
       events.push("close-target");
-      return true;
+      return { status: "completed" };
     });
     const runtimeHintCb = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
       const epoch = runtime.promptEpoch?.status ?? "acquired";
@@ -659,7 +668,14 @@ describe("gemini-web executor", () => {
     expect(result.answerText).toBe("deep-think answer");
     expect(getCookies).not.toHaveBeenCalled();
     expect(launchChrome).toHaveBeenCalled();
-    expect(connectWithNewTab).toHaveBeenCalled();
+    expect(connectWithNewTabWithExactAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/executor-test-owner",
+      }),
+      expect.any(Function),
+      expect.stringMatching(/^about:blank#oracle-acquisition=/),
+      { retries: 6 },
+    );
     expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
     expect(result.promptEpoch).toMatchObject({
       status: "committed",
@@ -675,7 +691,7 @@ describe("gemini-web executor", () => {
       conversationId: "target-1",
       promptEpoch: expect.objectContaining({ status: "committed" }),
     });
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
     expect(events.indexOf("persist:pending")).toBeGreaterThan(
       events.lastIndexOf("persist:acquired"),
@@ -703,7 +719,7 @@ describe("gemini-web executor", () => {
     expect(events.indexOf("close-target")).toBeGreaterThan(
       events.indexOf("persist:committed:finalize"),
     );
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(events.lastIndexOf("persist:committed")).toBeGreaterThan(events.indexOf("close-target"));
     expect(killChrome).toHaveBeenCalledTimes(1);
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
@@ -721,9 +737,9 @@ describe("gemini-web executor", () => {
       }
       return evaluateNormally(input);
     });
-    closeTab.mockImplementationOnce(async () => {
+    closeChromeTargetWithExactAuthority.mockImplementationOnce(async () => {
       events.push("close-target");
-      return true;
+      return { status: "completed" };
     });
     const exec = createGeminiWebExecutor({});
 
@@ -771,7 +787,7 @@ describe("gemini-web executor", () => {
     expect(events.indexOf("close-target")).toBeGreaterThan(
       events.indexOf("persist:committed:abort"),
     );
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
@@ -795,7 +811,7 @@ describe("gemini-web executor", () => {
     ).rejects.toThrow(
       "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
     );
-    expect(closeTab).toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalled();
   });
   it.each([
     { first: "finalize" as const, second: "finalize" as const },
@@ -823,7 +839,7 @@ describe("gemini-web executor", () => {
         },
       });
     }
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
   });
 
@@ -836,7 +852,7 @@ describe("gemini-web executor", () => {
       log: () => {},
     });
 
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     await expect(result.abort()).resolves.toMatchObject({ status: "completed" });
     await expect(result.finalize()).rejects.toMatchObject({
       details: {
@@ -845,7 +861,7 @@ describe("gemini-web executor", () => {
         boundMode: "abort",
       },
     });
-    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
@@ -916,14 +932,22 @@ describe("gemini-web executor", () => {
     });
 
     expect(settleManualChromeOwner).not.toHaveBeenCalled();
-    expect(closeTab).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
     expect(settleManualChromeOwner).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({ disposition: "preserve" }),
       expect.any(Function),
     );
-    expect(closeTab).toHaveBeenCalledWith(9222, "target-1", expect.any(Function), "127.0.0.1");
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authority: expect.objectContaining({
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/executor-test-owner",
+        }),
+        targetId: "target-1",
+        logger: expect.any(Function),
+      }),
+    );
     expect(killChrome).not.toHaveBeenCalled();
   });
 });

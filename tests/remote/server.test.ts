@@ -25,7 +25,7 @@ import type {
   BrowserRunTransaction,
 } from "../../src/browserMode.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
-import type { ReattachDeps } from "../../src/browser/reattach.js";
+import type { ReattachDeps, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
   buildRemotePromptRequestIdentity,
@@ -2086,6 +2086,153 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     15_000,
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "aborts cleanup-only committed epochs after restart without answer recapture",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-followup-cleanup-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "6".repeat(64);
+      const prompt = "partial turn must not resume";
+      const promptEpoch = {
+        ...committedPromptEpoch(prompt),
+        remainingFollowUps: 1,
+      };
+      const runtime: BrowserRunTransaction["runtime"] = {
+        browserTransport: "cdp",
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "partial-followup-target",
+        conversationId: "remote-conversation",
+        promptEpoch,
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "partial-followup-target",
+            conversationId: "remote-conversation",
+            promptEpoch,
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const stagedPromptEpoch = committedPromptEpoch(prompt);
+      const stagedRuntime: BrowserRunTransaction["runtime"] = {
+        ...runtime,
+        promptEpoch: stagedPromptEpoch,
+        recoveryCleanupResources: runtime.recoveryCleanupResources?.map((resource) => ({
+          ...resource,
+          promptEpoch: stagedPromptEpoch,
+        })),
+      };
+      const beforeCrash = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: "controller-before-partial-followup",
+      });
+      await beforeCrash.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "run-partial-followup",
+        createdAt: new Date().toISOString(),
+        requestIdentity: {
+          acceptedPromptSha256: [promptIdentitySha256(prompt)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+        browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+      });
+      await beforeCrash.stageCapture({
+        transactionToken,
+        runId: "run-partial-followup",
+        result: {
+          answerText: "partial answer must not publish",
+          answerMarkdown: "partial answer must not publish",
+          tookMs: 1,
+          answerTokens: 5,
+          answerChars: 31,
+        },
+        runtime: stagedRuntime,
+      });
+      await beforeCrash.journalRuntime(transactionToken, runtime);
+
+      const resumeBrowser = vi.fn();
+      const retryCleanup = vi.fn(
+        async (
+          cleanupRuntime: BrowserRunTransaction["runtime"],
+          _logger: unknown,
+          _deps: unknown,
+          mode?: "finalize" | "abort",
+        ) => {
+          expect(mode).toBe("abort");
+          expect(cleanupRuntime).toMatchObject({
+            promptEpoch,
+            recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+            recoveryCleanupResources: [
+              expect.objectContaining({ chromeTargetId: "partial-followup-target" }),
+            ],
+          });
+          return completedBrowserCaptureCleanup(cleanupRuntime);
+        },
+      );
+      const restarted = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: "controller-after-partial-followup",
+          resumeBrowser,
+          retryCleanup,
+        },
+      );
+      try {
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "terminal",
+            outcome: {
+              state: "aborted",
+              finalization: {
+                status: "completed",
+                runtime: { promptEpoch, cleanup: { status: "completed" } },
+              },
+            },
+          },
+        });
+        expect(retry.json).not.toHaveProperty("transaction.result");
+        expect(resumeBrowser).not.toHaveBeenCalled();
+        expect(retryCleanup).toHaveBeenCalledOnce();
+
+        const reloaded = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: "partial-followup-reader",
+        });
+        const settled = await reloaded.read(transactionToken);
+        expect(settled).toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+          finalization: { status: "completed" },
+        });
+        expect(settled).not.toHaveProperty("settlementMode");
+        expect(settled).not.toHaveProperty("runtime");
+        expect(settled).not.toHaveProperty("result");
+        expect(settled).not.toHaveProperty("stagedCapture");
+      } finally {
+        await restarted.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "durably journals each recovery acquisition hint under the current controller before continuing",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retry-runtime-hints-"));
@@ -3029,6 +3176,298 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const restarted = await createRemoteServer(options, { transactionStoreDir });
       await restarted.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "falls back to the staged exact capture when the initial publication write fails",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-publish-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "staged-publication-target",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch("remote test"),
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "staged-publication-target",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch("remote test"),
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const publishCapture = vi
+        .spyOn(RemoteTransactionStore.prototype, "publishCapture")
+        .mockRejectedValueOnce(new Error("simulated initial publication write failure"));
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            const result: BrowserRunResult = {
+              answerText: "staged exact answer",
+              answerMarkdown: "staged exact answer",
+              tookMs: 2,
+              answerTokens: 3,
+              answerChars: 19,
+            };
+            const transaction = browserTransaction(options.prompt, result, runtime);
+            await options.preArchiveCaptureCb?.(result, transaction.runtime);
+            return transaction;
+          },
+        },
+      );
+      try {
+        const response = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${"1".repeat(64)}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        expect(response.events).toContainEqual(
+          expect.objectContaining({
+            type: "transaction",
+            transaction: expect.objectContaining({
+              result: expect.objectContaining({
+                answerText: "staged exact answer",
+                warnings: expect.arrayContaining([
+                  expect.objectContaining({ code: "remote-publication-write-recovered" }),
+                ]),
+              }),
+            }),
+          }),
+        );
+        const record = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: "staged-publication-reader",
+        });
+        const published = await record.read("1".repeat(64));
+        expect(published).toMatchObject({
+          state: "pending",
+          result: { answerText: "staged exact answer" },
+        });
+        expect(published).not.toHaveProperty("stagedCapture");
+        expect(publishCapture).toHaveBeenCalledOnce();
+      } finally {
+        publishCapture.mockRestore();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "promotes the durable pre-archive capture after restart without browser recapture",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-restart-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "2".repeat(64);
+      const prompt = "restart after archive";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        browserTransport: "cdp",
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "lost-after-archive",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "lost-after-archive",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const beforeCrash = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: "controller-before-staged-crash",
+      });
+      await beforeCrash.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "run-staged-crash",
+        createdAt: new Date().toISOString(),
+        requestIdentity: {
+          acceptedPromptSha256: [promptIdentitySha256(prompt)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+        browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+      });
+      await beforeCrash.stageCapture({
+        transactionToken,
+        runId: "run-staged-crash",
+        result: {
+          answerText: "restart-safe staged answer",
+          answerMarkdown: "restart-safe staged answer",
+          tookMs: 3,
+          answerTokens: 4,
+          answerChars: 26,
+        },
+        runtime,
+      });
+      const resumeBrowser = vi.fn(async () => {
+        throw new Error("retry must not recapture a durable staged answer");
+      });
+      const restarted = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: "controller-after-staged-crash",
+          resumeBrowser,
+        },
+      );
+      try {
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "transaction",
+            transaction: {
+              result: {
+                answerText: "restart-safe staged answer",
+                warnings: [
+                  expect.objectContaining({ code: "remote-post-archive-target-unavailable" }),
+                ],
+              },
+            },
+          },
+        });
+        expect(resumeBrowser).not.toHaveBeenCalled();
+        const afterRetry = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: "staged-retry-reader",
+        });
+        const record = await afterRetry.read(transactionToken);
+        expect(record).toMatchObject({
+          state: "pending",
+          result: { answerText: "restart-safe staged answer" },
+          runtime: {
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+          },
+        });
+        expect(record).not.toHaveProperty("stagedCapture");
+        expect(JSON.stringify(record?.runtime)).not.toMatch(
+          /lost-after-archive|chromeTargetId|chromePort|chromeHost|recoveryCleanupResources/u,
+        );
+      } finally {
+        await restarted.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "invalidates and aborts a staged capture on positive post-archive identity mismatch",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-mismatch-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "3".repeat(64);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "mismatched-post-archive-target",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch("remote test"),
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "mismatched-post-archive-target",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch("remote test"),
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const retryCleanup = vi.fn<typeof retryBrowserRecoveryCleanup>(async (cleanupRuntime) => ({
+        status: "completed" as const,
+        runtime: cleanupRuntime,
+      }));
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          retryCleanup,
+          runBrowser: async (options) => {
+            const result: BrowserRunResult = {
+              answerText: "must never publish",
+              answerMarkdown: "must never publish",
+              tookMs: 1,
+              answerTokens: 3,
+              answerChars: 18,
+            };
+            const transaction = browserTransaction(options.prompt, result, runtime);
+            await options.preArchiveCaptureCb?.(result, transaction.runtime);
+            throw new BrowserAutomationError("Post-archive prompt identity changed", {
+              stage: "prompt-epoch",
+              code: "committed-prompt-identity-mismatch",
+            });
+          },
+        },
+      );
+      try {
+        const run = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        expect(run.events.some((event) => event.type === "transaction")).toBe(false);
+        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: { status: "terminal", outcome: { state: "aborted" } },
+        });
+        const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
+        const record = JSON.parse(await readFile(recordPath, "utf8"));
+        expect(record).toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+        });
+        expect(record).not.toHaveProperty("result");
+        expect(record).not.toHaveProperty("stagedCapture");
+        expect(record).not.toHaveProperty("runtime");
+        expect(record).not.toHaveProperty("requestIdentity");
+        expect(record).not.toHaveProperty("browserConfig");
+        expect(JSON.stringify(record)).not.toMatch(
+          /must never publish|mismatched-post-archive-target/u,
+        );
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     },
   );
 });

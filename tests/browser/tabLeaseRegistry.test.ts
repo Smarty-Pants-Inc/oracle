@@ -92,6 +92,93 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     }
   });
 
+  test("prunes a dead exact-base v1 lease and atomically rewrites the registry", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    const legacyLease = {
+      id: "base-v1-dead-lease",
+      pid: 76_543,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      await writeFile(registryPath, JSON.stringify({ version: 1, leases: [legacyLease] }), "utf8");
+
+      await expect(
+        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+          readProcessLiveness: () => "dead",
+        }),
+      ).resolves.toBe(false);
+
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 2/);
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"leases": \[\]/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves live and unknown exact-base leases as authoritative after migration", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    const legacyLease = {
+      id: "base-v1-live-lease",
+      pid: 76_544,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      await writeFile(registryPath, JSON.stringify({ version: 1, leases: [legacyLease] }), "utf8");
+
+      await expect(
+        acquireBrowserTabLease(
+          dir,
+          { maxConcurrentTabs: 1, timeoutMs: 100, pollMs: 25 },
+          {
+            pid: 76_545,
+            readProcessLiveness: () => "alive",
+            readProcessStartIdentity: async () => "new-process-generation",
+          },
+        ),
+      ).rejects.toThrow(/timed out waiting/i);
+      const migrated = JSON.parse(await readFile(registryPath, "utf8")) as {
+        version: number;
+        leases: Array<Record<string, unknown>>;
+      };
+      expect(migrated).toMatchObject({
+        version: 2,
+        leases: [expect.objectContaining(legacyLease)],
+      });
+      expect(migrated.leases[0]).not.toHaveProperty("processStartIdentity");
+
+      const teardown = vi.fn(async () => true);
+      await expect(
+        teardownBrowserResourcesIfNoActiveLeases(dir, teardown, {
+          readProcessLiveness: () => "unknown",
+        }),
+      ).resolves.toEqual({ status: "preserved", reason: "active-leases" });
+      expect(teardown).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("migrates a v1 current-generation lease through its release path", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    const registryPath = path.join(dir, "oracle-tab-leases.json");
+    try {
+      const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
+      const current = JSON.parse(await readFile(registryPath, "utf8")) as { leases: unknown[] };
+      await writeFile(registryPath, JSON.stringify({ version: 1, leases: current.leases }), "utf8");
+
+      await lease.release();
+
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 2/);
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"leases": \[\]/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("retains a live null-generation lease and prunes it only after its pid is dead", async () => {
     const dir = await makeTempDir("oracle-tab-leases-");
     const registryPath = path.join(dir, "oracle-tab-leases.json");
@@ -115,9 +202,10 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
           readProcessStartIdentity: async () => "replacement-generation",
         }),
       ).resolves.toBe(true);
-      await expect(readFile(registryPath, "utf8")).resolves.toContain(
-        '"processStartIdentity":null',
-      );
+      expect(JSON.parse(await readFile(registryPath, "utf8"))).toMatchObject({
+        version: 2,
+        leases: [{ processStartIdentity: null }],
+      });
 
       await expect(
         hasOtherActiveBrowserTabLeases(dir, "other-lease", {
@@ -125,9 +213,10 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
           readProcessStartIdentity: async () => "replacement-generation",
         }),
       ).resolves.toBe(true);
-      await expect(readFile(registryPath, "utf8")).resolves.toContain(
-        '"processStartIdentity":null',
-      );
+      expect(JSON.parse(await readFile(registryPath, "utf8"))).toMatchObject({
+        version: 2,
+        leases: [{ processStartIdentity: null }],
+      });
       await expect(
         hasOtherActiveBrowserTabLeases(dir, "other-lease", {
           readProcessLiveness: () => "dead",

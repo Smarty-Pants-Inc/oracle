@@ -24,6 +24,7 @@ vi.mock("../../src/browser/sessionRunner.ts", () => ({
 
 vi.mock("../../src/browser/reattach.ts", () => ({
   resumeBrowserSession: vi.fn(),
+  retryBrowserRecoveryCleanup: vi.fn(),
 }));
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 vi.mock("../../src/cli/durableAnswer.ts", async () => {
@@ -86,7 +87,7 @@ import {
 import { sendSessionNotification } from "../../src/cli/notifier.ts";
 import { getCliVersion } from "../../src/version.ts";
 import { deriveModelOutputPath } from "../../src/cli/sessionRunner.ts";
-import { resumeBrowserSession } from "../../src/browser/reattach.ts";
+import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
 
 const baseSessionMeta: SessionMetadata = {
@@ -127,8 +128,12 @@ function createReattachResult(
   answerMarkdown: string,
   runtime: BrowserRuntimeMetadata,
 ) {
+  const preSettlementCleanupResult = runtime.recoveryCleanupResult;
   const capturedRuntime = runtime.recoveryCleanupResources?.length
-    ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
+    ? {
+        ...runtime,
+        recoveryCleanupResult: preSettlementCleanupResult ?? { status: "pending" as const },
+      }
     : runtime;
   const finalizedRuntime = { ...capturedRuntime };
   delete finalizedRuntime.recoveryCleanupResources;
@@ -170,6 +175,52 @@ function createCleanupRuntime(
       status === "failed"
         ? { status, error: `cleanup failed for ${targetId}`, settlementMode: "abort" }
         : { status },
+  };
+}
+
+function createPendingChromeAcquisitionRuntime(): BrowserRuntimeMetadata {
+  const userDataDir = path.resolve("/tmp/oracle-pending-acquisition");
+  const generationId = "70000000-0000-4000-8000-000000000007";
+  return {
+    browserTransport: "cdp",
+    chromePid: 7_777,
+    chromeHost: "127.0.0.1",
+    chromeProfileRoot: userDataDir,
+    userDataDir,
+    controllerPid: 2_147_483_647,
+    recoveryCleanupResources: [
+      {
+        chromePid: 7_777,
+        chromeHost: "127.0.0.1",
+        chromeProfileRoot: userDataDir,
+        userDataDir,
+        profileDirectoryIdentity: {
+          version: 1,
+          platform: process.platform,
+          canonicalPath: userDataDir,
+          device: "1",
+          inode: "2",
+        },
+        acquisition: {
+          generationId,
+          pendingResource: "chrome-process",
+          processOwnerProvenance: "temporary-launch",
+          processLaunchClaim: {
+            version: 1,
+            generationId,
+            nonce: "80000000-0000-4000-8000-000000000008",
+          },
+          processOwnerDisposition: "close-on-last-lease",
+        },
+        recoveryCleanup: {
+          ownsTarget: false,
+          profileKind: "temporary",
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: false,
+        },
+      },
+    ],
+    recoveryCleanupResult: { status: "pending" },
   };
 }
 
@@ -219,6 +270,7 @@ beforeEach(() => {
   });
   vi.mocked(runMultiModelApiSession).mockReset();
   vi.mocked(resumeBrowserSession).mockReset();
+  vi.mocked(retryBrowserRecoveryCleanup).mockReset();
   vi.mocked(runBrowserSessionExecution).mockReset();
   vi.mocked(ensureSessionArtifacts).mockReset();
   vi.mocked(persistDurableBrowserAnswer).mockReset();
@@ -1332,6 +1384,109 @@ describe("performSessionRun", () => {
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("cleanup remains pending"));
   });
+
+  test("keeps a published browser run completed when final runtime persistence fails once", async () => {
+    const capturedRuntime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      chromeTargetId: "published-runtime-target",
+      tabUrl: "https://chatgpt.com/c/published-runtime",
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeTargetId: "published-runtime-target",
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const retryableRuntime: BrowserRuntimeMetadata = {
+      ...capturedRuntime,
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "target close remains retryable",
+        settlementMode: "finalize",
+      },
+    };
+    const finalize = vi.fn(async () => ({
+      status: "pending" as const,
+      runtime: retryableRuntime,
+      error: "target close remains retryable",
+    }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime: capturedRuntime,
+      answerText: "published answer",
+      finalize,
+      abort,
+    });
+    let failedFinalRuntimeWrite = false;
+    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+      if (
+        !failedFinalRuntimeWrite &&
+        patch.browser?.runtime?.recoveryCleanupResult?.settlementMode === "finalize"
+      ) {
+        failedFinalRuntimeWrite = true;
+        throw new Error("final runtime metadata fsync failed once");
+      }
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: { ...baseRunOptions, writeOutputPath: "/tmp/published-browser-output.md" },
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(failedFinalRuntimeWrite).toBe(true);
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls).toContainEqual([
+      baseSessionMeta.id,
+      expect.objectContaining({
+        status: "completed",
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({
+            path: "/tmp/durable-browser-answer.md",
+            sha256: "answer-sha256",
+          }),
+        ]),
+      }),
+    ]);
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+    ).toBe(false);
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      browser: { runtime: retryableRuntime },
+    });
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({ status: "completed" }),
+    );
+    expect(
+      sessionStoreMock.updateModelRun.mock.calls.some(([, , patch]) => patch.status === "error"),
+    ).toBe(false);
+    expect(fsPromises.writeFile).toHaveBeenCalledWith(
+      path.resolve("/tmp/published-browser-output.md"),
+      "published answer\n",
+      "utf8",
+    );
+    expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("recovered final cleanup authority persistence after retry"),
+    );
+  });
+
   test("aborts after terminal metadata publication fails and retains the answer receipt", async () => {
     const pendingRuntime: BrowserRuntimeMetadata = {
       chromePort: 9222,
@@ -1997,6 +2152,235 @@ describe("performSessionRun", () => {
     );
     expect(logLines).toContain("oracle session sess-1 --render");
     expect(logLines).toContain("Auto-reattach attempt 1");
+  });
+
+  test("reconciles exact epoch-less acquisition authority before restarting a stale browser session", async () => {
+    const pendingRuntime = createPendingChromeAcquisitionRuntime();
+    const retainedRuntime: BrowserRuntimeMetadata = {
+      ...pendingRuntime,
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "Chrome process launch discovery is temporarily unavailable",
+        settlementMode: "abort",
+      },
+    };
+    vi.mocked(retryBrowserRecoveryCleanup).mockResolvedValueOnce({
+      status: "pending",
+      runtime: retainedRuntime,
+      error: "Chrome process launch discovery is temporarily unavailable",
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          status: "running",
+          mode: "browser",
+          browser: { config: { chromePath: null }, runtime: pendingRuntime },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/acquisition cleanup remains pending/i);
+
+    expect(retryBrowserRecoveryCleanup).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join(os.tmpdir(), "oracle-test-session", "browser-recovery.lock"),
+      }),
+      "abort",
+    );
+    expect(runBrowserSessionExecution).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime: retainedRuntime },
+      error: {
+        category: "browser-automation",
+        details: { code: "browser-acquisition-cleanup-pending", runtime: retainedRuntime },
+      },
+    });
+  });
+
+  test("starts a replacement browser only after exact acquisition cleanup completes", async () => {
+    const pendingRuntime = createPendingChromeAcquisitionRuntime();
+    const recoveredRuntime: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+    };
+    const freshRuntime: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      ...committedDemoAuthority,
+    };
+    const finalize = vi.fn(async () => ({
+      status: "completed" as const,
+      runtime: freshRuntime,
+    }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: freshRuntime }));
+    vi.mocked(retryBrowserRecoveryCleanup).mockResolvedValueOnce({
+      status: "completed",
+      runtime: recoveredRuntime,
+    });
+    vi.mocked(runBrowserSessionExecution).mockResolvedValueOnce({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 100,
+      runtime: freshRuntime,
+      answerText: "replacement browser answer",
+      finalize,
+      abort,
+    });
+
+    await performSessionRun({
+      sessionMeta: {
+        ...baseSessionMeta,
+        status: "error",
+        mode: "browser",
+        browser: { config: { chromePath: null }, runtime: pendingRuntime },
+      },
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(retryBrowserRecoveryCleanup).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.any(Object),
+      "abort",
+    );
+    expect(vi.mocked(retryBrowserRecoveryCleanup).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runBrowserSessionExecution).mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
+    );
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "completed",
+      browser: { runtime: freshRuntime },
+    });
+  });
+
+  test("rejects PID-only acquisition state without starting recovery or a replacement browser", async () => {
+    const pendingRuntime = createPendingChromeAcquisitionRuntime();
+    const resource = pendingRuntime.recoveryCleanupResources?.[0];
+    if (!resource?.acquisition) throw new Error("Missing acquisition fixture");
+    const malformedRuntime: BrowserRuntimeMetadata = {
+      ...pendingRuntime,
+      recoveryCleanupResources: [
+        {
+          ...resource,
+          acquisition: { ...resource.acquisition, processLaunchClaim: undefined },
+        },
+      ],
+    };
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          status: "error",
+          mode: "browser",
+          browser: { config: { chromePath: null }, runtime: malformedRuntime },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/authority is incomplete or malformed/i);
+
+    expect(retryBrowserRecoveryCleanup).not.toHaveBeenCalled();
+    expect(runBrowserSessionExecution).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime: malformedRuntime },
+      error: {
+        category: "browser-automation",
+        details: { code: "browser-acquisition-authority-invalid", runtime: malformedRuntime },
+      },
+    });
+  });
+
+  test("rejects conflicting positive acquisition identities before cleanup admission", async () => {
+    const pendingRuntime = createPendingChromeAcquisitionRuntime();
+    const resource = pendingRuntime.recoveryCleanupResources?.[0];
+    const launchClaim = resource?.acquisition?.processLaunchClaim;
+    const profileDirectory = resource?.profileDirectoryIdentity;
+    if (!resource || !launchClaim || !profileDirectory) {
+      throw new Error("Missing exact acquisition fixture");
+    }
+    const normalizedUserDataDir =
+      process.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath;
+    const executablePath =
+      process.platform === "win32"
+        ? String.raw`c:\program files\google\chrome\application\chrome.exe`
+        : process.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome";
+    const resourceIdentity = {
+      pid: 7_777,
+      processStartTime: "resource-process-generation",
+      executablePath,
+      normalizedUserDataDir,
+      launchNonce: launchClaim.nonce,
+      launchClaim,
+      profileDirectory,
+    };
+    const conflictingClaim = {
+      ...launchClaim,
+      nonce: "90000000-0000-4000-8000-000000000009",
+    };
+    const mismatchedRuntime: BrowserRuntimeMetadata = {
+      ...pendingRuntime,
+      chromeProcessIdentity: {
+        ...resourceIdentity,
+        processStartTime: "conflicting-process-generation",
+        launchNonce: conflictingClaim.nonce,
+        launchClaim: conflictingClaim,
+      },
+      recoveryCleanupResources: [{ ...resource, chromeProcessIdentity: resourceIdentity }],
+    };
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          status: "error",
+          mode: "browser",
+          browser: { config: { chromePath: null }, runtime: mismatchedRuntime },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/authority is incomplete or malformed/i);
+
+    expect(retryBrowserRecoveryCleanup).not.toHaveBeenCalled();
+    expect(runBrowserSessionExecution).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime: mismatchedRuntime },
+      error: {
+        category: "browser-automation",
+        details: { code: "browser-acquisition-authority-invalid", runtime: mismatchedRuntime },
+      },
+    });
   });
 
   test("rejects epoch-less recovery authority", async () => {
@@ -2814,6 +3198,127 @@ describe("performSessionRun", () => {
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
     expect(reattach.abort).not.toHaveBeenCalled();
+  });
+
+  test("keeps auto-reattach completed when final runtime persistence fails once", async () => {
+    const initialRuntime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      tabUrl: "https://chatgpt.com/c/demo",
+      ...committedDemoAuthority,
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("assistant timed out", {
+        stage: "assistant-timeout",
+        runtime: initialRuntime,
+      }),
+    );
+    const capturedRuntime: BrowserRuntimeMetadata = {
+      ...initialRuntime,
+      chromeTargetId: "AUTO-PUBLISHED-TARGET",
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "AUTO-PUBLISHED-TARGET",
+          conversationId: "demo",
+          promptEpoch: committedDemoAuthority.promptEpoch,
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const retryableRuntime: BrowserRuntimeMetadata = {
+      ...capturedRuntime,
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "reattach cleanup remains retryable",
+        settlementMode: "finalize",
+      },
+    };
+    const finalize = vi.fn(async () => ({
+      status: "pending" as const,
+      runtime: retryableRuntime,
+      error: "reattach cleanup remains retryable",
+    }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    vi.mocked(resumeBrowserSession).mockResolvedValue({
+      answerText: "auto published text",
+      answerMarkdown: "auto published markdown",
+      runtime: capturedRuntime,
+      finalize,
+      abort,
+    });
+    let failedFinalRuntimeWrite = false;
+    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+      if (
+        !failedFinalRuntimeWrite &&
+        patch.browser?.runtime?.recoveryCleanupResult?.settlementMode === "finalize"
+      ) {
+        failedFinalRuntimeWrite = true;
+        throw new Error("auto final runtime metadata fsync failed once");
+      }
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: { ...baseRunOptions, writeOutputPath: "/tmp/auto-published-output.md" },
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 0,
+        autoReattachIntervalMs: 1,
+        autoReattachTimeoutMs: 1000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(failedFinalRuntimeWrite).toBe(true);
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls).toContainEqual([
+      baseSessionMeta.id,
+      expect.objectContaining({
+        status: "completed",
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({
+            path: "/tmp/durable-browser-answer.md",
+            sha256: "answer-sha256",
+          }),
+        ]),
+      }),
+    ]);
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+    ).toBe(false);
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      browser: { runtime: retryableRuntime },
+    });
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({ status: "completed" }),
+    );
+    expect(
+      sessionStoreMock.updateModelRun.mock.calls.some(([, , patch]) => patch.status === "error"),
+    ).toBe(false);
+    expect(fsPromises.writeFile).toHaveBeenCalledWith(
+      path.resolve("/tmp/auto-published-output.md"),
+      "auto published markdown\n",
+      "utf8",
+    );
+    expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("recovered final cleanup authority persistence after retry"),
+    );
   });
 
   test("retries auto-reattach with the newest error-carried remote runtime", async () => {
