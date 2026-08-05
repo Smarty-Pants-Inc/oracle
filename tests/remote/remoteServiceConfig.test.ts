@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertLoopbackRemoteBind,
   isLoopbackRemoteHostname,
   parsePlaintextRemoteEndpoint,
   resolveRemoteServiceConfig,
@@ -77,6 +78,43 @@ describe("resolveRemoteServiceConfig", () => {
     expect(resolved.sources.token).toBe("env");
   });
 
+  it("requires explicit legacy fallback and keeps its bearer distinct", () => {
+    const env = {
+      ORACLE_REMOTE_HOST: "127.0.0.4:9473",
+      ORACLE_REMOTE_TOKEN: "env-v3-key",
+      ORACLE_REMOTE_LEGACY_TOKEN: "env-legacy-bearer",
+      ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL: "1",
+    } as NodeJS.ProcessEnv;
+
+    const resolved = resolveRemoteServiceConfig({ userConfig: {}, env });
+
+    expect(resolved.legacyToken).toBe("env-legacy-bearer");
+    expect(resolved.allowLegacyTextProtocol).toBe(true);
+    expect(resolved.sources.legacyToken).toBe("env");
+    expect(resolved.sources.allowLegacyTextProtocol).toBe("env");
+    expect(() =>
+      resolveRemoteServiceConfig({
+        cliHost: "127.0.0.1:9473",
+        cliToken: "shared-credential",
+        cliLegacyToken: "shared-credential",
+        cliAllowLegacyTextProtocol: true,
+        env: {} as NodeJS.ProcessEnv,
+      }),
+    ).toThrow(/distinct from the v3 HMAC root key/i);
+  });
+
+  it("does not enable legacy fallback merely because a legacy token exists", () => {
+    const resolved = resolveRemoteServiceConfig({
+      userConfig: {
+        browser: { remoteLegacyToken: "legacy-bearer" },
+      },
+      env: {} as NodeJS.ProcessEnv,
+    });
+
+    expect(resolved.legacyToken).toBe("legacy-bearer");
+    expect(resolved.allowLegacyTextProtocol).toBe(false);
+  });
+
   it("refuses non-loopback plaintext endpoints with SSH-tunnel guidance", () => {
     expect(() => parsePlaintextRemoteEndpoint("bridge.example.com:9473")).toThrow(
       /loopback-only.*SSH tunnel.*verified TLS/i,
@@ -87,6 +125,10 @@ describe("resolveRemoteServiceConfig", () => {
         env: {} as NodeJS.ProcessEnv,
       }),
     ).toThrow(/Refused endpoint: 192\.0\.2\.10:9473/);
+
+    expect(() => assertLoopbackRemoteBind("0.0.0.0")).toThrow(
+      /loopback-only.*SSH tunnel.*Refused bind address/i,
+    );
   });
 
   it("accepts only literal loopback identities for plaintext", () => {

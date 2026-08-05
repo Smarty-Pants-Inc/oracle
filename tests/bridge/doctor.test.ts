@@ -20,6 +20,7 @@ vi.mock("../../src/browser/detect.js", () => ({
 }));
 
 import { runBridgeDoctor } from "../../src/cli/bridge/doctor.js";
+import { runBridgeClient } from "../../src/cli/bridge/client.js";
 
 describe("oracle bridge doctor", () => {
   let tempDir: string;
@@ -30,6 +31,8 @@ describe("oracle bridge doctor", () => {
     process.exitCode = undefined;
     delete process.env.ORACLE_REMOTE_HOST;
     delete process.env.ORACLE_REMOTE_TOKEN;
+    delete process.env.ORACLE_REMOTE_LEGACY_TOKEN;
+    delete process.env.ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL;
     delete process.env.ORACLE_ENGINE;
 
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-doctor-"));
@@ -60,6 +63,78 @@ describe("oracle bridge doctor", () => {
     expect(output).toMatch(/TCP connect:\s+ok/i);
     expect(output).toContain("Auth (/health):");
     expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it("accepts explicitly configured legacy-only remote compatibility", async () => {
+    await fs.writeFile(
+      path.join(tempDir, "config.json"),
+      JSON.stringify(
+        {
+          browser: {
+            remoteHost: "127.0.0.1:9473",
+            remoteLegacyToken: "legacy-bearer",
+            remoteAllowLegacyTextProtocol: true,
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg) => logs.push(String(msg)));
+
+    await runBridgeDoctor({ verbose: false });
+
+    const output = stripAnsi(logs.join("\n"));
+    expect(output).toMatch(/remoteLegacyToken:\s+set/i);
+    expect(output).toMatch(/legacy text fallback:\s+explicitly enabled/i);
+    expect(output).not.toMatch(/Problems:/i);
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it("writes explicit legacy-only client config without reusing the bearer as a modern key", async () => {
+    const configFile = path.join(tempDir, "legacy-client.json");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await runBridgeClient({
+      connect: "127.0.0.1:9473",
+      legacyToken: "legacy-bearer",
+      allowLegacyTextProtocol: true,
+      config: configFile,
+      test: false,
+    });
+
+    const config = JSON.parse(await fs.readFile(configFile, "utf8"));
+    expect(config.browser).toMatchObject({
+      remoteHost: "127.0.0.1:9473",
+      remoteToken: null,
+      remoteLegacyToken: "legacy-bearer",
+      remoteAllowLegacyTextProtocol: true,
+    });
+  });
+
+  it("refuses to reuse a modern connection token as the legacy bearer", async () => {
+    await expect(
+      runBridgeClient({
+        connect: "127.0.0.1:9473?token=shared-credential",
+        legacyToken: "shared-credential",
+        allowLegacyTextProtocol: true,
+        writeConfig: false,
+        test: false,
+      }),
+    ).rejects.toThrow(/distinct from the v3 HMAC root key/i);
+  });
+
+  it("rejects non-loopback bridge artifacts even when the health check is skipped", async () => {
+    await expect(
+      runBridgeClient({
+        connect: "oracle+tcp://bridge.example.test:9473?token=secret",
+        writeConfig: false,
+        test: false,
+      }),
+    ).rejects.toThrow(/loopback-only.*SSH tunnel/i);
   });
 
   it("fails when remote token is missing", async () => {

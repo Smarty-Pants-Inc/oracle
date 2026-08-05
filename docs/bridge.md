@@ -9,7 +9,7 @@ Oracle’s bridge workflow lets you keep an authenticated ChatGPT session on a W
 
 ## Generated artifact transfer
 
-Bridge runs now keep the Windows browser host and Linux client separated while still returning ChatGPT-generated files, such as ZIP, CSV, PDF, wheels, and source distributions, to a cloud-readable path. The host advertises artifact-transfer support from the token-protected `GET /health` response. The Linux client uses that capability signal in `oracle bridge client --test` and `oracle bridge doctor`; older hosts remain usable for text responses, but generated files require manual copy from the Windows browser until both sides are upgraded.
+Bridge runs keep the Windows browser host and Linux client separated while returning ChatGPT-generated files when both sides use transaction v3. The host advertises artifact-transfer support from its authenticated health response. Predecessor text-only hosts remain reachable only through explicit legacy opt-in and a scoped legacy bearer; generated files then require manual copy.
 
 The transfer protocol is pull-based and keeps secrets local to the host:
 
@@ -20,8 +20,8 @@ The transfer protocol is pull-based and keeps secrets local to the host:
 
 Operational notes:
 
-- Run the same patched Oracle version on both Windows host and Linux client before relying on automatic file transfer. Mixed versions remain backward compatible for text-only runs.
-- `oracle bridge doctor` reports `Artifact transfer: bridge v1` when the host supports the protocol, including the advertised maximum artifact size.
+- Run the same patched Oracle version on both Windows host and Linux client before relying on automatic file transfer. Mixed-version text compatibility is fail-closed unless the operator explicitly enables it with a separate predecessor bearer.
+- `oracle bridge doctor` reports the negotiated protocol and `Artifact transfer: bridge v1` when the host supports the protocol, including the advertised maximum artifact size.
 - The default bridge transfer size limit is 512 MiB. Larger files stay on the browser host and require manual copy.
 - Session inspection prints artifact path, size, SHA-256 prefix, validation status, and transfer status so agents can verify whether the returned path is local to the Linux client.
 
@@ -44,6 +44,7 @@ Useful flags:
 
 - Bind a different local port: `--bind 127.0.0.1:9474`
 - Use a specific token: `--token <value>`
+- Allow predecessor text-only clients with a separate bearer: `--legacy-token <different-value>`
 - Print the connection string (includes token): `--print`
 - Print only the token: `--print-token`
 - SSH port/custom args: `--ssh-extra-args "-p 2222"`
@@ -63,15 +64,33 @@ Then on the Linux host:
 oracle bridge client --connect ~/bridge-connection.json --write-config --test
 ```
 
-This writes:
-
-- `~/.oracle/config.json` → `browser.remoteHost` and `browser.remoteToken`
+This writes the loopback endpoint and modern v3 key to `browser.remoteHost` and `browser.remoteToken`. Bridge client rejects non-loopback connection artifacts even with `--no-test`.
 
 Now browser runs automatically route through the host:
 
 ```bash
 oracle --engine browser -p "hello" --file README.md
 ```
+
+### Explicit mixed-version text bridge
+
+There is no silent downgrade.
+
+- **New client → predecessor host:** provide a tokenless loopback endpoint plus a distinct legacy bearer and explicit opt-in. Connection tokens are never repurposed as bearer credentials:
+
+  ```bash
+  oracle bridge client \
+    --connect 127.0.0.1:9473 \
+    --legacy-token <predecessor-bearer> \
+    --allow-legacy-text-protocol \
+    --write-config --test
+  ```
+
+  To configure modern v3 plus fallback concurrently, use a normal connection artifact and pass a legacy token that differs from its modern connection token.
+
+- **Predecessor client → new host:** start the new host with `--legacy-token <different-predecessor-bearer>`, then configure the predecessor client with that bearer. Never give the predecessor client the modern `--token` value; modern HMAC root keys are not bearer credentials.
+
+Persistent compatibility uses `browser.remoteLegacyToken` plus `browser.remoteAllowLegacyTextProtocol: true`. Environment-only clients use `ORACLE_REMOTE_LEGACY_TOKEN` plus `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`. Legacy runs return text only and require manual artifact transfer.
 
 ## 2b) Linux desktop: local manual-login (no bridge)
 
@@ -117,7 +136,7 @@ Then start Claude Code with that config (or register it via `claude mcp add` dep
 Notes:
 
 - The snippet includes `ORACLE_ENGINE="browser"` so MCP consult calls use browser mode even if `OPENAI_API_KEY` is set.
-- By default the snippets leave `ORACLE_REMOTE_TOKEN` as `<YOUR_TOKEN>` to avoid printing secrets; rerun with `--print-token` if you explicitly want it included.
+- By default the snippets replace configured secrets with placeholders. `--print-token` includes the modern token and, when explicit compatibility is enabled, the distinct legacy token plus `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`.
 
 ### macOS local browser: Let Them Fight
 
@@ -150,13 +169,14 @@ oracle bridge doctor
 
 It checks:
 
-- Whether a remote host/token is configured
-- TCP reachability to the remote host
-- Remote auth via `GET /health` (token-protected)
+- Whether a loopback remote host and usable modern or explicitly enabled legacy credential are configured
+- TCP reachability to the loopback endpoint
+- Authenticated protocol negotiation via `GET /health`
 - If no remote is configured, it probes local Chrome + cookie DB detection and suggests `--browser-chrome-path` / `--browser-cookie-path`
 
 ## Security notes
 
 - Tokens are not printed by default.
 - The connection artifact and config file contain secrets; keep them private (Oracle writes them with restrictive permissions on Unix).
+- A legacy bearer must be distinct from the modern v3 HMAC root key; the modern key is never sent or accepted as bearer authentication.
 - Bridge does **not** extract/decrypt cookies from arbitrary profiles; the Windows machine keeps the authenticated session locally.

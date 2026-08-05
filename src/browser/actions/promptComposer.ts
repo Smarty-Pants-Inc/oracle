@@ -301,6 +301,7 @@ export async function submitPrompt(
         code: "prompt-too-large",
         promptLength,
         observedLength,
+        promptSubmissionRejected: true,
       },
     );
   }
@@ -865,6 +866,27 @@ function sendButtonTimeoutMs(
     : 45_000;
 }
 
+function hasExactAcceptedPromptTurn(
+  probe: CommitProbeState | undefined,
+  expectedPromptSha256: string,
+  baseline: number,
+): probe is CommitProbeState & {
+  turnsCount: number;
+  matchedUserTurnIndex: number;
+  matchedUserTurnText: string;
+} {
+  return (
+    typeof probe?.turnsCount === "number" &&
+    Number.isFinite(probe.turnsCount) &&
+    typeof probe.matchedUserTurnIndex === "number" &&
+    Number.isInteger(probe.matchedUserTurnIndex) &&
+    probe.matchedUserTurnIndex >= baseline &&
+    probe.turnsCount > probe.matchedUserTurnIndex &&
+    typeof probe.matchedUserTurnText === "string" &&
+    promptIdentitySha256(probe.matchedUserTurnText) === expectedPromptSha256
+  );
+}
+
 export async function verifyPromptCommitted(
   Runtime: ChromeClient["Runtime"],
   prompt: string,
@@ -943,6 +965,17 @@ export async function verifyPromptCommitted(
       const promptText = readUserPromptText(node);
       return promptText === null ? '' : normalizePromptIdentity(promptText);
     });
+    const promptTooLargePattern = /message (?:you submitted|is) (?:was )?too long|submit something shorter|maximum (?:message|context) length|reduce (?:the )?length of (?:your )?(?:message|prompt)/i;
+    const promptTooLargeVisible = [
+      '[role="alert"]',
+      '[role="status"]',
+      '[aria-live]',
+      '[data-testid*="toast"]',
+      '[data-testid*="banner"]',
+      '[data-testid*="error"]',
+    ].some((selector) => Array.from(document.querySelectorAll(selector)).some((node) => (
+      isVisible(node) && promptTooLargePattern.test(String(node.innerText ?? node.textContent ?? ''))
+    )));
     return {
       baseline,
       matchedUserTurnIndex,
@@ -956,6 +989,7 @@ export async function verifyPromptCommitted(
           document.querySelector('[data-testid*="assistant"]'),
       ),
       composerCleared,
+      promptTooLargeVisible,
       inConversation: Boolean(conversationId),
       conversationId,
       href,
@@ -967,39 +1001,36 @@ export async function verifyPromptCommitted(
   })()`;
 
   let lastProbe: CommitProbeState | undefined;
+  let acceptedTurnProbe: CommitProbeState | undefined;
+  let promptTooLargeRejectionObserved = false;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const info = result.value as CommitProbeState | undefined;
     if (info && typeof info === "object") {
       lastProbe = info;
     }
-    const turnsCount = info?.turnsCount;
-    const userTurnIndex = info?.matchedUserTurnIndex;
-    const matchedUserTurnText = info?.matchedUserTurnText;
+    if (info?.promptTooLargeVisible === true) {
+      promptTooLargeRejectionObserved = true;
+    }
     const conversationId = info?.conversationId?.trim();
-    if (
-      typeof turnsCount === "number" &&
-      Number.isFinite(turnsCount) &&
-      typeof userTurnIndex === "number" &&
-      Number.isInteger(userTurnIndex) &&
-      userTurnIndex >= baseline &&
-      turnsCount > userTurnIndex &&
-      typeof matchedUserTurnText === "string" &&
-      promptIdentitySha256(matchedUserTurnText) === expectedPromptSha256 &&
-      typeof info?.matchedUserTurnId === "string" &&
-      info.matchedUserTurnId.trim().length > 0 &&
-      typeof info?.matchedUserMessageId === "string" &&
-      info.matchedUserMessageId.trim().length > 0 &&
-      conversationId
-    ) {
-      return {
-        committedTurns: Math.floor(turnsCount),
-        verifiedUserTurnIndex: userTurnIndex,
-        promptSha256: expectedPromptSha256,
-        verifiedUserTurnId: info.matchedUserTurnId.trim(),
-        verifiedUserMessageId: info.matchedUserMessageId.trim(),
-        conversationId,
-      };
+    if (hasExactAcceptedPromptTurn(info, expectedPromptSha256, baseline)) {
+      acceptedTurnProbe = info;
+      if (
+        typeof info.matchedUserTurnId === "string" &&
+        info.matchedUserTurnId.trim().length > 0 &&
+        typeof info.matchedUserMessageId === "string" &&
+        info.matchedUserMessageId.trim().length > 0 &&
+        conversationId
+      ) {
+        return {
+          committedTurns: Math.floor(info.turnsCount),
+          verifiedUserTurnIndex: info.matchedUserTurnIndex,
+          promptSha256: expectedPromptSha256,
+          verifiedUserTurnId: info.matchedUserTurnId.trim(),
+          verifiedUserMessageId: info.matchedUserMessageId.trim(),
+          conversationId,
+        };
+      }
     }
     await delay(100);
   }
@@ -1007,22 +1038,38 @@ export async function verifyPromptCommitted(
     .then((res) => res?.result?.value as CommitProbeState | undefined)
     .catch(() => undefined);
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
+  if (hasExactAcceptedPromptTurn(probe, expectedPromptSha256, baseline)) {
+    acceptedTurnProbe = probe;
+  }
+  if (probe?.promptTooLargeVisible === true) {
+    promptTooLargeRejectionObserved = true;
+  }
   if (logger) {
     logger(
       `Prompt commit check failed; latest state: ${probe ? JSON.stringify(probe) : "unavailable"}`,
     );
     await logDomFailure(Runtime, logger, "prompt-commit");
   }
-  if (prompt.trim().length >= 50_000) {
+  if (acceptedTurnProbe) {
     throw new BrowserAutomationError(
-      "Prompt did not appear in conversation before timeout (likely too large).",
+      "Prompt appeared in a new user turn, but stable turn identity did not become available; refusing to resend.",
       {
         stage: "submit-prompt",
-        code: "prompt-too-large",
+        code: "prompt-commit-identity-unavailable",
         promptLength: prompt.trim().length,
         timeoutMs,
+        commitProbe: summarizeCommitProbe(acceptedTurnProbe),
       },
     );
+  }
+  if (prompt.trim().length >= 50_000 && promptTooLargeRejectionObserved) {
+    throw new BrowserAutomationError("ChatGPT rejected the prompt as too large.", {
+      stage: "submit-prompt",
+      code: "prompt-too-large",
+      promptLength: prompt.trim().length,
+      timeoutMs,
+      promptSubmissionRejected: true,
+    });
   }
   throw new BrowserAutomationError(
     "Prompt did not appear in conversation before timeout (send may have failed)",
@@ -1047,6 +1094,7 @@ interface CommitProbeState {
   assistantVisible?: boolean;
   composerCleared?: boolean;
   inConversation?: boolean;
+  promptTooLargeVisible?: boolean;
   conversationId?: string | null;
   turnsCount?: number;
   href?: string;
@@ -1069,6 +1117,7 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,
     composerCleared: probe.composerCleared,
+    promptTooLargeVisible: probe.promptTooLargeVisible,
     inConversation: probe.inConversation,
     editorLength: typeof probe.editorValue === "string" ? probe.editorValue.length : undefined,
     lastTurnLength: typeof probe.lastTurn === "string" ? probe.lastTurn.length : undefined,

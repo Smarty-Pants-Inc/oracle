@@ -298,7 +298,7 @@ export async function handleRemoteRunRequest(params: {
       throw new Error("Remote transaction lost its exact pre-archive staged capture");
     }
     const registrations = stagedCapture.artifacts ?? [];
-    const publicResult = stagedCapture.result;
+    const publicResult = projectRemotePublicResult(result);
     let record: RemoteTransactionRecord;
     try {
       record = await params.transactionStore.publishCapture({

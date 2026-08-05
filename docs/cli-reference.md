@@ -106,11 +106,15 @@ See [Browser Mode](browser-mode.md) for usage.
 
 ## Remote browser
 
-| Flag                          | Purpose                                      |
-| ----------------------------- | -------------------------------------------- |
-| `--remote-host <host:port>`   | Use a remote `oracle serve` host.            |
-| `--remote-token <secret>`     | Auth for the remote host.                    |
-| `--remote-chrome <host:port>` | Attach to an existing remote Chrome session. |
+| Flag                             | Purpose                                                                        |
+| -------------------------------- | ------------------------------------------------------------------------------ |
+| `--remote-host <host:port>`      | Use a loopback `oracle serve` endpoint, normally through an SSH tunnel.        |
+| `--remote-token <secret>`        | Modern transaction-v3 HMAC root key for the remote host.                       |
+| `--remote-legacy-token <secret>` | Distinct predecessor text-only bearer; inert without explicit opt-in.          |
+| `--allow-legacy-text-protocol`   | Explicitly permit predecessor text-only fallback; no artifacts or v3 recovery. |
+| `--remote-chrome <host:port>`    | Attach to an existing remote Chrome session.                                   |
+
+`oracle serve` and remote-service clients reject non-loopback plaintext endpoints. Use SSH tunneling between machines; verified TLS is not implemented. For predecessor clients, `oracle serve --legacy-token <distinct-secret>` exposes only the legacy health/text routes and never accepts the modern v3 key as a bearer.
 
 ## Approved ChatGPT conversation export
 

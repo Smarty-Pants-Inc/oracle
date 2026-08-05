@@ -11,6 +11,7 @@ import {
 } from "../../src/browser/constants.js";
 import { verifyCommittedPromptTurn } from "../../src/browser/actions/assistantResponse.js";
 import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
+import { runSubmissionWithRecoveryForTest } from "../../src/browser/promptSubmissionCoordinator.js";
 
 describe("promptComposer", () => {
   test("fails composer clearing when stale text remains", async () => {
@@ -162,9 +163,10 @@ describe("promptComposer", () => {
     await expect(verifyCommittedPromptTurn(runtime as never, locator)).resolves.toBeUndefined();
   });
 
-  test("does not commit an exact prompt turn without stable turn and message ids", async () => {
+  test("classifies an exact accepted long prompt without stable ids as identity-unavailable", async () => {
     vi.useFakeTimers();
     try {
+      const acceptedLongPrompt = "x".repeat(50_000);
       const runtime = {
         evaluate: vi.fn().mockResolvedValue({
           result: {
@@ -174,7 +176,7 @@ describe("promptComposer", () => {
               matchedUserTurnIndex: 0,
               matchedUserTurnId: null,
               matchedUserMessageId: null,
-              matchedUserTurnText: "hello",
+              matchedUserTurnText: acceptedLongPrompt,
               conversationId: "conversation-1",
             },
           },
@@ -182,15 +184,168 @@ describe("promptComposer", () => {
       };
       const pending = promptComposer.verifyPromptCommitted(
         runtime as never,
-        "hello",
+        acceptedLongPrompt,
         150,
         undefined,
         0,
       );
-      const assertion = expect(pending).rejects.toThrow(/prompt did not appear/i);
+      const assertion = pending.then(
+        () => {
+          throw new Error("expected verifyPromptCommitted to reject");
+        },
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(250);
+      const error = (await assertion) as { details?: Record<string, unknown> };
+      expect(error).toMatchObject({
+        details: {
+          stage: "submit-prompt",
+          code: "prompt-commit-identity-unavailable",
+          commitProbe: {
+            matchedUserTurnIndex: 0,
+            matchedUserTurnIdPresent: false,
+            matchedUserMessageIdPresent: false,
+            matchedUserTurnLength: acceptedLongPrompt.length,
+          },
+        },
+      });
+      expect(error.details?.code).not.toBe("prompt-too-large");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not send a fallback after an exact accepted long prompt lacks stable ids", async () => {
+    vi.useFakeTimers();
+    try {
+      const acceptedLongPrompt = "x".repeat(50_000);
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 1,
+              matchedUserTurnIndex: 0,
+              matchedUserTurnId: null,
+              matchedUserMessageId: null,
+              matchedUserTurnText: acceptedLongPrompt,
+              conversationId: "conversation-1",
+            },
+          },
+        }),
+      };
+      const submit = vi.fn(async () => {
+        await promptComposer.verifyPromptCommitted(
+          runtime as never,
+          acceptedLongPrompt,
+          150,
+          undefined,
+          0,
+        );
+        throw new Error("accepted prompt unexpectedly produced committed identity");
+      });
+      const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
+      const pending = runSubmissionWithRecoveryForTest({
+        prompt: acceptedLongPrompt,
+        attachments: [],
+        fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
+        submit,
+        reloadPromptComposer: vi.fn().mockResolvedValue(undefined),
+        prepareFallbackSubmission,
+        logger: Object.assign(vi.fn(), { verbose: false }),
+      });
+      const assertion = expect(pending).rejects.toMatchObject({
+        details: { code: "prompt-commit-identity-unavailable" },
+      });
 
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith(acceptedLongPrompt, []);
+      expect(prepareFallbackSubmission).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("uses the fallback after ChatGPT visibly rejects an oversized prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const oversizedPrompt = "x".repeat(50_000);
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 0,
+              turnsCount: 0,
+              matchedUserTurnIndex: null,
+              matchedUserTurnId: null,
+              matchedUserMessageId: null,
+              matchedUserTurnText: null,
+              hasNewTurn: false,
+              composerCleared: false,
+              promptTooLargeVisible: true,
+              conversationId: null,
+            },
+          },
+        }),
+      };
+      const fallbackResult = {
+        baselineTurns: 0,
+        baselineAssistantText: "",
+        promptLocator: {
+          epoch: {
+            status: "committed" as const,
+            epochId: "fallback-epoch",
+            promptSha256: "a".repeat(64),
+            baselineTurns: 0,
+            followUpOrdinal: 0,
+            remainingFollowUps: 0,
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "fallback-turn",
+            verifiedUserMessageId: "fallback-message",
+            conversationId: "fallback-conversation",
+          },
+          conversationId: "fallback-conversation",
+          promptSha256: "a".repeat(64),
+          verifiedUserTurnIndex: 0,
+          verifiedUserTurnId: "fallback-turn",
+          verifiedUserMessageId: "fallback-message",
+          conversationUrls: ["https://chatgpt.com/c/fallback-conversation"],
+        },
+      };
+      const submit = vi.fn(async (submittedPrompt: string) => {
+        if (submittedPrompt === oversizedPrompt) {
+          await promptComposer.verifyPromptCommitted(
+            runtime as never,
+            oversizedPrompt,
+            150,
+            undefined,
+            0,
+          );
+          throw new Error("oversized prompt unexpectedly committed");
+        }
+        return fallbackResult;
+      });
+      const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
+      const pending = runSubmissionWithRecoveryForTest({
+        prompt: oversizedPrompt,
+        attachments: [],
+        fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
+        submit,
+        reloadPromptComposer: vi.fn().mockResolvedValue(undefined),
+        prepareFallbackSubmission,
+        logger: Object.assign(vi.fn(), { verbose: false }),
+      });
+      const assertion = expect(pending).resolves.toBe(fallbackResult);
+
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(submit).toHaveBeenNthCalledWith(1, oversizedPrompt, []);
+      expect(submit).toHaveBeenNthCalledWith(2, "fallback prompt", []);
+      expect(prepareFallbackSubmission).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

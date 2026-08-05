@@ -18,6 +18,7 @@ import {
 } from "./filesystemLockModel.js";
 import {
   capturePhysicalDirectoryIdentity,
+  isRetryableWindowsLockMutationError,
   lockPathExists,
   readErrorCode,
   removePreparedLockDirectory,
@@ -29,6 +30,8 @@ const LOCK_MUTATION_REQUEST_PREFIX = "request-";
 const LOCK_MUTATION_PREPARATION_PREFIX = ".preparing-";
 const LOCK_MUTATION_TICKET_FILENAME = "ticket";
 const LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS = 1_000;
+
+const retainedFilesystemLockMutationRequestRemovals = new Set<Promise<void>>();
 
 export interface FilesystemLockMutationOptions {
   owner: FilesystemLockOwnerRecord;
@@ -322,12 +325,48 @@ async function removeFilesystemLockMutationRequestBeforeReturning(
       await removeFilesystemLockMutationRequest(state, options);
       return;
     } catch (error) {
-      if (!isRetryableFilesystemLockMutationCleanupError(error) || Date.now() >= deadline) {
-        throw error;
+      if (!isRetryableFilesystemLockMutationCleanupError(error, state)) throw error;
+      if (Date.now() >= deadline) {
+        if (!isFilesystemLockMutationRequestQueueVisible(state)) throw error;
+        retainFilesystemLockMutationRequestRemoval(state, options);
+        return;
       }
     }
     await delay(Math.min(options.pollMs, Math.max(1, deadline - Date.now())));
   }
+}
+
+function retainFilesystemLockMutationRequestRemoval(
+  state: FilesystemLockMutationRequestRemovalState,
+  options: FilesystemLockMutationOptions,
+): void {
+  const removal = retryRetainedFilesystemLockMutationRequestRemoval(state, options);
+  retainedFilesystemLockMutationRequestRemovals.add(removal);
+  void removal.finally(() => {
+    retainedFilesystemLockMutationRequestRemovals.delete(removal);
+  });
+}
+
+async function retryRetainedFilesystemLockMutationRequestRemoval(
+  state: FilesystemLockMutationRequestRemovalState,
+  options: FilesystemLockMutationOptions,
+): Promise<void> {
+  for (;;) {
+    try {
+      await removeFilesystemLockMutationRequest(state, options);
+      return;
+    } catch (error) {
+      if (!isRetryableFilesystemLockMutationCleanupError(error, state)) return;
+    }
+    await delayWithoutKeepingProcessAlive(options.pollMs);
+  }
+}
+
+function delayWithoutKeepingProcessAlive(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, Math.max(1, ms));
+  timer.unref();
+  return promise;
 }
 
 async function removeFilesystemLockMutationRequest(
@@ -383,16 +422,28 @@ async function removeFilesystemLockMutationRequest(
   state.isolatedRemovalRootPath = undefined;
 }
 
-function isRetryableFilesystemLockMutationCleanupError(error: unknown): boolean {
+function isRetryableFilesystemLockMutationCleanupError(
+  error: unknown,
+  state: FilesystemLockMutationRequestRemovalState,
+): boolean {
   const code = readErrorCode(error);
   return (
     code === "EINTR" ||
     code === "EAGAIN" ||
     code === "EBUSY" ||
+    code === "EEXIST" ||
     code === "EMFILE" ||
     code === "ENFILE" ||
-    code === "ENOTEMPTY"
+    code === "ENOTEMPTY" ||
+    (isFilesystemLockMutationRequestQueueVisible(state) &&
+      isRetryableWindowsLockMutationError(error))
   );
+}
+
+function isFilesystemLockMutationRequestQueueVisible(
+  state: FilesystemLockMutationRequestRemovalState,
+): boolean {
+  return state.quarantinedPath === undefined && state.isolatedRemovalRootPath === undefined;
 }
 
 // Mutation requests coordinate only live processes. They need atomic visibility and exact-owner

@@ -5,13 +5,7 @@ import {
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserRemoteRecoveryMetadata, BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { RemotePublicRuntime } from "./types.js";
-
-export function findRemoteRecoveryAuthority(
-  runtime: BrowserRuntimeMetadata,
-): BrowserRemoteRecoveryMetadata | undefined {
-  return runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
-    ?.remoteRecovery;
-}
+export { findRemoteRecoveryAuthority } from "../browser/reattachability.js";
 
 export function projectRemoteRecoveryRuntime(
   runtime: RemotePublicRuntime,

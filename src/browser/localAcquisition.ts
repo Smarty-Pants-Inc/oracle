@@ -326,7 +326,7 @@ export async function acquireLocalBrowserResources({
     }
     const cleanupErrors: unknown[] = [];
     if (manualLogin && acquiredChrome && tabLease) {
-      if (acquiredChrome.disposition === "close-on-last-lease") {
+      if (!effectiveKeepBrowser && acquiredChrome.disposition === "close-on-last-lease") {
         const ownerForCleanup = acquiredChrome;
         const teardown = retainBrowserTabLeaseTeardownAuthority(userDataDir, tabLease, {
           logger,
@@ -357,8 +357,16 @@ export async function acquireLocalBrowserResources({
         } catch (releaseError) {
           cleanupErrors.push(releaseError);
         }
-        const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
-        if (settlement.status === "unsafe") cleanupErrors.push(settlement.reason);
+        if (effectiveKeepBrowser && acquiredChrome.disposition === "close-on-last-lease") {
+          try {
+            await releaseManualChromeOwnerEndpointAuthority(acquiredChrome);
+          } catch (releaseError) {
+            cleanupErrors.push(releaseError);
+          }
+        } else {
+          const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
+          if (settlement.status === "unsafe") cleanupErrors.push(settlement.reason);
+        }
       }
     } else if (tabLease) {
       const handle = tabLease;

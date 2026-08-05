@@ -276,13 +276,9 @@ beforeEach(async () => {
   vi.mocked(runBrowserSessionExecution).mockReset();
   vi.mocked(ensureSessionArtifacts).mockReset();
   vi.mocked(persistDurableBrowserAnswer).mockReset();
-  vi.mocked(persistDurableBrowserAnswer).mockResolvedValue({
-    artifact: {
-      kind: "transcript",
-      path: "/tmp/durable-browser-answer.md",
-      sha256: "answer-sha256",
-      sizeBytes: 6,
-    },
+  vi.mocked(persistDurableBrowserAnswer).mockImplementation(async (_options, expectedReceipt) => {
+    if (!expectedReceipt) throw new Error("publication intent receipt missing");
+    return expectedReceipt;
   });
   vi.mocked(ensureSessionArtifacts).mockImplementation(
     async ({ existingArtifacts }) => existingArtifacts,
@@ -1281,8 +1277,8 @@ describe("performSessionRun", () => {
         { kind: "transcript", path: "/tmp/transcript.md" },
         expect.objectContaining({
           kind: "transcript",
-          path: "/tmp/durable-browser-answer.md",
-          sha256: "answer-sha256",
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
         }),
       ],
     });
@@ -1297,10 +1293,19 @@ describe("performSessionRun", () => {
     expect(cleanupUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
     expect(finalize).toHaveBeenCalledTimes(1);
     expect(abort).not.toHaveBeenCalled();
-    expect(vi.mocked(persistDurableBrowserAnswer)).toHaveBeenCalledWith({
-      sessionId: baseSessionMeta.id,
-      answer: "Answer",
-    });
+    expect(vi.mocked(persistDurableBrowserAnswer)).toHaveBeenCalledWith(
+      {
+        sessionId: baseSessionMeta.id,
+        answer: "Answer",
+      },
+      expect.objectContaining({
+        artifact: expect.objectContaining({
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          sizeBytes: Buffer.byteLength("Answer"),
+        }),
+      }),
+    );
     expect(vi.mocked(ensureSessionArtifacts)).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: baseSessionMeta.id,
@@ -1491,8 +1496,8 @@ describe("performSessionRun", () => {
         status: "completed",
         artifacts: expect.arrayContaining([
           expect.objectContaining({
-            path: "/tmp/durable-browser-answer.md",
-            sha256: "answer-sha256",
+            path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
           }),
         ]),
       }),
@@ -1606,8 +1611,8 @@ describe("performSessionRun", () => {
         status: "completed",
         artifacts: expect.arrayContaining([
           expect.objectContaining({
-            path: "/tmp/durable-browser-answer.md",
-            sha256: "answer-sha256",
+            path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
           }),
         ]),
       }),
@@ -3235,7 +3240,9 @@ describe("performSessionRun", () => {
       artifacts: [
         { kind: "transcript", path: "/tmp/transcript.md" },
         { kind: "deep-research-report", path: "/tmp/deep-research-report.md" },
-        expect.objectContaining({ path: "/tmp/durable-browser-answer.md" }),
+        expect.objectContaining({
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+        }),
       ],
       response: { status: "completed" },
       browser: expect.objectContaining({
@@ -3254,11 +3261,20 @@ describe("performSessionRun", () => {
       vi.mocked(sendSessionNotification).mock.invocationCallOrder.at(-1) ?? 0,
     );
     expect(reattach.finalize).toHaveBeenCalledOnce();
-    expect(vi.mocked(persistDurableBrowserAnswer)).toHaveBeenCalledWith({
-      sessionId: baseSessionMeta.id,
-      answer: "ok markdown",
-      logHeader: "[auto-reattach] captured assistant response on attempt 1",
-    });
+    expect(vi.mocked(persistDurableBrowserAnswer)).toHaveBeenCalledWith(
+      {
+        sessionId: baseSessionMeta.id,
+        answer: "ok markdown",
+        logHeader: "[auto-reattach] captured assistant response on attempt 1",
+      },
+      expect.objectContaining({
+        artifact: expect.objectContaining({
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          sizeBytes: Buffer.byteLength("ok markdown"),
+        }),
+      }),
+    );
     expect(
       vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.(),
     ).toBe(true);
@@ -3364,8 +3380,8 @@ describe("performSessionRun", () => {
         status: "completed",
         artifacts: expect.arrayContaining([
           expect.objectContaining({
-            path: "/tmp/durable-browser-answer.md",
-            sha256: "answer-sha256",
+            path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
           }),
         ]),
       }),

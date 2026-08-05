@@ -36,6 +36,37 @@ export interface PlatformProcessGenerationProviderDeps {
   readFile?: ProcessGenerationFileReader;
 }
 
+type DarwinProcessGenerationNamespace = "audit-pidversion" | "kernel-start" | "sample-launch";
+// A namespace switch is not evidence of PID reuse. Only an exact match or a mismatch within one
+// authenticated provider namespace is comparable.
+
+export function arePlatformProcessGenerationsDefinitelyDifferent(
+  persistedIdentity: string,
+  observedIdentity: string,
+): boolean {
+  if (persistedIdentity === observedIdentity) return false;
+  const persistedDarwinNamespace = readDarwinProcessGenerationNamespace(persistedIdentity);
+  const observedDarwinNamespace = readDarwinProcessGenerationNamespace(observedIdentity);
+  return (
+    persistedDarwinNamespace === null ||
+    observedDarwinNamespace === null ||
+    persistedDarwinNamespace === observedDarwinNamespace
+  );
+}
+
+function readDarwinProcessGenerationNamespace(
+  identity: string,
+): DarwinProcessGenerationNamespace | null {
+  if (/^darwin-audit-pidversion:\d+$/u.test(identity)) return "audit-pidversion";
+  if (/^darwin-kernel-start:\d+:\d{6}$/u.test(identity)) return "kernel-start";
+  if (
+    /^darwin-sample-launch:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3,9}[+-]\d{4}$/u.test(identity)
+  ) {
+    return "sample-launch";
+  }
+  return null;
+}
+
 const executeProcessGenerationCommand: ProcessGenerationCommandExecutor = async (
   file,
   args,

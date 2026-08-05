@@ -344,49 +344,67 @@ Key behavior:
 
 ### Remote Service Mode (`oracle serve`)
 
-Prefer to keep Chrome entirely on the remote Mac (no DevTools tunneling, no manual cookie shuffling)? Use the built-in service:
+Use the built-in service when Chrome should remain on a remote Mac. Oracle remote HTTP transport is plaintext and therefore **loopback-only**; cross-machine access must use an SSH tunnel.
 
-1. **Start the host**
+1. **Start the host on loopback**
 
    ```bash
-   oracle serve
+   oracle serve --host 127.0.0.1 --port 9473
    ```
 
-   Oracle picks a free port, launches Chrome, starts an HTTP/SSE API, and prints:
+   Oracle launches Chrome, starts the authenticated HTTP/SSE API, and prints its loopback address plus a generated modern v3 HMAC root key. Use `--port` or `--token` to override those values. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
 
+2. **Create the client-side SSH tunnel**
+
+   ```bash
+   ssh -N -L 9473:127.0.0.1:9473 user@remote-mac
    ```
-   Listening at 0.0.0.0:9473
-   Access token: c4e5f9...
-   ```
 
-   Use `--host`, `--port`, or `--token` to override the defaults if needed.
-   If the host Chrome profile is not signed into ChatGPT, the service opens chatgpt.com for login and exits—sign in, then restart `oracle serve`.
+   Keep that SSH process running. The local `127.0.0.1:9473` endpoint is now carried to the remote host's loopback service.
 
-2. **Run from your laptop**
+3. **Run from the client**
 
    ```bash
    oracle --engine browser \
-     --remote-host 192.168.64.2:9473 \
-     --remote-token c4e5f9... \
-   --prompt "Summarize the incident doc" \
-    --file docs/incidents/latest.md
+     --remote-host 127.0.0.1:9473 \
+     --remote-token <modern-v3-hmac-root-key> \
+     --prompt "Summarize the incident doc" \
+     --file docs/incidents/latest.md
    ```
 
-   - `--remote-host` points the CLI at the VM.
-   - `--remote-token` matches the token printed by `oracle serve` (set `ORACLE_REMOTE_TOKEN` to avoid repeating it).
-   - You can also set defaults in `~/.oracle/config.json` (`browser.remoteHost`, `browser.remoteToken`) so you don’t need the flags; env vars still override those when present.
-   - Cookies are **not** transferred from your laptop. The service requires the host Chrome profile to be signed in; if not, it opens chatgpt.com and exits so you can log in, then restart `oracle serve`.
-
-3. **What happens**
-   - The CLI assembles the composed prompt + file bundle locally, sends them to the VM, and streams log lines/answer text back through the same HTTP connection.
-   - The remote host runs Chrome locally, pulls ChatGPT cookies from its own Chrome profile, and reuses them across runs while the service is up. If cookies are missing, the service exits after opening chatgpt.com so you can sign in before restarting.
-   - Background/detached sessions (`--no-wait`) are disabled in remote mode so the CLI can keep streaming output.
-   - `oracle serve` logs the DevTools port of the manual-login Chrome (e.g., `Manual-login Chrome DevTools port: 54371`). Runs automatically attach to that logged-in Chrome; you can use the printed port/JSON URL for debugging if needed.
+   Store the same loopback host and modern key in `browser.remoteHost` / `browser.remoteToken`, or use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
 
 4. **Stop the host**
-   - `Ctrl+C` on the VM shuts down the HTTP server and Chrome. Restart `oracle serve` whenever you need a new session; omit `--token` to let it rotate automatically.
 
-This mode is ideal when you have a macOS VM (or spare Mac mini) logged into ChatGPT and you just want to run the CLI from another machine without ever copying profiles or keeping Chrome visible locally.
+   `Ctrl+C` shuts down the HTTP server and Chrome. Restarting without `--token` rotates the modern key.
+
+#### Migration from direct LAN endpoints
+
+Direct plaintext LAN access is no longer supported. Replace `oracle serve --host 0.0.0.0` and client VM/LAN addresses with a loopback bind plus SSH `-L` (or `oracle bridge host --ssh ...`). Both server binds and client endpoints reject non-loopback addresses. There is no TLS escape hatch in this release.
+
+#### Explicit mixed-version text compatibility
+
+Secure defaults never downgrade. A new client may contact a predecessor text-only host only with both a scoped legacy bearer and the explicit opt-in flag:
+
+```bash
+oracle --engine browser \
+  --remote-host 127.0.0.1:9473 \
+  --remote-legacy-token <predecessor-bearer> \
+  --allow-legacy-text-protocol \
+  --prompt "Text-only compatibility run"
+```
+
+Omit `--remote-token` when the predecessor host has no modern v3 key. The equivalent persistent settings are `browser.remoteLegacyToken` and `browser.remoteAllowLegacyTextProtocol`; the env equivalents are `ORACLE_REMOTE_LEGACY_TOKEN` and `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`.
+
+For an old client contacting a new host, start the new host with a **distinct** legacy bearer:
+
+```bash
+oracle serve --host 127.0.0.1 --port 9473 \
+  --token <modern-v3-hmac-root-key> \
+  --legacy-token <different-predecessor-bearer>
+```
+
+Configure the old client with only the predecessor bearer. The modern HMAC root key is never accepted as a bearer token. Legacy mode is text-only: generated files require manual transfer, and transaction-v3 generation-bound recovery is unavailable.
 
 ## Limitations / Follow-Up Plan
 

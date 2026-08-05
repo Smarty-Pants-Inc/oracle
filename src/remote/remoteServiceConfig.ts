@@ -8,9 +8,13 @@ export type RemoteServiceConfigSource = "cli" | "config.browser" | "env" | "unse
 export interface ResolvedRemoteServiceConfig {
   host?: string;
   token?: string;
+  legacyToken?: string;
+  allowLegacyTextProtocol: boolean;
   sources: {
     host: RemoteServiceConfigSource;
     token: RemoteServiceConfigSource;
+    legacyToken: RemoteServiceConfigSource;
+    allowLegacyTextProtocol: RemoteServiceConfigSource;
   };
 }
 
@@ -47,45 +51,96 @@ function normalizeString(value: unknown): string | undefined {
   return trimmed.length ? trimmed : undefined;
 }
 
+function normalizeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return undefined;
+  switch (value.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+      return false;
+    default:
+      return undefined;
+  }
+}
+
+function resolveSource(
+  cliValue: unknown,
+  configValue: unknown,
+  envValue: unknown,
+): RemoteServiceConfigSource {
+  if (cliValue !== undefined) return "cli";
+  if (configValue !== undefined) return "config.browser";
+  if (envValue !== undefined) return "env";
+  return "unset";
+}
+
 export function resolveRemoteServiceConfig({
   cliHost,
   cliToken,
+  cliLegacyToken,
+  cliAllowLegacyTextProtocol,
   userConfig,
   env = process.env,
 }: {
   cliHost?: string;
   cliToken?: string;
+  cliLegacyToken?: string;
+  cliAllowLegacyTextProtocol?: boolean;
   userConfig?: UserConfig;
   env?: NodeJS.ProcessEnv;
 }): ResolvedRemoteServiceConfig {
   const configBrowserHost = normalizeString(userConfig?.browser?.remoteHost);
   const configBrowserToken = normalizeString(userConfig?.browser?.remoteToken);
+  const configBrowserLegacyToken = normalizeString(userConfig?.browser?.remoteLegacyToken);
+  const configAllowLegacyTextProtocol = normalizeBoolean(
+    userConfig?.browser?.remoteAllowLegacyTextProtocol,
+  );
 
   const envHost = normalizeString(env.ORACLE_REMOTE_HOST);
   const envToken = normalizeString(env.ORACLE_REMOTE_TOKEN);
+  const envLegacyToken = normalizeString(env.ORACLE_REMOTE_LEGACY_TOKEN);
+  const envAllowLegacyTextProtocol = normalizeBoolean(env.ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL);
 
   const cliHostValue = normalizeString(cliHost);
   const cliTokenValue = normalizeString(cliToken);
+  const cliLegacyTokenValue = normalizeString(cliLegacyToken);
+  const cliAllowLegacyTextProtocolValue = normalizeBoolean(cliAllowLegacyTextProtocol);
 
   const host = cliHostValue ?? configBrowserHost ?? envHost;
   const token = cliTokenValue ?? configBrowserToken ?? envToken;
-
-  const hostSource: RemoteServiceConfigSource = cliHostValue
-    ? "cli"
-    : configBrowserHost
-      ? "config.browser"
-      : envHost
-        ? "env"
-        : "unset";
-
-  const tokenSource: RemoteServiceConfigSource = cliTokenValue
-    ? "cli"
-    : configBrowserToken
-      ? "config.browser"
-      : envToken
-        ? "env"
-        : "unset";
+  const legacyToken = cliLegacyTokenValue ?? configBrowserLegacyToken ?? envLegacyToken;
+  const allowLegacyTextProtocol =
+    cliAllowLegacyTextProtocolValue ??
+    configAllowLegacyTextProtocol ??
+    envAllowLegacyTextProtocol ??
+    false;
 
   if (host) parsePlaintextRemoteEndpoint(host);
-  return { host, token, sources: { host: hostSource, token: tokenSource } };
+  if (allowLegacyTextProtocol && token && legacyToken && token === legacyToken) {
+    throw new Error(
+      "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
+    );
+  }
+
+  return {
+    host,
+    token,
+    legacyToken,
+    allowLegacyTextProtocol,
+    sources: {
+      host: resolveSource(cliHostValue, configBrowserHost, envHost),
+      token: resolveSource(cliTokenValue, configBrowserToken, envToken),
+      legacyToken: resolveSource(cliLegacyTokenValue, configBrowserLegacyToken, envLegacyToken),
+      allowLegacyTextProtocol: resolveSource(
+        cliAllowLegacyTextProtocolValue,
+        configAllowLegacyTextProtocol,
+        envAllowLegacyTextProtocol,
+      ),
+    },
+  };
 }

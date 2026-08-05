@@ -10,6 +10,7 @@ import type {
   RecoveryCleanupPhaseResult,
 } from "./reattachCleanupTypes.js";
 import type { BrowserCaptureFinalizationResult } from "./types.js";
+import { findRemoteRecoveryAuthority } from "./reattachability.js";
 export async function finalizeRemoteRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
   deps: ReattachCleanupDeps,
@@ -83,9 +84,7 @@ export async function finalizeRemoteRecoveryCleanupGroup(
     );
   }
   if (result.status === "completed") return { pending: [], errors: [] };
-  const returnedAuthority = result.runtime.recoveryCleanupResources?.find(
-    (candidate) => candidate.remoteRecovery,
-  )?.remoteRecovery;
+  const returnedAuthority = findRemoteRecoveryAuthority(result.runtime);
   return pending(
     result.error || "Remote cleanup settlement remains pending.",
     returnedAuthority ?? authority,

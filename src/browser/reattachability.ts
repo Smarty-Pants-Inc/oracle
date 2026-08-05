@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { BrowserRemoteRecoveryMetadata } from "../sessionManager.js";
 import { extractStableConversationIdFromUrl, isStableConversationUrl } from "./conversationUrl.js";
 import {
   parseChromeProcessIdentity,
@@ -14,6 +15,13 @@ export type CommittedBrowserPromptEpoch = Extract<
   NonNullable<BrowserRuntimeMetadata["promptEpoch"]>,
   { status: "committed" }
 >;
+
+export function findRemoteRecoveryAuthority(
+  runtime: BrowserRuntimeMetadata,
+): BrowserRemoteRecoveryMetadata | undefined {
+  return runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
+    ?.remoteRecovery;
+}
 
 export interface CommittedPromptEpochLocator {
   epoch: CommittedBrowserPromptEpoch;

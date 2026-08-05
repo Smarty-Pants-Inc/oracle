@@ -1,0 +1,306 @@
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { resolveBrowserConfig } from "../../src/browser/config.js";
+import { createLocalBrowserRunState } from "../../src/browser/localRunState.js";
+import {
+  captureProfileDirectoryIdentity,
+  createChromeProcessLaunchClaim,
+  type ChromeOwnerDisposition,
+  type ChromeProcessIdentity,
+  type ProfileDirectoryIdentity,
+} from "../../src/browser/profileState.js";
+import type {
+  ChromeLaunchResult,
+  RetainedChromeEndpointAuthority,
+} from "../../src/browser/chromeLifecycle.js";
+import type { LocalBrowserAcquisition } from "../../src/browser/localAcquisition.js";
+import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
+import type * as ManualLoginProfileModule from "../../src/browser/manualLoginProfile.js";
+import type {
+  BrowserTabLease,
+  BrowserTabLeaseTeardownAuthority,
+} from "../../src/browser/tabLeaseRegistry.js";
+import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
+
+const logger = vi.fn<(message: string) => void>();
+
+function manualOwner(
+  profileDirectory: ProfileDirectoryIdentity,
+  disposition: ChromeOwnerDisposition,
+  pid = 54_321,
+  port = 45_678,
+): { owner: ManualChromeOwner; authority: RetainedChromeEndpointAuthority } {
+  const identity: ChromeProcessIdentity = {
+    pid,
+    processStartTime: "2026-08-05T00:00:00.000Z",
+    executablePath:
+      process.platform === "win32"
+        ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
+        : process.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome",
+    normalizedUserDataDir:
+      process.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
+    launchNonce: `mixed-owner-${pid}`,
+    profileDirectory,
+  };
+  const authority: RetainedChromeEndpointAuthority = {
+    browserWSEndpoint: `ws://127.0.0.1:${port}/devtools/browser/mixed-${identity.pid}`,
+    kill: vi.fn(async () => ({ status: "already-stopped" as const, pid: identity.pid })),
+    release: vi.fn(async () => undefined),
+  };
+  const chrome = {
+    pid,
+    port,
+    process: undefined,
+    processIdentity: identity,
+    endpointAuthority: authority,
+    kill: authority.kill,
+  } as unknown as ChromeLaunchResult;
+  return {
+    owner: {
+      chrome,
+      processIdentity: identity,
+      source: "recorded",
+      disposition,
+      endpointAuthority: authority,
+    },
+    authority,
+  };
+}
+
+function lastLeaseTeardownAuthority(lease: BrowserTabLease): BrowserTabLeaseTeardownAuthority {
+  let leaseReleased = false;
+  return {
+    get leaseReleased() {
+      return leaseReleased;
+    },
+    settle: async (teardown) => {
+      if (!leaseReleased) {
+        await lease.release();
+        leaseReleased = true;
+      }
+      return (await teardown())
+        ? { status: "completed", disposition: "teardown-completed" }
+        : { status: "preserved", reason: "teardown-unsafe" };
+    },
+  };
+}
+
+function manualOwnerSettlementMocks() {
+  const releaseManualChromeOwnerEndpointAuthority = vi.fn(async (owner: ManualChromeOwner) => {
+    await owner.endpointAuthority?.release();
+  });
+  const settleManualChromeOwner = vi.fn(async (_profileDir: string, owner: ManualChromeOwner) => {
+    if (owner.disposition === "preserve") {
+      await owner.endpointAuthority?.release();
+      return { status: "preserved" as const };
+    }
+    const outcome = await owner.endpointAuthority?.kill();
+    return outcome?.status === "already-stopped" || outcome?.status === "stopped"
+      ? { status: "terminated" as const }
+      : { status: "unsafe" as const, reason: "termination failed" };
+  });
+  return { releaseManualChromeOwnerEndpointAuthority, settleManualChromeOwner };
+}
+
+afterEach(() => {
+  vi.doUnmock("../../src/browser/manualChromeOwner.js");
+  vi.doUnmock("../../src/browser/manualLoginProfile.js");
+  vi.doUnmock("../../src/browser/tabLeaseRegistry.js");
+  vi.resetModules();
+  logger.mockClear();
+});
+
+describe("local manual Chrome owner settlement", () => {
+  test.each([
+    {
+      name: "current preserve with recorded close-on-last-lease",
+      keepBrowser: true,
+      ownerDisposition: "close-on-last-lease",
+      expectedDirectRelease: 1,
+      expectedOwnerSettlement: 0,
+      expectedEndpointRelease: 1,
+      expectedEndpointKill: 0,
+    },
+    {
+      name: "current close with recorded close-on-last-lease",
+      keepBrowser: false,
+      ownerDisposition: "close-on-last-lease",
+      expectedDirectRelease: 0,
+      expectedOwnerSettlement: 1,
+      expectedEndpointRelease: 0,
+      expectedEndpointKill: 1,
+    },
+    {
+      name: "current preserve with recorded preserve",
+      keepBrowser: true,
+      ownerDisposition: "preserve",
+      expectedDirectRelease: 0,
+      expectedOwnerSettlement: 1,
+      expectedEndpointRelease: 1,
+      expectedEndpointKill: 0,
+    },
+    {
+      name: "current close with recorded preserve",
+      keepBrowser: false,
+      ownerDisposition: "preserve",
+      expectedDirectRelease: 0,
+      expectedOwnerSettlement: 1,
+      expectedEndpointRelease: 1,
+      expectedEndpointKill: 0,
+    },
+  ] as const)("settles $name without leaking or closing the wrong owner", async (scenario) => {
+    vi.resetModules();
+    const ownerMocks = manualOwnerSettlementMocks();
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ownerMocks);
+    // The subject must load after the manual-owner settlement mocks are installed.
+    const { createLocalRunSettlementCoordinator } =
+      await import("../../src/browser/localRunSettlement.js");
+
+    const profileDirectory: ProfileDirectoryIdentity = {
+      version: 1,
+      platform: process.platform,
+      canonicalPath: path.join(os.tmpdir(), "oracle-mixed-owner-settlement"),
+      device: "1",
+      inode: "2",
+    };
+    const { owner, authority } = manualOwner(profileDirectory, scenario.ownerDisposition);
+    const releaseLease = vi.fn(async () => undefined);
+    const lease: BrowserTabLease = {
+      id: "mixed-owner-lease",
+      profileDirectory,
+      release: releaseLease,
+      update: vi.fn(async () => undefined),
+    };
+    const state = createLocalBrowserRunState(lease);
+    state.ownsTarget = false;
+    state.runStatus = "complete";
+    const config = resolveBrowserConfig({
+      manualLogin: true,
+      manualLoginProfileDir: profileDirectory.canonicalPath,
+      keepBrowser: scenario.keepBrowser,
+    });
+    const acquisition: LocalBrowserAcquisition = {
+      config,
+      manualLogin: true,
+      profileIsPreSigned: true,
+      userDataDir: profileDirectory.canonicalPath,
+      effectiveKeepBrowser: scenario.keepBrowser,
+      acquisitionGenerationId: "10000000-0000-4000-8000-000000000001",
+      acquisitionLaunchClaim: createChromeProcessLaunchClaim(
+        "10000000-0000-4000-8000-000000000001",
+      ),
+      acquisitionOwnerDisposition: scenario.keepBrowser ? "preserve" : "close-on-last-lease",
+      acquisitionTargetMarkerUrl: "about:blank#oracle-acquisition=mixed-owner",
+      acquisitionProfileIdentity: profileDirectory,
+      chromeOwner: owner,
+      chrome: owner.chrome,
+      chromeOwnerDisposition: scenario.ownerDisposition,
+      chromeHost: "127.0.0.1",
+      settlementEndpointAuthority: authority,
+      tabLease: lease,
+      manualLeaseTeardownAuthority: lastLeaseTeardownAuthority(lease),
+    };
+
+    const coordinator = createLocalRunSettlementCoordinator({
+      acquisition,
+      state,
+      options: { prompt: "test" },
+      logger,
+      usingCopiedProfile: false,
+      timing: { startedAt: Date.now() },
+    });
+
+    await expect(coordinator.lifecycle.settleIfUnpublished()).resolves.toMatchObject({
+      status: "completed",
+    });
+    expect(releaseLease).toHaveBeenCalledOnce();
+    expect(state.tabLease).toBeNull();
+    expect(ownerMocks.releaseManualChromeOwnerEndpointAuthority).toHaveBeenCalledTimes(
+      scenario.expectedDirectRelease,
+    );
+    expect(ownerMocks.settleManualChromeOwner).toHaveBeenCalledTimes(
+      scenario.expectedOwnerSettlement,
+    );
+    expect(authority.release).toHaveBeenCalledTimes(scenario.expectedEndpointRelease);
+    expect(authority.kill).toHaveBeenCalledTimes(scenario.expectedEndpointKill);
+  });
+
+  test("preserves a current keep-browser owner when acquisition settlement fails after reuse", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-mixed-owner-acquisition-"));
+    try {
+      vi.resetModules();
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const { owner, authority } = manualOwner(profileDirectory, "close-on-last-lease");
+      const releaseLease = vi.fn(async () => undefined);
+      const lease: BrowserTabLease = {
+        id: "mixed-owner-lease",
+        profileDirectory,
+        release: releaseLease,
+        update: vi.fn(async () => undefined),
+      };
+      const retainTeardownAuthority = vi.fn(() => lastLeaseTeardownAuthority(lease));
+      const ownerMocks = manualOwnerSettlementMocks();
+      const acquisitionFailure = new Error("target authority journal failed");
+      let rejectedTargetJournal = false;
+
+      vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+        acquireManualChromeOwner: vi.fn(async () => owner),
+        ...ownerMocks,
+      }));
+      vi.doMock("../../src/browser/manualLoginProfile.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof ManualLoginProfileModule>()),
+        assertManualLoginProfileReadyForRun: vi.fn(async () => undefined),
+      }));
+      vi.doMock("../../src/browser/tabLeaseRegistry.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof TabLeaseRegistryModule>()),
+        acquireBrowserTabLease: vi.fn(async () => lease),
+        retainBrowserTabLeaseTeardownAuthority: retainTeardownAuthority,
+      }));
+      // The subject must load after acquisition collaborators are mocked.
+      const { acquireLocalBrowserResources } =
+        await import("../../src/browser/localAcquisition.js");
+      const config = resolveBrowserConfig({
+        manualLogin: true,
+        manualLoginProfileDir: profileDir,
+        keepBrowser: true,
+      });
+
+      await expect(
+        acquireLocalBrowserResources({
+          options: {
+            prompt: "test",
+            runtimeHintCb: async (runtime) => {
+              const resource = runtime.recoveryCleanupResources?.[0];
+              if (
+                resource?.acquisition?.pendingResource === "chrome-target" &&
+                !runtime.recoveryCleanupResult?.settlementMode &&
+                !rejectedTargetJournal
+              ) {
+                rejectedTargetJournal = true;
+                throw acquisitionFailure;
+              }
+            },
+          },
+          config,
+          logger,
+          usingCopiedProfile: false,
+        }),
+      ).rejects.toBe(acquisitionFailure);
+
+      expect(releaseLease).toHaveBeenCalledOnce();
+      expect(retainTeardownAuthority).not.toHaveBeenCalled();
+      expect(ownerMocks.releaseManualChromeOwnerEndpointAuthority).toHaveBeenCalledOnce();
+      expect(ownerMocks.settleManualChromeOwner).not.toHaveBeenCalled();
+      expect(authority.release).toHaveBeenCalledOnce();
+      expect(authority.kill).not.toHaveBeenCalled();
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+});

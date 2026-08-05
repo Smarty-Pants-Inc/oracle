@@ -1,10 +1,8 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserLogger } from "./types.js";
-import {
-  BrowserCaptureSettlementController,
-  markBrowserCaptureCleanupPending,
-} from "./runLifecycle.js";
+import { markBrowserCaptureCleanupPending } from "./runLifecycle.js";
+import { OwnedBrowserResourceTransaction } from "./ownedBrowserResources.js";
 import {
   defaultRecoveryLockPath,
   finalizeRecoveredRuntime,
@@ -40,7 +38,7 @@ export function createReattachSettlement(
   const persistSettlementResult = async (resultRuntime: BrowserRuntimeMetadata): Promise<void> => {
     await deps.runtimeHintCb?.(resultRuntime);
   };
-  const settlement = new BrowserCaptureSettlementController(
+  const settlement = new OwnedBrowserResourceTransaction(
     {
       persistRuntime: async (pendingRuntime) => {
         await lockAuthority.ensure();

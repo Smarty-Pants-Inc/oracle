@@ -70,15 +70,12 @@ type BrowserRunLifecycleState =
   | { kind: "ready" }
   | { kind: "dispatching"; dispatch: PendingDispatch }
   | { kind: "capturing"; dispatch: CommittedDispatch }
-  | { kind: "published"; settlement: BrowserCaptureSettlementController };
+  | { kind: "published"; settlement: OwnedBrowserResourceTransaction };
 
 export interface BrowserRunLifecycleAdapters extends OwnedBrowserResourceTransactionAdapters {
   getRuntime: () => BrowserRuntimeMetadata;
   onPromptCommitted?: () => void;
 }
-
-/** Stable public facade for the canonical owned-browser-resource transaction. */
-export class BrowserCaptureSettlementController extends OwnedBrowserResourceTransaction {}
 
 function pendingPromptEpoch(
   dispatch: PendingDispatch,
@@ -143,7 +140,7 @@ function captureResultRuntime(
 
 export function createBrowserRunTransaction(
   result: BrowserRunResult,
-  settlement: BrowserCaptureSettlementController,
+  settlement: OwnedBrowserResourceTransaction,
 ): BrowserRunTransaction {
   const publishedRuntime = settlement.runtime();
   return {
@@ -353,7 +350,7 @@ export class BrowserRunLifecycleController {
     if (this.state.kind !== "capturing") {
       throw this.illegalTransition("issue captured result for caller publication");
     }
-    const settlement = new BrowserCaptureSettlementController(this.adapters, this.runtime(base));
+    const settlement = new OwnedBrowserResourceTransaction(this.adapters, this.runtime(base));
     const publishedResult = this.promptCommitPersistenceFailure
       ? {
           ...result,
@@ -384,14 +381,14 @@ export class BrowserRunLifecycleController {
     if (this.state.kind !== "capturing") {
       throw this.illegalTransition("publish committed recovery authority");
     }
-    const settlement = new BrowserCaptureSettlementController(this.adapters, this.runtime(base));
+    const settlement = new OwnedBrowserResourceTransaction(this.adapters, this.runtime(base));
     this.state = { kind: "published", settlement };
     return settlement.runtime();
   }
 
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
     if (this.state.kind === "published") return null;
-    const settlement = new BrowserCaptureSettlementController(
+    const settlement = new OwnedBrowserResourceTransaction(
       this.adapters,
       this.runtime(this.adapters.getRuntime()),
     );

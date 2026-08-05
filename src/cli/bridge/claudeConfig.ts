@@ -35,6 +35,8 @@ export async function runBridgeClaudeConfig(options: BridgeClaudeConfigCliOption
       ),
     remoteHost: resolved.host,
     remoteToken: resolved.token,
+    remoteLegacyToken: resolved.legacyToken,
+    allowLegacyTextProtocol: resolved.allowLegacyTextProtocol,
     includeToken: Boolean(options.printToken),
     localBrowser: Boolean(options.localBrowser),
   });
@@ -43,7 +45,7 @@ export async function runBridgeClaudeConfig(options: BridgeClaudeConfigCliOption
   if (!options.printToken && !options.localBrowser) {
     console.error("");
     console.error(
-      chalk.dim("Tip: rerun with --print-token to include ORACLE_REMOTE_TOKEN in the snippet."),
+      chalk.dim("Tip: rerun with --print-token to include configured remote token(s)."),
     );
   }
 }
@@ -53,6 +55,8 @@ export function formatClaudeMcpConfig({
   browserProfileDir,
   remoteHost,
   remoteToken,
+  remoteLegacyToken,
+  allowLegacyTextProtocol = false,
   includeToken,
   localBrowser = false,
 }: {
@@ -60,6 +64,8 @@ export function formatClaudeMcpConfig({
   browserProfileDir: string;
   remoteHost?: string;
   remoteToken?: string;
+  remoteLegacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
   includeToken: boolean;
   localBrowser?: boolean;
 }): string {
@@ -74,8 +80,18 @@ export function formatClaudeMcpConfig({
   if (remoteHost && !localBrowser) {
     // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
     env["ORACLE_REMOTE_HOST"] = remoteHost;
-    // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
-    env["ORACLE_REMOTE_TOKEN"] = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+    if (remoteToken || !allowLegacyTextProtocol) {
+      // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
+      env["ORACLE_REMOTE_TOKEN"] = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+    }
+    if (allowLegacyTextProtocol) {
+      // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
+      env["ORACLE_REMOTE_LEGACY_TOKEN"] = includeToken
+        ? (remoteLegacyToken ?? "<YOUR_LEGACY_TOKEN>")
+        : "<YOUR_LEGACY_TOKEN>";
+      // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
+      env["ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL"] = "1";
+    }
   }
 
   // Claude Code supports project-scoped `.mcp.json` config files:

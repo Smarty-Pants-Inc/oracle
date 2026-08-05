@@ -273,6 +273,142 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("keeps a live Darwin owner active when audit pidversion appears after sample fallback", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const ownerPid = 4_321;
+    const contenderPid = 5_432;
+    let auditIdentityAvailable = false;
+    const execute = vi.fn(async (file: string, args: string[]) => {
+      if (file === "/usr/bin/lsappinfo") {
+        const pid = Number(args[1]);
+        return {
+          stdout: auditIdentityAvailable
+            ? `"node" ASN:0x0-0x1234: pid = ${pid} token=[pid=${pid} pV:${pid + 7_000}]\n`
+            : "",
+        };
+      }
+      if (file === "/usr/bin/python3") return { stdout: "" };
+      if (file === "/usr/bin/sample") {
+        const pid = Number(args[0]);
+        return {
+          stdout: [
+            `Analysis of sampling node (pid ${pid}) every 1000 milliseconds`,
+            `Process:         node [${pid}]`,
+            "Launch Time:     2026-08-05 11:57:07.287 -0400",
+          ].join("\n"),
+        };
+      }
+      throw new Error(`Unexpected process query: ${file}`);
+    });
+    const generationProvider = createPlatformProcessGenerationProvider({
+      platform: "darwin",
+      execute,
+    });
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(
+          ownerPid,
+          generationProvider.readProcessGeneration,
+          () => "alive",
+          "darwin",
+        ),
+      },
+    );
+
+    try {
+      expect(original.owner.processStartIdentity).toBe(
+        "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
+      );
+      const ownerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
+      auditIdentityAvailable = true;
+      const beforeStaleLockQuarantine = vi.fn(async () => undefined);
+
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              contenderPid,
+              generationProvider.readProcessGeneration,
+              () => "alive",
+              "darwin",
+            ),
+            beforeStaleLockQuarantine,
+          },
+        ),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      expect(beforeStaleLockQuarantine).not.toHaveBeenCalled();
+      await expect(readFile(path.join(lockPath, "owner.json"), "utf8")).resolves.toBe(ownerRaw);
+    } finally {
+      await original.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims a live PID only when the Darwin provider proves a generation mismatch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const ownerPid = 4_321;
+    const contenderPid = 5_432;
+    let ownerStartMicroseconds = "287123";
+    const generationProvider = createPlatformProcessGenerationProvider({
+      platform: "darwin",
+      execute: async (file, args) => {
+        if (file === "/usr/bin/lsappinfo") return { stdout: "" };
+        if (file === "/usr/bin/python3") {
+          const pid = Number(args.at(-1));
+          const startMicroseconds = pid === ownerPid ? ownerStartMicroseconds : "999999";
+          return { stdout: `${pid}:1785945427:${startMicroseconds}\n` };
+        }
+        throw new Error(`Unexpected process query: ${file}`);
+      },
+    });
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(
+          ownerPid,
+          generationProvider.readProcessGeneration,
+          () => "alive",
+          "darwin",
+        ),
+      },
+    );
+
+    try {
+      ownerStartMicroseconds = "287124";
+      const beforeStaleLockQuarantine = vi.fn(async () => undefined);
+      const replacement = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            contenderPid,
+            generationProvider.readProcessGeneration,
+            () => "alive",
+            "darwin",
+          ),
+          beforeStaleLockQuarantine,
+        },
+      );
+
+      expect(beforeStaleLockQuarantine).toHaveBeenCalledTimes(1);
+      expect(replacement.owner).toMatchObject({
+        pid: contenderPid,
+        processStartIdentity: "darwin-kernel-start:1785945427:999999",
+      });
+      await replacement.release();
+    } finally {
+      await original.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("retries Windows generation proof within one bounded acquisition budget", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "missing-parent", "recovery.lock");
@@ -731,31 +867,28 @@ describe("crash-recoverable filesystem lock", () => {
     },
   );
 
-  test.runIf(process.platform === "linux" || process.platform === "darwin")(
-    "deletes an ordinary isolated generation with the bound helper",
-    async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-"));
-      const candidatePath = path.join(root, "candidate");
-      await mkdir(path.join(candidatePath, "nested"), { recursive: true });
-      await writeFile(path.join(candidatePath, "nested", "owned-marker"), "delete");
-      try {
-        const isolation = await isolateDirectoryGenerationForRemoval(
-          candidatePath,
-          async (generationPath) => (await stat(generationPath)).isDirectory(),
-        );
-        expect(isolation.status).toBe("isolated");
-        if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+  test.runIf(
+    process.platform === "linux" || process.platform === "darwin" || process.platform === "win32",
+  )("deletes an ordinary isolated generation with the bound helper", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-"));
+    const candidatePath = path.join(root, "candidate");
+    await mkdir(path.join(candidatePath, "nested"), { recursive: true });
+    await writeFile(path.join(candidatePath, "nested", "owned-marker"), "delete");
+    try {
+      const isolation = await isolateDirectoryGenerationForRemoval(
+        candidatePath,
+        async (generationPath) => (await stat(generationPath)).isDirectory(),
+      );
+      expect(isolation.status).toBe("isolated");
+      if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
 
-        await expect(
-          removeIsolatedDirectoryGeneration(isolation.rootPath),
-        ).resolves.toBeUndefined();
-        await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
-        await expect(stat(candidatePath)).rejects.toMatchObject({ code: "ENOENT" });
-      } finally {
-        await rm(root, { recursive: true, force: true });
-      }
-    },
-  );
+      await expect(removeIsolatedDirectoryGeneration(isolation.rootPath)).resolves.toBeUndefined();
+      await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(candidatePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("bound deletion unlinks external directory links and stays pending when unsupported", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-device-boundary-"));
@@ -785,7 +918,11 @@ describe("crash-recoverable filesystem lock", () => {
       } catch (error) {
         removalError = error;
       }
-      if (process.platform === "linux" || process.platform === "darwin") {
+      if (
+        process.platform === "linux" ||
+        process.platform === "darwin" ||
+        process.platform === "win32"
+      ) {
         expect(removalError).toBeUndefined();
         expect(generationDevice).not.toBe(0n);
         await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1678,6 +1815,114 @@ describe("crash-recoverable filesystem lock", () => {
       resumeCleanup();
       resumeBlocker();
       await Promise.allSettled([blocker, timedAcquire].filter(Boolean) as Promise<unknown>[]);
+      await blockerLock?.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains timed-out visible request cleanup until a retryable rename obstruction clears", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const mutationRootPath = `${lockPath}.mutations`;
+    const originalPid = 53_053;
+    const blockerPid = 54_054;
+    const contenderPid = 55_055;
+    const successorPid = 56_056;
+    const { promise: allowBlocker, resolve: resumeBlocker } = Promise.withResolvers<void>();
+    const { promise: blockerReady, resolve: markBlockerReady } = Promise.withResolvers<void>();
+    let blockerLock: CrashRecoverableFilesystemLock | undefined;
+    let successorLock: CrashRecoverableFilesystemLock | undefined;
+    let cleanupCollisionPath: string | undefined;
+    const identities: Record<number, string> = {
+      [originalPid]: "original-start",
+      [blockerPid]: "blocker-start",
+      [contenderPid]: "contender-start",
+      [successorPid]: "successor-start",
+    };
+    await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(
+          originalPid,
+          async (pid) => identities[pid] ?? null,
+        ),
+      },
+    );
+    const blocker = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(blockerPid, async (pid) =>
+          pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        ),
+        beforeStaleLockQuarantine: async () => {
+          markBlockerReady();
+          await allowBlocker;
+        },
+      },
+    );
+
+    try {
+      await blockerReady;
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          { timeoutMs: 20, pollMs: 10 },
+          {
+            processIdentityProvider: createProcessIdentityProvider(contenderPid, async (pid) =>
+              pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+            ),
+            beforeMutationRequestTicketPublication: async (requestPath) => {
+              const ownerNonce = path.basename(requestPath).slice("request-".length);
+              cleanupCollisionPath = `${requestPath}.stale-${ownerNonce}`;
+              await mkdir(cleanupCollisionPath);
+              await writeFile(path.join(cleanupCollisionPath, "occupied"), "occupied\n", "utf8");
+            },
+          },
+        ),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+
+      expect(cleanupCollisionPath).toBeDefined();
+      expect(
+        (await readdir(mutationRootPath)).filter(
+          (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+        ),
+      ).toHaveLength(2);
+      await rm(cleanupCollisionPath!, { recursive: true, force: true });
+      cleanupCollisionPath = undefined;
+      await vi.waitFor(async () => {
+        expect(
+          (await readdir(mutationRootPath)).filter(
+            (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
+          ),
+        ).toHaveLength(1);
+      });
+
+      resumeBlocker();
+      blockerLock = await blocker;
+      await blockerLock.release();
+      blockerLock = undefined;
+      successorLock = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 1_000, pollMs: 10 },
+        {
+          processIdentityProvider: createProcessIdentityProvider(
+            successorPid,
+            async (pid) => identities[pid] ?? null,
+          ),
+        },
+      );
+      await successorLock.release();
+      successorLock = undefined;
+      expect(await readdir(mutationRootPath)).toEqual([]);
+    } finally {
+      resumeBlocker();
+      if (cleanupCollisionPath !== undefined) {
+        await rm(cleanupCollisionPath, { recursive: true, force: true });
+      }
+      await Promise.allSettled([blocker]);
+      await successorLock?.release().catch(() => undefined);
       await blockerLock?.release().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }

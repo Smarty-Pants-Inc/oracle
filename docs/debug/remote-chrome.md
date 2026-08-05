@@ -1,11 +1,13 @@
 # Remote Chrome Service Debug Log
 
+> Historical debugging record. Direct plaintext LAN serving shown in the original notes has been removed; current `oracle serve` is loopback-only and must be reached through SSH tunneling.
+
 ## Context
 
 - Date: 2025-11-20 (US timezone)
-- Goal: Run Oracle browser mode from local laptop against VM-hosted Chrome via new `oracle serve` remote service.
-- VM IP: 192.168.64.2
-- Service port/token used during attempts: 49810 / `cd93955b64d5afcb946a4a4a89651313`
+- Goal: Run Oracle browser mode from a local laptop against VM-hosted Chrome via the then-new `oracle serve` remote service.
+- Current transport replacement: client and service both use `127.0.0.1:49810`, connected through SSH `-L`.
+- Credentials below are redacted.
 
 ## Attempts
 
@@ -14,9 +16,10 @@
 Command:
 
 ```
+ssh -N -L 49810:127.0.0.1:49810 user@remote-host
 oracle --engine browser \
-  --remote-host 192.168.64.2:49810 \
-  --remote-token cd93955b64d5afcb946a4a4a89651313 \
+  --remote-host 127.0.0.1:49810 \
+  --remote-token <redacted> \
   --prompt "Remote service sanity check" \
   --wait
 ```
@@ -25,7 +28,7 @@ Outcome:
 
 - Initially routed to local Chrome (before wiring fix).
 - After wiring fix, logs showed “Routing browser automation to remote host …” but requests failed with:
-  - `ECONNREFUSED 192.168.64.2:49810` when no service listening.
+  - `ECONNREFUSED 127.0.0.1:49810` when the SSH tunnel or service was not listening.
   - `busy` when a previous service process was still bound.
 - Later run reached remote path but failed model switch: `Unable to find model option matching "GPT-5.2 Pro"` (remote Chrome not logged into ChatGPT / model picker mismatch).
 - After disabling cookie shipping and requiring host login, remote runs now fail earlier: service logs “Loading ChatGPT cookies from host Chrome profile…” then reports `Unhandled promise rejection ... Unknown error` when `loadChromeCookies` runs on the VM. Remote client sees `socket hang up` because the server doesn’t deliver a result.
@@ -39,12 +42,12 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --port 49810 --token cd93955b64d5afcb946a4a4a89651313
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <redacted>
   ```
 - When started correctly, logs show:
   ```
-  Listening at 0.0.0.0:49810
-  Access token: cd93955b64d5afcb946a4a4a89651313
+  Listening at 127.0.0.1:49810
+  Access token: <redacted>
   ```
 - One run failed with EADDRINUSE when a stale node listener stayed on 49810; resolved by killing `node ...49810`.
 
@@ -62,7 +65,7 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --port 49810 --token cd93955b64d5afcb946a4a4a89651313
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <redacted>
   ```
   Leave it running; verify with `lsof -nP -iTCP:49810 -sTCP:LISTEN`.
 - Sign into ChatGPT in the VM’s Chrome profile used by the service so model switching succeeds. (Currently we rely on host cookies only; client cookie shipping is disabled.)

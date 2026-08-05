@@ -677,11 +677,14 @@ export async function runConsultTool(
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (resolvedEngine === "browser" && resolvedRemote.host) {
-    if (!resolvedRemote.token) {
+    if (
+      !resolvedRemote.token &&
+      !(resolvedRemote.allowLegacyTextProtocol && resolvedRemote.legacyToken)
+    ) {
       return {
         isError: true,
         content: textContent(
-          `Remote host configured (${resolvedRemote.host}) but remote token is missing. Run \`oracle bridge client --connect <...>\` or set ORACLE_REMOTE_TOKEN.`,
+          `Remote host configured (${resolvedRemote.host}) but no usable remote credential is configured. Set ORACLE_REMOTE_TOKEN for v3, or explicitly opt into predecessor text-only compatibility with ORACLE_REMOTE_LEGACY_TOKEN and ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1.`,
         ),
       };
     }
@@ -689,6 +692,8 @@ export async function runConsultTool(
       executeBrowser: createRemoteBrowserExecutor({
         host: resolvedRemote.host,
         token: resolvedRemote.token,
+        legacyToken: resolvedRemote.legacyToken,
+        allowLegacyTextProtocol: resolvedRemote.allowLegacyTextProtocol,
       }),
     };
   }

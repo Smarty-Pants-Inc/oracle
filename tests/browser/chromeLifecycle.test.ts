@@ -1599,7 +1599,6 @@ describe("closeBlankChromeTabs", () => {
 
   test("reports explicit attached ownership for the HTTP fallback target", async () => {
     const fallbackClient = { close: vi.fn(async () => undefined) };
-    cdpNewMock.mockRejectedValue(new Error("cannot create target"));
     cdpListMock.mockResolvedValue([
       { id: "borrowed-target", type: "page", url: "https://chatgpt.com/" },
     ]);
@@ -1610,7 +1609,6 @@ describe("closeBlankChromeTabs", () => {
       "127.0.0.1",
       9222,
       vi.fn<(message: string) => void>(),
-      "about:blank",
     );
 
     expect(cdpMock).toHaveBeenCalledWith({
@@ -1620,6 +1618,9 @@ describe("closeBlankChromeTabs", () => {
     });
     expect(connection.targetId).toBe("borrowed-target");
     expect(connection.ownership).toBe("attached");
+    await connection.close();
+    expect(fallbackClient.close).toHaveBeenCalledOnce();
+    expect(cdpCloseMock).not.toHaveBeenCalled();
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {

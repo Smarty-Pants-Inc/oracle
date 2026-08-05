@@ -29,6 +29,8 @@ JSON5 parsing, so trailing commas and comments are allowed.
     // Remote browser bridge (preferred place to store remote host settings)
     remoteHost: "127.0.0.1:9473",
     remoteToken: "…", // written by `oracle bridge client` (kept private; not printed by default)
+    remoteLegacyToken: "…", // predecessor text-only bearer; must differ from remoteToken
+    remoteAllowLegacyTextProtocol: false, // secure default; explicit opt-in only
     remoteViaSshReverseTunnel: { ssh: "user@linux-host", remotePort: 9473 }, // optional metadata
     debugPort: null, // fixed DevTools port (env: ORACLE_BROWSER_PORT / ORACLE_BROWSER_DEBUG_PORT)
     timeoutMs: 1200000,
@@ -104,9 +106,10 @@ ChatGPT Project URL in a package subdirectory.
 
 Project configs intentionally support only workflow defaults. They cannot set
 provider routing or secret/executable fields such as `apiBaseUrl`, `modelOverrides`, `azure`,
-`browser.remoteHost`, `browser.remoteToken`, `browser.chromePath`, or
-`browser.chromeCookiePath`. Keep tokens and machine-local executable/profile
-paths in `~/.oracle/config.json`, environment variables, or explicit CLI flags.
+`browser.remoteHost`, `browser.remoteToken`, `browser.remoteLegacyToken`,
+`browser.remoteAllowLegacyTextProtocol`, `browser.chromePath`, or `browser.chromeCookiePath`.
+Keep tokens and machine-local executable/profile paths in `~/.oracle/config.json`, environment
+variables, or explicit CLI flags.
 
 ## Precedence
 
@@ -117,7 +120,7 @@ CLI flags and explicit override environment variables → effective config (proj
 - Provider routing and machine-local fields (`apiBaseUrl`, `modelOverrides`, `azure`, remote browser host/token defaults, Chrome binary/profile paths, cookie DB paths, and session retention cleanup) are ignored in project configs and are read only from the user config, environment variables, or explicit CLI flags.
 - `ORACLE_ENGINE=api|browser` is a global override for engine selection (useful for MCP/Codex setups); it wins over `config.json`.
 - If `azure.endpoint` (or `--azure-endpoint`) is set, Oracle reads `AZURE_OPENAI_API_KEY` first and falls back to `OPENAI_API_KEY` for GPT models.
-- Remote browser defaults follow the same order: `--remote-host/--remote-token` win, then `browser.remoteHost` / `browser.remoteToken` in the config, then `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN` if still unset.
+- Remote browser defaults follow the same order: CLI flags win, then `browser.remoteHost` / `browser.remoteToken` / `browser.remoteLegacyToken` / `browser.remoteAllowLegacyTextProtocol`, then `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN` / `ORACLE_REMOTE_LEGACY_TOKEN` / `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL`. Legacy fallback remains disabled unless the boolean opt-in resolves true, and the legacy bearer must differ from the modern v3 HMAC root key.
 - `OPENAI_API_KEY` only influences engine selection when neither the CLI nor `config.json` specify an engine (API when present, otherwise browser).
 - `modelOverrides` applies only to API runs and existing built-in model keys. It can replace the on-wire `apiModel`, reasoning effort, input limit, and per-token pricing; unspecified fields and the bundled tokenizer remain unchanged. Invalid override values are ignored. Project configs cannot set this field.
 - `ORACLE_NOTIFY*` env vars still layer on top of the config’s `notify` block.

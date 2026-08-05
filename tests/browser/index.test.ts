@@ -1526,7 +1526,10 @@ describe("runSubmissionWithRecoveryForTest", () => {
       .fn()
       .mockRejectedValueOnce(new BrowserAutomationError("dead composer", { code: "dead-composer" }))
       .mockRejectedValueOnce(
-        new BrowserAutomationError("prompt too large", { code: "prompt-too-large" }),
+        new BrowserAutomationError("prompt too large", {
+          code: "prompt-too-large",
+          promptSubmissionRejected: true,
+        }),
       )
       .mockResolvedValueOnce({
         baselineTurns: 7,
@@ -1568,14 +1571,42 @@ describe("runSubmissionWithRecoveryForTest", () => {
     ]);
   });
 
+  test("does not use a fallback when oversized rejection is unproven", async () => {
+    const unproven = new BrowserAutomationError("prompt may be too large", {
+      code: "prompt-too-large",
+    });
+    const submit = vi.fn().mockRejectedValue(unproven);
+    const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      runSubmissionWithRecoveryForTest({
+        prompt: "inline prompt",
+        attachments: [],
+        fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
+        submit,
+        reloadPromptComposer: vi.fn().mockResolvedValue(undefined),
+        prepareFallbackSubmission,
+        logger: vi.fn<(message: string) => void>(),
+      }),
+    ).rejects.toBe(unproven);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(prepareFallbackSubmission).not.toHaveBeenCalled();
+  });
+
   test("throws when prompt-too-large happens again after fallback", async () => {
     const submit = vi
       .fn()
       .mockRejectedValueOnce(
-        new BrowserAutomationError("prompt too large", { code: "prompt-too-large" }),
+        new BrowserAutomationError("prompt too large", {
+          code: "prompt-too-large",
+          promptSubmissionRejected: true,
+        }),
       )
       .mockRejectedValueOnce(
-        new BrowserAutomationError("prompt too large again", { code: "prompt-too-large" }),
+        new BrowserAutomationError("prompt too large again", {
+          code: "prompt-too-large",
+          promptSubmissionRejected: true,
+        }),
       );
 
     await expect(

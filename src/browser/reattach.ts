@@ -29,6 +29,7 @@ import {
   recoveryCleanupGroupKey,
 } from "./reattachCleanup.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
+import { findRemoteRecoveryAuthority } from "./reattachability.js";
 export type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
 import {
   assertSameCommittedPromptEpoch,
@@ -52,11 +53,6 @@ import {
 } from "./reattachTargetAuthority.js";
 import { createReattachSettlement } from "./reattachSettlement.js";
 export { retryBrowserRecoveryCleanup } from "./reattachSettlement.js";
-
-function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata) {
-  return runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
-    ?.remoteRecovery;
-}
 
 type ReattachRecoveryClassification = "stale-runtime" | "recoverable-transport";
 
@@ -118,7 +114,7 @@ export async function resumeBrowserSession(
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
   const explicitTabRef = config?.browserTabRef?.trim() || undefined;
-  const initialRemoteRecovery = remoteRecoveryAuthority(runtime);
+  const initialRemoteRecovery = findRemoteRecoveryAuthority(runtime);
   if (initialRemoteRecovery && explicitTabRef) {
     throw explicitTargetAuthorityError(
       explicitTabRef,

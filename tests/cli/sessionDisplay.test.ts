@@ -178,16 +178,9 @@ beforeEach(() => {
     dir: "/tmp/sessions/sess",
     log: "/tmp/sessions/sess/session.log",
   });
-  persistDurableBrowserAnswerMock.mockResolvedValue({
-    artifact: {
-      kind: "transcript",
-      path: "/tmp/sessions/sess/artifacts/durable-browser-answer.md",
-      label: "Durable browser answer",
-      sha256: "a".repeat(64),
-      sizeBytes: 16,
-    },
-    sha256: "a".repeat(64),
-    sizeBytes: 16,
+  persistDurableBrowserAnswerMock.mockImplementation(async (_options, expectedReceipt) => {
+    if (!expectedReceipt) throw new Error("publication intent receipt missing");
+    return expectedReceipt;
   });
   saveBrowserTranscriptArtifactMock.mockResolvedValue(null);
   saveDeepResearchReportArtifactMock.mockResolvedValue(null);
@@ -1234,12 +1227,21 @@ describe("attachSession rendering", () => {
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
       ([, patch]) => patch.status === "completed",
     );
-    expect(persistDurableBrowserAnswerMock).toHaveBeenCalledWith({
-      sessionId: "sess",
-      answer: "Recovered **answer**",
-      logHeader: "[reattach] captured assistant response from existing Chrome tab",
-      replaceLog: false,
-    });
+    expect(persistDurableBrowserAnswerMock).toHaveBeenCalledWith(
+      {
+        sessionId: "sess",
+        answer: "Recovered **answer**",
+        logHeader: "[reattach] captured assistant response from existing Chrome tab",
+        replaceLog: false,
+      },
+      expect.objectContaining({
+        artifact: expect.objectContaining({
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          sizeBytes: Buffer.byteLength("Recovered **answer**"),
+        }),
+      }),
+    );
     expect(persistDurableBrowserAnswerMock.mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
@@ -1247,8 +1249,8 @@ describe("attachSession rendering", () => {
       status: "completed",
       artifacts: [
         expect.objectContaining({
-          path: "/tmp/sessions/sess/artifacts/durable-browser-answer.md",
-          sha256: "a".repeat(64),
+          path: expect.stringMatching(/[\\/]artifacts[\\/]browser-answer-[a-f0-9]{64}\.md$/u),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
         }),
       ],
     });

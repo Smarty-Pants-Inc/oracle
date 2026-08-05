@@ -9,7 +9,7 @@ export async function persistPreArchiveCapture(
 ): Promise<void> {
   if (!callback) return;
   try {
-    await callback(result, runtime);
+    await callback(structuredClone(result), runtime);
   } catch (cause) {
     throw new BrowserAutomationError(
       "The exact captured answer could not be persisted before conversation archive.",

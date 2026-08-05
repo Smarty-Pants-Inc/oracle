@@ -1,6 +1,7 @@
 import net from "node:net";
 import path from "node:path";
 import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import { captureDeepResearchTargetKeys } from "./actions/deepResearch.js";
 import { resolveBrowserConfig } from "./config.js";
 import type { BrowserAttachment, BrowserLogger, ChromeClient } from "./types.js";
@@ -59,7 +60,10 @@ export async function runSubmissionWithRecovery({
         continue;
       }
 
-      const isPromptTooLarge = hasBrowserErrorCode(error, "prompt-too-large");
+      const isPromptTooLarge =
+        hasBrowserErrorCode(error, "prompt-too-large") &&
+        error instanceof BrowserAutomationError &&
+        error.details?.promptSubmissionRejected === true;
       if (fallbackSubmission && isPromptTooLarge && !usedFallbackSubmission) {
         usedFallbackSubmission = true;
         logger("[browser] Inline prompt too large; retrying with file uploads.");

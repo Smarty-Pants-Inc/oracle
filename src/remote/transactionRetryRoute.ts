@@ -24,6 +24,7 @@ import {
   terminalTransactionRetryResponse,
 } from "./transactionProtocol.js";
 import { settleExpiredRemoteTransaction } from "./transactionServer.js";
+import { sendJson } from "./serverHttp.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
 import { RemoteTransactionStore } from "./transactionStore.js";
 import { RemoteRetryRequestSchema, type RemoteTransactionRetryResponse } from "./types.js";
@@ -308,10 +309,4 @@ async function readRetryRequestBody(req: http.IncomingMessage): Promise<string> 
     chunks.push(buffer);
   }
   return Buffer.concat(chunks, receivedBytes).toString("utf8");
-}
-
-function sendJson(res: http.ServerResponse, statusCode: number, value: unknown): void {
-  if (res.destroyed || res.writableEnded) return;
-  res.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-  res.end(JSON.stringify(value));
 }

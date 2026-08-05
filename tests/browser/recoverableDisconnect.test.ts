@@ -1126,6 +1126,8 @@ describe("recoverable disconnect lifecycle", () => {
           answerText: "completed answer",
           archive: { archived: true },
         });
+        expect(fixture.preArchiveCaptures).toHaveLength(1);
+        expect(fixture.preArchiveCaptures[0]).not.toHaveProperty("archive");
       },
     );
   }, 30_000);

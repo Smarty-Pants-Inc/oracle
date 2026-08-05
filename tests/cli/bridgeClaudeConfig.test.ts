@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { formatClaudeMcpConfig } from "../../src/cli/bridge/claudeConfig.ts";
+import { formatCodexMcpSnippet } from "../../src/cli/bridge/codexConfig.ts";
 
 const execFileAsync = promisify(execFile);
 const CLI_ENTRY = path.join(process.cwd(), "bin", "oracle-cli.ts");
@@ -33,6 +34,36 @@ describe("formatClaudeMcpConfig", () => {
       ORACLE_REMOTE_HOST: "127.0.0.1:9473",
       ORACLE_REMOTE_TOKEN: "<YOUR_TOKEN>",
     });
+  });
+
+  test("prints explicit legacy-only MCP credentials without inventing a modern bearer", () => {
+    const parsed = JSON.parse(
+      formatClaudeMcpConfig({
+        oracleHomeDir: "/Users/test/.oracle-local",
+        browserProfileDir: "/Users/test/.oracle-local/browser-profile",
+        remoteHost: "127.0.0.1:9473",
+        remoteLegacyToken: "legacy-bearer",
+        allowLegacyTextProtocol: true,
+        includeToken: false,
+      }),
+    );
+
+    expect(parsed.mcpServers.oracle.env).toMatchObject({
+      ORACLE_REMOTE_HOST: "127.0.0.1:9473",
+      ORACLE_REMOTE_LEGACY_TOKEN: "<YOUR_LEGACY_TOKEN>",
+      ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL: "1",
+    });
+    expect(parsed.mcpServers.oracle.env).not.toHaveProperty("ORACLE_REMOTE_TOKEN");
+
+    const codex = formatCodexMcpSnippet({
+      remoteHost: "127.0.0.1:9473",
+      remoteLegacyToken: "legacy-bearer",
+      allowLegacyTextProtocol: true,
+      includeToken: true,
+    });
+    expect(codex).toContain('ORACLE_REMOTE_LEGACY_TOKEN = "legacy-bearer"');
+    expect(codex).toContain('ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL = "1"');
+    expect(codex).not.toContain("ORACLE_REMOTE_TOKEN =");
   });
 
   test("prints a local-browser Claude Code MCP config without remote bridge env", () => {

@@ -20,6 +20,27 @@ interface RetainedTargetCloseAuthority {
 }
 
 const retainedTargetCloseAuthorities = new Map<string, RetainedTargetCloseAuthority>();
+const MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES = 128;
+const retainedTerminalTargetCloseCapabilityIds: string[] = [];
+
+function retainTerminalTargetCloseCapability(
+  capabilityId: string,
+  authority: RetainedTargetCloseAuthority,
+  terminalStatus: "completed" | "gone",
+): void {
+  retainedTargetCloseAuthorities.set(capabilityId, {
+    generationId: authority.generationId,
+    targetId: authority.targetId,
+    terminalStatus,
+  });
+  retainedTerminalTargetCloseCapabilityIds.push(capabilityId);
+  while (
+    retainedTerminalTargetCloseCapabilityIds.length >
+    MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES
+  ) {
+    retainedTargetCloseAuthorities.delete(retainedTerminalTargetCloseCapabilityIds.shift()!);
+  }
+}
 
 export function retainChromeTargetCloseCapability(options: {
   generationId: string;
@@ -110,11 +131,7 @@ export async function closeChromeTargetWithRetainedCapability(options: {
       };
     }
     if (retainedTargetCloseAuthorities.get(capability.capabilityId) === authority) {
-      retainedTargetCloseAuthorities.set(capability.capabilityId, {
-        generationId: authority.generationId,
-        targetId: authority.targetId,
-        terminalStatus: closeResult.status,
-      });
+      retainTerminalTargetCloseCapability(capability.capabilityId, authority, closeResult.status);
     }
     return closeResult;
   })();
@@ -127,3 +144,15 @@ export async function closeChromeTargetWithRetainedCapability(options: {
     }
   }
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
+export const __test__ = {
+  clearRetainedTargetCloseAuthorities(): void {
+    retainedTargetCloseAuthorities.clear();
+    retainedTerminalTargetCloseCapabilityIds.length = 0;
+  },
+  retainedTargetCloseAuthorityCount(): number {
+    return retainedTargetCloseAuthorities.size;
+  },
+  retainedTerminalTargetCloseCapabilityLimit: MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES,
+};

@@ -29,6 +29,10 @@ export interface BrowserConfigDefaults {
   remoteHost?: string | null;
   /** Access token clients must provide to the remote `oracle serve` instance. */
   remoteToken?: string | null;
+  /** Bearer credential scoped only to the predecessor text protocol; must differ from remoteToken. */
+  remoteLegacyToken?: string | null;
+  /** Explicitly permit fallback to the predecessor text-only remote protocol. */
+  remoteAllowLegacyTextProtocol?: boolean;
   /** Optional metadata for the SSH reverse-tunnel that makes remoteHost reachable. */
   remoteViaSshReverseTunnel?: RemoteViaSshReverseTunnelConfig | null;
   timeoutMs?: number;

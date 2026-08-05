@@ -43,20 +43,20 @@ async function settlePublishedRemoteCapture(
   followUpCount: number,
   requiredArtifactsSaved: boolean,
 ): Promise<BrowserRunTransaction> {
-  const capture = context.publishableCapture;
-  if (!capture) {
+  const stagedCapture = context.publishableCapture;
+  if (!stagedCapture) {
     throw new Error("Remote browser capture is unavailable for publication.");
   }
   await persistPreArchiveCapture(
     context.options.preArchiveCaptureCb,
-    capture,
+    stagedCapture,
     context.lifecycle.runtime(),
   );
   context.postCapturePendingWork = {
     code: "browser-archive-pending",
     context: "ChatGPT conversation archive",
   };
-  capture.archive = await maybeArchiveCompletedConversation({
+  const archive = await maybeArchiveCompletedConversation({
     Runtime: target.Runtime,
     logger: context.logger,
     config: context.config,
@@ -65,7 +65,8 @@ async function settlePublishedRemoteCapture(
     followUpCount,
     requiredArtifactsSaved,
   });
-  capture.tookMs = Date.now() - context.startedAt;
+  const capture = { ...stagedCapture, archive, tookMs: Date.now() - context.startedAt };
+  context.publishableCapture = capture;
   context.postCapturePendingWork = {
     code: "browser-final-identity-verification-pending",
     context: "final committed-turn identity verification",

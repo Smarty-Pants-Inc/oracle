@@ -11,10 +11,12 @@ import {
 } from "../../bridge/connection.js";
 import type { BridgeConnectionArtifact } from "../../bridge/connection.js";
 import { serveRemote } from "../../remote/server.js";
+import { assertLoopbackRemoteBind } from "../../remote/remoteServiceConfig.js";
 
 export interface BridgeHostCliOptions {
   bind?: string;
   token?: string;
+  legacyToken?: string;
   writeConnection?: string;
   ssh?: string;
   sshRemotePort?: number;
@@ -41,11 +43,18 @@ export async function runBridgeHost(
 ): Promise<void> {
   const bindRaw = options.bind?.trim() || "127.0.0.1:9473";
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
+  assertLoopbackRemoteBind(bindHost);
 
   const tokenRaw = options.token?.trim() || "auto";
   const token = tokenRaw === "auto" ? randomBytes(16).toString("hex") : tokenRaw;
   if (!token.trim()) {
     throw new Error("Token is required (use --token auto to generate one).");
+  }
+  const legacyToken = options.legacyToken?.trim() || undefined;
+  if (legacyToken && legacyToken === token) {
+    throw new Error(
+      "Legacy text clients require a bearer credential distinct from the modern v3 HMAC root key.",
+    );
   }
 
   const writeConnectionPath =
@@ -60,10 +69,7 @@ export async function runBridgeHost(
 
   const connectionHostForClient = sshTarget
     ? normalizeHostPort("127.0.0.1", sshRemotePort)
-    : normalizeHostPort(
-        bindHost === "0.0.0.0" || bindHost === "::" ? "127.0.0.1" : bindHost,
-        bindPort,
-      );
+    : normalizeHostPort(bindHost, bindPort);
 
   const artifact = await upsertConnectionArtifact(writeConnectionPath, {
     remoteHost: connectionHostForClient,
@@ -95,6 +101,7 @@ export async function runBridgeHost(
     await spawnBridgeHostInBackground({
       bind: bindRaw,
       token,
+      legacyToken,
       writeConnectionPath,
       sshTarget,
       sshRemotePort,
@@ -113,6 +120,9 @@ export async function runBridgeHost(
       "Token stored in connection artifact (not printed). Use --print or --print-token if needed.",
     ),
   );
+  if (legacyToken) {
+    console.log(chalk.dim("- Predecessor text compatibility: enabled with a distinct bearer"));
+  }
 
   const startTunnel = deps.startReverseTunnel ?? startReverseTunnel;
   const runRemoteService = deps.serveRemote ?? serveRemote;
@@ -145,6 +155,7 @@ export async function runBridgeHost(
       host: bindHost,
       port: bindPort,
       token,
+      legacyToken,
       logger: filteredServeLogger,
     });
   } finally {
@@ -304,6 +315,7 @@ function splitArgs(input: string): string[] {
 async function spawnBridgeHostInBackground({
   bind,
   token,
+  legacyToken,
   writeConnectionPath,
   sshTarget,
   sshRemotePort,
@@ -312,6 +324,7 @@ async function spawnBridgeHostInBackground({
 }: {
   bind: string;
   token: string;
+  legacyToken?: string;
   writeConnectionPath: string;
   sshTarget?: string;
   sshRemotePort?: number;
@@ -342,6 +355,9 @@ async function spawnBridgeHostInBackground({
     "--write-connection",
     writeConnectionPath,
   ];
+  if (legacyToken) {
+    args.push("--legacy-token", legacyToken);
+  }
   if (sshTarget) {
     args.push("--ssh", sshTarget);
   }

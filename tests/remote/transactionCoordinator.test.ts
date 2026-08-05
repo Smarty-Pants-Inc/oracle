@@ -7,11 +7,11 @@ import type { DurableRemoteArtifactRegistration } from "../../src/remote/transac
 import { RemoteTransactionCoordinator } from "../../src/remote/transactionCoordinator.js";
 import { settlementResponse } from "../../src/remote/transactionProtocol.js";
 import {
-  BrowserCaptureSettlementController,
   completedBrowserCaptureCleanup,
   createBrowserRunTransaction,
   type BrowserCaptureSettlementAdapters,
 } from "../../src/browser/runLifecycle.js";
+import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
@@ -377,7 +377,7 @@ describe("RemoteTransactionCoordinator", () => {
           return completedBrowserCaptureCleanup(pendingRuntime);
         },
       );
-      const settlement = new BrowserCaptureSettlementController(
+      const settlement = new OwnedBrowserResourceTransaction(
         {
           persistRuntime: async (pendingRuntime) => {
             await store.persistSettlementRuntime(transactionToken, pendingRuntime);

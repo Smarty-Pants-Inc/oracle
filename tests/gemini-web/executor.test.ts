@@ -726,70 +726,97 @@ describe("gemini-web executor", () => {
     expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
-  it("persists exact prompt and cleanup authority before a post-binding response failure", async () => {
-    const persisted: BrowserRuntimeMetadata[] = [];
-    const events: string[] = [];
-    const evaluateNormally = runtimeEvaluate.getMockImplementation();
-    if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
-    runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
-      if (String(input.expression ?? "").includes("const ordered =")) {
-        throw new Error("injected response polling failure");
-      }
-      return evaluateNormally(input);
-    });
-    closeChromeTargetWithExactAuthority.mockImplementationOnce(async () => {
-      events.push("close-target");
-      return { status: "completed" };
-    });
-    const exec = createGeminiWebExecutor({});
+  it.each([
+    {
+      phase: "response",
+      expressionMarker: "const ordered =",
+      failureMessage: "injected response polling failure",
+    },
+    {
+      phase: "thought",
+      expressionMarker: "thoughts-header-button",
+      failureMessage: "injected thought capture failure",
+    },
+  ])(
+    "publishes committed recovery authority after a $phase capture failure",
+    async ({ expressionMarker, failureMessage }) => {
+      const persisted: BrowserRuntimeMetadata[] = [];
+      const events: string[] = [];
+      const evaluateNormally = runtimeEvaluate.getMockImplementation();
+      if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
+      runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
+        if (String(input.expression ?? "").includes(expressionMarker)) {
+          throw new Error(failureMessage);
+        }
+        return evaluateNormally(input);
+      });
+      const exec = createGeminiWebExecutor({});
 
-    await expect(
-      exec({
-        prompt: "hello",
-        attachments: [],
-        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
-        runtimeHintCb: async (runtime) => {
-          persisted.push(runtime);
-          events.push(
-            `persist:${runtime.promptEpoch?.status ?? "acquired"}:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}`,
-          );
-        },
-        log: () => {},
-      }),
-    ).rejects.toThrow("injected response polling failure");
-
-    const committed = persisted.find((runtime) => runtime.promptEpoch?.status === "committed");
-    expect(committed).toMatchObject({
-      conversationId: "target-1",
-      promptEpoch: {
-        status: "committed",
-        promptSha256: promptIdentitySha256("hello"),
-        verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: "data-message-id:user-current",
-        verifiedUserMessageId: "data-message-id:user-current",
-        conversationId: "target-1",
-      },
-      recoveryCleanupResources: [
-        expect.objectContaining({
-          chromeTargetId: "target-1",
-          conversationId: "target-1",
-          promptEpoch: expect.objectContaining({ status: "committed" }),
+      await expect(
+        exec({
+          prompt: "hello",
+          attachments: [],
+          config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+          runtimeHintCb: async (runtime) => {
+            persisted.push(runtime);
+            events.push(
+              `persist:${runtime.promptEpoch?.status ?? "acquired"}:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}`,
+            );
+          },
+          log: () => {},
         }),
-      ],
-    });
-    expect(events.indexOf("persist:pending:unbound")).toBeGreaterThanOrEqual(0);
-    expect(events.indexOf("persist:committed:unbound")).toBeGreaterThan(
-      events.indexOf("persist:pending:unbound"),
-    );
-    expect(events.indexOf("persist:committed:abort")).toBeGreaterThan(
-      events.indexOf("persist:committed:unbound"),
-    );
-    expect(events.indexOf("close-target")).toBeGreaterThan(
-      events.indexOf("persist:committed:abort"),
-    );
-    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
-    expect(killChrome).toHaveBeenCalledTimes(1);
-  });
+      ).rejects.toMatchObject({
+        name: "BrowserAutomationError",
+        message: expect.stringContaining(failureMessage),
+        details: {
+          stage: "gemini-response-capture",
+          code: "gemini-response-capture-recoverable",
+          reattachable: true,
+          runtime: {
+            conversationId: "target-1",
+            promptEpoch: {
+              status: "committed",
+              promptSha256: promptIdentitySha256("hello"),
+              verifiedUserTurnIndex: 0,
+              verifiedUserTurnId: "data-message-id:user-current",
+              verifiedUserMessageId: "data-message-id:user-current",
+              conversationId: "target-1",
+            },
+            recoveryCleanupResult: { status: "pending" },
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromeTargetId: "target-1",
+                targetCloseCapability: expect.objectContaining({
+                  version: 1,
+                  generationId: expect.any(String),
+                  capabilityId: expect.any(String),
+                }),
+                conversationId: "target-1",
+                promptEpoch: expect.objectContaining({ status: "committed" }),
+                recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
+              }),
+            ],
+          },
+        },
+      });
+
+      const committed = persisted.find((runtime) => runtime.promptEpoch?.status === "committed");
+      expect(committed).toMatchObject({
+        conversationId: "target-1",
+        promptEpoch: expect.objectContaining({
+          status: "committed",
+          promptSha256: promptIdentitySha256("hello"),
+        }),
+      });
+      expect(events.indexOf("persist:pending:unbound")).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf("persist:committed:unbound")).toBeGreaterThan(
+        events.indexOf("persist:pending:unbound"),
+      );
+      expect(events).not.toContain("persist:committed:abort");
+      expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+      expect(killChrome).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects Chrome evaluation exceptions and cleans up the unpublished session", async () => {
     runtimeEvaluate.mockResolvedValueOnce({
@@ -811,7 +838,8 @@ describe("gemini-web executor", () => {
     ).rejects.toThrow(
       "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
     );
-    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
   });
   it.each([
     { first: "finalize" as const, second: "finalize" as const },

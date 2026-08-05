@@ -1,12 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import {
-  BrowserCaptureSettlementController,
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   createBrowserRunTransaction,
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
+import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 const committedVerification = {
@@ -157,7 +157,7 @@ describe("BrowserRunLifecycleController", () => {
     const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
       completedBrowserCaptureCleanup(runtime),
     );
-    const settlement = new BrowserCaptureSettlementController(
+    const settlement = new OwnedBrowserResourceTransaction(
       {
         persistRuntime,
         settleResources,
@@ -215,7 +215,7 @@ describe("BrowserRunLifecycleController", () => {
       const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
         completedBrowserCaptureCleanup(runtime),
       );
-      const settlement = new BrowserCaptureSettlementController(
+      const settlement = new OwnedBrowserResourceTransaction(
         { persistRuntime, settleResources },
         remoteRuntime(),
       );

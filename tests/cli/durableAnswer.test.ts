@@ -7,6 +7,7 @@ import {
   durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
+  readDurableBrowserAnswer,
   type DurableBrowserAnswerReceipt,
 } from "../../src/cli/durableAnswer.js";
 import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
@@ -133,14 +134,18 @@ describe("persistDurableBrowserAnswer", () => {
 });
 
 describe("publishCompletedBrowserCapture", () => {
-  const receipt: DurableBrowserAnswerReceipt = {
-    artifact: {
-      kind: "transcript",
-      path: "/tmp/durable-answer.md",
-      sha256: "a".repeat(64),
-      sizeBytes: 6,
-    },
-  };
+  function acceptPreparedReceipt(events?: string[]) {
+    return vi.fn(
+      async (
+        _options: Parameters<typeof persistDurableBrowserAnswer>[0],
+        expectedReceipt?: DurableBrowserAnswerReceipt,
+      ) => {
+        events?.push("receipt");
+        if (!expectedReceipt) throw new Error("publication intent receipt missing");
+        return expectedReceipt;
+      },
+    );
+  }
 
   function sessionResult(
     sessionId: string,
@@ -212,6 +217,7 @@ describe("publishCompletedBrowserCapture", () => {
       return sessionResult(sessionId, updates);
     });
 
+    const persistAnswer = acceptPreparedReceipt(events);
     const result = await publishCompletedBrowserCapture({
       answer: { sessionId: "session-1", answer: "answer" },
       transaction: {
@@ -230,10 +236,7 @@ describe("publishCompletedBrowserCapture", () => {
         }),
       },
       browser: browser(capturedRuntime),
-      persistAnswer: vi.fn(async () => {
-        events.push("receipt");
-        return receipt;
-      }),
+      persistAnswer,
       prepareArtifacts: async () => {
         events.push("prepare");
         return [];
@@ -252,10 +255,79 @@ describe("publishCompletedBrowserCapture", () => {
     ]);
     expect(result).toMatchObject({
       published: true,
-      receipt,
+      receipt: persistAnswer.mock.calls[0]?.[1],
       finalization: { status: "completed", runtime: finalizedRuntime },
       runtimeAuthority: { status: "persisted" },
     });
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
+  test("restart discovers the exact answer after a crash before artifact preparation", async () => {
+    await setupSession();
+    const answer = "answer durable before preparation";
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    const bindSettlement = vi.fn(async (mode: "finalize" | "abort") => ({
+      ...runtime,
+      recoveryCleanupResult: { status: "pending" as const, settlementMode: mode },
+    }));
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
+    let answerBecameDurable!: () => void;
+    const durableBoundary = new Promise<void>((resolve) => {
+      answerBecameDurable = resolve;
+    });
+    const interruptedPreparation = vi.fn(async () => []);
+    const persistThenCrash = vi.fn(
+      async (
+        answerOptions: Parameters<typeof persistDurableBrowserAnswer>[0],
+        expectedReceipt?: DurableBrowserAnswerReceipt,
+      ) => {
+        await persistDurableBrowserAnswer(answerOptions, expectedReceipt);
+        answerBecameDurable();
+        return new Promise<DurableBrowserAnswerReceipt>(() => undefined);
+      },
+    );
+
+    const interrupted = publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer },
+      transaction: { runtime, bindSettlement, finalize, abort },
+      browser: browser(runtime),
+      persistAnswer: persistThenCrash,
+      prepareArtifacts: interruptedPreparation,
+    });
+    void interrupted.catch(() => undefined);
+    await durableBoundary;
+
+    const intent = await readBrowserCapturePublicationJournal("session-1");
+    expect(intent).toMatchObject({
+      phase: "preparing",
+      receipt: {
+        artifact: {
+          path: expect.stringContaining("browser-answer-"),
+          sha256: createHash("sha256").update(answer).digest("hex"),
+          sizeBytes: Buffer.byteLength(answer),
+        },
+      },
+    });
+    if (!intent) throw new Error("publication intent missing at durable answer boundary");
+    expect(await readFile(intent.receipt.artifact.path, "utf8")).toBe(answer);
+    expect(await readDurableBrowserAnswer(intent.receipt)).toBe(answer);
+    expect(interruptedPreparation).not.toHaveBeenCalled();
+
+    const recoveredPreparation = vi.fn(async () => []);
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer },
+        transaction: { runtime, bindSettlement, finalize, abort },
+        browser: browser(runtime),
+        persistAnswer: persistDurableBrowserAnswer,
+        prepareArtifacts: recoveredPreparation,
+      }),
+    ).resolves.toMatchObject({ published: true, receipt: intent.receipt });
+    expect(recoveredPreparation).toHaveBeenCalledTimes(1);
+    expect(bindSettlement).toHaveBeenCalledTimes(1);
+    expect(finalize).toHaveBeenCalledTimes(1);
+    expect(abort).not.toHaveBeenCalled();
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
 
@@ -263,6 +335,7 @@ describe("publishCompletedBrowserCapture", () => {
     await setupSession();
     const events: string[] = [];
     const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    let preparedReceipt: DurableBrowserAnswerReceipt | undefined;
     const promise = publishCompletedBrowserCapture({
       answer: { sessionId: "session-1", answer: "answer" },
       transaction: {
@@ -281,10 +354,17 @@ describe("publishCompletedBrowserCapture", () => {
         }),
       },
       browser: browser(runtime),
-      persistAnswer: vi.fn(async () => {
-        events.push("receipt");
-        return receipt;
-      }),
+      persistAnswer: vi.fn(
+        async (
+          _options: Parameters<typeof persistDurableBrowserAnswer>[0],
+          expectedReceipt?: DurableBrowserAnswerReceipt,
+        ) => {
+          events.push("receipt");
+          if (!expectedReceipt) throw new Error("publication intent receipt missing");
+          preparedReceipt = expectedReceipt;
+          return expectedReceipt;
+        },
+      ),
       prepareArtifacts: async () => {
         events.push("prepare");
         throw new Error("artifact fsync failed");
@@ -294,8 +374,20 @@ describe("publishCompletedBrowserCapture", () => {
     await expect(promise).rejects.toThrow("staging failed after the answer became durable");
     expect(events).toEqual(["receipt", "prepare", "bind:abort", "abort"]);
     await promise.catch((error: unknown) => {
-      expect(durableBrowserAnswerReceiptFromError(error)).toEqual(receipt);
+      expect(durableBrowserAnswerReceiptFromError(error)).toEqual(preparedReceipt);
     });
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({
+            path: preparedReceipt?.artifact.path,
+            sha256: preparedReceipt?.artifact.sha256,
+          }),
+        ]),
+      }),
+    );
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
 
   test("keeps FINALIZE authority recoverable when completed projection is interrupted", async () => {
@@ -317,14 +409,13 @@ describe("publishCompletedBrowserCapture", () => {
         answer: { sessionId: "session-1", answer: "answer" },
         transaction: { runtime, bindSettlement, finalize, abort },
         browser: browser(runtime),
-        persistAnswer: vi.fn(async () => receipt),
+        persistAnswer: acceptPreparedReceipt(),
       }),
     ).rejects.toMatchObject({ details: { code: "finalize-bound-publication-pending" } });
     expect(abort).not.toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "finalize-bound",
-      receipt,
     });
 
     vi.mocked(sessionStore.updateSession).mockResolvedValue(sessionResult("session-1"));
@@ -365,7 +456,7 @@ describe("publishCompletedBrowserCapture", () => {
         answer: { sessionId: "session-1", answer: "answer" },
         transaction: { runtime, bindSettlement, finalize, abort },
         browser: browser(runtime),
-        persistAnswer: vi.fn(async () => receipt),
+        persistAnswer: acceptPreparedReceipt(),
       }),
     ).rejects.toMatchObject({ details: { code: "finalize-local-binding-persistence-failed" } });
     expect(finalize).not.toHaveBeenCalled();
@@ -447,7 +538,7 @@ describe("publishCompletedBrowserCapture", () => {
         abort: vi.fn(),
       },
       browser: browser(capturedRuntime),
-      persistAnswer: vi.fn(async () => receipt),
+      persistAnswer: acceptPreparedReceipt(),
     });
 
     expect(result.finalization.status).toBe("pending");
@@ -515,7 +606,7 @@ describe("publishCompletedBrowserCapture", () => {
         abort: vi.fn(),
       },
       browser: browser(runtime),
-      persistAnswer: vi.fn(async () => receipt),
+      persistAnswer: acceptPreparedReceipt(),
     });
 
     expect(result).toMatchObject({

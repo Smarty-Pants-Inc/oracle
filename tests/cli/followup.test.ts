@@ -119,7 +119,7 @@ describe("browser follow-up resolution", () => {
     const store = { readSession: vi.fn(async () => metadata) };
 
     await expect(resolveBrowserFollowupReference("missing-url", store)).rejects.toThrow(
-      /structurally valid committed prompt epoch.*oracle status/s,
+      /completed legacy metadata.*one exact ChatGPT conversation.*oracle status/s,
     );
   });
 
@@ -136,12 +136,90 @@ describe("browser follow-up resolution", () => {
     expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/harvested");
   });
 
-  test("rejects epoch-less browser locator fields", () => {
+  test("resolves a completed pre-prompt-epoch browser session without reviving old target authority", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      id: "legacy-browser",
+      mode: "browser",
+      model: "gpt-5.5-pro",
+      browser: {
+        config: {
+          manualLogin: true,
+          manualLoginProfileDir: "/tmp/oracle-profile",
+          browserTabRef: "stale-owned-target",
+          researchMode: "deep",
+          archiveConversations: "auto",
+        },
+        runtime: {
+          tabUrl: "https://chatgpt.com/c/legacy-thread",
+          chromeTargetId: "stale-owned-target",
+          chromePort: 9222,
+        },
+      },
+    };
+    const store = { readSession: vi.fn(async () => metadata) };
+
+    await expect(resolveBrowserFollowupReference("legacy-browser", store)).resolves.toEqual({
+      sessionId: "legacy-browser",
+      resumeConversationUrl: "https://chatgpt.com/c/legacy-thread",
+      model: "gpt-5.5-pro",
+      browserConfig: {
+        manualLogin: true,
+        manualLoginProfileDir: "/tmp/oracle-profile",
+        browserTabRef: null,
+        researchMode: "off",
+        archiveConversations: "never",
+        resumeConversationUrl: "https://chatgpt.com/c/legacy-thread",
+      },
+    });
+  });
+
+  test("builds a canonical URL for a completed legacy exact conversation id", () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
       browser: { runtime: { conversationId: "legacy-only" } },
     };
+
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/legacy-only");
+  });
+
+  test.each([
+    {
+      name: "runtime URL and conversation id disagree",
+      runtime: {
+        tabUrl: "https://chatgpt.com/c/legacy-url",
+        conversationId: "legacy-field",
+      },
+      harvest: undefined,
+    },
+    {
+      name: "runtime and harvested URLs disagree",
+      runtime: { tabUrl: "https://chatgpt.com/c/legacy-url" },
+      harvest: { url: "https://chatgpt.com/c/other-thread" },
+    },
+  ])("rejects an ambiguous completed legacy locator when $name", async ({ runtime, harvest }) => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: { runtime, harvest },
+    };
+
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+    const store = { readSession: vi.fn(async () => metadata) };
+    await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
+      /one exact ChatGPT conversation/s,
+    );
+  });
+
+  test("does not use the legacy locator path for an incomplete session", () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      status: "running",
+      mode: "browser",
+      browser: { runtime: { tabUrl: "https://chatgpt.com/c/not-completed" } },
+    };
+
     expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
   });
 
@@ -256,7 +334,7 @@ describe("browser follow-up resolution", () => {
 
     const store = { readSession: vi.fn(async () => metadata) };
     await expect(resolveBrowserFollowupReference("external-url", store)).rejects.toThrow(
-      /structurally valid committed prompt epoch/s,
+      /completed legacy metadata.*one exact ChatGPT conversation/s,
     );
   });
 
@@ -275,7 +353,7 @@ describe("browser follow-up resolution", () => {
 
     const store = { readSession: vi.fn(async () => metadata) };
     await expect(resolveBrowserFollowupReference("project-shell", store)).rejects.toThrow(
-      /structurally valid committed prompt epoch/s,
+      /completed legacy metadata.*one exact ChatGPT conversation/s,
     );
   });
 

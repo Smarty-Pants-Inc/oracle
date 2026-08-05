@@ -8,7 +8,12 @@ import type { DurableBrowserAnswerReceipt } from "./durableAnswer.js";
 const JOURNAL_FILENAME = "browser-capture-publication.json";
 const MAX_AUDIT_MESSAGE_CHARS = 240;
 
-export type BrowserPublicationPhase = "staged" | "finalize-bound" | "published" | "cleanup-pending";
+export type BrowserPublicationPhase =
+  | "preparing"
+  | "staged"
+  | "finalize-bound"
+  | "published"
+  | "cleanup-pending";
 
 export interface BrowserCapturePublicationJournal {
   version: 1;
@@ -178,6 +183,7 @@ function isBrowserCapturePublicationJournal(
 
 function isPublicationPhase(value: unknown): value is BrowserPublicationPhase {
   return (
+    value === "preparing" ||
     value === "staged" ||
     value === "finalize-bound" ||
     value === "published" ||
@@ -186,7 +192,23 @@ function isPublicationPhase(value: unknown): value is BrowserPublicationPhase {
 }
 
 function isReceipt(value: unknown): value is DurableBrowserAnswerReceipt {
-  return Boolean(value && typeof value === "object" && "artifact" in value);
+  if (!value || typeof value !== "object" || !("artifact" in value)) return false;
+  const artifact = value.artifact;
+  return Boolean(
+    artifact &&
+    typeof artifact === "object" &&
+    "kind" in artifact &&
+    artifact.kind === "transcript" &&
+    "path" in artifact &&
+    typeof artifact.path === "string" &&
+    "sha256" in artifact &&
+    typeof artifact.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(artifact.sha256) &&
+    "sizeBytes" in artifact &&
+    typeof artifact.sizeBytes === "number" &&
+    Number.isSafeInteger(artifact.sizeBytes) &&
+    artifact.sizeBytes >= 0,
+  );
 }
 
 function readErrorCode(error: unknown): string | undefined {

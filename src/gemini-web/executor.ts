@@ -9,8 +9,8 @@ import type {
 } from "../browser/types.js";
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
+import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
 import {
-  BrowserCaptureSettlementController,
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
@@ -65,7 +65,7 @@ function createSettledGeminiTransaction(
   runtime: BrowserRuntimeMetadata = {},
 ): BrowserRunTransaction {
   const finalization = completedBrowserCaptureCleanup(runtime);
-  const settlement = new BrowserCaptureSettlementController(
+  const settlement = new OwnedBrowserResourceTransaction(
     { settleResources: async () => finalization },
     finalization.runtime,
   );
@@ -410,6 +410,20 @@ async function runGeminiDeepThinkViaBrowser(
       answerChars: response.text.length,
     });
   } catch (error) {
+    if (lifecycle.isPromptCommitted()) {
+      const runtime = lifecycle.publishRecovery();
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BrowserAutomationError(
+        `Gemini response capture failed after verified prompt commit; the live browser session was preserved for recovery: ${message}`,
+        {
+          stage: "gemini-response-capture",
+          code: "gemini-response-capture-recoverable",
+          reattachable: true,
+          runtime,
+        },
+        error,
+      );
+    }
     const finalization = await lifecycle.settleIfUnpublished();
     if (finalization?.status === "pending") {
       const message = error instanceof Error ? error.message : String(error);

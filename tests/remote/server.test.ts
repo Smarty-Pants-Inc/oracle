@@ -57,12 +57,12 @@ import {
   writeOracleChromeOwner,
 } from "../../src/browser/profileState.js";
 import {
-  BrowserCaptureSettlementController,
   completedBrowserCaptureCleanup,
   createBrowserRunTransaction,
   pendingBrowserCaptureCleanup,
   type BrowserCaptureSettlementAdapters,
 } from "../../src/browser/runLifecycle.js";
+import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
 
 const CAN_LISTEN_LOCALHOST =
   spawnSync(
@@ -139,7 +139,7 @@ function lifecycleBrowserTransaction(
     conversationId,
     promptEpoch: committedPromptEpoch(prompt, conversationId, followUpOrdinal),
   };
-  const settlement = new BrowserCaptureSettlementController(
+  const settlement = new OwnedBrowserResourceTransaction(
     {
       persistRuntime: async (pendingRuntime) => {
         await runtimeHintCb?.(pendingRuntime);
@@ -3349,6 +3349,75 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "publishes the committed archive result without changing the durable pre-archive capture",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-archive-result-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "0".repeat(64);
+      const preArchiveResult: BrowserRunResult = {
+        answerText: "archived answer",
+        answerMarkdown: "archived answer",
+        tookMs: 2,
+        answerTokens: 2,
+        answerChars: 15,
+      };
+      const archive = {
+        mode: "always" as const,
+        attempted: true,
+        archived: true,
+        conversationUrl: "https://chatgpt.com/c/remote-conversation",
+      };
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            const transaction = browserTransaction(
+              options.prompt,
+              { ...preArchiveResult, archive },
+              { conversationId: "remote-conversation" },
+            );
+            await options.preArchiveCaptureCb?.(preArchiveResult, transaction.runtime);
+            return transaction;
+          },
+        },
+      );
+      try {
+        const response = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: {
+            ...remoteRunPayload(),
+            browserConfig: { archiveConversations: "always" },
+          },
+        });
+        expect(response.events).toContainEqual(
+          expect.objectContaining({
+            type: "transaction",
+            transaction: expect.objectContaining({
+              result: expect.objectContaining({ answerText: "archived answer", archive }),
+            }),
+          }),
+        );
+        expect(preArchiveResult).not.toHaveProperty("archive");
+        const store = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: "archive-result-reader",
+        });
+        expect(await store.read(transactionToken)).toMatchObject({
+          state: "pending",
+          result: { answerText: "archived answer", archive },
+        });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "falls back to the staged exact capture when the initial publication write fails",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-publish-"));
@@ -3523,6 +3592,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             },
           },
         });
+        expect(retry).not.toMatchObject({
+          json: { transaction: { result: { archive: expect.anything() } } },
+        });
         expect(resumeBrowser).not.toHaveBeenCalled();
         const afterRetry = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
@@ -3537,6 +3609,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             promptEpoch: committedPromptEpoch(prompt),
           },
         });
+        expect(record?.result).not.toHaveProperty("archive");
         expect(record).not.toHaveProperty("stagedCapture");
         expect(JSON.stringify(record?.runtime)).not.toMatch(
           /lost-after-archive|chromeTargetId|chromePort|chromeHost|recoveryCleanupResources/u,

@@ -88,9 +88,10 @@ export interface PublishCompletedBrowserCaptureOptions {
 }
 
 /**
- * Publishes a completed browser capture through a crash-recoverable four-phase transaction:
- * stage durable answer/artifacts, bind FINALIZE remotely and locally, commit audit-only completed
- * projections, then execute idempotent finalize effects. Only a pre-stage failure may select ABORT.
+ * Publishes a completed browser capture through a crash-recoverable transaction:
+ * journal the exact answer intent, durably stage answer/artifacts, bind FINALIZE remotely and
+ * locally, commit audit-only completed projections, then execute idempotent finalize effects.
+ * Only a pre-stage failure may select ABORT.
  */
 export async function publishCompletedBrowserCapture(
   options: PublishCompletedBrowserCaptureOptions,
@@ -103,7 +104,15 @@ export async function publishCompletedBrowserCapture(
     journal = await recognizeCommittedPublication(journal);
   } else {
     try {
-      journal = await stageBrowserCapture(options, projectRuntime);
+      journal = await prepareBrowserCapturePublication(options, projectRuntime);
+    } catch (stageError) {
+      return abortPreStageFailure(options, stageError, projectRuntime);
+    }
+  }
+
+  if (journal.phase === "preparing") {
+    try {
+      journal = await stageBrowserCapture(options, journal);
     } catch (stageError) {
       return abortPreStageFailure(options, stageError, projectRuntime);
     }
@@ -184,29 +193,77 @@ export async function publishCompletedBrowserCapture(
 
 export async function persistDurableBrowserAnswer(
   options: PersistDurableBrowserAnswerOptions,
+  expectedReceipt?: DurableBrowserAnswerReceipt,
 ): Promise<DurableBrowserAnswerReceipt> {
+  const prepared = await prepareDurableBrowserAnswer(options);
+  if (expectedReceipt) assertDurableBrowserAnswerReceipt(prepared.receipt, expectedReceipt);
+
+  const artifactsDir = path.dirname(prepared.receipt.artifact.path);
+  await mkdir(artifactsDir, { recursive: true });
+  await syncDirectoryIfSupported(prepared.paths.dir);
+  await ensureDurableFile(prepared.receipt.artifact.path, prepared.payload);
+
+  if (options.logHeader) {
+    const logPayload = Buffer.from(`${options.logHeader}\nAnswer:\n${options.answer}\n`, "utf8");
+    if (options.replaceLog) {
+      await writeFileAtomicDurable(prepared.paths.log, logPayload);
+    } else {
+      await appendDurableFile(prepared.paths.log, logPayload);
+    }
+  }
+
+  return expectedReceipt ?? prepared.receipt;
+}
+
+export async function readDurableBrowserAnswer(
+  receipt: DurableBrowserAnswerReceipt,
+): Promise<string | null> {
+  const targetPath = receipt.artifact.path;
+  let entry: Stats;
+  try {
+    entry = await lstat(targetPath);
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  if (!entry.isFile()) {
+    throw new Error(`Durable browser answer is not a regular file: ${targetPath}`);
+  }
+
+  const handle = await open(targetPath, "r");
+  try {
+    const before = await handle.stat();
+    if (!isUnchangedFile(entry, before)) {
+      throw new Error(`Durable browser answer path changed during recovery: ${targetPath}`);
+    }
+    const payload = await handle.readFile();
+    const afterRead = await handle.stat();
+    if (!isUnchangedFile(before, afterRead)) {
+      throw new Error(`Durable browser answer changed during recovery: ${targetPath}`);
+    }
+    const sha256 = createHash("sha256").update(payload).digest("hex");
+    if (payload.byteLength !== receipt.artifact.sizeBytes || sha256 !== receipt.artifact.sha256) {
+      throw new Error(`Durable browser answer receipt mismatch: ${targetPath}`);
+    }
+    const named = await lstat(targetPath);
+    if (!isUnchangedFile(afterRead, named)) {
+      throw new Error(`Durable browser answer path changed during recovery: ${targetPath}`);
+    }
+    return payload.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function prepareDurableBrowserAnswer(options: PersistDurableBrowserAnswerOptions) {
   if (!options.answer.trim()) {
     throw new Error("Cannot persist an empty browser answer");
   }
   const payload = Buffer.from(options.answer, "utf8");
   const sha256 = createHash("sha256").update(payload).digest("hex");
   const paths = await sessionStore.getPaths(options.sessionId);
-  const artifactsDir = path.join(paths.dir, "artifacts");
-  await mkdir(artifactsDir, { recursive: true });
-  await syncDirectoryIfSupported(paths.dir);
-  const answerPath = path.join(artifactsDir, `browser-answer-${sha256}.md`);
-  await ensureDurableFile(answerPath, payload);
-
-  if (options.logHeader) {
-    const logPayload = Buffer.from(`${options.logHeader}\nAnswer:\n${options.answer}\n`, "utf8");
-    if (options.replaceLog) {
-      await writeFileAtomicDurable(paths.log, logPayload);
-    } else {
-      await appendDurableFile(paths.log, logPayload);
-    }
-  }
-
-  return {
+  const answerPath = path.join(paths.dir, "artifacts", `browser-answer-${sha256}.md`);
+  const receipt: DurableBrowserAnswerReceipt = {
     artifact: {
       kind: "transcript",
       path: answerPath,
@@ -219,6 +276,7 @@ export async function persistDurableBrowserAnswer(
       origin: { mode: "local" },
     },
   };
+  return { paths, payload, receipt };
 }
 
 export function durableBrowserAnswerReceiptFromError(
@@ -238,42 +296,66 @@ export function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata 
     : undefined;
 }
 
-async function stageBrowserCapture(
+async function prepareBrowserCapturePublication(
   options: PublishCompletedBrowserCaptureOptions,
   projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
 ): Promise<BrowserCapturePublicationJournal> {
+  const { receipt } = await prepareDurableBrowserAnswer(options.answer);
+  const runtime = projectRuntime(options.transaction.runtime);
+  const journal: BrowserCapturePublicationJournal = {
+    version: 1,
+    sessionId: options.answer.sessionId,
+    phase: "preparing",
+    receipt,
+    artifacts: options.existingArtifacts ?? [],
+    completedAt: new Date().toISOString(),
+    usage: options.usage,
+    elapsedMs: options.elapsedMs,
+    response: options.response,
+    model: options.model,
+    browserAudit: projectCompletedBrowserMetadataAudit(options.browser, runtime),
+    runtime,
+  };
+  await writeBrowserCapturePublicationJournal(journal);
+  return journal;
+}
+
+async function stageBrowserCapture(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+): Promise<BrowserCapturePublicationJournal> {
   const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
-  const receipt = await persistAnswer(options.answer);
+  const preparedAnswer = await prepareDurableBrowserAnswer(options.answer);
+  assertDurableBrowserAnswerReceipt(preparedAnswer.receipt, journal.receipt);
+  const existingAnswer = await readDurableBrowserAnswer(journal.receipt);
+  const receipt =
+    existingAnswer === null
+      ? await persistAnswer(options.answer, journal.receipt)
+      : journal.receipt;
+  assertDurableBrowserAnswerReceipt(receipt, journal.receipt);
   try {
     const preparedArtifacts = await options.prepareArtifacts?.();
-    const artifacts = mergeArtifacts(options.existingArtifacts, [
-      ...(preparedArtifacts ?? []),
-      receipt.artifact,
-    ]);
-    const runtime = projectRuntime(options.transaction.runtime);
-    const journal: BrowserCapturePublicationJournal = {
-      version: 1,
-      sessionId: options.answer.sessionId,
+    const stagedJournal: BrowserCapturePublicationJournal = {
+      ...journal,
       phase: "staged",
       receipt,
-      artifacts,
-      completedAt: new Date().toISOString(),
-      usage: options.usage,
-      elapsedMs: options.elapsedMs,
-      response: options.response,
-      model: options.model,
-      browserAudit: projectCompletedBrowserMetadataAudit(options.browser, runtime),
-      runtime,
+      artifacts: mergeArtifacts(
+        journal.artifacts.filter(
+          (artifact) =>
+            artifact.kind !== receipt.artifact.kind || artifact.path !== receipt.artifact.path,
+        ),
+        [...(preparedArtifacts ?? []), receipt.artifact],
+      ),
     };
-    await writeBrowserCapturePublicationJournal(journal);
-    return journal;
+    await writeBrowserCapturePublicationJournal(stagedJournal);
+    return stagedJournal;
   } catch (error) {
     throw new BrowserAutomationError(
       `Browser capture staging failed after the answer became durable: ${formatError(error)}`,
       {
         stage: "browser-capture-publication",
         code: "browser-capture-staging-failed",
-        runtime: options.transaction.runtime,
+        runtime: journal.runtime,
         answerReceipt: receipt,
       },
       error,
@@ -499,6 +581,10 @@ async function abortPreStageFailure(
   stageError: unknown,
   projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
 ): Promise<never> {
+  const answerReceipt = durableBrowserAnswerReceiptFromError(stageError);
+  const artifacts = answerReceipt
+    ? mergeArtifacts(options.existingArtifacts, [answerReceipt.artifact])
+    : undefined;
   let boundRuntime: BrowserRuntimeMetadata;
   try {
     boundRuntime = projectRuntime(await options.transaction.bindSettlement("abort"));
@@ -509,7 +595,7 @@ async function abortPreStageFailure(
         stage: "browser-capture-publication",
         code: "abort-binding-failed",
         runtime: runtimeFromBrowserError(bindingError) ?? options.transaction.runtime,
-        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+        answerReceipt,
       },
       stageError,
     );
@@ -517,6 +603,7 @@ async function abortPreStageFailure(
   try {
     await sessionStore.updateSession(options.answer.sessionId, {
       browser: { ...options.browser, runtime: boundRuntime },
+      ...(artifacts ? { artifacts } : {}),
     });
   } catch (persistenceError) {
     throw new BrowserAutomationError(
@@ -525,7 +612,7 @@ async function abortPreStageFailure(
         stage: "browser-capture-publication",
         code: "abort-authority-persistence-failed",
         runtime: boundRuntime,
-        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+        answerReceipt,
       },
       stageError,
     );
@@ -551,11 +638,13 @@ async function abortPreStageFailure(
   try {
     await sessionStore.updateSession(options.answer.sessionId, {
       browser: { ...options.browser, runtime: abortionRuntime },
+      ...(artifacts ? { artifacts } : {}),
     });
   } catch (error) {
     try {
       await sessionStore.updateSession(options.answer.sessionId, {
         browser: { ...options.browser, runtime: abortionRuntime },
+        ...(artifacts ? { artifacts } : {}),
       });
     } catch (retryError) {
       throw new BrowserAutomationError(
@@ -564,10 +653,26 @@ async function abortPreStageFailure(
           stage: "browser-capture-publication",
           code: "abort-authority-persistence-failed",
           runtime: abortionRuntime,
-          answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+          answerReceipt,
           firstError: formatError(error),
         },
         retryError,
+      );
+    }
+  }
+  if (answerReceipt) {
+    try {
+      await clearBrowserCapturePublicationJournal(options.answer.sessionId);
+    } catch (clearError) {
+      throw new BrowserAutomationError(
+        `Browser capture staging failed (${formatError(stageError)}); durable publication intent cleanup remains pending: ${formatError(clearError)}`,
+        {
+          stage: "browser-capture-publication",
+          code: "abort-publication-journal-cleanup-failed",
+          runtime: abortionRuntime,
+          answerReceipt,
+        },
+        clearError,
       );
     }
   }
@@ -578,7 +683,7 @@ async function abortPreStageFailure(
         stage: "browser-capture-publication",
         code: "publication-failed-cleanup-pending",
         runtime: abortionRuntime,
-        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+        answerReceipt,
         cleanupError: abortion.error,
       },
       stageError,
@@ -660,6 +765,20 @@ function assertJournalMatchesCapture(
         answerReceipt: journal.receipt,
       },
     );
+  }
+}
+
+function assertDurableBrowserAnswerReceipt(
+  actual: DurableBrowserAnswerReceipt,
+  expected: DurableBrowserAnswerReceipt,
+): void {
+  if (
+    actual.artifact.kind !== expected.artifact.kind ||
+    actual.artifact.path !== expected.artifact.path ||
+    actual.artifact.sha256 !== expected.artifact.sha256 ||
+    actual.artifact.sizeBytes !== expected.artifact.sizeBytes
+  ) {
+    throw new Error("Durable browser answer receipt does not match its publication intent");
   }
 }
 

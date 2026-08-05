@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { configPath as defaultConfigPath } from "../../config.js";
 import type { UserConfig } from "../../config.js";
 import {
+  normalizeHostPort,
   parseBridgeConnectionString,
   readBridgeConnectionArtifact,
   looksLikePath,
@@ -11,6 +12,7 @@ import {
 import type { BridgeTunnelInfo } from "../../bridge/connection.js";
 import { readUserConfigFile, writeUserConfigFile } from "../../bridge/userConfigFile.js";
 import { checkRemoteHealth } from "../../remote/health.js";
+import { parsePlaintextRemoteEndpoint } from "../../remote/remoteServiceConfig.js";
 
 export interface BridgeClientCliOptions {
   connect?: string;
@@ -18,6 +20,8 @@ export interface BridgeClientCliOptions {
   config?: string;
   test?: boolean;
   printEnv?: boolean;
+  legacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
 }
 
 export async function runBridgeClient(options: BridgeClientCliOptions): Promise<void> {
@@ -28,12 +32,34 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
     );
   }
 
-  const { remoteHost, remoteToken, tunnel } = await resolveConnection(connectRaw);
+  const allowLegacyTextProtocol = options.allowLegacyTextProtocol === true;
+  const explicitLegacyToken = options.legacyToken?.trim() || undefined;
+  if (allowLegacyTextProtocol && !explicitLegacyToken) {
+    throw new Error(
+      "--allow-legacy-text-protocol requires a distinct --legacy-token; connection tokens are never reused as legacy bearers.",
+    );
+  }
+  if (explicitLegacyToken && !allowLegacyTextProtocol) {
+    throw new Error("--legacy-token requires explicit --allow-legacy-text-protocol opt-in.");
+  }
+  const { remoteHost, remoteToken, tunnel } = await resolveConnection(connectRaw, {
+    allowTokenless: allowLegacyTextProtocol,
+  });
+  parsePlaintextRemoteEndpoint(remoteHost);
+  const token = remoteToken;
+  const legacyToken = allowLegacyTextProtocol ? explicitLegacyToken : undefined;
+  if (token && legacyToken && token === legacyToken) {
+    throw new Error(
+      "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
+    );
+  }
 
   if (options.test !== false) {
     const health = await checkRemoteHealth({
       host: remoteHost,
-      token: remoteToken,
+      token,
+      legacyToken,
+      allowLegacyTextProtocol,
       timeoutMs: 5000,
     });
     if (!health.ok) {
@@ -58,7 +84,9 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
     const next: UserConfig = { ...config, browser: { ...config.browser } };
     next.browser = { ...next.browser };
     next.browser.remoteHost = remoteHost;
-    next.browser.remoteToken = remoteToken;
+    next.browser.remoteToken = token ?? null;
+    next.browser.remoteLegacyToken = legacyToken ?? null;
+    next.browser.remoteAllowLegacyTextProtocol = allowLegacyTextProtocol;
     if (tunnel) {
       next.browser.remoteViaSshReverseTunnel = {
         ssh: tunnel.ssh,
@@ -81,13 +109,39 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
     console.log("# Optional env overrides (paste into your shell):");
     console.log(`export ORACLE_ENGINE=browser`);
     console.log(`export ORACLE_REMOTE_HOST=${shellQuote(remoteHost)}`);
-    console.log(`export ORACLE_REMOTE_TOKEN=${shellQuote(remoteToken)}`);
+    if (token) console.log(`export ORACLE_REMOTE_TOKEN=${shellQuote(token)}`);
+    if (allowLegacyTextProtocol && legacyToken) {
+      console.log(`export ORACLE_REMOTE_LEGACY_TOKEN=${shellQuote(legacyToken)}`);
+      console.log("export ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1");
+    }
   }
 }
 
 async function resolveConnection(
   input: string,
-): Promise<{ remoteHost: string; remoteToken: string; tunnel?: BridgeTunnelInfo }> {
+  options: { allowTokenless?: boolean } = {},
+): Promise<{ remoteHost: string; remoteToken?: string; tunnel?: BridgeTunnelInfo }> {
+  if (
+    options.allowTokenless &&
+    (input.includes("://") || !looksLikePath(input)) &&
+    !/[?&]token=/.test(input)
+  ) {
+    let url: URL;
+    try {
+      url = input.includes("://") ? new URL(input) : new URL(`oracle+tcp://${input}`);
+    } catch (error) {
+      throw new Error(
+        `Invalid connection string: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const hostname = url.hostname?.trim();
+    const port = Number.parseInt(url.port ?? "", 10);
+    if (!hostname || !Number.isFinite(port) || port <= 0 || port > 65_535) {
+      throw new Error(`Invalid connection string host: ${input}. Expected host:port.`);
+    }
+    return { remoteHost: normalizeHostPort(hostname, port) };
+  }
+
   if (input.includes("://")) {
     return { ...parseBridgeConnectionString(input) };
   }

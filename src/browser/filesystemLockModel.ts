@@ -2,6 +2,7 @@ import path from "node:path";
 import { lstat, open, readFile, stat } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
 import { readErrorCode, syncDirectory } from "./filesystemLockIo.js";
+import { arePlatformProcessGenerationsDefinitelyDifferent } from "./platformProcessGeneration.js";
 
 export const LOCK_OWNER_FILENAME = "owner.json";
 export const LOCK_MUTATION_DIRECTORY_SUFFIX = ".mutations";
@@ -125,7 +126,13 @@ export async function inspectExistingLock(
       if (liveness === "unknown") return { status: "active", owner };
       if (owner.processStartIdentity !== null) {
         const observedIdentity = await options.readProcessIdentity(owner.pid);
-        if (observedIdentity !== null && owner.processStartIdentity !== observedIdentity) {
+        if (
+          observedIdentity !== null &&
+          arePlatformProcessGenerationsDefinitelyDifferent(
+            owner.processStartIdentity,
+            observedIdentity,
+          )
+        ) {
           return verifiedStaleGeneration(raw);
         }
       }
@@ -142,7 +149,10 @@ export async function inspectExistingLock(
           partialOwner.processStartIdentity === undefined ||
           partialOwner.processStartIdentity === null ||
           observedIdentity === null ||
-          partialOwner.processStartIdentity === observedIdentity
+          !arePlatformProcessGenerationsDefinitelyDifferent(
+            partialOwner.processStartIdentity,
+            observedIdentity,
+          )
         ) {
           return { status: "active" };
         }

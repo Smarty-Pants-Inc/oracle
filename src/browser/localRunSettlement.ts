@@ -4,7 +4,10 @@ import type {
 } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { closeBlankChromeTabsWithExactAuthority } from "./chromeLifecycle.js";
-import { settleManualChromeOwner } from "./manualChromeOwner.js";
+import {
+  releaseManualChromeOwnerEndpointAuthority,
+  settleManualChromeOwner,
+} from "./manualChromeOwner.js";
 import {
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
@@ -309,6 +312,21 @@ export function createLocalRunSettlementCoordinator({
         errors.push("Manual-login cleanup has no retained lease teardown authority");
         logger(
           "[browser] Manual-login cleanup has no retained lease teardown authority; preserving Chrome resources.",
+        );
+      }
+    }
+    if (
+      manualLogin &&
+      effectiveKeepBrowser &&
+      chromeOwnerDisposition === "close-on-last-lease" &&
+      !manualOwnerSettled
+    ) {
+      try {
+        await releaseManualChromeOwnerEndpointAuthority(chromeOwner);
+        manualOwnerSettled = true;
+      } catch (error) {
+        errors.push(
+          `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }

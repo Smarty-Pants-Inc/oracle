@@ -28,9 +28,12 @@ import {
   durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
+  readDurableBrowserAnswer,
   runtimeFromBrowserError,
+  type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
 import {
+  clearBrowserCapturePublicationJournal,
   readBrowserCapturePublicationJournal,
   sanitizeBrowserPublicationMessage,
 } from "./browserPublicationJournal.js";
@@ -71,6 +74,14 @@ export async function orchestrateBrowserAttachAuthority(
 ): Promise<SessionMetadata> {
   let metadata = initialMetadata;
   let publicationJournal = await readBrowserCapturePublicationJournal(sessionId);
+  if (
+    publicationJournal?.phase === "preparing" &&
+    metadata.browser?.runtime?.recoveryCleanupResult?.settlementMode === "abort" &&
+    hasDurableBrowserAnswerReceipt(metadata, publicationJournal.receipt)
+  ) {
+    await clearBrowserCapturePublicationJournal(sessionId);
+    publicationJournal = null;
+  }
   let runtime = publicationJournal?.runtime ?? metadata.browser?.runtime;
   if (!publicationJournal) {
     const repairedRuntime = repairTrustedStaleConversationUrl(runtime);
@@ -113,7 +124,7 @@ export async function orchestrateBrowserAttachAuthority(
     acquisitionOnlyCleanup && !exactPendingAcquisitionAuthority;
   let cleanupRetryMode: "finalize" | "abort" | null = automaticAcquisitionCleanupMode;
   if (!cleanupRetryMode && !malformedAcquisitionOnlyCleanup) {
-    if (metadata.status === "completed" && persistedCleanupMode === "abort") {
+    if (persistedCleanupMode === "abort") {
       cleanupRetryMode = "abort";
     } else if (
       completedCleanupAcknowledged &&
@@ -232,6 +243,7 @@ export async function orchestrateBrowserAttachAuthority(
     Boolean(runtime) &&
     hasFallbackSessionInfo &&
     hasRecoverableConversation &&
+    persistedCleanupMode !== "abort" &&
     !explicitlyNonRecoverable &&
     disconnectRecoveryAuthorized &&
     !workerAlive &&
@@ -289,7 +301,12 @@ export async function orchestrateBrowserAttachAuthority(
       },
     );
     authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
-    const answerText = reattachResult.answerMarkdown || reattachResult.answerText;
+    const capturedAnswer = reattachResult.answerMarkdown || reattachResult.answerText;
+    const journaledAnswer =
+      publicationJournal?.phase === "preparing"
+        ? await readDurableBrowserAnswer(publicationJournal.receipt)
+        : null;
+    const answerText = journaledAnswer ?? capturedAnswer;
     const outputTokens = estimateTokenCount(answerText);
     const usage = publicationJournal?.usage ?? {
       inputTokens: 0,
@@ -317,8 +334,7 @@ export async function orchestrateBrowserAttachAuthority(
         runtime: authoritativeRuntime,
       },
       existingArtifacts: metadata.artifacts,
-      prepareArtifacts: async () =>
-        saveReattachBrowserArtifacts(sessionId, metadata, reattachResult),
+      prepareArtifacts: async () => saveReattachBrowserArtifacts(sessionId, metadata, answerText),
       usage,
       response: { status: "completed" },
       model: metadata.model,
@@ -466,9 +482,8 @@ export function isDeepResearchToolCallPlaceholder(
 async function saveReattachBrowserArtifacts(
   sessionId: string,
   metadata: SessionMetadata,
-  result: { answerText: string; answerMarkdown: string },
+  body: string,
 ): Promise<SessionMetadata["artifacts"]> {
-  const body = result.answerMarkdown || result.answerText;
   const conversationUrl = metadata.browser?.runtime?.tabUrl;
   const logger = browserLogger();
   const reportArtifact = isDeepResearchBrowserSession(metadata)
@@ -491,7 +506,10 @@ async function saveReattachBrowserArtifacts(
   return appendArtifacts(metadata.artifacts, [reportArtifact, transcriptArtifact]);
 }
 
-function hasDurableBrowserAnswerReceipt(metadata: SessionMetadata): boolean {
+function hasDurableBrowserAnswerReceipt(
+  metadata: SessionMetadata,
+  expected?: DurableBrowserAnswerReceipt,
+): boolean {
   return Boolean(
     metadata.artifacts?.some(
       (artifact) =>
@@ -499,7 +517,11 @@ function hasDurableBrowserAnswerReceipt(metadata: SessionMetadata): boolean {
         artifact.label === "Durable browser answer" &&
         typeof artifact.sha256 === "string" &&
         artifact.sha256.length === 64 &&
-        typeof artifact.sizeBytes === "number",
+        typeof artifact.sizeBytes === "number" &&
+        (!expected ||
+          (artifact.path === expected.artifact.path &&
+            artifact.sha256 === expected.artifact.sha256 &&
+            artifact.sizeBytes === expected.artifact.sizeBytes)),
     ),
   );
 }

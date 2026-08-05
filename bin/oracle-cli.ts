@@ -78,7 +78,10 @@ import {
 } from "../src/cli/notifier.js";
 import { loadUserConfig, type UserConfig } from "../src/config.js";
 import { shouldBlockDuplicatePrompt } from "../src/cli/duplicatePromptGuard.js";
-import { resolveRemoteServiceConfig } from "../src/remote/remoteServiceConfig.js";
+import {
+  assertLoopbackRemoteBind,
+  resolveRemoteServiceConfig,
+} from "../src/remote/remoteServiceConfig.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
 import {
   isAzureOpenAICandidateModel,
@@ -169,6 +172,8 @@ interface CliOptions extends OptionValues {
   browserDebugPort?: number;
   remoteHost?: string;
   remoteToken?: string;
+  remoteLegacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
   youtube?: string;
   generateImage?: string;
   editImage?: string;
@@ -219,6 +224,8 @@ interface RestartCommandOptions {
   wait?: boolean;
   remoteHost?: string;
   remoteToken?: string;
+  remoteLegacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
 }
 
 const VERSION = getCliVersion();
@@ -865,11 +872,21 @@ program
   .addOption(
     new Option(
       "--remote-host <host:port>",
-      "Delegate browser runs to a remote `oracle serve` instance.",
+      "Delegate browser runs to a loopback `oracle serve` endpoint, normally through SSH.",
+    ),
+  )
+  .addOption(new Option("--remote-token <token>", "Modern v3 HMAC root key for `oracle serve`."))
+  .addOption(
+    new Option(
+      "--remote-legacy-token <token>",
+      "Bearer token scoped to an explicitly enabled predecessor text-only remote host.",
     ),
   )
   .addOption(
-    new Option("--remote-token <token>", "Access token for the remote `oracle serve` instance."),
+    new Option(
+      "--allow-legacy-text-protocol",
+      "Explicitly allow predecessor text-only remote protocol fallback (no artifact transfer).",
+    ).default(undefined),
   )
   .addOption(
     new Option(
@@ -961,10 +978,19 @@ Examples:
 
 program
   .command("serve")
-  .description("Run Oracle browser automation as a remote service for other machines.")
-  .option("--host <address>", "Interface to bind (default 0.0.0.0).")
+  .description(
+    "Run Oracle browser automation as a loopback-only remote service; use SSH tunneling between machines.",
+  )
+  .option(
+    "--host <address>",
+    "Loopback interface to bind (default 127.0.0.1; non-loopback addresses are rejected).",
+  )
   .option("--port <number>", "Port to listen on (default random).", parseIntOption)
-  .option("--token <value>", "Access token clients must provide (random if omitted).")
+  .option("--token <value>", "Modern v3 HMAC root key (random if omitted).")
+  .option(
+    "--legacy-token <value>",
+    "Distinct bearer token for opt-in predecessor text-only clients; never reuse --token.",
+  )
   .option(
     "--manual-login",
     "Use a dedicated Chrome profile for manual login (recommended when cookie sync is unavailable).",
@@ -976,10 +1002,20 @@ program
   )
   .action(async (commandOptions) => {
     const { serveRemote } = await import("../src/remote/server.js");
+    const host = commandOptions.host?.trim() || "127.0.0.1";
+    assertLoopbackRemoteBind(host);
+    const token = commandOptions.token?.trim() || undefined;
+    const legacyToken = commandOptions.legacyToken?.trim() || undefined;
+    if (token && legacyToken && token === legacyToken) {
+      throw new Error(
+        "Legacy text clients require a bearer credential distinct from the modern v3 HMAC root key.",
+      );
+    }
     await serveRemote({
-      host: commandOptions.host,
+      host,
       port: commandOptions.port,
-      token: commandOptions.token,
+      token,
+      legacyToken,
       manualLoginDefault: commandOptions.manualLogin,
       manualLoginProfileDir: commandOptions.manualLoginProfileDir,
     });
@@ -1105,9 +1141,18 @@ const bridgeCommand = program
 
 bridgeCommand
   .command("host")
-  .description("Start a secure oracle serve host (optionally with an SSH reverse tunnel).")
-  .option("--bind <host:port>", "Local bind address for the host service (default 127.0.0.1:9473).")
-  .option("--token <token|auto>", "Service access token (default auto).", "auto")
+  .description(
+    "Start a loopback-only oracle serve host, optionally exposed through an SSH reverse tunnel.",
+  )
+  .option(
+    "--bind <host:port>",
+    "Loopback bind address for the host service (default 127.0.0.1:9473; non-loopback rejected).",
+  )
+  .option("--token <token|auto>", "Modern v3 HMAC root key (default auto).", "auto")
+  .option(
+    "--legacy-token <token>",
+    "Distinct bearer token for predecessor text-only clients; never reuse --token.",
+  )
   .option(
     "--write-connection <path>",
     "Write a connection artifact JSON (default ~/.oracle/bridge-connection.json).",
@@ -1134,12 +1179,22 @@ bridgeCommand
   .description("Configure this machine to use a remote oracle serve host.")
   .requiredOption("--connect <connection>", "Connection string or path to bridge-connection.json.")
   .option(
+    "--legacy-token <token>",
+    "Distinct predecessor bearer required for explicit legacy text compatibility.",
+  )
+  .addOption(
+    new Option(
+      "--allow-legacy-text-protocol",
+      "Explicitly allow predecessor text-only protocol fallback; requires --legacy-token.",
+    ).default(undefined),
+  )
+  .option(
     "--config <path>",
     "Override the oracle config file location (default ~/.oracle/config.json).",
   )
   .option("--no-write-config", "Do not write ~/.oracle/config.json (just validate).")
   .option("--no-test", "Skip remote /health check.")
-  .option("--print-env", "Print env var exports (includes token).", false)
+  .option("--print-env", "Print env var exports (includes configured token(s)).", false)
   .action(async (commandOptions) => {
     const { runBridgeClient } = await import("../src/cli/bridge/client.js");
     await runBridgeClient(commandOptions);
@@ -1157,7 +1212,7 @@ bridgeCommand
 bridgeCommand
   .command("codex-config")
   .description("Print a Codex CLI MCP server config snippet for oracle-mcp.")
-  .option("--print-token", "Include ORACLE_REMOTE_TOKEN in the snippet.", false)
+  .option("--print-token", "Include configured remote token(s) in the snippet.", false)
   .action(async (commandOptions) => {
     const { runBridgeCodexConfig } = await import("../src/cli/bridge/codexConfig.js");
     await runBridgeCodexConfig(commandOptions);
@@ -1166,7 +1221,7 @@ bridgeCommand
 bridgeCommand
   .command("claude-config")
   .description("Print a Claude Code MCP config snippet (.mcp.json) for oracle-mcp.")
-  .option("--print-token", "Include ORACLE_REMOTE_TOKEN in the snippet.", false)
+  .option("--print-token", "Include configured remote token(s) in the snippet.", false)
   .option(
     "--local-browser",
     "Use a local signed-in Chrome profile instead of a remote bridge.",
@@ -1366,8 +1421,21 @@ program
   .description("Re-run a stored session as a new session (clones options).")
   .addOption(new Option("--wait").default(undefined))
   .addOption(new Option("--no-wait").default(undefined).hideHelp())
-  .option("--remote-host <host:port>", "Delegate browser runs to a remote `oracle serve` instance.")
-  .option("--remote-token <token>", "Access token for the remote `oracle serve` instance.")
+  .option(
+    "--remote-host <host:port>",
+    "Delegate browser runs to a loopback `oracle serve` endpoint.",
+  )
+  .option("--remote-token <token>", "Modern v3 HMAC root key for `oracle serve`.")
+  .option(
+    "--remote-legacy-token <token>",
+    "Bearer token scoped to an explicitly enabled predecessor text-only remote host.",
+  )
+  .addOption(
+    new Option(
+      "--allow-legacy-text-protocol",
+      "Explicitly allow predecessor text-only remote protocol fallback (no artifact transfer).",
+    ).default(undefined),
+  )
   .action(async (sessionId: string, _options: RestartCommandOptions, cmd: Command) => {
     const restartOptions = cmd.opts<RestartCommandOptions>();
     await restartSession(sessionId, restartOptions);
@@ -1833,11 +1901,15 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const remoteConfig = resolveRemoteServiceConfig({
     cliHost: options.remoteHost,
     cliToken: options.remoteToken,
+    cliLegacyToken: options.remoteLegacyToken,
+    cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
     userConfig,
     env: process.env,
   });
   const remoteHost = remoteConfig.host;
   const remoteToken = remoteConfig.token;
+  const remoteLegacyToken = remoteConfig.legacyToken;
+  const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
   if (remoteHost) {
     console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
   }
@@ -2319,7 +2391,12 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   if (browserConfig && remoteHost) {
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
     browserDeps = {
-      executeBrowser: createRemoteBrowserExecutor({ host: remoteHost, token: remoteToken }),
+      executeBrowser: createRemoteBrowserExecutor({
+        host: remoteHost,
+        token: remoteToken,
+        legacyToken: remoteLegacyToken,
+        allowLegacyTextProtocol,
+      }),
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && activeModel.startsWith("gemini")) {
@@ -2695,11 +2772,15 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   const remoteConfig = resolveRemoteServiceConfig({
     cliHost: options.remoteHost,
     cliToken: options.remoteToken,
+    cliLegacyToken: options.remoteLegacyToken,
+    cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
     userConfig,
     env: process.env,
   });
   const remoteHost = remoteConfig.host;
   const remoteToken = remoteConfig.token;
+  const remoteLegacyToken = remoteConfig.legacyToken;
+  const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
   if (remoteHost && engine !== "browser") {
     throw new Error("--remote-host requires a browser session.");
   }
@@ -2715,7 +2796,12 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   if (browserConfig && remoteHost) {
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
     browserDeps = {
-      executeBrowser: createRemoteBrowserExecutor({ host: remoteHost, token: remoteToken }),
+      executeBrowser: createRemoteBrowserExecutor({
+        host: remoteHost,
+        token: remoteToken,
+        legacyToken: remoteLegacyToken,
+        allowLegacyTextProtocol,
+      }),
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && runOptions.model.startsWith("gemini")) {

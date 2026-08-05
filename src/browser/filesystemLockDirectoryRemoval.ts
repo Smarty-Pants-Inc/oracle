@@ -162,13 +162,10 @@ function delay(ms) {
   return deferred.promise;
 }
 
-// Darwin /dev/fd entries expose synthetic fdescfs metadata and cannot be traversed. Each worker
-// instead starts in the already-opened directory, attests that kernel-bound cwd, and waits for go.
-async function runDarwinBoundDirectoryChild(
-  entryPath,
-  expectedIdentity,
-  expectedDevice,
-) {
+// Darwin fdesc paths are non-traversable, while Windows exposes no safe directory-open flags.
+// A recursively spawned worker binds each directory as its cwd, attests that exact generation,
+// and waits for go before mutating it.
+async function runBoundCwdDirectoryChild(entryPath, expectedIdentity, expectedDevice) {
   const token = randomUUID();
   const child = spawn(process.execPath, [...process.execArgv, token, "directory"], {
     cwd: entryPath,
@@ -262,7 +259,9 @@ async function deleteBoundDirectoryContents(
   expectedIdentity,
   expectedMountId,
 ) {
-  const directoryEntry = await directoryHandle.stat({ bigint: true });
+  const directoryEntry = process.platform === "win32"
+    ? await fs.lstat(".", { bigint: true })
+    : await directoryHandle.stat({ bigint: true });
   if (!sameIdentity(identity(directoryEntry), expectedIdentity)) {
     throw new Error("Bound removal directory generation changed before traversal");
   }
@@ -289,8 +288,13 @@ async function deleteBoundDirectoryContents(
 
     let childHandle;
     try {
-      childHandle = await fs.open(entryPath, directoryOpenFlags);
-      const childEntry = await childHandle.stat({ bigint: true });
+      let childEntry;
+      if (process.platform === "win32") {
+        childEntry = await fs.lstat(entryPath, { bigint: true });
+      } else {
+        childHandle = await fs.open(entryPath, directoryOpenFlags);
+        childEntry = await childHandle.stat({ bigint: true });
+      }
       if (!childEntry.isDirectory() || !sameIdentity(identity(before), identity(childEntry))) {
         throw new Error("Bound removal directory generation changed at " + entryPath);
       }
@@ -303,11 +307,7 @@ async function deleteBoundDirectoryContents(
       if (process.platform === "linux") {
         await deleteBoundDirectoryContents(childHandle, childIdentity, expectedMountId);
       } else {
-        await runDarwinBoundDirectoryChild(
-          entryPath,
-          childIdentity,
-          expectedIdentity.device,
-        );
+        await runBoundCwdDirectoryChild(entryPath, childIdentity, expectedIdentity.device);
       }
     } finally {
       await childHandle?.close();
@@ -322,14 +322,17 @@ async function deleteBoundDirectoryContents(
 }
 
 async function runDirectoryWorker(token) {
-  if (process.platform !== "darwin") {
-    throw new Error("Bound removal cwd worker is only available on Darwin");
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    throw new Error("Bound removal cwd worker is unavailable on this platform");
   }
   let directoryHandle;
   try {
     const pathEntry = await fs.lstat(".", { bigint: true });
-    directoryHandle = await fs.open(".", directoryOpenFlags);
-    const directoryEntry = await directoryHandle.stat({ bigint: true });
+    let directoryEntry = pathEntry;
+    if (process.platform !== "win32") {
+      directoryHandle = await fs.open(".", directoryOpenFlags);
+      directoryEntry = await directoryHandle.stat({ bigint: true });
+    }
     if (
       !directoryEntry.isDirectory() ||
       !sameIdentity(identity(pathEntry), identity(directoryEntry))
@@ -348,7 +351,9 @@ async function runDirectoryWorker(token) {
     await readGo(token);
 
     const currentPathEntry = await fs.lstat(".", { bigint: true });
-    const currentEntry = await directoryHandle.stat({ bigint: true });
+    const currentEntry = process.platform === "win32"
+      ? currentPathEntry
+      : await directoryHandle.stat({ bigint: true });
     if (
       !sameIdentity(identity(currentPathEntry), directoryIdentity) ||
       !sameIdentity(identity(currentEntry), directoryIdentity)
@@ -373,10 +378,14 @@ async function runRootWorker(token) {
   try {
     const rootPathEntry = await fs.lstat(".", { bigint: true });
     const generationPathEntry = await fs.lstat("generation", { bigint: true });
-    rootHandle = await fs.open(".", directoryOpenFlags);
-    generationHandle = await fs.open("generation", directoryOpenFlags);
-    const rootEntry = await rootHandle.stat({ bigint: true });
-    const generationEntry = await generationHandle.stat({ bigint: true });
+    let rootEntry = rootPathEntry;
+    let generationEntry = generationPathEntry;
+    if (process.platform !== "win32") {
+      rootHandle = await fs.open(".", directoryOpenFlags);
+      generationHandle = await fs.open("generation", directoryOpenFlags);
+      rootEntry = await rootHandle.stat({ bigint: true });
+      generationEntry = await generationHandle.stat({ bigint: true });
+    }
     try {
       if (process.platform === "linux") {
         const rootedRootEntry = await fs.stat(descriptorPath(rootHandle), { bigint: true });
@@ -436,8 +445,12 @@ async function runRootWorker(token) {
     if (currentEntries.length !== 1 || currentEntries[0] !== "generation") {
       throw new Error("Bound removal root changed after attestation");
     }
-    const currentRoot = await rootHandle.stat({ bigint: true });
-    const currentGeneration = await generationHandle.stat({ bigint: true });
+    const currentRoot = process.platform === "win32"
+      ? await fs.lstat(".", { bigint: true })
+      : await rootHandle.stat({ bigint: true });
+    const currentGeneration = process.platform === "win32"
+      ? await fs.lstat("generation", { bigint: true })
+      : await generationHandle.stat({ bigint: true });
     const currentGenerationPath = await fs.lstat("generation", { bigint: true });
     if (
       !sameIdentity(identity(currentRoot), rootIdentity) ||
@@ -454,13 +467,13 @@ async function runRootWorker(token) {
         generationMountId,
       );
     } else {
-      await runDarwinBoundDirectoryChild(
+      await runBoundCwdDirectoryChild(
         "generation",
         generationIdentity,
         generationIdentity.device,
       );
     }
-    await generationHandle.close();
+    await generationHandle?.close();
     generationHandle = undefined;
     const generationBeforeRemoval = await fs.lstat("generation", { bigint: true });
     if (!sameIdentity(identity(generationBeforeRemoval), generationIdentity)) {
@@ -484,8 +497,10 @@ async function runRootWorker(token) {
     throw new Error("Bound removal helper token is missing");
   }
   if (
-    (process.platform !== "linux" && process.platform !== "darwin") ||
-    !hasDirectoryCapabilityFlags
+    (process.platform !== "linux" &&
+      process.platform !== "darwin" &&
+      process.platform !== "win32") ||
+    (process.platform !== "win32" && !hasDirectoryCapabilityFlags)
   ) {
     throw new Error("Bound removal has no descriptor-rooted directory API on this platform");
   }
@@ -672,7 +687,24 @@ export async function removeIsolatedDirectoryGeneration(
     canonicalRootPath,
     journal.rootIdentity,
   );
-  if (rootStatus !== "matches") {
+  if (rootStatus === "missing") {
+    const racedCompletion = await readIsolatedDirectoryCleanupCompletion(completionPath, true);
+    if (racedCompletion !== null) {
+      assertCleanupCompletionMatchesJournal(racedCompletion, journal);
+      await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath);
+      return;
+    }
+    try {
+      await readIsolatedDirectoryCleanupJournal(journalPath);
+    } catch (error) {
+      if (readErrorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    throw new Error(
+      `Isolated cleanup root disappeared without a completion receipt at ${canonicalRootPath}; cleanup remains pending`,
+    );
+  }
+  if (rootStatus === "changed") {
     throw new Error(
       `Isolated cleanup root identity changed at ${canonicalRootPath}; cleanup remains pending`,
     );
@@ -735,9 +767,15 @@ export async function replayPendingIsolatedDirectoryRemovals(
   const rootPaths = new Set<string>();
   for (const authorityName of cleanupAuthorityNames) {
     const authorityPath = path.join(canonicalParentPath, authorityName);
-    const authority = authorityName.endsWith(ISOLATED_REMOVAL_JOURNAL_SUFFIX)
-      ? await readIsolatedDirectoryCleanupJournal(authorityPath)
-      : await readIsolatedDirectoryCleanupCompletion(authorityPath);
+    let authority: IsolatedDirectoryCleanupJournal | IsolatedDirectoryCleanupCompletion;
+    try {
+      authority = authorityName.endsWith(ISOLATED_REMOVAL_JOURNAL_SUFFIX)
+        ? await readIsolatedDirectoryCleanupJournal(authorityPath)
+        : await readIsolatedDirectoryCleanupCompletion(authorityPath);
+    } catch (error) {
+      if (readErrorCode(error) === "ENOENT") continue;
+      throw error;
+    }
     if (path.dirname(authority.rootPath) !== canonicalParentPath) {
       throw new Error(`Isolated cleanup authority escapes its parent directory: ${authorityPath}`);
     }

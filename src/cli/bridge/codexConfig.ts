@@ -18,6 +18,8 @@ export async function runBridgeCodexConfig(options: BridgeCodexConfigCliOptions)
   const snippet = formatCodexMcpSnippet({
     remoteHost: resolved.host,
     remoteToken: resolved.token,
+    remoteLegacyToken: resolved.legacyToken,
+    allowLegacyTextProtocol: resolved.allowLegacyTextProtocol,
     includeToken: Boolean(options.printToken),
   });
 
@@ -25,7 +27,7 @@ export async function runBridgeCodexConfig(options: BridgeCodexConfigCliOptions)
   if (!options.printToken) {
     console.error("");
     console.error(
-      chalk.dim("Tip: rerun with --print-token to include ORACLE_REMOTE_TOKEN in the snippet."),
+      chalk.dim("Tip: rerun with --print-token to include configured remote token(s)."),
     );
   }
 }
@@ -33,14 +35,35 @@ export async function runBridgeCodexConfig(options: BridgeCodexConfigCliOptions)
 export function formatCodexMcpSnippet({
   remoteHost,
   remoteToken,
+  remoteLegacyToken,
+  allowLegacyTextProtocol = false,
   includeToken,
 }: {
   remoteHost?: string;
   remoteToken?: string;
+  remoteLegacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
   includeToken: boolean;
 }): string {
   const hostValue = remoteHost ?? "127.0.0.1:9473";
-  const tokenValue = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+  const envEntries = [
+    `ORACLE_ENGINE = "browser"`,
+    `ORACLE_REMOTE_HOST = "${escapeTomlString(hostValue)}"`,
+  ];
+  if (remoteToken || !allowLegacyTextProtocol) {
+    const tokenValue = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+    envEntries.push(`ORACLE_REMOTE_TOKEN = "${escapeTomlString(tokenValue)}"`);
+  }
+  if (allowLegacyTextProtocol) {
+    const legacyTokenValue = includeToken
+      ? (remoteLegacyToken ?? "<YOUR_LEGACY_TOKEN>")
+      : "<YOUR_LEGACY_TOKEN>";
+    envEntries.push(
+      `ORACLE_REMOTE_LEGACY_TOKEN = "${escapeTomlString(legacyTokenValue)}"`,
+      `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL = "1"`,
+    );
+  }
+  const envValue = envEntries.join(", ");
 
   return [
     "# ~/.codex/config.toml",
@@ -48,13 +71,13 @@ export function formatCodexMcpSnippet({
     "[mcp.servers.oracle]",
     'command = "oracle-mcp"',
     "args = []",
-    `env = { ORACLE_ENGINE = "browser", ORACLE_REMOTE_HOST = "${escapeTomlString(hostValue)}", ORACLE_REMOTE_TOKEN = "${escapeTomlString(tokenValue)}" }`,
+    `env = { ${envValue} }`,
     "",
     "# If you prefer npx:",
     "# [mcp.servers.oracle]",
     '# command = "npx"',
     '# args = ["-y", "@steipete/oracle", "oracle-mcp"]',
-    `# env = { ORACLE_ENGINE = "browser", ORACLE_REMOTE_HOST = "${escapeTomlString(hostValue)}", ORACLE_REMOTE_TOKEN = "${escapeTomlString(tokenValue)}" }`,
+    `# env = { ${envValue} }`,
   ].join("\n");
 }
 

@@ -59,6 +59,16 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
         `remoteToken: ${resolvedRemote.token ? "set" : "missing"} (${resolvedRemote.sources.token})`,
       ),
     );
+    lines.push(
+      chalk.dim(
+        `remoteLegacyToken: ${resolvedRemote.legacyToken ? "set" : "missing"} (${resolvedRemote.sources.legacyToken})`,
+      ),
+    );
+    lines.push(
+      chalk.dim(
+        `legacy text fallback: ${resolvedRemote.allowLegacyTextProtocol ? "explicitly enabled" : "disabled"} (${resolvedRemote.sources.allowLegacyTextProtocol})`,
+      ),
+    );
 
     const tcp = await checkTcpConnection(resolvedRemote.host, 2000);
     if (tcp.ok) {
@@ -70,14 +80,19 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
       );
     }
 
-    if (!resolvedRemote.token) {
+    const hasUsableCredential =
+      Boolean(resolvedRemote.token) ||
+      Boolean(resolvedRemote.allowLegacyTextProtocol && resolvedRemote.legacyToken);
+    if (!hasUsableCredential) {
       fail.push(
-        "Remote token is missing. Run `oracle bridge client --connect <...> --write-config` or set ORACLE_REMOTE_TOKEN.",
+        "Remote credential is missing. Configure ORACLE_REMOTE_TOKEN for v3, or explicitly opt into predecessor text-only compatibility with ORACLE_REMOTE_LEGACY_TOKEN and ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1.",
       );
     } else if (tcp.ok) {
       const health = await checkRemoteHealth({
         host: resolvedRemote.host,
         token: resolvedRemote.token,
+        legacyToken: resolvedRemote.legacyToken,
+        allowLegacyTextProtocol: resolvedRemote.allowLegacyTextProtocol,
         timeoutMs: 5000,
       });
       if (health.ok) {
@@ -138,6 +153,8 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
     formatCodexMcpSnippet({
       remoteHost: resolvedRemote.host,
       remoteToken: resolvedRemote.token,
+      remoteLegacyToken: resolvedRemote.legacyToken,
+      allowLegacyTextProtocol: resolvedRemote.allowLegacyTextProtocol,
       includeToken: false,
     }),
   );
