@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import {
@@ -8,6 +8,12 @@ import {
   projectBrowserCaptureFinalization,
   projectBrowserRetryableCleanupRuntime,
 } from "../../src/browser/ownedBrowserResources.js";
+import {
+  __test__ as targetCloseAuthorityTest,
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "../../src/browser/targetCloseAuthority.js";
+import type { BrowserLogger } from "../../src/browser/types.js";
 
 const profileDirectory = {
   version: 1 as const,
@@ -56,6 +62,9 @@ function acquisitionRuntime(
 }
 
 describe("OwnedBrowserResourceTransaction", () => {
+  afterEach(() => {
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+  });
   it("persists acquisition intent before the effect and exact authority immediately after", async () => {
     const events: string[] = [];
     const persistRuntime = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
@@ -169,6 +178,52 @@ describe("OwnedBrowserResourceTransaction", () => {
     await expect(transaction.settle("finalize")).resolves.toMatchObject({ status: "completed" });
     expect(settleResources).toHaveBeenCalledTimes(2);
     expect(persistSettlementResult).toHaveBeenCalledTimes(2);
+  });
+
+  it("acknowledges terminal target authority only after cleanup state persists", async () => {
+    const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+    const logger = vi.fn<(message: string) => void>() as BrowserLogger;
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "generation-1",
+      targetId: "target-1",
+      close: closeTarget,
+    });
+    const runtime = acquisitionRuntime();
+    const resource = runtime.recoveryCleanupResources?.[0];
+    if (!resource) throw new Error("owned target fixture is missing");
+    runtime.recoveryCleanupResources = [{ ...resource, targetCloseCapability: capability }];
+    const persistSettlementResult = vi
+      .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
+      .mockRejectedValueOnce(new Error("completed runtime store unavailable"));
+    const transaction = new OwnedBrowserResourceTransaction(
+      {
+        persistRuntime: async () => undefined,
+        persistSettlementResult,
+        settleResources: async (_mode, pendingRuntime) => {
+          await closeChromeTargetWithRetainedCapability({
+            capability,
+            targetId: "target-1",
+            logger,
+          });
+          return completedBrowserCaptureCleanup(pendingRuntime);
+        },
+      },
+      runtime,
+    );
+
+    await expect(transaction.settle("finalize")).resolves.toMatchObject({ status: "pending" });
+    expect(targetCloseAuthorityTest.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(
+      0,
+    );
+    await expect(
+      closeChromeTargetWithRetainedCapability({ capability, targetId: "target-1", logger }),
+    ).resolves.toEqual({ status: "completed" });
+
+    await expect(transaction.settle("finalize")).resolves.toMatchObject({ status: "completed" });
+    expect(targetCloseAuthorityTest.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(
+      1,
+    );
+    expect(closeTarget).toHaveBeenCalledOnce();
   });
 
   it("preserves authoritative prompt epoch and conversation identity through resource settlement", () => {

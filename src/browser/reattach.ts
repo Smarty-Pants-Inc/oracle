@@ -9,9 +9,11 @@ import {
   waitForResumedConversationHydration,
   verifyCommittedPromptTurn,
 } from "./pageActions.js";
+import { recoverCommittedGeminiDeepThinkResponse } from "./providers/geminiDeepThinkDomProvider.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
+import { resolveGeminiWebModel } from "../gemini-web/models.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 import {
   extractConversationIdFromUrl,
@@ -22,6 +24,7 @@ import {
   waitForLocationChange,
   type TargetInfoLite,
 } from "./reattachHelpers.js";
+import { delay } from "./utils.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import {
   defaultRecoveryLockPath,
@@ -45,6 +48,7 @@ import {
   pickTarget,
   selectTarget,
   type ExplicitTargetSelectionFailure,
+  type TargetSelection,
 } from "./reattachTargetSelection.js";
 import {
   exactOwnedTargetGeneration,
@@ -107,6 +111,57 @@ async function classifyReattachFailure<T>(
   }
 }
 
+function isGeminiAppUrl(candidate: string | null | undefined): boolean {
+  if (!candidate) return false;
+  try {
+    const url = new URL(candidate);
+    return (
+      url.protocol === "https:" &&
+      !url.port &&
+      url.hostname === "gemini.google.com" &&
+      (url.pathname === "/app" || url.pathname.startsWith("/app/"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function selectGeminiRecoveryTarget(
+  targets: TargetInfoLite[],
+  runtime: BrowserRuntimeMetadata,
+  browserTabRef?: string,
+): TargetSelection {
+  const targetIds = new Set(
+    [
+      runtime.chromeTargetId,
+      ...(runtime.recoveryCleanupResources ?? []).map((resource) => resource.chromeTargetId),
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+  );
+  if (targetIds.size !== 1) {
+    return { status: targetIds.size > 1 ? "ambiguous" : "missing" };
+  }
+  const targetId = targetIds.values().next().value;
+  if (!targetId) return { status: "missing" };
+  if (
+    runtime.promptEpoch?.status !== "committed" ||
+    runtime.promptEpoch.conversationId !== targetId
+  ) {
+    return { status: "mismatched" };
+  }
+  const exactTargets = targets.filter((target) => (target.targetId ?? target.id) === targetId);
+  if (exactTargets.length !== 1) {
+    return { status: exactTargets.length > 1 ? "ambiguous" : "missing" };
+  }
+  const target = exactTargets[0];
+  if (target.type && target.type !== "page") return { status: "mismatched" };
+  if (!isGeminiAppUrl(target.url)) return { status: "mismatched" };
+  if (browserTabRef) {
+    if (browserTabRef.toLowerCase() === "current") return { status: "unsupported" };
+    if (browserTabRef !== targetId && browserTabRef !== target.url) return { status: "mismatched" };
+  }
+  return { status: "selected", target, targetId };
+}
+
 export async function resumeBrowserSession(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
@@ -114,6 +169,8 @@ export async function resumeBrowserSession(
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
   const explicitTabRef = config?.browserTabRef?.trim() || undefined;
+  const geminiDeepThinkRecovery =
+    resolveGeminiWebModel(config?.desiredModel) === "gemini-3-pro-deep-think";
   const initialRemoteRecovery = findRemoteRecoveryAuthority(runtime);
   if (initialRemoteRecovery && explicitTabRef) {
     throw explicitTargetAuthorityError(
@@ -164,6 +221,17 @@ export async function resumeBrowserSession(
     reason: string,
     authoritativeRuntime: BrowserRuntimeMetadata = runtime,
   ): Promise<ReattachResult> => {
+    if (geminiDeepThinkRecovery) {
+      throw new BrowserAutomationError(
+        `Exact Gemini reattach cannot reopen or resubmit the accepted prompt after ${classification}: ${reason}`,
+        {
+          stage: "gemini-response-capture",
+          code: "gemini-reattach-authority-unavailable",
+          reattachable: classification === "recoverable-transport",
+          runtime: authoritativeRuntime,
+        },
+      );
+    }
     if (explicitTabRef) {
       throw explicitTargetAuthorityError(
         explicitTabRef,
@@ -262,7 +330,9 @@ export async function resumeBrowserSession(
         "Unable to list targets from the recorded Chrome endpoint.",
         listTargets,
       );
-      const selection = selectTarget(targetList, liveRuntime, explicitTabRef);
+      const selection = geminiDeepThinkRecovery
+        ? selectGeminiRecoveryTarget(targetList, liveRuntime, explicitTabRef)
+        : selectTarget(targetList, liveRuntime, explicitTabRef);
       if (selection.status !== "selected") {
         if (explicitTabRef) {
           const descriptions: Record<ExplicitTargetSelectionFailure, string> = {
@@ -275,6 +345,17 @@ export async function resumeBrowserSession(
             explicitTabRef,
             selection.status,
             `Explicit browser tab ${explicitTabRef} ${descriptions[selection.status]}.`,
+          );
+        }
+        if (geminiDeepThinkRecovery) {
+          throw new BrowserAutomationError(
+            "The exact Gemini target is unavailable or no longer belongs to the committed prompt authority.",
+            {
+              stage: "gemini-response-capture",
+              code: "gemini-reattach-target-mismatch",
+              reattachable: selection.status === "missing",
+              runtime: liveRuntime,
+            },
           );
         }
         liveRuntime = { ...liveRuntime, chromeTargetId: undefined };
@@ -319,6 +400,73 @@ export async function resumeBrowserSession(
           if (Page && typeof Page.enable === "function") await Page.enable();
         },
       );
+      if (geminiDeepThinkRecovery) {
+        const timeoutMs = config?.timeoutMs ?? 120_000;
+        const pingTimeoutMs = Math.min(5_000, Math.max(1_500, Math.floor(timeoutMs * 0.05)));
+        await classifyReattachFailure(
+          "recoverable-transport",
+          `Gemini target ${targetId} did not respond to the reattach probe.`,
+          async () =>
+            withTimeout(
+              Runtime.evaluate({ expression: "1+1", returnByValue: true }),
+              pingTimeoutMs,
+              "Gemini reattach target did not respond",
+            ),
+        );
+        let answer: { text: string };
+        try {
+          answer = await recoverCommittedGeminiDeepThinkResponse(
+            {
+              evaluate: async <T>(expression: string): Promise<T | undefined> => {
+                const evaluation = await Runtime.evaluate({
+                  expression,
+                  returnByValue: true,
+                  awaitPromise: true,
+                });
+                if (evaluation.exceptionDetails) {
+                  const detail =
+                    evaluation.exceptionDetails.exception?.description ??
+                    evaluation.exceptionDetails.text ??
+                    "unknown exception";
+                  throw new Error(`Gemini reattach DOM evaluation failed: ${detail}`);
+                }
+                return evaluation.result?.value as T | undefined;
+              },
+              delay,
+              log: logger,
+            },
+            promptLocator,
+            timeoutMs,
+          );
+        } catch (error) {
+          if (error instanceof BrowserAutomationError) {
+            throw new BrowserAutomationError(
+              error.message,
+              { ...error.details, runtime: liveRuntime },
+              error,
+            );
+          }
+          throw new BrowserAutomationError(
+            error instanceof Error ? error.message : String(error),
+            {
+              stage: "gemini-response-capture",
+              code: "gemini-reattach-capture-pending",
+              reattachable: true,
+              runtime: liveRuntime,
+            },
+            error,
+          );
+        }
+        await closeAttached();
+        return buildResult(
+          {
+            answerText: answer.text,
+            answerMarkdown: answer.text,
+            runtime: liveRuntime,
+          },
+          liveRuntime,
+        );
+      }
 
       const ensureConversationOpen = async () => {
         const { result } = await Runtime.evaluate({

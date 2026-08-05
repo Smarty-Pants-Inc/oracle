@@ -4,6 +4,8 @@ import {
   promptIdentitySha256,
   type PromptCommitVerification,
 } from "../actions/promptComposer.js";
+import type { CommittedPromptEpochLocator } from "../reattachability.js";
+import { BrowserAutomationError } from "../../oracle/errors.js";
 import type {
   PromptCommitEvidence,
   ProviderDomAdapter,
@@ -18,7 +20,7 @@ interface GeminiPromptBaseline {
   userQueryCount: number;
   responseCount: number;
   normalizedPrompt: string;
-  userStableId: string;
+  userStableId: string | null;
 }
 
 interface GeminiDomProviderState {
@@ -126,7 +128,7 @@ function parseSubmissionProbe(
 ): {
   baseline: GeminiPromptBaseline | null;
   sendResult: string;
-  bindingStatus: "bound" | "ambiguous" | "missing-stable-id" | "prompt-mismatch" | "timeout";
+  bindingStatus: "bound" | "accepted" | "ambiguous" | "prompt-mismatch" | "timeout";
 } {
   try {
     const decoded: unknown = JSON.parse(payload ?? "{}");
@@ -153,11 +155,11 @@ function parseSubmissionProbe(
     ) {
       throw new Error("invalid submission probe");
     }
-    let bindingStatus: "bound" | "ambiguous" | "missing-stable-id" | "prompt-mismatch" | "timeout";
+    let bindingStatus: "bound" | "accepted" | "ambiguous" | "prompt-mismatch" | "timeout";
     switch (decoded.bindingStatus) {
       case "bound":
+      case "accepted":
       case "ambiguous":
-      case "missing-stable-id":
       case "prompt-mismatch":
       case "timeout":
         bindingStatus = decoded.bindingStatus;
@@ -166,18 +168,19 @@ function parseSubmissionProbe(
         throw new Error("invalid submission probe");
     }
     const stableId = typeof userStableId === "string" && userStableId.trim() ? userStableId : null;
-    if (bindingStatus === "bound" && !stableId) {
-      throw new Error("bound submission omitted stable identity");
+    if ((bindingStatus === "bound") !== Boolean(stableId)) {
+      throw new Error("submission identity does not match binding status");
     }
     return {
-      baseline: stableId
-        ? {
-            userQueryCount,
-            responseCount,
-            normalizedPrompt: normalizePromptForIdentity(prompt),
-            userStableId: stableId,
-          }
-        : null,
+      baseline:
+        bindingStatus === "bound" || bindingStatus === "accepted"
+          ? {
+              userQueryCount,
+              responseCount,
+              normalizedPrompt: normalizePromptForIdentity(prompt),
+              userStableId: stableId,
+            }
+          : null,
       sendResult,
       bindingStatus,
     };
@@ -254,29 +257,41 @@ function findCausallyPairedResponse(
   entries: GeminiRawTurnDescriptor[],
   baseline: GeminiPromptBaseline,
 ): GeminiResponsePairing {
-  const boundUserIndexes: number[] = [];
-  for (const [index, entry] of entries.entries()) {
-    if (entry.kind === "user" && entry.stableId === baseline.userStableId) {
-      boundUserIndexes.push(index);
+  let submittedUserIndex: number;
+  if (baseline.userStableId) {
+    const boundUserIndexes: number[] = [];
+    for (const [index, entry] of entries.entries()) {
+      if (entry.kind === "user" && entry.stableId === baseline.userStableId) {
+        boundUserIndexes.push(index);
+      }
     }
+    if (boundUserIndexes.length > 1) {
+      return {
+        status: "unsupported",
+        reason: "Gemini rendered the dispatched user message identity more than once.",
+      };
+    }
+    if (boundUserIndexes.length === 0) return { status: "waiting" };
+    submittedUserIndex = boundUserIndexes[0];
+  } else {
+    submittedUserIndex = baseline.userQueryCount + baseline.responseCount;
   }
-  if (boundUserIndexes.length > 1) {
-    return {
-      status: "unsupported",
-      reason: "Gemini rendered the dispatched user message identity more than once.",
-    };
-  }
-  if (boundUserIndexes.length === 0) return { status: "waiting" };
 
-  const submittedUserIndex = boundUserIndexes[0];
   const submittedUser = entries[submittedUserIndex];
+  if (!submittedUser) return { status: "waiting" };
   if (
+    submittedUser.kind !== "user" ||
     !submittedUser.postBaseline ||
     normalizePromptForIdentity(submittedUser.text) !== baseline.normalizedPrompt
   ) {
-    return { status: "waiting" };
+    return baseline.userStableId
+      ? { status: "waiting" }
+      : {
+          status: "unsupported",
+          reason:
+            "Gemini no longer exposes the exact accepted current turn at its committed DOM position.",
+        };
   }
-
   const completedResponses: Array<GeminiRawTurnDescriptor & { kind: "response" }> = [];
   for (let index = submittedUserIndex + 1; index < entries.length; index += 1) {
     const entry = entries[index];
@@ -446,7 +461,6 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
       let sendResult = 'not-found';
       let finished = false;
       let candidateTimer;
-      let sawMatchingTurnWithoutStableId = false;
       let timeout;
       const observer = new MutationObserver(() => inspect());
       const finish = (bindingStatus, userStableId = null) => {
@@ -493,11 +507,7 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
         }
         if (text !== expectedPrompt) return;
         const stableId = readStableId(turn);
-        if (stableId) {
-          scheduleFinish('bound', stableId);
-          return;
-        }
-        sawMatchingTurnWithoutStableId = true;
+        scheduleFinish(stableId ? 'bound' : 'accepted', stableId);
       }
       const root = document.documentElement ?? document.body;
       if (root) {
@@ -526,10 +536,7 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
         return promise;
       }
       inspect();
-      timeout = setTimeout(
-        () => finish(sawMatchingTurnWithoutStableId ? 'missing-stable-id' : 'timeout'),
-        ${bindingTimeoutMs},
-      );
+      timeout = setTimeout(() => finish('timeout'), ${bindingTimeoutMs});
       return promise;
     })()`,
   );
@@ -542,15 +549,13 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
       "Gemini mounted multiple post-baseline user turns; exact dispatch ownership is ambiguous.",
     );
   }
-  if (submission.bindingStatus === "missing-stable-id") {
-    throw new Error(
-      "Gemini user turn lacks a stable provider message identifier; this Gemini UI is unsupported.",
-    );
-  }
   if (submission.bindingStatus === "prompt-mismatch") {
     throw new Error("Gemini mounted a different post-baseline user turn after this dispatch.");
   }
-  if (submission.bindingStatus !== "bound" || !submission.baseline) {
+  if (
+    (submission.bindingStatus !== "bound" && submission.bindingStatus !== "accepted") ||
+    !submission.baseline
+  ) {
     throw new Error("Failed to bind Gemini response to the newly submitted user turn.");
   }
   const state = requireGeminiState(ctx);
@@ -558,12 +563,19 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
   if (!conversationId) {
     throw new Error("Gemini Deep Think prompt binding requires a stable conversation identity.");
   }
+  const promptSha256 = promptIdentitySha256(ctx.prompt);
+  const verifiedUserTurnIndex =
+    submission.baseline.userQueryCount + submission.baseline.responseCount;
+  // Some Gemini builds omit provider ids. The unique post-baseline DOM position plus
+  // the committed prompt hash is still exact authority and survives in this synthetic id.
+  const verifiedUserTurnId =
+    submission.baseline.userStableId ?? `gemini-dom-turn:${verifiedUserTurnIndex}:${promptSha256}`;
   const verification: PromptCommitVerification = {
-    committedTurns: submission.baseline.userQueryCount + submission.baseline.responseCount + 1,
-    promptSha256: promptIdentitySha256(ctx.prompt),
-    verifiedUserTurnIndex: submission.baseline.userQueryCount + submission.baseline.responseCount,
-    verifiedUserTurnId: submission.baseline.userStableId,
-    verifiedUserMessageId: submission.baseline.userStableId,
+    committedTurns: verifiedUserTurnIndex + 1,
+    promptSha256,
+    verifiedUserTurnIndex,
+    verifiedUserTurnId,
+    verifiedUserMessageId: verifiedUserTurnId,
     conversationId,
   };
   state.geminiPromptBaseline = submission.baseline;
@@ -726,6 +738,99 @@ async function extractThoughts(ctx: ProviderDomFlowContext): Promise<string | nu
     extracted.text.length > 0
     ? extracted.text
     : null;
+}
+
+export async function recoverCommittedGeminiDeepThinkResponse(
+  ctx: Pick<ProviderDomFlowContext, "evaluate" | "delay" | "log">,
+  promptLocator: CommittedPromptEpochLocator,
+  timeoutMs: number,
+): Promise<{ text: string }> {
+  const responseTurnSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseTurn);
+  const responseTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseText);
+  const responseCompleteSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseComplete);
+  const spinnerSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.spinner);
+  const userQuerySel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
+  const userQueryTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQueryText);
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
+
+  while (Date.now() < deadline) {
+    const payload = await ctx.evaluate<string>(
+      `(() => {
+        ${GEMINI_STABLE_ID_READER}
+        const isVisible = (element) => {
+          if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') return false;
+          const rect = typeof element.getBoundingClientRect === 'function'
+            ? element.getBoundingClientRect()
+            : null;
+          return !rect || (rect.width > 0 && rect.height > 0);
+        };
+        const userTurns = Array.from(document.querySelectorAll(${userQuerySel}));
+        const responseTurns = Array.from(document.querySelectorAll(${responseTurnSel}));
+        const ordered = [
+          ...userTurns.map((node) => ({
+            node,
+            kind: 'user',
+            postBaseline: true,
+            text: node.querySelector(${userQueryTextSel})?.textContent ?? node.textContent ?? '',
+            stableId: readStableId(node),
+          })),
+          ...responseTurns.map((node) => ({
+            node,
+            kind: 'response',
+            postBaseline: true,
+            text: node.querySelector(${responseTextSel})?.textContent ?? '',
+            stableId: readStableId(node),
+            completionMarked: Boolean(node.querySelector(${responseCompleteSel})),
+            visibleSpinner: Array.from(node.querySelectorAll(${spinnerSel})).some(isVisible),
+          })),
+        ].sort((left, right) => {
+          if (left.node === right.node) return 0;
+          return left.node.compareDocumentPosition(right.node) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+        });
+        return JSON.stringify({ entries: ordered.map(({ node, ...entry }) => entry) });
+      })()`,
+    );
+    const entries = parseResponseProbe(payload);
+    if (entries) {
+      const submittedUser = entries[promptLocator.verifiedUserTurnIndex];
+      if (submittedUser) {
+        if (
+          submittedUser.kind !== "user" ||
+          promptIdentitySha256(submittedUser.text) !== promptLocator.promptSha256
+        ) {
+          throw new BrowserAutomationError(
+            "Recovered Gemini turn does not match the committed prompt epoch.",
+            { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+          );
+        }
+        const completedResponses: Array<GeminiRawTurnDescriptor & { kind: "response" }> = [];
+        for (
+          let index = promptLocator.verifiedUserTurnIndex + 1;
+          index < entries.length;
+          index += 1
+        ) {
+          const entry = entries[index];
+          if (entry.kind === "user") break;
+          if (isCompletedGeminiResponse(entry)) completedResponses.push(entry);
+        }
+        if (completedResponses.length > 1) {
+          throw new BrowserAutomationError(
+            "Gemini exposes multiple completed responses for the committed prompt epoch.",
+            {
+              stage: "gemini-response-capture",
+              code: "gemini-response-ownership-ambiguous",
+              reattachable: false,
+            },
+          );
+        }
+        if (completedResponses.length === 1) {
+          return { text: completedResponses[0].text.trim() };
+        }
+      }
+    }
+    await ctx.delay(1_000);
+  }
+  throw new Error("Timed out waiting for the committed Gemini response during reattach.");
 }
 
 export const geminiDeepThinkDomProvider: ProviderDomAdapter = {

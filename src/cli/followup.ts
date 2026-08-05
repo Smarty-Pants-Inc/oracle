@@ -19,9 +19,47 @@ export interface FollowupSessionReader {
 
 const EXACT_CONVERSATION_ID = /^[a-zA-Z0-9-]+$/;
 
+/** Pre-epoch sessions identify the ChatGPT browser provider only through mode and model. */
+function isLegacyChatGptBrowserSession(metadata: SessionMetadata): boolean {
+  const metadataMode: unknown = metadata.mode;
+  const optionsMode: unknown = metadata.options?.mode;
+  if (metadataMode === undefined && optionsMode === undefined) return false;
+  if (
+    (metadataMode !== undefined && metadataMode !== "browser") ||
+    (optionsMode !== undefined && optionsMode !== "browser")
+  ) {
+    return false;
+  }
+
+  const rawMetadataModel: unknown = metadata.model;
+  const rawOptionsModel: unknown = metadata.options?.model;
+  const metadataModel =
+    typeof rawMetadataModel === "string" && rawMetadataModel.trim()
+      ? rawMetadataModel.trim().toLowerCase()
+      : undefined;
+  const optionsModel =
+    typeof rawOptionsModel === "string" && rawOptionsModel.trim()
+      ? rawOptionsModel.trim().toLowerCase()
+      : undefined;
+  if (
+    (rawMetadataModel !== undefined && !metadataModel) ||
+    (rawOptionsModel !== undefined && !optionsModel)
+  ) {
+    return false;
+  }
+  if (
+    (!metadataModel && !optionsModel) ||
+    (metadataModel && optionsModel && metadataModel !== optionsModel)
+  ) {
+    return false;
+  }
+  const model = optionsModel ?? metadataModel;
+  return Boolean(model?.startsWith("gpt-") && !model.includes("codex"));
+}
+
 /** Legacy metadata may authorize only a conversation URL for a new run, never old cleanup state. */
 function resolveCompletedLegacyConversationUrl(metadata: SessionMetadata): string | null {
-  if (metadata.status !== "completed") return null;
+  if (metadata.status !== "completed" || !isLegacyChatGptBrowserSession(metadata)) return null;
   const runtime = metadata.browser?.runtime;
   if (!runtime || runtime.promptEpoch !== undefined) return null;
 

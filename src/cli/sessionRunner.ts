@@ -649,6 +649,11 @@ export async function performSessionRun({
     const assistantTimeout =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "assistant-timeout";
+    const geminiCaptureFailure =
+      userError?.category === "browser-automation" &&
+      (userError.details as { stage?: string; reattachable?: boolean } | undefined)?.stage ===
+        "gemini-response-capture" &&
+      (userError.details as { reattachable?: boolean } | undefined)?.reattachable === true;
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
@@ -674,24 +679,30 @@ export async function performSessionRun({
       reattachGuidanceLogged = true;
       log(formatBrowserReattachGuidance(sessionMeta.id));
     };
-    if (connectionLost && mode === "browser" && browserCanReattach) {
+    if ((connectionLost || geminiCaptureFailure) && mode === "browser" && browserCanReattach) {
       const runtime = errorBrowserRuntime;
       const recoverableRuntime = runtime ?? currentBrowser?.runtime;
-      const recoverableDisconnect =
-        (userError.details as { recoverableDisconnect?: boolean } | undefined)
-          ?.recoverableDisconnect === true;
+      const recoveryAuthorized = geminiCaptureFailure
+        ? (userError.details as { reattachable?: boolean } | undefined)?.reattachable === true
+        : (userError.details as { recoverableDisconnect?: boolean } | undefined)
+            ?.recoverableDisconnect === true;
       const hasRecoveryAuthority = hasResumableBrowserAuthority(recoverableRuntime);
-      if (!recoverableDisconnect || !hasRecoveryAuthority) {
+      if (!recoveryAuthorized || !hasRecoveryAuthority) {
         log(
           dim(
-            "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
+            geminiCaptureFailure
+              ? "Gemini capture failed without resumable committed-prompt authority; marking session error."
+              : "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
           ),
         );
         if (modelForStatus) {
           await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
             status: "error",
             completedAt: new Date().toISOString(),
-            response: { status: "error", incompleteReason: "chrome-disconnected" },
+            response: {
+              status: "error",
+              incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
+            },
             error: {
               category: userError.category,
               message: userError.message,
@@ -709,7 +720,10 @@ export async function performSessionRun({
             config: browserConfig,
             runtime: recoverableRuntime,
           },
-          response: { status: "error", incompleteReason: "chrome-disconnected" },
+          response: {
+            status: "error",
+            incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
+          },
           error: {
             category: userError.category,
             message: userError.message,
@@ -718,7 +732,13 @@ export async function performSessionRun({
         });
         throw error;
       }
-      log(dim("Chrome disconnected before completion; keeping session running for reattach."));
+      log(
+        dim(
+          geminiCaptureFailure
+            ? "Gemini response capture remains incomplete; keeping session running for exact reattach."
+            : "Chrome disconnected before completion; keeping session running for reattach.",
+        ),
+      );
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "running",
@@ -734,14 +754,15 @@ export async function performSessionRun({
           config: browserConfig,
           runtime: recoverableRuntime,
         },
-        response: { status: "running", incompleteReason: "chrome-disconnected" },
+        response: {
+          status: "running",
+          incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
+        },
       });
       logBrowserReattachGuidance(recoverableRuntime);
-      // Connection-lost should attempt the same recovery path as assistant-timeout.
-      // When auto-reattach interval is unset, still try a single resume so a live
-      // Chrome/target can be harvested instead of leaving the session permanently running.
+      // A live committed target gets one immediate harvest attempt even without a configured loop.
       const configuredIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
-      const connectionLostIntervalMs =
+      const recoveryIntervalMs =
         configuredIntervalMs > 0
           ? configuredIntervalMs
           : Math.max(1_000, Math.min(browserConfig?.timeoutMs ?? 30_000, 30_000));
@@ -750,7 +771,7 @@ export async function performSessionRun({
         runtime: recoverableRuntime ?? undefined,
         browserConfig: {
           ...browserConfig,
-          autoReattachIntervalMs: connectionLostIntervalMs,
+          autoReattachIntervalMs: recoveryIntervalMs,
           autoReattachDelayMs: browserConfig?.autoReattachDelayMs ?? 0,
           autoReattachTimeoutMs:
             browserConfig?.autoReattachTimeoutMs ?? browserConfig?.timeoutMs ?? 120_000,
@@ -775,7 +796,10 @@ export async function performSessionRun({
           errorMessage: message,
           mode,
           browser: currentBrowser,
-          response: { status: "running", incompleteReason: "chrome-disconnected" },
+          response: {
+            status: "running",
+            incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
+          },
         });
       }
       return;

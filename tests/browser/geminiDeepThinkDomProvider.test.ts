@@ -26,7 +26,7 @@ type GeminiState = Record<string, unknown> & {
     userQueryCount: number;
     responseCount: number;
     normalizedPrompt: string;
-    userStableId: string;
+    userStableId: string | null;
   };
   geminiPromptCommitVerification?: PromptCommitVerification;
   geminiResponseStableId?: string;
@@ -308,16 +308,44 @@ describe("geminiDeepThinkDomProvider", () => {
     );
   });
 
-  it("fails unsupported when the mounted Gemini user turn has no stable provider id", async () => {
+  it("commits and captures the exact accepted Gemini turn without a provider id", async () => {
     const turns: FixtureTurn[] = [];
-    const ctx = createContext(turns, { inputTimeoutMs: 1_000 }, (notify) => {
+    const state: GeminiState = { inputTimeoutMs: 1_000, timeoutMs: 1_000 };
+    const ctx = createContext(turns, state, (notify) => {
       turns.push({ kind: "user", order: 1, text: "new request" });
       notify();
     });
+    const promptSha256 = promptIdentitySha256("New request");
+    const verifiedUserTurnId = `gemini-dom-turn:0:${promptSha256}`;
 
-    await expect(geminiDeepThinkDomProvider.submitPrompt(ctx)).rejects.toThrow(
-      "lacks a stable provider message identifier",
-    );
+    await expect(geminiDeepThinkDomProvider.submitPrompt(ctx)).resolves.toEqual({
+      status: "committed",
+      verification: {
+        committedTurns: 1,
+        promptSha256,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId,
+        verifiedUserMessageId: verifiedUserTurnId,
+        conversationId: "gemini-conversation",
+      },
+    });
+    expect(state.geminiPromptBaseline).toEqual({
+      userQueryCount: 0,
+      responseCount: 0,
+      normalizedPrompt: "new request",
+      userStableId: null,
+    });
+
+    turns.push({
+      kind: "response",
+      order: 2,
+      text: "accepted answer",
+      stableId: "response-current",
+      complete: true,
+    });
+    await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).resolves.toEqual({
+      text: "accepted answer",
+    });
   });
 
   it("rejects stale and later-turn responses while publishing only the exact current answer", async () => {

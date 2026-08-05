@@ -11,7 +11,12 @@ const stripAnsi = (text: string): string => text.replace(ansiRegex, "");
 
 vi.mock("../../src/remote/health.js", () => ({
   checkTcpConnection: vi.fn(async () => ({ ok: true })),
-  checkRemoteHealth: vi.fn(async () => ({ ok: true, version: "test", uptimeSeconds: 1 })),
+  checkRemoteHealth: vi.fn(async () => ({
+    ok: true,
+    protocol: "transaction-v3",
+    version: "test",
+    uptimeSeconds: 1,
+  })),
 }));
 
 vi.mock("../../src/browser/detect.js", () => ({
@@ -21,6 +26,7 @@ vi.mock("../../src/browser/detect.js", () => ({
 
 import { runBridgeDoctor } from "../../src/cli/bridge/doctor.js";
 import { runBridgeClient } from "../../src/cli/bridge/client.js";
+import { checkRemoteHealth } from "../../src/remote/health.js";
 
 describe("oracle bridge doctor", () => {
   let tempDir: string;
@@ -62,6 +68,7 @@ describe("oracle bridge doctor", () => {
     expect(output).toMatch(/Remote service:\s+configured/i);
     expect(output).toMatch(/TCP connect:\s+ok/i);
     expect(output).toContain("Auth (/health):");
+    expect(output).toMatch(/Negotiated protocol:\s+transaction-v3/i);
     expect(process.exitCode ?? 0).toBe(0);
   });
 
@@ -81,6 +88,12 @@ describe("oracle bridge doctor", () => {
       ),
       "utf8",
     );
+    vi.mocked(checkRemoteHealth).mockResolvedValueOnce({
+      ok: true,
+      protocol: "legacy-text-v1",
+      version: "legacy-test",
+      uptimeSeconds: 1,
+    });
 
     const logs: string[] = [];
     vi.spyOn(console, "log").mockImplementation((msg) => logs.push(String(msg)));
@@ -90,6 +103,7 @@ describe("oracle bridge doctor", () => {
     const output = stripAnsi(logs.join("\n"));
     expect(output).toMatch(/remoteLegacyToken:\s+set/i);
     expect(output).toMatch(/legacy text fallback:\s+explicitly enabled/i);
+    expect(output).toMatch(/Negotiated protocol:\s+legacy-text-v1/i);
     expect(output).not.toMatch(/Problems:/i);
     expect(process.exitCode ?? 0).toBe(0);
   });

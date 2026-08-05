@@ -89,7 +89,7 @@ describe("browser coordinator public settlement", () => {
     expect(finalize).not.toHaveBeenCalled();
   });
 
-  test("returns the captured answer without publishing pending cleanup authority", async () => {
+  test("retains a non-durable same-process retry when public cleanup remains pending", async () => {
     const runtime: BrowserRunTransaction["runtime"] = {
       chromeHost: "remote.example",
       chromePort: 9333,
@@ -113,11 +113,16 @@ describe("browser coordinator public settlement", () => {
         error: "Remote Chrome target close was not confirmed",
       },
     };
-    const finalize = vi.fn(async () => ({
+    const pending = {
       status: "pending" as const,
       runtime,
       error: "Remote Chrome target close was not confirmed",
-    }));
+    };
+    const finalize = vi
+      .fn<BrowserRunTransaction["finalize"]>()
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce({ status: "completed", runtime: {} });
     const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
     runRemoteBrowserMode.mockResolvedValueOnce(browserTransaction(finalize, abort, runtime));
 
@@ -144,7 +149,12 @@ describe("browser coordinator public settlement", () => {
     expect(result).not.toHaveProperty("chromePort");
     expect(result).not.toHaveProperty("chromeTargetId");
     expect(result).not.toHaveProperty("recoveryCleanupResources");
-    expect(finalize).toHaveBeenCalledOnce();
+    expect(result.retryCleanup).toEqual(expect.any(Function));
+    expect(Object.keys(result)).not.toContain("retryCleanup");
+    expect(JSON.stringify(result)).not.toContain("retryCleanup");
+    await expect(result.retryCleanup!()).resolves.toBe("pending");
+    await expect(result.retryCleanup!()).resolves.toBe("completed");
+    expect(finalize).toHaveBeenCalledTimes(3);
     expect(abort).not.toHaveBeenCalled();
   });
 });

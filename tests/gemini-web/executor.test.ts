@@ -818,6 +818,61 @@ describe("gemini-web executor", () => {
     },
   );
 
+  it("never aborts an accepted Gemini turn that has no provider id", async () => {
+    const evaluateNormally = runtimeEvaluate.getMockImplementation();
+    if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
+    runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
+      const source = String(input.expression ?? "");
+      if (source.includes("beforeUserCount")) {
+        return {
+          result: {
+            value: JSON.stringify({
+              userQueryCount: 0,
+              responseCount: 0,
+              sendResult: "clicked",
+              bindingStatus: "accepted",
+              userStableId: null,
+            }),
+          },
+        };
+      }
+      if (source.includes("const ordered =")) {
+        throw new Error("injected accepted-turn response failure");
+      }
+      return evaluateNormally(input);
+    });
+    const promptSha256 = promptIdentitySha256("hello");
+    const verifiedUserTurnId = `gemini-dom-turn:0:${promptSha256}`;
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+        log: () => {},
+      }),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        code: "gemini-response-capture-recoverable",
+        reattachable: true,
+        runtime: {
+          promptEpoch: {
+            status: "committed",
+            promptSha256,
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId,
+            verifiedUserMessageId: verifiedUserTurnId,
+            conversationId: "target-1",
+          },
+        },
+      },
+    });
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+    expect(killChrome).not.toHaveBeenCalled();
+  });
+
   it("rejects Chrome evaluation exceptions and cleans up the unpublished session", async () => {
     runtimeEvaluate.mockResolvedValueOnce({
       result: { type: "object", subtype: "error" },

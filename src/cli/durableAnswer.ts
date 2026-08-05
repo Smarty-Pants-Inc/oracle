@@ -14,6 +14,7 @@ import {
   bindBrowserCaptureCleanupSettlement,
   pendingBrowserCaptureCleanup,
 } from "../browser/runLifecycle.js";
+import { appendArtifacts } from "../browser/artifacts.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
 import {
@@ -106,6 +107,7 @@ export async function publishCompletedBrowserCapture(
     try {
       journal = await prepareBrowserCapturePublication(options, projectRuntime);
     } catch (stageError) {
+      if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
       return abortPreStageFailure(options, stageError, projectRuntime);
     }
   }
@@ -114,6 +116,7 @@ export async function publishCompletedBrowserCapture(
     try {
       journal = await stageBrowserCapture(options, journal);
     } catch (stageError) {
+      if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
       return abortPreStageFailure(options, stageError, projectRuntime);
     }
   }
@@ -316,8 +319,14 @@ async function prepareBrowserCapturePublication(
     browserAudit: projectCompletedBrowserMetadataAudit(options.browser, runtime),
     runtime,
   };
-  await writeBrowserCapturePublicationJournal(journal);
-  return journal;
+  try {
+    await writeBrowserCapturePublicationJournal(journal);
+    return journal;
+  } catch (writeError) {
+    const recovered = await recoverExpectedPublicationJournalWrite(journal, null, writeError);
+    if (recovered) return recovered;
+    throw writeError;
+  }
 }
 
 async function stageBrowserCapture(
@@ -325,31 +334,75 @@ async function stageBrowserCapture(
   journal: BrowserCapturePublicationJournal,
 ): Promise<BrowserCapturePublicationJournal> {
   const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
-  const preparedAnswer = await prepareDurableBrowserAnswer(options.answer);
-  assertDurableBrowserAnswerReceipt(preparedAnswer.receipt, journal.receipt);
-  const existingAnswer = await readDurableBrowserAnswer(journal.receipt);
-  const receipt =
-    existingAnswer === null
-      ? await persistAnswer(options.answer, journal.receipt)
-      : journal.receipt;
-  assertDurableBrowserAnswerReceipt(receipt, journal.receipt);
+  let receipt: DurableBrowserAnswerReceipt | undefined;
   try {
+    const preparedAnswer = await prepareDurableBrowserAnswer(options.answer);
+    assertDurableBrowserAnswerReceipt(preparedAnswer.receipt, journal.receipt);
+    const existingAnswer = await readDurableBrowserAnswer(journal.receipt);
+    if (existingAnswer === null) {
+      try {
+        const persistedReceipt = await persistAnswer(options.answer, journal.receipt);
+        assertDurableBrowserAnswerReceipt(persistedReceipt, journal.receipt);
+        receipt = journal.receipt;
+      } catch (persistError) {
+        if (isBrowserCapturePublicationRecoveryPending(persistError)) throw persistError;
+        const recoveredAnswer = await recoverDurableAnswerAfterPersistenceFailure(
+          journal,
+          options.answer.answer,
+          persistError,
+        );
+        if (recoveredAnswer === null) throw persistError;
+        receipt = journal.receipt;
+      }
+    } else {
+      receipt = journal.receipt;
+    }
+    if (!receipt) throw new Error("Durable browser answer receipt was not established");
+    const durableReceipt = receipt;
+
     const preparedArtifacts = await options.prepareArtifacts?.();
     const stagedJournal: BrowserCapturePublicationJournal = {
       ...journal,
       phase: "staged",
-      receipt,
-      artifacts: mergeArtifacts(
-        journal.artifacts.filter(
-          (artifact) =>
-            artifact.kind !== receipt.artifact.kind || artifact.path !== receipt.artifact.path,
-        ),
-        [...(preparedArtifacts ?? []), receipt.artifact],
-      ),
+      receipt: durableReceipt,
+      artifacts:
+        appendArtifacts(
+          journal.artifacts.filter(
+            (artifact) =>
+              artifact.kind !== durableReceipt.artifact.kind ||
+              artifact.path !== durableReceipt.artifact.path,
+          ),
+          [...(preparedArtifacts ?? []), durableReceipt.artifact],
+        ) ?? [],
     };
-    await writeBrowserCapturePublicationJournal(stagedJournal);
-    return stagedJournal;
+    try {
+      await writeBrowserCapturePublicationJournal(stagedJournal);
+      return stagedJournal;
+    } catch (writeError) {
+      const recovered = await recoverExpectedPublicationJournalWrite(
+        stagedJournal,
+        journal,
+        writeError,
+      );
+      if (recovered) return recovered;
+      throw writeError;
+    }
   } catch (error) {
+    if (isBrowserCapturePublicationRecoveryPending(error)) throw error;
+    if (!receipt) {
+      try {
+        if ((await readDurableBrowserAnswer(journal.receipt)) !== null) {
+          receipt = journal.receipt;
+        }
+      } catch (recoveryError) {
+        throw browserCapturePublicationRecoveryPending(
+          journal,
+          error,
+          `The exact durable answer could not be reconciled: ${formatError(recoveryError)}`,
+        );
+      }
+    }
+    if (!receipt) throw error;
     throw new BrowserAutomationError(
       `Browser capture staging failed after the answer became durable: ${formatError(error)}`,
       {
@@ -361,6 +414,96 @@ async function stageBrowserCapture(
       error,
     );
   }
+}
+
+async function recoverDurableAnswerAfterPersistenceFailure(
+  journal: BrowserCapturePublicationJournal,
+  answer: string,
+  persistError: unknown,
+): Promise<string | null> {
+  try {
+    const recovered = await readDurableBrowserAnswer(journal.receipt);
+    if (recovered === null) return null;
+    await ensureDurableFile(journal.receipt.artifact.path, Buffer.from(answer, "utf8"));
+    return recovered;
+  } catch (recoveryError) {
+    throw browserCapturePublicationRecoveryPending(
+      journal,
+      persistError,
+      `The answer write outcome could not be reconciled: ${formatError(recoveryError)}`,
+    );
+  }
+}
+
+async function recoverExpectedPublicationJournalWrite(
+  expected: BrowserCapturePublicationJournal,
+  previous: BrowserCapturePublicationJournal | null,
+  writeError: unknown,
+): Promise<BrowserCapturePublicationJournal | null> {
+  let recovered: BrowserCapturePublicationJournal | null;
+  try {
+    recovered = await readBrowserCapturePublicationJournal(expected.sessionId);
+  } catch (recoveryError) {
+    throw browserCapturePublicationRecoveryPending(
+      expected,
+      writeError,
+      `The publication journal write outcome could not be read: ${formatError(recoveryError)}`,
+    );
+  }
+  if (recovered && publicationJournalsMatch(recovered, expected)) {
+    try {
+      await writeBrowserCapturePublicationJournal(expected);
+      return expected;
+    } catch (retryError) {
+      throw browserCapturePublicationRecoveryPending(
+        expected,
+        writeError,
+        `The exact publication journal could not complete its durability barrier: ${formatError(retryError)}`,
+      );
+    }
+  }
+  if (
+    (recovered === null && previous === null) ||
+    (recovered && previous && publicationJournalsMatch(recovered, previous))
+  ) {
+    return null;
+  }
+  throw browserCapturePublicationRecoveryPending(
+    expected,
+    writeError,
+    "The publication journal write outcome does not match either transaction boundary.",
+  );
+}
+
+function publicationJournalsMatch(
+  actual: BrowserCapturePublicationJournal,
+  expected: BrowserCapturePublicationJournal,
+): boolean {
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function browserCapturePublicationRecoveryPending(
+  journal: BrowserCapturePublicationJournal,
+  cause: unknown,
+  reason: string,
+): BrowserAutomationError {
+  return new BrowserAutomationError(
+    `Browser capture publication recovery remains pending. ${reason}`,
+    {
+      stage: "browser-capture-publication",
+      code: "browser-capture-staging-recovery-pending",
+      runtime: journal.runtime,
+      answerReceipt: journal.receipt,
+    },
+    cause,
+  );
+}
+
+function isBrowserCapturePublicationRecoveryPending(error: unknown): boolean {
+  return (
+    error instanceof BrowserAutomationError &&
+    error.details?.code === "browser-capture-staging-recovery-pending"
+  );
 }
 
 async function bindFinalizeAuthority(
@@ -583,7 +726,7 @@ async function abortPreStageFailure(
 ): Promise<never> {
   const answerReceipt = durableBrowserAnswerReceiptFromError(stageError);
   const artifacts = answerReceipt
-    ? mergeArtifacts(options.existingArtifacts, [answerReceipt.artifact])
+    ? appendArtifacts(options.existingArtifacts, [answerReceipt.artifact])
     : undefined;
   let boundRuntime: BrowserRuntimeMetadata;
   try {
@@ -660,21 +803,19 @@ async function abortPreStageFailure(
       );
     }
   }
-  if (answerReceipt) {
-    try {
-      await clearBrowserCapturePublicationJournal(options.answer.sessionId);
-    } catch (clearError) {
-      throw new BrowserAutomationError(
-        `Browser capture staging failed (${formatError(stageError)}); durable publication intent cleanup remains pending: ${formatError(clearError)}`,
-        {
-          stage: "browser-capture-publication",
-          code: "abort-publication-journal-cleanup-failed",
-          runtime: abortionRuntime,
-          answerReceipt,
-        },
-        clearError,
-      );
-    }
+  try {
+    await clearBrowserCapturePublicationJournal(options.answer.sessionId);
+  } catch (clearError) {
+    throw new BrowserAutomationError(
+      `Browser capture staging failed (${formatError(stageError)}); durable publication intent cleanup remains pending: ${formatError(clearError)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "abort-publication-journal-cleanup-failed",
+        runtime: abortionRuntime,
+        answerReceipt,
+      },
+      clearError,
+    );
   }
   if (abortion.status === "pending") {
     throw new BrowserAutomationError(
@@ -780,20 +921,6 @@ function assertDurableBrowserAnswerReceipt(
   ) {
     throw new Error("Durable browser answer receipt does not match its publication intent");
   }
-}
-
-function mergeArtifacts(
-  existing: SessionArtifact[] | undefined,
-  additions: SessionArtifact[],
-): SessionArtifact[] {
-  const merged = new Map<string, SessionArtifact>();
-  for (const artifact of existing ?? []) {
-    merged.set(`${artifact.kind}:${artifact.path}`, artifact);
-  }
-  for (const artifact of additions) {
-    merged.set(`${artifact.kind}:${artifact.path}`, artifact);
-  }
-  return Array.from(merged.values());
 }
 
 async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<void> {

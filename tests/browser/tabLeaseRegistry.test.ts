@@ -331,7 +331,43 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     }
   });
 
-  test("drops a live pid lease when its process-start identity changed", async () => {
+  test("preserves a live Darwin lease across process-generation provider changes", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    try {
+      await acquireBrowserTabLease(
+        dir,
+        { maxConcurrentTabs: 1, timeoutMs: 500, sessionId: "darwin-provider-fallback" },
+        {
+          pid: 345_678,
+          platform: "darwin",
+          readProcessLiveness: () => "alive",
+          readProcessStartIdentity: async () => "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
+        },
+      );
+
+      for (const observedIdentity of [
+        "darwin-kernel-start:1785945427:287123",
+        "darwin-audit-pidversion:7001",
+      ]) {
+        await expect(
+          hasOtherActiveBrowserTabLeases(dir, "unrelated-lease", {
+            readProcessLiveness: () => "alive",
+            readProcessStartIdentity: async () => observedIdentity,
+          }),
+        ).resolves.toBe(true);
+      }
+      const registry = JSON.parse(
+        await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ sessionId?: string }> };
+      expect(registry.leases).toEqual([
+        expect.objectContaining({ sessionId: "darwin-provider-fallback" }),
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("drops a live Darwin PID lease when its provider proves a generation mismatch", async () => {
     const dir = await makeTempDir("oracle-tab-leases-");
     try {
       await acquireBrowserTabLease(
@@ -340,7 +376,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         {
           pid: 345_678,
           readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async () => "original-process-start",
+          readProcessStartIdentity: async () => "darwin-kernel-start:1785945427:287123",
         },
       );
 
@@ -350,7 +386,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         {
           readProcessLiveness: () => "alive",
           readProcessStartIdentity: async (pid) =>
-            pid === 345_678 ? "reused-process-start" : "replacement-process-start",
+            pid === 345_678
+              ? "darwin-kernel-start:1785945427:287124"
+              : "darwin-kernel-start:1785945427:999999",
         },
       );
 

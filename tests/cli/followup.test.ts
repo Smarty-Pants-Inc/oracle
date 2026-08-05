@@ -177,12 +177,72 @@ describe("browser follow-up resolution", () => {
   test("builds a canonical URL for a completed legacy exact conversation id", () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
-      mode: "browser",
+      options: { mode: "browser", model: "gpt-5.5-pro" },
       browser: { runtime: { conversationId: "legacy-only" } },
     };
 
     expect(resolveBrowserResumeConversationUrl(metadata)).toBe("https://chatgpt.com/c/legacy-only");
   });
+
+  test.each(["gemini-3.1-pro", "gpt-5.1-codex"])(
+    "rejects completed legacy non-ChatGPT browser model %s even with an exact ChatGPT URL",
+    async (model) => {
+      const metadata: SessionMetadata = {
+        ...baseMetadata,
+        mode: "browser",
+        model,
+        options: { mode: "browser", model },
+        browser: { runtime: { tabUrl: "https://chatgpt.com/c/not-chatgpt-provider" } },
+      };
+
+      expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+      const store = { readSession: vi.fn(async () => metadata) };
+      await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
+        /one exact ChatGPT conversation/s,
+      );
+    },
+  );
+
+  test.each([
+    {
+      name: "browser and API modes conflict",
+      metadataMode: "browser",
+      optionsMode: "api",
+      metadataModel: "gpt-5.5-pro",
+      optionsModel: "gpt-5.5-pro",
+    },
+    {
+      name: "GPT and Gemini models conflict",
+      metadataMode: "browser",
+      optionsMode: "browser",
+      metadataModel: "gpt-5.5-pro",
+      optionsModel: "gemini-3.1-pro",
+    },
+    {
+      name: "model provenance is missing",
+      metadataMode: "browser",
+      optionsMode: "browser",
+      metadataModel: undefined,
+      optionsModel: undefined,
+    },
+  ] as const)(
+    "rejects a completed legacy locator when $name",
+    async ({ metadataMode, optionsMode, metadataModel, optionsModel }) => {
+      const metadata: SessionMetadata = {
+        ...baseMetadata,
+        mode: metadataMode,
+        model: metadataModel,
+        options: { mode: optionsMode, model: optionsModel },
+        browser: { runtime: { tabUrl: "https://chatgpt.com/c/ambiguous-provenance" } },
+      };
+
+      expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+      const store = { readSession: vi.fn(async () => metadata) };
+      await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
+        /one exact ChatGPT conversation/s,
+      );
+    },
+  );
 
   test.each([
     {
@@ -202,6 +262,7 @@ describe("browser follow-up resolution", () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
+      model: "gpt-5.5-pro",
       browser: { runtime, harvest },
     };
 
@@ -217,6 +278,7 @@ describe("browser follow-up resolution", () => {
       ...baseMetadata,
       status: "running",
       mode: "browser",
+      model: "gpt-5.5-pro",
       browser: { runtime: { tabUrl: "https://chatgpt.com/c/not-completed" } },
     };
 
@@ -327,6 +389,7 @@ describe("browser follow-up resolution", () => {
       ...baseMetadata,
       id: "external-url",
       mode: "browser",
+      model: "gpt-5.5-pro",
       browser: { runtime: { tabUrl: "https://evil.example.com/c/pwned" } },
     };
 
@@ -343,6 +406,7 @@ describe("browser follow-up resolution", () => {
       ...baseMetadata,
       id: "project-shell",
       mode: "browser",
+      model: "gpt-5.5-pro",
       browser: {
         config: { url: "https://chatgpt.com/g/g-p-abc123/project" },
         runtime: { tabUrl: "https://chatgpt.com/g/g-p-abc123/project" },

@@ -98,6 +98,7 @@ export async function runBridgeDoctor(_options: BridgeDoctorCliOptions): Promise
       if (health.ok) {
         const meta = health.version ? `oracle ${health.version}` : "ok";
         lines.push(chalk.dim(`Auth (/health): ${chalk.green(meta)}`));
+        lines.push(chalk.dim(`Negotiated protocol: ${chalk.green(health.protocol ?? "unknown")}`));
         if (health.capabilities?.artifactTransfer) {
           lines.push(
             chalk.dim(

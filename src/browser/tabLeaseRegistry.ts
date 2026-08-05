@@ -11,6 +11,7 @@ import {
   readProcessLiveness,
   readProcessStartIdentity,
 } from "./filesystemLock.js";
+import { arePlatformProcessGenerationsDefinitelyDifferent } from "./platformProcessGeneration.js";
 import {
   captureProfileDirectoryIdentity,
   verifyProfileDirectoryIdentity,
@@ -621,7 +622,15 @@ async function pruneStaleLeases(
         observedProcessIdentities.set(lease.pid, observedIdentityPromise);
       }
       const observedIdentity = await observedIdentityPromise;
-      if (observedIdentity !== null && observedIdentity !== lease.processStartIdentity) continue;
+      if (
+        observedIdentity !== null &&
+        arePlatformProcessGenerationsDefinitelyDifferent(
+          lease.processStartIdentity,
+          observedIdentity,
+        )
+      ) {
+        continue;
+      }
     }
     active.push(lease);
   }

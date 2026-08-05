@@ -1,6 +1,7 @@
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserCaptureFinalizationResult } from "./types.js";
+import { acknowledgeChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 
 export type BrowserCaptureSettlementMode = "finalize" | "abort";
 
@@ -206,6 +207,29 @@ function projectPendingBrowserCleanupAuthority(
 ): BrowserRuntimeMetadata {
   if (!runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult) return runtime;
   return markBrowserCaptureCleanupPending(runtime);
+}
+
+function acknowledgeSettledTargetCloseCapabilities(
+  beforeSettlement: BrowserRuntimeMetadata,
+  persistedSettlement: BrowserRuntimeMetadata,
+): void {
+  for (const resource of beforeSettlement.recoveryCleanupResources ?? []) {
+    const capability = resource.targetCloseCapability;
+    if (
+      capability &&
+      resource.chromeTargetId &&
+      !persistedSettlement.recoveryCleanupResources?.some(
+        (persistedResource) =>
+          persistedResource.targetCloseCapability?.generationId === capability.generationId &&
+          persistedResource.targetCloseCapability.capabilityId === capability.capabilityId,
+      )
+    ) {
+      acknowledgeChromeTargetCloseCapability({
+        capability,
+        targetId: resource.chromeTargetId,
+      });
+    }
+  }
 }
 
 export function completedBrowserCaptureCleanup(
@@ -579,6 +603,7 @@ export class OwnedBrowserResourceTransaction {
         const boundResult = bindBrowserCaptureCleanupSettlement(result, mode);
         try {
           await this.adapters.persistSettlementResult?.(boundResult.runtime);
+          acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
         } catch (error) {
           const retryRuntime =
             boundResult.status === "pending" ? boundResult.runtime : boundRuntime;

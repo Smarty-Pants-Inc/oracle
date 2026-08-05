@@ -16,29 +16,35 @@ interface RetainedTargetCloseAuthority {
   readonly close?: (logger: BrowserLogger) => Promise<ExactChromeTargetCleanupResult>;
   readonly release?: () => Promise<void>;
   terminalStatus?: "completed" | "gone";
+  terminalAcknowledged?: boolean;
   settlement?: Promise<RetainedTargetCloseCapabilityResult>;
 }
 
 const retainedTargetCloseAuthorities = new Map<string, RetainedTargetCloseAuthority>();
 const MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES = 128;
-const retainedTerminalTargetCloseCapabilityIds: string[] = [];
+const retainedAcknowledgedTerminalTargetCloseCapabilityIds: string[] = [];
 
 function retainTerminalTargetCloseCapability(
   capabilityId: string,
   authority: RetainedTargetCloseAuthority,
   terminalStatus: "completed" | "gone",
+  terminalAcknowledged: boolean,
 ): void {
   retainedTargetCloseAuthorities.set(capabilityId, {
     generationId: authority.generationId,
     targetId: authority.targetId,
     terminalStatus,
+    ...(terminalAcknowledged ? { terminalAcknowledged: true } : {}),
   });
-  retainedTerminalTargetCloseCapabilityIds.push(capabilityId);
+  if (!terminalAcknowledged) return;
+  retainedAcknowledgedTerminalTargetCloseCapabilityIds.push(capabilityId);
   while (
-    retainedTerminalTargetCloseCapabilityIds.length >
+    retainedAcknowledgedTerminalTargetCloseCapabilityIds.length >
     MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES
   ) {
-    retainedTargetCloseAuthorities.delete(retainedTerminalTargetCloseCapabilityIds.shift()!);
+    retainedTargetCloseAuthorities.delete(
+      retainedAcknowledgedTerminalTargetCloseCapabilityIds.shift()!,
+    );
   }
 }
 
@@ -131,7 +137,12 @@ export async function closeChromeTargetWithRetainedCapability(options: {
       };
     }
     if (retainedTargetCloseAuthorities.get(capability.capabilityId) === authority) {
-      retainTerminalTargetCloseCapability(capability.capabilityId, authority, closeResult.status);
+      retainTerminalTargetCloseCapability(
+        capability.capabilityId,
+        authority,
+        closeResult.status,
+        false,
+      );
     }
     return closeResult;
   })();
@@ -145,14 +156,43 @@ export async function closeChromeTargetWithRetainedCapability(options: {
   }
 }
 
+/** Releases a terminal capability only after its exact target cleanup state is durable. */
+export function acknowledgeChromeTargetCloseCapability(options: {
+  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
+  targetId: string;
+}): void {
+  const { capability, targetId } = options;
+  if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
+  const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
+  if (
+    !authority?.terminalStatus ||
+    authority.terminalAcknowledged ||
+    authority.close ||
+    authority.release ||
+    authority.generationId !== capability.generationId ||
+    authority.targetId !== targetId
+  ) {
+    return;
+  }
+  retainTerminalTargetCloseCapability(
+    capability.capabilityId,
+    authority,
+    authority.terminalStatus,
+    true,
+  );
+}
+
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   clearRetainedTargetCloseAuthorities(): void {
     retainedTargetCloseAuthorities.clear();
-    retainedTerminalTargetCloseCapabilityIds.length = 0;
+    retainedAcknowledgedTerminalTargetCloseCapabilityIds.length = 0;
   },
   retainedTargetCloseAuthorityCount(): number {
     return retainedTargetCloseAuthorities.size;
+  },
+  retainedAcknowledgedTerminalTargetCloseAuthorityCount(): number {
+    return retainedAcknowledgedTerminalTargetCloseCapabilityIds.length;
   },
   retainedTerminalTargetCloseCapabilityLimit: MAX_RETAINED_TERMINAL_TARGET_CLOSE_CAPABILITIES,
 };

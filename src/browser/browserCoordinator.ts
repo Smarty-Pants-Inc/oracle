@@ -12,6 +12,7 @@ import { runRemoteBrowserMode } from "./remoteBrowserCoordinator.js";
 import { normalizeBrowserFollowUpPrompts } from "./responseCaptureCoordinator.js";
 import type {
   BrowserAttachment,
+  BrowserCaptureFinalizationResult,
   BrowserLogger,
   BrowserRunOptions,
   BrowserRunResult,
@@ -133,11 +134,21 @@ function projectPublicBrowserRunResult(transaction: BrowserRunTransaction): Brow
   return result;
 }
 
-export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
+export async function runBrowserMode(options: BrowserRunOptions): Promise<
+  BrowserRunResult & {
+    readonly retryCleanup?: () => Promise<BrowserCaptureFinalizationResult["status"]>;
+  }
+> {
   const transaction = await runBrowserModeTransaction(options);
   const finalization = await transaction.finalize();
   const result = projectPublicBrowserRunResult(transaction);
   if (finalization.status === "pending") {
+    Object.defineProperty(result, "retryCleanup", {
+      configurable: false,
+      enumerable: false,
+      value: async () => (await transaction.finalize()).status,
+      writable: false,
+    });
     result.warnings = [
       ...(result.warnings ?? []),
       {

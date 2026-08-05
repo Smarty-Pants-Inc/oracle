@@ -890,6 +890,52 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test.runIf(
+    process.platform === "linux" || process.platform === "darwin" || process.platform === "win32",
+  )("serializes concurrent removal of one journaled root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-race-"));
+    const candidatePath = path.join(root, "candidate");
+    await mkdir(path.join(candidatePath, "nested"), { recursive: true });
+    await writeFile(path.join(candidatePath, "nested", "owned-marker"), "delete");
+    const firstAttested = Promise.withResolvers<void>();
+    const allowFirstRemoval = Promise.withResolvers<void>();
+    const removals: Promise<void>[] = [];
+    let secondHelperAttested = false;
+    try {
+      const isolation = await isolateDirectoryGenerationForRemoval(
+        candidatePath,
+        async (generationPath) => (await stat(generationPath)).isDirectory(),
+      );
+      expect(isolation.status).toBe("isolated");
+      if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+
+      const firstRemoval = removeIsolatedDirectoryGeneration(isolation.rootPath, {
+        afterChildAttestation: async () => {
+          firstAttested.resolve();
+          await allowFirstRemoval.promise;
+        },
+      });
+      removals.push(firstRemoval);
+      await firstAttested.promise;
+      const secondRemoval = removeIsolatedDirectoryGeneration(isolation.rootPath, {
+        afterChildAttestation: () => {
+          secondHelperAttested = true;
+        },
+      });
+      removals.push(secondRemoval);
+      expect(secondRemoval).toBe(firstRemoval);
+      expect(secondHelperAttested).toBe(false);
+      allowFirstRemoval.resolve();
+      await expect(Promise.all(removals)).resolves.toEqual([undefined, undefined]);
+      await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(candidatePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      allowFirstRemoval.resolve();
+      await Promise.allSettled(removals);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("bound deletion unlinks external directory links and stays pending when unsupported", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-device-boundary-"));
     const candidatePath = path.join(root, "candidate");

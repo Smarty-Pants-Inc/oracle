@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type {
   BrowserRuntimeMetadata,
@@ -14,6 +17,12 @@ import {
   isDeepResearchPlaceholderCapture,
   attachSession,
 } from "../../src/cli/sessionDisplay.ts";
+import { orchestrateBrowserAttachAuthority } from "../../src/cli/browserAttachController.ts";
+import {
+  readBrowserCapturePublicationJournal,
+  type BrowserCapturePublicationJournal,
+  type BrowserPublicationPhase,
+} from "../../src/cli/browserPublicationJournal.ts";
 import chalk from "chalk";
 import path from "node:path";
 import { BrowserAutomationError } from "../../src/oracle/errors.ts";
@@ -87,6 +96,51 @@ const readModelLogMock = sessionStoreMock.readModelLog as unknown as ReturnType<
 const readSessionRequestMock = sessionStoreMock.readRequest as unknown as ReturnType<typeof vi.fn>;
 
 const originalIsTty = process.stdout.isTTY;
+const tempDirectories: string[] = [];
+
+async function installBrowserPublicationJournal(
+  phase: BrowserPublicationPhase,
+  runtime: BrowserRuntimeMetadata,
+  answer: string,
+): Promise<BrowserCapturePublicationJournal> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-display-publication-"));
+  tempDirectories.push(directory);
+  const artifactsDirectory = path.join(directory, "artifacts");
+  await mkdir(artifactsDirectory, { recursive: true });
+  const sha256 = createHash("sha256").update(answer).digest("hex");
+  const artifact: SessionArtifact = {
+    kind: "transcript",
+    path: path.join(artifactsDirectory, `browser-answer-${sha256}.md`),
+    label: "Durable browser answer",
+    mimeType: "text/markdown",
+    sha256,
+    sizeBytes: Buffer.byteLength(answer),
+    validation: { type: "generic", ok: true },
+    transfer: { status: "not-needed" },
+    origin: { mode: "local" },
+  };
+  await writeFile(artifact.path, answer);
+  const journal: BrowserCapturePublicationJournal = {
+    version: 1,
+    sessionId: "sess",
+    phase,
+    receipt: { artifact },
+    artifacts: phase === "preparing" ? [] : [artifact],
+    completedAt: "2026-08-05T00:00:00.000Z",
+    response: { status: "completed" },
+    browserAudit: { runtime },
+    runtime,
+  };
+  await writeFile(
+    path.join(directory, "browser-capture-publication.json"),
+    `${JSON.stringify(journal, null, 2)}\n`,
+  );
+  sessionStoreMock.getPaths.mockResolvedValue({
+    dir: directory,
+    log: path.join(directory, "session.log"),
+  });
+  return journal;
+}
 const originalChalkLevel = chalk.level;
 
 function committedPromptAuthority(conversationId: string): BrowserRuntimeMetadata {
@@ -186,12 +240,15 @@ beforeEach(() => {
   saveDeepResearchReportArtifactMock.mockResolvedValue(null);
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.useRealTimers();
   process.exitCode = undefined;
   Object.defineProperty(process.stdout, "isTTY", { value: originalIsTty, configurable: true });
   chalk.level = originalChalkLevel;
   vi.restoreAllMocks();
+  await Promise.all(
+    tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+  );
 });
 
 describe("formatResponseMetadata", () => {
@@ -710,6 +767,147 @@ describe("attachSession rendering", () => {
       sessionStoreMock.updateSession.mock.calls.every(([, patch]) => patch.status === undefined),
     ).toBe(true);
     expect(sessionStoreMock.updateModelRun).not.toHaveBeenCalled();
+  });
+
+  test("publishes a verified preparing answer without live browser authority", async () => {
+    const answer = "answer already durable before restart";
+    const runtime: BrowserRuntimeMetadata = {
+      chromePid: 2_147_483_647,
+      recoveryCleanupResources: [
+        {
+          chromePid: 2_147_483_647,
+          chromeTargetId: "gone-target",
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const journal = await installBrowserPublicationJournal("preparing", runtime, answer);
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      mode: "browser",
+      browser: { config: {} },
+    };
+    const recoveredMeta = { ...completedMeta, artifacts: [journal.receipt.artifact] };
+    readSessionMetadataMock.mockResolvedValue(recoveredMeta);
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    resumeBrowserSessionMock.mockRejectedValue(new Error("browser authority is unavailable"));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recoveryCleanupResult: expect.objectContaining({ settlementMode: "finalize" }),
+      }),
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join(
+          path.dirname(path.dirname(journal.receipt.artifact.path)),
+          "browser-recovery.lock",
+        ),
+        isRemotePublicationAcknowledged: expect.any(Function),
+      }),
+      "finalize",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(true);
+  });
+
+  test("retries cleanup-pending publication authority without recapturing the answer", async () => {
+    const answer = "published answer awaiting cleanup";
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: "retained-target",
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "cleanup interrupted",
+        settlementMode: "finalize",
+      },
+    };
+    const journal = await installBrowserPublicationJournal("cleanup-pending", runtime, answer);
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      mode: "browser",
+      browser: { config: {} },
+      artifacts: [journal.receipt.artifact],
+    };
+    readSessionMetadataMock.mockResolvedValue(completedMeta);
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
+    expect(saveBrowserTranscriptArtifactMock).not.toHaveBeenCalled();
+    expect(saveDeepResearchReportArtifactMock).not.toHaveBeenCalled();
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recoveryCleanupResult: expect.objectContaining({ settlementMode: "finalize" }),
+      }),
+      expect.any(Function),
+      expect.objectContaining({ isRemotePublicationAcknowledged: expect.any(Function) }),
+      "finalize",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(true);
+  });
+
+  test("discards a stale preparing journal when persisted ABORT authority has no receipt", async () => {
+    const answer = "answer from an abandoned preparing transaction";
+    const preAbortRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: "aborted-target",
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    await installBrowserPublicationJournal("preparing", preAbortRuntime, answer);
+    const abortRuntime: BrowserRuntimeMetadata = {
+      ...preAbortRuntime,
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "abort cleanup interrupted",
+        settlementMode: "abort",
+      },
+    };
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      mode: "browser",
+      browser: { runtime: abortRuntime },
+    };
+    readSessionMetadataMock.mockResolvedValue({
+      ...completedMeta,
+      browser: { runtime: {} },
+    });
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      abortRuntime,
+      expect.any(Function),
+      expect.objectContaining({ isRemotePublicationAcknowledged: expect.any(Function) }),
+      "abort",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(false);
+    expect(await readBrowserCapturePublicationJournal("sess")).toBeNull();
   });
 
   test("does not settle completed browser cleanup without a durable answer receipt", async () => {

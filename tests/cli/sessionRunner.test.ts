@@ -3028,6 +3028,91 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("oracle session sess-1 --render");
   });
 
+  test("keeps committed Gemini capture failures running for exact reattach", async () => {
+    const runtime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "gemini-target-1",
+      conversationId: "gemini-target-1",
+      promptEpoch: {
+        status: "committed" as const,
+        epochId: "gemini-epoch-1",
+        promptSha256: "d".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "gemini-dom-turn:0:accepted",
+        verifiedUserMessageId: "gemini-dom-turn:0:accepted",
+        conversationId: "gemini-target-1",
+      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "gemini-target-1",
+          conversationId: "gemini-target-1",
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login" as const,
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" as const },
+    } satisfies BrowserRuntimeMetadata;
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Gemini response capture failed after commit", {
+        stage: "gemini-response-capture",
+        code: "gemini-response-capture-recoverable",
+        reattachable: true,
+        runtime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(
+      new BrowserAutomationError("Gemini answer is still generating", {
+        stage: "gemini-response-capture",
+        code: "gemini-reattach-capture-pending",
+        reattachable: true,
+        runtime,
+      }),
+    );
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        desiredModel: "gemini-3-pro-deep-think",
+        timeoutMs: 2_000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledWith(
+      runtime,
+      expect.objectContaining({ desiredModel: "gemini-3-pro-deep-think" }),
+      expect.any(Function),
+      expect.any(Object),
+    );
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "running",
+      completedAt: undefined,
+      browser: { runtime },
+      response: { status: "running", incompleteReason: "incomplete-capture" },
+    });
+    const logLines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logLines).toContain(
+      "Gemini response capture remains incomplete; keeping session running for exact reattach.",
+    );
+  });
+
   test("records runtime and guidance when cloudflare challenge is detected", async () => {
     const automationError = new BrowserAutomationError(
       "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.",

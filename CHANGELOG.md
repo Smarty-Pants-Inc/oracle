@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Remote/Bridge: require authenticated transaction v3 by default and expose predecessor text compatibility only through explicit opt-in with a distinct scoped bearer that is never reused from the modern HMAC key.
+- Remote/Bridge: make plaintext serve and client endpoints loopback-only, reject direct LAN binds, document SSH tunnel migration, and report the negotiated protocol in `oracle bridge doctor`.
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
 - Browser: submit uploaded prompts whenever ChatGPT exposes an enabled send button even if secondary attachment evidence is stale, and close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 - Browser: serialize manual-login Chrome ownership across normal runs, Project Sources, and recovery, reusing only exact-profile owners while keeping PID authority stable and tab leases independent.

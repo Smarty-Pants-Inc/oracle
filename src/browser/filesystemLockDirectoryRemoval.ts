@@ -50,6 +50,14 @@ export interface IsolatedDirectoryRemovalDeps {
   afterChildAttestation?: (rootPath: string) => void | Promise<void>;
 }
 
+interface InFlightIsolatedDirectoryRemoval {
+  readonly removal: Promise<void>;
+}
+
+// Retained release and replay can converge on the same journal in one process. Only the first
+// exact-authority attempt may spawn a removal helper; concurrent callers share its settlement.
+const inFlightIsolatedDirectoryRemovals = new Map<string, InFlightIsolatedDirectoryRemoval>();
+
 interface RemovalHelperAttestation {
   readonly type: "attested";
   readonly token: string;
@@ -646,11 +654,33 @@ export async function isolateDirectoryGenerationForRemoval(
   return { status: "isolated", rootPath, generationPath };
 }
 
-export async function removeIsolatedDirectoryGeneration(
+export function removeIsolatedDirectoryGeneration(
   rootPath: string,
   deps: IsolatedDirectoryRemovalDeps = {},
 ): Promise<void> {
   const canonicalRootPath = path.resolve(rootPath);
+  const existing = inFlightIsolatedDirectoryRemovals.get(canonicalRootPath);
+  if (existing !== undefined) return existing.removal;
+
+  const authority = readIsolatedDirectoryCleanupAuthority(canonicalRootPath);
+  const removal: Promise<void> = authority.then(async (journal) => {
+    if (journal === null) return;
+    await removeAuthorizedIsolatedDirectoryGeneration(canonicalRootPath, journal, deps);
+  });
+  const entry = { removal };
+  inFlightIsolatedDirectoryRemovals.set(canonicalRootPath, entry);
+  const clear = (): void => {
+    if (inFlightIsolatedDirectoryRemovals.get(canonicalRootPath) === entry) {
+      inFlightIsolatedDirectoryRemovals.delete(canonicalRootPath);
+    }
+  };
+  void removal.then(clear, clear);
+  return removal;
+}
+
+async function readIsolatedDirectoryCleanupAuthority(
+  canonicalRootPath: string,
+): Promise<IsolatedDirectoryCleanupJournal | null> {
   const journalPath = isolatedDirectoryCleanupJournalPath(canonicalRootPath);
   const completionPath = isolatedDirectoryCleanupCompletionPath(canonicalRootPath);
   let journal: IsolatedDirectoryCleanupJournal;
@@ -665,7 +695,7 @@ export async function removeIsolatedDirectoryGeneration(
         try {
           await lstat(canonicalRootPath);
         } catch (rootError) {
-          if (readErrorCode(rootError) === "ENOENT") return;
+          if (readErrorCode(rootError) === "ENOENT") return null;
           throw rootError;
         }
       }
@@ -675,7 +705,16 @@ export async function removeIsolatedDirectoryGeneration(
   if (journal.rootPath !== canonicalRootPath) {
     throw new Error(`Isolated cleanup journal does not authorize ${canonicalRootPath}`);
   }
+  return journal;
+}
 
+async function removeAuthorizedIsolatedDirectoryGeneration(
+  canonicalRootPath: string,
+  journal: IsolatedDirectoryCleanupJournal,
+  deps: IsolatedDirectoryRemovalDeps,
+): Promise<void> {
+  const journalPath = isolatedDirectoryCleanupJournalPath(canonicalRootPath);
+  const completionPath = isolatedDirectoryCleanupCompletionPath(canonicalRootPath);
   const completion = await readIsolatedDirectoryCleanupCompletion(completionPath, true);
   if (completion !== null) {
     assertCleanupCompletionMatchesJournal(completion, journal);
@@ -697,8 +736,7 @@ export async function removeIsolatedDirectoryGeneration(
     try {
       await readIsolatedDirectoryCleanupJournal(journalPath);
     } catch (error) {
-      if (readErrorCode(error) === "ENOENT") return;
-      throw error;
+      if (readErrorCode(error) !== "ENOENT") throw error;
     }
     throw new Error(
       `Isolated cleanup root disappeared without a completion receipt at ${canonicalRootPath}; cleanup remains pending`,

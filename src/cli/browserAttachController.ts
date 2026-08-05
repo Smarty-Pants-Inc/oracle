@@ -2,12 +2,13 @@ import chalk from "chalk";
 import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import type { BrowserLogger } from "../browser/types.js";
+import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
 import {
   resumeBrowserSession,
   retryBrowserRecoveryCleanup,
   type ReattachResult,
 } from "../browser/reattach.js";
+import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/profileState.js";
 import {
@@ -30,12 +31,14 @@ import {
   publishCompletedBrowserCapture,
   readDurableBrowserAnswer,
   runtimeFromBrowserError,
+  type BrowserCapturePublicationAcknowledgement,
   type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
 import {
   clearBrowserCapturePublicationJournal,
   readBrowserCapturePublicationJournal,
   sanitizeBrowserPublicationMessage,
+  type BrowserCapturePublicationJournal,
 } from "./browserPublicationJournal.js";
 import {
   hasRemoteRecoveryAuthority,
@@ -76,11 +79,38 @@ export async function orchestrateBrowserAttachAuthority(
   let publicationJournal = await readBrowserCapturePublicationJournal(sessionId);
   if (
     publicationJournal?.phase === "preparing" &&
-    metadata.browser?.runtime?.recoveryCleanupResult?.settlementMode === "abort" &&
-    hasDurableBrowserAnswerReceipt(metadata, publicationJournal.receipt)
+    metadata.browser?.runtime?.recoveryCleanupResult?.settlementMode === "abort"
   ) {
     await clearBrowserCapturePublicationJournal(sessionId);
     publicationJournal = null;
+  }
+  if (publicationJournal) {
+    const durableAnswer = await readDurableBrowserAnswer(publicationJournal.receipt);
+    if (durableAnswer !== null || publicationJournal.phase !== "preparing") {
+      if (durableAnswer === null) {
+        console.log(
+          chalk.yellow(
+            "Durable browser publication recovery is pending because its verified answer is unavailable.",
+          ),
+        );
+        return metadata;
+      }
+      try {
+        return await recoverDurableBrowserPublication(
+          sessionId,
+          metadata,
+          publicationJournal,
+          durableAnswer,
+        );
+      } catch (error) {
+        console.log(
+          chalk.red(
+            `Durable browser publication recovery remains pending: ${sanitizeBrowserPublicationMessage(formatError(error))}`,
+          ),
+        );
+        return (await sessionStore.readSession(sessionId)) ?? metadata;
+      }
+    }
   }
   let runtime = publicationJournal?.runtime ?? metadata.browser?.runtime;
   if (!publicationJournal) {
@@ -423,6 +453,98 @@ export async function orchestrateBrowserAttachAuthority(
     if (!authorityPersisted) throw error;
     return metadata;
   }
+}
+
+async function recoverDurableBrowserPublication(
+  sessionId: string,
+  metadata: SessionMetadata,
+  journal: BrowserCapturePublicationJournal,
+  answer: string,
+): Promise<SessionMetadata> {
+  console.log(chalk.yellow("Recovering a durable browser answer publication..."));
+  const acknowledgement = createBrowserCapturePublicationAcknowledgement();
+  if (journal.phase === "published" || journal.phase === "cleanup-pending") {
+    acknowledgement.acknowledge();
+  }
+  const transaction = createPersistedBrowserPublicationTransaction(
+    sessionId,
+    metadata,
+    journal,
+    acknowledgement,
+  );
+  const outputTokens = estimateTokenCount(answer);
+  const publication = await publishCompletedBrowserCapture({
+    answer: {
+      sessionId,
+      answer,
+      logHeader: "[reattach] recovered durable assistant response without browser recapture",
+    },
+    transaction,
+    persistAnswer: persistDurableBrowserAnswer,
+    browser: metadata.browser ?? journal.browserAudit,
+    existingArtifacts: metadata.artifacts,
+    prepareArtifacts: async () => saveReattachBrowserArtifacts(sessionId, metadata, answer),
+    usage: journal.usage ?? {
+      inputTokens: 0,
+      outputTokens,
+      reasoningTokens: 0,
+      totalTokens: outputTokens,
+    },
+    response: journal.response ?? { status: "completed" },
+    model: journal.model ?? metadata.model,
+    acknowledgement,
+    label: "Recovered browser answer",
+    log: (message) => console.log(dim(message)),
+  });
+  if (publication.finalization.status === "pending") {
+    console.log(
+      chalk.yellow(
+        `Durable browser answer is published; cleanup remains pending: ${sanitizeBrowserPublicationMessage(publication.finalization.error)}`,
+      ),
+    );
+  } else {
+    console.log(chalk.green("Durable browser answer publication recovered."));
+  }
+  return (await sessionStore.readSession(sessionId)) ?? metadata;
+}
+
+function createPersistedBrowserPublicationTransaction(
+  sessionId: string,
+  metadata: SessionMetadata,
+  journal: BrowserCapturePublicationJournal,
+  acknowledgement: BrowserCapturePublicationAcknowledgement,
+): Pick<BrowserRunTransaction, "runtime" | "bindSettlement" | "finalize" | "abort"> {
+  const settlement = new OwnedBrowserResourceTransaction(
+    {
+      persistRuntime: async (runtime) => {
+        await sessionStore.updateSession(sessionId, {
+          browser: { ...(metadata.browser ?? journal.browserAudit), runtime },
+        });
+      },
+      settleResources: async (mode, runtime) => {
+        const sessionPaths = await sessionStore.getPaths(sessionId);
+        return retryBrowserRecoveryCleanup(
+          runtime,
+          browserLogger(),
+          {
+            recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+            recoveryCleanup: { retainChromeEndpointAuthority },
+            isRemotePublicationAcknowledged: acknowledgement.isPublished,
+          },
+          mode,
+        );
+      },
+    },
+    journal.runtime,
+  );
+  return {
+    get runtime() {
+      return settlement.runtime();
+    },
+    bindSettlement: (mode) => settlement.bindSettlement(mode),
+    finalize: () => settlement.settle("finalize"),
+    abort: () => settlement.settle("abort"),
+  };
 }
 
 function repairTrustedStaleConversationUrl(

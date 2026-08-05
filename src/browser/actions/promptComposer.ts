@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   INPUT_SELECTORS,
@@ -24,6 +24,43 @@ const ENTER_KEY_EVENT = {
   nativeVirtualKeyCode: 13,
 } as const;
 const ENTER_KEY_TEXT = "\r";
+const PROMPT_TOO_LARGE_REJECTION_SELECTORS = [
+  '[role="alert"]',
+  '[role="status"]',
+  "[aria-live]",
+  '[data-testid*="toast"]',
+  '[data-testid*="banner"]',
+  '[data-testid*="error"]',
+] as const;
+const PROMPT_TOO_LARGE_REJECTION_PATTERN =
+  "message (?:you submitted|is) (?:was )?too long|submit something shorter|maximum (?:message|context) length|reduce (?:the )?length of (?:your )?(?:message|prompt)";
+const PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE = "data-oracle-prompt-rejection-baseline";
+
+function buildPromptTooLargeRejectionReaderExpression(): string {
+  return `const readVisiblePromptTooLargeRejections = () => {
+    const selectors = ${JSON.stringify(PROMPT_TOO_LARGE_REJECTION_SELECTORS)};
+    const pattern = new RegExp(${JSON.stringify(PROMPT_TOO_LARGE_REJECTION_PATTERN)}, 'i');
+    const fingerprint = (text) => {
+      let hash = 2166136261;
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return text.length + ':' + (hash >>> 0);
+    };
+    const matches = [];
+    const seen = new Set();
+    for (const selector of selectors) {
+      for (const node of Array.from(document.querySelectorAll(selector))) {
+        if (seen.has(node) || !isVisible(node)) continue;
+        seen.add(node);
+        const text = String(node.innerText ?? node.textContent ?? '').replace(/\\s+/g, ' ').trim();
+        if (pattern.test(text)) matches.push({ node, fingerprint: fingerprint(text) });
+      }
+    }
+    return matches;
+  };`;
+}
 export function normalizePromptForIdentity(prompt: string): string {
   return prompt
     .toLowerCase()
@@ -115,6 +152,38 @@ export interface PromptCommitVerification {
 }
 
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
+interface PromptTooLargeRejectionBaseline {
+  token: string;
+  entries: Array<{ marker: string; fingerprint: string }>;
+}
+
+async function capturePromptTooLargeRejectionBaseline(
+  Runtime: ChromeClient["Runtime"],
+): Promise<PromptTooLargeRejectionBaseline | undefined> {
+  const token = randomUUID();
+  const { result } = await Runtime.evaluate({
+    expression: `(() => {
+      const isVisible = (node) => {
+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      ${buildPromptTooLargeRejectionReaderExpression()}
+      const token = ${JSON.stringify(token)};
+      const markerAttribute = ${JSON.stringify(PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE)};
+      const entries = readVisiblePromptTooLargeRejections().map(({ node, fingerprint }, index) => {
+        const marker = token + ':' + index;
+        node.setAttribute(markerAttribute, marker);
+        return { marker, fingerprint };
+      });
+      return { token, entries };
+    })()`,
+    returnByValue: true,
+  });
+  const value = result.value as PromptTooLargeRejectionBaseline | undefined;
+  if (value?.token !== token || !Array.isArray(value.entries)) return undefined;
+  return value;
+}
 
 export async function submitPrompt(
   deps: {
@@ -306,6 +375,11 @@ export async function submitPrompt(
     );
   }
 
+  const promptTooLargeRejectionBaseline =
+    promptLength >= 50_000
+      ? await capturePromptTooLargeRejectionBaseline(runtime).catch(() => undefined)
+      : undefined;
+
   await deps.onPromptDispatchStarted?.();
   const clicked = await attemptSendButton(
     runtime,
@@ -332,7 +406,14 @@ export async function submitPrompt(
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-  return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, baselineTurns);
+  return await verifyPromptCommitted(
+    runtime,
+    prompt,
+    commitTimeoutMs,
+    logger,
+    baselineTurns,
+    promptTooLargeRejectionBaseline,
+  );
 }
 
 export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logger: BrowserLogger) {
@@ -893,6 +974,7 @@ export async function verifyPromptCommitted(
   timeoutMs: number,
   logger: BrowserLogger | undefined,
   baselineTurns: number,
+  promptTooLargeRejectionBaseline?: PromptTooLargeRejectionBaseline,
 ): Promise<PromptCommitVerification> {
   if (!Number.isFinite(baselineTurns) || baselineTurns < 0) {
     throw new BrowserAutomationError(
@@ -910,6 +992,10 @@ export async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
+  const rejectionBaselineLiteral = JSON.stringify(promptTooLargeRejectionBaseline ?? null);
+  const rejectionMarkerAttributeLiteral = JSON.stringify(
+    PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE,
+  );
   // Only a full normalized prompt match in a new user turn can commit this epoch.
   // Prefixes, substrings, and historical repeated turns are never commit authority.
   const script = `(() => {
@@ -917,6 +1003,8 @@ export async function verifyPromptCommitted(
     const fallback = document.querySelector(${fallbackSelectorLiteral});
     const inputSelectors = ${inputSelectorsLiteral};
     const baseline = ${baseline};
+    const rejectionBaseline = ${rejectionBaselineLiteral};
+    const rejectionMarkerAttribute = ${rejectionMarkerAttributeLiteral};
     ${buildPromptIdentityNormalizationExpression()}
     ${buildConversationTurnIdentityExpression()}
     ${buildReadUserPromptTextExpression()}
@@ -937,9 +1025,11 @@ export async function verifyPromptCommitted(
     let matchedUserTurnId = null;
     let matchedUserMessageId = null;
     let matchedUserTurnText = null;
+    let hasPostBaselineUserTurn = false;
     for (let index = baseline; index < articles.length; index += 1) {
       const node = articles[index];
       if (!isUserTurn(node)) continue;
+      hasPostBaselineUserTurn = true;
       const promptText = readUserPromptText(node);
       const text = promptText === null ? null : normalizePromptIdentity(promptText);
       if (text === null || !matchesPrompt(text)) continue;
@@ -965,23 +1055,23 @@ export async function verifyPromptCommitted(
       const promptText = readUserPromptText(node);
       return promptText === null ? '' : normalizePromptIdentity(promptText);
     });
-    const promptTooLargePattern = /message (?:you submitted|is) (?:was )?too long|submit something shorter|maximum (?:message|context) length|reduce (?:the )?length of (?:your )?(?:message|prompt)/i;
-    const promptTooLargeVisible = [
-      '[role="alert"]',
-      '[role="status"]',
-      '[aria-live]',
-      '[data-testid*="toast"]',
-      '[data-testid*="banner"]',
-      '[data-testid*="error"]',
-    ].some((selector) => Array.from(document.querySelectorAll(selector)).some((node) => (
-      isVisible(node) && promptTooLargePattern.test(String(node.innerText ?? node.textContent ?? ''))
-    )));
+    ${buildPromptTooLargeRejectionReaderExpression()}
+    const rejectionBaselineEntries = new Map(
+      (rejectionBaseline?.entries ?? []).map(({ marker, fingerprint }) => [marker, fingerprint]),
+    );
+    const promptTooLargeRejectedForDispatch = Boolean(
+      rejectionBaseline && readVisiblePromptTooLargeRejections().some(({ node, fingerprint }) => {
+        const marker = node.getAttribute(rejectionMarkerAttribute);
+        return typeof marker !== 'string' || rejectionBaselineEntries.get(marker) !== fingerprint;
+      }),
+    );
     return {
       baseline,
       matchedUserTurnIndex,
       matchedUserTurnId,
       matchedUserMessageId,
       matchedUserTurnText,
+      hasPostBaselineUserTurn,
       hasNewTurn: articles.length > baseline,
       stopVisible: Boolean(document.querySelector(${stopSelectorLiteral})),
       assistantVisible: Boolean(
@@ -989,7 +1079,7 @@ export async function verifyPromptCommitted(
           document.querySelector('[data-testid*="assistant"]'),
       ),
       composerCleared,
-      promptTooLargeVisible,
+      promptTooLargeRejectedForDispatch,
       inConversation: Boolean(conversationId),
       conversationId,
       href,
@@ -1003,14 +1093,18 @@ export async function verifyPromptCommitted(
   let lastProbe: CommitProbeState | undefined;
   let acceptedTurnProbe: CommitProbeState | undefined;
   let promptTooLargeRejectionObserved = false;
+  let postBaselineTurnObserved = false;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const info = result.value as CommitProbeState | undefined;
     if (info && typeof info === "object") {
       lastProbe = info;
     }
-    if (info?.promptTooLargeVisible === true) {
+    if (info?.promptTooLargeRejectedForDispatch === true && promptTooLargeRejectionBaseline) {
       promptTooLargeRejectionObserved = true;
+    }
+    if (info?.hasNewTurn === true || info?.hasPostBaselineUserTurn === true) {
+      postBaselineTurnObserved = true;
     }
     const conversationId = info?.conversationId?.trim();
     if (hasExactAcceptedPromptTurn(info, expectedPromptSha256, baseline)) {
@@ -1041,8 +1135,11 @@ export async function verifyPromptCommitted(
   if (hasExactAcceptedPromptTurn(probe, expectedPromptSha256, baseline)) {
     acceptedTurnProbe = probe;
   }
-  if (probe?.promptTooLargeVisible === true) {
+  if (probe?.promptTooLargeRejectedForDispatch === true && promptTooLargeRejectionBaseline) {
     promptTooLargeRejectionObserved = true;
+  }
+  if (probe?.hasNewTurn === true || probe?.hasPostBaselineUserTurn === true) {
+    postBaselineTurnObserved = true;
   }
   if (logger) {
     logger(
@@ -1062,7 +1159,11 @@ export async function verifyPromptCommitted(
       },
     );
   }
-  if (prompt.trim().length >= 50_000 && promptTooLargeRejectionObserved) {
+  if (
+    prompt.trim().length >= 50_000 &&
+    promptTooLargeRejectionObserved &&
+    !postBaselineTurnObserved
+  ) {
     throw new BrowserAutomationError("ChatGPT rejected the prompt as too large.", {
       stage: "submit-prompt",
       code: "prompt-too-large",
@@ -1089,12 +1190,13 @@ interface CommitProbeState {
   matchedUserTurnId?: string | null;
   matchedUserMessageId?: string | null;
   matchedUserTurnText?: string | null;
+  hasPostBaselineUserTurn?: boolean;
   hasNewTurn?: boolean;
   stopVisible?: boolean;
   assistantVisible?: boolean;
   composerCleared?: boolean;
   inConversation?: boolean;
-  promptTooLargeVisible?: boolean;
+  promptTooLargeRejectedForDispatch?: boolean;
   conversationId?: string | null;
   turnsCount?: number;
   href?: string;
@@ -1113,11 +1215,12 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     matchedUserMessageIdPresent: Boolean(probe.matchedUserMessageId),
     matchedUserTurnLength:
       typeof probe.matchedUserTurnText === "string" ? probe.matchedUserTurnText.length : undefined,
+    hasPostBaselineUserTurn: probe.hasPostBaselineUserTurn,
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,
     composerCleared: probe.composerCleared,
-    promptTooLargeVisible: probe.promptTooLargeVisible,
+    promptTooLargeRejectedForDispatch: probe.promptTooLargeRejectedForDispatch,
     inConversation: probe.inConversation,
     editorLength: typeof probe.editorValue === "string" ? probe.editorValue.length : undefined,
     lastTurnLength: typeof probe.lastTurn === "string" ? probe.lastTurn.length : undefined,
@@ -1126,6 +1229,7 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
 
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
+  capturePromptTooLargeRejectionBaseline,
   attemptSendButton,
   sendButtonTimeoutMs,
   verifyPromptCommitted,

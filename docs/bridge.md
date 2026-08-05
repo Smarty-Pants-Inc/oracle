@@ -21,7 +21,7 @@ The transfer protocol is pull-based and keeps secrets local to the host:
 Operational notes:
 
 - Run the same patched Oracle version on both Windows host and Linux client before relying on automatic file transfer. Mixed-version text compatibility is fail-closed unless the operator explicitly enables it with a separate predecessor bearer.
-- `oracle bridge doctor` reports the negotiated protocol and `Artifact transfer: bridge v1` when the host supports the protocol, including the advertised maximum artifact size.
+- `oracle bridge doctor` prints the negotiated `transaction-v3` or `legacy-text-v1` protocol and reports `Artifact transfer: bridge v1` when the host advertises it, including the maximum artifact size.
 - The default bridge transfer size limit is 512 MiB. Larger files stay on the browser host and require manual copy.
 - Session inspection prints artifact path, size, SHA-256 prefix, validation status, and transfer status so agents can verify whether the returned path is local to the Linux client.
 
@@ -171,7 +171,7 @@ It checks:
 
 - Whether a loopback remote host and usable modern or explicitly enabled legacy credential are configured
 - TCP reachability to the loopback endpoint
-- Authenticated protocol negotiation via `GET /health`
+- Authenticated protocol negotiation via `GET /health`, including the selected `transaction-v3` or `legacy-text-v1` protocol
 - If no remote is configured, it probes local Chrome + cookie DB detection and suggests `--browser-chrome-path` / `--browser-cookie-path`
 
 ## Security notes

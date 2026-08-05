@@ -12,6 +12,7 @@ import {
 } from "./profileDirectoryAuthority.js";
 import { readDevToolsPort } from "./profileDevToolsState.js";
 import {
+  arePlatformProcessGenerationsDefinitelyDifferent,
   createPlatformProcessGenerationProvider,
   type ProcessGenerationCommandExecutor,
 } from "./platformProcessGeneration.js";
@@ -216,7 +217,14 @@ export async function inspectChromeProcessIdentityWithDeps(
     : readChromeProcessSnapshot(identity.pid, platform, deps.execute ?? executeProcessCommand));
   if (!snapshot) return processAlive(identity.pid) ? "unavailable" : "exited";
   if (snapshot.pid !== identity.pid) return "unavailable";
-  if (snapshot.processStartTime.trim() !== identity.processStartTime) return "exited";
+  if (
+    arePlatformProcessGenerationsDefinitelyDifferent(
+      identity.processStartTime,
+      snapshot.processStartTime.trim(),
+    )
+  ) {
+    return "exited";
+  }
   const executablePath = normalizeExecutablePath(snapshot.executablePath, platform);
   if (
     executablePath !== identity.executablePath ||

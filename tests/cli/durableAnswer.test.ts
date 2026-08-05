@@ -331,6 +331,177 @@ describe("publishCompletedBrowserCapture", () => {
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
 
+  test("reconciles an answer write that throws after its atomic rename", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const prepareArtifacts = vi.fn(async () => []);
+    const writeFileAtomicDurable = sessionManager.writeFileAtomicDurable;
+    let injectedFailure = false;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        await writeFileAtomicDurable(targetPath, data, mode);
+        if (!injectedFailure && path.basename(targetPath).startsWith("browser-answer-")) {
+          injectedFailure = true;
+          throw new Error("directory fsync failed after answer rename");
+        }
+      },
+    );
+
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "renamed answer" },
+        transaction: {
+          runtime,
+          bindSettlement: vi.fn(async () => runtime),
+          finalize,
+          abort,
+        },
+        browser: browser(runtime),
+        prepareArtifacts,
+      }),
+    ).resolves.toMatchObject({ published: true });
+
+    expect(injectedFailure).toBe(true);
+    expect(prepareArtifacts).toHaveBeenCalledOnce();
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
+  test("reconciles a preparing journal write that throws after its atomic rename", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const prepareArtifacts = vi.fn(async () => []);
+    const writeFileAtomicDurable = sessionManager.writeFileAtomicDurable;
+    let injectedFailure = false;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        await writeFileAtomicDurable(targetPath, data, mode);
+        if (!injectedFailure && path.basename(targetPath) === "browser-capture-publication.json") {
+          injectedFailure = true;
+          throw new Error("directory fsync failed after journal rename");
+        }
+      },
+    );
+
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "journaled answer" },
+        transaction: {
+          runtime,
+          bindSettlement: vi.fn(async () => runtime),
+          finalize,
+          abort,
+        },
+        browser: browser(runtime),
+        persistAnswer: acceptPreparedReceipt(),
+        prepareArtifacts,
+      }),
+    ).resolves.toMatchObject({ published: true });
+
+    expect(injectedFailure).toBe(true);
+    expect(prepareArtifacts).toHaveBeenCalledOnce();
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
+  test("clears the preparing journal when answer persistence fails before a receipt", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    const abortBoundRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+    };
+    const bindSettlement = vi.fn(async () => abortBoundRuntime);
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "answer never persisted" },
+        transaction: {
+          runtime,
+          bindSettlement,
+          finalize: vi.fn(),
+          abort,
+        },
+        browser: browser(runtime),
+        persistAnswer: vi.fn(async () => {
+          throw new Error("answer write failed before rename");
+        }),
+      }),
+    ).rejects.toThrow("answer write failed before rename");
+
+    expect(bindSettlement).toHaveBeenCalledWith("abort");
+    expect(abort).toHaveBeenCalledOnce();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({
+        browser: expect.objectContaining({ runtime: abortBoundRuntime }),
+      }),
+    );
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
+  test("clears a crashed preparing intent when restart recaptures different bytes", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    let answerPersistenceStarted!: () => void;
+    const persistenceBoundary = new Promise<void>((resolve) => {
+      answerPersistenceStarted = resolve;
+    });
+    const interrupted = publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer: "first captured answer" },
+      transaction: {
+        runtime,
+        bindSettlement: vi.fn(async () => runtime),
+        finalize: vi.fn(),
+        abort: vi.fn(),
+      },
+      browser: browser(runtime),
+      persistAnswer: vi.fn(async () => {
+        answerPersistenceStarted();
+        return new Promise<DurableBrowserAnswerReceipt>(() => undefined);
+      }),
+    });
+    void interrupted.catch(() => undefined);
+    await persistenceBoundary;
+    expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
+      phase: "preparing",
+    });
+
+    const abortBoundRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+    };
+    const bindSettlement = vi.fn(async () => abortBoundRuntime);
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "different recaptured answer" },
+        transaction: {
+          runtime,
+          bindSettlement,
+          finalize: vi.fn(),
+          abort,
+        },
+        browser: browser(runtime),
+      }),
+    ).rejects.toThrow("receipt does not match its publication intent");
+
+    expect(bindSettlement).toHaveBeenCalledWith("abort");
+    expect(abort).toHaveBeenCalledOnce();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({
+        browser: expect.objectContaining({ runtime: abortBoundRuntime }),
+      }),
+    );
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
   test("binds ABORT before cleanup when pre-stage preparation fails", async () => {
     await setupSession();
     const events: string[] = [];

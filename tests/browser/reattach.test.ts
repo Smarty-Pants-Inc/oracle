@@ -32,6 +32,7 @@ import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { acquireBrowserTabLease } from "../../src/browser/tabLeaseRegistry.js";
 import type { ExactChromeTargetCleanupResult } from "../../src/browser/chromeLifecycle.js";
 import { retainChromeTargetCloseCapability } from "../../src/browser/targetCloseAuthority.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 function createBrowserLogger(): BrowserLogger {
   return vi.fn<(message: string) => void>();
@@ -673,6 +674,137 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     expect(removeProfile).toHaveBeenCalledWith(profileDir);
     await rm(profileDir, { recursive: true, force: true });
   }, 15_000);
+
+  test("harvests the exact committed Gemini target without resubmitting", async () => {
+    const promptSha256 = promptIdentitySha256("New request");
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "gemini-target-1",
+      conversationId: "gemini-target-1",
+      promptEpoch: {
+        status: "committed" as const,
+        epochId: "gemini-epoch-1",
+        promptSha256,
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: `gemini-dom-turn:0:${promptSha256}`,
+        verifiedUserMessageId: `gemini-dom-turn:0:${promptSha256}`,
+        conversationId: "gemini-target-1",
+      },
+    } satisfies BrowserRuntimeMetadata;
+    const listTargets = vi.fn(async () => [
+      {
+        targetId: "gemini-target-1",
+        type: "page",
+        url: "https://gemini.google.com/app/conversation-1",
+      },
+      { targetId: "foreign-target", type: "page", url: "https://gemini.google.com/app/other" },
+    ]);
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "1+1") return { result: { value: 2 } };
+      if (expression.includes("const ordered =")) {
+        return {
+          result: {
+            value: JSON.stringify({
+              entries: [
+                {
+                  kind: "user",
+                  postBaseline: true,
+                  text: "New request",
+                  stableId: null,
+                },
+                {
+                  kind: "response",
+                  postBaseline: true,
+                  text: "exact recovered Gemini answer",
+                  stableId: null,
+                  completionMarked: true,
+                  visibleSpinner: false,
+                },
+              ],
+            }),
+          },
+        };
+      }
+      return { result: { value: null } };
+    });
+    const close = vi.fn(async () => undefined);
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(async () => undefined), evaluate },
+      DOM: { enable: vi.fn(async () => undefined) },
+      close,
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const recoverSession = vi.fn();
+    const waitForAssistantResponse = vi.fn();
+    const release = vi.fn(async () => undefined);
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { desiredModel: "gemini-3-pro-deep-think", timeoutMs: 2_000 },
+      createBrowserLogger(),
+      {
+        listTargets,
+        connect,
+        recoverSession,
+        waitForAssistantResponse,
+        acquireRecoveryLock: vi.fn(async () => ({ release })),
+      },
+    );
+
+    expect(result.answerText).toBe("exact recovered Gemini answer");
+    expect(result.answerMarkdown).toBe("exact recovered Gemini answer");
+    expect(connect).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "127.0.0.1", port: 51559, target: "gemini-target-1" }),
+    );
+    expect(recoverSession).not.toHaveBeenCalled();
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+    await result.abort();
+  });
+
+  test("never reopens or resubmits when the exact committed Gemini target is missing", async () => {
+    const baseRuntime = withCommittedPromptEpoch({
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "gemini-target-missing",
+      conversationId: "gemini-target-missing",
+    });
+    const runtime: BrowserRuntimeMetadata = {
+      ...baseRuntime,
+      promptEpoch: {
+        ...baseRuntime.promptEpoch!,
+        promptSha256: promptIdentitySha256("New request"),
+      },
+    };
+    const recoverSession = vi.fn();
+    const release = vi.fn(async () => undefined);
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { desiredModel: "gemini-3-pro-deep-think", timeoutMs: 2_000 },
+        createBrowserLogger(),
+        {
+          listTargets: vi.fn(async () => []),
+          recoverSession,
+          acquireRecoveryLock: vi.fn(async () => ({ release })),
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        stage: "gemini-response-capture",
+        code: "gemini-reattach-target-mismatch",
+        reattachable: true,
+        runtime,
+      },
+    });
+    expect(recoverSession).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
 
   test("uses the committed prompt epoch as the assistant turn floor", async () => {
     const runtime = withCommittedPromptEpoch(

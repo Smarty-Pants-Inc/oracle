@@ -388,6 +388,66 @@ describe("profileState", () => {
     ).toBe(false);
   });
 
+  test("keeps Darwin inspection current across providers while still verifying process authority", async () => {
+    const userDataDir = "/tmp/oracle-mac-provider-generation";
+    const executablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    const launchClaim = {
+      version: 1 as const,
+      generationId: "00000000-0000-4000-8000-000000007001",
+      nonce: "00000000-0000-4000-8000-000000007002",
+    };
+    const identity = {
+      pid: 4321,
+      processStartTime: "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
+      executablePath,
+      normalizedUserDataDir: userDataDir,
+      launchNonce: launchClaim.nonce,
+      launchClaim,
+      profileDirectory: {
+        version: 1 as const,
+        platform: "darwin" as const,
+        canonicalPath: userDataDir,
+        device: "1",
+        inode: "2",
+      },
+    } satisfies ChromeProcessIdentity;
+    const validCommandTokens = [
+      executablePath,
+      `--user-data-dir=${userDataDir}`,
+      `--oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}`,
+    ];
+    const inspect = (processStartTime: string, commandTokens = validCommandTokens) =>
+      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+        platform: "darwin",
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+        readProcessSnapshot: async () => ({
+          pid: identity.pid,
+          processStartTime,
+          executablePath,
+          commandLine: commandTokens.join(" "),
+          commandTokens,
+        }),
+      });
+
+    for (const observedIdentity of [
+      "darwin-kernel-start:1785945427:287123",
+      "darwin-audit-pidversion:7001",
+    ]) {
+      await expect(inspect(observedIdentity)).resolves.toBe("current");
+    }
+    await expect(
+      inspect("darwin-audit-pidversion:7001", [
+        executablePath,
+        `--user-data-dir=${userDataDir}`,
+        `--oracle-launch-claim=${launchClaim.generationId}:00000000-0000-4000-8000-000000007003`,
+      ]),
+    ).resolves.toBe("unavailable");
+    await expect(inspect("darwin-sample-launch:2026-08-05T11:57:07.288-0400")).resolves.toBe(
+      "exited",
+    );
+  });
+
   test("crash recovery without stable authority remains pending and never taskkills", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const identity = syntheticWindowsChromeIdentity(profileDir);
