@@ -9,6 +9,7 @@ import { mkdir, mkdtemp, readdir, realpath, rm, writeFile, readFile, stat } from
 import {
   createRemoteServer,
   drainRemoteServerShutdown,
+  __test__ as serverTest,
   type RemoteServerInstance,
 } from "../../src/remote/server.js";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
@@ -442,6 +443,123 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "aborts captured live authority when required artifact preparation fails",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-abort-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const missingArtifactPath = path.join(
+        tmpDir,
+        "sessions",
+        "artifact-abort-session",
+        "artifacts",
+        "missing.zip",
+      );
+      const transactionToken = "6".repeat(64);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "artifact-abort-target",
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "artifact-abort-target",
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      setOracleHomeDirOverrideForTest(tmpDir);
+      await mkdir(path.dirname(missingArtifactPath), { recursive: true });
+      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+        async (mode, pendingRuntime) => {
+          expect(mode).toBe("abort");
+          const recordName = (await readdir(transactionStoreDir)).find((name) =>
+            name.endsWith(".json"),
+          );
+          if (!recordName) throw new Error("missing bound artifact failure transaction");
+          expect(
+            JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
+          ).toMatchObject({
+            state: "recoverable-error",
+            settlementMode: "abort",
+            runtime: {
+              recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+            },
+          });
+          return completedBrowserCaptureCleanup(pendingRuntime);
+        },
+      );
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) =>
+            lifecycleBrowserTransaction(
+              options.prompt,
+              {
+                answerText: "captured before artifact failure",
+                answerMarkdown: "captured before artifact failure",
+                tookMs: 1,
+                answerTokens: 4,
+                answerChars: 32,
+                savedFiles: [
+                  {
+                    kind: "file",
+                    path: missingArtifactPath,
+                    label: "missing required artifact",
+                    mimeType: "application/zip",
+                    sizeBytes: 22,
+                    sourceUrl: "sandbox:/mnt/data/missing.zip",
+                    url: "browser-download",
+                    finalUrl: "browser-download",
+                    filename: "missing.zip",
+                  },
+                ],
+              },
+              runtime,
+              options.runtimeHintCb,
+              settleResources,
+            ),
+        },
+      );
+
+      try {
+        const response = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        expect(response.statusCode).toBe(200);
+        expect(response.events.find((event) => event.type === "error")).toMatchObject({
+          error: { recoverableDisconnect: false },
+        });
+        expect(settleResources).toHaveBeenCalledOnce();
+
+        const recordName = (await readdir(transactionStoreDir)).find((name) =>
+          name.endsWith(".json"),
+        );
+        if (!recordName) throw new Error("missing aborted artifact failure transaction");
+        expect(
+          JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
+        ).toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+          finalization: { status: "completed" },
+        });
+
+        await server.close();
+        expect(settleResources).toHaveBeenCalledOnce();
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "keeps manual-login Chrome but requests completed run-tab cleanup",
     async () => {
       const manualLoginProfileDir = "/tmp/oracle-manual-login-profile-test";
@@ -501,6 +619,55 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
     15_000,
   );
+
+  test("serve bootstrap releases retained endpoint authority without killing Chrome", async () => {
+    const kill = vi.fn(async () => ({ status: "stopped" as const, pid: 4321 }));
+    const release = vi.fn(async () => undefined);
+    const owner = {
+      chrome: {
+        pid: 4321,
+        port: 9222,
+        processIdentity: { pid: 4321 },
+        kill,
+      },
+      processIdentity: { pid: 4321 },
+      source: "recorded" as const,
+      disposition: "preserve" as const,
+      endpointAuthority: {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/serve-bootstrap",
+        kill,
+        release,
+      },
+    };
+    const acquireOwner = vi.fn(async () => owner);
+    const logger = vi.fn<(message: string) => void>();
+
+    await serverTest.bootstrapRemoteManualChromeOwner("/tmp/oracle-serve-bootstrap", logger, {
+      acquireOwner: acquireOwner as never,
+    });
+
+    expect(acquireOwner).toHaveBeenCalledWith(
+      "/tmp/oracle-serve-bootstrap",
+      expect.objectContaining({ manualLogin: true, keepBrowser: true }),
+      logger,
+      "remote-serve-bootstrap",
+    );
+    expect(release).toHaveBeenCalledOnce();
+    expect(kill).not.toHaveBeenCalled();
+
+    const announcementFailure = new Error("bootstrap announcement failed");
+    await expect(
+      serverTest.bootstrapRemoteManualChromeOwner(
+        "/tmp/oracle-serve-bootstrap",
+        vi.fn(() => {
+          throw announcementFailure;
+        }) as BrowserLogger,
+        { acquireOwner: acquireOwner as never },
+      ),
+    ).rejects.toBe(announcementFailure);
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(kill).not.toHaveBeenCalled();
+  });
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "transfers saved browser file artifacts to the client session directory",

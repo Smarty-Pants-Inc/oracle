@@ -55,6 +55,7 @@ import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
 import {
   persistDurableBrowserAnswer,
   publishBrowserCapture,
+  runtimeFromBrowserError,
   type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
 
@@ -659,7 +660,7 @@ export async function performSessionRun({
         configuredIntervalMs > 0
           ? configuredIntervalMs
           : Math.max(1_000, Math.min(browserConfig?.timeoutMs ?? 30_000, 30_000));
-      const success = await autoReattachUntilComplete({
+      await autoReattachUntilComplete({
         sessionMeta,
         runtime: recoverableRuntime ?? undefined,
         browserConfig: {
@@ -676,9 +677,6 @@ export async function performSessionRun({
         log,
         maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
       });
-      if (success) {
-        return;
-      }
       return;
     }
     if (assistantTimeout && mode === "browser" && browserCanReattach) {
@@ -694,7 +692,7 @@ export async function performSessionRun({
         details: userError.details,
       };
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
-      const autoRuntime = runtime ?? currentBrowser?.runtime;
+      let autoRuntime = runtime ?? currentBrowser?.runtime;
       const willAutoReattach =
         autoReattachIntervalMs > 0 && hasResumableBrowserAuthority(autoRuntime);
       if (willAutoReattach) {
@@ -719,7 +717,7 @@ export async function performSessionRun({
           response: timeoutResponse,
           error: timeoutError,
         });
-        const success = await autoReattachUntilComplete({
+        const reattach = await autoReattachUntilComplete({
           sessionMeta,
           runtime: autoRuntime,
           browserConfig,
@@ -729,9 +727,10 @@ export async function performSessionRun({
           notificationSettings,
           log,
         });
-        if (success) {
+        if (reattach.outcome !== "exhausted") {
           return;
         }
+        autoRuntime = reattach.runtime ?? autoRuntime;
       }
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -749,12 +748,12 @@ export async function performSessionRun({
         browser: {
           ...currentBrowser,
           config: browserConfig,
-          runtime: runtime ?? currentBrowser?.runtime,
+          runtime: autoRuntime,
         },
         response: timeoutResponse,
         error: timeoutError,
       });
-      logBrowserReattachGuidance(runtime ?? currentBrowser?.runtime);
+      logBrowserReattachGuidance(autoRuntime);
       return;
     }
     if (cloudflareChallenge && mode === "browser") {
@@ -1205,6 +1204,29 @@ async function writeAssistantOutput(
   }
 }
 
+type AutoReattachOutcome = {
+  outcome: "completed" | "terminal" | "exhausted";
+  runtime?: BrowserRuntimeMetadata;
+};
+function isTerminalAutoReattachError(error: unknown): boolean {
+  const userError = asOracleUserError(error);
+  if (userError?.category !== "browser-automation") return false;
+  const details = userError.details as
+    | {
+        code?: string;
+        reattachable?: boolean;
+        reattachClassification?: string;
+        recoverableDisconnect?: boolean;
+      }
+    | undefined;
+  return (
+    details?.recoverableDisconnect === false ||
+    details?.reattachable === false ||
+    details?.reattachClassification === "explicit-selector-terminal" ||
+    details?.code === "committed-prompt-identity-mismatch"
+  );
+}
+
 async function autoReattachUntilComplete({
   sessionMeta,
   runtime,
@@ -1225,15 +1247,15 @@ async function autoReattachUntilComplete({
   notificationSettings: NotificationSettings;
   log: (message?: string) => void;
   maxAttempts?: number;
-}): Promise<boolean> {
+}): Promise<AutoReattachOutcome> {
   if (!runtime || !browserConfig) {
     log(dim("Auto-reattach disabled: missing runtime or browser config."));
-    return false;
+    return { outcome: "exhausted" };
   }
   const delayMs = Math.max(0, browserConfig.autoReattachDelayMs ?? 0);
   const intervalMs = Math.max(0, browserConfig.autoReattachIntervalMs ?? 0);
   if (intervalMs <= 0) {
-    return false;
+    return { outcome: "exhausted", runtime };
   }
   const timeoutMs =
     Math.max(0, browserConfig.autoReattachTimeoutMs ?? 0) ||
@@ -1268,6 +1290,7 @@ async function autoReattachUntilComplete({
     (await sessionStore.getPaths(sessionMeta.id)).dir,
     "browser-recovery.lock",
   );
+  let retryRuntime = runtime;
 
   let attempt = 0;
   for (;;) {
@@ -1278,7 +1301,7 @@ async function autoReattachUntilComplete({
           `Auto-reattach stopped after ${formatElapsed(maxTotalMs)} without capturing an answer.`,
         ),
       );
-      return false;
+      return { outcome: "exhausted", runtime: retryRuntime };
     }
     attempt += 1;
     log(dim(`Auto-reattach attempt ${attempt}...`));
@@ -1286,18 +1309,19 @@ async function autoReattachUntilComplete({
     let durablyCompleted = false;
     let reattachResult: ReattachResult | null = null;
     let answerReceipt: DurableBrowserAnswerReceipt | undefined;
-    let authoritativeRuntime = runtime;
+    let authoritativeRuntime = retryRuntime;
     let remotePublicationAcknowledged = false;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
         timeoutMs,
       };
-      reattachResult = await resumeBrowserSession(runtime, reattachConfig, logger, {
+      reattachResult = await resumeBrowserSession(retryRuntime, reattachConfig, logger, {
         recoveryLockPath,
         isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
         runtimeHintCb: async (latestRuntime) => {
           authoritativeRuntime = latestRuntime;
+          retryRuntime = latestRuntime;
           await sessionStore.updateSession(sessionMeta.id, {
             browser: {
               ...browserMetadata,
@@ -1309,6 +1333,7 @@ async function autoReattachUntilComplete({
       });
       captureSucceeded = true;
       authoritativeRuntime = reattachResult.runtime;
+      retryRuntime = reattachResult.runtime;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const usage = {
@@ -1360,6 +1385,7 @@ async function autoReattachUntilComplete({
         },
         persistRuntime: async (latestRuntime) => {
           authoritativeRuntime = latestRuntime;
+          retryRuntime = latestRuntime;
           await sessionStore.updateSession(sessionMeta.id, {
             browser: {
               ...browserMetadata,
@@ -1410,7 +1436,7 @@ async function autoReattachUntilComplete({
             );
           });
       }
-      return true;
+      return { outcome: "completed", runtime: retryRuntime };
     } catch (error) {
       if (durablyCompleted) {
         log(
@@ -1418,14 +1444,12 @@ async function autoReattachUntilComplete({
             `Auto-reattach completed, but a post-publication side effect failed: ${formatError(error)}`,
           ),
         );
-        return true;
+        return { outcome: "completed", runtime: retryRuntime };
       }
       if (captureSucceeded) {
         const message = formatError(error);
         const userError = asOracleUserError(error);
-        const failureRuntime =
-          (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime ??
-          authoritativeRuntime;
+        const failureRuntime = runtimeFromBrowserError(error) ?? authoritativeRuntime;
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
@@ -1455,12 +1479,65 @@ async function autoReattachUntilComplete({
         }
         throw error;
       }
-      const message = error instanceof Error ? error.message : String(error);
+      const errorRuntime = runtimeFromBrowserError(error);
+      if (errorRuntime) {
+        authoritativeRuntime = errorRuntime;
+        retryRuntime = errorRuntime;
+      }
+      const message = formatError(error);
+      const userError = asOracleUserError(error);
+      if (
+        isTerminalAutoReattachError(error) ||
+        retryRuntime.recoveryCleanupResult?.settlementMode !== undefined ||
+        (errorRuntime !== undefined && !hasResumableBrowserAuthority(errorRuntime))
+      ) {
+        const details = userError?.details as { stage?: string } | undefined;
+        const incompleteReason =
+          details?.stage === "connection-lost" ? "chrome-disconnected" : "incomplete-capture";
+        const terminalError = userError
+          ? {
+              category: userError.category,
+              message: userError.message,
+              details: userError.details,
+            }
+          : { category: "internal" as const, message };
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+          browser: {
+            ...browserMetadata,
+            config: browserConfig,
+            runtime: retryRuntime,
+          },
+          response: { status: "error", incompleteReason },
+          error: terminalError,
+        });
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "error",
+            completedAt: new Date().toISOString(),
+            response: { status: "error", incompleteReason },
+            error: terminalError,
+          });
+        }
+        log(dim(`Auto-reattach stopped on terminal browser outcome: ${message}`));
+        return { outcome: "terminal", runtime: retryRuntime };
+      }
+      if (errorRuntime) {
+        await sessionStore.updateSession(sessionMeta.id, {
+          browser: {
+            ...browserMetadata,
+            config: browserConfig,
+            runtime: retryRuntime,
+          },
+        });
+      }
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
     }
     if (attempt >= attemptLimit) {
       log(dim(`Auto-reattach stopped after ${attempt} attempt(s) without capturing an answer.`));
-      return false;
+      return { outcome: "exhausted", runtime: retryRuntime };
     }
     const remainingAfterAttemptMs = maxDeadline - Date.now();
     if (remainingAfterAttemptMs <= 0) {
@@ -1469,7 +1546,7 @@ async function autoReattachUntilComplete({
           `Auto-reattach stopped after ${formatElapsed(maxTotalMs)} without capturing an answer.`,
         ),
       );
-      return false;
+      return { outcome: "exhausted", runtime: retryRuntime };
     }
     await wait(Math.min(intervalMs, remainingAfterAttemptMs));
   }

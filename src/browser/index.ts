@@ -328,6 +328,32 @@ function connectionLostCause(
   return "cdp-client-disconnect";
 }
 
+function runtimeFromBrowserAutomationError(error: unknown): BrowserRuntimeMetadata | undefined {
+  if (!(error instanceof BrowserAutomationError)) return undefined;
+  return (error.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime;
+}
+
+function disconnectAssessmentFailureError(options: {
+  error: unknown;
+  runtime: BrowserRuntimeMetadata;
+  remote?: boolean;
+}): BrowserAutomationError {
+  const message = options.error instanceof Error ? options.error.message : String(options.error);
+  const promptCommitted = options.runtime.promptEpoch?.status === "committed";
+  return new BrowserAutomationError(
+    `${options.remote ? "Remote Chrome" : "Chrome"} disconnected, but Oracle could not durably record the verified recovery authority: ${message}`,
+    {
+      stage: "connection-lost",
+      code: "disconnect-assessment-failed",
+      recoverableDisconnect: promptCommitted,
+      disconnectCause: promptCommitted ? "cdp-client-disconnect" : "prompt-commit-unverified",
+      runtime: options.runtime,
+      assessmentError: message,
+    },
+    options.error,
+  );
+}
+
 type RecoverableDisconnectDetails = {
   stage?: string;
   recoverableDisconnect?: boolean;
@@ -1816,6 +1842,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     });
     return disconnectAssessmentPromise;
   };
+  let disconnectAssessmentFailure: BrowserAutomationError | null = null;
+  const classifyDisconnectAssessmentFailure = (error: unknown): BrowserAutomationError => {
+    const runtime = runtimeFromBrowserAutomationError(error) ?? buildLocalRuntimeMetadata();
+    return disconnectAssessmentFailureError({ error, runtime });
+  };
   let manualOwnerSettled = false;
   let closedOwnedTargetId: string | null = null;
   let releasedTabLeaseId: string | null = null;
@@ -2100,34 +2131,39 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         // Until the fresh liveness/commit probe resolves, cleanup authority is unresolved.
         // Preserve first so no concurrent failure path can tear down a potentially recoverable run.
         preserveBrowserOnError = true;
-        void getDisconnectAssessment().then((assessment) => {
-          preserveBrowserOnError = assessment.recoverable;
-          if (assessment.recoverable) {
-            logger(
-              "CDP client disconnected; Chrome/target still reachable and the prompt is committed. Leaving run recoverable for reattach.",
+        void getDisconnectAssessment()
+          .then((assessment) => {
+            preserveBrowserOnError = assessment.recoverable;
+            if (assessment.recoverable) {
+              logger(
+                "CDP client disconnected; Chrome/target still reachable and the prompt is committed. Leaving run recoverable for reattach.",
+              );
+            } else if (assessment.targetReachable) {
+              logger(
+                usingCopiedProfile
+                  ? "CDP client disconnected; copy-profile runs are not retained."
+                  : "CDP client disconnected before prompt commit could be verified; cleaning up the run.",
+              );
+            } else {
+              logger("Chrome window closed; attempting to abort run.");
+            }
+            const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
+            reject(
+              new BrowserAutomationError(
+                connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
+                {
+                  stage: "connection-lost",
+                  recoverableDisconnect: assessment.recoverable,
+                  disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
+                  runtime: buildLocalRuntimeMetadata(tabUrl),
+                },
+              ),
             );
-          } else if (assessment.targetReachable) {
-            logger(
-              usingCopiedProfile
-                ? "CDP client disconnected; copy-profile runs are not retained."
-                : "CDP client disconnected before prompt commit could be verified; cleaning up the run.",
-            );
-          } else {
-            logger("Chrome window closed; attempting to abort run.");
-          }
-          const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
-          reject(
-            new BrowserAutomationError(
-              connectionLostMessage({ assessment, copiedProfile: usingCopiedProfile }),
-              {
-                stage: "connection-lost",
-                recoverableDisconnect: assessment.recoverable,
-                disconnectCause: connectionLostCause(assessment, usingCopiedProfile),
-                runtime: buildLocalRuntimeMetadata(tabUrl),
-              },
-            ),
-          );
-        });
+          })
+          .catch((error) => {
+            disconnectAssessmentFailure = classifyDisconnectAssessmentFailure(error);
+            reject(disconnectAssessmentFailure);
+          });
       });
     });
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
@@ -2138,7 +2174,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
-    await Promise.all(domainEnablers);
+    await raceWithDisconnect(Promise.all(domainEnablers));
     lifecycle.markAcquired();
     if (!config.headless && config.hideWindow) {
       await positionChromeWindowOffscreen(client, logger);
@@ -3326,7 +3362,46 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Chrome connection lost before completion: ${normalizedError.message}`);
       logger(normalizedError.stack);
     }
-    let assessment = await getDisconnectAssessment();
+    let assessment: ChromeDisconnectAssessment;
+    try {
+      assessment = await getDisconnectAssessment();
+    } catch (assessmentError) {
+      let classified =
+        disconnectAssessmentFailure ?? classifyDisconnectAssessmentFailure(assessmentError);
+      const recoveryRuntime = runtimeFromBrowserAutomationError(classified);
+      if (classified.details?.recoverableDisconnect === true && recoveryRuntime) {
+        try {
+          await writeOracleChromeOwner(userDataDir, {
+            port: chrome.port,
+            processIdentity: chrome.processIdentity,
+            disposition: chromeOwnerDisposition,
+          });
+          const publishedRuntime = lifecycle.publishRecovery(recoveryRuntime);
+          classified = disconnectAssessmentFailureError({
+            error: classified.cause ?? classified,
+            runtime: publishedRuntime,
+          });
+          preserveBrowserOnError = true;
+        } catch (ownerError) {
+          classified = new BrowserAutomationError(
+            "Chrome disconnected after prompt commit, but retained Chrome owner authority could not be persisted.",
+            {
+              stage: "connection-lost",
+              code: "retained-owner-persistence-failed",
+              recoverableDisconnect: false,
+              disconnectCause: "prompt-commit-unverified",
+              runtime: recoveryRuntime,
+            },
+            new AggregateError(
+              [classified, ownerError],
+              "Retained Chrome owner publication failed",
+            ),
+          );
+        }
+      }
+      if (classified.details?.recoverableDisconnect === true) await emitRuntimeHint();
+      throw rememberEscapingFailure(classified);
+    }
     if (assessment.recoverable) {
       try {
         await writeOracleChromeOwner(userDataDir, {
@@ -3739,6 +3814,31 @@ async function runRemoteBrowserMode(
     });
     return disconnectAssessmentPromise;
   };
+  let disconnectAssessmentFailure: BrowserAutomationError | null = null;
+  const classifyDisconnectAssessmentFailure = (error: unknown): BrowserAutomationError => {
+    let cause = error;
+    if (lifecycle.promptDispatch().status === "committed") {
+      try {
+        lifecycle.publishRecovery(
+          runtimeFromBrowserAutomationError(error) ?? buildRemoteRuntimeBase(),
+        );
+      } catch (publicationError) {
+        cause = new AggregateError(
+          [error, publicationError],
+          "Failed to publish verified remote disconnect recovery authority",
+        );
+      }
+    }
+    const runtime = buildRemoteRuntimeMetadata();
+    preserveBrowserOnError = runtime.promptEpoch?.status === "committed";
+    return disconnectAssessmentFailureError({ error: cause, runtime, remote: true });
+  };
+  let rejectDisconnect: (reason?: unknown) => void = () => undefined;
+  const disconnectPromise = new Promise<never>((_, reject) => {
+    rejectDisconnect = reject;
+  });
+  const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
+    Promise.race([promise, disconnectPromise]);
   let closedRemoteTargetId: string | null = null;
   let releasedRemoteTabLeaseId: string | null = null;
   async function settleRemoteResources(
@@ -3870,7 +3970,25 @@ async function runRemoteBrowserMode(
     }
     client.on("disconnect", () => {
       connectionClosedUnexpectedly = true;
-      void getDisconnectAssessment();
+      preserveBrowserOnError = true;
+      void getDisconnectAssessment()
+        .then((assessment) => {
+          preserveBrowserOnError = assessment.recoverable;
+          const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
+          rejectDisconnect(
+            new BrowserAutomationError(connectionLostMessage({ assessment, remote: true }), {
+              stage: "connection-lost",
+              recoverableDisconnect: assessment.recoverable,
+              disconnectCause: connectionLostCause(assessment),
+              runtime: buildRemoteRuntimeMetadata(tabUrl),
+            }),
+          );
+        })
+        .catch((error) => {
+          const classified = classifyDisconnectAssessmentFailure(error);
+          disconnectAssessmentFailure = classified;
+          rejectDisconnect(classified);
+        });
     });
     const { Network, Page, Runtime, Input, DOM, Target } = client;
 
@@ -3878,7 +3996,7 @@ async function runRemoteBrowserMode(
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
-    await Promise.all(domainEnablers);
+    await raceWithDisconnect(Promise.all(domainEnablers));
     lifecycle.markAcquired();
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     await enableFocusEmulation(client, logger, "remote target");
@@ -4085,13 +4203,15 @@ async function runRemoteBrowserMode(
         deepResearch && client
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
-      const commitEvidence = await runProviderSubmissionFlow(chatgptDomProvider, {
-        prompt,
-        evaluate: async () => undefined,
-        delay,
-        log: logger,
-        state: providerState,
-      });
+      const commitEvidence = await raceWithDisconnect(
+        runProviderSubmissionFlow(chatgptDomProvider, {
+          prompt,
+          evaluate: async () => undefined,
+          delay,
+          log: logger,
+          state: providerState,
+        }),
+      );
       await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
       const promptLocator = requireCommittedPromptLocator(lifecycle);
       const providerBaselineTurns = providerState.baselineTurns;
@@ -4730,7 +4850,15 @@ async function runRemoteBrowserMode(
       throw rememberRemoteEscapingFailure(withInterruptedArchiveDetails(normalizedError, archive));
     }
 
-    const assessment = await getDisconnectAssessment();
+    let assessment: ChromeDisconnectAssessment;
+    try {
+      assessment = await getDisconnectAssessment();
+    } catch (assessmentError) {
+      const classified =
+        disconnectAssessmentFailure ?? classifyDisconnectAssessmentFailure(assessmentError);
+      await emitRuntimeHint();
+      throw rememberRemoteEscapingFailure(classified);
+    }
     preserveBrowserOnError = assessment.recoverable;
     const tabUrl = assessment.liveness.matchedUrl ?? lastUrl;
     if (assessment.recoverable) {

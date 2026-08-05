@@ -792,6 +792,35 @@ describe("gemini-web executor", () => {
     );
     expect(closeTab).toHaveBeenCalled();
   });
+  it.each([
+    { first: "finalize" as const, second: "finalize" as const },
+    { first: "abort" as const, second: "abort" as const },
+    { first: "finalize" as const, second: "abort" as const },
+    { first: "abort" as const, second: "finalize" as const },
+  ])("settles HTTP Gemini transactions $first→$second", async ({ first, second }) => {
+    const exec = createGeminiWebExecutor({});
+    const transaction = await exec({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "gemini-3-pro" },
+      log: () => {},
+    });
+
+    const settled = await transaction[first]();
+    if (first === second) {
+      await expect(transaction[second]()).resolves.toBe(settled);
+    } else {
+      await expect(transaction[second]()).rejects.toMatchObject({
+        details: {
+          code: "browser-run-lifecycle-settlement-conflict",
+          requestedMode: second,
+          boundMode: first,
+        },
+      });
+    }
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(killChrome).not.toHaveBeenCalled();
+  });
 
   it("binds abort mode and rejects later finalize without duplicate teardown", async () => {
     const exec = createGeminiWebExecutor({});

@@ -22,18 +22,25 @@ import {
   positionChromeWindowOffscreen,
   connectToRemoteChromeTarget,
   closeChromeTarget,
+  retainChromeEndpointAuthority,
   type RemoteChromeConnection,
+  type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
-import { acquireManualChromeOwner, type BrowserChrome } from "./manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
+  type BrowserChrome,
+  type ManualChromeOwner,
+} from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
 import {
   captureProfileDirectoryIdentity,
+  inspectChromeProcessIdentity,
   sameChromeProcessIdentity,
   terminateRecordedChromeForProfile,
   verifyProfileDirectoryIdentity,
-  type ChromeOwnerDisposition,
 } from "./profileState.js";
 import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
@@ -51,7 +58,6 @@ import {
   type CommittedPromptEpochLocator,
 } from "./reattachability.js";
 import {
-  chromeProcessIdentityKey,
   finalizeRecoveredRuntime,
   pendingFinalization,
   type ReattachCleanupDeps,
@@ -64,45 +70,100 @@ type ExplicitTargetSelectionFailure = "missing" | "ambiguous" | "mismatched" | "
 export type TargetSelection =
   | { status: "selected"; target: TargetInfoLite }
   | { status: ExplicitTargetSelectionFailure };
+interface RefreshAttachRuntimeDeps {
+  readActivePort?: typeof readDevToolsActivePortInfo;
+  inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
+  retainEndpointAuthority?: (options: {
+    host: string;
+    port: number;
+    browserWSEndpoint?: string;
+    userDataDir: string;
+    processIdentity: NonNullable<BrowserRuntimeMetadata["chromeProcessIdentity"]>;
+  }) => Promise<RetainedChromeEndpointAuthority>;
+}
+
 export async function refreshAttachRuntime(
   runtime: BrowserRuntimeMetadata,
+  deps: RefreshAttachRuntimeDeps = {},
 ): Promise<BrowserRuntimeMetadata | null> {
-  if (!runtime.chromeProfileRoot) {
+  const recordedEndpoint = runtime.chromeBrowserWSEndpoint
+    ? new URL(runtime.chromeBrowserWSEndpoint)
+    : null;
+  const host = runtime.chromeHost ?? recordedEndpoint?.hostname ?? "127.0.0.1";
+  const normalizedHost = host.toLowerCase();
+  const localHost =
+    normalizedHost === "localhost" ||
+    normalizedHost === "localhost." ||
+    normalizedHost.startsWith("127.") ||
+    normalizedHost === "::1" ||
+    normalizedHost === "[::1]";
+  const profileRoot = runtime.chromeProfileRoot ?? runtime.userDataDir;
+  if (!profileRoot) {
+    if (localHost) {
+      throw new Error("Recorded local Chrome endpoint has no physical profile authority");
+    }
     return runtime;
   }
-  const host = runtime.chromeHost ?? "127.0.0.1";
-  const activePort = await readDevToolsActivePortInfo(runtime.chromeProfileRoot, {
+
+  const processIdentity = runtime.chromeProcessIdentity;
+  if (!processIdentity) {
+    throw new Error("Recorded local Chrome endpoint has no exact process identity");
+  }
+  const inspection = await (deps.inspectProcessIdentity ?? inspectChromeProcessIdentity)(
+    profileRoot,
+    processIdentity,
+  );
+  if (inspection === "exited") return null;
+  if (inspection !== "current") {
+    throw new Error("Recorded local Chrome process generation could not be authenticated");
+  }
+
+  const activePort = await (deps.readActivePort ?? readDevToolsActivePortInfo)(profileRoot, {
     host,
   });
-  if (!activePort) {
-    return runtime;
+  const browserWSEndpoint =
+    activePort?.browserWSEndpoint ?? runtime.chromeBrowserWSEndpoint ?? undefined;
+  const endpointPort = browserWSEndpoint
+    ? Number.parseInt(new URL(browserWSEndpoint).port, 10)
+    : undefined;
+  const port = activePort?.port ?? runtime.chromePort ?? endpointPort;
+  if (!port) {
+    throw new Error("Recorded local Chrome endpoint has no valid DevTools port");
   }
-  const runtimeProcessKey = chromeProcessIdentityKey(runtime.chromeProcessIdentity);
-  const profileRoot = path.resolve(runtime.chromeProfileRoot);
-  const recoveryCleanupResources = runtime.recoveryCleanupResources?.map((resource) => {
-    if (resource.remoteRecovery) return resource;
-    const sameAuthority = runtimeProcessKey
-      ? JSON.stringify(chromeProcessIdentityKey(resource.chromeProcessIdentity)) ===
-        JSON.stringify(runtimeProcessKey)
-      : [resource.chromeProfileRoot, resource.userDataDir].some(
-          (candidate) => candidate && path.resolve(candidate) === profileRoot,
-        );
-    return sameAuthority
-      ? {
-          ...resource,
-          chromeHost: host,
-          chromePort: activePort.port,
-          chromeBrowserWSEndpoint: activePort.browserWSEndpoint,
-        }
-      : resource;
+
+  const authority = await (deps.retainEndpointAuthority ?? retainChromeEndpointAuthority)({
+    host,
+    port,
+    browserWSEndpoint,
+    userDataDir: profileRoot,
+    processIdentity,
   });
-  return {
-    ...runtime,
-    chromeHost: host,
-    chromePort: activePort.port,
-    chromeBrowserWSEndpoint: activePort.browserWSEndpoint,
-    recoveryCleanupResources,
-  };
+  try {
+    const recoveryCleanupResources = runtime.recoveryCleanupResources?.map((resource) => {
+      if (
+        resource.remoteRecovery ||
+        !resource.chromeProcessIdentity ||
+        !sameChromeProcessIdentity(resource.chromeProcessIdentity, processIdentity)
+      ) {
+        return resource;
+      }
+      return {
+        ...resource,
+        chromeHost: host,
+        chromePort: port,
+        chromeBrowserWSEndpoint: authority.browserWSEndpoint,
+      };
+    });
+    return {
+      ...runtime,
+      chromeHost: host,
+      chromePort: port,
+      chromeBrowserWSEndpoint: authority.browserWSEndpoint,
+      recoveryCleanupResources,
+    };
+  } finally {
+    await authority.release();
+  }
 }
 
 export function selectTarget(
@@ -305,7 +366,7 @@ export async function resumeBrowserSessionViaNewChrome(
   const fallbackLeaseId = randomUUID();
   const fallbackTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
-  let manualChromeOwnerDisposition: ChromeOwnerDisposition | null = null;
+  let manualChromeOwner: ManualChromeOwner | null = null;
   let fallbackLease: BrowserTabLease | null = null;
   let chrome: BrowserChrome | null = null;
   let retainedOwnedChrome: BrowserChrome | null = null;
@@ -313,11 +374,16 @@ export async function resumeBrowserSessionViaNewChrome(
   let fallbackRuntime: BrowserRuntimeMetadata | null = null;
   let client: ChromeClient | null = null;
   let closeFallbackConnection: (() => Promise<void>) | null = null;
+  let completedFallbackCleanup: Extract<
+    ReattachFinalizationResult,
+    { status: "completed" }
+  > | null = null;
+  let manualOwnerEndpointReleased = false;
   const refreshFallbackRuntime = (
     pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
   ): BrowserRuntimeMetadata => {
     const closesProcess = manualLogin
-      ? manualChromeOwnerDisposition === "close-on-last-lease"
+      ? manualChromeOwner?.disposition === "close-on-last-lease"
       : !resolved.keepBrowser;
     const ownsProcess = Boolean(chrome && closesProcess);
     const profileKind = manualLogin ? "manual-login" : ownsProcess ? "temporary" : "none";
@@ -353,7 +419,7 @@ export async function resumeBrowserSessionViaNewChrome(
         keepBrowser:
           pendingResource === "tab-lease" ||
           (manualLogin
-            ? manualChromeOwnerDisposition === "preserve"
+            ? manualChromeOwner?.disposition === "preserve"
             : chrome
               ? !ownsProcess
               : Boolean(resolved.keepBrowser)),
@@ -384,6 +450,38 @@ export async function resumeBrowserSessionViaNewChrome(
     const next = refreshFallbackRuntime(pendingResource);
     await deps.runtimeHintCb?.(next);
     return next;
+  };
+  const retainPendingEndpointReleaseRuntime = (
+    completedRuntime: BrowserRuntimeMetadata,
+    authorityRuntime: BrowserRuntimeMetadata,
+  ): BrowserRuntimeMetadata => {
+    const resource = (authorityRuntime.recoveryCleanupResources ?? [])
+      .toReversed()
+      .find(
+        (candidate) =>
+          candidate.recoveryCleanup.profileKind === "manual-login" &&
+          candidate.userDataDir &&
+          path.resolve(candidate.userDataDir) === path.resolve(userDataDir),
+      );
+    if (!resource) return authorityRuntime;
+    return {
+      ...completedRuntime,
+      chromeTargetId: undefined,
+      recoveryCleanupResources: [
+        {
+          ...resource,
+          chromeTargetId: undefined,
+          tabLease: undefined,
+          recoveryCleanup: {
+            ...resource.recoveryCleanup,
+            ownsTarget: false,
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: undefined,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
   };
   const settleFallbackResources = async (
     mode: "finalize" | "abort",
@@ -446,15 +544,39 @@ export async function resumeBrowserSessionViaNewChrome(
         }
       : (deps.recoveryCleanup ?? {});
 
-    try {
-      return await finalizeRecoveredRuntime(authorityRuntime, logger, cleanupDeps, mode);
-    } catch (cleanupError) {
-      return pendingFinalization(
-        authorityRuntime,
-        cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-        mode,
-      );
+    if (!completedFallbackCleanup) {
+      try {
+        const cleanupResult = await finalizeRecoveredRuntime(
+          authorityRuntime,
+          logger,
+          cleanupDeps,
+          mode,
+        );
+        if (cleanupResult.status === "pending") return cleanupResult;
+        completedFallbackCleanup = cleanupResult;
+      } catch (cleanupError) {
+        return pendingFinalization(
+          authorityRuntime,
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          mode,
+        );
+      }
     }
+
+    if (manualChromeOwner && !manualOwnerEndpointReleased) {
+      try {
+        await releaseManualChromeOwnerEndpointAuthority(manualChromeOwner);
+        manualOwnerEndpointReleased = true;
+      } catch (releaseError) {
+        const error = `Exact Chrome endpoint release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`;
+        return pendingFinalization(
+          retainPendingEndpointReleaseRuntime(completedFallbackCleanup.runtime, authorityRuntime),
+          error,
+          mode,
+        );
+      }
+    }
+    return completedFallbackCleanup;
   };
 
   await persistFallbackRuntime(manualLogin ? "tab-lease" : "chrome-process");
@@ -476,14 +598,16 @@ export async function resumeBrowserSessionViaNewChrome(
         logger,
         `reattach-${process.pid}`,
       );
+      manualChromeOwner = owner;
       chrome = owner.chrome;
-      manualChromeOwnerDisposition = owner.disposition;
     } else {
       chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger);
     }
     if (
       chrome &&
-      (manualLogin ? manualChromeOwnerDisposition === "close-on-last-lease" : !resolved.keepBrowser)
+      (manualLogin
+        ? manualChromeOwner?.disposition === "close-on-last-lease"
+        : !resolved.keepBrowser)
     ) {
       retainedOwnedChrome = chrome;
     }
@@ -642,6 +766,23 @@ export async function resumeBrowserSessionViaNewChrome(
     };
   } catch (error) {
     const cleanupResult = await settleFallbackResources("abort");
+    try {
+      await deps.runtimeHintCb?.(cleanupResult.runtime);
+    } catch (persistenceError) {
+      const persistenceMessage =
+        persistenceError instanceof Error ? persistenceError.message : String(persistenceError);
+      throw new BrowserAutomationError(
+        `Browser fallback recovery failed; exact abort cleanup authority could not be persisted: ${persistenceMessage}`,
+        {
+          stage: "browser-reattach-fallback-cleanup",
+          code: "fallback-cleanup-runtime-persistence-failed",
+          runtime: cleanupResult.runtime,
+          cleanupStatus: cleanupResult.status,
+          ...(cleanupResult.status === "pending" ? { cleanupError: cleanupResult.error } : {}),
+        },
+        error,
+      );
+    }
     if (cleanupResult.status === "pending") {
       throw new BrowserAutomationError(
         `Browser fallback recovery failed and cleanup remains pending: ${cleanupResult.error}`,

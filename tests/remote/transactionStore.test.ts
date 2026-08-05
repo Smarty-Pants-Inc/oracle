@@ -495,6 +495,28 @@ describe("RemoteTransactionStore", () => {
       message: "already bound to abort",
     },
     {
+      name: "conflicting recoverable settlement runtime",
+      setup: async (store, token) => {
+        await begin(store, token);
+        await store.recordRecoverableFailure({
+          transactionToken: token,
+          runtime,
+          error: failure(true),
+        });
+        await store.bindSettlement({
+          transactionToken: token,
+          mode: "abort",
+          durablePublication: false,
+        });
+      },
+      act: async (store, token) =>
+        store.persistSettlementRuntime(token, {
+          ...runtime,
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        }),
+      message: "exact durable settlement mode",
+    },
+    {
       name: "settlement completion without durable binding",
       setup: async (store, token) => {
         await begin(store, token);

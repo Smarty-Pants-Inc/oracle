@@ -5,6 +5,12 @@ import { describe, expect, test, vi } from "vitest";
 import type { BrowserRunTransaction } from "../../src/browserMode.js";
 import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionStore.js";
 import { RemoteTransactionCoordinator } from "../../src/remote/transactionCoordinator.js";
+import {
+  BrowserCaptureSettlementController,
+  completedBrowserCaptureCleanup,
+  createBrowserRunTransaction,
+  type BrowserCaptureSettlementAdapters,
+} from "../../src/browser/runLifecycle.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
@@ -294,6 +300,92 @@ describe("RemoteTransactionCoordinator", () => {
 
       expect(retryCleanup).toHaveBeenNthCalledWith(1, runtime, "abort");
       expect(retryCleanup).toHaveBeenNthCalledWith(2, runtime, "finalize");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("persists abort-bound recoverable authority before live cleanup and releases it when terminal", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recoverable-abort-"));
+    const transactionToken = "3".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: "controller-generation-1",
+      });
+      await store.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "run-1",
+        createdAt: new Date().toISOString(),
+        requestIdentity: {
+          acceptedPromptSha256: ["a".repeat(64)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+        browserConfig: {
+          chatgptUrl: "https://chatgpt.com",
+          url: "https://chatgpt.com",
+        },
+      });
+      await store.recordRecoverableFailure({
+        transactionToken,
+        runtime,
+        error: {
+          name: "BrowserAutomationError",
+          category: "browser-automation",
+          message: "Required artifact preparation failed after capture",
+          code: "artifact-registration-failed",
+          stage: "execute-browser",
+          recoverableDisconnect: true,
+        },
+      });
+
+      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+        async (mode, pendingRuntime) => {
+          expect(mode).toBe("abort");
+          await expect(store.read(transactionToken)).resolves.toMatchObject({
+            state: "recoverable-error",
+            settlementMode: "abort",
+            runtime: {
+              recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+            },
+          });
+          return completedBrowserCaptureCleanup(pendingRuntime);
+        },
+      );
+      const settlement = new BrowserCaptureSettlementController(
+        {
+          persistRuntime: async (pendingRuntime) => {
+            await store.persistSettlementRuntime(transactionToken, pendingRuntime);
+          },
+          settleResources,
+        },
+        runtime,
+      );
+      const active = createBrowserRunTransaction(capturedResult, settlement);
+      const coordinator = new RemoteTransactionCoordinator({
+        transactionStore: store,
+        retryCleanup: vi.fn(async () => ({ status: "completed" as const, runtime })),
+      });
+      coordinator.registerActive(transactionToken, active);
+
+      await expect(
+        coordinator.settle({
+          transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).resolves.toMatchObject({
+        finalization: { status: "completed" },
+        record: { state: "aborted", terminalAudit: { settlementMode: "abort" } },
+      });
+      expect(settleResources).toHaveBeenCalledOnce();
+      expect(coordinator.hasActive(transactionToken)).toBe(false);
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "aborted",
+        terminalAudit: { settlementMode: "abort" },
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

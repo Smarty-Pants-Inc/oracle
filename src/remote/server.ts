@@ -54,7 +54,10 @@ import type {
 } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
-import { acquireManualChromeOwner } from "../browser/manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  releaseManualChromeOwnerEndpointAuthority,
+} from "../browser/manualChromeOwner.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
 import {
@@ -1254,6 +1257,38 @@ export async function drainRemoteServerShutdown(
   }
 }
 
+interface RemoteManualChromeBootstrapDeps {
+  acquireOwner?: typeof acquireManualChromeOwner;
+  releaseOwnerEndpoint?: typeof releaseManualChromeOwnerEndpointAuthority;
+}
+
+async function bootstrapRemoteManualChromeOwner(
+  profileDir: string,
+  logger: BrowserLogger,
+  deps: RemoteManualChromeBootstrapDeps = {},
+): Promise<void> {
+  const owner = await (deps.acquireOwner ?? acquireManualChromeOwner)(
+    profileDir,
+    resolveBrowserConfig({
+      manualLogin: true,
+      manualLoginProfileDir: profileDir,
+      manualLoginCookieSync: false,
+      cookieSync: false,
+      keepBrowser: true,
+      url: CHATGPT_URL,
+    }),
+    logger,
+    "remote-serve-bootstrap",
+  );
+  try {
+    logger(
+      `${owner.source === "launched" ? "Launched" : "Reusing"} canonical manual-login Chrome owner on DevTools port ${owner.chrome.port} (pid ${owner.processIdentity.pid}).`,
+    );
+  } finally {
+    await (deps.releaseOwnerEndpoint ?? releaseManualChromeOwnerEndpointAuthority)(owner);
+  }
+}
+
 export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(homedir(), ".oracle", "browser-profile");
@@ -1291,22 +1326,7 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
       const bootstrapLogger = ((message?: string) => {
         if (typeof message === "string") console.log(message);
       }) as BrowserLogger;
-      const owner = await acquireManualChromeOwner(
-        manualProfileDir,
-        resolveBrowserConfig({
-          manualLogin: true,
-          manualLoginProfileDir: manualProfileDir,
-          manualLoginCookieSync: false,
-          cookieSync: false,
-          keepBrowser: true,
-          url: CHATGPT_URL,
-        }),
-        bootstrapLogger,
-        "remote-serve-bootstrap",
-      );
-      console.log(
-        `${owner.source === "launched" ? "Launched" : "Reusing"} canonical manual-login Chrome owner on DevTools port ${owner.chrome.port} (pid ${owner.processIdentity.pid}).`,
-      );
+      await bootstrapRemoteManualChromeOwner(manualProfileDir, bootstrapLogger);
     } else if (opened) {
       console.log(
         "Opened chatgpt.com for login. Sign in, then restart `oracle serve` to continue.",
@@ -1688,3 +1708,8 @@ function canSpawn(cmd: string): boolean {
     return false;
   }
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
+export const __test__ = {
+  bootstrapRemoteManualChromeOwner,
+};

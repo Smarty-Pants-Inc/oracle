@@ -180,7 +180,7 @@ describe("BrowserRunLifecycleController", () => {
     expect(lifecycle.isPromptCommitted()).toBe(true);
   });
 
-  test("restores pending authority when committed evidence is not durable", async () => {
+  test("retains verified committed authority when its persistence fails", async () => {
     const persistRuntime = vi
       .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
       .mockResolvedValueOnce(undefined)
@@ -199,12 +199,20 @@ describe("BrowserRunLifecycleController", () => {
       details: {
         code: "prompt-epoch-persistence-failed",
         runtime: {
-          promptEpoch: { status: "pending" },
+          promptEpoch: expect.objectContaining({
+            status: "committed",
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+          }),
         },
       },
     });
-    expect(lifecycle.promptDispatch()).toMatchObject({ status: "pending", prompt: "review" });
-    expect(lifecycle.promptEpoch()).toMatchObject({ status: "pending" });
+    expect(lifecycle.promptDispatch()).toMatchObject({ status: "committed" });
+    expect(lifecycle.promptEpoch()).toMatchObject({
+      status: "committed",
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+    });
   });
 
   test.each([

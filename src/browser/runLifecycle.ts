@@ -300,7 +300,8 @@ export class BrowserRunLifecycleController {
     try {
       await this.persistRuntime();
     } catch (cause) {
-      this.state = { kind: "dispatching", dispatch: pending };
+      // Verification records an external post-effect fact. Keep that exact committed authority
+      // in memory so a disconnect recovery path can publish it even when durability fails.
       throw this.promptAuthorityPersistenceError(cause);
     }
     this.adapters.onPromptCommitted?.();

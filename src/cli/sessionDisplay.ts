@@ -48,6 +48,7 @@ import {
 import {
   persistDurableBrowserAnswer,
   publishBrowserCapture,
+  runtimeFromBrowserError,
   type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
 
@@ -561,6 +562,7 @@ export async function attachSession(
       }
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
+      authoritativeRuntime = runtimeFromBrowserError(error) ?? authoritativeRuntime;
       let authorityPersisted = true;
       try {
         const artifacts =

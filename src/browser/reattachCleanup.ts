@@ -11,10 +11,13 @@ import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js
 import {
   closeChromeTarget,
   listRemoteChromeTargets,
+  retainChromeEndpointAuthority,
   type RemoteTargetInfo,
+  type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
 import {
   cleanupStaleProfileState,
+  inspectChromeProcessIdentity,
   isSafeChromeTerminationOutcome,
   readOracleChromeOwner,
   removeProfileDirectoryIfIdentityMatches,
@@ -39,6 +42,9 @@ import {
 export interface ReattachCleanupDeps {
   closeChromeTarget?: typeof closeChromeTarget;
   listChromeTargets?: typeof listRemoteChromeTargets;
+  retainChromeEndpointAuthority?: typeof retainChromeEndpointAuthority;
+  inspectChromeProcessIdentity?: typeof inspectChromeProcessIdentity;
+  verifyProfileDirectoryIdentity?: typeof verifyProfileDirectoryIdentity;
   terminateRecordedChromeForProfile?: typeof terminateRecordedChromeForProfile;
   readOracleChromeOwner?: typeof readOracleChromeOwner;
   verifyChromeProcessIdentity?: typeof verifyChromeProcessIdentity;
@@ -65,6 +71,102 @@ type PendingProcessAcquisitionResolution =
   | { status: "resolved"; resource: BrowserRecoveryCleanupResourceMetadata }
   | { status: "settled" }
   | { status: "pending"; resource: BrowserRecoveryCleanupResourceMetadata; error: string };
+type PersistedLocalTargetEndpointBinding =
+  | { status: "gone" }
+  | {
+      status: "bound";
+      host: string;
+      port: number;
+      browserWSEndpoint: string;
+      authority: RetainedChromeEndpointAuthority;
+    };
+
+async function bindPersistedLocalTargetEndpoint(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+  deps: ReattachCleanupDeps,
+): Promise<PersistedLocalTargetEndpointBinding> {
+  const processIdentity = resource.chromeProcessIdentity;
+  const processProfile = physicalProfileDirectoryIdentity(processIdentity?.profileDirectory);
+  const resourceProfile = physicalProfileDirectoryIdentity(resource.profileDirectoryIdentity);
+  if (!processIdentity || !processProfile) {
+    throw new Error("Owned local Chrome target has no exact process/profile identity");
+  }
+  if (resourceProfile && !sameProfileDirectoryIdentity(resourceProfile, processProfile)) {
+    throw new Error("Owned local Chrome target profile identities disagree");
+  }
+  if (
+    resource.userDataDir &&
+    resource.chromeProfileRoot &&
+    path.resolve(resource.userDataDir) !== path.resolve(resource.chromeProfileRoot)
+  ) {
+    throw new Error("Owned local Chrome target profile paths disagree");
+  }
+  const profileDir =
+    resource.userDataDir ?? resource.chromeProfileRoot ?? processProfile.canonicalPath;
+  if (
+    !(await (deps.verifyProfileDirectoryIdentity ?? verifyProfileDirectoryIdentity)(
+      profileDir,
+      processProfile,
+    ))
+  ) {
+    throw new Error("Owned local Chrome target physical profile generation could not be verified");
+  }
+  const inspection = await (deps.inspectChromeProcessIdentity ?? inspectChromeProcessIdentity)(
+    profileDir,
+    processIdentity,
+  );
+  if (inspection === "exited") return { status: "gone" };
+  if (inspection !== "current") {
+    throw new Error("Owned local Chrome target process generation could not be authenticated");
+  }
+
+  const endpoint = resource.chromeBrowserWSEndpoint
+    ? new URL(resource.chromeBrowserWSEndpoint)
+    : null;
+  const host = resource.chromeHost ?? endpoint?.hostname ?? "127.0.0.1";
+  const port =
+    resource.chromePort ?? inferPortFromBrowserWSEndpoint(resource.chromeBrowserWSEndpoint);
+  if (!port) throw new Error("Owned local Chrome target has no valid DevTools port");
+  const authority = await (deps.retainChromeEndpointAuthority ?? retainChromeEndpointAuthority)({
+    host,
+    port,
+    browserWSEndpoint: resource.chromeBrowserWSEndpoint,
+    userDataDir: profileDir,
+    processIdentity,
+  });
+  return {
+    status: "bound",
+    host,
+    port,
+    browserWSEndpoint: authority.browserWSEndpoint,
+    authority,
+  };
+}
+
+function requiresExactLocalTargetBinding(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+): boolean {
+  if (resource.chromeProcessIdentity || resource.recoveryCleanup.profileKind !== "none") {
+    return true;
+  }
+  let host = resource.chromeHost;
+  if (!host && resource.chromeBrowserWSEndpoint) {
+    try {
+      host = new URL(resource.chromeBrowserWSEndpoint).hostname;
+    } catch {
+      return true;
+    }
+  }
+  if (!host) return true;
+  const normalizedHost = host.toLowerCase();
+  return (
+    normalizedHost === "localhost" ||
+    normalizedHost === "localhost." ||
+    normalizedHost.startsWith("127.") ||
+    normalizedHost === "::1" ||
+    normalizedHost === "[::1]"
+  );
+}
 
 async function reconcilePendingProcessAcquisition(
   resource: BrowserRecoveryCleanupResourceMetadata,
@@ -299,10 +401,12 @@ async function finalizeRecoveryCleanupGroup(
         break;
       }
     }
-    const connectionPort = connectionResource
+    let connectionPort = connectionResource
       ? (connectionResource.chromePort ??
         inferPortFromBrowserWSEndpoint(connectionResource.chromeBrowserWSEndpoint))
       : undefined;
+    let connectionHost = connectionResource?.chromeHost ?? "127.0.0.1";
+    let connectionEndpoint = connectionResource?.chromeBrowserWSEndpoint;
     const targets = new Map<string, RecoveryCleanupEntry[]>();
     for (const entry of group.entries) {
       const { resource } = entry;
@@ -322,67 +426,111 @@ async function finalizeRecoveryCleanupGroup(
       else targets.set(targetKey, [entry]);
     }
 
-    let discoveredTargets: RemoteTargetInfo[] | null = null;
-    for (const targetEntries of targets.values()) {
-      const representative = targetEntries[0];
-      if (!representative) continue;
-      const resource = representative.resource;
-      let targetId = resource.chromeTargetId;
-      const targetMarkerUrl = resource.acquisition?.targetMarkerUrl;
-      if (!targetId && targetMarkerUrl && connectionResource && connectionPort) {
-        try {
-          discoveredTargets ??= await (deps.listChromeTargets ?? listRemoteChromeTargets)({
-            host: connectionResource.chromeHost ?? "127.0.0.1",
-            port: connectionPort,
-            browserWSEndpoint: connectionResource.chromeBrowserWSEndpoint,
-          });
-          const matches = discoveredTargets.filter(
-            (target) => target.type === "page" && target.url === targetMarkerUrl && target.targetId,
-          );
-          if (matches.length === 0) continue;
-          if (matches.length === 1) targetId = matches[0]?.targetId;
-          else {
+    let endpointAuthority: RetainedChromeEndpointAuthority | undefined;
+    let targetEndpointAvailable = true;
+    let recordedTargetsGone = false;
+    if (
+      targets.size > 0 &&
+      connectionResource &&
+      requiresExactLocalTargetBinding(connectionResource)
+    ) {
+      try {
+        const binding = await bindPersistedLocalTargetEndpoint(connectionResource, deps);
+        if (binding.status === "gone") {
+          recordedTargetsGone = true;
+        } else {
+          endpointAuthority = binding.authority;
+          connectionHost = binding.host;
+          connectionPort = binding.port;
+          connectionEndpoint = binding.browserWSEndpoint;
+        }
+      } catch (error) {
+        targetEndpointAvailable = false;
+        const message = error instanceof Error ? error.message : String(error);
+        for (const targetEntries of targets.values()) {
+          for (const entry of targetEntries) {
+            addPending(entry, `Chrome target endpoint authentication failed: ${message}`);
+          }
+        }
+      }
+    }
+
+    if (targetEndpointAvailable && !recordedTargetsGone) {
+      let discoveredTargets: RemoteTargetInfo[] | null = null;
+      for (const targetEntries of targets.values()) {
+        const representative = targetEntries[0];
+        if (!representative) continue;
+        const resource = representative.resource;
+        let targetId = resource.chromeTargetId;
+        const targetMarkerUrl = resource.acquisition?.targetMarkerUrl;
+        if (!targetId && targetMarkerUrl && connectionResource && connectionPort) {
+          try {
+            discoveredTargets ??= await (deps.listChromeTargets ?? listRemoteChromeTargets)({
+              host: connectionHost,
+              port: connectionPort,
+              browserWSEndpoint: connectionEndpoint,
+            });
+            const matches = discoveredTargets.filter(
+              (target) =>
+                target.type === "page" && target.url === targetMarkerUrl && target.targetId,
+            );
+            if (matches.length === 0) continue;
+            if (matches.length === 1) targetId = matches[0]?.targetId;
+            else {
+              for (const entry of targetEntries) {
+                addPending(
+                  entry,
+                  `Owned Chrome target acquisition marker is ambiguous: ${targetMarkerUrl}`,
+                );
+              }
+              continue;
+            }
+          } catch (error) {
             for (const entry of targetEntries) {
               addPending(
                 entry,
-                `Owned Chrome target acquisition marker is ambiguous: ${targetMarkerUrl}`,
+                `Chrome target acquisition recovery failed: ${error instanceof Error ? error.message : String(error)}`,
               );
             }
             continue;
           }
-        } catch (error) {
+        }
+        if (!targetId || !connectionResource || !connectionPort) {
           for (const entry of targetEntries) {
-            addPending(
-              entry,
-              `Chrome target acquisition recovery failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
+            addPending(entry, "Owned Chrome target cleanup metadata is incomplete");
           }
           continue;
         }
-      }
-      if (!targetId || !connectionResource || !connectionPort) {
-        for (const entry of targetEntries) {
-          addPending(entry, "Owned Chrome target cleanup metadata is incomplete");
-        }
-        continue;
-      }
-      try {
-        const closed = await closeTarget({
-          host: connectionResource.chromeHost ?? "127.0.0.1",
-          port: connectionPort,
-          browserWSEndpoint: connectionResource.chromeBrowserWSEndpoint,
-          targetId,
-          logger,
-        });
-        if (!closed) {
+        try {
+          const closed = await closeTarget({
+            host: connectionHost,
+            port: connectionPort,
+            browserWSEndpoint: connectionEndpoint,
+            targetId,
+            logger,
+          });
+          if (!closed) {
+            for (const entry of targetEntries) {
+              addPending(entry, `Chrome target close was not confirmed: ${targetId}`);
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
           for (const entry of targetEntries) {
-            addPending(entry, `Chrome target close was not confirmed: ${targetId}`);
+            addPending(entry, `Chrome target close failed: ${message}`);
           }
         }
+      }
+    }
+    if (endpointAuthority) {
+      try {
+        await endpointAuthority.release();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        for (const entry of targetEntries) {
-          addPending(entry, `Chrome target close failed: ${message}`);
+        for (const targetEntries of targets.values()) {
+          for (const entry of targetEntries) {
+            addPending(entry, `Chrome target endpoint release failed: ${message}`);
+          }
         }
       }
     }
@@ -435,11 +583,15 @@ async function finalizeRecoveryCleanupGroup(
                     return;
                   }
                   teardownViaLeaseAttempted = true;
-                  teardownViaLeaseError = await teardownLocalRecoveryGroup(
-                    teardownEntry.resource,
-                    logger,
-                    deps,
-                  );
+                  try {
+                    teardownViaLeaseError = await teardownLocalRecoveryGroup(
+                      teardownEntry.resource,
+                      logger,
+                      deps,
+                    );
+                  } catch (error) {
+                    teardownViaLeaseError = error instanceof Error ? error.message : String(error);
+                  }
                 }
               : undefined,
         });
@@ -476,44 +628,10 @@ async function finalizeRecoveryCleanupGroup(
     const profileKind = resource.recoveryCleanup.profileKind;
     try {
       let teardownError: string | null = null;
-      if (
-        group.entries.some((entry) => entry.resource.tabLease) &&
-        profileKind === "manual-login"
-      ) {
+      if (profileKind === "manual-login") {
         teardownError = teardownViaLeaseAttempted
           ? teardownViaLeaseError
-          : "Manual-login cleanup preserved resources (active-leases)";
-      } else if (profileKind === "manual-login") {
-        const teardown =
-          deps.teardownBrowserResourcesIfNoActiveLeases ?? teardownBrowserResourcesIfNoActiveLeases;
-        const profileDir = resource.userDataDir;
-        const processIdentity = resource.chromeProcessIdentity;
-        const profileDirectory = physicalProfileDirectoryIdentity(
-          processIdentity?.profileDirectory,
-        );
-        if (!profileDir) {
-          teardownError = "Cleanup profile path is missing";
-        } else if (!processIdentity) {
-          teardownError = "Chrome process identity cleanup metadata is missing";
-        } else if (!profileDirectory) {
-          teardownError = "Chrome physical profile identity cleanup metadata is missing";
-        } else {
-          let directError: string | null = null;
-          const outcome = await teardown(
-            profileDir,
-            async () => {
-              directError = await teardownLocalRecoveryGroup(resource, logger, deps);
-              return directError === null;
-            },
-            { logger, expectedProfileIdentity: profileDirectory },
-          );
-          if (outcome.status !== "completed") {
-            teardownError =
-              directError ??
-              outcome.error ??
-              `Manual-login cleanup preserved resources (${outcome.reason})`;
-          }
-        }
+          : await teardownManualLoginRecoveryGroupIfNoActiveLeases(resource, logger, deps);
       } else {
         teardownError = await teardownLocalRecoveryGroup(resource, logger, deps);
       }
@@ -615,6 +733,36 @@ async function finalizeRemoteRecoveryCleanupGroup(
     result.error || "Remote cleanup settlement remains pending.",
     returnedAuthority ?? authority,
   );
+}
+
+async function teardownManualLoginRecoveryGroupIfNoActiveLeases(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+  logger: BrowserLogger,
+  deps: ReattachCleanupDeps,
+): Promise<string | null> {
+  const teardown =
+    deps.teardownBrowserResourcesIfNoActiveLeases ?? teardownBrowserResourcesIfNoActiveLeases;
+  const profileDir = resource.userDataDir;
+  const processIdentity = resource.chromeProcessIdentity;
+  const profileDirectory = physicalProfileDirectoryIdentity(processIdentity?.profileDirectory);
+  if (!profileDir) return "Cleanup profile path is missing";
+  if (!processIdentity) return "Chrome process identity cleanup metadata is missing";
+  if (!profileDirectory) return "Chrome physical profile identity cleanup metadata is missing";
+
+  let directError: string | null = null;
+  const outcome = await teardown(
+    profileDir,
+    async () => {
+      directError = await teardownLocalRecoveryGroup(resource, logger, deps);
+      return directError === null;
+    },
+    { logger, expectedProfileIdentity: profileDirectory },
+  );
+  return outcome.status === "completed"
+    ? null
+    : (directError ??
+        outcome.error ??
+        `Manual-login cleanup preserved resources (${outcome.reason})`);
 }
 
 async function teardownLocalRecoveryGroup(

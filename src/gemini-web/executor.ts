@@ -10,6 +10,7 @@ import type {
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
 import {
+  BrowserCaptureSettlementController,
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
@@ -64,11 +65,17 @@ function createSettledGeminiTransaction(
   runtime: BrowserRuntimeMetadata = {},
 ): BrowserRunTransaction {
   const finalization = completedBrowserCaptureCleanup(runtime);
+  const settlement = new BrowserCaptureSettlementController(
+    { settleResources: async () => finalization },
+    finalization.runtime,
+  );
   return {
     ...result,
-    runtime: finalization.runtime,
-    finalize: async () => finalization,
-    abort: async () => finalization,
+    get runtime() {
+      return settlement.runtime();
+    },
+    finalize: () => settlement.settle("finalize"),
+    abort: () => settlement.settle("abort"),
   };
 }
 

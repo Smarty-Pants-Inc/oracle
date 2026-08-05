@@ -2634,6 +2634,156 @@ describe("performSessionRun", () => {
     expect(reattach.abort).not.toHaveBeenCalled();
   });
 
+  test("retries auto-reattach with the newest error-carried remote runtime", async () => {
+    const requestIdentity = {
+      acceptedPromptSha256: ["a".repeat(64)],
+      followUpOrdinal: 0,
+      remainingFollowUps: 0 as const,
+    };
+    const initialRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "3".repeat(64),
+            state: "pre-receipt",
+            requestIdentity,
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    const retryRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "4".repeat(64),
+            state: "recoverable-error",
+            requestIdentity,
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("assistant timed out", {
+        stage: "assistant-timeout",
+        runtime: initialRuntime,
+      }),
+    );
+    const retryError = new BrowserAutomationError("remote retry transport interrupted", {
+      stage: "remote-retry",
+      recoverableDisconnect: true,
+      runtime: retryRuntime,
+    });
+    const reattach = createReattachResult("ok text", "ok markdown", retryRuntime);
+    vi.mocked(resumeBrowserSession)
+      .mockRejectedValueOnce(retryError)
+      .mockResolvedValueOnce(reattach.value);
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 0,
+        autoReattachIntervalMs: 1,
+        autoReattachTimeoutMs: 1000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(resumeBrowserSession).mock.calls[0]?.[0]).toBe(initialRuntime);
+    expect(vi.mocked(resumeBrowserSession).mock.calls[1]?.[0]).toBe(retryRuntime);
+    const retryRuntimePersistenceIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      ([, patch]) => patch.browser?.runtime === retryRuntime,
+    );
+    expect(retryRuntimePersistenceIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      sessionStoreMock.updateSession.mock.invocationCallOrder[retryRuntimePersistenceIndex],
+    ).toBeLessThan(vi.mocked(resumeBrowserSession).mock.invocationCallOrder[1] ?? 0);
+  });
+
+  test("stops auto-reattach on a terminal remote outcome without restoring stale authority", async () => {
+    const initialRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "5".repeat(64),
+            state: "pre-receipt",
+            requestIdentity: {
+              acceptedPromptSha256: ["b".repeat(64)],
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+            },
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    const terminalRuntime: BrowserRuntimeMetadata = {};
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("assistant timed out", {
+        stage: "assistant-timeout",
+        runtime: initialRuntime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(
+      new BrowserAutomationError("Remote transaction was already finalized.", {
+        stage: "remote-retry",
+        code: "remote-transaction-finalized",
+        recoverableDisconnect: false,
+        runtime: terminalRuntime,
+      }),
+    );
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 0,
+        autoReattachIntervalMs: 1,
+        autoReattachTimeoutMs: 1000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      errorMessage: "Remote transaction was already finalized.",
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+      browser: { runtime: terminalRuntime },
+      error: {
+        category: "browser-automation",
+        details: { recoverableDisconnect: false, runtime: terminalRuntime },
+      },
+    });
+    expect(finalUpdate?.browser?.runtime).toEqual(terminalRuntime);
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "completed"),
+    ).toBe(false);
+    expect(log.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "Auto-reattach stopped on terminal browser outcome",
+    );
+  });
+
   test("aborts auto-reattach when durable answer persistence fails", async () => {
     const automationError = new BrowserAutomationError("assistant timed out", {
       stage: "assistant-timeout",

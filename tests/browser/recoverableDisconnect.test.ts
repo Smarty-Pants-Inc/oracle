@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
-import type { BrowserRecoveryCleanupMetadata } from "../../src/sessionManager.js";
+import type {
+  BrowserRecoveryCleanupMetadata,
+  BrowserRuntimeMetadata,
+} from "../../src/sessionManager.js";
 import {
   captureProfileDirectoryIdentity,
   readOracleChromeOwner,
@@ -20,7 +23,30 @@ type BrowserAutomationErrorConstructor = new (
 type DisconnectFixtureOptions = {
   copiedProfile?: boolean;
   semanticProbeSucceeds?: boolean;
+  runtimePersistenceFailsAfterCommit?: boolean;
 };
+
+type RemoteDisconnectFixtureOptions = {
+  disconnectDuringSubmission?: boolean;
+  runtimePersistenceFailsAfterCommit?: boolean;
+};
+
+async function captureUnhandledRejections<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; unhandledRejections: unknown[] }> {
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    const result = await run();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return { result, unhandledRejections };
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+}
 
 const targetId = "recoverable-target";
 const conversationUrl = `https://chatgpt.com/c/${targetId}`;
@@ -78,17 +104,25 @@ async function withRemoteLateDisconnectFixture(
     browserAutomationError: BrowserAutomationErrorConstructor;
     archiveChatGptConversation: Mock;
     verifyCommittedPromptTurn: Mock;
+    verifyPromptCommitted: Mock;
+    connectToRemoteChromeTarget: Mock;
     closeRemoteConnection: Mock;
     closeChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
+    runtimePersistenceError: Error;
+    runtimeHints: BrowserRuntimeMetadata[];
+    unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
     committedTurnVerified: boolean;
   }) => Promise<void> | void,
+  options: RemoteDisconnectFixtureOptions = {},
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let providerObservedDispatchStart = false;
   let committedTurnVerified = false;
   let assistantResponseAvailable = false;
+  const runtimePersistenceError = new Error("remote runtime persistence unavailable");
+  const runtimeHints: BrowserRuntimeMetadata[] = [];
   const closeRemoteConnection = vi.fn().mockResolvedValue(undefined);
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
@@ -101,9 +135,16 @@ async function withRemoteLateDisconnectFixture(
       disconnectHandler = handler;
     },
   });
+  const recoveryClient = createClient({});
+  const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
+    client: recoveryClient,
+    targetId,
+    ownership: "attached",
+    close: vi.fn().mockResolvedValue(undefined),
+  });
   const archiveChatGptConversation = vi.fn(async () => {
     // The archive await is the last await before the completion atomicity check.
-    disconnectHandler?.();
+    if (!options.disconnectDuringSubmission) disconnectHandler?.();
     await Promise.resolve();
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
@@ -112,6 +153,14 @@ async function withRemoteLateDisconnectFixture(
       throw new Error("Committed-turn verification preceded provider dispatch");
     }
     committedTurnVerified = true;
+  });
+  const verifyPromptCommitted = vi.fn().mockResolvedValue({
+    committedTurns: 1,
+    promptSha256: promptIdentitySha256("keep this submitted conversation"),
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "turn-0",
+    verifiedUserMessageId: "message-0",
+    conversationId: targetId,
   });
 
   vi.resetModules();
@@ -122,6 +171,7 @@ async function withRemoteLateDisconnectFixture(
       ownership,
       close: closeRemoteConnection,
     }),
+    connectToRemoteChromeTarget,
     closeChromeTarget,
     closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
@@ -148,6 +198,7 @@ async function withRemoteLateDisconnectFixture(
         : null,
     ),
     verifyCommittedPromptTurn,
+    verifyPromptCommitted,
     waitForAssistantResponse: vi.fn(async () => {
       assistantResponseAvailable = true;
       return { text: "completed answer", meta: {} };
@@ -170,9 +221,13 @@ async function withRemoteLateDisconnectFixture(
     connectionLostUserMessage: vi.fn(() => "connection lost"),
   }));
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
-    runProviderSubmissionFlow: vi.fn(async () => {
+    runProviderSubmissionFlow: vi.fn(() => {
       providerObservedDispatchStart = true;
-      return {
+      if (options.disconnectDuringSubmission) {
+        disconnectHandler?.();
+        return new Promise<never>(() => undefined);
+      }
+      return Promise.resolve({
         status: "committed" as const,
         verification: {
           committedTurns: 1,
@@ -182,7 +237,7 @@ async function withRemoteLateDisconnectFixture(
           verifiedUserMessageId: "message-0",
           conversationId: targetId,
         },
-      };
+      });
     }),
   }));
   vi.doMock("../../src/browser/chatgptImages.js", () => ({
@@ -226,17 +281,28 @@ async function withRemoteLateDisconnectFixture(
         import("../../src/browser/index.js"),
         import("../../src/oracle/errors.js"),
       ]);
-    const error = await runBrowserMode({
-      prompt: "keep this submitted conversation",
-      config: {
-        remoteChrome: { host: "remote.example", port: 9333 },
-        cookieSync: false,
-        manualLogin: false,
-        headless: true,
-        modelStrategy: "ignore",
-        archiveConversations: "always",
-      },
-    }).catch((caught) => caught);
+    const { result: error, unhandledRejections } = await captureUnhandledRejections(() =>
+      runBrowserMode({
+        prompt: "keep this submitted conversation",
+        config: {
+          remoteChrome: { host: "remote.example", port: 9333 },
+          cookieSync: false,
+          manualLogin: false,
+          headless: true,
+          modelStrategy: "ignore",
+          archiveConversations: "always",
+        },
+        runtimeHintCb: async (runtime) => {
+          runtimeHints.push(runtime);
+          if (
+            options.runtimePersistenceFailsAfterCommit &&
+            runtime.promptEpoch?.status === "committed"
+          ) {
+            throw runtimePersistenceError;
+          }
+        },
+      }).catch((caught) => caught),
+    );
 
     await verify({
       error,
@@ -246,8 +312,13 @@ async function withRemoteLateDisconnectFixture(
       closeChromeTarget,
       probeChromeTargetLiveness,
       verifyCommittedPromptTurn,
+      verifyPromptCommitted,
+      connectToRemoteChromeTarget,
       providerObservedDispatchStart,
       committedTurnVerified,
+      runtimePersistenceError,
+      runtimeHints,
+      unhandledRejections,
     });
   } finally {
     vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -269,6 +340,7 @@ async function withDisconnectFixture(
   options: DisconnectFixtureOptions,
   verify: (fixture: {
     error: unknown;
+    browserAutomationError: BrowserAutomationErrorConstructor;
     closeChromeTarget: Mock;
     kill: Mock;
     connectToRemoteChromeTarget: Mock;
@@ -276,6 +348,9 @@ async function withDisconnectFixture(
     verifyPromptCommitted: Mock;
     profileDir: string;
     processIdentity: ChromeProcessIdentity;
+    runtimePersistenceError: Error;
+    runtimeHints: BrowserRuntimeMetadata[];
+    unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
   }) => Promise<void> | void,
 ): Promise<void> {
@@ -283,6 +358,8 @@ async function withDisconnectFixture(
   let profileDir = "";
   let processIdentity: ChromeProcessIdentity | null = null;
   let providerObservedDispatchStart = false;
+  const runtimePersistenceError = new Error("local runtime persistence unavailable");
+  const runtimeHints: BrowserRuntimeMetadata[] = [];
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const kill = vi.fn().mockResolvedValue({ status: "stopped", pid: 1234, signal: "SIGTERM" });
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
@@ -378,27 +455,43 @@ async function withDisconnectFixture(
   }));
 
   try {
-    // The literal dynamic import is intentional: each scenario must load index.ts
-    // after its CDP mocks.
-    const { runBrowserMode } = await import("../../src/browser/index.js");
-    const error = await runBrowserMode({
-      prompt: "keep this submitted conversation",
-      config: {
-        cookieSync: false,
-        manualLogin: false,
-        headless: true,
-        modelStrategy: "ignore",
-        ...(options.copiedProfile
-          ? { copyProfileSource: path.join(os.tmpdir(), "source-profile") }
-          : {}),
-      },
-    }).catch((caught) => caught);
+    // The literal dynamic imports are intentional: each scenario must load the runner and
+    // error class from the same post-mock module graph.
+    const [{ runBrowserMode }, { BrowserAutomationError: browserAutomationError }] =
+      await Promise.all([
+        import("../../src/browser/index.js"),
+        import("../../src/oracle/errors.js"),
+      ]);
+    const { result: error, unhandledRejections } = await captureUnhandledRejections(() =>
+      runBrowserMode({
+        prompt: "keep this submitted conversation",
+        config: {
+          cookieSync: false,
+          manualLogin: false,
+          headless: true,
+          modelStrategy: "ignore",
+          ...(options.copiedProfile
+            ? { copyProfileSource: path.join(os.tmpdir(), "source-profile") }
+            : {}),
+        },
+        runtimeHintCb: async (runtime) => {
+          runtimeHints.push(runtime);
+          if (
+            options.runtimePersistenceFailsAfterCommit &&
+            runtime.promptEpoch?.status === "committed"
+          ) {
+            throw runtimePersistenceError;
+          }
+        },
+      }).catch((caught) => caught),
+    );
     if (!processIdentity) {
       throw new Error("Disconnect fixture did not acquire Chrome process authority");
     }
 
     await verify({
       error,
+      browserAutomationError,
       closeChromeTarget,
       kill,
       connectToRemoteChromeTarget,
@@ -406,6 +499,9 @@ async function withDisconnectFixture(
       verifyPromptCommitted,
       profileDir,
       processIdentity,
+      runtimePersistenceError,
+      runtimeHints,
+      unhandledRejections,
       providerObservedDispatchStart,
     });
   } finally {
@@ -500,6 +596,80 @@ describe("recoverable disconnect lifecycle", () => {
     });
   }, 30_000);
 
+  test("publishes exact local recovery when committed authority persistence rejects", async () => {
+    await withDisconnectFixture({ runtimePersistenceFailsAfterCommit: true }, async (fixture) => {
+      const persistenceFailure = (fixture.error as Error & { cause?: unknown }).cause;
+      expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.verifyPromptCommitted).toHaveBeenCalledTimes(1);
+      expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
+      expect(fixture.error).toMatchObject({
+        details: {
+          stage: "connection-lost",
+          code: "disconnect-assessment-failed",
+          recoverableDisconnect: true,
+          disconnectCause: "cdp-client-disconnect",
+          runtime: {
+            chromePid: 1234,
+            chromeProcessIdentity: fixture.processIdentity,
+            chromeTargetId: targetId,
+            conversationId: targetId,
+            promptEpoch: expect.objectContaining({
+              status: "committed",
+              verifiedUserTurnIndex: 1,
+              verifiedUserTurnId: "turn-1",
+              verifiedUserMessageId: "message-1",
+              conversationId: targetId,
+            }),
+            recoveryCleanupResult: { status: "pending" },
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromeTargetId: targetId,
+                conversationId: targetId,
+                promptEpoch: expect.objectContaining({
+                  status: "committed",
+                  verifiedUserTurnId: "turn-1",
+                  verifiedUserMessageId: "message-1",
+                }),
+                recoveryCleanup: expect.objectContaining({
+                  ownsTarget: true,
+                  closeOwnedTargetOnComplete: false,
+                }),
+              }),
+            ],
+          },
+        },
+      });
+      expect(persistenceFailure).toMatchObject({
+        details: {
+          stage: "prompt-epoch-persistence",
+          code: "prompt-epoch-persistence-failed",
+          runtime: {
+            promptEpoch: expect.objectContaining({
+              status: "committed",
+              verifiedUserTurnId: "turn-1",
+              verifiedUserMessageId: "message-1",
+            }),
+          },
+        },
+      });
+      expect((persistenceFailure as Error & { cause?: unknown }).cause).toBe(
+        fixture.runtimePersistenceError,
+      );
+      expect(
+        fixture.runtimeHints.some((runtime) => runtime.promptEpoch?.status === "committed"),
+      ).toBe(true);
+      expect(fixture.unhandledRejections).toEqual([]);
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+      expect(fixture.kill).not.toHaveBeenCalled();
+      await expect(access(fixture.profileDir)).resolves.toBeUndefined();
+      await expect(readOracleChromeOwner(fixture.profileDir)).resolves.toEqual({
+        port: 9230,
+        processIdentity: fixture.processIdentity,
+        disposition: "close-on-last-lease",
+      });
+    });
+  }, 30_000);
+
   test("cleans an owned copied profile instead of retaining an otherwise recoverable disconnect", async () => {
     await withDisconnectFixture({ copiedProfile: true }, async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
@@ -558,6 +728,97 @@ describe("recoverable disconnect lifecycle", () => {
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
   }, 30_000);
+
+  test("routes remote assessment persistence rejection into exact pending recovery", async () => {
+    await withRemoteLateDisconnectFixture(
+      "created",
+      async (fixture) => {
+        const persistenceFailure = (fixture.error as Error & { cause?: unknown }).cause;
+        expect(fixture.providerObservedDispatchStart).toBe(true);
+        expect(fixture.archiveChatGptConversation).not.toHaveBeenCalled();
+        expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
+        expect(fixture.connectToRemoteChromeTarget).toHaveBeenCalledWith(
+          "remote.example",
+          9333,
+          expect.any(Function),
+          { targetId, browserWSEndpoint: undefined, closeTargetOnDispose: false },
+        );
+        expect(fixture.verifyPromptCommitted).toHaveBeenCalledWith(
+          expect.objectContaining({ evaluate: expect.any(Function) }),
+          "keep this submitted conversation",
+          60_000,
+          expect.any(Function),
+          0,
+        );
+        expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          details: {
+            stage: "connection-lost",
+            code: "disconnect-assessment-failed",
+            recoverableDisconnect: true,
+            disconnectCause: "cdp-client-disconnect",
+            runtime: {
+              browserTransport: "cdp",
+              chromeHost: "remote.example",
+              chromePort: 9333,
+              chromeTargetId: targetId,
+              conversationId: targetId,
+              promptEpoch: expect.objectContaining({
+                status: "committed",
+                verifiedUserTurnIndex: 0,
+                verifiedUserTurnId: "turn-0",
+                verifiedUserMessageId: "message-0",
+                conversationId: targetId,
+              }),
+              recoveryCleanupResult: { status: "pending" },
+              recoveryCleanupResources: [
+                expect.objectContaining({
+                  chromeHost: "remote.example",
+                  chromePort: 9333,
+                  chromeTargetId: targetId,
+                  conversationId: targetId,
+                  promptEpoch: expect.objectContaining({
+                    status: "committed",
+                    verifiedUserTurnId: "turn-0",
+                    verifiedUserMessageId: "message-0",
+                  }),
+                  recoveryCleanup: {
+                    ownsTarget: true,
+                    profileKind: "none",
+                    keepBrowser: false,
+                    closeOwnedTargetOnComplete: false,
+                  },
+                }),
+              ],
+            },
+          },
+        });
+        expect(persistenceFailure).toMatchObject({
+          details: {
+            stage: "prompt-epoch-persistence",
+            code: "prompt-epoch-persistence-failed",
+            runtime: {
+              promptEpoch: expect.objectContaining({
+                status: "committed",
+                verifiedUserTurnId: "turn-0",
+                verifiedUserMessageId: "message-0",
+              }),
+            },
+          },
+        });
+        expect((persistenceFailure as Error & { cause?: unknown }).cause).toBe(
+          fixture.runtimePersistenceError,
+        );
+        expect(
+          fixture.runtimeHints.some((runtime) => runtime.promptEpoch?.status === "committed"),
+        ).toBe(true);
+        expect(fixture.unhandledRejections).toEqual([]);
+        expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+      },
+      { disconnectDuringSubmission: true, runtimePersistenceFailsAfterCommit: true },
+    );
+  });
 
   test("recovers a committed remote target when it disconnects during the final archive await", async () => {
     await withRemoteLateDisconnectFixture("created", async (fixture) => {

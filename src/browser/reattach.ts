@@ -275,7 +275,20 @@ export async function resumeBrowserSession(
 
     let liveRuntime = runtime;
     try {
-      liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+      if (!deps.listTargets) {
+        const refreshedRuntime = await classifyReattachFailure(
+          "stale-runtime",
+          "Recorded Chrome endpoint could not be bound to its exact process generation.",
+          () => refreshAttachRuntime(runtime),
+        );
+        if (!refreshedRuntime) {
+          throw new ClassifiedReattachError(
+            "stale-runtime",
+            "The recorded Chrome process generation has exited.",
+          );
+        }
+        liveRuntime = refreshedRuntime;
+      }
       const livePromptLocator = requireCommittedPromptEpochLocator(liveRuntime);
       assertSameCommittedPromptEpoch(promptLocator, livePromptLocator);
       const host = liveRuntime.chromeHost ?? "127.0.0.1";
@@ -533,6 +546,7 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   finalizeRecoveredRuntime,
+  refreshAttachRuntime,
   recoveryCleanupGroupKey,
   defaultRecoveryLockPath,
   createOwnedRecoveryTargetConnection,

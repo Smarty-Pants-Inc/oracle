@@ -337,8 +337,8 @@ export class RemoteTransactionStore {
   }
 
   /**
-   * Persists controller runtime only after capture publication and exact durable
-   * settlement binding. Running and unbound recovery journaling remain separate.
+   * Persists controller runtime only after exact durable settlement binding for
+   * a pending capture or an abort-bound recoverable failure.
    */
   async persistSettlementRuntime(
     transactionToken: string,

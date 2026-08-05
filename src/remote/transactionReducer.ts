@@ -172,7 +172,10 @@ const reducers: RemoteTransactionReducers = {
     return { persist: true, outcome: undefined };
   },
   "persist-settlement-runtime": (record, transition, context) => {
-    if (record.state !== "pending") {
+    const acceptsSettlementRuntime =
+      record.state === "pending" ||
+      (record.state === "recoverable-error" && record.settlementMode === "abort");
+    if (!acceptsSettlementRuntime) {
       throw new Error(`Cannot persist settlement runtime for transaction in state ${record.state}`);
     }
     assertCurrentController(record, context, "persist settlement runtime");

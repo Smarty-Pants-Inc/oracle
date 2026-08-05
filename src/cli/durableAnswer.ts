@@ -209,7 +209,7 @@ async function persistAbortRuntime<T>(
   }
 }
 
-function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata | undefined {
+export function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata | undefined {
   if (!(error instanceof BrowserAutomationError)) return undefined;
   const runtime = error.details?.runtime;
   return typeof runtime === "object" && runtime !== null

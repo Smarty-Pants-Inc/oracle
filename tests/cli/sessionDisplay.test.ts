@@ -16,6 +16,7 @@ import {
 } from "../../src/cli/sessionDisplay.ts";
 import chalk from "chalk";
 import path from "node:path";
+import { BrowserAutomationError } from "../../src/oracle/errors.ts";
 
 const waitMock = vi.hoisted(() => vi.fn());
 const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
@@ -918,6 +919,76 @@ describe("attachSession rendering", () => {
     );
     expect(finalize).toHaveBeenCalledOnce();
   });
+
+  test("persists the terminal remote runtime carried by a manual reattach error", async () => {
+    const staleRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "1".repeat(64),
+            state: "pre-receipt",
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    const hintedRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "2".repeat(64),
+            state: "recoverable-error",
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    const terminalRuntime: BrowserRuntimeMetadata = {};
+    const remoteMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: { config: {}, runtime: staleRuntime },
+      error: {
+        category: "browser-automation",
+        message: "remote response disconnected",
+        details: { recoverableDisconnect: true },
+      },
+    };
+    resumeBrowserSessionMock.mockImplementationOnce(async (...args: unknown[]) => {
+      const deps = args[3] as
+        | { runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => Promise<void> }
+        | undefined;
+      await deps?.runtimeHintCb?.(hintedRuntime);
+      throw new BrowserAutomationError("Remote transaction was already finalized.", {
+        stage: "remote-retry",
+        code: "remote-transaction-finalized",
+        recoverableDisconnect: false,
+        runtime: terminalRuntime,
+      });
+    });
+    readSessionMetadataMock.mockResolvedValue(remoteMeta);
+    readSessionLogMock.mockResolvedValue("");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    const runtimeUpdates = sessionStoreMock.updateSession.mock.calls
+      .map(([, patch]) => patch.browser?.runtime)
+      .filter((candidate) => candidate !== undefined);
+    expect(runtimeUpdates).toContainEqual(hintedRuntime);
+    expect(runtimeUpdates.at(-1)).toEqual(terminalRuntime);
+  });
+
   test("persists a verified answer receipt before manual reattach completion and cleanup", async () => {
     const recoverableMeta: SessionMetadata = {
       ...baseMeta,
