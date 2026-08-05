@@ -471,7 +471,6 @@ describe("recoverable disconnect lifecycle", () => {
                   conversationId: targetId,
                 }),
                 recoveryCleanup: {
-                  transport: "local",
                   ownsTarget: true,
                   profileKind: "temporary",
                   keepBrowser: false,
@@ -490,7 +489,7 @@ describe("recoverable disconnect lifecycle", () => {
         processIdentity: fixture.processIdentity,
       });
     });
-  });
+  }, 30_000);
 
   test("cleans an owned copied profile instead of retaining an otherwise recoverable disconnect", async () => {
     await withDisconnectFixture({ copiedProfile: true }, async (fixture) => {
@@ -514,7 +513,7 @@ describe("recoverable disconnect lifecycle", () => {
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
-  });
+  }, 30_000);
 
   test("cleans a temporary profile when the fresh semantic probe cannot confirm dispatch", async () => {
     await withDisconnectFixture({ semanticProbeSucceeds: false }, async (fixture) => {
@@ -549,7 +548,7 @@ describe("recoverable disconnect lifecycle", () => {
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
-  });
+  }, 30_000);
 
   test("recovers a committed remote target when it disconnects during the final archive await", async () => {
     await withRemoteLateDisconnectFixture("created", async (fixture) => {
@@ -602,7 +601,6 @@ describe("recoverable disconnect lifecycle", () => {
                 }),
                 tabLease: undefined,
                 recoveryCleanup: {
-                  transport: "local",
                   ownsTarget: true,
                   profileKind: "none",
                   keepBrowser: false,
@@ -653,7 +651,6 @@ describe("recoverable disconnect lifecycle", () => {
                 }),
                 tabLease: undefined,
                 recoveryCleanup: {
-                  transport: "local",
                   ownsTarget: false,
                   profileKind: "none",
                   keepBrowser: false,

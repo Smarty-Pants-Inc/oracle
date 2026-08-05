@@ -21,6 +21,12 @@ let currentProcessStartIdentity: string | undefined;
 let currentProcessStartIdentityPromise: Promise<string | null> | undefined;
 let currentProcessStartIdentityRetryAfterMs = 0;
 export type ProcessLiveness = "alive" | "dead" | "unknown";
+export interface FilesystemLockProcessIdentityProvider {
+  readonly platform: NodeJS.Platform;
+  readonly pid: number;
+  readonly readProcessLiveness: (pid: number) => ProcessLiveness;
+  readonly readProcessStartIdentity: (pid: number) => Promise<string | null>;
+}
 
 export interface FilesystemLockOwnerRecord {
   version: 1;
@@ -46,10 +52,8 @@ export interface CrashRecoverableFilesystemLockOptions {
 }
 
 export interface CrashRecoverableFilesystemLockDeps {
+  processIdentityProvider?: FilesystemLockProcessIdentityProvider;
   now?: () => number;
-  pid?: number;
-  readProcessLiveness?: (pid: number) => ProcessLiveness;
-  readProcessStartIdentity?: (pid: number) => Promise<string | null>;
   randomUUID?: () => string;
   beforeLockPublication?: (preparedLockPath: string) => Promise<void>;
   beforeStaleLockQuarantine?: () => Promise<void>;
@@ -116,10 +120,11 @@ export async function acquireCrashRecoverableFilesystemLock(
   options: CrashRecoverableFilesystemLockOptions = {},
   deps: CrashRecoverableFilesystemLockDeps = {},
 ): Promise<CrashRecoverableFilesystemLock> {
+  const processIdentityProvider = deps.processIdentityProvider ?? realProcessIdentityProvider;
   const now = deps.now ?? Date.now;
-  const pid = deps.pid ?? process.pid;
-  const readLiveness = deps.readProcessLiveness ?? readProcessLiveness;
-  const readProcessIdentity = deps.readProcessStartIdentity ?? readProcessStartIdentity;
+  const pid = processIdentityProvider.pid;
+  const readLiveness = processIdentityProvider.readProcessLiveness;
+  const readProcessIdentity = processIdentityProvider.readProcessStartIdentity;
   const createNonce = deps.randomUUID ?? randomUUID;
   const timeoutMs = Math.max(0, options.timeoutMs ?? 0);
   const pollMs = Math.max(10, options.pollMs ?? DEFAULT_POLL_MS);
@@ -130,11 +135,10 @@ export async function acquireCrashRecoverableFilesystemLock(
   const processStartIdentity = await readProcessIdentity(pid);
   // A timed-out Windows probe for the real current process must not make recovery unbounded. The
   // null generation keeps the lock fail-closed while that PID is alive and becomes stale only
-  // after liveness proves it dead. Explicit/test process identities still require a generation.
+  // after liveness proves it dead. Injected providers must still report a stable generation.
   const permitsUnverifiedCurrentProcess =
-    process.platform === "win32" &&
-    pid === process.pid &&
-    deps.readProcessStartIdentity === undefined;
+    processIdentityProvider === realProcessIdentityProvider &&
+    processIdentityProvider.platform === "win32";
   if (!processStartIdentity && !permitsUnverifiedCurrentProcess) {
     throw new Error(
       `Cannot acquire crash-recoverable filesystem lock at ${lockPath} without a stable process generation for pid ${pid}`,
@@ -148,16 +152,10 @@ export async function acquireCrashRecoverableFilesystemLock(
     sessionId: options.sessionId,
     createdAt: new Date(now()).toISOString(),
   };
-  const mutationProcessStartIdentity = await readProcessStartIdentity(process.pid);
-  if (!mutationProcessStartIdentity && process.platform !== "win32") {
-    throw new Error(
-      `Cannot coordinate crash-recoverable filesystem lock mutations at ${lockPath} without a stable process generation for pid ${process.pid}`,
-    );
-  }
   const mutationOwner: FilesystemLockOwnerRecord = {
     version: 1,
-    pid: process.pid,
-    processStartIdentity: mutationProcessStartIdentity,
+    pid,
+    processStartIdentity,
     ownerNonce: createNonce(),
     createdAt: new Date(now()).toISOString(),
   };
@@ -169,8 +167,8 @@ export async function acquireCrashRecoverableFilesystemLock(
     now,
     pollMs,
     incompleteLockStaleMs,
-    readLiveness: readProcessLiveness,
-    readProcessIdentity: readProcessStartIdentity,
+    readLiveness,
+    readProcessIdentity,
     createNonce,
     beforeRequestOwnerWrite: deps.beforeMutationRequestOwnerWrite,
     beforeTicketPublication: deps.beforeMutationRequestTicketPublication,
@@ -295,6 +293,13 @@ export async function acquireCrashRecoverableFilesystemLock(
     }
   }
 }
+
+const realProcessIdentityProvider: FilesystemLockProcessIdentityProvider = {
+  platform: process.platform,
+  pid: process.pid,
+  readProcessLiveness,
+  readProcessStartIdentity,
+};
 
 export function readProcessLiveness(pid: number): ProcessLiveness {
   if (!Number.isInteger(pid) || pid <= 0) return "unknown";

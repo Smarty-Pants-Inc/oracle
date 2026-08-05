@@ -272,7 +272,16 @@ describe("buildReattachLine", () => {
       status: "error",
       mode: "browser",
       options: {},
-      browser: { runtime: { remoteRecovery } },
+      browser: {
+        runtime: {
+          recoveryCleanupResources: [
+            {
+              remoteRecovery,
+              recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+            },
+          ],
+        },
+      },
     };
 
     expect(buildReattachLine(metadata)).toBe(
@@ -284,7 +293,13 @@ describe("buildReattachLine", () => {
         status: "completed",
         browser: {
           runtime: {
-            remoteRecovery: { ...remoteRecovery, settlementMode: "finalize" },
+            recoveryCleanupResources: [
+              {
+                remoteRecovery,
+                recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+              },
+            ],
+            recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
           },
         },
       }),
@@ -514,10 +529,8 @@ describe("attachSession rendering", () => {
       host: "bridge.example:9443",
       transactionToken: "a".repeat(64),
       state: "pending" as const,
-      settlementMode: "finalize" as const,
     };
     const pendingRuntime: BrowserRuntimeMetadata = {
-      remoteRecovery,
       recoveryCleanupResources: [
         {
           chromeHost: "127.0.0.1",
@@ -525,7 +538,6 @@ describe("attachSession rendering", () => {
           chromeTargetId: "completed-pending-target",
           remoteRecovery,
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: false,
             profileKind: "none",
             keepBrowser: true,
@@ -590,7 +602,6 @@ describe("attachSession rendering", () => {
           chromePort: 9222,
           chromeTargetId: "unpublished-target",
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: false,
             profileKind: "none",
             keepBrowser: true,
@@ -622,15 +633,12 @@ describe("attachSession rendering", () => {
       host: "bridge.example:9443",
       transactionToken: "b".repeat(64),
       state: "pending" as const,
-      settlementMode: "abort" as const,
     };
     const pendingRuntime: BrowserRuntimeMetadata = {
-      remoteRecovery,
       recoveryCleanupResources: [
         {
           remoteRecovery,
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: false,
             profileKind: "none",
             keepBrowser: false,
@@ -689,7 +697,6 @@ describe("attachSession rendering", () => {
             chromePort: 9222,
             userDataDir: "/tmp/copied-profile",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "copied",
               keepBrowser: false,
@@ -749,7 +756,14 @@ describe("attachSession rendering", () => {
       state: "pre-receipt" as const,
       requestIdentity,
     };
-    const remoteOnlyRuntime: BrowserRuntimeMetadata = { remoteRecovery };
+    const remoteOnlyRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery,
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
     const remoteMeta: SessionMetadata = {
       ...baseMeta,
       status: "error",
@@ -763,14 +777,12 @@ describe("attachSession rendering", () => {
     };
     const capturedRuntime: BrowserRuntimeMetadata = {
       ...committedPromptAuthority("remote-only-conversation"),
-      remoteRecovery: { ...remoteRecovery, state: "pending" },
       recoveryCleanupResources: [
         {
           conversationId: "remote-only-conversation",
           promptEpoch: committedPromptAuthority("remote-only-conversation").promptEpoch,
           remoteRecovery: { ...remoteRecovery, state: "pending" },
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: false,
             profileKind: "none",
             keepBrowser: false,
@@ -830,7 +842,6 @@ describe("attachSession rendering", () => {
               chromeHost: "127.0.0.1",
               chromeTargetId: "manual-recovery-target",
               recoveryCleanup: {
-                transport: "remote",
                 ownsTarget: false,
                 profileKind: "none",
                 keepBrowser: true,
@@ -925,7 +936,6 @@ describe("attachSession rendering", () => {
               chromeHost: "127.0.0.1",
               chromeTargetId: "manual-failure-target",
               recoveryCleanup: {
-                transport: "remote",
                 ownsTarget: false,
                 profileKind: "none",
                 keepBrowser: true,

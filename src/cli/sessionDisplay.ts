@@ -194,11 +194,8 @@ function hasDurableBrowserAnswerReceipt(metadata: SessionMetadata): boolean {
   );
 }
 
-function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | undefined) {
-  return (
-    runtime?.remoteRecovery ??
-    runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)?.remoteRecovery
-  );
+function hasRemoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | undefined): boolean {
+  return Boolean(runtime?.recoveryCleanupResources?.some((resource) => resource.remoteRecovery));
 }
 
 export interface ShowStatusOptions {
@@ -326,7 +323,6 @@ export async function attachSession(
     };
     runtime = repairedRuntime;
   }
-  const persistedRemoteRecovery = remoteRecoveryAuthority(runtime);
   const persistedCleanupMode = runtime?.recoveryCleanupResult?.settlementMode;
   const completedCleanupAcknowledged =
     metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata);
@@ -335,8 +331,7 @@ export async function attachSession(
     (persistedCleanupMode === undefined || persistedCleanupMode === "finalize")
       ? "finalize"
       : metadata.status === "error"
-        ? (persistedCleanupMode ??
-          (persistedRemoteRecovery?.settlementMode === "abort" ? "abort" : null))
+        ? (persistedCleanupMode ?? null)
         : null;
   if (
     cleanupRetryMode &&
@@ -381,8 +376,8 @@ export async function attachSession(
   const workerAlive = isProcessAlive(metadata.lifecycle?.workerPid);
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
   const hasIncompleteCapture = metadata.response?.incompleteReason === "incomplete-capture";
-  const remoteRecovery = remoteRecoveryAuthority(runtime);
-  const hasResumableRemoteAuthority = Boolean(remoteRecovery && !remoteRecovery.settlementMode);
+  const hasResumableRemoteAuthority =
+    hasRemoteRecoveryAuthority(runtime) && !runtime?.recoveryCleanupResult?.settlementMode;
   const statusAllowsReattach =
     metadata.status === "running" ||
     (metadata.status === "error" &&
@@ -990,11 +985,20 @@ export function buildReattachLine(metadata: SessionMetadata): string | null {
   if (metadata.status === "running") {
     return `Session ${metadata.id} reattached, request started ${elapsedLabel} ago.`;
   }
-  const remoteRecovery = remoteRecoveryAuthority(metadata.browser?.runtime);
-  if (metadata.status === "error" && remoteRecovery) {
+  const runtime = metadata.browser?.runtime;
+  const hasRemoteRecovery = hasRemoteRecoveryAuthority(runtime);
+  if (
+    metadata.status === "error" &&
+    hasRemoteRecovery &&
+    !runtime?.recoveryCleanupResult?.settlementMode
+  ) {
     return `Session ${metadata.id} retained recoverable remote browser authority from ${elapsedLabel} ago.`;
   }
-  if (metadata.status === "completed" && remoteRecovery?.settlementMode === "finalize") {
+  if (
+    metadata.status === "completed" &&
+    hasRemoteRecovery &&
+    runtime?.recoveryCleanupResult?.settlementMode === "finalize"
+  ) {
     return `Session ${metadata.id} retained pending remote browser finalization from ${elapsedLabel} ago.`;
   }
   return null;

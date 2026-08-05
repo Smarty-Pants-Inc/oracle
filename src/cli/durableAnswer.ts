@@ -38,7 +38,7 @@ export async function persistDurableBrowserAnswer(
   await mkdir(artifactsDir, { recursive: true });
   await syncDirectoryIfSupported(paths.dir);
   const answerPath = path.join(artifactsDir, `browser-answer-${sha256}.md`);
-  const verified = await ensureDurableFile(answerPath, payload);
+  await ensureDurableFile(answerPath, payload);
 
   if (options.logHeader) {
     const logPayload = Buffer.from(`${options.logHeader}\nAnswer:\n${options.answer}\n`, "utf8");
@@ -49,24 +49,20 @@ export async function persistDurableBrowserAnswer(
     }
   }
 
-  const verifiedSha256 = createHash("sha256").update(verified).digest("hex");
-  if (!verified.equals(payload) || verifiedSha256 !== sha256) {
-    throw new Error(`Durable browser answer verification failed: ${answerPath}`);
-  }
   return {
     artifact: {
       kind: "transcript",
       path: answerPath,
       label: "Durable browser answer",
       mimeType: "text/markdown",
-      sizeBytes: verified.byteLength,
+      sizeBytes: payload.byteLength,
       sha256,
       validation: { type: "generic", ok: true },
       transfer: { status: "not-needed" },
       origin: { mode: "local" },
     },
     sha256,
-    sizeBytes: verified.byteLength,
+    sizeBytes: payload.byteLength,
   };
 }
 
@@ -225,7 +221,7 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<Buffer> {
+async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<void> {
   let entry: Stats;
   try {
     entry = await lstat(targetPath);
@@ -262,7 +258,6 @@ async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<B
     if (!isUnchangedFile(afterSync, named)) {
       throw new Error(`Durable browser answer path changed during verification: ${targetPath}`);
     }
-    return existing;
   } finally {
     await handle.close();
   }

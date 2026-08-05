@@ -29,7 +29,6 @@ function remoteRuntime(): BrowserRuntimeMetadata {
         chromePort: 9222,
         chromeTargetId: "owned-target",
         recoveryCleanup: {
-          transport: "remote",
           ownsTarget: true,
           profileKind: "none",
           keepBrowser: false,
@@ -41,7 +40,7 @@ function remoteRuntime(): BrowserRuntimeMetadata {
 }
 
 describe("BrowserRunLifecycleController", () => {
-  test("enforces acquire, dispatch, verify, capture, publication, and finalization phases", async () => {
+  test("enforces acquisition, dispatch verification, capture publication, and finalization", async () => {
     const persistRuntime = vi.fn(async (_runtime: BrowserRuntimeMetadata) => undefined);
     const settleResources = vi.fn(
       async (_mode: "finalize" | "abort", runtime: BrowserRuntimeMetadata) =>
@@ -60,10 +59,12 @@ describe("BrowserRunLifecycleController", () => {
     lifecycle.markAcquired();
     await lifecycle.resetPrompt();
     const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
-    expect(lifecycle.phase()).toMatchObject({
-      kind: "dispatching",
-      epoch: { status: "pending", baselineTurns: 0 },
+    expect(lifecycle.promptDispatch()).toMatchObject({
+      status: "pending",
+      prompt: "review",
+      baselineTurns: 0,
     });
+    expect(lifecycle.promptEpoch()).toMatchObject({ status: "pending", baselineTurns: 0 });
     expect(() =>
       lifecycle.issueCapture({
         answerText: "unverified answer",
@@ -75,9 +76,10 @@ describe("BrowserRunLifecycleController", () => {
     ).toThrow(/dispatching phase/i);
 
     await lifecycle.recordPromptCommitVerification(committedVerification, identity);
-    expect(lifecycle.phase()).toMatchObject({
-      kind: "capturing",
-      epoch: { status: "committed", conversationId: "captured-conversation" },
+    expect(lifecycle.promptDispatch()).toMatchObject({ status: "committed" });
+    expect(lifecycle.promptEpoch()).toMatchObject({
+      status: "committed",
+      conversationId: "captured-conversation",
     });
 
     const transaction = lifecycle.issueCapture({
@@ -88,7 +90,6 @@ describe("BrowserRunLifecycleController", () => {
       answerChars: 15,
     });
 
-    expect(lifecycle.phase()).toEqual({ kind: "caller-publication" });
     expect(transaction.promptEpoch).toMatchObject({ status: "committed" });
     expect(transaction.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
     expect(transaction.runtime.recoveryCleanupResources).toEqual([
@@ -104,7 +105,7 @@ describe("BrowserRunLifecycleController", () => {
     expect(settleResources).not.toHaveBeenCalled();
     expect(await lifecycle.settleIfUnpublished()).toBeNull();
 
-    await transaction.finalize();
+    const finalization = await transaction.finalize();
     await expect(transaction.abort()).rejects.toMatchObject({
       details: {
         code: "browser-run-lifecycle-settlement-conflict",
@@ -120,7 +121,7 @@ describe("BrowserRunLifecycleController", () => {
         recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
       }),
     );
-    expect(lifecycle.phase()).toEqual({ kind: "completed", mode: "finalize" });
+    expect(finalization.status).toBe("completed");
     expect(persistRuntime).toHaveBeenCalledWith(
       expect.objectContaining({
         promptEpoch: expect.objectContaining({ status: "committed" }),
@@ -202,10 +203,8 @@ describe("BrowserRunLifecycleController", () => {
         },
       },
     });
-    expect(lifecycle.phase()).toMatchObject({
-      kind: "dispatching",
-      epoch: { status: "pending" },
-    });
+    expect(lifecycle.promptDispatch()).toMatchObject({ status: "pending", prompt: "review" });
+    expect(lifecycle.promptEpoch()).toMatchObject({ status: "pending" });
   });
 
   test.each([
@@ -261,11 +260,6 @@ describe("BrowserRunLifecycleController", () => {
           },
         },
       });
-      expect(lifecycle.phase()).toEqual({
-        kind: "cleanup-pending",
-        mode,
-        error: "target close was not confirmed",
-      });
       await expect(transaction[oppositeMode]()).rejects.toMatchObject({
         details: {
           code: "browser-run-lifecycle-settlement-conflict",
@@ -295,7 +289,6 @@ describe("BrowserRunLifecycleController", () => {
           recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "retry-target" })],
         }),
       );
-      expect(lifecycle.phase()).toEqual({ kind: "completed", mode });
     },
   );
 
@@ -409,11 +402,6 @@ describe("BrowserRunLifecycleController", () => {
           settlementMode: "finalize",
         },
       },
-    });
-    expect(lifecycle.phase()).toEqual({
-      kind: "cleanup-pending",
-      mode: "finalize",
-      error: "profile removal was not confirmed",
     });
   });
 });

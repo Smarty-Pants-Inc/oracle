@@ -4,15 +4,14 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { openGeminiBrowserSession } from "../../src/gemini-web/browserSessionManager.js";
 
-type LeaseReleaseOptions = {
-  onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
-};
+type Teardown = () => Promise<boolean>;
 
 const {
   connectWithNewTab,
   closeTab,
   acquireManualChromeOwner,
   acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
   cleanupStaleProfileState,
   captureProfileDirectoryIdentity,
   verifyProfileDirectoryIdentity,
@@ -20,6 +19,8 @@ const {
   ownerKill,
   leaseUpdate,
   leaseRelease,
+  teardownSettle,
+  teardownState,
   clientClose,
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS,
   normalizeMaxConcurrentTabs,
@@ -28,6 +29,7 @@ const {
   closeTab: vi.fn(async () => true),
   acquireManualChromeOwner: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
+  retainBrowserTabLeaseTeardownAuthority: vi.fn(),
   cleanupStaleProfileState: vi.fn(async () => true),
   captureProfileDirectoryIdentity: vi.fn(async (profileDir: string) => ({
     version: 1,
@@ -49,6 +51,8 @@ const {
   ownerKill: vi.fn(),
   leaseUpdate: vi.fn(),
   leaseRelease: vi.fn(),
+  teardownSettle: vi.fn(),
+  teardownState: { leaseReleased: false },
   clientClose: vi.fn(),
 }));
 
@@ -72,6 +76,7 @@ vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS,
   normalizeMaxConcurrentTabs,
   acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
 }));
 
 describe("openGeminiBrowserSession", () => {
@@ -101,8 +106,14 @@ describe("openGeminiBrowserSession", () => {
     leaseUpdate.mockReset();
     leaseUpdate.mockResolvedValue(undefined);
     leaseRelease.mockReset();
-    leaseRelease.mockImplementation(async (options: LeaseReleaseOptions = {}) => {
-      await options.onRelease?.({ isLastLease: true });
+    leaseRelease.mockResolvedValue(undefined);
+    teardownState.leaseReleased = false;
+    teardownSettle.mockReset();
+    teardownSettle.mockImplementation(async (teardown: Teardown) => {
+      teardownState.leaseReleased = true;
+      return (await teardown())
+        ? { status: "completed", disposition: "teardown-completed" }
+        : { status: "preserved", reason: "teardown-unsafe" };
     });
     clientClose.mockReset();
     clientClose.mockResolvedValue(undefined);
@@ -111,6 +122,13 @@ describe("openGeminiBrowserSession", () => {
     closeTab.mockClear();
     acquireManualChromeOwner.mockReset();
     acquireBrowserTabLease.mockReset();
+    retainBrowserTabLeaseTeardownAuthority.mockReset();
+    retainBrowserTabLeaseTeardownAuthority.mockImplementation(() => ({
+      get leaseReleased() {
+        return teardownState.leaseReleased;
+      },
+      settle: teardownSettle,
+    }));
     cleanupStaleProfileState.mockClear();
     cleanupStaleProfileState.mockResolvedValue(true);
 
@@ -127,6 +145,7 @@ describe("openGeminiBrowserSession", () => {
     });
     acquireBrowserTabLease.mockResolvedValue({
       id: "lease-1",
+      profileDirectory: processIdentity.profileDirectory,
       update: leaseUpdate,
       release: leaseRelease,
     });
@@ -207,12 +226,14 @@ describe("openGeminiBrowserSession", () => {
     expect(leaseRelease).toHaveBeenCalledTimes(1);
     expect(ownerKill).not.toHaveBeenCalled();
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
+    expect(retainBrowserTabLeaseTeardownAuthority).not.toHaveBeenCalled();
   });
 
-  it("keeps a launched owner alive until its final tab lease releases", async () => {
+  it("hands a launched owner off without killing it when another lease is already active", async () => {
     const profileDir = path.join(tempRoot, "shared-profile");
-    leaseRelease.mockImplementationOnce(async (options: LeaseReleaseOptions = {}) => {
-      await options.onRelease?.({ isLastLease: false });
+    teardownSettle.mockImplementationOnce(async () => {
+      teardownState.leaseReleased = true;
+      return { status: "completed", disposition: "active-lease-handoff" };
     });
 
     const session = await openGeminiBrowserSession({
@@ -224,7 +245,7 @@ describe("openGeminiBrowserSession", () => {
 
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(clientClose).toHaveBeenCalledTimes(1);
-    expect(leaseRelease).toHaveBeenCalledTimes(1);
+    expect(teardownSettle).toHaveBeenCalledTimes(1);
     expect(ownerKill).not.toHaveBeenCalled();
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
@@ -262,6 +283,80 @@ describe("openGeminiBrowserSession", () => {
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
 
+  it("rechecks the lease registry before retrying the exact launched-owner handle", async () => {
+    const profileDir = path.join(tempRoot, "teardown-race-profile");
+    ownerKill
+      .mockResolvedValueOnce({
+        status: "unsafe",
+        pid: processIdentity.pid,
+        reason: "termination failed",
+      })
+      .mockResolvedValueOnce({ status: "stopped", pid: processIdentity.pid });
+    teardownSettle
+      .mockImplementationOnce(async (teardown: Teardown) => {
+        teardownState.leaseReleased = true;
+        expect(await teardown()).toBe(false);
+        return { status: "preserved", reason: "teardown-unsafe" };
+      })
+      .mockImplementationOnce(async () => ({ status: "preserved", reason: "active-leases" }))
+      .mockImplementationOnce(async (teardown: Teardown) => {
+        expect(await teardown()).toBe(true);
+        return { status: "completed", disposition: "teardown-completed" };
+      });
+    const session = await openGeminiBrowserSession({
+      browserConfig: { manualLoginProfileDir: profileDir },
+      keepBrowserDefault: false,
+      purpose: "Gemini Deep Think",
+    });
+
+    await expect(session.close()).rejects.toThrow("did not settle cleanly");
+    expect(ownerKill).toHaveBeenCalledTimes(1);
+    expect(session.runtime().recoveryCleanupResources?.[0]?.tabLease).toBeUndefined();
+
+    await expect(session.close()).rejects.toThrow("active-leases");
+    expect(ownerKill).toHaveBeenCalledTimes(1);
+
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(ownerKill).toHaveBeenCalledTimes(2);
+    expect(cleanupStaleProfileState).toHaveBeenCalledTimes(1);
+    expect(session.runtime().recoveryCleanupResources).toBeUndefined();
+  });
+
+  it("attaches durable cleanup authority when session opening cannot settle", async () => {
+    const profileDir = path.join(tempRoot, "open-failure-profile");
+    connectWithNewTab.mockRejectedValueOnce(new Error("connection failed"));
+    ownerKill.mockResolvedValueOnce({
+      status: "unsafe",
+      pid: processIdentity.pid,
+      reason: "termination failed",
+    });
+
+    await expect(
+      openGeminiBrowserSession({
+        browserConfig: { manualLoginProfileDir: profileDir },
+        keepBrowserDefault: false,
+        purpose: "Gemini Deep Think",
+      }),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        stage: "gemini-browser-session-open",
+        runtime: {
+          recoveryCleanupResult: { status: "failed", settlementMode: "abort" },
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              userDataDir: profileDir,
+              tabLease: undefined,
+              recoveryCleanup: expect.objectContaining({ keepBrowser: false }),
+            }),
+          ],
+        },
+      },
+    });
+    expect(ownerKill).toHaveBeenCalledTimes(1);
+    expect(cleanupStaleProfileState).not.toHaveBeenCalled();
+  });
+
   it("retries target closure before releasing controller or lease authority", async () => {
     const profileDir = path.join(tempRoot, "close-retry-profile");
     closeTab.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
@@ -282,7 +377,7 @@ describe("openGeminiBrowserSession", () => {
 
     expect(closeTab).toHaveBeenCalledTimes(2);
     expect(clientClose).toHaveBeenCalledTimes(1);
-    expect(leaseRelease).toHaveBeenCalledTimes(1);
+    expect(teardownSettle).toHaveBeenCalledTimes(1);
     expect(ownerKill).toHaveBeenCalledTimes(1);
     expect(cleanupStaleProfileState).toHaveBeenCalledTimes(1);
   });

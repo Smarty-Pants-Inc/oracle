@@ -6,10 +6,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import chalk from "chalk";
+import CDP from "chrome-remote-interface";
 import type {
   BrowserAttachment,
   BrowserCaptureFinalizationResult,
   BrowserLogger,
+  ChromeClient,
   CookieParam,
 } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
@@ -54,7 +56,7 @@ import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { getOracleHomeDir } from "../oracleHome.js";
-import { normalizeChatgptUrl, estimateTokenCount } from "../browser/utils.js";
+import { delay, normalizeChatgptUrl, estimateTokenCount } from "../browser/utils.js";
 import { sanitizeArtifactFilename, sanitizeArtifactMimeType } from "../browser/artifacts.js";
 import type {
   BrowserRemotePromptRequestIdentity,
@@ -71,6 +73,14 @@ import {
 import { acquireManualChromeOwner } from "../browser/manualChromeOwner.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
+import {
+  inspectChromeProcessIdentity,
+  readOracleChromeOwner,
+  sameChromeProcessIdentity,
+  type ChromeProcessIdentity,
+  type ProfileStateLogger,
+  type RecordedChromeTerminationOutcome,
+} from "../browser/profileState.js";
 import { RemoteArtifactStore, RemoteArtifactUnavailableError } from "./artifactStore.js";
 import {
   type DurableRemoteAutomationError,
@@ -102,6 +112,7 @@ interface RemoteServerDeps {
   resumeBrowser?: typeof resumeBrowserSession;
   transactionStoreDir?: string;
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
+  exactChromeCleanup?: typeof terminateRemoteChromeWithExactControl;
   controllerGeneration?: string;
   transactionLeaseDurationMs?: number;
   transactionStoreNow?: () => number;
@@ -153,7 +164,7 @@ export async function createRemoteServer(
   assertLoopbackRemoteBind(bindHost);
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const resumeBrowser = deps.resumeBrowser ?? resumeBrowserSession;
-  const retryCleanup = deps.retryCleanup ?? retryBrowserRecoveryCleanup;
+  const injectedRetryCleanup = deps.retryCleanup;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
   const authToken = options.token ?? randomBytes(16).toString("hex");
@@ -192,13 +203,35 @@ export async function createRemoteServer(
     sessionsRoot: path.join(getOracleHomeDir(), "sessions"),
   });
   const activeTransactions = new Map<string, BrowserRunTransaction>();
+  let closing = false;
+  let closed = false;
   const cleanupLogger = ((message?: string) => {
     if (typeof message === "string") logger(`[serve] ${message}`);
   }) as BrowserLogger;
   const transactionCoordinator = new RemoteTransactionCoordinator({
     transactionStore,
     activeTransactions,
-    retryCleanup: (runtime, mode) => retryCleanup(runtime, cleanupLogger, {}, mode),
+    retryCleanup: (runtime, mode) => {
+      const cleanup = injectedRetryCleanup ?? retryBrowserRecoveryCleanup;
+      return cleanup(
+        runtime,
+        cleanupLogger,
+        injectedRetryCleanup
+          ? {}
+          : {
+              recoveryCleanup: {
+                terminateRecordedChromeForProfile: (profileDir, identity, cleanupLog) =>
+                  (deps.exactChromeCleanup ?? terminateRemoteChromeWithExactControl)(
+                    runtime,
+                    profileDir,
+                    identity,
+                    cleanupLog,
+                  ),
+              },
+            },
+        mode,
+      );
+    },
   });
 
   // Remote Chrome and lease settlement are single-flight. Per-record work is additionally
@@ -280,6 +313,10 @@ export async function createRemoteServer(
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
           capabilities: ARTIFACT_CAPABILITIES,
         });
+        return;
+      }
+      if (closing) {
+        sendJson(res, 503, { error: "server_closing" });
         return;
       }
 
@@ -453,21 +490,51 @@ export async function createRemoteServer(
   logger(color(chalk.yellowBright, `Access token: ${authToken}`));
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
-  let closed = false;
   return {
     port: address.port,
     token: authToken,
     async close() {
       if (closed) return;
-      closed = true;
-      clearInterval(leaseSweepTimer);
+      if (closing) throw new Error("Remote server close is already in progress");
+      closing = true;
       try {
+        await sweepInFlight;
+        if (browserWorkBusy) {
+          throw new Error("Remote server cannot close while browser work is active");
+        }
+        browserWorkBusy = true;
+        try {
+          for (const transactionToken of transactionCoordinator.activeTransactionTokens()) {
+            const record = await transactionStore.read(transactionToken);
+            if (!record) {
+              throw new Error("Remote server has live browser authority without a durable record");
+            }
+            const mode = record.settlementMode ?? "abort";
+            const outcome = await transactionCoordinator.settle({
+              transactionToken,
+              mode,
+              durablePublication: mode === "finalize" && Boolean(record.publicationAcknowledgedAt),
+            });
+            if (outcome.finalization.status !== "completed") {
+              throw new Error(
+                `Remote server cannot close while transaction ${transactionToken} cleanup remains pending`,
+              );
+            }
+          }
+        } finally {
+          browserWorkBusy = false;
+        }
+        if (transactionCoordinator.activeTransactionTokens().length > 0) {
+          throw new Error("Remote server cannot close while live transaction authority remains");
+        }
+        clearInterval(leaseSweepTimer);
         const closeDeferred = createDeferred<void>();
         server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
         await closeDeferred.promise;
-        await sweepInFlight?.catch(() => undefined);
-      } finally {
+        closed = true;
         await controllerLock.release();
+      } finally {
+        closing = false;
       }
     },
   };
@@ -482,6 +549,161 @@ class RemoteRequestError extends Error {
     super(message);
     this.name = "RemoteRequestError";
   }
+}
+
+async function terminateRemoteChromeWithExactControl(
+  runtime: BrowserRuntimeMetadata,
+  profileDir: string,
+  identity: ChromeProcessIdentity,
+  logger?: ProfileStateLogger,
+): Promise<RecordedChromeTerminationOutcome> {
+  const resource = runtime.recoveryCleanupResources?.find(
+    (candidate) =>
+      candidate.chromeProcessIdentity &&
+      sameChromeProcessIdentity(candidate.chromeProcessIdentity, identity),
+  );
+  if (!resource) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Durable cleanup resource does not contain the exact Chrome process generation",
+    };
+  }
+  let owner;
+  try {
+    owner = await readOracleChromeOwner(profileDir);
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!owner || !sameChromeProcessIdentity(owner.processIdentity, identity)) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Persisted Chrome owner launch nonce or process identity no longer matches",
+    };
+  }
+  const inspection = await inspectChromeProcessIdentity(profileDir, identity).catch(
+    () => "unavailable" as const,
+  );
+  if (inspection === "exited") return { status: "already-stopped", pid: identity.pid };
+  if (inspection !== "current") {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Exact Chrome process generation could not be reverified before cleanup",
+    };
+  }
+
+  const host = resource.chromeHost ?? "127.0.0.1";
+  const port = resource.chromePort ?? owner.port;
+  if (port !== owner.port) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Durable Chrome control port does not match the persisted owner record",
+    };
+  }
+  let browserWSEndpoint = resource.chromeBrowserWSEndpoint;
+  if (!browserWSEndpoint) {
+    const hostForUrl = host.includes(":") ? `[${host}]` : host;
+    try {
+      const response = await fetch(`http://${hostForUrl}:${port}/json/version`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const version = (await response.json()) as { webSocketDebuggerUrl?: unknown };
+      if (typeof version.webSocketDebuggerUrl !== "string") {
+        throw new Error("Chrome did not expose a browser control endpoint");
+      }
+      browserWSEndpoint = version.webSocketDebuggerUrl;
+    } catch (error) {
+      return {
+        status: "unsafe",
+        pid: identity.pid,
+        reason: `Exact Chrome control discovery failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(browserWSEndpoint);
+  } catch {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Durable Chrome browser control endpoint is invalid",
+    };
+  }
+  if (
+    endpoint.protocol !== "ws:" ||
+    endpoint.hostname !== host ||
+    Number.parseInt(endpoint.port, 10) !== port ||
+    !/^\/devtools\/browser\/[^/]+$/u.test(endpoint.pathname)
+  ) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: "Durable Chrome browser control endpoint does not match its exact host and port",
+    };
+  }
+
+  let client: ChromeClient | null = null;
+  try {
+    client = (await CDP({ target: endpoint.toString(), local: true })) as ChromeClient;
+    await client.Browser.getVersion();
+    const processInfo = await client.SystemInfo.getProcessInfo();
+    const exactBrowser = processInfo.processInfo.some(
+      (process) => process.type === "browser" && process.id === identity.pid,
+    );
+    if (!exactBrowser) {
+      return {
+        status: "unsafe",
+        pid: identity.pid,
+        reason: "Chrome control channel is not bound to the persisted process generation",
+      };
+    }
+    const beforeClose = await inspectChromeProcessIdentity(profileDir, identity).catch(
+      () => "unavailable" as const,
+    );
+    if (beforeClose !== "current") {
+      return {
+        status: "unsafe",
+        pid: identity.pid,
+        reason: "Exact Chrome process generation changed before Browser.close",
+      };
+    }
+    await client.Browser.close();
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid: identity.pid,
+      reason: `Exact Chrome control channel failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  } finally {
+    await client?.close().catch(() => undefined);
+  }
+
+  const deadline = Date.now() + 7_000;
+  while (Date.now() < deadline) {
+    const afterClose = await inspectChromeProcessIdentity(profileDir, identity).catch(
+      () => "unavailable" as const,
+    );
+    if (afterClose === "exited") {
+      logger?.(`Stopped exact Chrome process generation ${identity.pid} through Browser.close`);
+      return { status: "stopped", pid: identity.pid, signal: "CONTROL_CHANNEL" };
+    }
+    if (afterClose === "unavailable") break;
+    await delay(100);
+  }
+  return {
+    status: "unsafe",
+    pid: identity.pid,
+    reason: "Exact Chrome process exit could not be proven after Browser.close",
+  };
 }
 
 async function handleRemoteRunRequest(params: {
@@ -530,13 +752,11 @@ async function handleRemoteRunRequest(params: {
   const runId = randomUUID();
   const now = new Date().toISOString();
   try {
-    await params.transactionStore.create({
+    await params.transactionStore.begin({
       protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
       transactionToken: params.transactionToken,
       runId,
       createdAt: now,
-      updatedAt: now,
-      state: "running",
       requestIdentity,
       browserConfig: effectiveBrowserConfig,
     });
@@ -635,29 +855,13 @@ async function handleRemoteRunRequest(params: {
       artifacts: fileArtifacts,
     });
     const publicResult = projectRemotePublicResult(result);
-    const record = await params.transactionStore.update(params.transactionToken, (current) => {
-      if (current.state !== "running") {
-        throw new Error(`Cannot publish capture from transaction state ${current.state}`);
-      }
-      if (current.runId !== runId) {
-        throw new Error("Remote capture run identity changed before durable commit");
-      }
-      if (
-        registrations.some(
-          (registration) =>
-            registration.transactionToken !== params.transactionToken ||
-            registration.descriptor.runId !== runId,
-        )
-      ) {
-        throw new Error("Remote artifact registration identity does not match its capture");
-      }
-      current.state = "pending";
-      current.result = publicResult;
-      current.runtime = capturedTransaction.runtime;
-      current.modelSelection = result.modelSelection;
-      current.artifacts = registrations;
-      current.error = undefined;
-      current.finalization = undefined;
+    const record = await params.transactionStore.publishCapture({
+      transactionToken: params.transactionToken,
+      runId,
+      result: publicResult,
+      runtime: capturedTransaction.runtime,
+      modelSelection: result.modelSelection,
+      artifacts: registrations,
     });
     durableCapture = true;
     params.transactionCoordinator.registerActive(params.transactionToken, capturedTransaction);
@@ -689,38 +893,31 @@ async function handleRemoteRunRequest(params: {
             rawError,
           );
     const failedCapture = capture;
-    if (failedCapture) {
-      await params.transactionStore.update(params.transactionToken, (current) => {
-        current.settlementMode = "abort";
-      });
-    }
-    const failedCleanup = failedCapture
-      ? await failedCapture
-          .abort()
-          .catch((abortError) => pendingCleanupResult(failedCapture.runtime, abortError))
-      : null;
     const errorRuntime = browserRuntimeFromError(error);
     const journaled = await params.transactionStore.read(params.transactionToken);
-    const recoverableRuntime =
-      failedCleanup?.status === "pending"
-        ? failedCleanup.runtime
-        : error.details?.recoverableDisconnect === true
-          ? (errorRuntime ?? journaled?.runtime)
-          : undefined;
+    const recoverableRuntime = failedCapture?.runtime ?? errorRuntime ?? journaled?.runtime;
     const durableError = serializeDurableBrowserAutomationError(error, Boolean(recoverableRuntime));
-    const remoteError = projectRemoteBrowserAutomationError(
-      durableError,
-      recoverableRuntime,
-      params.transactionToken,
-      failedCapture ? "abort" : undefined,
-    );
-    await params.transactionStore.update(params.transactionToken, (current) => {
-      current.state = recoverableRuntime ? "recoverable-error" : "failed";
-      current.runtime = recoverableRuntime;
-      current.error = durableError;
-      current.finalization = failedCleanup ?? undefined;
+    let record = await params.transactionStore.recordRecoverableFailure({
+      transactionToken: params.transactionToken,
+      runtime: recoverableRuntime,
+      error: durableError,
     });
-    sendEvent({ type: "error", error: remoteError });
+    const cleanupRequired =
+      Boolean(failedCapture) ||
+      (Boolean(recoverableRuntime) && error.details?.recoverableDisconnect !== true);
+    if (cleanupRequired && recoverableRuntime) {
+      if (failedCapture) {
+        params.transactionCoordinator.registerActive(params.transactionToken, failedCapture);
+      }
+      record = (
+        await params.transactionCoordinator.settle({
+          transactionToken: params.transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        })
+      ).record;
+    }
+    sendEvent({ type: "error", error: remoteBrowserAutomationError(record) });
     params.logger(
       `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
     );
@@ -838,151 +1035,131 @@ async function serveRemoteTransactionRetry(params: {
   }
 
   try {
-    const outcome = await params.transactionStore.withTransactionRecord(
-      params.transactionToken,
-      async (record, persist) => {
-        if (record.state === "running") {
-          return { statusCode: 202, body: { status: "running" as const } };
-        }
-        if (record.state === "finalized" || record.state === "aborted") {
-          return {
-            statusCode: 409,
-            body: {
-              error: "transaction_already_settled",
-              state: record.state,
-              transactionToken: record.transactionToken,
-            },
-          };
-        }
-        if (record.result) {
-          const response: RemoteTransactionRetryResponse = {
-            status: "transaction",
-            transaction: remoteTransactionPayload(record),
-          };
-          return { statusCode: 200, body: response };
-        }
-        if (record.state !== "recoverable-error" || !record.runtime || record.settlementMode) {
-          const response: RemoteTransactionRetryResponse = {
-            status: "error",
-            error: remoteBrowserAutomationError(record),
-          };
-          return { statusCode: 200, body: response };
-        }
+    const record = renewed;
+    if (record.state === "running") {
+      sendJson(params.res, 202, { status: "running" });
+      return;
+    }
+    if (record.state === "finalized" || record.state === "aborted") {
+      sendJson(params.res, 409, {
+        error: "transaction_already_settled",
+        state: record.state,
+        transactionToken: record.transactionToken,
+      });
+      return;
+    }
+    if (record.result) {
+      const response: RemoteTransactionRetryResponse = {
+        status: "transaction",
+        transaction: remoteTransactionPayload(record),
+      };
+      sendJson(params.res, 200, response);
+      return;
+    }
+    if (record.state !== "recoverable-error" || !record.runtime || record.settlementMode) {
+      const response: RemoteTransactionRetryResponse = {
+        status: "error",
+        error: remoteBrowserAutomationError(record),
+      };
+      sendJson(params.res, 200, response);
+      return;
+    }
 
-        const recoveryRuntime = record.runtime;
-        return await params.runBrowserWork(async () => {
-          const recoveryStartedAt = Date.now();
-          let recovered: ReattachResult;
-          try {
-            recovered = await params.resumeBrowser(
-              recoveryRuntime,
-              record.browserConfig,
-              params.logger,
-            );
-          } catch (rawError) {
-            const error =
-              rawError instanceof BrowserAutomationError
-                ? rawError
-                : new BrowserAutomationError(
-                    rawError instanceof Error ? rawError.message : "Remote browser recovery failed",
-                    { stage: "remote-answer-recovery" },
-                    rawError,
-                  );
-            record.runtime = browserRuntimeFromError(error) ?? record.runtime;
-            record.error = serializeDurableBrowserAutomationError(error, true);
-            record.finalization = undefined;
-            await persist();
-            const response: RemoteTransactionRetryResponse = {
-              status: "error",
-              error: remoteBrowserAutomationError(record),
-            };
-            return { statusCode: 200, body: response };
-          }
-
-          const capture = browserTransactionFromRecoveredSession(
-            recovered,
-            Date.now() - recoveryStartedAt,
-          );
-          const result = browserRunResultFromTransaction(capture);
-          try {
-            assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
-            const fileArtifacts: SessionArtifact[] = [
-              ...(result.savedFiles ?? []),
-              ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
-            ];
-            const registrations = await params.artifactStore.prepareRequiredArtifacts({
-              transactionToken: record.transactionToken,
-              runId: record.runId,
-              artifacts: fileArtifacts,
-            });
-            if (
-              registrations.some(
-                (registration) =>
-                  registration.transactionToken !== record.transactionToken ||
-                  registration.descriptor.runId !== record.runId,
-              )
-            ) {
-              throw new Error(
-                "Recovered remote artifact registration identity does not match capture",
+    const recoveryRuntime = record.runtime;
+    const outcome = await params.runBrowserWork(async () => {
+      const recoveryStartedAt = Date.now();
+      let recovered: ReattachResult;
+      try {
+        recovered = await params.resumeBrowser(
+          recoveryRuntime,
+          record.browserConfig,
+          params.logger,
+        );
+      } catch (rawError) {
+        const error =
+          rawError instanceof BrowserAutomationError
+            ? rawError
+            : new BrowserAutomationError(
+                rawError instanceof Error ? rawError.message : "Remote browser recovery failed",
+                { stage: "remote-answer-recovery" },
+                rawError,
               );
-            }
-            record.state = "pending";
-            record.result = projectRemotePublicResult(result);
-            record.runtime = capture.runtime;
-            record.modelSelection = result.modelSelection;
-            record.artifacts = registrations;
-            record.error = undefined;
-            record.finalization = undefined;
-            await persist();
-          } catch (rawError) {
-            const error =
-              rawError instanceof BrowserAutomationError
-                ? rawError
-                : new BrowserAutomationError(
-                    rawError instanceof Error
-                      ? rawError.message
-                      : "Recovered remote capture could not be durably published.",
-                    {
-                      stage: "remote-answer-publication",
-                      code: "remote-answer-publication-failed",
-                    },
-                    rawError,
-                  );
-            record.state = "recoverable-error";
-            record.settlementMode = "abort";
-            record.runtime = capture.runtime;
-            record.result = undefined;
-            record.modelSelection = undefined;
-            record.artifacts = undefined;
-            record.finalization = undefined;
-            record.error = serializeDurableBrowserAutomationError(error, true);
-            await persist();
-            const finalization = await capture
-              .abort()
-              .catch((cleanupError) => pendingCleanupResult(capture.runtime, cleanupError));
-            record.runtime = finalization.runtime;
-            record.finalization = finalization;
-            record.error = serializeDurableBrowserAutomationError(
-              error,
-              finalization.status === "pending",
-            );
-            record.state = finalization.status === "completed" ? "failed" : "recoverable-error";
-            await persist();
-            const response: RemoteTransactionRetryResponse = {
-              status: "error",
-              error: remoteBrowserAutomationError(record),
-            };
-            return { statusCode: 200, body: response };
-          }
-          params.transactionCoordinator.registerActive(record.transactionToken, capture);
-          const response: RemoteTransactionRetryResponse = {
-            status: "transaction",
-            transaction: remoteTransactionPayload(record),
-          };
-          return { statusCode: 200, body: response };
+        const failed = await params.transactionStore.recordRecoverableFailure({
+          transactionToken: record.transactionToken,
+          runtime: browserRuntimeFromError(error) ?? recoveryRuntime,
+          error: serializeDurableBrowserAutomationError(error, true),
         });
-      },
-    );
+        const response: RemoteTransactionRetryResponse = {
+          status: "error",
+          error: remoteBrowserAutomationError(failed),
+        };
+        return { statusCode: 200, body: response };
+      }
+
+      const capture = browserTransactionFromRecoveredSession(
+        recovered,
+        Date.now() - recoveryStartedAt,
+      );
+      const result = browserRunResultFromTransaction(capture);
+      try {
+        assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
+        const fileArtifacts: SessionArtifact[] = [
+          ...(result.savedFiles ?? []),
+          ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+        ];
+        const registrations = await params.artifactStore.prepareRequiredArtifacts({
+          transactionToken: record.transactionToken,
+          runId: record.runId,
+          artifacts: fileArtifacts,
+        });
+        const published = await params.transactionStore.publishCapture({
+          transactionToken: record.transactionToken,
+          runId: record.runId,
+          result: projectRemotePublicResult(result),
+          runtime: capture.runtime,
+          modelSelection: result.modelSelection,
+          artifacts: registrations,
+        });
+        params.transactionCoordinator.registerActive(record.transactionToken, capture);
+        const response: RemoteTransactionRetryResponse = {
+          status: "transaction",
+          transaction: remoteTransactionPayload(published),
+        };
+        return { statusCode: 200, body: response };
+      } catch (rawError) {
+        const error =
+          rawError instanceof BrowserAutomationError
+            ? rawError
+            : new BrowserAutomationError(
+                rawError instanceof Error
+                  ? rawError.message
+                  : "Recovered remote capture could not be durably published.",
+                {
+                  stage: "remote-answer-publication",
+                  code: "remote-answer-publication-failed",
+                },
+                rawError,
+              );
+        await params.transactionStore.recordRecoverableFailure({
+          transactionToken: record.transactionToken,
+          runtime: capture.runtime,
+          error: serializeDurableBrowserAutomationError(error, true),
+        });
+        params.transactionCoordinator.registerActive(record.transactionToken, capture);
+        const failed = (
+          await params.transactionCoordinator.settle({
+            transactionToken: record.transactionToken,
+            mode: "abort",
+            durablePublication: false,
+          })
+        ).record;
+        const response: RemoteTransactionRetryResponse = {
+          status: "error",
+          error: remoteBrowserAutomationError(failed),
+        };
+        return { statusCode: 200, body: response };
+      }
+    });
     sendJson(params.res, outcome.statusCode, outcome.body);
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {
@@ -1103,40 +1280,11 @@ async function sweepExpiredRemoteTransactions(params: {
   logger: (message: string) => void;
 }): Promise<void> {
   for (const candidate of await params.transactionStore.listExpiredNonterminalRecords()) {
-    const settlement = await params.transactionStore.withTransactionRecord(
-      candidate.transactionToken,
-      async (record, persist) => {
-        if (
-          record.leaseExpiresAt !== candidate.leaseExpiresAt ||
-          record.state === "finalized" ||
-          record.state === "aborted" ||
-          record.state === "failed"
-        ) {
-          return null;
-        }
-        let recordChanged = false;
-        if (record.state === "running") {
-          const hadRuntimeAuthority = Boolean(record.runtime);
-          record.state = hadRuntimeAuthority ? "recoverable-error" : "failed";
-          record.error = buildExpiredLeaseError(record, hadRuntimeAuthority);
-          recordChanged = true;
-          if (!hadRuntimeAuthority) {
-            await persist();
-            return null;
-          }
-        }
-        const mode = record.settlementMode ?? "abort";
-        if (!record.settlementMode) {
-          record.settlementMode = mode;
-          recordChanged = true;
-        }
-        if (recordChanged) await persist();
-        return {
-          mode,
-          durablePublication: mode === "finalize" && Boolean(record.publicationAcknowledgedAt),
-        };
-      },
-    );
+    const settlement = await params.transactionStore.expire({
+      transactionToken: candidate.transactionToken,
+      expectedLeaseExpiresAt: candidate.leaseExpiresAt,
+      buildError: buildExpiredLeaseError,
+    });
     if (!settlement) continue;
     try {
       const outcome = await params.transactionCoordinator.settle({
@@ -1186,18 +1334,6 @@ function settlementResponse(
     },
   };
   return RemoteTransactionSettlementResponseSchema.parse(response);
-}
-
-function pendingCleanupResult(runtime: BrowserRuntimeMetadata, error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return {
-    status: "pending" as const,
-    runtime: {
-      ...runtime,
-      recoveryCleanupResult: { status: "failed" as const, error: message },
-    },
-    error: message,
-  };
 }
 
 function remoteTransactionPayload(record: RemoteTransactionRecord): RemoteRunTransactionPayload {
@@ -1435,11 +1571,16 @@ function remoteBrowserAutomationError(
       record.settlementMode,
     );
   }
-  if (record.state === "failed" && record.terminalAudit) {
+  if (
+    record.terminalAudit &&
+    (record.state === "failed" ||
+      (record.state === "aborted" &&
+        Boolean(record.terminalAudit.errorCode || record.terminalAudit.errorStage)))
+  ) {
     return RemoteBrowserAutomationErrorSchema.parse({
       name: "BrowserAutomationError",
       category: "browser-automation",
-      message: "Remote browser automation failed before recoverable authority was committed.",
+      message: "Remote browser automation failed and cleanup is complete.",
       code: record.terminalAudit.errorCode,
       stage: record.terminalAudit.errorStage,
       recoverableDisconnect: false,

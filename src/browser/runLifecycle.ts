@@ -37,16 +37,6 @@ export type BrowserPromptDispatchPhase =
       verification: PromptCommitVerification;
     };
 
-export type BrowserRunLifecyclePhase =
-  | { kind: "acquiring" }
-  | { kind: "ready" }
-  | { kind: "dispatching"; epoch: Extract<BrowserPromptEpoch, { status: "pending" }> }
-  | { kind: "capturing"; epoch: Extract<BrowserPromptEpoch, { status: "committed" }> }
-  | { kind: "caller-publication" }
-  | { kind: "settling"; mode: BrowserCaptureSettlementMode }
-  | { kind: "completed"; mode: BrowserCaptureSettlementMode }
-  | { kind: "cleanup-pending"; mode: BrowserCaptureSettlementMode; error: string };
-
 interface PendingDispatch {
   epochId: string;
   prompt: string;
@@ -98,9 +88,7 @@ export function markBrowserCaptureCleanupPending(
   settlementMode?: BrowserCaptureSettlementMode,
 ): BrowserRuntimeMetadata {
   const hasCleanupAuthority = Boolean(
-    runtime.recoveryCleanupResources?.length ||
-    runtime.recoveryCleanupResult ||
-    runtime.remoteRecovery,
+    runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult,
   );
   if (!hasCleanupAuthority) return runtime;
   return {
@@ -118,7 +106,6 @@ export function completedBrowserCaptureCleanup(
   const completed = { ...runtime };
   delete completed.recoveryCleanupResources;
   delete completed.recoveryCleanupResult;
-  delete completed.remoteRecovery;
   return { status: "completed", runtime: completed };
 }
 
@@ -128,9 +115,7 @@ export function pendingBrowserCaptureCleanup(
   settlementMode?: BrowserCaptureSettlementMode,
 ): BrowserCaptureFinalizationResult {
   const hasCleanupAuthority = Boolean(
-    runtime.recoveryCleanupResources?.length ||
-    runtime.recoveryCleanupResult ||
-    runtime.remoteRecovery,
+    runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult,
   );
   return {
     status: "pending",
@@ -154,9 +139,7 @@ export function bindBrowserCaptureCleanupSettlement(
 ): BrowserCaptureFinalizationResult {
   if (result.status === "completed") return result;
   const hasCleanupAuthority = Boolean(
-    result.runtime.recoveryCleanupResources?.length ||
-    result.runtime.recoveryCleanupResult ||
-    result.runtime.remoteRecovery,
+    result.runtime.recoveryCleanupResources?.length || result.runtime.recoveryCleanupResult,
   );
   if (!hasCleanupAuthority) return result;
   const cleanupResult = result.runtime.recoveryCleanupResult;
@@ -238,26 +221,6 @@ export class BrowserRunLifecycleController {
   private state: BrowserRunLifecycleState = { kind: "acquiring" };
 
   constructor(private readonly adapters: BrowserRunLifecycleAdapters) {}
-
-  phase(): BrowserRunLifecyclePhase {
-    switch (this.state.kind) {
-      case "acquiring":
-      case "ready":
-        return { kind: this.state.kind };
-      case "dispatching":
-        return { kind: "dispatching", epoch: pendingPromptEpoch(this.state.dispatch) };
-      case "capturing":
-        return { kind: "capturing", epoch: committedPromptEpoch(this.state.dispatch) };
-      case "caller-publication":
-        return { kind: "caller-publication" };
-      case "settling":
-        return { kind: "settling", mode: this.state.mode };
-      case "completed":
-        return { kind: "completed", mode: this.state.mode };
-      case "cleanup-pending":
-        return { kind: "cleanup-pending", mode: this.state.mode, error: this.state.result.error };
-    }
-  }
 
   markAcquired(): void {
     if (this.state.kind !== "acquiring") {

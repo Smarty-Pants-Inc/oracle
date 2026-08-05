@@ -211,7 +211,6 @@ describe("browser recovery cleanup", () => {
         },
       },
       recoveryCleanup: {
-        transport: "local" as const,
         ownsTarget: true,
         profileKind: "none" as const,
         keepBrowser: true,

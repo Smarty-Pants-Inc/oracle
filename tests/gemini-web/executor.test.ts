@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
-import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
+import type {
+  OracleChromeOwnerRecord,
+  RecordedChromeTerminationOutcome,
+} from "../../src/browser/profileState.js";
 
 const {
   launchChrome,
@@ -18,11 +21,18 @@ const {
   captureProfileDirectoryIdentity,
   acquireManualChromeOwner,
   acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
+  teardownSettle,
+  teardownState,
 } = vi.hoisted(() => ({
   launchChrome: vi.fn(),
   connectWithNewTab: vi.fn(),
   closeTab: vi.fn(async () => true),
-  killChrome: vi.fn(async () => ({ status: "stopped" as const, pid: 12345 })),
+  killChrome: vi.fn<() => Promise<RecordedChromeTerminationOutcome>>(async () => ({
+    status: "stopped" as const,
+    pid: 12345,
+    signal: "CONTROL_CHANNEL" as const,
+  })),
   resolveBrowserConfig: vi.fn((input: unknown) => input),
   readDevToolsPort: vi.fn(async () => null),
   writeOracleChromeOwner: vi.fn(
@@ -42,6 +52,9 @@ const {
   ),
   acquireManualChromeOwner: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
+  retainBrowserTabLeaseTeardownAuthority: vi.fn(),
+  teardownSettle: vi.fn(),
+  teardownState: { leaseReleased: false },
 }));
 
 const runGeminiWebWithFallback = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({
@@ -114,6 +127,7 @@ vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
     return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 3;
   },
   acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
 }));
 vi.mock("../../src/browser/utils.js", () => ({
   delay,
@@ -160,6 +174,21 @@ describe("gemini-web executor", () => {
     captureProfileDirectoryIdentity.mockClear();
     acquireManualChromeOwner.mockReset();
     acquireBrowserTabLease.mockReset();
+    retainBrowserTabLeaseTeardownAuthority.mockReset();
+    teardownState.leaseReleased = false;
+    teardownSettle.mockReset();
+    teardownSettle.mockImplementation(async (teardown: () => Promise<boolean>) => {
+      teardownState.leaseReleased = true;
+      return (await teardown())
+        ? { status: "completed", disposition: "teardown-completed" }
+        : { status: "preserved", reason: "teardown-unsafe" };
+    });
+    retainBrowserTabLeaseTeardownAuthority.mockImplementation(() => ({
+      get leaseReleased() {
+        return teardownState.leaseReleased;
+      },
+      settle: teardownSettle,
+    }));
 
     launchChrome.mockResolvedValue({
       port: 9222,
@@ -192,11 +221,7 @@ describe("gemini-web executor", () => {
       id: "lease-1",
       profileDirectory: await captureProfileDirectoryIdentity(profileDir, { create: true }),
       update: vi.fn(async () => undefined),
-      release: vi.fn(
-        async (options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> }) => {
-          await options?.onRelease?.({ isLastLease: true });
-        },
-      ),
+      release: vi.fn(async () => undefined),
     }));
     runtimeEvaluate = vi.fn(async ({ expression }: { expression?: string }) => {
       const source = String(expression ?? "");
@@ -220,6 +245,43 @@ describe("gemini-web executor", () => {
       }
       if (source.includes("toolbox-drawer-button")) {
         return { result: { value: "clicked" } };
+      }
+      if (source.includes("beforeUserTurns")) {
+        const nonceLiteral = source.match(/value:\s*("oracle-gemini-[^"]+")/)?.[1];
+        const boundNonce = nonceLiteral ? JSON.parse(nonceLiteral) : null;
+        return {
+          result: {
+            value: JSON.stringify({
+              userQueryCount: 0,
+              responseCount: 0,
+              sendResult: "clicked",
+              boundNonce,
+            }),
+          },
+        };
+      }
+      if (source.includes("const ordered =")) {
+        return {
+          result: {
+            value: JSON.stringify({
+              entries: [
+                {
+                  kind: "user",
+                  postBaseline: true,
+                  text: "hello",
+                  boundToDispatch: true,
+                },
+                {
+                  kind: "response",
+                  postBaseline: true,
+                  text: "deep-think answer",
+                  completionMarked: true,
+                  visibleSpinner: false,
+                },
+              ],
+            }),
+          },
+        };
       }
       if (source.includes("includes('deep think')")) {
         return { result: { value: "clicked" } };
@@ -461,6 +523,44 @@ describe("gemini-web executor", () => {
       "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
     );
     expect(closeTab).toHaveBeenCalled();
+  });
+
+  it("returns retryable cleanup authority when launched-owner teardown is temporarily unsafe", async () => {
+    killChrome
+      .mockResolvedValueOnce({ status: "unsafe", pid: 12345, reason: "termination failed" })
+      .mockResolvedValueOnce({ status: "stopped", pid: 12345, signal: "CONTROL_CHANNEL" });
+    teardownSettle
+      .mockImplementationOnce(async (teardown: () => Promise<boolean>) => {
+        teardownState.leaseReleased = true;
+        expect(await teardown()).toBe(false);
+        return { status: "preserved", reason: "teardown-unsafe" };
+      })
+      .mockImplementationOnce(async () => ({ status: "preserved", reason: "active-leases" }))
+      .mockImplementationOnce(async (teardown: () => Promise<boolean>) => {
+        expect(await teardown()).toBe(true);
+        return { status: "completed", disposition: "teardown-completed" };
+      });
+    const { createGeminiWebExecutor } = await import("../../src/gemini-web/executor.js");
+    const exec = createGeminiWebExecutor({});
+
+    const result = await exec({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      log: () => {},
+    });
+
+    expect(result.answerText).toBe("deep-think answer");
+    expect(result.runtime.recoveryCleanupResult).toMatchObject({ status: "failed" });
+    expect(result.runtime.recoveryCleanupResources?.[0]?.tabLease).toBeUndefined();
+    expect(killChrome).toHaveBeenCalledTimes(1);
+
+    await expect(result.finalize()).resolves.toMatchObject({ status: "pending" });
+    expect(killChrome).toHaveBeenCalledTimes(1);
+
+    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+    expect(killChrome).toHaveBeenCalledTimes(2);
+    expect(cleanupStaleProfileState).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to HTTP/header path for gemini deep-think when attachments are present", async () => {

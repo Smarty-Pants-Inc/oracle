@@ -578,7 +578,7 @@ export async function performSessionRun({
     )?.runtime;
     const browserCanReattach =
       !browserConfig?.copyProfileSource ||
-      Boolean(remoteRecoveryAuthority(errorBrowserRuntime ?? currentBrowser?.runtime));
+      hasRemoteRecoveryAuthority(errorBrowserRuntime ?? currentBrowser?.runtime);
     let reattachGuidanceLogged = false;
     const logBrowserReattachGuidance = (
       runtime: BrowserRuntimeMetadata | null | undefined,
@@ -852,21 +852,17 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined) {
-  return (
-    runtime?.remoteRecovery ??
-    runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)?.remoteRecovery
-  );
+function hasRemoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
+  return Boolean(runtime?.recoveryCleanupResources?.some((resource) => resource.remoteRecovery));
 }
 
 function hasBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
-  return Boolean(remoteRecoveryAuthority(runtime)) || hasRecoverableChatGptConversation(runtime);
+  return hasRemoteRecoveryAuthority(runtime) || hasRecoverableChatGptConversation(runtime);
 }
 
 function hasResumableBrowserAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
-  const remoteRecovery = remoteRecoveryAuthority(runtime);
   return (
-    Boolean(remoteRecovery && !remoteRecovery.settlementMode) ||
+    (hasRemoteRecoveryAuthority(runtime) && !runtime?.recoveryCleanupResult?.settlementMode) ||
     hasRecoverableChatGptConversation(runtime)
   );
 }

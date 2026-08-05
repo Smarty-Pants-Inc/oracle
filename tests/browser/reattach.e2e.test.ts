@@ -13,7 +13,6 @@ vi.mock("../../src/browser/reattach.js", () => ({
     const completedRuntime = { ...runtime };
     delete completedRuntime.recoveryCleanupResources;
     delete completedRuntime.recoveryCleanupResult;
-    delete completedRuntime.remoteRecovery;
     return { status: "completed", runtime: completedRuntime };
   }),
 }));
@@ -82,7 +81,6 @@ function createReattachResult(
   const finalizedRuntime = { ...capturedRuntime };
   delete finalizedRuntime.recoveryCleanupResources;
   delete finalizedRuntime.recoveryCleanupResult;
-  delete finalizedRuntime.remoteRecovery;
   return {
     answerText,
     answerMarkdown,
@@ -139,7 +137,6 @@ describe("browser reattach end-to-end (simulated)", () => {
                 chromeHost: "remote.example.test",
                 chromePort: 9222,
                 recoveryCleanup: {
-                  transport: "remote",
                   ownsTarget: false,
                   profileKind: "none",
                   keepBrowser: true,
@@ -672,7 +669,6 @@ describe("browser reattach end-to-end (simulated)", () => {
             userDataDir: profileDir,
             chromeTargetId: "t-1",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,

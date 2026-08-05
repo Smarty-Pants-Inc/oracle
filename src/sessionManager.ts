@@ -91,7 +91,6 @@ export interface BrowserSessionConfig {
 export type BrowserRecoveryProfileKind = "temporary" | "manual-login" | "copied" | "none";
 
 export interface BrowserRecoveryCleanupMetadata {
-  transport: "local" | "remote";
   ownsTarget: boolean;
   profileKind: BrowserRecoveryProfileKind;
   keepBrowser: boolean;
@@ -117,7 +116,6 @@ export interface BrowserRemoteRecoveryMetadata {
   transactionToken: string;
   state: "pre-receipt" | "pending" | "recoverable-error";
   requestIdentity?: BrowserRemotePromptRequestIdentity;
-  settlementMode?: "finalize" | "abort";
 }
 export interface BrowserRecoveryTabLeaseMetadata {
   id: string;
@@ -181,8 +179,6 @@ export interface BrowserRuntimeMetadata {
   recoveryCleanupResources?: BrowserRecoveryCleanupResourceMetadata[];
   /** Durable state for cleanup that must occur only after answer/session persistence. */
   recoveryCleanupResult?: BrowserRecoveryCleanupResultMetadata;
-  /** Opaque transaction authority; the remote service credential is resolved separately. */
-  remoteRecovery?: BrowserRemoteRecoveryMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }

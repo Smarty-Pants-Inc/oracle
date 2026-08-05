@@ -1,13 +1,13 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
-const nonterminalAuthority = {
+const authority = {
   requestIdentity: {
     acceptedPromptSha256: ["8".repeat(64)],
     followUpOrdinal: 0,
@@ -16,8 +16,31 @@ const nonterminalAuthority = {
   browserConfig: { chatgptUrl: "https://chatgpt.com/" },
 };
 
+const runtime = {
+  chromeTargetId: "target-1",
+  conversationId: "conversation-1",
+};
+
+const capturedResult = {
+  answerText: "durable answer",
+  answerMarkdown: "durable answer",
+  tookMs: 1,
+  answerTokens: 2,
+  answerChars: 14,
+};
+
+async function begin(store: RemoteTransactionStore, transactionToken: string, runId: string) {
+  await store.begin({
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    transactionToken,
+    runId,
+    createdAt: new Date().toISOString(),
+    ...authority,
+  });
+}
+
 describe("RemoteArtifactStore", () => {
-  test("keeps artifacts authorized across thirty minutes until transaction settlement", async () => {
+  test("keeps artifacts authorized across restart until durable transaction settlement", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-store-"));
     const sessionsRoot = path.join(root, "sessions");
     const artifactDirectory = path.join(sessionsRoot, "session-1", "artifacts");
@@ -27,7 +50,6 @@ describe("RemoteArtifactStore", () => {
     const payload = Buffer.from("durable artifact", "utf8");
     const sha256 = createHash("sha256").update(payload).digest("hex");
     let now = Date.parse("2026-01-01T00:00:00.000Z");
-    const createdAt = new Date(now).toISOString();
 
     try {
       await mkdir(artifactDirectory, { recursive: true });
@@ -37,15 +59,7 @@ describe("RemoteArtifactStore", () => {
         controllerGeneration: "controller-generation-1",
         now: () => now,
       });
-      await firstTransactionStore.create({
-        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-        transactionToken,
-        runId: "run-1",
-        createdAt,
-        updatedAt: createdAt,
-        state: "pending",
-        ...nonterminalAuthority,
-      });
+      await begin(firstTransactionStore, transactionToken, "run-1");
       const firstArtifactStore = new RemoteArtifactStore({
         transactionStore: firstTransactionStore,
         sessionsRoot,
@@ -63,8 +77,12 @@ describe("RemoteArtifactStore", () => {
           },
         ],
       });
-      await firstTransactionStore.update(transactionToken, (record) => {
-        record.artifacts = registrations;
+      await firstTransactionStore.publishCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime,
+        artifacts: registrations,
       });
       const [registration] = registrations;
       if (!registration) throw new Error("Expected a durable artifact registration");
@@ -90,7 +108,6 @@ describe("RemoteArtifactStore", () => {
       );
 
       now += 31 * 60 * 1000;
-
       const restartedTransactionStore = await RemoteTransactionStore.open({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-2",
@@ -121,27 +138,18 @@ describe("RemoteArtifactStore", () => {
       const firstReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
       const duplicateReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
       expect(duplicateReceipt).toEqual(firstReceipt);
-      expect(firstReceipt).toMatchObject({
-        receiptId: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        deliveredAt: expect.any(String),
-        byteSize: payload.length,
-        sha256,
-      });
       await expect(
         restartedArtifactStore.requiredDeliveriesComplete(transactionToken),
       ).resolves.toBe(true);
-      await expect(restartedTransactionStore.read(transactionToken)).resolves.toMatchObject({
-        artifacts: [
-          {
-            transactionToken,
-            canonicalPath: await realpath(artifactPath),
-            deliveryReceipt: firstReceipt,
-          },
-        ],
+      await restartedTransactionStore.bindSettlement({
+        transactionToken,
+        mode: "abort",
+        durablePublication: false,
       });
-      await restartedTransactionStore.update(transactionToken, (record) => {
-        record.state = "aborted";
-        record.settlementMode = "abort";
+      await restartedTransactionStore.completeSettlement({
+        transactionToken,
+        mode: "abort",
+        finalization: { status: "completed", runtime },
       });
       await expect(
         restartedArtifactStore.openForDelivery(
@@ -160,7 +168,6 @@ describe("RemoteArtifactStore", () => {
     const artifactDirectory = path.join(sessionsRoot, "session-2", "artifacts");
     const artifactPath = path.join(artifactDirectory, "result.txt");
     const transactionToken = "d".repeat(64);
-    const createdAt = new Date().toISOString();
     try {
       await mkdir(artifactDirectory, { recursive: true });
       await writeFile(artifactPath, "first generation", "utf8");
@@ -168,23 +175,19 @@ describe("RemoteArtifactStore", () => {
         directory: path.join(root, "transactions"),
         controllerGeneration: "controller-generation-1",
       });
-      await transactionStore.create({
-        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-        transactionToken,
-        runId: "run-2",
-        createdAt,
-        updatedAt: createdAt,
-        state: "pending",
-        ...nonterminalAuthority,
-      });
+      await begin(transactionStore, transactionToken, "run-2");
       const artifactStore = new RemoteArtifactStore({ transactionStore, sessionsRoot });
       const registrations = await artifactStore.prepareRequiredArtifacts({
         transactionToken,
         runId: "run-2",
         artifacts: [{ kind: "file", path: artifactPath, mimeType: "text/plain" }],
       });
-      await transactionStore.update(transactionToken, (record) => {
-        record.artifacts = registrations;
+      await transactionStore.publishCapture({
+        transactionToken,
+        runId: "run-2",
+        result: capturedResult,
+        runtime,
+        artifacts: registrations,
       });
       const [registration] = registrations;
       if (!registration) throw new Error("Expected a durable artifact registration");

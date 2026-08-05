@@ -3,6 +3,7 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import type { BrowserRunTransaction } from "../../src/browserMode.js";
+import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionStore.js";
 import { RemoteTransactionCoordinator } from "../../src/remote/transactionCoordinator.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
@@ -26,20 +27,7 @@ const runtime: BrowserRunTransaction["runtime"] = {
     {
       chromeTargetId: "target-1",
       conversationId: "conversation-1",
-      promptEpoch: {
-        status: "committed",
-        epochId: "epoch-1",
-        promptSha256: "a".repeat(64),
-        baselineTurns: 1,
-        followUpOrdinal: 0,
-        remainingFollowUps: 0,
-        verifiedUserTurnIndex: 1,
-        verifiedUserTurnId: "turn-1",
-        verifiedUserMessageId: "message-1",
-        conversationId: "conversation-1",
-      },
       recoveryCleanup: {
-        transport: "local",
         ownsTarget: true,
         profileKind: "temporary",
         keepBrowser: false,
@@ -57,19 +45,45 @@ const capturedResult = {
   answerChars: 4,
 };
 
-async function createPendingStore(root: string, transactionToken: string) {
+function artifact(transactionToken: string): DurableRemoteArtifactRegistration {
+  return {
+    transactionToken,
+    canonicalPath: "/private/session/result.zip",
+    fileIdentity: {
+      device: "1",
+      inode: "2",
+      birthtimeNs: "3",
+      ctimeNs: "4",
+    },
+    descriptor: {
+      artifactId: "artifact-1",
+      runId: "run-1",
+      kind: "file",
+      filename: "result.zip",
+      mimeType: "application/zip",
+      byteSize: 4,
+      sha256: "b".repeat(64),
+      sourceUrlKind: "browser-download",
+      transferStatus: "ready",
+      required: true,
+    },
+  };
+}
+
+async function createPendingStore(
+  root: string,
+  transactionToken: string,
+  artifacts: DurableRemoteArtifactRegistration[] = [],
+) {
   const store = await RemoteTransactionStore.open({
     directory: root,
     controllerGeneration: "controller-generation-1",
   });
-  const createdAt = new Date().toISOString();
-  await store.create({
+  await store.begin({
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     transactionToken,
     runId: "run-1",
-    createdAt,
-    updatedAt: createdAt,
-    state: "pending",
+    createdAt: new Date().toISOString(),
     requestIdentity: {
       acceptedPromptSha256: ["a".repeat(64)],
       followUpOrdinal: 0,
@@ -79,28 +93,26 @@ async function createPendingStore(root: string, transactionToken: string) {
       chatgptUrl: "https://chatgpt.com",
       url: "https://chatgpt.com",
     },
-    runtime,
+  });
+  await store.publishCapture({
+    transactionToken,
+    runId: "run-1",
     result: capturedResult,
+    runtime,
+    artifacts,
   });
   return store;
 }
 
 describe("RemoteTransactionCoordinator", () => {
-  test("retains live authority across pending settlement and retries only the bound mode", async () => {
+  test("binds before cleanup, retains live authority while pending, and retries only that mode", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-settlement-"));
     const transactionToken = "e".repeat(64);
     try {
       const store = await createPendingStore(root, transactionToken);
       const finalize = vi
         .fn<BrowserRunTransaction["finalize"]>()
-        .mockResolvedValueOnce({
-          status: "pending",
-          runtime: {
-            ...runtime,
-            recoveryCleanupResult: { status: "failed", error: "target still closing" },
-          },
-          error: "target still closing",
-        })
+        .mockRejectedValueOnce(new Error("target still closing"))
         .mockResolvedValueOnce({ status: "completed", runtime });
       const active: BrowserRunTransaction = {
         ...capturedResult,
@@ -118,8 +130,17 @@ describe("RemoteTransactionCoordinator", () => {
       await expect(
         coordinator.settle({ transactionToken, mode: "finalize", durablePublication: true }),
       ).resolves.toMatchObject({
-        finalization: { status: "pending" },
-        record: { state: "pending" },
+        finalization: {
+          status: "pending",
+          runtime: {
+            recoveryCleanupResult: {
+              status: "failed",
+              settlementMode: "finalize",
+              error: "target still closing",
+            },
+          },
+        },
+        record: { state: "pending", settlementMode: "finalize" },
       });
       expect(coordinator.hasActive(transactionToken)).toBe(true);
       expect(finalize).toHaveBeenCalledTimes(1);
@@ -148,9 +169,6 @@ describe("RemoteTransactionCoordinator", () => {
       });
       expect(finalizedRecord).not.toHaveProperty("result");
       expect(finalizedRecord).not.toHaveProperty("runtime");
-      expect(finalizedRecord).not.toHaveProperty("artifacts");
-      expect(finalizedRecord).not.toHaveProperty("settlementMode");
-      expect(finalizedRecord).not.toHaveProperty("publicationAcknowledgedAt");
       expect(finalizedRecord).not.toHaveProperty("requestIdentity");
       expect(finalizedRecord).not.toHaveProperty("browserConfig");
       expect(finalizedRecord).not.toHaveProperty("leaseExpiresAt");
@@ -159,37 +177,11 @@ describe("RemoteTransactionCoordinator", () => {
     }
   });
 
-  test("prohibits finalization until every required artifact has a durable receipt", async () => {
+  test("does not invoke browser finalization until required artifact receipts are durable", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-required-artifact-"));
     const transactionToken = "f".repeat(64);
     try {
-      const store = await createPendingStore(root, transactionToken);
-      await store.update(transactionToken, (record) => {
-        record.artifacts = [
-          {
-            transactionToken,
-            canonicalPath: path.join(root, "sessions", "session-1", "artifacts", "result.zip"),
-            fileIdentity: {
-              device: "1",
-              inode: "2",
-              birthtimeNs: "3",
-              ctimeNs: "4",
-            },
-            descriptor: {
-              artifactId: "artifact-1",
-              runId: "run-1",
-              kind: "file",
-              filename: "result.zip",
-              mimeType: "application/zip",
-              byteSize: 4,
-              sha256: "b".repeat(64),
-              sourceUrlKind: "browser-download",
-              transferStatus: "ready",
-              required: true,
-            },
-          },
-        ];
-      });
+      const store = await createPendingStore(root, transactionToken, [artifact(transactionToken)]);
       const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
       const coordinator = new RemoteTransactionCoordinator({
         transactionStore: store,
@@ -206,18 +198,15 @@ describe("RemoteTransactionCoordinator", () => {
         coordinator.settle({ transactionToken, mode: "finalize", durablePublication: true }),
       ).rejects.toMatchObject({ code: "required_artifact_delivery_incomplete" });
       expect(finalize).not.toHaveBeenCalled();
-      const pendingRecord = await store.read(transactionToken);
-      expect(pendingRecord).toMatchObject({ state: "pending" });
-
-      await store.update(transactionToken, (record) => {
-        const registration = record.artifacts?.[0];
-        if (!registration) throw new Error("missing artifact registration");
-        registration.deliveryReceipt = {
+      await store.recordArtifactDelivery({
+        transactionToken,
+        artifactId: "artifact-1",
+        receipt: {
           receiptId: "c".repeat(64),
           deliveredAt: new Date().toISOString(),
           byteSize: 4,
           sha256: "b".repeat(64),
-        };
+        },
       });
       await expect(
         coordinator.settle({ transactionToken, mode: "finalize", durablePublication: true }),
@@ -228,7 +217,7 @@ describe("RemoteTransactionCoordinator", () => {
     }
   });
 
-  test("retries durable cleanup with the exact persisted settlement mode", async () => {
+  test("retries cleanup without live controller authority using the exact persisted settlement mode", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-cleanup-mode-"));
     const abortToken = "1".repeat(64);
     const finalizeToken = "2".repeat(64);

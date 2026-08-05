@@ -1,6 +1,9 @@
 import path from "node:path";
 import os from "node:os";
 import type { BrowserRunOptions, BrowserLogger, ChromeClient } from "../browser/types.js";
+import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import { pendingBrowserCaptureCleanup } from "../browser/runLifecycle.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import { connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireManualChromeOwner, type ManualChromeOwner } from "../browser/manualChromeOwner.js";
@@ -10,7 +13,10 @@ import {
   type ChromeProcessIdentity,
   type RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";
-import { acquireBrowserTabLease } from "../browser/tabLeaseRegistry.js";
+import {
+  acquireBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
+} from "../browser/tabLeaseRegistry.js";
 
 export interface GeminiBrowserSession {
   profileDir: string;
@@ -18,6 +24,7 @@ export interface GeminiBrowserSession {
   client: ChromeClient;
   targetId: string;
   processIdentity: ChromeProcessIdentity;
+  runtime: () => BrowserRuntimeMetadata;
   close: () => Promise<void>;
 }
 
@@ -52,7 +59,38 @@ export async function openGeminiBrowserSession(
   try {
     owner = await acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose);
   } catch (error) {
-    await tabLease.release().catch(() => undefined);
+    try {
+      await tabLease.release();
+    } catch (cleanupError) {
+      const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      const runtime = pendingBrowserCaptureCleanup(
+        {
+          userDataDir: profileDir,
+          chromeProfileRoot: profileDir,
+          recoveryCleanupResources: [
+            {
+              profileDirectoryIdentity: tabLease.profileDirectory,
+              userDataDir: profileDir,
+              chromeProfileRoot: profileDir,
+              tabLease: { id: tabLease.id, profileDirectory: tabLease.profileDirectory },
+              recoveryCleanup: {
+                ownsTarget: false,
+                profileKind: "manual-login",
+                keepBrowser: true,
+              },
+            },
+          ],
+          controllerPid: process.pid,
+        },
+        `Browser tab lease release failed: ${message}`,
+        "abort",
+      ).runtime;
+      throw new BrowserAutomationError(
+        `Gemini browser owner acquisition failed and lease cleanup remains retryable: ${message}`,
+        { stage: "gemini-browser-session-open", runtime },
+        error,
+      );
+    }
     throw error;
   }
 
@@ -65,11 +103,14 @@ export async function openGeminiBrowserSession(
   let targetClosed = false;
   let clientClosed = false;
   let leaseReleased = false;
-  let ownerCleanupRequired = false;
   let ownerTerminated = false;
   let profileCleaned = false;
   let closeCompleted = false;
   let closeAttempt: Promise<void> | null = null;
+  const teardownAuthority =
+    !keepBrowser && owner.source === "launched"
+      ? retainBrowserTabLeaseTeardownAuthority(profileDir, tabLease, { logger })
+      : null;
 
   const cleanupFailure = (action: string, cause?: unknown): Error => {
     const detail =
@@ -78,7 +119,6 @@ export async function openGeminiBrowserSession(
   };
 
   const settleLaunchedOwner = async (): Promise<void> => {
-    if (!ownerCleanupRequired) return;
     if (!ownerTerminated) {
       let termination: RecordedChromeTerminationOutcome;
       try {
@@ -108,6 +148,50 @@ export async function openGeminiBrowserSession(
     }
   };
 
+  const runtime = (): BrowserRuntimeMetadata => {
+    const targetCleanupPending = Boolean(targetId && !targetClosed);
+    const processCleanupPending = Boolean(
+      teardownAuthority && (!ownerTerminated || !profileCleaned),
+    );
+    const recoveryCleanupPending = targetCleanupPending || !leaseReleased || processCleanupPending;
+    const base: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      chromePid: chrome.pid,
+      chromeProcessIdentity: processIdentity,
+      chromePort: port,
+      chromeHost: host,
+      chromeProfileRoot: profileDir,
+      userDataDir: profileDir,
+      chromeTargetId: targetCleanupPending ? (targetId ?? undefined) : undefined,
+      controllerPid: process.pid,
+    };
+    if (!recoveryCleanupPending) return base;
+    return {
+      ...base,
+      recoveryCleanupResources: [
+        {
+          chromePid: chrome.pid,
+          chromeProcessIdentity: processIdentity,
+          profileDirectoryIdentity: processIdentity.profileDirectory,
+          chromePort: port,
+          chromeHost: host,
+          chromeProfileRoot: profileDir,
+          userDataDir: profileDir,
+          chromeTargetId: targetCleanupPending ? (targetId ?? undefined) : undefined,
+          tabLease: !leaseReleased
+            ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
+            : undefined,
+          recoveryCleanup: {
+            ownsTarget: targetCleanupPending,
+            profileKind: "manual-login",
+            keepBrowser: !processCleanupPending,
+            closeOwnedTargetOnComplete: targetCleanupPending,
+          },
+        },
+      ],
+    };
+  };
+
   const settle = async (): Promise<void> => {
     if (!targetClosed && targetId) {
       let closed: boolean;
@@ -129,17 +213,27 @@ export async function openGeminiBrowserSession(
       }
       clientClosed = true;
     }
-    if (ownerCleanupRequired) {
-      await settleLaunchedOwner();
-    }
-    if (!leaseReleased) {
+    if (teardownAuthority) {
+      let teardownError: string | null = null;
+      const outcome = await teardownAuthority.settle(async () => {
+        try {
+          await settleLaunchedOwner();
+          return true;
+        } catch (error) {
+          teardownError = error instanceof Error ? error.message : String(error);
+          return false;
+        }
+      });
+      leaseReleased = teardownAuthority.leaseReleased;
+      if (outcome.status === "preserved") {
+        if (teardownError) throw new Error(teardownError);
+        throw cleanupFailure(
+          outcome.error ?? `browser owner cleanup remains pending (${outcome.reason})`,
+        );
+      }
+    } else if (!leaseReleased) {
       try {
-        await tabLease.release({
-          onRelease: async ({ isLastLease }) => {
-            ownerCleanupRequired = !keepBrowser && isLastLease && owner.source === "launched";
-            await settleLaunchedOwner();
-          },
-        });
+        await tabLease.release();
       } catch (error) {
         throw cleanupFailure("could not release its browser tab lease", error);
       }
@@ -169,7 +263,17 @@ export async function openGeminiBrowserSession(
     client = connection.client;
     targetId = connection.targetId;
   } catch (error) {
-    await close();
+    try {
+      await close();
+    } catch (cleanupError) {
+      const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      const pendingRuntime = pendingBrowserCaptureCleanup(runtime(), message, "abort").runtime;
+      throw new BrowserAutomationError(
+        `${error instanceof Error ? error.message : String(error)}; Gemini browser cleanup remains retryable: ${message}`,
+        { stage: "gemini-browser-session-open", runtime: pendingRuntime },
+        error,
+      );
+    }
     throw error;
   }
   if (!client || !targetId) {
@@ -182,6 +286,7 @@ export async function openGeminiBrowserSession(
     processIdentity,
     client,
     targetId,
+    runtime,
     close,
   };
 }

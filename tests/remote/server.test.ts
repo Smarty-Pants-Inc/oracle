@@ -26,6 +26,11 @@ import {
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import {
+  captureProfileDirectoryIdentity,
+  readOracleChromeOwner,
+  writeOracleChromeOwner,
+} from "../../src/browser/profileState.js";
 
 const CAN_LISTEN_LOCALHOST =
   spawnSync(
@@ -125,7 +130,6 @@ describe("remote browser service", () => {
             chromeTargetId: "remote-target",
             conversationId: "remote-conversation",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
@@ -209,11 +213,10 @@ describe("remote browser service", () => {
         },
         recoveryCleanupResources: [
           {
-            recoveryCleanup: { transport: "remote" },
+            recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
             remoteRecovery: { state: "pending" },
           },
         ],
-        remoteRecovery: { state: "pending" },
       });
       expect(JSON.stringify(result.runtime)).not.toContain("remote-target");
       expect(JSON.stringify(result.runtime)).not.toContain("9222");
@@ -386,6 +389,7 @@ describe("remote browser service", () => {
         await server.close();
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -536,6 +540,7 @@ describe("remote browser service", () => {
       await rm(tmpDir, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -561,8 +566,12 @@ describe("remote browser service", () => {
             stage: "remote-protocol",
             recoverableDisconnect: true,
             runtime: {
-              recoveryCleanupResources: [{ recoveryCleanup: { transport: "remote" } }],
-              remoteRecovery: { state: "recoverable-error" },
+              recoveryCleanupResources: [
+                {
+                  recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+                  remoteRecovery: { state: "recoverable-error" },
+                },
+              ],
             },
           },
         });
@@ -599,8 +608,12 @@ describe("remote browser service", () => {
             stage: "remote-protocol",
             recoverableDisconnect: true,
             runtime: {
-              recoveryCleanupResources: [{ recoveryCleanup: { transport: "remote" } }],
-              remoteRecovery: { state: "recoverable-error" },
+              recoveryCleanupResources: [
+                {
+                  recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+                  remoteRecovery: { state: "recoverable-error" },
+                },
+              ],
             },
           },
         });
@@ -636,8 +649,12 @@ describe("remote browser service", () => {
             stage: "remote-artifact-transfer",
             recoverableDisconnect: true,
             runtime: {
-              recoveryCleanupResources: [{ recoveryCleanup: { transport: "remote" } }],
-              remoteRecovery: { state: "pending" },
+              recoveryCleanupResources: [
+                {
+                  recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+                  remoteRecovery: { state: "pending" },
+                },
+              ],
             },
           },
         });
@@ -727,7 +744,6 @@ describe("remote browser service", () => {
             chromePort: 9222,
             chromeTargetId: "disconnect-target",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
@@ -817,6 +833,7 @@ describe("remote browser service", () => {
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -829,7 +846,6 @@ describe("remote browser service", () => {
           {
             chromePort: 9222,
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
@@ -882,7 +898,10 @@ describe("remote browser service", () => {
         const firstFinalization = await transaction.finalize();
         expect(firstFinalization).toMatchObject({
           status: "pending",
-          runtime: { remoteRecovery: { state: "pending" } },
+          runtime: {
+            recoveryCleanupResources: [{ remoteRecovery: { state: "pending" } }],
+            recoveryCleanupResult: { status: "failed", settlementMode: "finalize" },
+          },
         });
         await expect(
           settleRemoteBrowserRecovery({
@@ -922,7 +941,6 @@ describe("remote browser service", () => {
             chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/older-wss-authority",
             chromeTargetId: "older-wss-target",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: false,
               profileKind: "none",
               keepBrowser: true,
@@ -932,7 +950,6 @@ describe("remote browser service", () => {
             chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/wss-authority",
             chromeTargetId: "wss-target",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: false,
               profileKind: "none",
               keepBrowser: true,
@@ -971,11 +988,10 @@ describe("remote browser service", () => {
           },
           recoveryCleanupResources: [
             {
-              recoveryCleanup: { transport: "remote" },
+              recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
               remoteRecovery: { state: "pending" },
             },
           ],
-          remoteRecovery: { state: "pending" },
         });
         expect(transaction.runtime).not.toHaveProperty("chromePort");
         expect(transaction.runtime).not.toHaveProperty("chromeBrowserWSEndpoint");
@@ -988,7 +1004,7 @@ describe("remote browser service", () => {
         const finalization = await transaction.finalize();
         expect(finalization).toMatchObject({ status: "completed" });
         expect(finalization.runtime.recoveryCleanupResources).toBeUndefined();
-        expect(finalization.runtime.remoteRecovery).toBeUndefined();
+        expect(finalization.runtime).not.toHaveProperty("remoteRecovery");
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -1008,7 +1024,6 @@ describe("remote browser service", () => {
             chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recoverable",
             chromeTargetId: "recoverable-target",
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: false,
               profileKind: "none",
               keepBrowser: true,
@@ -1048,7 +1063,6 @@ describe("remote browser service", () => {
           details: {
             stage: "wait-for-answer",
             recoverableDisconnect: true,
-            remoteRecovery: { state: "recoverable-error" },
             runtime: {
               promptEpoch: {
                 promptSha256: promptIdentitySha256("recover"),
@@ -1056,8 +1070,12 @@ describe("remote browser service", () => {
                 verifiedUserMessageId: "message-0",
                 conversationId: "remote-conversation",
               },
-              recoveryCleanupResources: [{ recoveryCleanup: { transport: "remote" } }],
-              remoteRecovery: { state: "recoverable-error" },
+              recoveryCleanupResources: [
+                {
+                  recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+                  remoteRecovery: { state: "recoverable-error" },
+                },
+              ],
             },
           },
         });
@@ -1065,11 +1083,12 @@ describe("remote browser service", () => {
           throw new Error("expected a recoverable BrowserAutomationError");
         }
         const runtime = caught.details?.runtime as BrowserRunTransaction["runtime"] | undefined;
-        if (!runtime?.remoteRecovery) throw new Error("missing remote recovery authority");
-        expect(runtime.remoteRecovery).not.toHaveProperty("settlementMode");
-        expect(runtime.recoveryCleanupResources?.[0]?.remoteRecovery).not.toHaveProperty(
-          "settlementMode",
-        );
+        const remoteAuthority = runtime?.recoveryCleanupResources?.find(
+          (resource) => resource.remoteRecovery,
+        )?.remoteRecovery;
+        if (!remoteAuthority) throw new Error("missing remote recovery authority");
+        expect(runtime).not.toHaveProperty("remoteRecovery");
+        expect(remoteAuthority).not.toHaveProperty("settlementMode");
 
         await expect(
           settleRemoteBrowserRecovery({
@@ -1084,6 +1103,7 @@ describe("remote browser service", () => {
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1107,7 +1127,6 @@ describe("remote browser service", () => {
             conversationId: "remote-conversation",
             promptEpoch: committedPromptEpoch(prompt),
             recoveryCleanup: {
-              transport: "local",
               ownsTarget: true,
               profileKind: "temporary",
               keepBrowser: false,
@@ -1226,11 +1245,16 @@ describe("remote browser service", () => {
         conversationId: "remote-conversation",
         promptEpoch: committedPromptEpoch("different prompt"),
       };
-      const abort = vi.fn(async () => ({
+      const pendingAbort = {
         status: "pending" as const,
         runtime: mismatchedRuntime,
         error: "abort cleanup remains pending",
-      }));
+      };
+      const abort = vi
+        .fn<BrowserRunTransaction["abort"]>()
+        .mockResolvedValueOnce(pendingAbort)
+        .mockResolvedValueOnce(pendingAbort)
+        .mockResolvedValueOnce({ status: "completed", runtime: mismatchedRuntime });
       const resumeBrowser = vi.fn(async () => ({
         answerText: "wrong answer",
         answerMarkdown: "wrong answer",
@@ -1289,11 +1313,138 @@ describe("remote browser service", () => {
           settlementMode: "abort",
           finalization: { status: "pending" },
         });
+        await expect(server.close()).rejects.toThrow("cleanup remains pending");
+        expect(abort).toHaveBeenCalledTimes(2);
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "settles restart-persisted launched Chrome authority only through the exact cleanup capability",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-restart-cleanup-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-remote-restart-"));
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const identity = {
+        pid: process.pid,
+        processStartTime: "test-live-launched-owner",
+        executablePath: path.resolve(process.execPath),
+        normalizedUserDataDir:
+          process.platform === "win32"
+            ? profileDirectory.canonicalPath.toLowerCase()
+            : profileDirectory.canonicalPath,
+        launchNonce: "12345678-1234-4123-8123-123456789abc",
+        profileDirectory,
+      };
+      const chromePort = 45_678;
+      await writeOracleChromeOwner(profileDir, { port: chromePort, processIdentity: identity });
+      const prompt = "restart cleanup authority";
+      const transactionToken = "d".repeat(64);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: identity.pid,
+        chromeProcessIdentity: identity,
+        chromePort,
+        chromeHost: "127.0.0.1",
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            chromePid: identity.pid,
+            chromeProcessIdentity: identity,
+            profileDirectoryIdentity: profileDirectory,
+            chromePort,
+            chromeHost: "127.0.0.1",
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanup: {
+              ownsTarget: false,
+              profileKind: "temporary",
+              keepBrowser: false,
+            },
+          },
+        ],
+        recoveryCleanupResult: { status: "failed", settlementMode: "abort" },
+      };
+      const seeded = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: "controller-before-restart",
+      });
+      await seedRemoteTransaction(seeded, transactionToken, {
+        prompt,
+        runtime,
+        settlementMode: "abort",
+      });
+      await seeded.completeSettlement({
+        transactionToken,
+        mode: "abort",
+        finalization: {
+          status: "pending",
+          runtime,
+          error: "controller exited before launched Chrome cleanup completed",
+        },
+      });
+
+      const exactChromeCleanup = vi.fn(
+        async (_recordedRuntime: BrowserRunTransaction["runtime"], recordedProfileDir: string) => {
+          expect(recordedProfileDir).toBe(profileDir);
+          await expect(readOracleChromeOwner(recordedProfileDir)).resolves.toEqual({
+            port: chromePort,
+            processIdentity: identity,
+          });
+          return {
+            status: "stopped" as const,
+            pid: identity.pid,
+            signal: "CONTROL_CHANNEL" as const,
+          };
+        },
+      );
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: "controller-after-restart",
+          exactChromeCleanup,
+        },
+      );
+      try {
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/abort`,
+          token: "secret",
+          body: {},
+        });
+        expect(exactChromeCleanup, JSON.stringify(settlement.json)).toHaveBeenCalledOnce();
+        expect(settlement, JSON.stringify(settlement.json)).toMatchObject({
+          statusCode: 200,
+          json: { state: "aborted" },
+        });
+        expect(exactChromeCleanup).toHaveBeenCalledWith(
+          expect.objectContaining({ chromeProcessIdentity: identity }),
+          profileDir,
+          identity,
+          expect.any(Function),
+        );
+        await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(seeded.read(transactionToken)).resolves.toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+        });
+      } finally {
+        await server.close();
+        await rm(profileDir, { recursive: true, force: true });
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1374,6 +1525,7 @@ describe("remote browser service", () => {
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -1480,7 +1632,6 @@ describe("remote browser service", () => {
       const abortToken = "7".repeat(64);
       const preAuthorityToken = "8".repeat(64);
       const finalizeToken = "9".repeat(64);
-      const unacknowledgedFinalizeToken = "a".repeat(64);
       await seedRemoteTransaction(store, abortToken, {
         prompt: "expired running authority",
         state: "running",
@@ -1494,10 +1645,6 @@ describe("remote browser service", () => {
         prompt: "expired finalize cleanup",
         settlementMode: "finalize",
         publicationAcknowledged: true,
-      });
-      await seedRemoteTransaction(store, unacknowledgedFinalizeToken, {
-        prompt: "expired unacknowledged finalize cleanup",
-        settlementMode: "finalize",
       });
       now += leaseDurationMs + 1;
       const cleanupModes: Array<"finalize" | "abort"> = [];
@@ -1536,10 +1683,6 @@ describe("remote browser service", () => {
         expect(failed).not.toHaveProperty("requestIdentity");
         expect(failed).not.toHaveProperty("browserConfig");
         expect(await store.read(finalizeToken)).toMatchObject({ state: "finalized" });
-        expect(await store.read(unacknowledgedFinalizeToken)).toMatchObject({
-          state: "pending",
-          settlementMode: "finalize",
-        });
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -2074,7 +2217,6 @@ async function seedRemoteTransaction(
               conversationId: "remote-conversation",
               promptEpoch: committedPromptEpoch(options.prompt),
               recoveryCleanup: {
-                transport: "local" as const,
                 ownsTarget: true,
                 profileKind: "temporary" as const,
                 keepBrowser: false,
@@ -2083,14 +2225,12 @@ async function seedRemoteTransaction(
             },
           ],
         });
-  const now = new Date().toISOString();
-  await store.create({
+  const runId = `run-${transactionToken.slice(0, 8)}`;
+  await store.begin({
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     transactionToken,
-    runId: `run-${transactionToken.slice(0, 8)}`,
-    createdAt: now,
-    updatedAt: now,
-    state,
+    runId,
+    createdAt: new Date().toISOString(),
     requestIdentity: {
       acceptedPromptSha256: [promptIdentitySha256(options.prompt)],
       followUpOrdinal: 0,
@@ -2102,23 +2242,44 @@ async function seedRemoteTransaction(
       remoteChrome: null,
       attachRunning: false,
     },
-    ...(runtime ? { runtime } : {}),
-    ...(state === "pending"
-      ? {
-          result: {
-            answerText: "durable answer",
-            answerMarkdown: "durable answer",
-            tookMs: 1,
-            answerTokens: 2,
-            answerChars: 14,
-          },
-        }
-      : {}),
-    ...(options.settlementMode ? { settlementMode: options.settlementMode } : {}),
-    ...(options.publicationAcknowledged
-      ? { publicationAcknowledgedAt: new Date().toISOString() }
-      : {}),
   });
+  if (state === "running") {
+    if (runtime) await store.journalRuntime(transactionToken, runtime);
+  } else if (state === "recoverable-error") {
+    if (!runtime) throw new Error("recoverable seed requires runtime authority");
+    await store.recordRecoverableFailure({
+      transactionToken,
+      runtime,
+      error: {
+        name: "BrowserAutomationError",
+        category: "browser-automation",
+        message: "seeded recoverable browser disconnect",
+        stage: "remote-controller-restart",
+        recoverableDisconnect: true,
+      },
+    });
+  } else {
+    if (!runtime) throw new Error("pending seed requires runtime authority");
+    await store.publishCapture({
+      transactionToken,
+      runId,
+      runtime,
+      result: {
+        answerText: "durable answer",
+        answerMarkdown: "durable answer",
+        tookMs: 1,
+        answerTokens: 2,
+        answerChars: 14,
+      },
+    });
+  }
+  if (options.settlementMode) {
+    await store.bindSettlement({
+      transactionToken,
+      mode: options.settlementMode,
+      durablePublication: options.publicationAcknowledged === true,
+    });
+  }
   return runtime;
 }
 
@@ -2126,16 +2287,14 @@ function remoteRecoveryTransactionToken(error: unknown): string {
   if (!(error instanceof BrowserAutomationError)) {
     throw new Error("Expected recoverable BrowserAutomationError");
   }
-  const remoteRecovery = error.details?.remoteRecovery as
-    | { transactionToken?: unknown }
-    | undefined;
-  if (
-    typeof remoteRecovery?.transactionToken !== "string" ||
-    !/^[a-f0-9]{64}$/u.test(remoteRecovery.transactionToken)
-  ) {
+  const runtime = error.details?.runtime as BrowserRunTransaction["runtime"] | undefined;
+  const transactionToken = runtime?.recoveryCleanupResources?.find(
+    (resource) => resource.remoteRecovery,
+  )?.remoteRecovery?.transactionToken;
+  if (typeof transactionToken !== "string" || !/^[a-f0-9]{64}$/u.test(transactionToken)) {
     throw new Error("Recoverable error is missing exact remote transaction authority");
   }
-  return remoteRecovery.transactionToken;
+  return transactionToken;
 }
 
 async function readIncomingBody(

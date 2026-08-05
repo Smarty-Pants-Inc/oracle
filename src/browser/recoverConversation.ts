@@ -215,7 +215,6 @@ function createRecoveredConversationCleanup({
         ? undefined
         : { id: lease.id, profileDirectory: lease.profileDirectory },
       recoveryCleanup: {
-        transport: "local",
         ownsTarget: Boolean(target),
         profileKind: ownsProcess ? "manual-login" : "none",
         keepBrowser: !ownsProcess,

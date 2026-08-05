@@ -130,6 +130,47 @@ describe("session lifecycle", () => {
     expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
+  test("persists one remote cleanup authority and one settlement mode", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Remote recovery", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      browser: {
+        runtime: {
+          recoveryCleanupResources: [
+            {
+              remoteRecovery: {
+                protocolVersion: 1,
+                host: "127.0.0.1:4567",
+                transactionToken: "a".repeat(64),
+                state: "pending",
+              },
+              recoveryCleanup: {
+                ownsTarget: false,
+                profileKind: "none",
+                keepBrowser: false,
+              },
+            },
+          ],
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        },
+      },
+    });
+
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), meta.id, "meta.json"), "utf8"),
+    );
+    const runtime = stored.browser.runtime;
+    expect(runtime).not.toHaveProperty("remoteRecovery");
+    expect(runtime.recoveryCleanupResult).toEqual({
+      status: "pending",
+      settlementMode: "finalize",
+    });
+    expect(runtime.recoveryCleanupResources[0].remoteRecovery).not.toHaveProperty("settlementMode");
+    expect(runtime.recoveryCleanupResources[0].recoveryCleanup).not.toHaveProperty("transport");
+  });
+
   test("createSessionLogWriter appends logs and supports chunk writes", async () => {
     const meta = await sessionModule.initializeSession(
       { prompt: "Log history", model: "gpt-5.2-pro" },

@@ -97,6 +97,10 @@ function transactionEvent(transactionToken: string, prompt: string, artifacts: u
     },
   };
 }
+function remoteRecovery(runtime: BrowserRuntimeMetadata | undefined) {
+  return runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
+    ?.remoteRecovery;
+}
 
 const deadlines = {
   runOverallTimeoutMs: 120,
@@ -132,11 +136,14 @@ describe("remote client transport deadlines", () => {
         details: {
           recoverableDisconnect: true,
           runtime: {
-            recoveryCleanupResources: [{ recoveryCleanup: { transport: "remote" } }],
-            remoteRecovery: { state: "recoverable-error" },
+            recoveryCleanupResources: [{ remoteRecovery: { state: "recoverable-error" } }],
           },
         },
       });
+      expect(error).not.toHaveProperty("details.runtime.remoteRecovery");
+      expect(error).not.toHaveProperty(
+        "details.runtime.recoveryCleanupResources.0.recoveryCleanup.transport",
+      );
     } finally {
       await close(server);
     }
@@ -163,11 +170,16 @@ describe("remote client transport deadlines", () => {
         token: "secret",
         deadlines,
       })({ prompt: "settle", config: {} });
-      await expect(transaction.finalize()).resolves.toMatchObject({
+      const finalization = await transaction.finalize();
+      expect(finalization).toMatchObject({
         status: "pending",
-        runtime: { remoteRecovery: { state: "pending" } },
+        runtime: {
+          recoveryCleanupResources: [{ remoteRecovery: { state: "pending" } }],
+          recoveryCleanupResult: { settlementMode: "finalize" },
+        },
         error: expect.stringMatching(/idle timeout|overall timeout/i),
       });
+      expect(finalization.runtime).not.toHaveProperty("remoteRecovery");
     } finally {
       await close(server);
     }
@@ -220,9 +232,10 @@ describe("remote client transport deadlines", () => {
         details: {
           stage: "remote-artifact-transfer",
           recoverableDisconnect: true,
-          runtime: { remoteRecovery: { state: "pending" } },
+          runtime: { recoveryCleanupResources: [{ remoteRecovery: { state: "pending" } }] },
         },
       });
+      expect(error).not.toHaveProperty("details.runtime.remoteRecovery");
       expect(settlementRequests).toBe(0);
     } finally {
       setOracleHomeDirOverrideForTest(null);
@@ -256,24 +269,23 @@ describe("remote client transport deadlines", () => {
         prompt: "persist before network",
         config: {},
         runtimeHintCb: async (runtime) => {
-          events.push(`persist:${runtime.remoteRecovery?.state}`);
+          events.push(`persist:${remoteRecovery(runtime)?.state}`);
           persistedRuntimes.push(runtime);
         },
       });
 
       expect(events.slice(0, 2)).toEqual(["persist:pre-receipt", "network:run"]);
-      expect(persistedRuntimes[0]).toMatchObject({
-        remoteRecovery: {
-          state: "pre-receipt",
-          requestIdentity: {
-            acceptedPromptSha256: [promptIdentitySha256("persist before network")],
-            followUpOrdinal: 0,
-            remainingFollowUps: 0,
-          },
+      expect(remoteRecovery(persistedRuntimes[0])).toMatchObject({
+        state: "pre-receipt",
+        requestIdentity: {
+          acceptedPromptSha256: [promptIdentitySha256("persist before network")],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
         },
       });
+      expect(persistedRuntimes[0]).not.toHaveProperty("remoteRecovery");
       expect(persistedRuntimes[0]).not.toHaveProperty("recoveryCleanupResult");
-      expect(transaction.runtime.remoteRecovery).toMatchObject({
+      expect(remoteRecovery(transaction.runtime)).toMatchObject({
         state: "pending",
         requestIdentity: {
           acceptedPromptSha256: [promptIdentitySha256("persist before network")],
@@ -281,6 +293,7 @@ describe("remote client transport deadlines", () => {
           remainingFollowUps: 0,
         },
       });
+      expect(transaction.runtime).not.toHaveProperty("remoteRecovery");
     } finally {
       await close(server);
     }
@@ -315,7 +328,7 @@ describe("remote client transport deadlines", () => {
       });
       expect(runRequests).toBe(0);
       expect(persistedRuntimes).toHaveLength(1);
-      expect(persistedRuntimes[0]?.remoteRecovery).toMatchObject({
+      expect(remoteRecovery(persistedRuntimes[0])).toMatchObject({
         state: "pre-receipt",
         requestIdentity: {
           acceptedPromptSha256: [promptIdentitySha256("must persist first")],
@@ -323,13 +336,14 @@ describe("remote client transport deadlines", () => {
           remainingFollowUps: 0,
         },
       });
+      expect(persistedRuntimes[0]).not.toHaveProperty("remoteRecovery");
       expect(persistedRuntimes[0]).not.toHaveProperty("recoveryCleanupResult");
     } finally {
       await close(server);
     }
   });
 
-  it("rehydrates an abort-bound recoverable error into both recovery authorities", async () => {
+  it("rehydrates an abort-bound recoverable error into one authority and one settlement field", async () => {
     const server = http.createServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (!transactionToken) {
@@ -367,19 +381,23 @@ describe("remote client transport deadlines", () => {
         name: "BrowserAutomationError",
         details: {
           recoverableDisconnect: true,
-          remoteRecovery: { settlementMode: "abort" },
           runtime: {
-            remoteRecovery: { settlementMode: "abort" },
-            recoveryCleanupResources: [{ remoteRecovery: { settlementMode: "abort" } }],
+            recoveryCleanupResult: { settlementMode: "abort" },
+            recoveryCleanupResources: [{ remoteRecovery: { state: "recoverable-error" } }],
           },
         },
       });
+      expect(caught).not.toHaveProperty("details.remoteRecovery");
+      expect(caught).not.toHaveProperty("details.runtime.remoteRecovery");
+      expect(caught).not.toHaveProperty(
+        "details.runtime.recoveryCleanupResources.0.remoteRecovery.settlementMode",
+      );
     } finally {
       await close(server);
     }
   });
 
-  it("rejects a wire settlement mode that conflicts with persisted recovery authority", async () => {
+  it("rejects a wire settlement mode that conflicts with persisted cleanup result", async () => {
     const transactionToken = "f".repeat(64);
     const server = http.createServer(async (req, res) => {
       if (req.url !== `/transactions/${transactionToken}/retry`) {
@@ -410,18 +428,16 @@ describe("remote client transport deadlines", () => {
       host: `127.0.0.1:${port}`,
       transactionToken,
       state: "recoverable-error" as const,
-      settlementMode: "finalize" as const,
     };
     try {
       await expect(
         resumeRemoteBrowserTransaction({
           runtime: {
-            remoteRecovery: authority,
+            recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
             recoveryCleanupResources: [
               {
                 remoteRecovery: authority,
                 recoveryCleanup: {
-                  transport: "remote",
                   ownsTarget: false,
                   profileKind: "none",
                   keepBrowser: false,
@@ -501,14 +517,19 @@ describe("remote client transport deadlines", () => {
       res.end();
     });
     const port = await listen(server);
-    const runtime = {
-      remoteRecovery: {
-        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-        host: `127.0.0.1:${port}`,
-        transactionToken,
-        state: "pre-receipt" as const,
-        requestIdentity,
-      },
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            host: `127.0.0.1:${port}`,
+            transactionToken,
+            state: "pre-receipt",
+            requestIdentity,
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+        },
+      ],
     };
     try {
       const transaction = await resumeRemoteBrowserTransaction({
@@ -519,8 +540,9 @@ describe("remote client transport deadlines", () => {
       expect(transaction.answerText).toBe("answer");
       expect(transaction.runtime).toMatchObject({
         promptEpoch: { promptSha256: promptIdentitySha256("resume exact request") },
-        remoteRecovery: { state: "pending", requestIdentity },
+        recoveryCleanupResources: [{ remoteRecovery: { state: "pending", requestIdentity } }],
       });
+      expect(transaction.runtime).not.toHaveProperty("remoteRecovery");
     } finally {
       await close(server);
     }
@@ -551,14 +573,19 @@ describe("remote client transport deadlines", () => {
       res.end();
     });
     const port = await listen(server);
-    const runtime = {
-      remoteRecovery: {
-        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-        host: `127.0.0.1:${port}`,
-        transactionToken,
-        state: "pre-receipt" as const,
-        requestIdentity,
-      },
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            host: `127.0.0.1:${port}`,
+            transactionToken,
+            state: "pre-receipt",
+            requestIdentity,
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+        },
+      ],
     };
     try {
       await expect(
@@ -572,7 +599,11 @@ describe("remote client transport deadlines", () => {
         details: {
           code: "remote-prompt-authority-mismatch",
           recoverableDisconnect: true,
-          runtime: { remoteRecovery: { state: "pre-receipt", requestIdentity } },
+          runtime: {
+            recoveryCleanupResources: [
+              { remoteRecovery: { state: "pre-receipt", requestIdentity } },
+            ],
+          },
         },
       });
     } finally {
@@ -612,13 +643,18 @@ describe("remote client transport deadlines", () => {
     const port = await listen(server);
     const runtime: BrowserRuntimeMetadata = {
       promptEpoch: persistedPromptEpoch,
-      remoteRecovery: {
-        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-        host: `127.0.0.1:${port}`,
-        transactionToken,
-        state: "pending",
-        requestIdentity,
-      },
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            host: `127.0.0.1:${port}`,
+            transactionToken,
+            state: "pending",
+            requestIdentity,
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+        },
+      ],
     };
     try {
       await expect(
@@ -707,7 +743,7 @@ describe("remote client transport deadlines", () => {
         prompt,
         config: {},
         runtimeHintCb: async (runtime) => {
-          const mode = runtime.remoteRecovery?.settlementMode;
+          const mode = runtime.recoveryCleanupResult?.settlementMode;
           if (mode) events.push(`persist:${mode}`);
         },
       });
@@ -715,18 +751,10 @@ describe("remote client transport deadlines", () => {
       expect(firstFinalization).toMatchObject({
         status: "pending",
         runtime: {
-          remoteRecovery: {
-            settlementMode: "finalize",
-            requestIdentity: {
-              acceptedPromptSha256: [promptIdentitySha256(prompt)],
-              followUpOrdinal: 0,
-              remainingFollowUps: 0,
-            },
-          },
+          recoveryCleanupResult: { settlementMode: "finalize" },
           recoveryCleanupResources: [
             {
               remoteRecovery: {
-                settlementMode: "finalize",
                 requestIdentity: {
                   acceptedPromptSha256: [promptIdentitySha256(prompt)],
                   followUpOrdinal: 0,
@@ -737,6 +765,8 @@ describe("remote client transport deadlines", () => {
           ],
         },
       });
+      expect(firstFinalization.runtime).not.toHaveProperty("remoteRecovery");
+      expect(remoteRecovery(firstFinalization.runtime)).not.toHaveProperty("settlementMode");
       expect(events.slice(-2)).toEqual(["persist:finalize", "network:finalize"]);
       await expect(transaction.abort()).rejects.toMatchObject({
         details: { code: "settlement-mode-conflict" },

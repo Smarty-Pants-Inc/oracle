@@ -1107,7 +1107,6 @@ describe("performSessionRun", () => {
           userDataDir: "/tmp/profile",
           chromeTargetId: "owned-target",
           recoveryCleanup: {
-            transport: "local",
             ownsTarget: true,
             profileKind: "temporary",
             keepBrowser: false,
@@ -1246,7 +1245,6 @@ describe("performSessionRun", () => {
             state: "pending",
           },
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
@@ -1254,12 +1252,6 @@ describe("performSessionRun", () => {
         },
       ],
       recoveryCleanupResult: { status: "pending" },
-      remoteRecovery: {
-        protocolVersion: 3,
-        host: "bridge.example:9443",
-        transactionToken: "a".repeat(64),
-        state: "pending",
-      },
     };
     const finalize = vi.fn(async () => {
       throw new Error("bridge temporarily unavailable");
@@ -1291,7 +1283,14 @@ describe("performSessionRun", () => {
       browser: {
         runtime: {
           chromeTargetId: "remote-finalize-target",
-          remoteRecovery: { transactionToken: "a".repeat(64), state: "pending" },
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              remoteRecovery: expect.objectContaining({
+                transactionToken: "a".repeat(64),
+                state: "pending",
+              }),
+            }),
+          ],
           recoveryCleanupResult: {
             status: "failed",
             error: expect.stringContaining("bridge temporarily unavailable"),
@@ -1312,7 +1311,6 @@ describe("performSessionRun", () => {
           chromePort: 9222,
           chromeTargetId: "fallback-target",
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
@@ -1438,7 +1436,6 @@ describe("performSessionRun", () => {
           chromePort: 9222,
           chromeTargetId: "durability-target",
           recoveryCleanup: {
-            transport: "remote",
             ownsTarget: true,
             profileKind: "none",
             keepBrowser: false,
@@ -1859,19 +1856,66 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("does not reattach remote cleanup authority after settlement", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "f".repeat(64),
+            state: "pre-receipt",
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+      recoveryCleanupResult: { status: "failed", settlementMode: "finalize" },
+    };
+    const automationError = new BrowserAutomationError("Chrome disconnected", {
+      stage: "connection-lost",
+      recoverableDisconnect: true,
+      runtime,
+    });
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Chrome disconnected");
+
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime },
+    });
+  });
+
   test("retains remote-only pre-receipt authority and prints reattach guidance", async () => {
     const remoteRuntime: BrowserRuntimeMetadata = {
-      remoteRecovery: {
-        protocolVersion: 3,
-        host: "bridge.example:9443",
-        transactionToken: "d".repeat(64),
-        state: "pre-receipt",
-        requestIdentity: {
-          acceptedPromptSha256: ["e".repeat(64)],
-          followUpOrdinal: 0,
-          remainingFollowUps: 0,
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "d".repeat(64),
+            state: "pre-receipt",
+            requestIdentity: {
+              acceptedPromptSha256: ["e".repeat(64)],
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+            },
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
         },
-      },
+      ],
     };
     const automationError = new BrowserAutomationError(
       "Remote browser response disconnected before the durable receipt.",
@@ -2042,7 +2086,6 @@ describe("performSessionRun", () => {
           chromeHost: "127.0.0.1",
           chromeTargetId: "TARGET-1",
           recoveryCleanup: {
-            transport: "remote" as const,
             ownsTarget: false,
             profileKind: "none" as const,
             keepBrowser: true,
@@ -2100,7 +2143,6 @@ describe("performSessionRun", () => {
           chromeHost: "127.0.0.1",
           userDataDir: "/tmp/copied-profile",
           recoveryCleanup: {
-            transport: "local",
             ownsTarget: true,
             profileKind: "copied",
             keepBrowser: false,
@@ -2503,7 +2545,6 @@ describe("performSessionRun", () => {
           chromeHost: "127.0.0.1",
           chromeTargetId: "TARGET-1",
           recoveryCleanup: {
-            transport: "remote" as const,
             ownsTarget: false,
             profileKind: "none" as const,
             keepBrowser: true,
@@ -2616,7 +2657,6 @@ describe("performSessionRun", () => {
           chromeHost: "127.0.0.1",
           chromeTargetId: "TARGET-1",
           recoveryCleanup: {
-            transport: "remote" as const,
             ownsTarget: false,
             profileKind: "none" as const,
             keepBrowser: true,

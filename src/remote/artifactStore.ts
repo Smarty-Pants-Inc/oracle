@@ -122,42 +122,24 @@ export class RemoteArtifactStore {
       .update("\0")
       .update(String(params.byteSize))
       .digest("hex");
-    let receipt: DurableRemoteArtifactDeliveryReceipt | undefined;
-    await this.#transactionStore.update(params.transactionToken, (record) => {
-      if (!record.leaseExpiresAt || this.#now() >= Date.parse(record.leaseExpiresAt)) {
+    const proposedReceipt: DurableRemoteArtifactDeliveryReceipt = {
+      receiptId,
+      deliveredAt: new Date(this.#now()).toISOString(),
+      byteSize: params.byteSize,
+      sha256: params.sha256,
+    };
+    try {
+      return await this.#transactionStore.recordArtifactDelivery({
+        transactionToken: params.transactionToken,
+        artifactId: params.artifactId,
+        receipt: proposedReceipt,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("expired transaction lease")) {
         throw new RemoteArtifactUnavailableError("transaction_lease_expired");
       }
-      const registration = record.artifacts?.find(
-        (artifact) => artifact.descriptor.artifactId === params.artifactId,
-      );
-      if (!registration) throw new Error("Remote artifact registration does not exist");
-      if (
-        registration.descriptor.sha256 !== params.sha256 ||
-        registration.descriptor.byteSize !== params.byteSize
-      ) {
-        throw new Error("Remote artifact delivery receipt does not match registered content");
-      }
-      if (registration.deliveryReceipt) {
-        if (
-          registration.deliveryReceipt.receiptId !== receiptId ||
-          registration.deliveryReceipt.sha256 !== params.sha256 ||
-          registration.deliveryReceipt.byteSize !== params.byteSize
-        ) {
-          throw new Error("Remote artifact already has a different delivery receipt");
-        }
-        receipt = registration.deliveryReceipt;
-        return;
-      }
-      receipt = {
-        receiptId,
-        deliveredAt: new Date(this.#now()).toISOString(),
-        byteSize: params.byteSize,
-        sha256: params.sha256,
-      };
-      registration.deliveryReceipt = receipt;
-    });
-    if (!receipt) throw new Error("Remote artifact delivery receipt was not persisted");
-    return receipt;
+      throw error;
+    }
   }
 
   async requiredDeliveriesComplete(transactionToken: string): Promise<boolean> {

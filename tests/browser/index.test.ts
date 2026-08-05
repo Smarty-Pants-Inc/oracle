@@ -35,7 +35,6 @@ describe("unpublished browser cleanup", () => {
         {
           userDataDir: "/tmp/copied-profile",
           recoveryCleanup: {
-            transport: "local" as const,
             ownsTarget: true,
             profileKind: "copied" as const,
             keepBrowser: false,

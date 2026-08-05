@@ -473,7 +473,6 @@ describe("tabLeaseRegistry", () => {
               profileDirectoryIdentity: lease.profileDirectory,
               tabLease: { id: lease.id, profileDirectory: lease.profileDirectory },
               recoveryCleanup: {
-                transport: "local" as const,
                 ownsTarget: false,
                 profileKind: "manual-login" as const,
                 keepBrowser: false,

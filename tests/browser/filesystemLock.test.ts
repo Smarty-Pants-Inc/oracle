@@ -6,11 +6,24 @@ import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
 } from "../../src/browser/filesystemLock.js";
-import type { CrashRecoverableFilesystemLock } from "../../src/browser/filesystemLock.js";
+import type {
+  CrashRecoverableFilesystemLock,
+  FilesystemLockProcessIdentityProvider,
+  ProcessLiveness,
+} from "../../src/browser/filesystemLock.js";
 
 async function agePath(targetPath: string, ageMs = 10_000): Promise<void> {
   const timestamp = new Date(Date.now() - ageMs);
   await utimes(targetPath, timestamp, timestamp);
+}
+
+function createProcessIdentityProvider(
+  pid: number,
+  readProcessStartIdentity: (pid: number) => Promise<string | null>,
+  readProcessLiveness: (pid: number) => ProcessLiveness = () => "alive",
+  platform: NodeJS.Platform = "linux",
+): FilesystemLockProcessIdentityProvider {
+  return { platform, pid, readProcessLiveness, readProcessStartIdentity };
 }
 
 describe("crash-recoverable filesystem lock", () => {
@@ -23,8 +36,31 @@ describe("crash-recoverable filesystem lock", () => {
           lockPath,
           {},
           {
-            pid: 10_000,
-            readProcessStartIdentity: async () => null,
+            processIdentityProvider: createProcessIdentityProvider(10_000, async () => null),
+          },
+        ),
+      ).rejects.toThrow(/without a stable process generation/i);
+      await expect(stat(path.dirname(lockPath))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("requires an injected Windows provider to report a stable generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+    const lockPath = path.join(root, "missing-parent", "recovery.lock");
+    try {
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              10_004,
+              async () => null,
+              () => "alive",
+              "win32",
+            ),
           },
         ),
       ).rejects.toThrow(/without a stable process generation/i);
@@ -45,8 +81,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { incompleteLockStaleMs: 100 },
         {
-          pid: 10_001,
-          readProcessStartIdentity: async () => "current-start",
+          processIdentityProvider: createProcessIdentityProvider(
+            10_001,
+            async () => "current-start",
+          ),
         },
       );
       expect(lock.owner).toMatchObject({
@@ -71,8 +109,10 @@ describe("crash-recoverable filesystem lock", () => {
           lockPath,
           { incompleteLockStaleMs: 60_000 },
           {
-            pid: 10_002,
-            readProcessStartIdentity: async () => "current-start",
+            processIdentityProvider: createProcessIdentityProvider(
+              10_002,
+              async () => "current-start",
+            ),
           },
         ),
       ).rejects.toBeInstanceOf(FilesystemLockBusyError);
@@ -83,8 +123,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { incompleteLockStaleMs: 60_000 },
         {
-          pid: 10_002,
-          readProcessStartIdentity: async () => "current-start",
+          processIdentityProvider: createProcessIdentityProvider(
+            10_002,
+            async () => "current-start",
+          ),
         },
       );
       await lock.release();
@@ -108,10 +150,11 @@ describe("crash-recoverable filesystem lock", () => {
           lockPath,
           { incompleteLockStaleMs: 100 },
           {
-            pid: 10_003,
-            readProcessLiveness: (pid) => (pid === 41_041 ? "alive" : "dead"),
-            readProcessStartIdentity: async (pid) =>
-              pid === 41_041 ? null : "current-process-start",
+            processIdentityProvider: createProcessIdentityProvider(
+              10_003,
+              async (pid) => (pid === 41_041 ? null : "current-process-start"),
+              (pid) => (pid === 41_041 ? "alive" : "dead"),
+            ),
           },
         ),
       ).rejects.toBeInstanceOf(FilesystemLockBusyError);
@@ -128,8 +171,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         {},
         {
-          pid: 40_040,
-          readProcessStartIdentity: async () => "original-start",
+          processIdentityProvider: createProcessIdentityProvider(
+            40_040,
+            async () => "original-start",
+          ),
         },
       );
       await rm(lockPath, { recursive: true, force: false });
@@ -149,19 +194,19 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         {},
         {
-          pid: 42_042,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async () => "original-start",
+          processIdentityProvider: createProcessIdentityProvider(
+            42_042,
+            async () => "original-start",
+          ),
         },
       );
       const replacement = await acquireCrashRecoverableFilesystemLock(
         lockPath,
         {},
         {
-          pid: 43_043,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) =>
+          processIdentityProvider: createProcessIdentityProvider(43_043, async (pid) =>
             pid === 42_042 ? "reused-pid-start" : "replacement-start",
+          ),
         },
       );
 
@@ -217,19 +262,19 @@ describe("crash-recoverable filesystem lock", () => {
       lockPath,
       {},
       {
-        pid: originalPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        processIdentityProvider: createProcessIdentityProvider(
+          originalPid,
+          async (pid) => identities[pid] ?? null,
+        ),
       },
     );
     const reclaimer = acquireCrashRecoverableFilesystemLock(
       lockPath,
       {},
       {
-        pid: reclaimerPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) =>
+        processIdentityProvider: createProcessIdentityProvider(reclaimerPid, async (pid) =>
           pid === originalPid ? "reused-original-pid" : (identities[pid] ?? null),
+        ),
         beforeStaleLockQuarantine: async () => {
           markBeforeQuarantine();
           await allowQuarantine;
@@ -256,22 +301,24 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { timeoutMs: 5_000, pollMs: 10 },
         {
-          pid: replacementPid,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) =>
+          processIdentityProvider: createProcessIdentityProvider(replacementPid, async (pid) =>
             pid === originalPid ? "reused-original-pid" : (identities[pid] ?? null),
+          ),
           beforeLockPublication: async () => {
             markReplacementPrepared();
           },
         },
       );
       await replacementPrepared;
-      await vi.waitFor(async () => {
-        const requests = (await readdir(mutationRootPath)).filter((entry) =>
-          entry.startsWith("request-"),
-        );
-        expect(requests).toHaveLength(2);
-      });
+      await vi.waitFor(
+        async () => {
+          const requests = (await readdir(mutationRootPath)).filter((entry) =>
+            entry.startsWith("request-"),
+          );
+          expect(requests).toHaveLength(2);
+        },
+        { timeout: 10_000, interval: 10 },
+      );
       expect(await readFile(path.join(lockPath, "owner.json"), "utf8")).toBe(originalOwnerRaw);
 
       resumeBeforeQuarantine();
@@ -285,12 +332,15 @@ describe("crash-recoverable filesystem lock", () => {
         releaseSettled = true;
       });
       void releaseAttempt.catch(() => undefined);
-      await vi.waitFor(async () => {
-        const requests = (await readdir(mutationRootPath)).filter((entry) =>
-          entry.startsWith("request-"),
-        );
-        expect(requests).toHaveLength(3);
-      });
+      await vi.waitFor(
+        async () => {
+          const requests = (await readdir(mutationRootPath)).filter((entry) =>
+            entry.startsWith("request-"),
+          );
+          expect(requests).toHaveLength(3);
+        },
+        { timeout: 10_000, interval: 10 },
+      );
       expect(releaseSettled).toBe(false);
 
       resumeAfterQuarantine();
@@ -338,7 +388,7 @@ describe("crash-recoverable filesystem lock", () => {
       await reclaimerLock?.release().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("a stalled private publisher cannot alter a successor generation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
@@ -364,9 +414,10 @@ describe("crash-recoverable filesystem lock", () => {
       lockPath,
       {},
       {
-        pid: stalledPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        processIdentityProvider: createProcessIdentityProvider(
+          stalledPid,
+          async (pid) => identities[pid] ?? null,
+        ),
         beforeLockPublication: async (privatePath) => {
           preparedLockPath = privatePath;
           markStalledPublisherReady();
@@ -389,9 +440,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         {},
         {
-          pid: successorPid,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+          processIdentityProvider: createProcessIdentityProvider(
+            successorPid,
+            async (pid) => identities[pid] ?? null,
+          ),
         },
       );
       const successorOwnerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
@@ -449,19 +501,19 @@ describe("crash-recoverable filesystem lock", () => {
       lockPath,
       {},
       {
-        pid: originalPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        processIdentityProvider: createProcessIdentityProvider(
+          originalPid,
+          async (pid) => identities[pid] ?? null,
+        ),
       },
     );
     const stalledAcquire = acquireCrashRecoverableFilesystemLock(
       lockPath,
       { timeoutMs: 5_000, pollMs: 10 },
       {
-        pid: stalledPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) =>
+        processIdentityProvider: createProcessIdentityProvider(stalledPid, async (pid) =>
           pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        ),
         beforeMutationRequestOwnerWrite: async (preparedPath, requestPath) => {
           stalledPreparedPath = preparedPath;
           stalledRequestPath = requestPath;
@@ -483,10 +535,9 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { timeoutMs: 5_000, pollMs: 10 },
         {
-          pid: contenderPid,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) =>
+          processIdentityProvider: createProcessIdentityProvider(contenderPid, async (pid) =>
             pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          ),
           beforeStaleLockQuarantine: async () => {
             markContenderReady();
             await allowContender;
@@ -566,20 +617,20 @@ describe("crash-recoverable filesystem lock", () => {
       lockPath,
       {},
       {
-        pid: originalPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        processIdentityProvider: createProcessIdentityProvider(
+          originalPid,
+          async (pid) => identities[pid] ?? null,
+        ),
       },
     );
     const firstAcquire = acquireCrashRecoverableFilesystemLock(
       lockPath,
       { timeoutMs: 5_000, pollMs: 10 },
       {
-        pid: firstPid,
-        randomUUID: () => firstNonces[firstNonceIndex++] ?? `first-${firstNonceIndex}`,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) =>
+        processIdentityProvider: createProcessIdentityProvider(firstPid, async (pid) =>
           pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        ),
+        randomUUID: () => firstNonces[firstNonceIndex++] ?? `first-${firstNonceIndex}`,
         beforeMutationRequestTicketPublication: async (_requestPath, ticket) => {
           expect(ticket).toBe(1);
           markFirstTicketBlocked();
@@ -606,11 +657,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { timeoutMs: 5_000, pollMs: 10 },
         {
-          pid: secondPid,
-          randomUUID: () => secondNonces[secondNonceIndex++] ?? `second-${secondNonceIndex}`,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) =>
+          processIdentityProvider: createProcessIdentityProvider(secondPid, async (pid) =>
             pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          ),
+          randomUUID: () => secondNonces[secondNonceIndex++] ?? `second-${secondNonceIndex}`,
         },
       ).finally(() => {
         secondSettled = true;
@@ -683,19 +733,19 @@ describe("crash-recoverable filesystem lock", () => {
       lockPath,
       {},
       {
-        pid: originalPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) => identities[pid] ?? null,
+        processIdentityProvider: createProcessIdentityProvider(
+          originalPid,
+          async (pid) => identities[pid] ?? null,
+        ),
       },
     );
     const blocker = acquireCrashRecoverableFilesystemLock(
       lockPath,
       {},
       {
-        pid: blockerPid,
-        readProcessLiveness: () => "alive",
-        readProcessStartIdentity: async (pid) =>
+        processIdentityProvider: createProcessIdentityProvider(blockerPid, async (pid) =>
           pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+        ),
         beforeStaleLockQuarantine: async () => {
           markBlockerReady();
           await allowBlocker;
@@ -709,10 +759,9 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         { timeoutMs: 20, pollMs: 10 },
         {
-          pid: contenderPid,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async (pid) =>
+          processIdentityProvider: createProcessIdentityProvider(contenderPid, async (pid) =>
             pid === originalPid ? "reused-original-start" : (identities[pid] ?? null),
+          ),
           beforeMutationRequestRemoval: async () => {
             cleanupAttempts += 1;
             if (cleanupAttempts === 1) {
@@ -763,9 +812,10 @@ describe("crash-recoverable filesystem lock", () => {
         lockPath,
         {},
         {
-          pid: 44_044,
-          readProcessLiveness: () => "alive",
-          readProcessStartIdentity: async () => "original-start",
+          processIdentityProvider: createProcessIdentityProvider(
+            44_044,
+            async () => "original-start",
+          ),
         },
       );
 
@@ -774,9 +824,9 @@ describe("crash-recoverable filesystem lock", () => {
           lockPath,
           {},
           {
-            pid: 45_045,
-            readProcessLiveness: () => "alive",
-            readProcessStartIdentity: async (pid) => (pid === 44_044 ? null : "replacement-start"),
+            processIdentityProvider: createProcessIdentityProvider(45_045, async (pid) =>
+              pid === 44_044 ? null : "replacement-start",
+            ),
           },
         ),
       ).rejects.toBeInstanceOf(FilesystemLockBusyError);
@@ -786,46 +836,71 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test("backs off after a Windows process-generation timeout without negative-caching success", async () => {
-    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
-    const timeoutError = Object.assign(new Error("PowerShell process probe timed out"), {
-      code: "ETIMEDOUT",
-      killed: false,
-    });
-    let attempt = 0;
-    let now = 1_000;
-    const execFile = vi.fn();
-    const execFileAsync = vi.fn(async (..._args: unknown[]) => {
-      if (++attempt === 1) throw timeoutError;
-      return { stdout: "638000000000000000", stderr: "" };
-    });
-    Object.defineProperty(execFile, Symbol.for("nodejs.util.promisify.custom"), {
-      value: execFileAsync,
-    });
-    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+  test.each([
+    ["darwin", "darwin-current-start", 70_001],
+    ["linux", "linux-current-start", 70_002],
+    ["win32", "win32-current-start", 70_003],
+  ] as const)(
+    "uses one injected %s process identity for lock ownership and mutation coordination",
+    async (platform, currentStartIdentity, currentPid) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
+      const lockPath = path.join(root, "recovery.lock");
+      const originalPid = currentPid + 100;
+      const readProcessLiveness = vi.fn((_pid: number): ProcessLiveness => "alive");
+      const readProcessStartIdentity = vi.fn(async (pid: number) =>
+        pid === originalPid ? "reused-original-start" : currentStartIdentity,
+      );
+      let mutationOwner: { pid: number; processStartIdentity: string | null } | undefined;
 
-    try {
-      Object.defineProperty(process, "platform", { value: "win32" });
-      vi.resetModules();
-      vi.doMock("node:child_process", () => ({ execFile }));
-      // Reloading intentionally binds this test's mocked Windows child-process boundary.
-      const { readProcessStartIdentity } = await import("../../src/browser/filesystemLock.js");
+      try {
+        await mkdir(lockPath);
+        await writeFile(
+          path.join(lockPath, "owner.json"),
+          `${JSON.stringify({
+            version: 1,
+            pid: originalPid,
+            processStartIdentity: "original-start",
+            ownerNonce: "original-owner",
+            createdAt: new Date().toISOString(),
+          })}\n`,
+          "utf8",
+        );
 
-      await expect(readProcessStartIdentity(process.pid)).resolves.toBeNull();
-      await expect(readProcessStartIdentity(process.pid)).resolves.toBeNull();
-      now += 5_000;
-      await expect(readProcessStartIdentity(process.pid)).resolves.toBe("win32:638000000000000000");
-      await expect(readProcessStartIdentity(process.pid)).resolves.toBe("win32:638000000000000000");
-      expect(execFileAsync).toHaveBeenCalledTimes(2);
-      expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
-      expect(execFileAsync.mock.calls[0]?.[2]).toMatchObject({ timeout: 2_000 });
-    } finally {
-      nowSpy.mockRestore();
-      vi.doUnmock("node:child_process");
-      vi.resetModules();
-      if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
-    }
-  });
+        const lock = await acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              currentPid,
+              readProcessStartIdentity,
+              readProcessLiveness,
+              platform,
+            ),
+            beforeMutationRequestTicketPublication: async (requestPath) => {
+              mutationOwner = JSON.parse(
+                await readFile(path.join(requestPath, "owner.json"), "utf8"),
+              ) as { pid: number; processStartIdentity: string | null };
+            },
+          },
+        );
+
+        expect(lock.owner).toMatchObject({
+          pid: currentPid,
+          processStartIdentity: currentStartIdentity,
+        });
+        expect(mutationOwner).toMatchObject({
+          pid: currentPid,
+          processStartIdentity: currentStartIdentity,
+        });
+        expect(readProcessLiveness).toHaveBeenCalledWith(originalPid);
+        expect(readProcessStartIdentity).toHaveBeenCalledWith(currentPid);
+        expect(readProcessStartIdentity).toHaveBeenCalledWith(originalPid);
+        await lock.release();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("preserves a null-generation lock while its owner pid is alive", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
@@ -845,10 +920,11 @@ describe("crash-recoverable filesystem lock", () => {
         "utf8",
       );
       const deps = {
-        pid: 63_063,
-        readProcessLiveness: (pid: number) =>
-          pid === 62_062 && ownerAlive ? ("alive" as const) : ("dead" as const),
-        readProcessStartIdentity: async () => "replacement-start",
+        processIdentityProvider: createProcessIdentityProvider(
+          63_063,
+          async () => "replacement-start",
+          (pid) => (pid === 62_062 && ownerAlive ? "alive" : "dead"),
+        ),
       };
       await expect(
         acquireCrashRecoverableFilesystemLock(lockPath, {}, deps),

@@ -1405,7 +1405,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   function buildLocalRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
     return {
-      transport: "local",
       ownsTarget,
       profileKind: manualLogin ? "manual-login" : usingCopiedProfile ? "copied" : "temporary",
       keepBrowser: shouldPreserveLocalOwnerForRecovery({
@@ -2294,13 +2293,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         deepResearch && client
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
-      const commitEvidence = await runProviderSubmissionFlow(chatgptDomProvider, {
-        prompt,
-        evaluate: async () => undefined,
-        delay,
-        log: logger,
-        state: providerState,
-      });
+      const commitEvidence = await raceWithDisconnect(
+        runProviderSubmissionFlow(chatgptDomProvider, {
+          prompt,
+          evaluate: async () => undefined,
+          delay,
+          log: logger,
+          state: providerState,
+        }),
+      );
       await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
       const promptLocator = requireCommittedPromptLocator(lifecycle);
       const providerBaselineTurns = providerState.baselineTurns;
@@ -3363,7 +3364,6 @@ async function runRemoteBrowserMode(
 
   function buildRemoteRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
     return {
-      transport: "local",
       ownsTarget,
       profileKind: "none",
       keepBrowser: Boolean(config.keepBrowser),

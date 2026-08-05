@@ -13,12 +13,22 @@ interface GeminiPromptBaseline {
   userQueryCount: number;
   responseCount: number;
   normalizedPrompt: string;
+  dispatchNonce: string;
 }
 
 interface GeminiDomProviderState {
   inputTimeoutMs?: number;
   timeoutMs?: number;
   geminiPromptBaseline?: GeminiPromptBaseline;
+}
+
+interface GeminiRawTurnDescriptor {
+  kind: "user" | "response";
+  postBaseline: boolean;
+  text: string;
+  boundToDispatch?: boolean;
+  completionMarked?: boolean;
+  visibleSpinner?: boolean;
 }
 
 export const GEMINI_DEEP_THINK_SELECTORS = {
@@ -79,24 +89,41 @@ function requireGeminiState(ctx: ProviderDomFlowContext): GeminiDomProviderState
   return ctx.state as GeminiDomProviderState;
 }
 
-function parsePromptBaseline(payload: string | undefined, prompt: string): GeminiPromptBaseline {
+function parseSubmissionProbe(
+  payload: string | undefined,
+  prompt: string,
+  dispatchNonce: string,
+): {
+  baseline: GeminiPromptBaseline;
+  sendResult: string;
+  boundNonce: string | null;
+} {
   try {
     const parsed = JSON.parse(payload ?? "{}") as {
       userQueryCount?: unknown;
       responseCount?: unknown;
+      sendResult?: unknown;
+      boundNonce?: unknown;
     };
     if (
       !Number.isSafeInteger(parsed.userQueryCount) ||
       !Number.isSafeInteger(parsed.responseCount) ||
       (parsed.userQueryCount as number) < 0 ||
-      (parsed.responseCount as number) < 0
+      (parsed.responseCount as number) < 0 ||
+      typeof parsed.sendResult !== "string" ||
+      (typeof parsed.boundNonce !== "string" && parsed.boundNonce !== null)
     ) {
-      throw new Error("invalid counts");
+      throw new Error("invalid submission probe");
     }
     return {
-      userQueryCount: parsed.userQueryCount as number,
-      responseCount: parsed.responseCount as number,
-      normalizedPrompt: normalizePromptForIdentity(prompt),
+      baseline: {
+        userQueryCount: parsed.userQueryCount as number,
+        responseCount: parsed.responseCount as number,
+        normalizedPrompt: normalizePromptForIdentity(prompt),
+        dispatchNonce,
+      },
+      sendResult: parsed.sendResult,
+      boundNonce: parsed.boundNonce,
     };
   } catch {
     throw new Error("Failed to capture Gemini DOM baselines before submitting the prompt.");
@@ -109,6 +136,94 @@ function requirePromptBaseline(ctx: ProviderDomFlowContext): GeminiPromptBaselin
     throw new Error("Gemini Deep Think response polling requires a pre-dispatch prompt baseline.");
   }
   return baseline;
+}
+function parseResponseProbe(payload: string | undefined): GeminiRawTurnDescriptor[] | null {
+  try {
+    const parsed = JSON.parse(payload ?? "{}") as { entries?: unknown };
+    if (!Array.isArray(parsed.entries)) return null;
+    const entries: GeminiRawTurnDescriptor[] = [];
+    for (const entry of parsed.entries) {
+      if (
+        !entry ||
+        typeof entry !== "object" ||
+        ((entry as { kind?: unknown }).kind !== "user" &&
+          (entry as { kind?: unknown }).kind !== "response") ||
+        typeof (entry as { postBaseline?: unknown }).postBaseline !== "boolean" ||
+        typeof (entry as { text?: unknown }).text !== "string"
+      ) {
+        return null;
+      }
+      const descriptor = entry as {
+        kind: "user" | "response";
+        postBaseline: boolean;
+        text: string;
+        boundToDispatch?: unknown;
+        completionMarked?: unknown;
+        visibleSpinner?: unknown;
+      };
+      entries.push({
+        kind: descriptor.kind,
+        postBaseline: descriptor.postBaseline,
+        text: descriptor.text,
+        ...(descriptor.kind === "user"
+          ? { boundToDispatch: descriptor.boundToDispatch === true }
+          : {
+              completionMarked: descriptor.completionMarked === true,
+              visibleSpinner: descriptor.visibleSpinner === true,
+            }),
+      });
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+function isCompletedGeminiResponse(
+  entry: GeminiRawTurnDescriptor,
+): entry is GeminiRawTurnDescriptor & {
+  kind: "response";
+} {
+  if (entry.kind !== "response" || entry.completionMarked !== true) return false;
+  const text = entry.text.trim();
+  const lower = text.toLowerCase();
+  return (
+    text.length > 0 &&
+    !lower.includes("generating your response") &&
+    !lower.includes("check back later") &&
+    !lower.includes("i'm on it")
+  );
+}
+
+function findCausallyPairedResponse(
+  entries: GeminiRawTurnDescriptor[],
+  normalizedPrompt: string,
+): GeminiRawTurnDescriptor | null {
+  const boundUserIndexes: number[] = [];
+  for (const [index, entry] of entries.entries()) {
+    if (entry.kind === "user" && entry.boundToDispatch === true) boundUserIndexes.push(index);
+  }
+  if (boundUserIndexes.length !== 1) return null;
+
+  const submittedUserIndex = boundUserIndexes[0];
+  const submittedUser = entries[submittedUserIndex];
+  if (
+    !submittedUser.postBaseline ||
+    normalizePromptForIdentity(submittedUser.text) !== normalizedPrompt
+  ) {
+    return null;
+  }
+
+  for (let responseIndex = entries.length - 1; responseIndex >= 0; responseIndex -= 1) {
+    const response = entries[responseIndex];
+    if (!response.postBaseline || !isCompletedGeminiResponse(response)) continue;
+    for (let index = responseIndex - 1; index >= 0; index -= 1) {
+      if (entries[index].kind !== "user") continue;
+      if (index === submittedUserIndex) return response;
+      break;
+    }
+  }
+  return null;
 }
 
 async function waitForUi(ctx: ProviderDomFlowContext): Promise<void> {
@@ -230,33 +345,51 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
   const sendButtonSelectors = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.sendButton);
   const userQuerySelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
   const responseTurnSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseTurn);
-  const baselinePayload = await ctx.evaluate<string>(
-    `(() => JSON.stringify({
-      userQueryCount: document.querySelectorAll(${userQuerySelector}).length,
-      responseCount: document.querySelectorAll(${responseTurnSelector}).length,
-    }))()`,
-  );
-  requireGeminiState(ctx).geminiPromptBaseline = parsePromptBaseline(baselinePayload, ctx.prompt);
-
-  const sendResult = await ctx.evaluate<string>(
+  const dispatchNonce = `oracle-gemini-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const dispatchNonceLiteral = JSON.stringify(dispatchNonce);
+  const submissionPayload = await ctx.evaluate<string>(
     `(() => {
+      const beforeUserTurns = Array.from(document.querySelectorAll(${userQuerySelector}));
+      const responseCount = document.querySelectorAll(${responseTurnSelector}).length;
       const btn = document.querySelector(${sendButtonSelectors});
+      let sendResult = 'not-found';
       if (btn instanceof HTMLElement) {
         btn.click();
-        return 'clicked';
+        sendResult = 'clicked';
+      } else {
+        const editor = document.querySelector(${inputSelector});
+        if (editor instanceof HTMLElement) {
+          editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+          editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+          sendResult = 'enter';
+        }
       }
-      const editor = document.querySelector(${inputSelector});
-      if (editor instanceof HTMLElement) {
-        editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-        editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
-        return 'enter';
+      const newUserTurns = Array.from(document.querySelectorAll(${userQuerySelector})).filter(
+        (node) => !beforeUserTurns.includes(node),
+      );
+      const boundTurn = newUserTurns.length === 1 ? newUserTurns[0] : null;
+      if (boundTurn) {
+        Object.defineProperty(boundTurn, '__oracleGeminiDispatchNonce', {
+          configurable: true,
+          value: ${dispatchNonceLiteral},
+        });
       }
-      return 'not-found';
+      return JSON.stringify({
+        userQueryCount: beforeUserTurns.length,
+        responseCount,
+        sendResult,
+        boundNonce: boundTurn?.__oracleGeminiDispatchNonce ?? null,
+      });
     })()`,
   );
-  if (sendResult !== "clicked" && sendResult !== "enter") {
+  const submission = parseSubmissionProbe(submissionPayload, ctx.prompt, dispatchNonce);
+  if (submission.sendResult !== "clicked" && submission.sendResult !== "enter") {
     throw new Error("Failed to submit prompt in Gemini Deep Think mode (send control not found).");
   }
+  if (submission.boundNonce !== dispatchNonce) {
+    throw new Error("Failed to bind Gemini response to the newly submitted user turn.");
+  }
+  requireGeminiState(ctx).geminiPromptBaseline = submission.baseline;
   return { status: "attempted" };
 }
 
@@ -277,96 +410,60 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
   while (Date.now() < responseDeadline) {
     const payload = await ctx.evaluate<string>(
       `(() => {
-        const normalize = (value) => String(value ?? '')
-          .toLowerCase()
-          .replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ')
-          .replace(/\`\`\`/g, ' ')
-          .replace(/\`([^\`]*)\`/g, '$1')
-          .replace(/\\s+/g, ' ')
-          .trim();
+        const isVisible = (element) => {
+          if (element.hidden || element.getAttribute?.('aria-hidden') === 'true') return false;
+          const rect = typeof element.getBoundingClientRect === 'function'
+            ? element.getBoundingClientRect()
+            : null;
+          return !rect || (rect.width > 0 && rect.height > 0);
+        };
         const userTurns = Array.from(document.querySelectorAll(${userQuerySel}));
         const responseTurns = Array.from(document.querySelectorAll(${responseTurnSel}));
-        const entries = [
+        const ordered = [
           ...userTurns.map((node, index) => ({
             node,
             kind: 'user',
             postBaseline: index >= ${baseline.userQueryCount},
-            text: node.querySelector(${userQueryTextSel})?.textContent?.trim() ?? node.textContent?.trim() ?? '',
+            text: node.querySelector(${userQueryTextSel})?.textContent ?? node.textContent ?? '',
+            boundToDispatch: node.__oracleGeminiDispatchNonce === ${JSON.stringify(baseline.dispatchNonce)},
           })),
-          ...responseTurns.map((node, index) => {
-            const text = node.querySelector(${responseTextSel})?.textContent?.trim() ?? '';
-            const lower = text.toLowerCase();
-            return {
-              node,
-              kind: 'response',
-              postBaseline: index >= ${baseline.responseCount},
-              text,
-              completed: Boolean(node.querySelector(${responseCompleteSel})) && text.length > 0 &&
-                !lower.includes('generating your response') &&
-                !lower.includes('check back later') &&
-                !lower.includes("i'm on it"),
-            };
-          }),
+          ...responseTurns.map((node, index) => ({
+            node,
+            kind: 'response',
+            postBaseline: index >= ${baseline.responseCount},
+            text: node.querySelector(${responseTextSel})?.textContent ?? '',
+            completionMarked: Boolean(node.querySelector(${responseCompleteSel})),
+            visibleSpinner: Array.from(node.querySelectorAll(${spinnerSel})).some(isVisible),
+          })),
         ].sort((left, right) => {
           if (left.node === right.node) return 0;
           return left.node.compareDocumentPosition(right.node) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
         });
-        const completed = entries
-          .filter((entry) => entry.kind === 'response' && entry.postBaseline && entry.completed)
-          .reverse()
-          .find((entry) => {
-            for (let index = entries.indexOf(entry) - 1; index >= 0; index -= 1) {
-              const preceding = entries[index];
-              if (preceding.kind !== 'user') continue;
-              return preceding.postBaseline && normalize(preceding.text) === ${JSON.stringify(baseline.normalizedPrompt)};
-            }
-            return false;
-          });
-        if (completed) {
-          return JSON.stringify({ status: 'done', text: completed.text, causalPair: true });
-        }
-        const postBaselineResponses = entries.filter(
-          (entry) => entry.kind === 'response' && entry.postBaseline,
-        );
-        const lastTurn = postBaselineResponses[postBaselineResponses.length - 1]?.node;
-        const visibleSpinners = Array.from(lastTurn?.querySelectorAll(${spinnerSel}) ?? []).filter((spinner) => {
-          if (spinner.hidden || spinner.getAttribute?.('aria-hidden') === 'true') return false;
-          const rect = typeof spinner.getBoundingClientRect === 'function'
-            ? spinner.getBoundingClientRect()
-            : null;
-          return !rect || (rect.width > 0 && rect.height > 0);
-        });
-        return JSON.stringify({
-          status: postBaselineResponses.length === 0 ? 'waiting' : visibleSpinners.length > 0 ? 'generating' : 'streaming',
-          causalPair: false,
-        });
+        return JSON.stringify({ entries: ordered.map(({ node, ...entry }) => entry) });
       })()`,
     );
 
-    try {
-      const parsed = JSON.parse(payload ?? "{}") as {
-        status?: string;
-        text?: string;
-        causalPair?: unknown;
-      };
-      if (
-        parsed.causalPair === true &&
-        parsed.status === "done" &&
-        typeof parsed.text === "string" &&
-        parsed.text.length > 0
-      ) {
-        responseText = parsed.text;
+    const entries = parseResponseProbe(payload);
+    if (entries) {
+      const pairedResponse = findCausallyPairedResponse(entries, baseline.normalizedPrompt);
+      if (pairedResponse) {
+        responseText = pairedResponse.text.trim();
         break;
       }
+      const postBaselineResponses = entries.filter(
+        (entry) => entry.kind === "response" && entry.postBaseline,
+      );
+      const status =
+        postBaselineResponses.length === 0
+          ? "waiting"
+          : postBaselineResponses[postBaselineResponses.length - 1]?.visibleSpinner
+            ? "generating"
+            : "streaming";
       const now = Date.now();
       if (now - lastLog > 10_000) {
-        const status =
-          parsed.causalPair === true ? (parsed.status ?? "unknown") : "awaiting causal pair";
         ctx.log?.(`[gemini-web] Deep Think still generating... (${status})`);
         lastLog = now;
       }
-    } catch {
-      // Ignore malformed DOM probes while polling.
     }
     await ctx.delay(3_000);
   }
