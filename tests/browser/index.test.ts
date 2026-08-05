@@ -153,7 +153,7 @@ describe("local acquisition durability", () => {
       await expect(
         isolatedRunBrowserMode({
           prompt: "test",
-          config: { cookieSync: false },
+          config: { cookieSync: false, manualLogin: false },
           runtimeHintCb: async (runtime) => {
             runtimeHints.push(structuredClone(runtime));
           },
