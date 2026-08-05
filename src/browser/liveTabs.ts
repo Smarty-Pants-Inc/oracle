@@ -10,7 +10,10 @@ import {
   STOP_BUTTON_SELECTOR,
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import {
+  buildConversationTurnIdentityExpression,
+  buildConversationTurnListExpression,
+} from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 
@@ -160,6 +163,7 @@ function buildTabInspectionExpression(): string {
       const STOP_BUTTON_SELECTOR = ${stopSelectorLiteral};
       const LOGIN_CTA = ${LOGIN_CTA_PATTERN.toString()};
       const normalize = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
+      ${buildConversationTurnIdentityExpression()}
       const isVisible = (node) => {
         if (!(node instanceof Element)) return false;
         const style = window.getComputedStyle(node);
@@ -186,21 +190,9 @@ function buildTabInspectionExpression(): string {
       const promptNode = firstVisible(INPUT_SELECTORS);
       const promptReady = Boolean(promptNode);
       const turns = ${buildConversationTurnListExpression()};
-      const assistantTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
-        if (role === 'assistant') return true;
-        return Boolean(turn.querySelector(ASSISTANT_ROLE_SELECTOR));
-      });
-      const fallbackUserTurns = Array.from(
-        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
-      );
-      const userTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
-        if (role === 'user') return true;
-        return Boolean(
-          turn.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
-        );
-      });
+      const assistantTurns = turns.filter(isAssistantTurn);
+      const fallbackUserTurns = Array.from(document.querySelectorAll(USER_TURN_SELECTOR));
+      const userTurns = turns.filter(isUserTurn);
       const answerNode = ANSWER_SELECTORS
         .map((selector) => document.querySelectorAll(selector))
         .find((matches) => matches && matches.length > 0);
@@ -219,22 +211,6 @@ function buildTabInspectionExpression(): string {
       const lastUserContainer = lastUserTurn
         ? turns.find((turn) => turn === lastUserTurn || turn.contains?.(lastUserTurn))
         : null;
-      const readTurnId = (node) => {
-        const testId = node?.getAttribute?.('data-testid');
-        const value =
-          node?.getAttribute?.('data-turn-id') ||
-          node?.dataset?.turnId ||
-          (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
-          (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
-        return typeof value === 'string' && value.trim() ? value.trim() : null;
-      };
-      const readMessageId = (node) => {
-        const messageNode = node?.matches?.('[data-message-id]')
-          ? node
-          : node?.querySelector?.('[data-message-id]');
-        const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
-        return typeof value === 'string' && value.trim() ? value.trim() : null;
-      };
       const lastUserTurnId = readTurnId(lastUserContainer ?? lastUserTurn);
       const lastUserMessageId = readMessageId(lastUserContainer ?? lastUserTurn);
       const answerNodes = rawAnswerNodes.filter(

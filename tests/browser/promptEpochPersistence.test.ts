@@ -32,12 +32,32 @@ function browserRuntimeFromError(error: unknown): BrowserRuntimeMetadata | undef
   return runtime && typeof runtime === "object" ? (runtime as BrowserRuntimeMetadata) : undefined;
 }
 
+type PromptResetPersistenceTransition = {
+  from: BrowserRuntimeMetadata;
+  to: BrowserRuntimeMetadata;
+};
+
+function isPromptResetPersistenceTransition(
+  previous: BrowserRuntimeMetadata | undefined,
+  next: BrowserRuntimeMetadata,
+): previous is BrowserRuntimeMetadata {
+  const previousGeneration = previous?.recoveryCleanupResources?.[0]?.acquisition?.generationId;
+  return (
+    previous?.promptEpoch?.status === "committed" &&
+    next.promptEpoch === undefined &&
+    typeof previousGeneration === "string" &&
+    previousGeneration.length > 0 &&
+    next.recoveryCleanupResources?.[0]?.acquisition?.generationId === previousGeneration
+  );
+}
+
 async function runTwoTurnResetFailure(transport: Transport) {
   const turns: FakeTurn[] = [];
   let composerText = "";
-  let sawCommittedEpoch = false;
+  let lastDurablyPersistedRuntime: BrowserRuntimeMetadata | undefined;
+  const durablyPersistedRuntimes: BrowserRuntimeMetadata[] = [];
   let committedRuntime: BrowserRuntimeMetadata | undefined;
-  let rejectedResetRuntime: BrowserRuntimeMetadata | undefined;
+  let rejectedResetTransition: PromptResetPersistenceTransition | undefined;
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const killChrome = vi.fn().mockResolvedValue({ status: "stopped", pid: 4321, signal: "SIGTERM" });
   const closeConnection = vi.fn().mockResolvedValue(undefined);
@@ -212,6 +232,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
     closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/profileState.js", () => ({
+    captureProfileDirectoryIdentity,
     cleanupStaleProfileState: vi.fn().mockResolvedValue(undefined),
     acquireProfileRunLock: vi.fn(),
     isSafeChromeTerminationOutcome: vi.fn(() => true),
@@ -338,12 +359,13 @@ async function runTwoTurnResetFailure(transport: Transport) {
         archiveConversations: "never",
       },
       runtimeHintCb: async (runtime) => {
-        if (sawCommittedEpoch && runtime.promptEpoch === undefined) {
-          rejectedResetRuntime = runtime;
+        if (isPromptResetPersistenceTransition(lastDurablyPersistedRuntime, runtime)) {
+          rejectedResetTransition ??= { from: lastDurablyPersistedRuntime, to: runtime };
           throw new Error("simulated prompt-two reset persistence failure");
         }
+        lastDurablyPersistedRuntime = runtime;
+        durablyPersistedRuntimes.push(runtime);
         if (runtime.promptEpoch?.status === "committed") {
-          sawCommittedEpoch = true;
           committedRuntime = runtime;
         }
       },
@@ -352,7 +374,8 @@ async function runTwoTurnResetFailure(transport: Transport) {
     return {
       error,
       committedRuntime,
-      rejectedResetRuntime,
+      rejectedResetTransition,
+      durablyPersistedRuntimes,
       clearPromptComposer,
       insertText,
       closeChromeTarget,
@@ -402,8 +425,36 @@ describe("semantic prompt epoch persistence", () => {
           conversationId,
         },
       });
-      expect(fixture.rejectedResetRuntime).toMatchObject({
-        promptEpoch: undefined,
+      expect(fixture.rejectedResetTransition).toMatchObject({
+        from: {
+          promptEpoch: fixture.committedRuntime?.promptEpoch,
+        },
+        to: {
+          promptEpoch: undefined,
+        },
+      });
+      expect(
+        fixture.rejectedResetTransition?.to.recoveryCleanupResources?.[0]?.acquisition
+          ?.generationId,
+      ).toBe(
+        fixture.rejectedResetTransition?.from.recoveryCleanupResources?.[0]?.acquisition
+          ?.generationId,
+      );
+      const committedPersistenceIndex = fixture.durablyPersistedRuntimes.findIndex(
+        (persistedRuntime) => persistedRuntime.promptEpoch?.status === "committed",
+      );
+      expect(committedPersistenceIndex).toBeGreaterThan(0);
+      expect(
+        fixture.durablyPersistedRuntimes
+          .slice(0, committedPersistenceIndex)
+          .some(
+            (persistedRuntime) =>
+              persistedRuntime.recoveryCleanupResources?.[0]?.acquisition?.generationId !==
+              undefined,
+          ),
+      ).toBe(true);
+      expect(fixture.durablyPersistedRuntimes.at(-1)).toMatchObject({
+        promptEpoch: fixture.committedRuntime?.promptEpoch,
       });
       const promptPersistenceError = (fixture.error as Error & { cause?: unknown }).cause;
       expect(fixture.error).toMatchObject({

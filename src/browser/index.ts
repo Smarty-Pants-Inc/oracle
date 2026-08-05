@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -67,14 +68,18 @@ import {
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
-import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
+import type {
+  BrowserRecoveryCleanupMetadata,
+  BrowserRecoveryCleanupResourceMetadata,
+} from "../sessionManager.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.js";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
-import type { ProfileRunLock } from "./profileState.js";
+import type { ProfileDirectoryIdentity, ProfileRunLock } from "./profileState.js";
 import {
   acquireProfileRunLock,
+  captureProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
   writeOracleChromeOwner,
@@ -987,6 +992,32 @@ function unpublishedCleanupPendingError(
   );
 }
 
+type BrowserAcquisitionPendingResource = "tab-lease" | "chrome-process" | "chrome-target";
+
+async function persistCompletedUnpublishedFinalization(
+  finalization: BrowserCaptureFinalizationResult | null | undefined,
+  runtimeHintCb: BrowserRunOptions["runtimeHintCb"],
+  modelSelectionEvidence: BrowserModelSelectionEvidence | undefined,
+  escapingFailure?: unknown,
+): Promise<void> {
+  if (finalization?.status !== "completed" || !runtimeHintCb) return;
+  try {
+    await runtimeHintCb(finalization.runtime, modelSelectionEvidence);
+  } catch (error) {
+    const persistenceError = error instanceof Error ? error.message : String(error);
+    throw new BrowserAutomationError(
+      `Browser cleanup completed, but its final runtime could not be persisted: ${persistenceError}`,
+      {
+        stage: "browser-capture-finalization",
+        code: "completed-cleanup-persistence-failed",
+        runtime: finalization.runtime,
+        persistenceError,
+      },
+      escapingFailure ?? error,
+    );
+  }
+}
+
 export function maybeArchiveCompletedConversationForTest(
   args: Parameters<typeof maybeArchiveCompletedConversation>[0],
 ): Promise<BrowserArchiveResult> {
@@ -1442,17 +1473,88 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   } else {
     logger(`Created temporary Chrome profile at ${userDataDir}`);
   }
+  const acquisitionProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
+  const acquisitionGenerationId = randomUUID();
+  const acquisitionLeaseId = manualLogin ? randomUUID() : undefined;
+  const acquisitionTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
+  const buildLocalAcquisitionRuntime = (
+    pendingResource: BrowserAcquisitionPendingResource | undefined,
+    owner?: ManualChromeOwner | null,
+  ): BrowserRuntimeMetadata => {
+    const acquired = owner?.chrome;
+    const acquisitionOwnsTarget = pendingResource === "chrome-target";
+    const profileKind = manualLogin ? "manual-login" : usingCopiedProfile ? "copied" : "temporary";
+    const resource: BrowserRecoveryCleanupResourceMetadata = {
+      chromePid: acquired?.pid,
+      chromeProcessIdentity: acquired?.processIdentity,
+      profileDirectoryIdentity:
+        acquired?.processIdentity?.profileDirectory ?? acquisitionProfileIdentity,
+      chromePort: acquired?.port,
+      chromeHost: acquired?.host ?? "127.0.0.1",
+      chromeProfileRoot: userDataDir,
+      userDataDir,
+      tabLease:
+        manualLogin && acquisitionLeaseId
+          ? {
+              id: tabLease?.id ?? acquisitionLeaseId,
+              profileDirectory: tabLease?.profileDirectory ?? acquisitionProfileIdentity,
+            }
+          : undefined,
+      acquisition: {
+        generationId: acquisitionGenerationId,
+        ...(pendingResource ? { pendingResource } : {}),
+        ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
+      },
+      recoveryCleanup: {
+        ownsTarget: acquisitionOwnsTarget,
+        profileKind,
+        keepBrowser: owner
+          ? shouldPreserveLocalOwnerForRecovery({
+              effectiveKeepBrowser,
+              manualLogin,
+              ownerSource: owner.source,
+            })
+          : true,
+        closeOwnedTargetOnComplete: acquisitionOwnsTarget,
+      },
+    };
+    return {
+      browserTransport: "cdp",
+      chromePid: acquired?.pid,
+      chromeProcessIdentity: acquired?.processIdentity,
+      chromePort: acquired?.port,
+      chromeHost: acquired?.host ?? "127.0.0.1",
+      chromeProfileRoot: userDataDir,
+      userDataDir,
+      recoveryCleanupResources: [resource],
+      recoveryCleanupResult: { status: "pending" },
+      controllerPid: process.pid,
+    };
+  };
+  const persistLocalAcquisition = async (
+    pendingResource: BrowserAcquisitionPendingResource | undefined,
+    owner?: ManualChromeOwner | null,
+  ): Promise<void> => {
+    if (!runtimeHintCb) return;
+    await runtimeHintCb(
+      buildLocalAcquisitionRuntime(pendingResource, owner),
+      modelSelectionEvidence,
+    );
+  };
 
+  await persistLocalAcquisition(manualLogin ? "tab-lease" : "chrome-process");
   if (manualLogin) {
     tabLease = await acquireBrowserTabLease(userDataDir, {
       maxConcurrentTabs: config.maxConcurrentTabs,
       timeoutMs: config.timeoutMs,
       logger,
       sessionId: options.sessionId,
+      leaseId: acquisitionLeaseId,
     });
+    await persistLocalAcquisition("chrome-process");
   }
 
-  let acquiredChrome: ManualChromeOwner;
+  let acquiredChrome: ManualChromeOwner | null = null;
   try {
     if (manualLogin) {
       acquiredChrome = await acquireManualChromeOwner(
@@ -1476,20 +1578,49 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         source: "launched",
       };
     }
+    await persistLocalAcquisition(
+      config.browserTabRef ? undefined : "chrome-target",
+      acquiredChrome,
+    );
   } catch (error) {
     if (tabLease) {
       const handle = tabLease;
       tabLease = null;
       await handle.release().catch(() => undefined);
     }
-    if (usingCopiedProfile) {
+    if (acquiredChrome) {
+      if (manualLogin) {
+        await settleManualChromeOwner(userDataDir, acquiredChrome, logger).catch(() => undefined);
+      } else {
+        const termination = await acquiredChrome.chrome.kill().catch((terminationError) => ({
+          status: "unsafe" as const,
+          pid: acquiredChrome?.chrome.pid ?? -1,
+          reason:
+            terminationError instanceof Error ? terminationError.message : String(terminationError),
+        }));
+        if (isSafeChromeTerminationOutcome(termination)) {
+          await removeProfileDirectoryIfIdentityMatches(
+            userDataDir,
+            acquiredChrome.processIdentity.profileDirectory,
+          ).catch(() => false);
+        } else {
+          logger(
+            `[browser] Chrome acquisition cleanup was not safely confirmed; preserving ${userDataDir}: ${termination.reason}`,
+          );
+        }
+      }
+    } else if (usingCopiedProfile) {
       logger(
         `[browser] Copy-profile acquisition failed without a confirmed safe Chrome termination outcome; preserving ${userDataDir}.`,
       );
     }
     throw error;
   }
-  const { chrome, source: chromeOwnerSource } = acquiredChrome;
+  if (!acquiredChrome) {
+    throw new Error("Chrome acquisition completed without an owner record.");
+  }
+  const acquiredChromeOwner = acquiredChrome;
+  const { chrome, source: chromeOwnerSource } = acquiredChromeOwner;
   const chromeHost = chrome.host ?? "127.0.0.1";
   if (tabLease) {
     await tabLease.update({
@@ -1515,7 +1646,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       {
         chromePid: chrome.pid,
         chromeProcessIdentity: chrome.processIdentity,
-        profileDirectoryIdentity: chrome.processIdentity?.profileDirectory,
+        profileDirectoryIdentity:
+          chrome.processIdentity?.profileDirectory ?? acquisitionProfileIdentity,
         chromePort: chrome.port,
         chromeHost,
         chromeProfileRoot: userDataDir,
@@ -1525,6 +1657,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         tabLease: tabLease
           ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
           : undefined,
+        acquisition: {
+          generationId: acquisitionGenerationId,
+          ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
+        },
         recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
       },
     ],
@@ -1689,7 +1825,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           return false;
         }
         try {
-          const settlement = await settleManualChromeOwner(userDataDir, acquiredChrome, logger);
+          const settlement = await settleManualChromeOwner(
+            userDataDir,
+            acquiredChromeOwner,
+            logger,
+          );
           if (settlement.status === "unsafe") {
             teardownError = settlement.reason;
             return false;
@@ -1834,15 +1974,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       } else {
         const strictTabIsolation = Boolean(manualLogin && chromeOwnerSource !== "launched");
         const devtoolsRetries = manualLogin ? 6 : 0;
-        const connection = await connectWithNewTab(chrome.port, logger, "about:blank", chromeHost, {
-          fallbackToDefault: !strictTabIsolation,
-          retries: devtoolsRetries,
-          retryDelayMs: 500,
-        });
+        const connection = await connectWithNewTab(
+          chrome.port,
+          logger,
+          acquisitionTargetMarkerUrl,
+          chromeHost,
+          {
+            fallbackToDefault: !strictTabIsolation,
+            retries: devtoolsRetries,
+            retryDelayMs: 500,
+          },
+        );
         client = connection.client;
         isolatedTargetId = connection.targetId ?? null;
-        ownsTarget = true;
+        lastTargetId = connection.targetId ?? undefined;
+        ownsTarget = Boolean(connection.targetId);
       }
+      await runtimeHintCb?.(buildLocalRuntimeMetadata(), modelSelectionEvidence);
       if (tabLease && isolatedTargetId) {
         await tabLease.update({
           chromeHost,
@@ -3135,6 +3283,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     removeDialogHandler?.();
     removeTerminationHooks?.();
     const finalization = await lifecycle.settleIfUnpublished();
+    await persistCompletedUnpublishedFinalization(
+      finalization,
+      runtimeHintCb,
+      modelSelectionEvidence,
+      escapingFailure,
+    );
     if (finalization?.status === "pending") {
       // Cleanup authority deliberately supersedes the run outcome; the original failure is its cause.
       await Promise.reject(unpublishedCleanupPendingError(finalization, escapingFailure));
@@ -3361,23 +3515,36 @@ async function runRemoteBrowserMode(
   const remoteLeaseProfileDir = config.browserTabRef
     ? null
     : resolveRemoteTabLeaseProfileDir(config);
+  const acquisitionGenerationId = randomUUID();
+  const acquisitionLeaseId = randomUUID();
+  const acquisitionTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
+  let remoteLeaseProfileIdentity: ProfileDirectoryIdentity | undefined;
 
-  function buildRemoteRecoveryCleanupMetadata(): BrowserRecoveryCleanupMetadata {
+  function buildRemoteRecoveryCleanupMetadata(
+    pendingResource?: BrowserAcquisitionPendingResource,
+  ): BrowserRecoveryCleanupMetadata {
+    const authorityOwnsTarget = ownsTarget || pendingResource === "chrome-target";
     return {
-      ownsTarget,
+      ownsTarget: authorityOwnsTarget,
       profileKind: "none",
       keepBrowser: Boolean(config.keepBrowser),
-      closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
-        runStatus,
-        ownsTarget,
-        keepBrowser: Boolean(config.keepBrowser),
-        closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
-        preserveForRecovery: preserveBrowserOnError,
-      }),
+      closeOwnedTargetOnComplete:
+        pendingResource === "chrome-target"
+          ? true
+          : shouldCloseOwnedRunTargetAfterRun({
+              runStatus,
+              ownsTarget: authorityOwnsTarget,
+              keepBrowser: Boolean(config.keepBrowser),
+              closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+              preserveForRecovery: preserveBrowserOnError,
+            }),
     };
   }
 
-  const buildRemoteRuntimeBase = (tabUrl = lastUrl): BrowserRuntimeMetadata => ({
+  const buildRemoteRuntimeBase = (
+    tabUrl = lastUrl,
+    pendingResource?: BrowserAcquisitionPendingResource,
+  ): BrowserRuntimeMetadata => ({
     browserTransport: "cdp",
     chromePort: port,
     chromeHost: host,
@@ -3392,16 +3559,26 @@ async function runRemoteBrowserMode(
         chromeHost: host,
         chromeBrowserWSEndpoint: browserWSEndpoint,
         chromeProfileRoot,
-        profileDirectoryIdentity: tabLease?.profileDirectory,
+        profileDirectoryIdentity: tabLease?.profileDirectory ?? remoteLeaseProfileIdentity,
         userDataDir: remoteLeaseProfileDir ?? undefined,
         chromeTargetId: remoteTargetId ?? undefined,
         conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
-        tabLease: tabLease
-          ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
-          : undefined,
-        recoveryCleanup: buildRemoteRecoveryCleanupMetadata(),
+        tabLease:
+          remoteLeaseProfileDir && remoteLeaseProfileIdentity
+            ? {
+                id: tabLease?.id ?? acquisitionLeaseId,
+                profileDirectory: tabLease?.profileDirectory ?? remoteLeaseProfileIdentity,
+              }
+            : undefined,
+        acquisition: {
+          generationId: acquisitionGenerationId,
+          ...(pendingResource ? { pendingResource } : {}),
+          ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
+        },
+        recoveryCleanup: buildRemoteRecoveryCleanupMetadata(pendingResource),
       },
     ],
+    recoveryCleanupResult: { status: "pending" },
     controllerPid: process.pid,
   });
   const runtimeHintCb = options.runtimeHintCb;
@@ -3418,6 +3595,17 @@ async function runRemoteBrowserMode(
   });
   const buildRemoteRuntimeMetadata = (tabUrl = lastUrl): BrowserRuntimeMetadata =>
     lifecycle.runtime(buildRemoteRuntimeBase(tabUrl));
+  const persistRemoteRuntime = async (
+    pendingResource?: BrowserAcquisitionPendingResource,
+  ): Promise<void> => {
+    if (!runtimeHintCb) return;
+    await runtimeHintCb(
+      pendingResource
+        ? buildRemoteRuntimeBase(lastUrl, pendingResource)
+        : buildRemoteRuntimeMetadata(),
+      modelSelectionEvidence,
+    );
+  };
   const emitRuntimeHint = async () => {
     if (!runtimeHintCb) return;
     try {
@@ -3536,6 +3724,8 @@ async function runRemoteBrowserMode(
   try {
     if (remoteLeaseProfileDir) {
       await mkdir(remoteLeaseProfileDir, { recursive: true });
+      remoteLeaseProfileIdentity = await captureProfileDirectoryIdentity(remoteLeaseProfileDir);
+      await persistRemoteRuntime("tab-lease");
       tabLease = await acquireBrowserTabLease(remoteLeaseProfileDir, {
         maxConcurrentTabs: config.maxConcurrentTabs,
         timeoutMs: config.timeoutMs,
@@ -3543,7 +3733,9 @@ async function runRemoteBrowserMode(
         sessionId: options.sessionId,
         chromeHost: host,
         chromePort: port,
+        leaseId: acquisitionLeaseId,
       });
+      await persistRemoteRuntime("chrome-target");
     }
     if (config.browserTabRef) {
       const attached = await connectToExistingChatGptTab({
@@ -3564,7 +3756,7 @@ async function runRemoteBrowserMode(
         host,
         port,
         logger,
-        "about:blank",
+        acquisitionTargetMarkerUrl,
         browserWSEndpoint,
         {
           approvalWaitMs: config.attachRunning && browserWSEndpoint ? 20_000 : undefined,
@@ -3575,6 +3767,7 @@ async function runRemoteBrowserMode(
       ownsTarget = connection.ownership === "created";
       attachedExistingTab = connection.ownership === "attached";
     }
+    await persistRemoteRuntime();
     if (tabLease && remoteTargetId) {
       await tabLease.update({
         chromeHost: host,
@@ -3582,7 +3775,6 @@ async function runRemoteBrowserMode(
         chromeTargetId: remoteTargetId,
       });
     }
-    await emitRuntimeHint();
     client.on("disconnect", () => {
       connectionClosedUnexpectedly = true;
       void getDisconnectAssessment();
@@ -4475,6 +4667,12 @@ async function runRemoteBrowserMode(
     }
     removeDialogHandler?.();
     const finalization = await lifecycle.settleIfUnpublished();
+    await persistCompletedUnpublishedFinalization(
+      finalization,
+      runtimeHintCb,
+      modelSelectionEvidence,
+      escapingFailure,
+    );
     if (finalization?.status === "pending") {
       // Unpublished remote captures must retain the same cleanup authority as local captures.
       await Promise.reject(unpublishedCleanupPendingError(finalization, escapingFailure));

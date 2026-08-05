@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { normalizePromptForIdentity } from "../../src/browser/actions/promptComposer.js";
+import {
+  normalizePromptForIdentity,
+  promptIdentitySha256,
+  type PromptCommitVerification,
+} from "../../src/browser/actions/promptComposer.js";
 import { geminiDeepThinkDomProvider } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 
 type FixtureTurn = {
@@ -17,12 +21,14 @@ type FixtureTurn = {
 type GeminiState = Record<string, unknown> & {
   inputTimeoutMs?: number;
   timeoutMs?: number;
+  geminiConversationId?: string;
   geminiPromptBaseline?: {
     userQueryCount: number;
     responseCount: number;
     normalizedPrompt: string;
     userStableId: string;
   };
+  geminiPromptCommitVerification?: PromptCommitVerification;
   geminiResponseStableId?: string;
 };
 
@@ -162,6 +168,7 @@ function createContext(
   prompt = "New request",
 ) {
   const { document, FixtureMutationObserver } = createFixtureDocument(turns, onSend);
+  state.geminiConversationId ??= "gemini-conversation";
   return {
     prompt,
     state,
@@ -235,7 +242,15 @@ describe("geminiDeepThinkDomProvider", () => {
     });
 
     await expect(geminiDeepThinkDomProvider.submitPrompt(ctx)).resolves.toEqual({
-      status: "attempted",
+      status: "committed",
+      verification: {
+        committedTurns: 1,
+        promptSha256: promptIdentitySha256("New request"),
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "data-message-id:user-current",
+        verifiedUserMessageId: "data-message-id:user-current",
+        conversationId: "gemini-conversation",
+      },
     });
     expect(observerWasActiveAtSend).toBe(true);
     expect(state.geminiPromptBaseline).toEqual({
@@ -244,6 +259,12 @@ describe("geminiDeepThinkDomProvider", () => {
       normalizedPrompt: "new request",
       userStableId: "data-message-id:user-current",
     });
+    expect(state.geminiPromptCommitVerification).toEqual(
+      expect.objectContaining({
+        promptSha256: promptIdentitySha256("New request"),
+        verifiedUserTurnId: "data-message-id:user-current",
+      }),
+    );
   });
 
   it("recovers the exact dispatched turn after DOM replacement by stable provider identity", async () => {

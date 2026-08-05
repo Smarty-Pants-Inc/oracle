@@ -116,6 +116,7 @@ export async function acquireBrowserTabLease(
     sessionId?: string;
     chromeHost?: string;
     chromePort?: number;
+    leaseId?: string;
   },
   deps: BrowserTabLeaseDeps = {},
 ): Promise<BrowserTabLease> {
@@ -143,7 +144,7 @@ export async function acquireBrowserTabLease(
     );
   }
   const authority = await captureTabLeaseAuthority(profileDir, { create: true });
-  const leaseId = randomUUID();
+  const leaseId = options.leaseId ?? randomUUID();
   const startedAt = now();
   let warned = false;
   let lastHeartbeatAt = 0;

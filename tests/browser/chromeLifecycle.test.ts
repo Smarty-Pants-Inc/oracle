@@ -287,6 +287,88 @@ describe("hidden macOS Chrome launch", () => {
       verifyListeningPortOwnedByProcessForTest(4321, 64305, differentOwner),
     ).resolves.toBe(false);
   });
+
+  test("binds a reusable endpoint to the exact browser process generation", async () => {
+    // Dynamic import is required so Vitest's hoisted CDP mock initializes before module evaluation.
+    const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
+    const identity = processIdentity(
+      path.join(os.tmpdir(), "oracle-reused-profile"),
+      4321,
+      "11111111-1111-4111-8111-111111111113",
+    );
+    const browserWSEndpoint = "ws://127.0.0.1:64305/devtools/browser/exact-generation";
+    const discoverEndpoint = vi.fn(async () => ({ port: 64305, browserWSEndpoint }));
+    const inspectProcessIdentity = vi.fn(async () => "current" as const);
+    const resolveListeningPid = vi.fn(async () => identity.pid);
+    const mismatchedClientClose = vi.fn(async () => undefined);
+    const mismatchedClient = {
+      Browser: { getVersion: vi.fn(async () => ({})) },
+      SystemInfo: {
+        getProcessInfo: vi.fn(async () => ({
+          processInfo: [{ id: 9999, type: "browser" }],
+        })),
+      },
+      close: mismatchedClientClose,
+    };
+
+    await expect(
+      retainChromeEndpointAuthority(
+        {
+          host: "127.0.0.1",
+          port: 64305,
+          userDataDir: identity.profileDirectory.canonicalPath,
+          processIdentity: identity,
+        },
+        {
+          discoverEndpoint,
+          connectBrowser: vi.fn(async () => mismatchedClient as never),
+          inspectProcessIdentity,
+          resolveListeningPid,
+        },
+      ),
+    ).rejects.toThrow(/not bound to the captured browser process generation/i);
+    expect(mismatchedClientClose).toHaveBeenCalledOnce();
+
+    const exactClientClose = vi.fn(async () => undefined);
+    const exactClient = {
+      Browser: {
+        getVersion: vi.fn(async () => ({})),
+        close: vi.fn(async () => undefined),
+      },
+      SystemInfo: {
+        getProcessInfo: vi.fn(async () => ({
+          processInfo: [{ id: identity.pid, type: "browser" }],
+        })),
+      },
+      close: exactClientClose,
+    };
+    const authority = await retainChromeEndpointAuthority(
+      {
+        host: "127.0.0.1",
+        port: 64305,
+        userDataDir: identity.profileDirectory.canonicalPath,
+        processIdentity: identity,
+      },
+      {
+        discoverEndpoint,
+        connectBrowser: vi.fn(async () => exactClient as never),
+        inspectProcessIdentity,
+        resolveListeningPid,
+      },
+    );
+
+    expect(authority.browserWSEndpoint).toBe(browserWSEndpoint);
+    expect(inspectProcessIdentity).toHaveBeenCalledWith(
+      identity.profileDirectory.canonicalPath,
+      identity,
+    );
+    if (process.platform === "darwin") {
+      expect(resolveListeningPid).toHaveBeenCalledWith(64305);
+    }
+    await expect(authority.release()).resolves.toBeUndefined();
+    await expect(authority.release()).resolves.toBeUndefined();
+    expect(exactClientClose).toHaveBeenCalledOnce();
+  });
 });
 
 describe("stable Chrome process authority", () => {

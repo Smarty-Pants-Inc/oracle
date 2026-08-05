@@ -440,6 +440,43 @@ describe("RemoteTransactionStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-reconcile-store-"));
     const runtimeToken = "1".repeat(64);
     const preAuthorityToken = "2".repeat(64);
+    const acquisitionToken = "3".repeat(64);
+    const acquisitionRuntime = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeProfileRoot: "/tmp/oracle-browser-acquisition",
+      userDataDir: "/tmp/oracle-browser-acquisition",
+      recoveryCleanupResources: [
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromeProfileRoot: "/tmp/oracle-browser-acquisition",
+          userDataDir: "/tmp/oracle-browser-acquisition",
+          tabLease: {
+            id: "planned-lease-id",
+            profileDirectory: {
+              version: 1 as const,
+              platform: process.platform,
+              canonicalPath: "/tmp/oracle-browser-acquisition",
+              device: "1",
+              inode: "2",
+            },
+          },
+          acquisition: {
+            generationId: "acquisition-generation",
+            pendingResource: "tab-lease" as const,
+            targetMarkerUrl: "about:blank#oracle-acquisition=acquisition-generation",
+          },
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "manual-login" as const,
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" as const },
+    };
     try {
       const first = await RemoteTransactionStore.open({
         directory: root,
@@ -448,6 +485,8 @@ describe("RemoteTransactionStore", () => {
       await begin(first, runtimeToken);
       await first.journalRuntime(runtimeToken, runtime);
       await begin(first, preAuthorityToken);
+      await begin(first, acquisitionToken);
+      await first.journalRuntime(acquisitionToken, acquisitionRuntime);
 
       const restarted = await RemoteTransactionStore.open({
         directory: root,
@@ -470,10 +509,21 @@ describe("RemoteTransactionStore", () => {
           state: "failed",
           hadRuntimeAuthority: false,
         },
+        {
+          transactionToken: acquisitionToken,
+          previousControllerGeneration: "controller-generation-1",
+          state: "recoverable-error",
+          hadRuntimeAuthority: true,
+        },
       ]);
       await expect(restarted.read(runtimeToken)).resolves.toMatchObject({
         state: "recoverable-error",
         runtime,
+        restartRecovery: { previousControllerGeneration: "controller-generation-1" },
+      });
+      await expect(restarted.read(acquisitionToken)).resolves.toMatchObject({
+        state: "recoverable-error",
+        runtime: acquisitionRuntime,
         restartRecovery: { previousControllerGeneration: "controller-generation-1" },
       });
       await expect(restarted.read(preAuthorityToken)).resolves.toMatchObject({

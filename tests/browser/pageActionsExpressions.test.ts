@@ -216,12 +216,16 @@ describe("browser automation expressions", () => {
 
   test("markdown fallback filters user turns and respects assistant indicators", () => {
     const expression = buildMarkdownFallbackExtractorForTest("2");
-    expect(expression).not.toContain("const MIN_TURN_INDEX = (MIN_TURN_INDEX");
+
+    // Role recognition comes from the canonical conversation-turn helper. The fallback must
+    // apply that helper when excluding user markdown and when preferring assistant markdown.
     expect(expression).toContain("const __minTurn");
-    expect(expression).toContain("role !== 'user'");
-    expect(expression).toContain("copy-turn-action-button");
-    expect(expression).toContain(CONVERSATION_TURN_SELECTOR);
-    expect(expression).toContain("turn.contains?.(node)");
+    expect(expression).toContain(
+      `const ASSISTANT_TURN_SELECTOR = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};`,
+    );
+    expect(expression).toContain("const isUserTurn = (node) =>");
+    expect(expression).toContain("return !container || !isUserTurn(container);");
+    expect(expression).toContain("return Boolean(container && isAssistantTurn(container));");
   });
 
   test("markdown fallback does not self-reference MIN_TURN_INDEX literal", () => {
@@ -233,10 +237,16 @@ describe("browser automation expressions", () => {
 
   test("copy expression scopes to assistant turn buttons", () => {
     const expression = buildCopyExpressionForTest({});
-    expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
-    expect(expression).toContain(ASSISTANT_ROLE_SELECTOR);
-    expect(expression).toContain("isAssistantTurn");
-    expect(expression).toContain("copy-turn-action-button");
+
+    // The unhinted fallback must traverse canonical conversation turns, skip user turns, and
+    // only query a copy button within an assistant turn.
+    expect(expression).toContain(
+      `const ASSISTANT_TURN_SELECTOR = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};`,
+    );
+    expect(expression).toContain("const isAssistantTurn = (node) => {");
+    expect(expression).toContain("if (!isAssistantTurn(turn)) continue;");
+    expect(expression).toContain("turn.querySelector(BUTTON_SELECTOR)");
+    expect(expression).toContain("if (turn && isAssistantTurn(turn)) {");
   });
 
   test("user-turn attachment expression requires non-empty prompt text for prefix fallback", () => {

@@ -9,7 +9,10 @@ import {
   FINISHED_ACTIONS_SELECTOR,
   STOP_BUTTON_SELECTOR,
 } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import {
+  buildConversationTurnIdentityExpression,
+  buildConversationTurnListExpression,
+} from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -1126,33 +1129,7 @@ function buildDeepResearchCompletionPollExpression(
     const accountBlocked = pageText.includes('suspicious activity detected') &&
       pageText.includes('secure your account') &&
       pageText.includes('regain access');
-    const isAssistantTurn = (node) => {
-      if (!node) return false;
-      const attr = String(node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      return attr === 'assistant' ||
-        Boolean(node.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"]')) ||
-        String(node.getAttribute('data-testid') || '').toLowerCase().includes('conversation-turn') &&
-          /chatgpt\\s+said/i.test(node.innerText || node.textContent || '');
-    };
-    const isUserTurn = (node) => {
-      if (!node) return false;
-      const attr = String(node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      return attr === 'user' || Boolean(
-        node.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
-      );
-    };
-    const readTurnId = (node) => {
-      const testId = node?.getAttribute?.('data-testid');
-      const value = node?.getAttribute?.('data-turn-id') || node?.dataset?.turnId ||
-        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
-        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
-    const readMessageId = (node) => {
-      const messageNode = node?.matches?.('[data-message-id]') ? node : node?.querySelector?.('[data-message-id]');
-      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
+    ${buildConversationTurnIdentityExpression()}
     const conversationTurns = ${buildConversationTurnListExpression()};
     let exactAssistantTurn = null;
     if (EXPECTED_PROMPT) {
@@ -1172,7 +1149,7 @@ function buildDeepResearchCompletionPollExpression(
         if (!exactAssistantTurn && isAssistantTurn(turn)) exactAssistantTurn = turn;
       }
     }
-    const allAssistantTurns = Array.from(document.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]'));
+    const allAssistantTurns = Array.from(document.querySelectorAll(ASSISTANT_TURN_SELECTOR));
     const scopedTurns = EXPECTED_PROMPT
       ? (exactAssistantTurn ? [exactAssistantTurn] : [])
       : scopedToNewTurns

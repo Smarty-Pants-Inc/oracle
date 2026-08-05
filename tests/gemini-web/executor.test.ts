@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -8,6 +8,7 @@ import type {
 } from "../../src/browser/profileState.js";
 import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 const {
   launchChrome,
@@ -157,7 +158,7 @@ function requiredGeminiCookies() {
   ];
 }
 
-let runtimeEvaluate: ReturnType<typeof vi.fn>;
+let runtimeEvaluate: Mock<(input: { expression?: string }) => Promise<unknown>>;
 
 describe("gemini-web executor", () => {
   beforeEach(() => {
@@ -477,16 +478,16 @@ describe("gemini-web executor", () => {
     );
   });
 
-  it("returns recoverable pending authority before teardown and persists finalize mode first", async () => {
+  it("persists acquisition, pending dispatch, and exact commit before publishing capture", async () => {
     const events: string[] = [];
     closeTab.mockImplementationOnce(async () => {
       events.push("close-target");
       return true;
     });
     const runtimeHintCb = vi.fn(async (runtime: BrowserRuntimeMetadata) => {
-      events.push(
-        `persist:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}:${runtime.recoveryCleanupResult?.status}`,
-      );
+      const epoch = runtime.promptEpoch?.status ?? "acquired";
+      const settlement = runtime.recoveryCleanupResult?.settlementMode;
+      events.push(`persist:${epoch}${settlement ? `:${settlement}` : ""}`);
     });
     const exec = createGeminiWebExecutor({});
     const result = await exec({
@@ -502,17 +503,97 @@ describe("gemini-web executor", () => {
     expect(launchChrome).toHaveBeenCalled();
     expect(connectWithNewTab).toHaveBeenCalled();
     expect(runGeminiWebWithFallback).not.toHaveBeenCalled();
+    expect(result.promptEpoch).toMatchObject({
+      status: "committed",
+      promptSha256: promptIdentitySha256("hello"),
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "data-message-id:user-current",
+      verifiedUserMessageId: "data-message-id:user-current",
+      conversationId: "target-1",
+    });
     expect(result.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
-    expect(result.runtime.recoveryCleanupResources?.[0]?.chromeTargetId).toBe("target-1");
+    expect(result.runtime.recoveryCleanupResources?.[0]).toMatchObject({
+      chromeTargetId: "target-1",
+      conversationId: "target-1",
+      promptEpoch: expect.objectContaining({ status: "committed" }),
+    });
     expect(closeTab).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
-    expect(events).toEqual(["persist:unbound:pending"]);
+    expect(events).toEqual(["persist:acquired", "persist:pending", "persist:committed"]);
     expect(runtimeEvaluate).toHaveBeenCalledWith(
       expect.objectContaining({ awaitPromise: true, returnByValue: true }),
     );
 
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
-    expect(events).toEqual(["persist:unbound:pending", "persist:finalize:pending", "close-target"]);
+    expect(events).toEqual([
+      "persist:acquired",
+      "persist:pending",
+      "persist:committed",
+      "persist:committed:finalize",
+      "close-target",
+    ]);
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists exact prompt and cleanup authority before a post-binding response failure", async () => {
+    const persisted: BrowserRuntimeMetadata[] = [];
+    const events: string[] = [];
+    const evaluateNormally = runtimeEvaluate.getMockImplementation();
+    if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
+    runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
+      if (String(input.expression ?? "").includes("const ordered =")) {
+        throw new Error("injected response polling failure");
+      }
+      return evaluateNormally(input);
+    });
+    closeTab.mockImplementationOnce(async () => {
+      events.push("close-target");
+      return true;
+    });
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+        runtimeHintCb: async (runtime) => {
+          persisted.push(runtime);
+          events.push(
+            `persist:${runtime.promptEpoch?.status ?? "acquired"}:${runtime.recoveryCleanupResult?.settlementMode ?? "unbound"}`,
+          );
+        },
+        log: () => {},
+      }),
+    ).rejects.toThrow("injected response polling failure");
+
+    const committed = persisted.find((runtime) => runtime.promptEpoch?.status === "committed");
+    expect(committed).toMatchObject({
+      conversationId: "target-1",
+      promptEpoch: {
+        status: "committed",
+        promptSha256: promptIdentitySha256("hello"),
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "data-message-id:user-current",
+        verifiedUserMessageId: "data-message-id:user-current",
+        conversationId: "target-1",
+      },
+      recoveryCleanupResources: [
+        expect.objectContaining({
+          chromeTargetId: "target-1",
+          conversationId: "target-1",
+          promptEpoch: expect.objectContaining({ status: "committed" }),
+        }),
+      ],
+    });
+    expect(events).toEqual([
+      "persist:acquired:unbound",
+      "persist:pending:unbound",
+      "persist:committed:unbound",
+      "persist:committed:finalize",
+      "close-target",
+    ]);
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(killChrome).toHaveBeenCalledTimes(1);
   });
@@ -540,14 +621,14 @@ describe("gemini-web executor", () => {
     expect(closeTab).toHaveBeenCalled();
   });
 
-  it("returns runtime authority without teardown when pre-return persistence crashes", async () => {
+  it("binds abort authority when capture persistence and abort persistence both fail", async () => {
     const exec = createGeminiWebExecutor({});
 
     await expect(
       exec({
         prompt: "hello",
         attachments: [],
-        config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+        config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: false },
         runtimeHintCb: async () => {
           throw new Error("session store unavailable");
         },
@@ -557,13 +638,47 @@ describe("gemini-web executor", () => {
       details: {
         code: "gemini-browser-runtime-persistence-failed",
         runtime: {
-          recoveryCleanupResult: { status: "pending" },
+          recoveryCleanupResult: {
+            status: "failed",
+            error: "session store unavailable",
+            settlementMode: "abort",
+          },
           recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "target-1" })],
         },
       },
     });
     expect(closeTab).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
+  });
+
+  it("aborts unpublished browser resources when retrying abort persistence succeeds", async () => {
+    const runtimeHintCb = vi
+      .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
+      .mockRejectedValueOnce(new Error("session store unavailable"));
+    const exec = createGeminiWebExecutor({});
+
+    await expect(
+      exec({
+        prompt: "hello",
+        attachments: [],
+        config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: false },
+        runtimeHintCb,
+        log: () => {},
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        code: "gemini-browser-runtime-persistence-failed",
+      },
+    });
+    expect(runtimeHintCb).toHaveBeenCalledTimes(2);
+    expect(runtimeHintCb).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+      }),
+    );
+    expect(closeTab).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
   it("binds abort mode and rejects later finalize without duplicate teardown", async () => {

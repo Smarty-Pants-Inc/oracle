@@ -142,20 +142,6 @@ export class RemoteArtifactStore {
     }
   }
 
-  async requiredDeliveriesComplete(transactionToken: string): Promise<boolean> {
-    const record = await this.#transactionStore.read(transactionToken);
-    if (!record) throw new Error("Remote transaction does not exist");
-    return (record.artifacts ?? []).every(
-      (artifact) => !artifact.descriptor.required || Boolean(artifact.deliveryReceipt),
-    );
-  }
-
-  async descriptorsForTransaction(transactionToken: string): Promise<RemoteArtifactDescriptor[]> {
-    const record = await this.#transactionStore.read(transactionToken);
-    if (!record) throw new Error("Remote transaction does not exist");
-    return (record.artifacts ?? []).map((registration) => registration.descriptor);
-  }
-
   private async buildRegistration(params: {
     transactionToken: string;
     runId: string;

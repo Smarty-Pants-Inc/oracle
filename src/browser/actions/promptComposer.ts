@@ -8,7 +8,10 @@ import {
   STOP_BUTTON_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import {
+  buildConversationTurnIdentityExpression,
+  buildConversationTurnListExpression,
+} from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -29,6 +32,17 @@ export function normalizePromptForIdentity(prompt: string): string {
     .replace(/`([^`]*)`/g, "$1")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Build the browser-context counterpart of normalizePromptForIdentity. */
+export function buildPromptIdentityNormalizationExpression(): string {
+  return `const normalizePromptIdentity = (value) => {
+    let text = value?.toLowerCase?.() ?? '';
+    text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
+    text = text.replace(/\`\`\`/g, ' ');
+    text = text.replace(/\`([^\`]*)\`/g, '$1');
+    return text.replace(/\\s+/g, ' ').trim();
+  };`;
 }
 
 export function promptIdentitySha256(prompt: string): string {
@@ -829,13 +843,8 @@ export async function verifyPromptCommitted(
     const fallback = document.querySelector(${fallbackSelectorLiteral});
     const inputSelectors = ${inputSelectorsLiteral};
     const baseline = ${baseline};
-    const normalize = (value) => {
-      let text = value?.toLowerCase?.() ?? '';
-      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-      text = text.replace(/\`\`\`/g, ' ');
-      text = text.replace(/\`([^\`]*)\`/g, '$1');
-      return text.replace(/\\s+/g, ' ').trim();
-    };
+    ${buildPromptIdentityNormalizationExpression()}
+    ${buildConversationTurnIdentityExpression()}
     const normalizedPrompt = ${encodedPrompt};
     const articles = ${buildConversationTurnListExpression()};
     const readValue = (node) => {
@@ -848,31 +857,6 @@ export async function verifyPromptCommitted(
       const rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     };
-    const isUserTurn = (node) => {
-      const role = String(
-        node?.getAttribute?.('data-message-author-role') ||
-          node?.getAttribute?.('data-turn') ||
-          node?.dataset?.turn ||
-          '',
-      ).toLowerCase();
-      return role === 'user' || Boolean(node?.querySelector?.('[data-message-author-role="user"]'));
-    };
-    const readTurnId = (node) => {
-      const testId = node?.getAttribute?.('data-testid');
-      const value =
-        node?.getAttribute?.('data-turn-id') ||
-        node?.dataset?.turnId ||
-        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
-        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
-    const readMessageId = (node) => {
-      const messageNode = node?.matches?.('[data-message-id]')
-        ? node
-        : node?.querySelector?.('[data-message-id]');
-      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
     const matchesPrompt = (text) => normalizedPrompt.length > 0 && text === normalizedPrompt;
     let matchedUserTurnIndex = null;
     let matchedUserTurnId = null;
@@ -881,7 +865,7 @@ export async function verifyPromptCommitted(
     for (let index = baseline; index < articles.length; index += 1) {
       const node = articles[index];
       if (!isUserTurn(node)) continue;
-      const text = normalize(node?.innerText || node?.textContent || '');
+      const text = normalizePromptIdentity(node?.innerText || node?.textContent || '');
       if (!matchesPrompt(text)) continue;
       matchedUserTurnIndex = index;
       matchedUserTurnId = readTurnId(node);
@@ -901,7 +885,7 @@ export async function verifyPromptCommitted(
     const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
     const href = typeof location === 'object' && location.href ? location.href : '';
     const conversationId = href.match(/\\/c\\/([^/?#]+)/)?.[1] ?? null;
-    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
+    const normalizedTurns = articles.map((node) => normalizePromptIdentity(node?.innerText));
     return {
       baseline,
       matchedUserTurnIndex,

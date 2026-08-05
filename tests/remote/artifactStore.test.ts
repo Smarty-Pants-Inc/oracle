@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
+import {
+  missingRequiredArtifactDeliveries,
+  RemoteTransactionStore,
+} from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
 const authority = {
@@ -103,9 +106,9 @@ describe("RemoteArtifactStore", () => {
         },
       });
       expect(registration).not.toHaveProperty("expiresAt");
-      await expect(firstArtifactStore.requiredDeliveriesComplete(transactionToken)).resolves.toBe(
-        false,
-      );
+      const firstRecord = await firstTransactionStore.read(transactionToken);
+      expect(firstRecord).not.toBeNull();
+      expect(missingRequiredArtifactDeliveries(firstRecord!)).toHaveLength(1);
 
       now += 31 * 60 * 1000;
       const restartedTransactionStore = await RemoteTransactionStore.open({
@@ -138,9 +141,9 @@ describe("RemoteArtifactStore", () => {
       const firstReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
       const duplicateReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
       expect(duplicateReceipt).toEqual(firstReceipt);
-      await expect(
-        restartedArtifactStore.requiredDeliveriesComplete(transactionToken),
-      ).resolves.toBe(true);
+      const deliveredRecord = await restartedTransactionStore.read(transactionToken);
+      expect(deliveredRecord).not.toBeNull();
+      expect(missingRequiredArtifactDeliveries(deliveredRecord!)).toHaveLength(0);
       await restartedTransactionStore.bindSettlement({
         transactionToken,
         mode: "abort",

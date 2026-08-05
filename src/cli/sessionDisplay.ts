@@ -333,11 +333,7 @@ export async function attachSession(
       : metadata.status === "error"
         ? (persistedCleanupMode ?? null)
         : null;
-  if (
-    cleanupRetryMode &&
-    runtime?.recoveryCleanupResources?.length &&
-    runtime.recoveryCleanupResult
-  ) {
+  if (cleanupRetryMode && runtime?.recoveryCleanupResult) {
     const cleanupLogger = Object.assign(
       ((message?: string) => {
         if (message) console.log(dim(message));

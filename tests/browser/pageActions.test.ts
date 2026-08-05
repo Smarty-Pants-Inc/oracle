@@ -28,6 +28,7 @@ import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import { ASSISTANT_ROLE_SELECTOR } from "../../src/browser/constants.js";
 
 const logger = vi.fn();
 const committedPromptLocator = (
@@ -2017,16 +2018,18 @@ describe("waitForAssistantResponse", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     await expect(waitForAssistantResponse(runtime, 100, logger)).rejects.toThrow("stop");
+    // The observer must re-use the canonical turn-role helper and scope its terminal
+    // evidence to the final assistant turn rather than to arbitrary page controls.
     expect(capturedExpression).toContain("characterData: true");
-    expect(capturedExpression).toContain("copy-turn-action-button");
-    expect(capturedExpression).toContain("isLastAssistantTurnFinished");
+    expect(capturedExpression).toContain(
+      `const ASSISTANT_TURN_SELECTOR = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};`,
+    );
+    expect(capturedExpression).toContain("const isAssistantTurn = (node) => {");
+    expect(capturedExpression).toContain("if (isAssistantTurn(turns[i])) {");
     expect(capturedExpression).toContain("lastAssistantTurn.querySelector(FINISHED_SELECTOR)");
-    expect(capturedExpression).not.toContain("document.querySelector(FINISHED_SELECTOR)");
     expect(capturedExpression).toContain("lastAssistantTurn.querySelectorAll('.markdown')");
+    expect(capturedExpression).not.toContain("document.querySelector(FINISHED_SELECTOR)");
     expect(capturedExpression).not.toContain("document.querySelectorAll('.markdown')");
-    expect(capturedExpression).toContain("data-message-author-role");
-    expect(capturedExpression).toContain("role === 'assistant'");
-    expect(capturedExpression).toContain("normalized === 'pro thinking'");
   });
 
   test("falls back to snapshot when observer fails", async () => {

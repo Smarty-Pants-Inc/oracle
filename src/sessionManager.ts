@@ -121,6 +121,14 @@ export interface BrowserRecoveryTabLeaseMetadata {
   id: string;
   profileDirectory: ProfileDirectoryIdentity;
 }
+export interface BrowserRecoveryAcquisitionMetadata {
+  /** Stable authority generation shared by the intent and every acquired identity. */
+  generationId: string;
+  /** Side effect that may be in flight when this runtime snapshot is recovered. */
+  pendingResource?: "tab-lease" | "chrome-process" | "chrome-target";
+  /** Unique initial URL used to rediscover a target created inside a crash window. */
+  targetMarkerUrl?: string;
+}
 
 export interface BrowserRecoveryCleanupResourceMetadata {
   chromePid?: number;
@@ -136,6 +144,7 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   promptEpoch?: BrowserPromptEpoch;
   remoteRecovery?: BrowserRemoteRecoveryMetadata;
   tabLease?: BrowserRecoveryTabLeaseMetadata;
+  acquisition?: BrowserRecoveryAcquisitionMetadata;
   recoveryCleanup: BrowserRecoveryCleanupMetadata;
 }
 

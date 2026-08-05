@@ -191,6 +191,10 @@ export async function createRemoteServer(
   const activeTransactions = new Map<string, BrowserRunTransaction>();
   let closing = false;
   let closed = false;
+  let closeInFlight: Promise<void> | null = null;
+  let leaseSweepStopped = false;
+  let listenerClosed = false;
+  let controllerLockReleased = false;
   const cleanupLogger = ((message?: string) => {
     if (typeof message === "string") logger(`[serve] ${message}`);
   }) as BrowserLogger;
@@ -223,8 +227,16 @@ export async function createRemoteServer(
   // Remote Chrome and lease settlement are single-flight. Per-record work is additionally
   // serialized by RemoteTransactionStore.
   let browserWorkBusy = false;
+  let browserWorkIdle: { promise: Promise<void>; resolve: () => void } | null = null;
   let sweepInFlight: Promise<void> | null = null;
-  const runBrowserWork = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const startBrowserWork = (allowDuringClose = false): void => {
+    if (closing && !allowDuringClose) {
+      throw new RemoteTransactionConflictError(
+        503,
+        "server_closing",
+        "Remote server is shutting down",
+      );
+    }
     if (browserWorkBusy) {
       throw new RemoteTransactionConflictError(
         409,
@@ -233,19 +245,37 @@ export async function createRemoteServer(
       );
     }
     browserWorkBusy = true;
+    browserWorkIdle = Promise.withResolvers<void>();
+  };
+  const finishBrowserWork = (): void => {
+    const idle = browserWorkIdle;
+    browserWorkIdle = null;
+    browserWorkBusy = false;
+    idle?.resolve();
+  };
+  const waitForBrowserWorkToDrain = async (): Promise<void> => {
+    while (browserWorkBusy) {
+      const idle = browserWorkIdle;
+      if (!idle) throw new Error("Remote browser work drain lost its completion signal");
+      await idle.promise;
+    }
+  };
+  const runBrowserWork = async <T>(operation: () => Promise<T>): Promise<T> => {
+    startBrowserWork();
     try {
       return await operation();
     } finally {
-      browserWorkBusy = false;
+      finishBrowserWork();
     }
   };
   const sweepExpiredAuthority = async (waitForExisting = false): Promise<void> => {
+    if (closing) return;
     if (sweepInFlight) {
       if (waitForExisting) await sweepInFlight;
       return;
     }
     if (browserWorkBusy) return;
-    browserWorkBusy = true;
+    startBrowserWork();
     const sweep = sweepExpiredRemoteTransactions({
       transactionStore,
       transactionCoordinator,
@@ -256,7 +286,7 @@ export async function createRemoteServer(
       await sweep;
     } finally {
       if (sweepInFlight === sweep) sweepInFlight = null;
-      browserWorkBusy = false;
+      finishBrowserWork();
     }
   };
 
@@ -363,6 +393,10 @@ export async function createRemoteServer(
         }
         if (transactionMatch.action === "run") {
           await sweepExpiredAuthority(true);
+          if (closing) {
+            sendJson(res, 503, { error: "server_closing" });
+            return;
+          }
           if (browserWorkBusy) {
             if (verbose) {
               logger(
@@ -372,7 +406,7 @@ export async function createRemoteServer(
             sendJson(res, 409, { error: "busy" });
             return;
           }
-          browserWorkBusy = true;
+          startBrowserWork();
           try {
             await handleRemoteRunRequest({
               req,
@@ -387,7 +421,7 @@ export async function createRemoteServer(
               transactionCoordinator,
             });
           } finally {
-            browserWorkBusy = false;
+            finishBrowserWork();
           }
           return;
         }
@@ -476,52 +510,66 @@ export async function createRemoteServer(
   logger(color(chalk.yellowBright, `Access token: ${authToken}`));
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
-  return {
-    port: address.port,
-    token: authToken,
-    async close() {
-      if (closed) return;
-      if (closing) throw new Error("Remote server close is already in progress");
-      closing = true;
-      try {
-        await sweepInFlight;
-        if (browserWorkBusy) {
-          throw new Error("Remote server cannot close while browser work is active");
+  const closeRemoteServer = async (): Promise<void> => {
+    await waitForBrowserWorkToDrain();
+    startBrowserWork(true);
+    try {
+      for (const transactionToken of transactionCoordinator.activeTransactionTokens()) {
+        const shutdown = await transactionStore.prepareControllerShutdown(transactionToken);
+        if (shutdown.action !== "settle") {
+          activeTransactions.delete(transactionToken);
+          continue;
         }
-        browserWorkBusy = true;
-        try {
-          for (const transactionToken of transactionCoordinator.activeTransactionTokens()) {
-            const shutdown = await transactionStore.prepareControllerShutdown(transactionToken);
-            if (shutdown.action !== "settle") {
-              activeTransactions.delete(transactionToken);
-              continue;
-            }
-            const outcome = await transactionCoordinator.settle({
-              transactionToken,
-              mode: shutdown.mode,
-              durablePublication: shutdown.durablePublication,
-            });
-            if (outcome.finalization.status !== "completed") {
-              throw new Error(
-                `Remote server cannot close while transaction ${transactionToken} cleanup remains pending`,
-              );
-            }
-          }
-        } finally {
-          browserWorkBusy = false;
+        const outcome = await transactionCoordinator.settle({
+          transactionToken,
+          mode: shutdown.mode,
+          durablePublication: shutdown.durablePublication,
+        });
+        if (outcome.finalization.status !== "completed") {
+          throw new Error(
+            `Remote server cannot close while transaction ${transactionToken} cleanup remains pending`,
+          );
         }
-        if (transactionCoordinator.activeTransactionTokens().length > 0) {
-          throw new Error("Remote server cannot close while live transaction authority remains");
-        }
-        clearInterval(leaseSweepTimer);
+      }
+    } finally {
+      finishBrowserWork();
+    }
+    if (transactionCoordinator.activeTransactionTokens().length > 0) {
+      throw new Error("Remote server cannot close while live transaction authority remains");
+    }
+    if (!leaseSweepStopped) {
+      clearInterval(leaseSweepTimer);
+      leaseSweepStopped = true;
+    }
+    if (!listenerClosed) {
+      if (server.listening) {
         const closeDeferred = Promise.withResolvers<void>();
         server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
         await closeDeferred.promise;
-        closed = true;
-        await controllerLock.release();
-      } finally {
-        closing = false;
       }
+      listenerClosed = true;
+    }
+    if (!controllerLockReleased) {
+      await controllerLock.release();
+      controllerLockReleased = true;
+    }
+    closed = true;
+  };
+
+  return {
+    port: address.port,
+    token: authToken,
+    close() {
+      if (closed) return Promise.resolve();
+      if (closeInFlight) return closeInFlight;
+      closing = true;
+      let retainedClose: Promise<void>;
+      retainedClose = closeRemoteServer().catch((error) => {
+        if (closeInFlight === retainedClose) closeInFlight = null;
+        throw error;
+      });
+      closeInFlight = retainedClose;
+      return retainedClose;
     },
   };
 }
@@ -881,7 +929,15 @@ async function handleRemoteRunRequest(params: {
     const failedCapture = capture;
     const errorRuntime = browserRuntimeFromError(error);
     const journaled = await params.transactionStore.read(params.transactionToken);
-    const recoverableRuntime = failedCapture?.runtime ?? errorRuntime ?? journaled?.runtime;
+    const recoverableRuntime = hasBrowserCleanupAuthority(failedCapture?.runtime)
+      ? failedCapture.runtime
+      : errorRuntime &&
+          (hasBrowserCleanupAuthority(errorRuntime) ||
+            error.details?.recoverableDisconnect === true)
+        ? errorRuntime
+        : hasBrowserCleanupAuthority(journaled?.runtime)
+          ? journaled.runtime
+          : undefined;
     const durableError = serializeDurableBrowserAutomationError(error, Boolean(recoverableRuntime));
     let record = await params.transactionStore.recordRecoverableFailure({
       transactionToken: params.transactionToken,
@@ -1467,6 +1523,12 @@ function browserRuntimeFromError(
     : undefined;
 }
 
+function hasBrowserCleanupAuthority(
+  runtime: BrowserRuntimeMetadata | undefined,
+): runtime is BrowserRuntimeMetadata {
+  return Boolean(runtime?.recoveryCleanupResources?.length || runtime?.recoveryCleanupResult);
+}
+
 function serializeDurableBrowserAutomationError(
   error: BrowserAutomationError,
   recoverableDisconnect: boolean,
@@ -1575,6 +1637,27 @@ function remoteBrowserAutomationError(
   throw new Error("Remote error transaction is missing error metadata");
 }
 
+export async function drainRemoteServerShutdown(
+  server: Pick<RemoteServerInstance, "close">,
+  shutdownRequested: Promise<void>,
+  options: { logger?: (message: string) => void; retryDelayMs?: number } = {},
+): Promise<void> {
+  await shutdownRequested;
+  const logger = options.logger ?? console.error;
+  const retryDelayMs = options.retryDelayMs ?? 250;
+  for (;;) {
+    try {
+      await server.close();
+      return;
+    } catch (error) {
+      logger(
+        `Failed to close remote server: ${error instanceof Error ? error.message : String(error)}. Retrying graceful shutdown.`,
+      );
+      await delay(retryDelayMs);
+    }
+  }
+}
+
 export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(homedir(), ".oracle", "browser-profile");
@@ -1653,17 +1736,22 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
     manualLoginDefault: preferManualLogin,
     manualLoginProfileDir: manualProfileDir,
   });
-  const shutdownDeferred = Promise.withResolvers<void>();
+  const shutdownRequested = Promise.withResolvers<void>();
+  let shutdownStarted = false;
   const shutdown = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log("Shutting down remote service...");
-    server
-      .close()
-      .catch((error) => console.error("Failed to close remote server:", error))
-      .finally(() => shutdownDeferred.resolve());
+    shutdownRequested.resolve();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  await shutdownDeferred.promise;
+  try {
+    await drainRemoteServerShutdown(server, shutdownRequested.promise);
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+  }
 }
 
 function matchArtifactRequest(

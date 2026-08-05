@@ -1,10 +1,23 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
+  FilesystemLockReleasePendingError,
 } from "../../src/browser/filesystemLock.js";
 import type {
   CrashRecoverableFilesystemLock,
@@ -97,6 +110,52 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("reclaims a real lock after its owner process is killed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-process-"));
+    const lockPath = path.join(root, "recovery.lock");
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const moduleUrl = new URL("../../src/browser/filesystemLock.ts", import.meta.url).href;
+      const source = `
+        import { acquireCrashRecoverableFilesystemLock } from ${JSON.stringify(moduleUrl)};
+        const lock = await acquireCrashRecoverableFilesystemLock(process.argv[1]);
+        void lock;
+        process.stdout.write("ready\\n");
+        setInterval(() => undefined, 1_000);
+      `;
+      child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", source, lockPath],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const observed = await Promise.race([
+        once(child.stdout!, "data").then(([chunk]) => ({ kind: "ready", output: String(chunk) })),
+        once(child, "exit").then(([code, signal]) => ({ kind: "exit", code, signal })),
+      ]);
+      expect(observed).toMatchObject({ kind: "ready", output: expect.stringContaining("ready") });
+
+      const childExited = once(child, "exit");
+      expect(child.kill("SIGKILL")).toBe(true);
+      await childExited;
+      child = undefined;
+
+      const replacement = await acquireCrashRecoverableFilesystemLock(lockPath, {
+        timeoutMs: 5_000,
+        pollMs: 10,
+      });
+      expect(replacement.owner.pid).toBe(process.pid);
+      await replacement.release();
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const childExited = once(child, "exit");
+        child.kill("SIGKILL");
+        await childExited.catch(() => undefined);
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("reclaims an aged truncated owner only when it has no provable live owner", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-"));
     const lockPath = path.join(root, "recovery.lock");
@@ -181,6 +240,109 @@ describe("crash-recoverable filesystem lock", () => {
 
       await expect(lock.release()).resolves.toBeUndefined();
       await expect(lock.release()).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds release behind a live stalled mutation and retains retry authority", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-release-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const originalPid = 40_041;
+    const blockerPid = 40_042;
+    let resumeBlocker!: () => void;
+    const allowBlocker = new Promise<void>((resolve) => {
+      resumeBlocker = resolve;
+    });
+    let markBlockerReady!: () => void;
+    const blockerReady = new Promise<void>((resolve) => {
+      markBlockerReady = resolve;
+    });
+    const original = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(originalPid, async (pid) =>
+          pid === blockerPid ? "blocker-start" : "original-start",
+        ),
+      },
+    );
+    const blocker = acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      { timeoutMs: 5_000, pollMs: 10 },
+      {
+        processIdentityProvider: createProcessIdentityProvider(blockerPid, async (pid) =>
+          pid === originalPid ? "reused-original-start" : "blocker-start",
+        ),
+        beforeStaleLockQuarantine: async () => {
+          markBlockerReady();
+          await allowBlocker;
+          throw new Error("cancel stalled mutation");
+        },
+      },
+    );
+    void blocker.catch(() => undefined);
+
+    try {
+      await blockerReady;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const releaseDeadline = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("release exceeded bounded deadline")), 2_500);
+      });
+      try {
+        await expect(Promise.race([original.release(), releaseDeadline])).rejects.toBeInstanceOf(
+          FilesystemLockReleasePendingError,
+        );
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      await expect(readFile(path.join(lockPath, "owner.json"), "utf8")).resolves.toContain(
+        original.owner.ownerNonce,
+      );
+
+      resumeBlocker();
+      await expect(blocker).rejects.toThrow("cancel stalled mutation");
+      await expect(original.release()).resolves.toBeUndefined();
+    } finally {
+      resumeBlocker();
+      await blocker.catch(() => undefined);
+      await original.release().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("post-verification mutation quarantine replacement preserves unrelated data", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-lock-quarantine-race-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const movedGeneration = path.join(root, "verified-mutation-generation");
+    const nonces = ["owned-lock", "mutation-owner"];
+    let nonceIndex = 0;
+    let replacementPath: string | undefined;
+    const lock = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(40_043, async () => "owned-start"),
+        randomUUID: () => nonces[nonceIndex++] ?? `extra-${nonceIndex}`,
+        beforeMutationRequestRemoval: async (requestPath) => {
+          const quarantinedPath = `${requestPath}.stale-mutation-owner`;
+          replacementPath = quarantinedPath;
+          await rename(quarantinedPath, movedGeneration);
+          await mkdir(quarantinedPath);
+          await writeFile(path.join(quarantinedPath, "replacement-marker"), "never-delete");
+        },
+      },
+    );
+
+    try {
+      await expect(lock.release()).rejects.toThrow(/mutation ownership changed/i);
+      expect(
+        JSON.parse(await readFile(path.join(movedGeneration, "owner.json"), "utf8")),
+      ).toMatchObject({ ownerNonce: "mutation-owner" });
+      expect(replacementPath).toBeDefined();
+      await expect(
+        readFile(path.join(replacementPath ?? "", "replacement-marker"), "utf8"),
+      ).resolves.toBe("never-delete");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

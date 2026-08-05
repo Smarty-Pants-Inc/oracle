@@ -18,6 +18,8 @@ import {
   acquireCrashRecoverableFilesystemLock,
   type CrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
+  isolateDirectoryGenerationForRemoval,
+  removeIsolatedDirectoryGeneration,
 } from "./filesystemLock.js";
 
 export type ProfileStateLogger = (message: string) => void;
@@ -163,6 +165,7 @@ interface RemoveProfileDirectoryDeps {
   isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
   beforeQuarantineRename?: () => void | Promise<void>;
   beforeQuarantineDelete?: (quarantinePath: string) => void | Promise<void>;
+  afterQuarantineIdentityVerification?: (quarantinePath: string) => void | Promise<void>;
 }
 
 export async function removeProfileDirectoryIfIdentityMatches(
@@ -221,8 +224,18 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
 
   await deps.beforeQuarantineDelete?.(quarantinePath);
   if (!(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity))) return false;
-  await rm(quarantinePath, { recursive: true, force: true });
-  return !(await pathExists(quarantinePath));
+  await deps.afterQuarantineIdentityVerification?.(quarantinePath);
+  const isolation = await isolateDirectoryGenerationForRemoval(
+    quarantinePath,
+    async (generationPath) =>
+      verifyProfileDirectoryIdentity(
+        generationPath,
+        Object.freeze({ ...expected, canonicalPath: path.resolve(generationPath) }),
+      ),
+  );
+  if (isolation.status !== "isolated") return false;
+  await removeIsolatedDirectoryGeneration(isolation.rootPath);
+  return true;
 }
 
 async function rejectProfileSymlinkTraversal(
@@ -933,11 +946,11 @@ async function readChromeProcessSnapshot(
     }
 
     if (platform !== "darwin") return null;
-    const readPsField = async (field: "lstart" | "command"): Promise<string> => {
-      const { stdout } = await execute("ps", ["-p", String(Math.trunc(pid)), "-o", `${field}=`]);
-      return stdout.trim();
+    const readDarwinProcessGeneration = async (): Promise<string | null> => {
+      const { stdout } = await execute("/usr/bin/lsappinfo", ["info", String(Math.trunc(pid))]);
+      return parseDarwinAuditPidVersion(stdout, pid);
     };
-    const processStartTime = await readPsField("lstart");
+    const processStartTime = await readDarwinProcessGeneration();
     const { stdout: executableFiles } = await execute("/usr/sbin/lsof", [
       "-nP",
       "-a",
@@ -957,8 +970,14 @@ async function readChromeProcessSnapshot(
           isChromeExecutablePath(candidate, platform),
         ),
       );
-    const commandLine = await readPsField("command");
-    const confirmedStartTime = await readPsField("lstart");
+    const { stdout: commandOutput } = await execute("ps", [
+      "-p",
+      String(Math.trunc(pid)),
+      "-o",
+      "command=",
+    ]);
+    const commandLine = commandOutput.trim();
+    const confirmedStartTime = await readDarwinProcessGeneration();
     if (
       !processStartTime ||
       processStartTime !== confirmedStartTime ||
@@ -971,6 +990,22 @@ async function readChromeProcessSnapshot(
   } catch {
     return null;
   }
+}
+
+function parseDarwinAuditPidVersion(raw: string, expectedPid: number): string | null {
+  const processPid = raw.match(/\bpid\s*=\s*(\d+)\b/u)?.[1];
+  const auditToken = raw.match(
+    /\btoken=\[[^\]\r\n]*\bpid=(\d+)\b[^\]\r\n]*\bpV:(\d+)\b[^\]\r\n]*\]/u,
+  );
+  if (
+    processPid !== String(expectedPid) ||
+    auditToken?.[1] !== String(expectedPid) ||
+    !auditToken[2] ||
+    !/^\d+$/u.test(auditToken[2])
+  ) {
+    return null;
+  }
+  return `darwin-audit-pidversion:${auditToken[2]}`;
 }
 
 function parseLinuxProcStat(raw: string): { pid: number; startTicks: string } | null {

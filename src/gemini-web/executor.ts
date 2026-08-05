@@ -7,13 +7,15 @@ import type {
   CookieParam,
 } from "../browser/types.js";
 import { getCookies } from "@steipete/sweet-cookie";
-import { runProviderDomFlow } from "../browser/providerDomFlow.js";
+import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
 import {
   BrowserCaptureSettlementController,
+  BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   createBrowserRunTransaction,
   markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
+  type BrowserCaptureSettlementAdapters,
 } from "../browser/runLifecycle.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -96,6 +98,34 @@ async function settleGeminiSessions(sessions: GeminiBrowserSession[]): Promise<s
   return errors.length > 0 ? [...new Set(errors)].join("; ") : null;
 }
 
+function createGeminiSettlementAdapters(
+  sessions: GeminiBrowserSession[],
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
+): BrowserCaptureSettlementAdapters {
+  return {
+    ...(persistRuntime
+      ? { persistRuntime: async (runtime: BrowserRuntimeMetadata) => persistRuntime(runtime) }
+      : {}),
+    settleResources: async (mode) => {
+      const error = await settleGeminiSessions(sessions);
+      const runtime = combineGeminiSessionRuntime(sessions);
+      return error
+        ? pendingBrowserCaptureCleanup(markBrowserCaptureCleanupPending(runtime, mode), error, mode)
+        : completedBrowserCaptureCleanup(runtime);
+    },
+  };
+}
+
+function createGeminiRunLifecycle(
+  sessions: GeminiBrowserSession[],
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
+): BrowserRunLifecycleController {
+  return new BrowserRunLifecycleController({
+    ...createGeminiSettlementAdapters(sessions, persistRuntime),
+    getRuntime: () => combineGeminiSessionRuntime(sessions),
+  });
+}
+
 async function createGeminiBrowserTransaction(
   result: BrowserRunResult,
   sessions: GeminiBrowserSession[],
@@ -104,37 +134,28 @@ async function createGeminiBrowserTransaction(
   if (sessions.length === 0) return createSettledGeminiTransaction(result);
 
   const pendingRuntime = markBrowserCaptureCleanupPending(combineGeminiSessionRuntime(sessions));
+  const settlement = new BrowserCaptureSettlementController(
+    createGeminiSettlementAdapters(sessions, persistRuntime),
+    pendingRuntime,
+  );
   try {
     await persistRuntime?.(pendingRuntime);
   } catch (cause) {
+    const abort = await settlement.settle("abort");
+    const cleanupDetail =
+      abort.status === "completed"
+        ? "unpublished resources were aborted"
+        : `cleanup remains retryable: ${abort.error ?? "unknown cleanup failure"}`;
     throw new BrowserAutomationError(
-      "Failed to durably persist Gemini browser cleanup authority before returning capture.",
+      `Failed to durably persist Gemini browser cleanup authority before returning capture; ${cleanupDetail}.`,
       {
         stage: "gemini-browser-publication",
         code: "gemini-browser-runtime-persistence-failed",
-        runtime: pendingRuntime,
+        runtime: abort.runtime,
       },
       cause,
     );
   }
-
-  const settlement = new BrowserCaptureSettlementController(
-    {
-      persistRuntime: persistRuntime ? async (runtime) => persistRuntime(runtime) : undefined,
-      settleResources: async (mode) => {
-        const error = await settleGeminiSessions(sessions);
-        const runtime = combineGeminiSessionRuntime(sessions);
-        return error
-          ? pendingBrowserCaptureCleanup(
-              markBrowserCaptureCleanupPending(runtime, mode),
-              error,
-              mode,
-            )
-          : completedBrowserCaptureCleanup(runtime);
-      },
-    },
-    pendingRuntime,
-  );
   return createBrowserRunTransaction(result, settlement);
 }
 
@@ -274,15 +295,23 @@ async function loadGeminiCookiesFromCDP(
 async function runGeminiDeepThinkViaBrowser(
   prompt: string,
   browserConfig: BrowserRunOptions["config"],
+  options: {
+    showThoughts: boolean;
+    startedAt: number;
+    persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+  },
   log?: BrowserLogger,
-): Promise<{ text: string; thoughts: string | null; cleanupSession: GeminiBrowserSession }> {
+): Promise<BrowserRunTransaction> {
   const session = await openGeminiBrowserSession({
     browserConfig,
     keepBrowserDefault: true,
     purpose: "Gemini Deep Think",
     log,
   });
+  const lifecycle = createGeminiRunLifecycle([session], options.persistRuntime);
+  lifecycle.markAcquired();
   try {
+    await options.persistRuntime?.(lifecycle.runtime());
     const client = session.client;
     const { Runtime, Page } = client;
     if (
@@ -318,7 +347,8 @@ async function runGeminiDeepThinkViaBrowser(
     await Page.navigate({ url: "https://gemini.google.com/app" });
     await delay(3_000);
 
-    const domResult = await runProviderDomFlow(geminiDeepThinkDomProvider, {
+    const promptEpochIdentity = await lifecycle.beginPromptDispatch(prompt, 0, 0, 0);
+    const providerContext = {
       prompt,
       evaluate,
       delay,
@@ -326,13 +356,44 @@ async function runGeminiDeepThinkViaBrowser(
       state: {
         inputTimeoutMs: browserConfig?.inputTimeoutMs,
         timeoutMs: browserConfig?.timeoutMs,
+        geminiConversationId: session.targetId,
       },
-    });
+    };
+    const commitEvidence = await runProviderSubmissionFlow(
+      geminiDeepThinkDomProvider,
+      providerContext,
+    );
+    await lifecycle.recordPromptCommitEvidence(commitEvidence, promptEpochIdentity);
+    const response = await geminiDeepThinkDomProvider.waitForResponse(providerContext);
+    const thoughts = geminiDeepThinkDomProvider.extractThoughts
+      ? await geminiDeepThinkDomProvider.extractThoughts(providerContext)
+      : null;
 
-    log?.(`[gemini-web] Deep Think response received (${domResult.text.length} chars).`);
-    return { ...domResult, cleanupSession: session };
+    log?.(`[gemini-web] Deep Think response received (${response.text.length} chars).`);
+    const tookMs = Date.now() - options.startedAt;
+    let answerMarkdown = response.text;
+    if (options.showThoughts && thoughts) {
+      answerMarkdown = `## Thinking\n\n${thoughts}\n\n## Response\n\n${response.text}`;
+    }
+    log?.(`[gemini-web] Completed in ${tookMs}ms`);
+    return lifecycle.issueCapture({
+      answerText: response.text,
+      answerMarkdown,
+      tookMs,
+      answerTokens: estimateTokenCount(response.text),
+      answerChars: response.text.length,
+    });
   } catch (error) {
-    return throwAfterGeminiSessionCleanup(error, [session]);
+    const finalization = await lifecycle.settleIfUnpublished();
+    if (finalization?.status === "pending") {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BrowserAutomationError(
+        `${message}; Gemini browser cleanup remains retryable: ${finalization.error}`,
+        { stage: "gemini-browser-cleanup", runtime: finalization.runtime },
+        error,
+      );
+    }
+    throw error;
   }
 }
 
@@ -488,25 +549,17 @@ export function createGeminiWebExecutor(
 
     const domClient: IGeminiExecutionClient = {
       mode: "dom",
-      execute: async () => {
+      execute: () => {
         log?.("[gemini-web] Using browser DOM automation for Deep Think.");
-        const browserResult = await runGeminiDeepThinkViaBrowser(prompt, runOptions.config, log);
-        const tookMs = Date.now() - startTime;
-        let answerMarkdown = browserResult.text;
-        if (geminiOptions.showThoughts && browserResult.thoughts) {
-          answerMarkdown = `## Thinking\n\n${browserResult.thoughts}\n\n## Response\n\n${browserResult.text}`;
-        }
-        log?.(`[gemini-web] Completed in ${tookMs}ms`);
-        return createGeminiBrowserTransaction(
+        return runGeminiDeepThinkViaBrowser(
+          prompt,
+          runOptions.config,
           {
-            answerText: browserResult.text,
-            answerMarkdown,
-            tookMs,
-            answerTokens: estimateTokenCount(browserResult.text),
-            answerChars: browserResult.text.length,
+            showThoughts: Boolean(geminiOptions.showThoughts),
+            startedAt: startTime,
+            persistRuntime: runOptions.runtimeHintCb,
           },
-          [browserResult.cleanupSession],
-          runOptions.runtimeHintCb,
+          log,
         );
       },
     };

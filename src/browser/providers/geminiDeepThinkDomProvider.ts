@@ -1,4 +1,9 @@
-import { normalizePromptForIdentity } from "../actions/promptComposer.js";
+import {
+  buildPromptIdentityNormalizationExpression,
+  normalizePromptForIdentity,
+  promptIdentitySha256,
+  type PromptCommitVerification,
+} from "../actions/promptComposer.js";
 import type {
   PromptCommitEvidence,
   ProviderDomAdapter,
@@ -19,7 +24,9 @@ interface GeminiPromptBaseline {
 interface GeminiDomProviderState {
   inputTimeoutMs?: number;
   timeoutMs?: number;
+  geminiConversationId?: string;
   geminiPromptBaseline?: GeminiPromptBaseline;
+  geminiPromptCommitVerification?: PromptCommitVerification;
   geminiResponseStableId?: string;
 }
 
@@ -82,16 +89,6 @@ const GEMINI_STABLE_ID_READER = `
       if (values.size === 1) return attribute + ':' + Array.from(values)[0];
     }
     return null;
-  };
-`;
-
-const GEMINI_PROMPT_NORMALIZER = `
-  const normalize = (value) => {
-    let text = value?.toLowerCase?.() ?? '';
-    text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-    text = text.replace(/\`\`\`/g, ' ');
-    text = text.replace(/\`([^\`]*)\`/g, '$1');
-    return text.replace(/\\s+/g, ' ').trim();
   };
 `;
 
@@ -443,7 +440,7 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
       const responseCount = document.querySelectorAll(${responseTurnSelector}).length;
       const expectedPrompt = ${JSON.stringify(normalizePromptForIdentity(ctx.prompt))};
       ${GEMINI_STABLE_ID_READER}
-      ${GEMINI_PROMPT_NORMALIZER}
+      ${buildPromptIdentityNormalizationExpression()}
       const beforeStableIds = new Set(beforeUserTurns.map(readStableId).filter(Boolean));
       const { promise, resolve } = Promise.withResolvers();
       let sendResult = 'not-found';
@@ -487,7 +484,7 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
         }
         const turn = postBaselineTurns[0];
         if (!turn) return;
-        const text = normalize(
+        const text = normalizePromptIdentity(
           turn.querySelector(${userQueryTextSelector})?.textContent ?? turn.textContent ?? '',
         );
         if (text && text !== expectedPrompt) {
@@ -557,9 +554,22 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
     throw new Error("Failed to bind Gemini response to the newly submitted user turn.");
   }
   const state = requireGeminiState(ctx);
+  const conversationId = state.geminiConversationId?.trim();
+  if (!conversationId) {
+    throw new Error("Gemini Deep Think prompt binding requires a stable conversation identity.");
+  }
+  const verification: PromptCommitVerification = {
+    committedTurns: submission.baseline.userQueryCount + submission.baseline.responseCount + 1,
+    promptSha256: promptIdentitySha256(ctx.prompt),
+    verifiedUserTurnIndex: submission.baseline.userQueryCount + submission.baseline.responseCount,
+    verifiedUserTurnId: submission.baseline.userStableId,
+    verifiedUserMessageId: submission.baseline.userStableId,
+    conversationId,
+  };
   state.geminiPromptBaseline = submission.baseline;
+  state.geminiPromptCommitVerification = verification;
   delete state.geminiResponseStableId;
-  return { status: "attempted" };
+  return { status: "committed", verification };
 }
 
 async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: string }> {

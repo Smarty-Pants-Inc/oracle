@@ -758,7 +758,7 @@ describe("remote client transport deadlines", () => {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
         token: "secret",
-        deadlines,
+        deadlines: { ...deadlines, controlOverallTimeoutMs: 1_000, socketIdleTimeoutMs: 500 },
       })({
         prompt,
         config: {},

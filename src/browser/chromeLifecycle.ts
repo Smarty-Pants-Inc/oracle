@@ -362,7 +362,22 @@ interface LaunchedChromeControlKillOptions {
   readonly userDataDir: string;
   readonly processIdentity: ChromeProcessIdentity;
 }
+export interface RetainedChromeEndpointAuthority {
+  readonly browserWSEndpoint: string;
+  readonly kill: ChromeStableKill;
+  release(): Promise<void>;
+}
 
+export interface ChromeEndpointAuthorityOptions extends LaunchedChromeControlKillOptions {
+  readonly browserWSEndpoint?: string;
+}
+
+interface ChromeEndpointAuthorityDeps {
+  discoverEndpoint?: typeof discoverBrowserWebSocketEndpoint;
+  connectBrowser?: (browserWSEndpoint: string) => Promise<ChromeClient>;
+  inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
+  resolveListeningPid?: typeof resolveListeningPortOwnerPid;
+}
 interface LaunchedChromeControlKillDeps {
   inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
   retainControlChannel?: NonNullable<ChromeLaunchDeps["retainControlChannel"]>;
@@ -1070,13 +1085,14 @@ export async function createChromePageTarget(
   port: number,
   logger: BrowserLogger,
   host?: string,
+  url = "about:blank",
 ): Promise<string | undefined> {
   const effectiveHost = host ?? "127.0.0.1";
   try {
     const created = (await CDP.New({
       host: effectiveHost,
       port,
-      url: "about:blank",
+      url,
     })) as { id?: string; targetId?: string };
     const createdTargetId = created.targetId ?? created.id;
     if (!createdTargetId) {
@@ -1428,43 +1444,90 @@ interface IdentityBoundChromeControlKillDeps {
   timeoutMs?: number;
   pollMs?: number;
 }
-async function retainLaunchedChromeControlChannel(
-  options: LaunchedChromeControlKillOptions,
-): Promise<ChromeStableKill> {
-  const endpoint = await discoverBrowserWebSocketEndpoint(options.host, options.port);
-  const client = (await CDP({ target: endpoint.browserWSEndpoint, local: true })) as ChromeClient;
+export async function retainChromeEndpointAuthority(
+  options: ChromeEndpointAuthorityOptions,
+  deps: ChromeEndpointAuthorityDeps = {},
+): Promise<RetainedChromeEndpointAuthority> {
+  if (!Number.isInteger(options.port) || options.port <= 0 || options.port > 65_535) {
+    throw new Error(`Chrome control channel has an invalid DevTools port: ${options.port}`);
+  }
+  const endpoint = options.browserWSEndpoint
+    ? { port: options.port, browserWSEndpoint: options.browserWSEndpoint }
+    : await (deps.discoverEndpoint ?? discoverBrowserWebSocketEndpoint)(options.host, options.port);
+  const endpointUrl = new URL(endpoint.browserWSEndpoint);
+  if (
+    endpoint.port !== options.port ||
+    endpointUrl.protocol !== "ws:" ||
+    endpointUrl.hostname !== options.host ||
+    Number.parseInt(endpointUrl.port, 10) !== options.port ||
+    endpointUrl.username ||
+    endpointUrl.password ||
+    endpointUrl.search ||
+    endpointUrl.hash ||
+    !/^\/devtools\/browser\/[^/]+$/u.test(endpointUrl.pathname)
+  ) {
+    throw new Error("Chrome returned an invalid exact browser control channel");
+  }
+
+  const client = await (deps.connectBrowser
+    ? deps.connectBrowser(endpointUrl.toString())
+    : (CDP({ target: endpointUrl.toString(), local: true }) as Promise<ChromeClient>));
   try {
     await client.Browser.getVersion();
     const processResult = await client.SystemInfo.getProcessInfo();
-    if (
-      !Array.isArray(processResult.processInfo) ||
-      !processResult.processInfo.some(
-        (processInfo) =>
-          processInfo !== null &&
-          typeof processInfo === "object" &&
-          "id" in processInfo &&
-          processInfo.id === options.processIdentity.pid,
-      )
-    ) {
-      throw new Error("Chrome control channel is not bound to the captured browser process");
+    const browserProcessMatches = Array.isArray(processResult.processInfo)
+      ? processResult.processInfo.some(
+          (processInfo) =>
+            processInfo !== null &&
+            typeof processInfo === "object" &&
+            "id" in processInfo &&
+            processInfo.id === options.processIdentity.pid &&
+            "type" in processInfo &&
+            processInfo.type === "browser",
+        )
+      : false;
+    if (!browserProcessMatches) {
+      throw new Error(
+        "Chrome control channel is not bound to the captured browser process generation",
+      );
     }
-    const inspection = await inspectChromeProcessIdentity(
-      options.userDataDir,
-      options.processIdentity,
-    );
-    if (inspection !== "current") {
+
+    const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
+    const [inspection, listeningPid] = await Promise.all([
+      inspect(options.userDataDir, options.processIdentity),
+      options.processIdentity.profileDirectory.platform === "darwin"
+        ? (deps.resolveListeningPid ?? resolveListeningPortOwnerPid)(options.port)
+        : Promise.resolve(options.processIdentity.pid),
+    ]);
+    if (inspection !== "current" || listeningPid !== options.processIdentity.pid) {
       throw new Error("Chrome control channel is not bound to the exact process generation");
     }
-    return createIdentityBoundChromeControlKill(
-      client,
-      options.userDataDir,
-      options.processIdentity,
-      {},
-    );
+
+    let releasePromise: Promise<void> | undefined;
+    const release = (): Promise<void> => {
+      releasePromise ??= Promise.resolve(client.close()).then(() => undefined);
+      return releasePromise;
+    };
+    return Object.freeze({
+      browserWSEndpoint: endpointUrl.toString(),
+      kill: createIdentityBoundChromeControlKill(
+        client,
+        options.userDataDir,
+        options.processIdentity,
+        { inspectProcessIdentity: inspect },
+      ),
+      release,
+    });
   } catch (error) {
     await client.close().catch(() => undefined);
     throw error;
   }
+}
+
+async function retainLaunchedChromeControlChannel(
+  options: LaunchedChromeControlKillOptions,
+): Promise<ChromeStableKill> {
+  return (await retainChromeEndpointAuthority(options)).kill;
 }
 
 async function retainExactChromeControlChannel(
@@ -1472,23 +1535,16 @@ async function retainExactChromeControlChannel(
   userDataDir: string,
   processIdentity: ChromeProcessIdentity,
 ): Promise<ChromeStableKill> {
-  const client = (await CDP({ target: browserWSEndpoint, local: true })) as ChromeClient;
-  try {
-    await client.Browser.getVersion();
-    const endpoint = new URL(browserWSEndpoint);
-    const port = Number.parseInt(endpoint.port, 10);
-    const [listeningPid, inspection] = await Promise.all([
-      resolveListeningPortOwnerPid(port),
-      inspectChromeProcessIdentity(userDataDir, processIdentity),
-    ]);
-    if (listeningPid !== processIdentity.pid || inspection !== "current") {
-      throw new Error(`Hidden Chrome control channel is not bound to the exact process generation`);
-    }
-    return createIdentityBoundChromeControlKill(client, userDataDir, processIdentity, {});
-  } catch (error) {
-    await client.close().catch(() => undefined);
-    throw error;
-  }
+  const endpoint = new URL(browserWSEndpoint);
+  return (
+    await retainChromeEndpointAuthority({
+      host: endpoint.hostname,
+      port: Number.parseInt(endpoint.port, 10),
+      browserWSEndpoint,
+      userDataDir,
+      processIdentity,
+    })
+  ).kill;
 }
 
 function createIdentityBoundChromeControlKill(

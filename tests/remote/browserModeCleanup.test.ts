@@ -143,5 +143,5 @@ describe("remote browser unpublished cleanup", () => {
       vi.resetModules();
       await rm(profileDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });

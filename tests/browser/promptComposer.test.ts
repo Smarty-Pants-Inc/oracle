@@ -8,6 +8,8 @@ import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
 } from "../../src/browser/constants.js";
+import { verifyCommittedPromptTurn } from "../../src/browser/actions/assistantResponse.js";
+import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
 
 describe("promptComposer", () => {
   test("fails composer clearing when stale text remains", async () => {
@@ -34,6 +36,90 @@ describe("promptComposer", () => {
       details: { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
     });
     expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("commits and verifies a container whose user role exists only in nested data-turn markup", async () => {
+    const nestedUser = {
+      dataset: { messageId: "nested-message" },
+      getAttribute(name: string): string | null {
+        if (name === "data-turn") return "user";
+        if (name === "data-message-id") return "nested-message";
+        return null;
+      },
+      querySelector: () => null,
+    };
+    const container = {
+      innerText: "Exact nested prompt",
+      textContent: "Exact nested prompt",
+      dataset: { turnId: "nested-turn" },
+      getAttribute(name: string): string | null {
+        if (name === "data-testid") return "conversation-turn-nested";
+        if (name === "data-turn-id") return "nested-turn";
+        return null;
+      },
+      matches: () => false,
+      querySelector(selector: string) {
+        if (selector.includes('[data-turn="user"]')) return nestedUser;
+        if (selector === "[data-message-id]") return nestedUser;
+        return null;
+      },
+    };
+    const document = {
+      querySelector: () => null,
+      querySelectorAll: (selector: string) => {
+        if (
+          selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
+          selector === CONVERSATION_TURN_SELECTOR
+        ) {
+          return [container];
+        }
+        return [];
+      },
+    };
+    class FakeTextArea {}
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: Function(
+            "document",
+            "HTMLTextAreaElement",
+            "location",
+            `return ${expression};`,
+          )(document, FakeTextArea, { href: "https://chatgpt.com/c/nested-user" }),
+        },
+      })),
+    };
+
+    const committed = await promptComposer.verifyPromptCommitted(
+      runtime as never,
+      "Exact nested prompt",
+      150,
+      undefined,
+      0,
+    );
+
+    const locator: CommittedPromptEpochLocator = {
+      epoch: {
+        status: "committed",
+        epochId: "nested-user-prompt-epoch-0",
+        promptSha256: committed.promptSha256,
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: committed.verifiedUserTurnIndex,
+        verifiedUserTurnId: committed.verifiedUserTurnId,
+        verifiedUserMessageId: committed.verifiedUserMessageId,
+        conversationId: committed.conversationId,
+      },
+      conversationId: committed.conversationId,
+      promptSha256: committed.promptSha256,
+      verifiedUserTurnIndex: committed.verifiedUserTurnIndex,
+      verifiedUserTurnId: committed.verifiedUserTurnId,
+      verifiedUserMessageId: committed.verifiedUserMessageId,
+      conversationUrls: ["https://chatgpt.com/c/nested-user"],
+    };
+
+    await expect(verifyCommittedPromptTurn(runtime as never, locator)).resolves.toBeUndefined();
   });
 
   test("does not commit an exact prompt turn without stable turn and message ids", async () => {

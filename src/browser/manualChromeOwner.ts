@@ -1,5 +1,10 @@
 import { formatElapsed } from "../oracle/format.js";
-import { launchChrome, type ChromeLaunchResult } from "./chromeLifecycle.js";
+import {
+  launchChrome,
+  retainChromeEndpointAuthority,
+  type ChromeLaunchResult,
+  type RetainedChromeEndpointAuthority,
+} from "./chromeLifecycle.js";
 import {
   acquireProfileRunLock,
   captureChromeProcessIdentity,
@@ -30,6 +35,7 @@ export interface ManualChromeOwner {
   readonly chrome: BrowserChrome;
   readonly processIdentity: ChromeProcessIdentity;
   readonly source: ManualChromeOwnerSource;
+  readonly endpointAuthority?: RetainedChromeEndpointAuthority;
 }
 
 export interface ManualChromeOwnerDeps {
@@ -39,6 +45,7 @@ export interface ManualChromeOwnerDeps {
   discoverExactProfileChrome?: typeof findRunningChromeDebugTargetForProfile;
   isOwnerProcessAlive?: typeof isProcessAlive;
   launch?: typeof launchChrome;
+  retainEndpointAuthority?: typeof retainChromeEndpointAuthority;
   probe?: typeof verifyDevToolsReachable;
   readOwner?: typeof readOracleChromeOwner;
   readPort?: typeof readDevToolsPort;
@@ -57,7 +64,17 @@ export async function settleManualChromeOwner(
   logger: BrowserLogger,
   deps: Pick<ManualChromeOwnerDeps, "cleanupProfileState"> = {},
 ): Promise<ManualChromeOwnerSettlement> {
-  if (owner.source !== "launched") return { status: "preserved" };
+  if (owner.source !== "launched") {
+    try {
+      await owner.endpointAuthority?.release();
+      return { status: "preserved" };
+    } catch (error) {
+      return {
+        status: "unsafe",
+        reason: `Exact Chrome control channel could not be released: ${error instanceof Error ? error.message : error}`,
+      };
+    }
+  }
 
   const termination = await owner.chrome.kill().catch((error: unknown) => ({
     status: "unsafe" as const,
@@ -202,6 +219,12 @@ export async function acquireManualChromeOwner(
       if (!isSafeChromeTerminationOutcome(termination)) {
         failures.push(new Error(termination.reason));
       }
+    } else if (acquiredOwner?.endpointAuthority) {
+      try {
+        await acquiredOwner.endpointAuthority.release();
+      } catch (error) {
+        failures.push(error instanceof Error ? error : new Error(String(error)));
+      }
     }
     if (failures.length > 1) {
       throw new AggregateError(
@@ -237,6 +260,7 @@ async function findExistingManualChromeOwner(
   const readOwner = deps.readOwner ?? readOracleChromeOwner;
   const verifyIdentity = deps.verifyIdentity ?? verifyChromeProcessIdentity;
   const discoverExact = deps.discoverExactProfileChrome ?? findRunningChromeDebugTargetForProfile;
+  const retainEndpointAuthority = deps.retainEndpointAuthority ?? retainChromeEndpointAuthority;
   const probe = deps.probe ?? verifyDevToolsReachable;
   const ownerProcessAlive = deps.isOwnerProcessAlive ?? isProcessAlive;
 
@@ -254,19 +278,28 @@ async function findExistingManualChromeOwner(
       profileDir,
     );
     const recordedPid = requirePositiveInteger(recordedIdentity.pid, "recorded pid", profileDir);
-    const reachable = await probe({ port: recordedPort });
-    if (!reachable.ok) {
+    let endpointAuthority: RetainedChromeEndpointAuthority;
+    try {
+      endpointAuthority = await retainEndpointAuthority({
+        host: "127.0.0.1",
+        port: recordedPort,
+        userDataDir: profileDir,
+        processIdentity: recordedIdentity,
+      });
+    } catch (error) {
       throw new Error(
-        `Verified Chrome owner for ${profileDir} is running as pid ${recordedPid}, but DevTools port ${recordedPort} is unreachable (${reachable.error}); refusing to launch a second browser process`,
+        `Verified Chrome owner for ${profileDir} is running as pid ${recordedPid}, but DevTools port ${recordedPort} is not bound to that exact process generation; refusing to launch a second browser process`,
+        { cause: error },
       );
     }
     logger(
       `Reusing canonical Chrome owner for ${profileDir} (DevTools port ${recordedPort}, pid ${recordedPid})`,
     );
     return {
-      chrome: reusableChrome(recordedPort, recordedPid, recordedIdentity),
+      chrome: reusableChrome(recordedPort, recordedPid, recordedIdentity, endpointAuthority),
       processIdentity: recordedIdentity,
       source: "recorded",
+      endpointAuthority,
     };
   }
 
@@ -285,13 +318,6 @@ async function findExistingManualChromeOwner(
   if (discovered) {
     const pid = requirePositiveInteger(discovered.pid, "rediscovered pid", profileDir);
     const port = requirePositiveInteger(discovered.port, "rediscovered DevTools port", profileDir);
-    const reachable = await probe({ port });
-    if (!reachable.ok) {
-      throw new Error(
-        `Exact Chrome owner for ${profileDir} is running as pid ${pid}, but DevTools port ${port} is unreachable (${reachable.error}); refusing to launch a second browser process`,
-      );
-    }
-
     const processIdentity =
       recordedIdentity && recordedIdentity.pid === pid && recordedIdentityVerified
         ? recordedIdentity
@@ -302,12 +328,43 @@ async function findExistingManualChromeOwner(
         `Rediscovered Chrome owner belongs to a different physical profile generation.`,
       );
     }
-    await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
+
+    let endpointAuthority: RetainedChromeEndpointAuthority;
+    try {
+      endpointAuthority = await retainEndpointAuthority({
+        host: "127.0.0.1",
+        port,
+        userDataDir: profileDir,
+        processIdentity,
+      });
+    } catch (error) {
+      throw new Error(
+        `Rediscovered Chrome owner for ${profileDir} is running as pid ${pid}, but DevTools port ${port} is not bound to that exact process generation; refusing to reuse it`,
+        { cause: error },
+      );
+    }
+    try {
+      await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
+    } catch (error) {
+      try {
+        await endpointAuthority.release();
+      } catch (releaseError) {
+        throw new AggregateError(
+          [
+            error instanceof Error ? error : new Error(String(error)),
+            releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
+          ],
+          `Rediscovered Chrome authority could not be persisted or released safely.`,
+        );
+      }
+      throw error;
+    }
     logger(`Rediscovered exact Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
     return {
-      chrome: reusableChrome(port, pid, processIdentity),
+      chrome: reusableChrome(port, pid, processIdentity, endpointAuthority),
       processIdentity,
       source: "rediscovered",
+      endpointAuthority,
     };
   }
 
@@ -382,17 +439,13 @@ function reusableChrome(
   port: number,
   pid: number,
   processIdentity: ChromeProcessIdentity,
+  endpointAuthority: RetainedChromeEndpointAuthority,
 ): BrowserChrome {
   return {
     port,
     pid,
     processIdentity,
-    kill: async () => ({
-      status: "unsafe",
-      pid,
-      reason:
-        "Reused Chrome has no retained stable process handle or authenticated exact control channel",
-    }),
+    kill: endpointAuthority.kill,
     process: undefined,
   } as unknown as BrowserChrome;
 }

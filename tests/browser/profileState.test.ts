@@ -10,6 +10,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
@@ -232,7 +233,7 @@ describe("profileState", () => {
     ).toBe(false);
   });
 
-  test("captures a macOS Chrome executable from its physical text vnode", async () => {
+  test("captures a macOS Chrome generation from its audit token and physical text vnode", async () => {
     const userDataDir = "/tmp/oracle-mac-profile";
     const profileDirectory = {
       version: 1 as const,
@@ -242,13 +243,16 @@ describe("profileState", () => {
       inode: "2",
     };
     const execute = vi.fn(async (file: string, args: string[]) => {
+      if (file === "/usr/bin/lsappinfo") {
+        return {
+          stdout:
+            '"Google Chrome" ASN:0x0-0x1234: pid = 4321 token=[sess=100020 pid=4321 uid:501,501,501 g:20,20 pV:7001]\n',
+        };
+      }
       if (file === "/usr/sbin/lsof") {
         return {
           stdout: "p4321\nftxt\nn/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n",
         };
-      }
-      if (file === "ps" && args.at(-1) === "lstart=") {
-        return { stdout: "Tue Aug  4 12:00:00 2026\n" };
       }
       if (file === "ps" && args.at(-1) === "command=") {
         return {
@@ -266,7 +270,7 @@ describe("profileState", () => {
       }),
     ).resolves.toMatchObject({
       pid: 4321,
-      processStartTime: "Tue Aug  4 12:00:00 2026",
+      processStartTime: "darwin-audit-pidversion:7001",
       executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       normalizedUserDataDir: userDataDir,
     });
@@ -274,6 +278,66 @@ describe("profileState", () => {
       "/usr/sbin/lsof",
       expect.arrayContaining(["-p", "4321", "-d", "txt"]),
     );
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(execute).toHaveBeenNthCalledWith(1, "/usr/bin/lsappinfo", ["info", "4321"]);
+    expect(execute).toHaveBeenNthCalledWith(4, "/usr/bin/lsappinfo", ["info", "4321"]);
+  });
+
+  test("rejects a same-pid same-second macOS replacement while accepting the exact audit generation", async () => {
+    const userDataDir = "/tmp/oracle-mac-generation";
+    const profileDirectory = {
+      version: 1 as const,
+      platform: "darwin" as const,
+      canonicalPath: userDataDir,
+      device: "1",
+      inode: "2",
+    };
+    const identity = {
+      pid: 4321,
+      processStartTime: "darwin-audit-pidversion:7001",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: userDataDir,
+      launchNonce: "00000000-0000-4000-8000-000000007001",
+      profileDirectory,
+    };
+    const processExecutor = (pidVersion: number) =>
+      vi.fn(async (file: string, args: string[]) => {
+        if (file === "/usr/bin/lsappinfo") {
+          return {
+            stdout: `"Google Chrome" ASN:0x0-0x1234: pid = 4321 token=[sess=100020 pid=4321 uid:501,501,501 g:20,20 pV:${pidVersion}]\n`,
+          };
+        }
+        if (file === "/usr/sbin/lsof") {
+          return {
+            stdout: "p4321\nftxt\nn/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n",
+          };
+        }
+        if (file === "ps" && args.at(-1) === "command=") {
+          return {
+            stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir}\n`,
+          };
+        }
+        throw new Error(`Unexpected process query: ${file} ${args.join(" ")}`);
+      });
+    const verifyWith = (execute: (file: string, args: string[]) => Promise<{ stdout: string }>) =>
+      profileState.verifyChromeProcessIdentityForTest(userDataDir, identity, {
+        platform: "darwin",
+        execute,
+        readOwner: async () => ({ port: 45_678, processIdentity: identity }),
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+      });
+
+    const exactGeneration = processExecutor(7001);
+    await expect(verifyWith(exactGeneration)).resolves.toBe(true);
+
+    const samePidReplacement = processExecutor(7002);
+    await expect(verifyWith(samePidReplacement)).resolves.toBe(false);
+    expect(
+      samePidReplacement.mock.calls.some(
+        ([file, args]) => file === "ps" && args.at(-1) === "lstart=",
+      ),
+    ).toBe(false);
   });
 
   test("crash recovery without stable authority remains pending and never taskkills", async () => {
@@ -445,6 +509,27 @@ describe("profileState", () => {
     }
   });
 
+  test("removes a matching profile through an isolated directory generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-owned-"));
+    const profileDir = path.join(root, "profile");
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "authorized-marker"), "remove");
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+        }),
+      ).resolves.toBe(true);
+      expect(existsSync(profileDir)).toBe(false);
+      expect((await readdir(root)).filter((entry) => entry.startsWith(".oracle-remove-"))).toEqual(
+        [],
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("path replacement cannot redirect final profile deletion", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-retarget-"));
     const profileDir = path.join(root, "profile");
@@ -483,6 +568,34 @@ describe("profileState", () => {
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
           isChromeUsingUserDataDir: async () => false,
           beforeQuarantineDelete: async (quarantinePath) => {
+            replacementPath = quarantinePath;
+            await rename(quarantinePath, movedGeneration);
+            await mkdir(quarantinePath);
+            await writeFile(path.join(quarantinePath, "replacement-marker"), "never-delete");
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(existsSync(path.join(movedGeneration, "authorized-marker"))).toBe(true);
+      expect(replacementPath).toBeDefined();
+      expect(existsSync(path.join(replacementPath ?? "", "replacement-marker"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("post-verification quarantine replacement preserves both directory generations", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-quarantine-final-race-"));
+    const profileDir = path.join(root, "profile");
+    const movedGeneration = path.join(root, "verified-generation");
+    let replacementPath: string | undefined;
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "authorized-marker"), "preserve");
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          isChromeUsingUserDataDir: async () => false,
+          afterQuarantineIdentityVerification: async (quarantinePath) => {
             replacementPath = quarantinePath;
             await rename(quarantinePath, movedGeneration);
             await mkdir(quarantinePath);

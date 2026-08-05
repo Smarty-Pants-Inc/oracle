@@ -3,13 +3,15 @@ import type { CommittedPromptEpochLocator } from "../reattachability.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import {
   ANSWER_SELECTORS,
-  ASSISTANT_ROLE_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
   COPY_BUTTON_SELECTOR,
   FINISHED_ACTIONS_SELECTOR,
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import {
+  buildConversationTurnIdentityExpression,
+  buildConversationTurnListExpression,
+} from "../conversationTurns.js";
 import { buildThinkingActivePredicateJs, readThinkingActivity } from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
@@ -199,32 +201,12 @@ export async function verifyCommittedPromptTurn(
       const conversationId = href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
       if (conversationId !== expected.conversationId) return null;
       const turns = ${buildConversationTurnListExpression()};
-      const isUserTurn = (candidate) => {
-        if (!candidate) return false;
-        const candidateRole = String(
-          candidate.getAttribute?.('data-message-author-role') ||
-            candidate.getAttribute?.('data-turn') ||
-            candidate.dataset?.turn ||
-            '',
-        ).toLowerCase();
-        return candidateRole === 'user' || Boolean(
-          candidate.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
-        );
-      };
+      ${buildConversationTurnIdentityExpression()}
       const turn = turns[expected.userTurnIndex];
       if (!turn) return null;
       if (!isUserTurn(turn)) return null;
-      const testId = turn.getAttribute?.('data-testid');
-      const turnId =
-        turn.getAttribute?.('data-turn-id') ||
-        turn.dataset?.turnId ||
-        (String(testId || '').startsWith('conversation-turn-') ? testId : null) ||
-        (String(turn.id || '').startsWith('conversation-turn-') ? turn.id : null);
-      const messageNode = turn.matches?.('[data-message-id]')
-        ? turn
-        : turn.querySelector?.('[data-message-id]');
-      const messageId =
-        messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId || null;
+      const turnId = readTurnId(turn);
+      const messageId = readMessageId(turn);
       if (turnId !== expected.userTurnId) return null;
       if (messageId !== expected.userMessageId) return null;
       for (let index = expected.userTurnIndex + 1; index < turns.length; index += 1) {
@@ -906,17 +888,7 @@ function buildCompletionVisibilityExpression(
     const MIN_TURN_INDEX = ${minTurnLiteral};
     // Find the LAST assistant turn to check completion status. Must match the same logic as
     // buildAssistantExtractor, then correlate the controls to the sampled response.
-    const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
-    const isAssistantTurn = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-      if (role === 'assistant') return true;
-      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-      if (testId.includes('assistant')) return true;
-      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-    };
+    ${buildConversationTurnIdentityExpression()}
 
     const turns = ${buildConversationTurnListExpression()};
     let lastAssistantTurn = null;
@@ -1125,7 +1097,6 @@ function buildResponseObserverExpression(
   expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
   const selectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
-  const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
       ? Math.floor(minTurnIndex)
@@ -1140,7 +1111,7 @@ function buildResponseObserverExpression(
     const SELECTORS = ${selectorsLiteral};
     const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
     const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
-    const ASSISTANT_SELECTOR = ${assistantLiteral};
+    ${buildConversationTurnIdentityExpression()}
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     // Learned: settling avoids capturing mid-stream HTML; keep short.
     const settleDelayMs = 800;
@@ -1164,17 +1135,6 @@ function buildResponseObserverExpression(
     ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
     ${buildThinkingActivePredicateJs("isThinkingActiveNow")}
 
-    // Helper to detect assistant turns - must match buildAssistantExtractor logic for consistency.
-    const isAssistantTurn = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-      if (role === 'assistant') return true;
-      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-      if (testId.includes('assistant')) return true;
-      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-    };
 
     const MIN_TURN_INDEX = ${minTurnLiteral};
     ${buildAssistantExtractor("extractFromTurns", expectedPromptTurn)}
@@ -1380,7 +1340,6 @@ function buildAssistantExtractor(
   functionName: string,
   expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
-  const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const expectedUserLiteral = expectedPromptTurn
     ? JSON.stringify({
         index: expectedPromptTurn.verifiedUserTurnIndex,
@@ -1390,46 +1349,8 @@ function buildAssistantExtractor(
     : "null";
   return `const ${functionName} = () => {
     ${buildClickDispatcher()}
-    const ASSISTANT_SELECTOR = ${assistantLiteral};
+    ${buildConversationTurnIdentityExpression()}
     const EXPECTED_USER = ${expectedUserLiteral};
-    const isAssistantTurn = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-      if (role === 'assistant') return true;
-      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-      if (testId.includes('assistant')) return true;
-      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-    };
-    const isUserTurn = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      const role = String(
-        node.getAttribute('data-message-author-role') ||
-          node.getAttribute('data-turn') ||
-          node.dataset?.turn ||
-          '',
-      ).toLowerCase();
-      return role === 'user' || Boolean(
-        node.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
-      );
-    };
-    const readTurnId = (node) => {
-      const testId = node?.getAttribute?.('data-testid');
-      const value =
-        node?.getAttribute?.('data-turn-id') ||
-        node?.dataset?.turnId ||
-        (String(testId || '').startsWith('conversation-turn-') ? testId : '') ||
-        (String(node?.id || '').startsWith('conversation-turn-') ? node.id : '');
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
-    const readMessageId = (node) => {
-      const messageNode = node?.matches?.('[data-message-id]')
-        ? node
-        : node?.querySelector?.('[data-message-id]');
-      const value = messageNode?.getAttribute?.('data-message-id') || messageNode?.dataset?.messageId;
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
 
     const expandCollapsibles = (root) => {
       const buttons = Array.from(root.querySelectorAll('button'));
@@ -1475,7 +1396,7 @@ function buildAssistantExtractor(
     for (const index of candidateIndexes) {
       const turn = turns[index];
       if (!isAssistantTurn(turn)) continue;
-      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) ?? turn;
+        const messageRoot = turn.querySelector(ASSISTANT_TURN_SELECTOR) ?? turn;
       expandCollapsibles(messageRoot);
       const preferred =
         (messageRoot.matches?.('.markdown') || messageRoot.matches?.('[data-message-content]') ? messageRoot : null) ||
@@ -1518,6 +1439,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     ? `(${minTurnLiteral} >= 0 ? ${minTurnLiteral} : null)`
     : "null";
   return `(() => {
+    ${buildConversationTurnIdentityExpression()}
     const __minTurn = ${turnIndexValue};
     const roots = [
       document.querySelector('section[data-testid="screen-threadFlyOut"]'),
@@ -1535,7 +1457,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       );
     const scoreRoot = (node) => {
       const actions = node.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}').length;
-      const assistants = node.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]').length;
+      const assistants = node.querySelectorAll(ASSISTANT_TURN_SELECTOR).length;
       const markdowns = node.querySelectorAll(markdownSelector).length;
       return actions * 10 + assistants * 5 + markdowns;
     };
@@ -1559,7 +1481,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
     const collectLastUser = (scope) => {
       if (!scope?.querySelectorAll) return null;
-      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
+      const userTurns = Array.from(scope.querySelectorAll(USER_TURN_SELECTOR));
       return userTurns[userTurns.length - 1] ?? null;
     };
     const lastUser = collectLastUser(root) || collectLastUser(document);
@@ -1586,10 +1508,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       .filter((node) => !isExcluded(node))
       .filter((node) => {
         const container = node.closest('[data-message-author-role], [data-turn]');
-        if (!container) return true;
-        const role =
-          (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
-        return role !== 'user';
+        return !container || !isUserTurn(container);
       });
     if (markdowns.length === 0) return null;
     const actionButtons = Array.from(root.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}'));
@@ -1597,7 +1516,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     for (const button of actionButtons) {
       const container =
         button.closest('${CONVERSATION_TURN_SELECTOR}') ||
-        button.closest('[data-message-author-role="assistant"], [data-turn="assistant"]') ||
+        button.closest(ASSISTANT_TURN_SELECTOR) ||
         button.closest('[data-message-author-role], [data-turn]') ||
         button.closest('[data-testid*="assistant"]');
       if (!container || container === root || container === document.body) continue;
@@ -1605,10 +1524,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
         .filter((node) => !isExcluded(node))
         .filter((node) => {
           const roleNode = node.closest('[data-message-author-role], [data-turn]');
-          if (!roleNode) return true;
-          const role =
-            (roleNode.getAttribute('data-message-author-role') || roleNode.getAttribute('data-turn') || '').toLowerCase();
-          return role !== 'user';
+          return !roleNode || !isUserTurn(roleNode);
         });
       if (scoped.length === 0) continue;
       for (const node of scoped) {
@@ -1617,16 +1533,11 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     }
     const assistantMarkdowns = markdowns.filter((node) => {
       const container = node.closest('[data-message-author-role], [data-turn], [data-testid*="assistant"]');
-      if (!container) return false;
-      const role =
-        (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
-      if (role === 'assistant') return true;
-      const testId = (container.getAttribute('data-testid') || '').toLowerCase();
-      return testId.includes('assistant');
+      return Boolean(container && isAssistantTurn(container));
     });
     const hasAssistantIndicators = Boolean(
       root.querySelector('${FINISHED_ACTIONS_SELECTOR}') ||
-        root.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant"]'),
+        root.querySelector(ASSISTANT_TURN_SELECTOR + ', [data-testid*="assistant"]'),
     );
     const allowMarkdownFallback = hasAssistantIndicators || hasTurns || Boolean(userText);
     const candidates =
@@ -1697,17 +1608,7 @@ function buildCopyExpression(
       }
       if (requireExactHint) return null;
       const CONVERSATION_SELECTOR = ${JSON.stringify(CONVERSATION_TURN_SELECTOR)};
-      const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
-      const isAssistantTurn = (node) => {
-        if (!(node instanceof HTMLElement)) return false;
-        const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-        if (turnAttr === 'assistant') return true;
-        const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-        if (role === 'assistant') return true;
-        const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-        if (testId.includes('assistant')) return true;
-        return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-      };
+      ${buildConversationTurnIdentityExpression()}
       const turns = ${buildConversationTurnListExpression()};
       for (let i = turns.length - 1; i >= 0; i -= 1) {
         const turn = turns[i];

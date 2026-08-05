@@ -4,8 +4,14 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, realpath, rm, writeFile, readFile, stat } from "node:fs/promises";
-import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
+import {
+  createRemoteServer,
+  drainRemoteServerShutdown,
+  type RemoteServerInstance,
+} from "../../src/remote/server.js";
+import { runBridgeHost } from "../../src/cli/bridge/host.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   createRemoteBrowserExecutor,
@@ -827,6 +833,177 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "keeps the bridge tunnel and controller authority until an in-flight run reaches durable shutdown handoff",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-graceful-drain-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const controllerLockPath = path.join(transactionStoreDir, ".controller.lock");
+      const connectionPath = path.join(tmpDir, "bridge-connection.json");
+      const runStarted = Promise.withResolvers<void>();
+      const continueRun = Promise.withResolvers<void>();
+      const shutdownRequested = Promise.withResolvers<void>();
+      const tunnelStarted = Promise.withResolvers<void>();
+      const transactionToken = "5".repeat(64);
+      const rejectedTransactionToken = "6".repeat(64);
+      const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromePort: 9222,
+        chromeTargetId: "graceful-drain-target",
+      };
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            runStarted.resolve();
+            await continueRun.promise;
+            return browserTransaction(
+              options.prompt,
+              {
+                answerText: "durable shutdown answer",
+                answerMarkdown: "durable shutdown answer",
+                tookMs: 1,
+                answerTokens: 3,
+                answerChars: 23,
+              },
+              runtime,
+            );
+          },
+        },
+      );
+      let hostPromise: Promise<void> | undefined;
+      let hostSettled = false;
+      let lockPresentAtTunnelStop: boolean | undefined;
+      let recordAtTunnelStop: Record<string, unknown> | undefined;
+      let listenerProbeAtTunnelStop: Promise<unknown> | undefined;
+      const stopTunnel = vi.fn(() => {
+        lockPresentAtTunnelStop = existsSync(controllerLockPath);
+        recordAtTunnelStop = JSON.parse(readFileSync(recordPath, "utf8")) as Record<
+          string,
+          unknown
+        >;
+        listenerProbeAtTunnelStop = httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${rejectedTransactionToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        }).then(
+          () => new Error("remote listener still accepted work during tunnel teardown"),
+          (error: unknown) => error,
+        );
+      });
+
+      try {
+        hostPromise = runBridgeHost(
+          {
+            bind: `127.0.0.1:${server.port}`,
+            token: "secret",
+            writeConnection: connectionPath,
+            ssh: "synthetic-bridge-host",
+          },
+          {
+            serveRemote: () =>
+              drainRemoteServerShutdown(server, shutdownRequested.promise, {
+                logger: () => {},
+                retryDelayMs: 1,
+              }),
+            startReverseTunnel: () => {
+              tunnelStarted.resolve();
+              return { stop: stopTunnel };
+            },
+          },
+        );
+        void hostPromise.then(
+          () => {
+            hostSettled = true;
+          },
+          () => {
+            hostSettled = true;
+          },
+        );
+        await tunnelStarted.promise;
+
+        const runRequest = httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "secret",
+          body: remoteRunPayload(),
+        });
+        await runStarted.promise;
+        shutdownRequested.resolve();
+
+        await vi.waitFor(async () => {
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${rejectedTransactionToken}/run`,
+              token: "secret",
+              body: remoteRunPayload(),
+            }),
+          ).resolves.toMatchObject({
+            statusCode: 503,
+            json: { error: "server_closing" },
+          });
+        });
+
+        const explicitClose = server.close();
+        let explicitCloseSettled = false;
+        void explicitClose.then(
+          () => {
+            explicitCloseSettled = true;
+          },
+          () => {
+            explicitCloseSettled = true;
+          },
+        );
+        await Promise.resolve();
+        expect(explicitCloseSettled).toBe(false);
+        expect(hostSettled).toBe(false);
+        expect(stopTunnel).not.toHaveBeenCalled();
+        expect(existsSync(controllerLockPath)).toBe(true);
+
+        continueRun.resolve();
+        const runResponse = await runRequest;
+        expect(runResponse.statusCode).toBe(200);
+        expect(runResponse.events.find((event) => event.type === "transaction")).toMatchObject({
+          transaction: {
+            transactionToken,
+            state: "pending",
+            result: { answerText: "durable shutdown answer" },
+          },
+        });
+
+        await explicitClose;
+        await hostPromise;
+        expect(stopTunnel).toHaveBeenCalledOnce();
+        expect(lockPresentAtTunnelStop).toBe(false);
+        expect(recordAtTunnelStop).toMatchObject({
+          state: "pending",
+          result: { answerText: "durable shutdown answer" },
+          runtime: { chromeTargetId: "graceful-drain-target" },
+        });
+        if (!listenerProbeAtTunnelStop) throw new Error("missing listener teardown probe");
+        const listenerError = await listenerProbeAtTunnelStop;
+        expect(listenerError).toBeInstanceOf(Error);
+        expect(["ECONNREFUSED", "ECONNRESET"]).toContain(
+          (listenerError as NodeJS.ErrnoException).code,
+        );
+        await expect(server.close()).resolves.toBeUndefined();
+      } finally {
+        continueRun.resolve();
+        shutdownRequested.resolve();
+        await hostPromise?.catch(() => undefined);
+        await server.close().catch(() => undefined);
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "preserves an unacknowledged artifact capture across graceful restart and resumes delivery",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-handoff-"));
@@ -1398,8 +1575,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             },
           },
         });
-        expect(JSON.stringify(retry.json)).not.toContain("restart-target");
-        expect(JSON.stringify(retry.json)).not.toContain("9222");
+        const responseRuntime = (retry.json?.transaction as { runtime?: unknown } | undefined)
+          ?.runtime;
+        expect(responseRuntime).toStrictEqual({
+          promptEpoch: committedPromptEpoch(prompt),
+          cleanup: { status: "pending" },
+        });
         expect(resumeBrowser).toHaveBeenCalledOnce();
 
         const settlement = await httpPostJson({
@@ -1520,6 +1701,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-remote-restart-"));
       const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const canonicalProfileDir = profileDirectory.canonicalPath;
       const identity = {
         pid: process.pid,
         processStartTime: "test-live-launched-owner",
@@ -1532,7 +1714,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         profileDirectory,
       };
       const chromePort = 45_678;
-      await writeOracleChromeOwner(profileDir, { port: chromePort, processIdentity: identity });
+      await writeOracleChromeOwner(canonicalProfileDir, {
+        port: chromePort,
+        processIdentity: identity,
+      });
       const prompt = "restart cleanup authority";
       const transactionToken = "d".repeat(64);
       const runtime: BrowserRunTransaction["runtime"] = {

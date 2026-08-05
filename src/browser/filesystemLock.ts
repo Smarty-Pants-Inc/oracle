@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { delay } from "./utils.js";
 
 const LOCK_OWNER_FILENAME = "owner.json";
@@ -15,6 +15,7 @@ const DEFAULT_INCOMPLETE_STALE_MS = 5_000;
 const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
 const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
 const LOCK_MUTATION_REQUEST_CLEANUP_TIMEOUT_MS = 1_000;
+const LOCK_RELEASE_MUTATION_TIMEOUT_MS = 1_000;
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const CURRENT_PROCESS_IDENTITY_RETRY_MS = 5_000;
 const execFileAsync = promisify(execFile);
@@ -88,6 +89,7 @@ interface FilesystemLockMutationRequestRemovalState {
   requestPath: string;
   expectedGeneration: FilesystemLockGeneration;
   quarantinedPath?: string;
+  isolatedRemovalRootPath?: string;
 }
 
 interface FilesystemLockReleaseState {
@@ -113,6 +115,16 @@ export class FilesystemLockBusyError extends Error {
     this.name = "FilesystemLockBusyError";
     this.lockPath = lockPath;
     this.owner = owner;
+  }
+}
+export class FilesystemLockReleasePendingError extends Error {
+  readonly lockPath: string;
+  readonly retryable = true;
+
+  constructor(lockPath: string) {
+    super(`Filesystem lock release at ${lockPath} is pending mutation authority`);
+    this.name = "FilesystemLockReleasePendingError";
+    this.lockPath = lockPath;
   }
 }
 
@@ -408,6 +420,7 @@ async function acquireFilesystemLockMutationLease(
   options: FilesystemLockMutationOptions,
   deadlineMs?: number,
   whileWaiting?: () => Promise<void>,
+  deadlineNow: () => number = options.now,
 ): Promise<FilesystemLockMutationLease | null> {
   const mutationRootPath = `${lockPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`;
   let preparedRequestPath: string | undefined;
@@ -471,11 +484,11 @@ async function acquireFilesystemLockMutationLease(
       }
       await whileWaiting?.();
 
-      if (deadlineMs !== undefined && options.now() >= deadlineMs) return null;
+      if (deadlineMs !== undefined && deadlineNow() >= deadlineMs) return null;
       const waitMs =
         deadlineMs === undefined
           ? options.pollMs
-          : Math.min(options.pollMs, Math.max(1, deadlineMs - options.now()));
+          : Math.min(options.pollMs, Math.max(1, deadlineMs - deadlineNow()));
       await delay(waitMs);
     }
   } finally {
@@ -675,6 +688,12 @@ async function removeFilesystemLockMutationRequest(
   state: FilesystemLockMutationRequestRemovalState,
   options: FilesystemLockMutationOptions,
 ): Promise<void> {
+  if (state.isolatedRemovalRootPath !== undefined) {
+    await removeIsolatedDirectoryGeneration(state.isolatedRemovalRootPath);
+    state.isolatedRemovalRootPath = undefined;
+    return;
+  }
+
   if (state.quarantinedPath === undefined) {
     const quarantinedPath = `${state.requestPath}.stale-${options.owner.ownerNonce}`;
     try {
@@ -696,15 +715,26 @@ async function removeFilesystemLockMutationRequest(
       throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
     }
     // The verified rename is the queue-release point. Later cleanup failures retain only the
-    // quarantined path, so a retry can delete it without republishing a live request.
+    // quarantined path or its private removal root, so a retry never republishes a live request.
     state.quarantinedPath = quarantinedPath;
   }
 
+  await options.beforeRequestRemoval?.(state.requestPath);
   const quarantinedPath = state.quarantinedPath;
   if (quarantinedPath === undefined) return;
-  await options.beforeRequestRemoval?.(state.requestPath);
-  await removeLockPath(quarantinedPath);
+  const isolation = await isolateDirectoryGenerationForRemoval(quarantinedPath, (generationPath) =>
+    lockGenerationMatches(generationPath, state.expectedGeneration),
+  );
+  if (isolation.status === "missing") {
+    throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
+  }
+  if (isolation.status === "changed") {
+    throw new Error(`Filesystem lock mutation ownership changed at ${state.requestPath}`);
+  }
   state.quarantinedPath = undefined;
+  state.isolatedRemovalRootPath = isolation.rootPath;
+  await removeIsolatedDirectoryGeneration(isolation.rootPath);
+  state.isolatedRemovalRootPath = undefined;
 }
 
 function isRetryableFilesystemLockMutationCleanupError(error: unknown): boolean {
@@ -746,7 +776,15 @@ async function quarantineFilesystemLockMutationRequest(
     return false;
   }
 
-  await removeLockPath(quarantinedPath);
+  const isolation = await isolateDirectoryGenerationForRemoval(quarantinedPath, (generationPath) =>
+    lockGenerationMatches(generationPath, expectedGeneration),
+  );
+  if (isolation.status === "missing") return false;
+  if (isolation.status === "changed") {
+    await restoreFilesystemLockMutationRequest(requestPath, quarantinedPath);
+    return false;
+  }
+  await removeIsolatedDirectoryGeneration(isolation.rootPath);
   return true;
 }
 
@@ -777,15 +815,18 @@ async function releaseCrashRecoverableFilesystemLock(
         throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
       }
     };
-    await rejectChangedOwner();
+    // A live but stalled queue head must project retryable release authority instead of pinning
+    // controller shutdown forever. The lock object retains all state for a later release retry.
+    const mutationDeadlineMs = Date.now() + LOCK_RELEASE_MUTATION_TIMEOUT_MS;
     const mutationLease = await acquireFilesystemLockMutationLease(
       lockPath,
       mutationOptions,
-      undefined,
+      mutationDeadlineMs,
       rejectChangedOwner,
+      Date.now,
     );
     if (mutationLease === null) {
-      throw new Error(`Cannot serialize filesystem lock release at ${lockPath}`);
+      throw new FilesystemLockReleasePendingError(lockPath);
     }
     state.mutationLease = mutationLease;
   }
@@ -827,10 +868,15 @@ async function releaseCrashRecoverableFilesystemLock(
 
   if (state.detachedPath !== undefined) {
     const detachedPath = state.detachedPath;
-    const releasedOwner = await readLockOwnerForRelease(detachedPath);
-    if (releasedOwner === null) {
+    const releasedGeneration: FilesystemLockGeneration = {
+      ownerRaw: `${JSON.stringify(expectedOwner)}\n`,
+    };
+    const isolation = await isolateDirectoryGenerationForRemoval(detachedPath, (generationPath) =>
+      lockGenerationMatches(generationPath, releasedGeneration),
+    );
+    if (isolation.status === "missing") {
       state.detachedPath = undefined;
-    } else if (!sameLockOwner(releasedOwner, expectedOwner)) {
+    } else if (isolation.status === "changed") {
       try {
         await renameLockPath(detachedPath, lockPath);
         await syncDirectory(path.dirname(lockPath));
@@ -855,9 +901,7 @@ async function releaseCrashRecoverableFilesystemLock(
       }
       throw error;
     } else {
-      await syncDirectoryIfPresent(path.dirname(lockPath));
-      await removeLockPath(detachedPath);
-      await syncDirectoryIfPresent(path.dirname(lockPath));
+      await removeIsolatedDirectoryGeneration(isolation.rootPath);
       state.detachedPath = undefined;
     }
   }
@@ -980,8 +1024,15 @@ async function quarantineStaleLock(
     return false;
   }
 
-  await removeLockPath(stalePath);
-  await syncDirectory(path.dirname(lockPath));
+  const isolation = await isolateDirectoryGenerationForRemoval(stalePath, (generationPath) =>
+    lockGenerationMatches(generationPath, expectedGeneration),
+  );
+  if (isolation.status === "missing") return false;
+  if (isolation.status === "changed") {
+    await restoreUnexpectedLockGeneration(lockPath, stalePath);
+    return false;
+  }
+  await removeIsolatedDirectoryGeneration(isolation.rootPath);
   return true;
 }
 
@@ -1135,6 +1186,78 @@ function parsePartialLockOwner(
       return { pid };
     }
   }
+}
+
+// Public quarantine names are never recursively deleted. Move the candidate into a fresh,
+// mode-restricted removal root, then verify the moved generation. After this handoff callers
+// delete only the exclusively owned root, so replacement of the former quarantine name is inert.
+export async function isolateDirectoryGenerationForRemoval(
+  candidatePath: string,
+  verifyGeneration: (generationPath: string) => Promise<boolean>,
+): Promise<
+  | { status: "isolated"; rootPath: string; generationPath: string }
+  | { status: "missing" }
+  | { status: "changed" }
+> {
+  const parentPath = path.dirname(candidatePath);
+  const rootPath = await mkdtemp(path.join(parentPath, ".oracle-remove-"));
+  try {
+    await chmod(rootPath, 0o700);
+  } catch (error) {
+    await removeLockPath(rootPath);
+    throw error;
+  }
+  const generationPath = path.join(rootPath, "generation");
+  try {
+    await renameLockPath(candidatePath, generationPath);
+  } catch (error) {
+    await removeLockPath(rootPath);
+    if (readErrorCode(error) === "ENOENT") return { status: "missing" };
+    throw error;
+  }
+  try {
+    await syncDirectory(rootPath);
+    await syncDirectory(parentPath);
+  } catch (error) {
+    await restoreIsolatedDirectoryGeneration(candidatePath, rootPath, generationPath);
+    throw error;
+  }
+
+  let matches: boolean;
+  try {
+    matches = await verifyGeneration(generationPath);
+  } catch (error) {
+    await restoreIsolatedDirectoryGeneration(candidatePath, rootPath, generationPath);
+    throw error;
+  }
+  if (!matches) {
+    await restoreIsolatedDirectoryGeneration(candidatePath, rootPath, generationPath);
+    return { status: "changed" };
+  }
+  return { status: "isolated", rootPath, generationPath };
+}
+
+export async function removeIsolatedDirectoryGeneration(rootPath: string): Promise<void> {
+  await removeLockPath(rootPath);
+  await syncDirectoryIfPresent(path.dirname(rootPath));
+}
+
+async function restoreIsolatedDirectoryGeneration(
+  candidatePath: string,
+  rootPath: string,
+  generationPath: string,
+): Promise<void> {
+  try {
+    await renameLockPath(generationPath, candidatePath);
+    await syncDirectory(path.dirname(candidatePath));
+  } catch (error) {
+    throw new Error(
+      `Filesystem generation changed at ${candidatePath}; unexpected directory preserved at ${generationPath}`,
+      { cause: error },
+    );
+  }
+  await removeLockPath(rootPath);
+  await syncDirectoryIfPresent(path.dirname(rootPath));
 }
 
 async function renameLockPath(sourcePath: string, destinationPath: string): Promise<void> {

@@ -684,6 +684,44 @@ describe("attachSession rendering", () => {
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
   });
 
+  test("retries persisted lock-only abort cleanup after browser resources completed", async () => {
+    const pendingRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "recovery lock release failed",
+        settlementMode: "abort",
+      },
+    };
+    const errorMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: { runtime: pendingRuntime },
+    };
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    readSessionMetadataMock
+      .mockResolvedValueOnce(errorMeta)
+      .mockResolvedValue({ ...errorMeta, browser: { runtime: {} } });
+    readSessionLogMock.mockResolvedValue("");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", {
+      suppressMetadata: true,
+      renderPrompt: false,
+      renderMarkdown: false,
+    });
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+      }),
+      "abort",
+    );
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+  });
+
   test.each(["finalize", "abort"] as const)(
     "retries persisted local %s cleanup for an error session without acknowledging remote publication",
     async (settlementMode) => {

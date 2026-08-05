@@ -30,7 +30,15 @@ interface ReverseTunnelHandle {
   stop: () => void;
 }
 
-export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void> {
+export interface BridgeHostDeps {
+  serveRemote?: typeof serveRemote;
+  startReverseTunnel?: typeof startReverseTunnel;
+}
+
+export async function runBridgeHost(
+  options: BridgeHostCliOptions,
+  deps: BridgeHostDeps = {},
+): Promise<void> {
   const bindRaw = options.bind?.trim() || "127.0.0.1:9473";
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
 
@@ -106,9 +114,11 @@ export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void
     ),
   );
 
+  const startTunnel = deps.startReverseTunnel ?? startReverseTunnel;
+  const runRemoteService = deps.serveRemote ?? serveRemote;
   let tunnel: ReverseTunnelHandle | null = null;
   if (sshTarget) {
-    tunnel = startReverseTunnel({
+    tunnel = startTunnel({
       sshTarget,
       remotePort: sshRemotePort,
       localPort: bindPort,
@@ -131,7 +141,7 @@ export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void
   };
 
   try {
-    await serveRemote({
+    await runRemoteService({
       host: bindHost,
       port: bindPort,
       token,

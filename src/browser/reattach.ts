@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdtemp, mkdir } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
@@ -27,6 +27,7 @@ import {
   listRemoteChromeTargets,
   closeChromeTarget,
   type RemoteChromeConnection,
+  type RemoteTargetInfo,
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
@@ -72,9 +73,14 @@ import {
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
 } from "./reattachability.js";
+import {
+  BrowserCaptureSettlementController,
+  markBrowserCaptureCleanupPending,
+} from "./runLifecycle.js";
 
 export interface ReattachCleanupDeps {
   closeChromeTarget?: typeof closeChromeTarget;
+  listChromeTargets?: typeof listRemoteChromeTargets;
   terminateRecordedChromeForProfile?: typeof terminateRecordedChromeForProfile;
   cleanupStaleProfileState?: typeof cleanupStaleProfileState;
   teardownBrowserResourcesIfNoActiveLeases?: typeof teardownBrowserResourcesIfNoActiveLeases;
@@ -240,95 +246,67 @@ export async function resumeBrowserSession(
     const runtimeForCapture = capture.runtime ?? authoritativeRuntime;
     const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
     if (promptLocator) assertSameCommittedPromptEpoch(promptLocator, captureLocator);
-    const capturedRuntime = markRecoveryCleanupPending(runtimeForCapture);
-    let settlementRuntime = capturedRuntime;
-    let settlementMode: "finalize" | "abort" | null =
-      capturedRuntime.recoveryCleanupResult?.settlementMode ?? null;
-    let settlementInFlight: Promise<ReattachFinalizationResult> | null = null;
-    let completedSettlement: ReattachFinalizationResult | null = null;
-
-    const settle = async (mode: "finalize" | "abort"): Promise<ReattachFinalizationResult> => {
-      if (settlementMode && settlementMode !== mode) {
-        throw new BrowserAutomationError(
-          `Browser recovery is already bound to ${settlementMode} settlement.`,
-          { stage: "browser-recovery-settlement", code: "settlement-mode-conflict" },
-        );
-      }
-      if (completedSettlement) return completedSettlement;
-      if (settlementInFlight) return settlementInFlight;
-      settlementMode = mode;
-      settlementRuntime = bindPendingRecoveryCleanupSettlement(settlementRuntime, mode);
-      settlementInFlight = (async () => {
-        try {
-          await deps.runtimeHintCb?.(settlementRuntime);
-        } catch (error) {
-          return pendingFinalization(
-            settlementRuntime,
-            `Failed to persist ${mode} cleanup authority: ${error instanceof Error ? error.message : String(error)}`,
-            mode,
-          );
-        }
-        let result: ReattachFinalizationResult;
-        try {
-          const captureSettler =
-            mode === "abort"
-              ? (capture.abortResources ?? capture.finalizeResources)
-              : capture.finalizeResources;
-          result = captureSettler
-            ? await captureSettler()
-            : await finalizeRecoveredRuntime(
-                settlementRuntime,
-                logger,
-                {
-                  ...deps.recoveryCleanup,
-                  isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
-                },
-                mode,
-              );
-        } catch (error) {
-          const errorRuntime =
-            error instanceof BrowserAutomationError &&
-            typeof error.details?.runtime === "object" &&
-            error.details.runtime !== null
-              ? (error.details.runtime as BrowserRuntimeMetadata)
-              : settlementRuntime;
-          result = pendingFinalization(
-            errorRuntime,
-            error instanceof Error ? error.message : String(error),
-            mode,
-          );
-        }
-        if (result.status !== "completed") {
-          result = {
-            ...result,
-            runtime: bindPendingRecoveryCleanupSettlement(result.runtime, mode),
-          };
-        }
-        settlementRuntime = result.runtime;
-        if (result.status !== "completed") return result;
-        try {
-          await releaseRecoveryLock();
-        } catch (error) {
-          return pendingFinalization(
-            settlementRuntime,
-            `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
-            mode,
-          );
-        }
-        completedSettlement = result;
-        return result;
-      })().finally(() => {
-        settlementInFlight = null;
-      });
-      return settlementInFlight;
-    };
+    const capturedRuntime = markBrowserCaptureCleanupPending(runtimeForCapture);
+    const settlement = new BrowserCaptureSettlementController(
+      {
+        persistRuntime: async (pendingRuntime) => {
+          await deps.runtimeHintCb?.(pendingRuntime);
+        },
+        settleResources: async (mode, pendingRuntime) => {
+          let result: ReattachFinalizationResult;
+          try {
+            const captureSettler =
+              mode === "abort"
+                ? (capture.abortResources ?? capture.finalizeResources)
+                : capture.finalizeResources;
+            result = captureSettler
+              ? await captureSettler()
+              : await finalizeRecoveredRuntime(
+                  pendingRuntime,
+                  logger,
+                  {
+                    ...deps.recoveryCleanup,
+                    isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
+                  },
+                  mode,
+                );
+          } catch (error) {
+            const errorRuntime =
+              error instanceof BrowserAutomationError &&
+              typeof error.details?.runtime === "object" &&
+              error.details.runtime !== null
+                ? (error.details.runtime as BrowserRuntimeMetadata)
+                : pendingRuntime;
+            return pendingFinalization(
+              errorRuntime,
+              error instanceof Error ? error.message : String(error),
+              mode,
+            );
+          }
+          if (result.status !== "completed") return result;
+          try {
+            await releaseRecoveryLock();
+          } catch (error) {
+            return pendingFinalization(
+              result.runtime,
+              `Cleanup finished but recovery lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+              mode,
+            );
+          }
+          return result;
+        },
+      },
+      capturedRuntime,
+    );
 
     return {
       answerText: capture.answerText,
       answerMarkdown: capture.answerMarkdown,
-      runtime: capturedRuntime,
-      finalize: () => settle("finalize"),
-      abort: () => settle("abort"),
+      get runtime() {
+        return settlement.runtime();
+      },
+      finalize: () => settlement.settle("finalize"),
+      abort: () => settlement.settle("abort"),
     };
   };
 
@@ -826,11 +804,45 @@ async function finalizeRecoveryCleanupGroup(
       else targets.set(targetKey, [entry]);
     }
 
+    let discoveredTargets: RemoteTargetInfo[] | null = null;
     for (const targetEntries of targets.values()) {
       const representative = targetEntries[0];
       if (!representative) continue;
       const resource = representative.resource;
-      if (!resource.chromeTargetId || !connectionResource || !connectionPort) {
+      let targetId = resource.chromeTargetId;
+      const targetMarkerUrl = resource.acquisition?.targetMarkerUrl;
+      if (!targetId && targetMarkerUrl && connectionResource && connectionPort) {
+        try {
+          discoveredTargets ??= await (deps.listChromeTargets ?? listRemoteChromeTargets)({
+            host: connectionResource.chromeHost ?? "127.0.0.1",
+            port: connectionPort,
+            browserWSEndpoint: connectionResource.chromeBrowserWSEndpoint,
+          });
+          const matches = discoveredTargets.filter(
+            (target) => target.type === "page" && target.url === targetMarkerUrl && target.targetId,
+          );
+          if (matches.length === 0) continue;
+          if (matches.length === 1) targetId = matches[0]?.targetId;
+          else {
+            for (const entry of targetEntries) {
+              addPending(
+                entry,
+                `Owned Chrome target acquisition marker is ambiguous: ${targetMarkerUrl}`,
+              );
+            }
+            continue;
+          }
+        } catch (error) {
+          for (const entry of targetEntries) {
+            addPending(
+              entry,
+              `Chrome target acquisition recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          continue;
+        }
+      }
+      if (!targetId || !connectionResource || !connectionPort) {
         for (const entry of targetEntries) {
           addPending(entry, "Owned Chrome target cleanup metadata is incomplete");
         }
@@ -841,12 +853,12 @@ async function finalizeRecoveryCleanupGroup(
           host: connectionResource.chromeHost ?? "127.0.0.1",
           port: connectionPort,
           browserWSEndpoint: connectionResource.chromeBrowserWSEndpoint,
-          targetId: resource.chromeTargetId,
+          targetId,
           logger,
         });
         if (!closed) {
           for (const entry of targetEntries) {
-            addPending(entry, `Chrome target close was not confirmed: ${resource.chromeTargetId}`);
+            addPending(entry, `Chrome target close was not confirmed: ${targetId}`);
           }
         }
       } catch (error) {
@@ -1188,6 +1200,9 @@ function recoveryCleanupResourceKey(resource: BrowserRecoveryCleanupResourceMeta
     resource.chromeBrowserWSEndpoint ?? null,
     resource.chromeProcessIdentity?.launchNonce ?? null,
     profileDirectoryIdentityKey(resource.profileDirectoryIdentity) ?? null,
+    resource.acquisition?.generationId ?? null,
+    resource.acquisition?.pendingResource ?? null,
+    resource.acquisition?.targetMarkerUrl ?? null,
     Boolean(resource.remoteRecovery),
     resource.recoveryCleanup.ownsTarget,
     resource.recoveryCleanup.profileKind,
@@ -1372,38 +1387,6 @@ async function cleanupProfileAbsent(profileDir: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw error;
   }
-}
-
-function markRecoveryCleanupPending(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  if (!runtime.recoveryCleanupResources?.length) return runtime;
-  const settlementMode = runtime.recoveryCleanupResult?.settlementMode;
-  return {
-    ...runtime,
-    recoveryCleanupResult: {
-      status: "pending",
-      ...(settlementMode ? { settlementMode } : {}),
-    },
-  };
-}
-
-function bindPendingRecoveryCleanupSettlement(
-  runtime: BrowserRuntimeMetadata,
-  settlementMode: "finalize" | "abort",
-): BrowserRuntimeMetadata {
-  const hasCleanupAuthority = Boolean(
-    runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult,
-  );
-  if (!hasCleanupAuthority) return runtime;
-  return {
-    ...runtime,
-    recoveryCleanupResult: {
-      status: runtime.recoveryCleanupResult?.status ?? "pending",
-      ...(runtime.recoveryCleanupResult?.error
-        ? { error: runtime.recoveryCleanupResult.error }
-        : {}),
-      settlementMode,
-    },
-  };
 }
 
 function pendingFinalization(
@@ -1688,19 +1671,20 @@ async function createOwnedRecoveryTargetConnection(
   chrome: Pick<BrowserChrome, "host" | "port">,
   logger: BrowserLogger,
   deps: ReattachDeps,
-  onTargetAcquired?: (targetId: string) => void,
-  onTargetCleaned?: (targetId: string) => void,
+  targetMarkerUrl?: string,
+  onTargetAcquired?: (targetId: string) => void | Promise<void>,
+  onTargetCleaned?: (targetId: string) => void | Promise<void>,
 ): Promise<RemoteChromeConnection> {
   const host = chrome.host ?? "127.0.0.1";
   const createTarget = deps.createRecoveryTarget ?? createChromePageTarget;
-  const targetId = await createTarget(chrome.port, logger, host);
+  const targetId = await createTarget(chrome.port, logger, host, targetMarkerUrl);
   if (!targetId) {
     throw new Error("Unable to create a dedicated Chrome target for browser recovery.");
   }
-  onTargetAcquired?.(targetId);
 
   let connection: RemoteChromeConnection | null = null;
   try {
+    await onTargetAcquired?.(targetId);
     connection = await (deps.connectRecoveryTarget ?? connectToRemoteChromeTarget)(
       host,
       chrome.port,
@@ -1720,7 +1704,7 @@ async function createOwnedRecoveryTargetConnection(
     try {
       const closed = await closeTarget({ host, port: chrome.port, targetId, logger });
       if (!closed) cleanupError = "created target close was not confirmed";
-      else onTargetCleaned?.(targetId);
+      else await onTargetCleaned?.(targetId);
     } catch (closeError) {
       cleanupError = closeError instanceof Error ? closeError.message : String(closeError);
     }
@@ -1756,6 +1740,9 @@ async function resumeBrowserSessionViaNewChrome(
   if (manualLogin) await mkdir(userDataDir, { recursive: true });
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
+  const acquisitionGenerationId = randomUUID();
+  const fallbackLeaseId = randomUUID();
+  const fallbackTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
   let manualChromeOwnerSource: ManualChromeOwnerSource | null = null;
   let fallbackLease: BrowserTabLease | null = null;
@@ -1765,18 +1752,20 @@ async function resumeBrowserSessionViaNewChrome(
   let fallbackRuntime: BrowserRuntimeMetadata | null = null;
   let client: ChromeClient | null = null;
   let closeFallbackConnection: (() => Promise<void>) | null = null;
-  const refreshFallbackRuntime = (): BrowserRuntimeMetadata => {
+  const refreshFallbackRuntime = (
+    pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
+  ): BrowserRuntimeMetadata => {
     const ownsProcess = Boolean(
       chrome && !resolved.keepBrowser && (!manualLogin || manualChromeOwnerSource === "launched"),
     );
-    const hasNewAuthority = !manualLogin || Boolean(fallbackLease || chrome || fallbackTargetId);
     const profileKind = ownsProcess
       ? manualLogin
         ? "manual-login"
         : "temporary"
-      : !chrome && !manualLogin
-        ? "temporary"
-        : "none";
+      : manualLogin || chrome
+        ? "none"
+        : "temporary";
+    const ownsTarget = pendingResource === "chrome-target" || Boolean(fallbackTargetId);
     const resource: BrowserRecoveryCleanupResourceMetadata = {
       chromePid: chrome?.pid,
       chromeProcessIdentity: chrome?.processIdentity,
@@ -1789,14 +1778,23 @@ async function resumeBrowserSessionViaNewChrome(
       chromeTargetId: fallbackTargetId ?? undefined,
       conversationId: promptEpoch.conversationId,
       promptEpoch,
-      tabLease: fallbackLease
-        ? { id: fallbackLease.id, profileDirectory: fallbackLease.profileDirectory }
-        : undefined,
+      tabLease:
+        fallbackLease || manualLogin
+          ? {
+              id: fallbackLease?.id ?? fallbackLeaseId,
+              profileDirectory: fallbackLease?.profileDirectory ?? fallbackProfileIdentity,
+            }
+          : undefined,
+      acquisition: {
+        generationId: acquisitionGenerationId,
+        ...(pendingResource ? { pendingResource } : {}),
+        targetMarkerUrl: fallbackTargetMarkerUrl,
+      },
       recoveryCleanup: {
-        ownsTarget: Boolean(fallbackTargetId),
+        ownsTarget,
         profileKind,
         keepBrowser: !ownsProcess,
-        closeOwnedTargetOnComplete: Boolean(fallbackTargetId),
+        closeOwnedTargetOnComplete: ownsTarget,
       },
     };
     const next: BrowserRuntimeMetadata = {
@@ -1810,15 +1808,18 @@ async function resumeBrowserSessionViaNewChrome(
       chromeProfileRoot: userDataDir,
       userDataDir,
       chromeTargetId: fallbackTargetId ?? undefined,
-      recoveryCleanupResources: hasNewAuthority
-        ? [...inheritedRecoveryCleanupResources, resource]
-        : inheritedRecoveryCleanupResources,
-      recoveryCleanupResult: hasNewAuthority
-        ? { status: "pending" }
-        : runtime.recoveryCleanupResult,
+      recoveryCleanupResources: [...inheritedRecoveryCleanupResources, resource],
+      recoveryCleanupResult: { status: "pending" },
       controllerPid: process.pid,
     };
     fallbackRuntime = next;
+    return next;
+  };
+  const persistFallbackRuntime = async (
+    pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
+  ): Promise<BrowserRuntimeMetadata> => {
+    const next = refreshFallbackRuntime(pendingResource);
+    await deps.runtimeHintCb?.(next);
     return next;
   };
   const settleFallbackResources = async (
@@ -1893,7 +1894,7 @@ async function resumeBrowserSessionViaNewChrome(
     }
   };
 
-  refreshFallbackRuntime();
+  await persistFallbackRuntime(manualLogin ? "tab-lease" : "chrome-process");
   try {
     if (manualLogin) {
       fallbackLease = await (deps.acquireBrowserTabLease ?? acquireBrowserTabLease)(userDataDir, {
@@ -1901,8 +1902,9 @@ async function resumeBrowserSessionViaNewChrome(
         timeoutMs: resolved.timeoutMs,
         logger,
         sessionId: `reattach-${process.pid}`,
+        leaseId: fallbackLeaseId,
       });
-      refreshFallbackRuntime();
+      await persistFallbackRuntime("chrome-process");
     }
     if (manualLogin) {
       const owner = await (deps.acquireManualChromeOwner ?? acquireManualChromeOwner)(
@@ -1919,19 +1921,20 @@ async function resumeBrowserSessionViaNewChrome(
     if (!resolved.keepBrowser && (!manualLogin || manualChromeOwnerSource === "launched")) {
       retainedOwnedChrome = chrome;
     }
-    refreshFallbackRuntime();
+    await persistFallbackRuntime("chrome-target");
     const chromeHost = chrome.host ?? "127.0.0.1";
     const recoveryConnection = await createOwnedRecoveryTargetConnection(
       chrome,
       logger,
       deps,
-      (targetId) => {
+      fallbackTargetMarkerUrl,
+      async (targetId) => {
         fallbackTargetId = targetId;
-        refreshFallbackRuntime();
+        await persistFallbackRuntime();
       },
-      () => {
+      async () => {
         fallbackTargetId = null;
-        refreshFallbackRuntime();
+        await persistFallbackRuntime("chrome-target");
       },
     );
     const recoveryTargetId = recoveryConnection.targetId;

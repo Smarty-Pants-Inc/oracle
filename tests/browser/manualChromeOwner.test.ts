@@ -21,6 +21,7 @@ import {
   acquireBrowserTabLease,
   type BrowserTabLease,
 } from "../../src/browser/tabLeaseRegistry.js";
+import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLifecycle.js";
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -78,6 +79,17 @@ function launchedChrome(
   } as unknown as BrowserChrome;
 }
 
+function retainedEndpointAuthority(
+  identity: ChromeProcessIdentity,
+  port: number,
+): RetainedChromeEndpointAuthority {
+  return {
+    browserWSEndpoint: `ws://127.0.0.1:${port}/devtools/browser/exact-${identity.pid}`,
+    kill: vi.fn(async () => ({ status: "already-stopped" as const, pid: identity.pid })),
+    release: vi.fn(async () => undefined),
+  };
+}
+
 describe("manual Chrome owner acquisition", () => {
   test("serializes concurrent normal and fallback acquisition without conflating tab leases", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-manual-owner-"));
@@ -129,6 +141,8 @@ describe("manual Chrome owner acquisition", () => {
         async (_profileDir: string, identity: ChromeProcessIdentity) =>
           identity.launchNonce === canonicalIdentity.launchNonce,
       );
+      const endpointAuthority = retainedEndpointAuthority(canonicalIdentity, canonicalPort);
+      const retainEndpointAuthority = vi.fn(async () => endpointAuthority);
       const secondLockAttempted = createDeferred();
       let lockAttempts = 0;
       const acquireProfileLock = vi.fn(
@@ -144,6 +158,7 @@ describe("manual Chrome owner acquisition", () => {
         discoverExactProfileChrome,
         probe: vi.fn(async () => ({ ok: true as const })),
         verifyIdentity,
+        retainEndpointAuthority,
         writeOwner,
       };
 
@@ -205,6 +220,8 @@ describe("manual Chrome owner acquisition", () => {
       expect(fallbackOwner.processIdentity).toEqual(canonicalIdentity);
       expect(normalOwner.chrome.processIdentity).toEqual(canonicalIdentity);
       expect(fallbackOwner.chrome.processIdentity).toEqual(canonicalIdentity);
+      expect(retainEndpointAuthority).toHaveBeenCalledOnce();
+      expect(fallbackOwner.chrome.kill).toBe(endpointAuthority.kill);
       expect(acquireProfileLock).toHaveBeenNthCalledWith(
         1,
         profileDir,
@@ -248,6 +265,8 @@ describe("manual Chrome owner acquisition", () => {
       const launch = vi.fn();
       const discoverExactProfileChrome = vi.fn(async () => ({ pid: 43_211, port: 55_679 }));
       const verifyIdentity = vi.fn(async () => true);
+      const endpointAuthority = retainedEndpointAuthority(identity, 45_679);
+      const retainEndpointAuthority = vi.fn(async () => endpointAuthority);
 
       const owner = await acquireManualChromeOwner(
         profileDir,
@@ -259,6 +278,7 @@ describe("manual Chrome owner acquisition", () => {
           launch,
           probe: vi.fn(async () => ({ ok: true as const })),
           verifyIdentity,
+          retainEndpointAuthority,
           writeOwner,
         },
       );
@@ -271,6 +291,13 @@ describe("manual Chrome owner acquisition", () => {
       expect(launch).not.toHaveBeenCalled();
       expect(discoverExactProfileChrome).not.toHaveBeenCalled();
       expect(verifyIdentity).toHaveBeenCalledWith(profileDir, identity);
+      expect(retainEndpointAuthority).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 45_679,
+        userDataDir: profileDir,
+        processIdentity: identity,
+      });
+      expect(owner.chrome.kill).toBe(endpointAuthority.kill);
       expect(await readDevToolsPort(profileDir)).toBe(55_679);
       expect(await readOracleChromeOwner(profileDir)).toEqual({
         port: 45_679,
@@ -301,6 +328,8 @@ describe("manual Chrome owner acquisition", () => {
       const writeOwner = vi.fn(writeOracleChromeOwner);
       const captureIdentity = vi.fn(async () => currentIdentity);
       const launch = vi.fn();
+      const endpointAuthority = retainedEndpointAuthority(currentIdentity, 45_682);
+      const retainEndpointAuthority = vi.fn(async () => endpointAuthority);
 
       const owner = await acquireManualChromeOwner(
         profileDir,
@@ -316,6 +345,7 @@ describe("manual Chrome owner acquisition", () => {
             async (_profileDir: string, identity: ChromeProcessIdentity) =>
               identity.launchNonce === currentIdentity.launchNonce,
           ),
+          retainEndpointAuthority,
           writeOwner,
         },
       );
@@ -323,10 +353,57 @@ describe("manual Chrome owner acquisition", () => {
       expect(owner.source).toBe("rediscovered");
       expect(owner.processIdentity).toEqual(currentIdentity);
       expect(captureIdentity).toHaveBeenCalledWith(profileDir, 43_214);
+      expect(retainEndpointAuthority).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 45_682,
+        userDataDir: profileDir,
+        processIdentity: currentIdentity,
+      });
+      expect(owner.chrome.kill).toBe(endpointAuthority.kill);
       expect(writeOwner).toHaveBeenCalledOnce();
       expect(await readOracleChromeOwner(profileDir)).toEqual({
         port: 45_682,
         processIdentity: currentIdentity,
+      });
+      expect(launch).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a reachable recorded endpoint owned by another process generation", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-endpoint-mismatch-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_215,
+        "00000000-0000-4000-8000-000000000015",
+      );
+      await writeOracleChromeOwner(profileDir, { port: 45_683, processIdentity: identity });
+      const launch = vi.fn();
+      const retainEndpointAuthority = vi.fn(async () => {
+        throw new Error("CDP browser pid 9999 belongs to another generation");
+      });
+
+      await expect(
+        acquireManualChromeOwner(
+          profileDir,
+          resolveBrowserConfig({ manualLogin: true, reuseChromeWaitMs: 0 }),
+          logger,
+          "recorded-endpoint-mismatch",
+          {
+            launch,
+            probe: vi.fn(async () => ({ ok: true as const })),
+            retainEndpointAuthority,
+            verifyIdentity: vi.fn(async () => true),
+          },
+        ),
+      ).rejects.toThrow(/not bound to that exact process generation/i);
+      expect(retainEndpointAuthority).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 45_683,
+        userDataDir: profileDir,
+        processIdentity: identity,
       });
       expect(launch).not.toHaveBeenCalled();
     } finally {
@@ -500,13 +577,18 @@ describe("manual Chrome owner settlement", () => {
         );
         const chrome = launchedChrome(identity.pid, 45_684, identity);
         const cleanupProfileState = vi.fn(async () => true);
-        const owner: ManualChromeOwner = { chrome, processIdentity: identity, source };
+        const endpointAuthority = retainedEndpointAuthority(identity, 45_684);
+        const owner: ManualChromeOwner =
+          source === "launched"
+            ? { chrome, processIdentity: identity, source }
+            : { chrome, processIdentity: identity, source, endpointAuthority };
 
         await expect(
           settleManualChromeOwner(profileDir, owner, logger, { cleanupProfileState }),
         ).resolves.toEqual({ status: source === "launched" ? "terminated" : "preserved" });
         expect(chrome.kill).toHaveBeenCalledTimes(source === "launched" ? 1 : 0);
         expect(cleanupProfileState).toHaveBeenCalledTimes(source === "launched" ? 1 : 0);
+        expect(endpointAuthority.release).toHaveBeenCalledTimes(source === "launched" ? 0 : 1);
       } finally {
         await fs.rm(profileDir, { recursive: true, force: true });
       }

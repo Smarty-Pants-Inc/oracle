@@ -159,6 +159,8 @@ type ManualOwnerSource = "launched" | "recorded" | "rediscovered";
 async function resumeFallbackWithManualOwner(profileDir: string, source: ManualOwnerSource) {
   const processIdentity = await physicalChromeProcessIdentity(profileDir);
   const cleanupOrder: string[] = [];
+  const acquisitionOrder: string[] = [];
+  const runtimeHints: BrowserRuntimeMetadata[] = [];
   const closeChromeTarget = vi.fn(async () => {
     cleanupOrder.push("target");
     return true;
@@ -183,12 +185,17 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
       await options?.onRelease?.({ isLastLease: true });
     },
   );
-  const acquireBrowserTabLease = vi.fn(async () => ({
-    id: "fallback-lease",
-    profileDirectory: processIdentity.profileDirectory,
-    update: vi.fn(async () => undefined),
-    release: vi.fn(async () => undefined),
-  }));
+  const acquireBrowserTabLease = vi.fn(
+    async (_profileDir: string, options?: { leaseId?: string }) => {
+      acquisitionOrder.push("acquire:tab-lease");
+      return {
+        id: options?.leaseId ?? "fallback-lease",
+        profileDirectory: processIdentity.profileDirectory,
+        update: vi.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
+      };
+    },
+  );
   const Runtime = {
     enable: vi.fn(async () => undefined),
     evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -224,6 +231,22 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     processIdentity,
     source,
   };
+  const acquireManualChromeOwner = vi.fn(async () => {
+    acquisitionOrder.push("acquire:chrome-process");
+    return owner;
+  });
+  const createRecoveryTarget = vi.fn(
+    async (_port: number, _logger: BrowserLogger, _host?: string, targetUrl?: string) => {
+      acquisitionOrder.push("acquire:chrome-target");
+      return targetUrl ? "fallback-owned-target" : undefined;
+    },
+  );
+  const runtimeHintCb = vi.fn(async (hintedRuntime: BrowserRuntimeMetadata) => {
+    const pendingResource =
+      hintedRuntime.recoveryCleanupResources?.at(-1)?.acquisition?.pendingResource;
+    acquisitionOrder.push(`persist:${pendingResource ?? "acquired"}`);
+    runtimeHints.push(structuredClone(hintedRuntime));
+  });
 
   const result = await resumeBrowserSession(
     withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/test-conversation" }),
@@ -235,8 +258,8 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     vi.fn() as BrowserLogger,
     {
       acquireBrowserTabLease: acquireBrowserTabLease as never,
-      acquireManualChromeOwner: vi.fn(async () => owner) as never,
-      createRecoveryTarget: vi.fn(async () => "fallback-owned-target"),
+      acquireManualChromeOwner: acquireManualChromeOwner as never,
+      createRecoveryTarget,
       connectRecoveryTarget: vi.fn(async () => ({
         client,
         targetId: "fallback-owned-target",
@@ -257,6 +280,7 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
         cleanupStaleProfileState,
         releaseBrowserTabLease,
       },
+      runtimeHintCb,
     },
   );
   return {
@@ -267,6 +291,11 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     kill,
     releaseBrowserTabLease,
     cleanupOrder,
+    acquisitionOrder,
+    runtimeHints,
+    acquireBrowserTabLease,
+    acquireManualChromeOwner,
+    createRecoveryTarget,
   };
 }
 
@@ -743,6 +772,63 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     await result.abort();
   });
 
+  test("journals fallback acquisition intent and exact identities before later side effects", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-journal-order-"));
+    try {
+      const {
+        result,
+        acquisitionOrder,
+        runtimeHints,
+        acquireBrowserTabLease,
+        createRecoveryTarget,
+      } = await resumeFallbackWithManualOwner(profileDir, "launched");
+
+      expect(acquisitionOrder).toEqual([
+        "persist:tab-lease",
+        "acquire:tab-lease",
+        "persist:chrome-process",
+        "acquire:chrome-process",
+        "persist:chrome-target",
+        "acquire:chrome-target",
+        "persist:acquired",
+      ]);
+      const leaseIntent = runtimeHints[0]?.recoveryCleanupResources?.at(-1);
+      const targetIntent = runtimeHints[2]?.recoveryCleanupResources?.at(-1);
+      const acquired = runtimeHints[3]?.recoveryCleanupResources?.at(-1);
+      expect(leaseIntent).toMatchObject({
+        tabLease: { id: expect.any(String) },
+        acquisition: { generationId: expect.any(String), pendingResource: "tab-lease" },
+      });
+      expect(acquireBrowserTabLease).toHaveBeenCalledWith(
+        profileDir,
+        expect.objectContaining({ leaseId: leaseIntent?.tabLease?.id }),
+      );
+      expect(targetIntent).toMatchObject({
+        chromeProcessIdentity: expect.any(Object),
+        acquisition: {
+          generationId: leaseIntent?.acquisition?.generationId,
+          pendingResource: "chrome-target",
+          targetMarkerUrl: expect.stringContaining("oracle-acquisition="),
+        },
+      });
+      expect(createRecoveryTarget).toHaveBeenCalledWith(
+        9222,
+        expect.any(Function),
+        "127.0.0.1",
+        targetIntent?.acquisition?.targetMarkerUrl,
+      );
+      expect(acquired).toMatchObject({
+        chromeTargetId: "fallback-owned-target",
+        acquisition: { generationId: leaseIntent?.acquisition?.generationId },
+      });
+      expect(acquired?.acquisition?.pendingResource).toBeUndefined();
+
+      await expect(result.abort()).resolves.toMatchObject({ status: "completed" });
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
   test("fallback reattach uses retained kill authority for a temporary Chrome launch", async () => {
     let profileDir: string | null = null;
     const cleanupOrder: string[] = [];
@@ -803,6 +889,9 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         vi.fn() as BrowserLogger,
         {
           launchChrome: acquireTemporaryChromeOwner as never,
+          acquireRecoveryLock: vi.fn(async () => ({
+            release: vi.fn(async () => undefined),
+          })),
           createRecoveryTarget: vi.fn(async () => "fallback-owned-target"),
           connectRecoveryTarget: vi.fn(async () => ({
             client,
@@ -2261,6 +2350,59 @@ describe("recovery resource finalization", { timeout: 15_000 }, () => {
     }
   });
 
+  test("resolves a journaled target acquisition marker after restart", async () => {
+    const markerUrl = "about:blank#oracle-acquisition=marker-generation";
+    const closeChromeTarget = vi.fn(async () => true);
+    const listChromeTargets = vi.fn(async () => [
+      {
+        targetId: "marker-target",
+        type: "page",
+        url: markerUrl,
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/marker-target",
+      },
+    ]);
+    const runtime: BrowserRuntimeMetadata = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      recoveryCleanupResources: [
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          acquisition: {
+            generationId: "marker-generation",
+            pendingResource: "chrome-target",
+            targetMarkerUrl: markerUrl,
+          },
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "controller exited after target creation",
+        settlementMode: "abort",
+      },
+    };
+
+    await expect(
+      retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, {
+        acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
+        recoveryCleanup: { closeChromeTarget, listChromeTargets },
+      }),
+    ).resolves.toEqual({
+      status: "completed",
+      runtime: { chromeHost: "127.0.0.1", chromePort: 9222 },
+    });
+    expect(listChromeTargets).toHaveBeenCalledOnce();
+    expect(closeChromeTarget).toHaveBeenCalledWith(
+      expect.objectContaining({ targetId: "marker-target" }),
+    );
+  });
+
   test("preserves manual-login resources while another lease is active", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-active-lease-"));
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
@@ -2791,7 +2933,7 @@ describe("reattach helpers", () => {
       { createRecoveryTarget, connectRecoveryTarget },
     );
 
-    expect(createRecoveryTarget).toHaveBeenCalledWith(63333, logger, "127.0.0.1");
+    expect(createRecoveryTarget).toHaveBeenCalledWith(63333, logger, "127.0.0.1", undefined);
     expect(connectRecoveryTarget).toHaveBeenCalledWith("127.0.0.1", 63333, logger, {
       targetId: "created-target",
       closeTargetOnDispose: false,
