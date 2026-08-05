@@ -443,23 +443,22 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "aborts captured live authority when required artifact preparation fails",
+    "durably publishes a captured answer before finalizing after required artifact preparation fails",
     async () => {
-      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-abort-"));
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-pending-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const missingArtifactPath = path.join(
         tmpDir,
         "sessions",
-        "artifact-abort-session",
+        "artifact-pending-session",
         "artifacts",
         "missing.zip",
       );
-      const transactionToken = "6".repeat(64);
       const runtime: BrowserRunTransaction["runtime"] = {
-        chromeTargetId: "artifact-abort-target",
+        chromeTargetId: "artifact-pending-target",
         recoveryCleanupResources: [
           {
-            chromeTargetId: "artifact-abort-target",
+            chromeTargetId: "artifact-pending-target",
             recoveryCleanup: {
               ownsTarget: true,
               profileKind: "temporary",
@@ -473,20 +472,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await mkdir(path.dirname(missingArtifactPath), { recursive: true });
       const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
         async (mode, pendingRuntime) => {
-          expect(mode).toBe("abort");
-          const recordName = (await readdir(transactionStoreDir)).find((name) =>
-            name.endsWith(".json"),
-          );
-          if (!recordName) throw new Error("missing bound artifact failure transaction");
-          expect(
-            JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
-          ).toMatchObject({
-            state: "recoverable-error",
-            settlementMode: "abort",
-            runtime: {
-              recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
-            },
-          });
+          expect(mode).toBe("finalize");
           return completedBrowserCaptureCleanup(pendingRuntime);
         },
       );
@@ -525,33 +511,92 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const response = await httpPostNdjson({
-          hostname: "127.0.0.1",
-          port: server.port,
-          path: `/transactions/${transactionToken}/run`,
+        const transaction = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
           token: "secret",
-          body: remoteRunPayload(),
-        });
-        expect(response.statusCode).toBe(200);
-        expect(response.events.find((event) => event.type === "error")).toMatchObject({
-          error: { recoverableDisconnect: false },
-        });
-        expect(settleResources).toHaveBeenCalledOnce();
+        })({ prompt: "preserve answer after artifact failure", config: {} });
+        const publishedResult = {
+          answerText: "captured before artifact failure",
+          answerMarkdown: "captured before artifact failure",
+          warnings: [
+            {
+              code: "remote-artifact-preparation-pending",
+              severity: "warning",
+              message: "Remote browser host reported a warning.",
+            },
+          ],
+          tookMs: 1,
+          answerTokens: 4,
+          answerChars: 32,
+        };
+
+        expect(transaction).toMatchObject(publishedResult);
+        expect(settleResources).not.toHaveBeenCalled();
 
         const recordName = (await readdir(transactionStoreDir)).find((name) =>
           name.endsWith(".json"),
         );
-        if (!recordName) throw new Error("missing aborted artifact failure transaction");
-        expect(
-          JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
-        ).toMatchObject({
-          state: "aborted",
-          terminalAudit: { settlementMode: "abort" },
+        if (!recordName) throw new Error("missing captured artifact failure transaction");
+        const recordPath = path.join(transactionStoreDir, recordName);
+        const pendingRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        expect(pendingRecord).toMatchObject({
+          state: "pending",
+          requestIdentity: {
+            acceptedPromptSha256: [promptIdentitySha256("preserve answer after artifact failure")],
+          },
+        });
+        expect(pendingRecord.result).toEqual(publishedResult);
+        expect(pendingRecord).not.toHaveProperty("artifacts");
+
+        const pendingRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${pendingRecord.transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(pendingRetry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "transaction",
+            transaction: { state: "pending", result: publishedResult },
+          },
+        });
+        expect(JSON.parse(await readFile(recordPath, "utf8")).result).toEqual(publishedResult);
+
+        const firstFinalization = await transaction.finalize();
+        await expect(transaction.finalize()).resolves.toEqual(firstFinalization);
+        expect(firstFinalization).toMatchObject({ status: "completed" });
+        expect(settleResources).toHaveBeenCalledOnce();
+
+        const finalizedRecordText = await readFile(recordPath, "utf8");
+        const finalizedRecord = JSON.parse(finalizedRecordText);
+        expect(finalizedRecord).toMatchObject({
+          state: "finalized",
+          terminalAudit: {
+            settlementMode: "finalize",
+            publicationAcknowledgedAt: expect.any(String),
+          },
           finalization: { status: "completed" },
         });
+        expect(finalizedRecord).not.toHaveProperty("result");
 
-        await server.close();
-        expect(settleResources).toHaveBeenCalledOnce();
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${pendingRecord.transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "terminal",
+            transactionToken: pendingRecord.transactionToken,
+            outcome: { state: "finalized", finalization: { status: "completed" } },
+          },
+        });
+        await expect(readFile(recordPath, "utf8")).resolves.toBe(finalizedRecordText);
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });

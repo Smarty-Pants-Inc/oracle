@@ -108,6 +108,5 @@ export function resolveCommittedPromptEpochLocator(
 export function hasRecoverableChatGptConversation(
   runtime: BrowserRuntimeMetadata | null | undefined,
 ): boolean {
-  const locator = resolveCommittedPromptEpochLocator(runtime);
-  return locator !== null && locator.epoch.remainingFollowUps === 0;
+  return resolveCommittedPromptEpochLocator(runtime) !== null;
 }

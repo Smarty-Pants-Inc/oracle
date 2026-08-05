@@ -25,7 +25,8 @@ import {
   connectToRemoteChromeTarget,
   connectWithNewTab,
   closeChromeTarget,
-  closeBlankChromeTabs,
+  closeChromeTargetWithExactAuthority,
+  closeBlankChromeTabsWithExactAuthority,
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
@@ -80,6 +81,7 @@ import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import type { ProfileDirectoryIdentity, ProfileRunLock } from "./profileState.js";
 import {
   acquireProfileRunLock,
+  createChromeProcessLaunchClaim,
   captureProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
@@ -694,6 +696,81 @@ async function saveOptionalArtifact<T>(
     logger(`[browser] Failed to save session artifact: ${message}`);
     return null;
   }
+}
+
+function appendPostCaptureWarning(
+  result: BrowserRunResult,
+  code: string,
+  context: string,
+  error: unknown,
+  logger: BrowserLogger,
+): void {
+  const failureMessage = error instanceof Error ? error.message : String(error);
+  const failureStage =
+    error instanceof BrowserAutomationError && typeof error.details?.stage === "string"
+      ? error.details.stage
+      : context;
+  logger(`[browser] Answer captured; ${context} remains incomplete: ${failureMessage}`);
+  result.warnings = [
+    ...(result.warnings ?? []),
+    {
+      code,
+      severity: "warning",
+      message: `The exact assistant answer was preserved, but ${context} did not complete: ${failureMessage}`,
+      details: { stage: failureStage },
+    },
+  ];
+}
+
+type PostCapturePendingWork = {
+  code: string;
+  context: string;
+};
+
+function projectRuntimeAfterChromeTargetLoss(
+  runtime: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  const projected: BrowserRuntimeMetadata = { ...runtime };
+  delete projected.chromeTargetId;
+  const remainingResources: BrowserRecoveryCleanupResourceMetadata[] = [];
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    if (!resource.chromeTargetId) {
+      remainingResources.push(resource);
+      continue;
+    }
+    const hasNonTargetAuthority = Boolean(
+      resource.chromePid ||
+      resource.chromeProcessIdentity ||
+      resource.profileDirectoryIdentity ||
+      resource.userDataDir ||
+      resource.tabLease,
+    );
+    if (!hasNonTargetAuthority) continue;
+    remainingResources.push({
+      ...resource,
+      chromeTargetId: undefined,
+      recoveryCleanup: {
+        ...resource.recoveryCleanup,
+        ownsTarget: false,
+        closeOwnedTargetOnComplete: false,
+      },
+    });
+  }
+  if (remainingResources.length > 0) {
+    projected.recoveryCleanupResources = remainingResources;
+  } else {
+    delete projected.browserTransport;
+    delete projected.chromePid;
+    delete projected.chromeProcessIdentity;
+    delete projected.chromePort;
+    delete projected.chromeHost;
+    delete projected.chromeBrowserWSEndpoint;
+    delete projected.chromeProfileRoot;
+    delete projected.userDataDir;
+    delete projected.recoveryCleanupResources;
+    delete projected.recoveryCleanupResult;
+  }
+  return projected;
 }
 
 type AssistantAnswer = {
@@ -1472,6 +1549,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   }
   const acquisitionProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
   const acquisitionGenerationId = randomUUID();
+  const acquisitionLaunchClaim = createChromeProcessLaunchClaim(acquisitionGenerationId);
+  const acquisitionOwnerDisposition = effectiveKeepBrowser ? "preserve" : "close-on-last-lease";
   const acquisitionLeaseId = manualLogin ? randomUUID() : undefined;
   const acquisitionTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const buildLocalAcquisitionRuntime = (
@@ -1487,6 +1566,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       profileDirectoryIdentity:
         acquired?.processIdentity?.profileDirectory ?? acquisitionProfileIdentity,
       chromePort: acquired?.port,
+      chromeBrowserWSEndpoint: acquired?.endpointAuthority?.browserWSEndpoint,
       chromeHost: acquired?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -1500,6 +1580,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       acquisition: {
         generationId: acquisitionGenerationId,
         processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
+        processLaunchClaim: acquisitionLaunchClaim,
+        processOwnerDisposition: acquisitionOwnerDisposition,
         ...(pendingResource ? { pendingResource } : {}),
         ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
       },
@@ -1512,9 +1594,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               manualLogin,
               ownerDisposition: owner.disposition,
             })
-          : manualLogin
-            ? true
-            : effectiveKeepBrowser,
+          : acquisitionOwnerDisposition === "preserve",
         closeOwnedTargetOnComplete: acquisitionOwnsTarget,
       },
     };
@@ -1523,6 +1603,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePid: acquired?.pid,
       chromeProcessIdentity: acquired?.processIdentity,
       chromePort: acquired?.port,
+      chromeBrowserWSEndpoint: acquired?.endpointAuthority?.browserWSEndpoint,
       chromeHost: acquired?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -1601,6 +1682,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         config,
         logger,
         options.sessionId,
+        { launchClaim: acquisitionLaunchClaim },
       );
     } else {
       const chrome = await launchChrome(
@@ -1610,12 +1692,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         },
         userDataDir,
         logger,
+        { launchClaim: acquisitionLaunchClaim },
       );
       acquiredChrome = {
         chrome,
         processIdentity: chrome.processIdentity,
         source: "launched",
-        disposition: "close-on-last-lease",
+        disposition: acquisitionOwnerDisposition,
       };
     }
     await persistLocalAcquisition(
@@ -1721,6 +1804,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     disposition: chromeOwnerDisposition,
   } = acquiredChromeOwner;
   const chromeHost = chrome.host ?? "127.0.0.1";
+  const settlementEndpointAuthority =
+    acquiredChromeOwner.endpointAuthority ?? chrome.endpointAuthority;
   if (tabLease) {
     await tabLease.update({
       chromeHost,
@@ -1740,6 +1825,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     chromeProcessIdentity: chrome.processIdentity,
     chromePort: chrome.port,
     chromeHost,
+    chromeBrowserWSEndpoint: settlementEndpointAuthority?.browserWSEndpoint,
     chromeProfileRoot: userDataDir,
     userDataDir,
     chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
@@ -1753,6 +1839,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           chrome.processIdentity?.profileDirectory ?? acquisitionProfileIdentity,
         chromePort: chrome.port,
         chromeHost,
+        chromeBrowserWSEndpoint: settlementEndpointAuthority?.browserWSEndpoint,
         chromeProfileRoot: userDataDir,
         userDataDir,
         chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
@@ -1762,6 +1849,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           : undefined,
         acquisition: {
           generationId: acquisitionGenerationId,
+          processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
+          processLaunchClaim: acquisitionLaunchClaim,
+          processOwnerDisposition: acquisitionOwnerDisposition,
           ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
         },
         recoveryCleanup: buildLocalRecoveryCleanupMetadata(),
@@ -1823,6 +1913,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
+  let publishableCapture: BrowserRunResult | null = null;
+  let postCapturePendingWork: PostCapturePendingWork | null = null;
   let runStatus: "attempted" | "complete" = "attempted";
   let connectionClosedUnexpectedly = false;
   let stopThinkingMonitor: (() => void) | null = null;
@@ -1882,17 +1974,18 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (shouldCloseOwnedRunTarget) {
       if (!targetId || !chrome.port) {
         errors.push("Owned Chrome target cleanup metadata is incomplete");
+      } else if (!settlementEndpointAuthority) {
+        errors.push("Owned Chrome target has no retained exact endpoint authority");
       } else {
-        const closed = await closeChromeTarget({
-          port: chrome.port,
+        const targetCleanup = await closeChromeTargetWithExactAuthority({
+          authority: settlementEndpointAuthority,
           targetId,
           logger,
-          host: chromeHost,
         });
-        if (closed) {
+        if (targetCleanup.status === "completed" || targetCleanup.status === "gone") {
           closedOwnedTargetId = targetId;
         } else if (manualLogin || keepBrowserOpen) {
-          errors.push("Chrome target close was not confirmed");
+          errors.push(targetCleanup.reason);
         }
       }
     }
@@ -1918,10 +2011,18 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       ) {
         return;
       }
-      await closeBlankChromeTabs(chrome.port, logger, chromeHost, {
-        excludeTargetIds: [isolatedTargetId, lastTargetId],
-        preserveOneBlank: true,
-      });
+      if (!settlementEndpointAuthority) {
+        throw new Error("Blank-tab cleanup has no retained exact endpoint authority");
+      }
+      const blankCleanup = await closeBlankChromeTabsWithExactAuthority(
+        settlementEndpointAuthority,
+        logger,
+        {
+          excludeTargetIds: [isolatedTargetId, lastTargetId],
+          preserveOneBlank: true,
+        },
+      );
+      if (blankCleanup.status === "unsafe") throw new Error(blankCleanup.reason);
     };
     if (manualLogin && !keepBrowserOpen && manualLeaseTeardownAuthority) {
       let teardownError: string | null = null;
@@ -2028,12 +2129,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
     }
     if (!keepBrowserOpen && !manualLogin) {
-      const termination = await chrome.kill().catch((terminationError: unknown) => ({
-        status: "unsafe" as const,
-        pid: chrome.pid,
-        reason:
-          terminationError instanceof Error ? terminationError.message : String(terminationError),
-      }));
+      const termination = settlementEndpointAuthority
+        ? await settlementEndpointAuthority.kill().catch((terminationError: unknown) => ({
+            status: "unsafe" as const,
+            pid: chrome.pid,
+            reason:
+              terminationError instanceof Error
+                ? terminationError.message
+                : String(terminationError),
+          }))
+        : {
+            status: "unsafe" as const,
+            pid: chrome.pid,
+            reason: "Chrome teardown has no retained exact endpoint authority",
+          };
       if (!isSafeChromeTerminationOutcome(termination)) {
         keepBrowserOpen = true;
         errors.push(termination.reason);
@@ -2049,6 +2158,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           errors.push(`Profile removal was not confirmed: ${userDataDir}`);
           logger(`[browser] Failed to remove temporary Chrome profile ${userDataDir}.`);
         }
+      }
+    }
+    if (keepBrowserOpen && !manualLogin && errors.length === 0 && settlementEndpointAuthority) {
+      try {
+        await settlementEndpointAuthority.release();
+      } catch (error) {
+        errors.push(
+          `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
     if (!keepBrowserOpen && !connectionClosedUnexpectedly) {
@@ -2674,8 +2792,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       );
       await updateConversationHint("post-deep-research", 15_000).catch(() => false);
       await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
-      const durationMs = Date.now() - startedAt;
-      const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
         () =>
           saveDeepResearchReportArtifact({
@@ -2698,8 +2814,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           }),
         logger,
       );
-      const savedArtifacts = appendArtifacts(undefined, [reportArtifact, transcriptArtifact]);
-      const archive = await maybeArchiveCompletedConversation({
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
+      runStatus = "complete";
+      publishableCapture = {
+        answerText: researchResult.text,
+        answerMarkdown: researchResult.text,
+        answerHtml: researchResult.html,
+        artifacts: appendArtifacts(undefined, [reportArtifact, transcriptArtifact]),
+        modelSelection: modelSelectionEvidence,
+        tookMs: Date.now() - startedAt,
+        answerTokens: estimateTokenCount(researchResult.text),
+        answerChars: researchResult.text.length,
+      };
+      postCapturePendingWork = {
+        code: "browser-archive-pending",
+        context: "ChatGPT conversation archive",
+      };
+      publishableCapture.archive = await maybeArchiveCompletedConversation({
         Runtime,
         logger,
         config,
@@ -2707,23 +2838,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
-      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
-      if (connectionClosedUnexpectedly) {
-        throw new Error("Chrome disconnected before completion");
-      }
-      runStatus = "complete";
-      const result: BrowserRunResult = {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-        answerHtml: researchResult.html,
-        artifacts: savedArtifacts,
-        archive,
-        modelSelection: modelSelectionEvidence,
-        tookMs: durationMs,
-        answerTokens: tokens,
-        answerChars: researchResult.text.length,
+      publishableCapture.tookMs = Date.now() - startedAt;
+      postCapturePendingWork = {
+        code: "browser-final-identity-verification-pending",
+        context: "final committed-turn identity verification",
       };
-      return lifecycle.issueCapture(result);
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
+      postCapturePendingWork = {
+        code: "browser-final-target-liveness-pending",
+        context: "final Chrome target liveness confirmation",
+      };
+      if (connectionClosedUnexpectedly) {
+        throw new Error("Chrome disconnected after complete answer capture");
+      }
+      return lifecycle.issueCapture(publishableCapture);
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
@@ -3159,16 +3287,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       answerMarkdown = formatted.answerMarkdown;
       answerHtml = "";
     }
-    if (connectionClosedUnexpectedly) {
-      // Bail out on mid-run disconnects so the session stays reattachable.
-      throw new Error("Chrome disconnected before completion");
-    }
     const artifactPromptLocator = promptLocator;
     if (!artifactPromptLocator) {
       throw new BrowserAutomationError("Artifact prompt authority is unavailable.", {
         stage: "prompt-epoch",
         code: "prompt-epoch-evidence-missing",
       });
+    }
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Chrome disconnected before complete answer capture");
     }
     const artifactMinTurnIndex = artifactPromptLocator.verifiedUserTurnIndex + 1;
     await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
@@ -3228,8 +3355,27 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         }),
       logger,
     );
-    const savedArtifacts = appendArtifacts(savedBrowserArtifacts, [transcriptArtifact]);
-    const archive = await maybeArchiveCompletedConversation({
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    runStatus = "complete";
+    publishableCapture = {
+      answerText,
+      answerMarkdown,
+      answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
+      artifacts: appendArtifacts(savedBrowserArtifacts, [transcriptArtifact]),
+      generatedImages: imageArtifacts.generatedImages,
+      savedImages: imageArtifacts.savedImages,
+      downloadableFiles: fileArtifacts.files,
+      savedFiles: fileArtifacts.savedFiles,
+      modelSelection: modelSelectionEvidence,
+      tookMs: Date.now() - startedAt,
+      answerTokens: estimateTokenCount(answerMarkdown),
+      answerChars: answerText.length,
+    };
+    postCapturePendingWork = {
+      code: "browser-archive-pending",
+      context: "ChatGPT conversation archive",
+    };
+    publishableCapture.archive = await maybeArchiveCompletedConversation({
       Runtime,
       logger,
       config,
@@ -3240,35 +3386,82 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
         fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
     });
-    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
-    if (connectionClosedUnexpectedly) {
-      throw new Error("Chrome disconnected before completion");
-    }
-    runStatus = "complete";
-    const durationMs = Date.now() - startedAt;
-    const answerChars = answerText.length;
-    const answerTokens = estimateTokenCount(answerMarkdown);
-    const result: BrowserRunResult = {
-      answerText,
-      answerMarkdown,
-      answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
-      artifacts: savedArtifacts,
-      generatedImages: imageArtifacts.generatedImages,
-      savedImages: imageArtifacts.savedImages,
-      downloadableFiles: fileArtifacts.files,
-      savedFiles: fileArtifacts.savedFiles,
-      archive,
-      modelSelection: modelSelectionEvidence,
-      tookMs: durationMs,
-      answerTokens,
-      answerChars,
+    publishableCapture.tookMs = Date.now() - startedAt;
+    postCapturePendingWork = {
+      code: "browser-final-identity-verification-pending",
+      context: "final committed-turn identity verification",
     };
-    return lifecycle.issueCapture(result);
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    postCapturePendingWork = {
+      code: "browser-final-target-liveness-pending",
+      context: "final Chrome target liveness confirmation",
+    };
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Chrome disconnected after complete answer capture");
+    }
+    return lifecycle.issueCapture(publishableCapture);
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
-    escapingFailure = normalizedError;
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
+    const postCaptureAssessment =
+      publishableCapture && socketClosed
+        ? await getDisconnectAssessment().catch((assessmentError) => {
+            logger(
+              `[browser] Could not refine post-capture target authority: ${assessmentError instanceof Error ? assessmentError.message : String(assessmentError)}`,
+            );
+            return null;
+          })
+        : null;
+    const identityRevalidationLostWithTarget =
+      postCapturePendingWork?.code === "browser-final-identity-verification-pending" &&
+      !hasBrowserErrorCode(normalizedError, "committed-prompt-identity-mismatch") &&
+      postCaptureAssessment?.liveness.targetFound === false;
+    if (
+      publishableCapture &&
+      (postCapturePendingWork?.code === "browser-final-target-liveness-pending" ||
+        identityRevalidationLostWithTarget)
+    ) {
+      const pendingWork = identityRevalidationLostWithTarget
+        ? {
+            code: "browser-final-target-liveness-pending",
+            context: "final committed-turn revalidation after Chrome target loss",
+          }
+        : (postCapturePendingWork ?? {
+            code: "browser-publication-pending",
+            context: "answer publication",
+          });
+      appendPostCaptureWarning(
+        publishableCapture,
+        pendingWork.code,
+        pendingWork.context,
+        normalizedError,
+        logger,
+      );
+      let publicationBase = buildLocalRuntimeBase(lastUrl);
+      if (postCaptureAssessment?.liveness.targetFound === false) {
+        publicationBase = projectRuntimeAfterChromeTargetLoss(publicationBase);
+      }
+      if (socketClosed && !usingCopiedProfile) {
+        try {
+          await writeOracleChromeOwner(userDataDir, {
+            port: chrome.port,
+            processIdentity: chrome.processIdentity,
+            disposition: chromeOwnerDisposition,
+          });
+        } catch (ownerError) {
+          appendPostCaptureWarning(
+            publishableCapture,
+            "browser-owner-publication-pending",
+            "retained Chrome owner publication",
+            ownerError,
+            logger,
+          );
+        }
+      }
+      return lifecycle.issueCapture(publishableCapture, publicationBase);
+    }
+    escapingFailure = normalizedError;
     const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
     if (preservedErrorKind === "cloudflare-challenge") {
       if (usingCopiedProfile) {
@@ -3794,6 +3987,9 @@ async function runRemoteBrowserMode(
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
+  let publishableCapture: BrowserRunResult | null = null;
+  let postCapturePendingWork: PostCapturePendingWork | null = null;
+  let retainRemoteConnectionForSettlement = false;
   let connectionClosedUnexpectedly = false;
   let runStatus: "attempted" | "complete" = "attempted";
   let preserveBrowserOnError = false;
@@ -3897,6 +4093,10 @@ async function runRemoteBrowserMode(
         errors.push(`Browser lease release failed: ${message}`);
         logger(`[browser] Browser lease release failed; preserving remote target: ${message}`);
       }
+    }
+    if (retainRemoteConnectionForSettlement && !connectionClosedUnexpectedly && connection) {
+      await connection.close();
+      retainRemoteConnectionForSettlement = false;
     }
     const totalSeconds = (Date.now() - startedAt) / 1000;
     logger(`Remote session complete • ${totalSeconds.toFixed(1)}s total`);
@@ -4276,8 +4476,6 @@ async function runRemoteBrowserMode(
       );
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
       await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
-      const durationMs = Date.now() - startedAt;
-      const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
         () =>
           saveDeepResearchReportArtifact({
@@ -4300,8 +4498,23 @@ async function runRemoteBrowserMode(
           }),
         logger,
       );
-      const savedArtifacts = appendArtifacts(undefined, [reportArtifact, transcriptArtifact]);
-      const archive = await maybeArchiveCompletedConversation({
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
+      runStatus = "complete";
+      publishableCapture = {
+        answerText: researchResult.text,
+        answerMarkdown: researchResult.text,
+        answerHtml: researchResult.html,
+        artifacts: appendArtifacts(undefined, [reportArtifact, transcriptArtifact]),
+        modelSelection: modelSelectionEvidence,
+        tookMs: Date.now() - startedAt,
+        answerTokens: estimateTokenCount(researchResult.text),
+        answerChars: researchResult.text.length,
+      };
+      postCapturePendingWork = {
+        code: "browser-archive-pending",
+        context: "ChatGPT conversation archive",
+      };
+      publishableCapture.archive = await maybeArchiveCompletedConversation({
         Runtime,
         logger,
         config,
@@ -4309,23 +4522,22 @@ async function runRemoteBrowserMode(
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
-      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
-      if (connectionClosedUnexpectedly) {
-        throw new Error("Remote Chrome disconnected before completion");
-      }
-      runStatus = "complete";
-      const result: BrowserRunResult = {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-        answerHtml: researchResult.html,
-        artifacts: savedArtifacts,
-        archive,
-        modelSelection: modelSelectionEvidence,
-        tookMs: durationMs,
-        answerTokens: tokens,
-        answerChars: researchResult.text.length,
+      publishableCapture.tookMs = Date.now() - startedAt;
+      postCapturePendingWork = {
+        code: "browser-final-identity-verification-pending",
+        context: "final committed-turn identity verification",
       };
-      return lifecycle.issueCapture(result);
+      await assertCommittedPromptEpochCurrent(Runtime, expectedPromptTurn);
+      postCapturePendingWork = {
+        code: "browser-final-target-liveness-pending",
+        context: "final Chrome target liveness confirmation",
+      };
+      if (connectionClosedUnexpectedly) {
+        throw new Error("Remote Chrome disconnected after complete answer capture");
+      }
+      const transaction = lifecycle.issueCapture(publishableCapture);
+      retainRemoteConnectionForSettlement = lifecycle.hasPendingPromptAuthorityJournal();
+      return transaction;
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
@@ -4716,7 +4928,6 @@ async function runRemoteBrowserMode(
       answerMarkdown = formatted.answerMarkdown;
       answerHtml = "";
     }
-    const canSaveBrowserDownloadsLocally = isLocalChromeHost(host);
     const artifactPromptLocator = promptLocator;
     if (!artifactPromptLocator) {
       throw new BrowserAutomationError("Artifact prompt authority is unavailable.", {
@@ -4724,6 +4935,10 @@ async function runRemoteBrowserMode(
         code: "prompt-epoch-evidence-missing",
       });
     }
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Remote Chrome disconnected before complete answer capture");
+    }
+    const canSaveBrowserDownloadsLocally = isLocalChromeHost(host);
     const artifactMinTurnIndex = artifactPromptLocator.verifiedUserTurnIndex + 1;
     await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
     const artifactRuntime = createPromptEpochGuardedRuntime(Runtime, artifactPromptLocator);
@@ -4782,8 +4997,27 @@ async function runRemoteBrowserMode(
         }),
       logger,
     );
-    const savedArtifacts = appendArtifacts(savedBrowserArtifacts, [transcriptArtifact]);
-    const archive = await maybeArchiveCompletedConversation({
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    runStatus = "complete";
+    publishableCapture = {
+      answerText,
+      answerMarkdown,
+      answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
+      artifacts: appendArtifacts(savedBrowserArtifacts, [transcriptArtifact]),
+      generatedImages: imageArtifacts.generatedImages,
+      savedImages: imageArtifacts.savedImages,
+      downloadableFiles: fileArtifacts.files,
+      savedFiles: fileArtifacts.savedFiles,
+      modelSelection: modelSelectionEvidence,
+      tookMs: Date.now() - startedAt,
+      answerTokens: estimateTokenCount(answerMarkdown),
+      answerChars: answerText.length,
+    };
+    postCapturePendingWork = {
+      code: "browser-archive-pending",
+      context: "ChatGPT conversation archive",
+    };
+    publishableCapture.archive = await maybeArchiveCompletedConversation({
       Runtime,
       logger,
       config,
@@ -4794,35 +5028,68 @@ async function runRemoteBrowserMode(
         imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
         fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
     });
-    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
-    const durationMs = Date.now() - startedAt;
-    const answerChars = answerText.length;
-    const answerTokens = estimateTokenCount(answerMarkdown);
-
-    if (connectionClosedUnexpectedly) {
-      throw new Error("Remote Chrome disconnected before completion");
-    }
-    runStatus = "complete";
-    const result: BrowserRunResult = {
-      answerText,
-      answerMarkdown,
-      answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
-      tookMs: durationMs,
-      answerTokens,
-      answerChars,
-      artifacts: savedArtifacts,
-      generatedImages: imageArtifacts.generatedImages,
-      savedImages: imageArtifacts.savedImages,
-      downloadableFiles: fileArtifacts.files,
-      savedFiles: fileArtifacts.savedFiles,
-      archive,
-      modelSelection: modelSelectionEvidence,
+    publishableCapture.tookMs = Date.now() - startedAt;
+    postCapturePendingWork = {
+      code: "browser-final-identity-verification-pending",
+      context: "final committed-turn identity verification",
     };
-    return lifecycle.issueCapture(result);
+    await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
+    postCapturePendingWork = {
+      code: "browser-final-target-liveness-pending",
+      context: "final Chrome target liveness confirmation",
+    };
+    if (connectionClosedUnexpectedly) {
+      throw new Error("Remote Chrome disconnected after complete answer capture");
+    }
+    const transaction = lifecycle.issueCapture(publishableCapture);
+    retainRemoteConnectionForSettlement = lifecycle.hasPendingPromptAuthorityJournal();
+    return transaction;
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
+    const postCaptureAssessment =
+      publishableCapture && socketClosed
+        ? await getDisconnectAssessment().catch((assessmentError) => {
+            logger(
+              `[browser] Could not refine post-capture remote target authority: ${assessmentError instanceof Error ? assessmentError.message : String(assessmentError)}`,
+            );
+            return null;
+          })
+        : null;
+    const identityRevalidationLostWithTarget =
+      postCapturePendingWork?.code === "browser-final-identity-verification-pending" &&
+      !hasBrowserErrorCode(normalizedError, "committed-prompt-identity-mismatch") &&
+      postCaptureAssessment?.liveness.targetFound === false;
+    if (
+      publishableCapture &&
+      (postCapturePendingWork?.code === "browser-final-target-liveness-pending" ||
+        identityRevalidationLostWithTarget)
+    ) {
+      const pendingWork = identityRevalidationLostWithTarget
+        ? {
+            code: "browser-final-target-liveness-pending",
+            context: "final committed-turn revalidation after remote Chrome target loss",
+          }
+        : (postCapturePendingWork ?? {
+            code: "browser-publication-pending",
+            context: "answer publication",
+          });
+      appendPostCaptureWarning(
+        publishableCapture,
+        pendingWork.code,
+        pendingWork.context,
+        normalizedError,
+        logger,
+      );
+      let publicationBase = buildRemoteRuntimeBase(lastUrl);
+      if (postCaptureAssessment?.liveness.targetFound === false) {
+        publicationBase = projectRuntimeAfterChromeTargetLoss(publicationBase);
+      }
+      const transaction = lifecycle.issueCapture(publishableCapture, publicationBase);
+      retainRemoteConnectionForSettlement = lifecycle.hasPendingPromptAuthorityJournal();
+      return transaction;
+    }
     const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
 
     if (!socketClosed) {
@@ -4880,12 +5147,14 @@ async function runRemoteBrowserMode(
   } finally {
     await conversationUrlMonitor?.stop();
     try {
-      await closeRemoteConnectionAfterRun({
-        connectionClosedUnexpectedly,
-        connection,
-        client,
-        runStatus,
-      });
+      if (!retainRemoteConnectionForSettlement && !lifecycle.hasPendingPromptAuthorityJournal()) {
+        await closeRemoteConnectionAfterRun({
+          connectionClosedUnexpectedly,
+          connection,
+          client,
+          runStatus,
+        });
+      }
     } catch {
       // ignore
     }

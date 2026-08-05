@@ -7,7 +7,6 @@ import {
 } from "./chromeLifecycle.js";
 import {
   acquireProfileRunLock,
-  captureChromeProcessIdentity,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
   isSafeChromeTerminationOutcome,
@@ -22,6 +21,7 @@ import {
   writeOracleChromeOwner,
   type ChromeOwnerDisposition,
   type ChromeProcessIdentity,
+  type ChromeProcessLaunchClaim,
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
@@ -42,10 +42,10 @@ export interface ManualChromeOwner {
 
 export interface ManualChromeOwnerDeps {
   acquireProfileLock?: typeof acquireProfileRunLock;
-  captureIdentity?: typeof captureChromeProcessIdentity;
   cleanupProfileState?: typeof cleanupStaleProfileState;
   discoverExactProfileChrome?: typeof findRunningChromeDebugTargetForProfile;
   isOwnerProcessAlive?: typeof isProcessAlive;
+  launchClaim?: ChromeProcessLaunchClaim;
   launch?: typeof launchChrome;
   retainEndpointAuthority?: typeof retainChromeEndpointAuthority;
   probe?: typeof verifyDevToolsReachable;
@@ -112,6 +112,7 @@ export async function acquireManualChromeOwner(
         },
         profileDir,
         logger,
+        { launchClaim: deps.launchClaim },
       );
       if (
         !sameProfileDirectoryIdentity(
@@ -323,61 +324,9 @@ async function findExistingManualChromeOwner(
 
   const discovered = await discoverExact(profileDir);
   if (discovered) {
-    const pid = requirePositiveInteger(discovered.pid, "rediscovered pid", profileDir);
-    const port = requirePositiveInteger(discovered.port, "rediscovered DevTools port", profileDir);
-    const processIdentity =
-      recordedIdentity && recordedIdentity.pid === pid && recordedIdentityVerified
-        ? recordedIdentity
-        : await (deps.captureIdentity ?? captureChromeProcessIdentity)(profileDir, pid);
-    requireProcessIdentity(processIdentity, pid, profileDir);
-    if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, expectedProfileDirectory)) {
-      throw new Error(
-        `Rediscovered Chrome owner belongs to a different physical profile generation.`,
-      );
-    }
-
-    let endpointAuthority: RetainedChromeEndpointAuthority;
-    try {
-      endpointAuthority = await retainEndpointAuthority({
-        host: "127.0.0.1",
-        port,
-        userDataDir: profileDir,
-        processIdentity,
-      });
-    } catch (error) {
-      throw new Error(
-        `Rediscovered Chrome owner for ${profileDir} is running as pid ${pid}, but DevTools port ${port} is not bound to that exact process generation; refusing to reuse it`,
-        { cause: error },
-      );
-    }
-    try {
-      await persistCanonicalOwner(
-        profileDir,
-        { port, processIdentity, disposition: "preserve" },
-        deps,
-      );
-    } catch (error) {
-      try {
-        await endpointAuthority.release();
-      } catch (releaseError) {
-        throw new AggregateError(
-          [
-            error instanceof Error ? error : new Error(String(error)),
-            releaseError instanceof Error ? releaseError : new Error(String(releaseError)),
-          ],
-          `Rediscovered Chrome authority could not be persisted or released safely.`,
-        );
-      }
-      throw error;
-    }
-    logger(`Rediscovered exact Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
-    return {
-      chrome: reusableChrome(port, pid, processIdentity, endpointAuthority),
-      processIdentity,
-      source: "rediscovered",
-      disposition: "preserve",
-      endpointAuthority,
-    };
+    throw new Error(
+      `Chrome is already running for ${profileDir} as pid ${discovered.pid}, but no exact Oracle owner authority authenticates that process; refusing to adopt a pre-existing manual-login browser`,
+    );
   }
 
   if (activePort) {
@@ -459,6 +408,7 @@ function reusableChrome(
     port,
     pid,
     processIdentity,
+    endpointAuthority,
     kill: endpointAuthority.kill,
     process: undefined,
   } as unknown as BrowserChrome;

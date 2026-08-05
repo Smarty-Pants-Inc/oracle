@@ -1,5 +1,9 @@
 import CDP from "chrome-remote-interface";
 import type { BrowserLogger, ChromeClient } from "./types.js";
+import type {
+  ExactChromeEndpointOperationResult,
+  RetainedChromeEndpointAuthority,
+} from "./chromeEndpointAuthority.js";
 import { delay } from "./utils.js";
 
 export async function connectToChrome(
@@ -513,6 +517,149 @@ export async function closeChromeTarget(options: {
     return false;
   } finally {
     await browser?.close().catch(() => undefined);
+  }
+}
+
+export type ExactChromeTargetCleanupResult =
+  | { status: "completed" }
+  | { status: "gone" }
+  | { status: "unsafe"; reason: string };
+
+async function runExactEndpointOperation<T>(
+  authority: RetainedChromeEndpointAuthority,
+  operation: (client: ChromeClient) => Promise<T>,
+): Promise<ExactChromeEndpointOperationResult<T>> {
+  if (!authority.runExactOperation) {
+    return {
+      status: "unsafe",
+      reason: "Retained Chrome endpoint authority cannot authenticate deferred target effects",
+    };
+  }
+  return await authority.runExactOperation(operation);
+}
+
+export async function listChromeTargetsWithExactAuthority(
+  authority: RetainedChromeEndpointAuthority,
+): Promise<ExactChromeEndpointOperationResult<RemoteTargetInfo[]>> {
+  return await runExactEndpointOperation(authority, async (client) => {
+    const targetInfos = (await client.Target.getTargets()).targetInfos ?? [];
+    return targetInfos.map((target) => ({
+      targetId: target.targetId,
+      type: target.type,
+      url: target.url,
+    }));
+  });
+}
+
+export async function closeChromeTargetWithExactAuthority(options: {
+  authority: RetainedChromeEndpointAuthority;
+  targetId: string;
+  logger: BrowserLogger;
+}): Promise<ExactChromeTargetCleanupResult> {
+  const { authority, targetId, logger } = options;
+  try {
+    const initial = await listChromeTargetsWithExactAuthority(authority);
+    if (initial.status !== "completed") return initial;
+    if (!initial.value.some((target) => target.targetId === targetId)) {
+      logger(`Closed isolated browser tab (target=${targetId})`);
+      return { status: "completed" };
+    }
+    if (
+      !initial.value.some(
+        (target) => target.type === "page" && target.targetId && target.targetId !== targetId,
+      )
+    ) {
+      const replacement = await runExactEndpointOperation(authority, async (client) =>
+        client.Target.createTarget({ url: "about:blank" }),
+      );
+      if (replacement.status !== "completed") return replacement;
+      if (!replacement.value.targetId) {
+        return {
+          status: "unsafe",
+          reason: `Chrome has no replacement page target for ${targetId}`,
+        };
+      }
+      logger(`Opened replacement Chrome tab (target=${replacement.value.targetId})`);
+    }
+
+    const close = await runExactEndpointOperation(authority, async (client) =>
+      client.Target.closeTarget({ targetId }),
+    );
+    if (close.status !== "completed") return close;
+    if (close.value.success === false) {
+      return { status: "unsafe", reason: `Chrome rejected target close for ${targetId}` };
+    }
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await delay(25);
+      const current = await listChromeTargetsWithExactAuthority(authority);
+      if (current.status === "gone") return current;
+      if (current.status === "unsafe") return current;
+      if (!current.value.some((target) => target.targetId === targetId)) {
+        logger(`Closed isolated browser tab (target=${targetId})`);
+        return { status: "completed" };
+      }
+    }
+    return { status: "unsafe", reason: `Chrome target close was not confirmed: ${targetId}` };
+  } catch (error) {
+    return {
+      status: "unsafe",
+      reason: `Exact Chrome target cleanup failed: ${error instanceof Error ? error.message : error}`,
+    };
+  }
+}
+
+export async function closeBlankChromeTabsWithExactAuthority(
+  authority: RetainedChromeEndpointAuthority,
+  logger: BrowserLogger,
+  options?: {
+    excludeTargetIds?: Iterable<string | null | undefined>;
+    preserveOneBlank?: boolean;
+  },
+): Promise<ExactChromeTargetCleanupResult> {
+  const excluded = new Set(
+    [...(options?.excludeTargetIds ?? [])].filter(
+      (targetId): targetId is string => typeof targetId === "string" && targetId.length > 0,
+    ),
+  );
+  try {
+    const listed = await listChromeTargetsWithExactAuthority(authority);
+    if (listed.status !== "completed") return listed;
+    const preservedBlankTargetId = options?.preserveOneBlank
+      ? listed.value
+          .filter(isBlankPageTarget)
+          .map((target) => target.targetId)
+          .filter((targetId): targetId is string => Boolean(targetId))
+          .sort()[0]
+      : undefined;
+    let closed = 0;
+    for (const target of listed.value) {
+      const targetId = target.targetId;
+      if (
+        !targetId ||
+        targetId === preservedBlankTargetId ||
+        excluded.has(targetId) ||
+        !isBlankPageTarget(target)
+      ) {
+        continue;
+      }
+      const close = await runExactEndpointOperation(authority, async (client) =>
+        client.Target.closeTarget({ targetId }),
+      );
+      if (close.status !== "completed") return close;
+      if (close.value.success === false) {
+        return { status: "unsafe", reason: `Chrome rejected blank target close for ${targetId}` };
+      }
+      closed += 1;
+    }
+    if (closed > 0) {
+      logger(`Closed ${closed} blank Chrome tab${closed === 1 ? "" : "s"}.`);
+    }
+    return { status: "completed" };
+  } catch (error) {
+    return {
+      status: "unsafe",
+      reason: `Exact blank-tab cleanup failed: ${error instanceof Error ? error.message : error}`,
+    };
   }
 }
 

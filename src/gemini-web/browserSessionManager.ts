@@ -24,7 +24,10 @@ import {
   settleManualChromeOwner,
   type ManualChromeOwner,
 } from "../browser/manualChromeOwner.js";
-import { captureProfileDirectoryIdentity } from "../browser/profileState.js";
+import {
+  captureProfileDirectoryIdentity,
+  createChromeProcessLaunchClaim,
+} from "../browser/profileState.js";
 import {
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
@@ -73,6 +76,8 @@ export async function openGeminiBrowserSession(
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   const generationId = randomUUID();
+  const launchClaim = createChromeProcessLaunchClaim(generationId);
+  const ownerDisposition = resolvedConfig.keepBrowser ? "preserve" : "close-on-last-lease";
   const leaseId = randomUUID();
   const targetMarkerUrl = `about:blank#oracle-acquisition=${generationId}`;
   let profileDirectory = await captureProfileDirectoryIdentity(profileDir);
@@ -101,6 +106,7 @@ export async function openGeminiBrowserSession(
       chromePid: chrome?.pid,
       chromeProcessIdentity: owner?.processIdentity,
       chromePort: chrome?.port,
+      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
       chromeHost: chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: profileDir,
       userDataDir: profileDir,
@@ -116,6 +122,7 @@ export async function openGeminiBrowserSession(
           chromeProcessIdentity: owner?.processIdentity,
           profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
           chromePort: chrome?.port,
+          chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
           chromeHost: chrome?.host ?? "127.0.0.1",
           chromeProfileRoot: profileDir,
           userDataDir: profileDir,
@@ -129,15 +136,15 @@ export async function openGeminiBrowserSession(
           acquisition: {
             generationId,
             processOwnerProvenance: "manual-canonical-owner",
+            processLaunchClaim: launchClaim,
+            processOwnerDisposition: ownerDisposition,
             ...(pendingResource ? { pendingResource } : {}),
             targetMarkerUrl,
           },
           recoveryCleanup: {
             ownsTarget: targetCleanupPending,
             profileKind: "manual-login",
-            keepBrowser: owner
-              ? owner.disposition === "preserve"
-              : Boolean(resolvedConfig.keepBrowser),
+            keepBrowser: owner ? owner.disposition === "preserve" : ownerDisposition === "preserve",
             closeOwnedTargetOnComplete: targetCleanupPending,
           },
         },
@@ -274,7 +281,8 @@ export async function openGeminiBrowserSession(
     });
     owner = await resources.journalAcquisition({
       intentRuntime: runtime("chrome-process"),
-      acquire: () => acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose),
+      acquire: () =>
+        acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose, { launchClaim }),
       acquiredRuntime: (acquiredOwner) => {
         owner = acquiredOwner;
         return runtime();

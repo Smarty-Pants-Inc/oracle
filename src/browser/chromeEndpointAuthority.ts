@@ -120,9 +120,17 @@ export interface LaunchedChromeControlOptions {
   readonly processIdentity: ChromeProcessIdentity;
 }
 
+export type ExactChromeEndpointOperationResult<T> =
+  | { status: "completed"; value: T }
+  | { status: "gone" }
+  | { status: "unsafe"; reason: string };
+
 export interface RetainedChromeEndpointAuthority {
   readonly browserWSEndpoint: string;
   readonly kill: ChromeStableKill;
+  runExactOperation?<T>(
+    operation: (client: ChromeClient) => Promise<T>,
+  ): Promise<ExactChromeEndpointOperationResult<T>>;
   release(): Promise<void>;
 }
 
@@ -152,11 +160,13 @@ export interface ChromeEndpointAuthorityOptions extends LaunchedChromeControlOpt
   readonly browserWSEndpoint?: string;
 }
 
-interface ChromeEndpointAuthorityDeps {
+export interface ChromeEndpointAuthorityDeps {
   discoverEndpoint?: typeof discoverBrowserWebSocketEndpoint;
   connectBrowser?: (browserWSEndpoint: string) => Promise<ChromeClient>;
   inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
   resolveListeningPid?: typeof resolveListeningPortOwnerPid;
+  timeoutMs?: number;
+  pollMs?: number;
 }
 
 export interface LaunchedChromeEndpointControl {
@@ -389,45 +399,114 @@ export async function retainChromeEndpointAuthority(
     ? deps.connectBrowser(endpointUrl.toString())
     : (CDP({ target: endpointUrl.toString(), local: true }) as Promise<ChromeClient>));
   try {
-    await client.Browser.getVersion();
-    const processResult = await client.SystemInfo.getProcessInfo();
-    const browserProcessMatches = Array.isArray(processResult.processInfo)
-      ? processResult.processInfo.some(
-          (processInfo) =>
-            processInfo !== null &&
-            typeof processInfo === "object" &&
-            "id" in processInfo &&
-            processInfo.id === options.processIdentity.pid &&
-            "type" in processInfo &&
-            processInfo.type === "browser",
-        )
-      : false;
-    if (!browserProcessMatches) {
-      throw new Error(
-        "Chrome control channel is not bound to the captured browser process generation",
-      );
-    }
-
     const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
-    const [inspection, listeningPid] = await Promise.all([
-      inspect(options.userDataDir, options.processIdentity),
-      options.processIdentity.profileDirectory.platform === "darwin"
-        ? (deps.resolveListeningPid ?? resolveListeningPortOwnerPid)(options.port)
-        : Promise.resolve(options.processIdentity.pid),
-    ]);
-    if (inspection !== "current" || listeningPid !== options.processIdentity.pid) {
-      throw new Error("Chrome control channel is not bound to the exact process generation");
+    const inspectExactBinding = async (): Promise<
+      { status: "current" } | { status: "gone" } | { status: "unsafe"; reason: string }
+    > => {
+      let inspection: ChromeProcessIdentityInspection;
+      try {
+        inspection = await inspect(options.userDataDir, options.processIdentity);
+      } catch (error) {
+        return {
+          status: "unsafe",
+          reason: `Exact Chrome process generation could not be inspected: ${error instanceof Error ? error.message : error}`,
+        };
+      }
+      if (inspection === "exited") return { status: "gone" };
+      if (inspection !== "current") {
+        return {
+          status: "unsafe",
+          reason: "Exact Chrome process/profile generation could not be reverified",
+        };
+      }
+
+      if (options.processIdentity.profileDirectory.platform === "darwin") {
+        const listeningPid = await (deps.resolveListeningPid ?? resolveListeningPortOwnerPid)(
+          options.port,
+        );
+        if (listeningPid !== options.processIdentity.pid) {
+          return {
+            status: "unsafe",
+            reason: "Chrome DevTools listener no longer belongs to the exact process generation",
+          };
+        }
+      }
+
+      try {
+        const processResult = await client.SystemInfo.getProcessInfo();
+        const browserProcessMatches = Array.isArray(processResult.processInfo)
+          ? processResult.processInfo.some(
+              (processInfo) =>
+                processInfo !== null &&
+                typeof processInfo === "object" &&
+                "id" in processInfo &&
+                processInfo.id === options.processIdentity.pid &&
+                "type" in processInfo &&
+                processInfo.type === "browser",
+            )
+          : false;
+        return browserProcessMatches
+          ? { status: "current" }
+          : {
+              status: "unsafe",
+              reason:
+                "Chrome control channel is not bound to the captured browser process generation",
+            };
+      } catch (error) {
+        return {
+          status: "unsafe",
+          reason: `Exact Chrome endpoint process identity is unavailable: ${error instanceof Error ? error.message : error}`,
+        };
+      }
+    };
+
+    await client.Browser.getVersion();
+    const initialBinding = await inspectExactBinding();
+    if (initialBinding.status !== "current") {
+      throw new Error(
+        initialBinding.status === "gone"
+          ? "Exact Chrome process generation exited before endpoint authority was retained"
+          : initialBinding.reason,
+      );
     }
 
     const rawKill = createIdentityBoundChromeControlKill(
       client,
       options.userDataDir,
       options.processIdentity,
-      { inspectProcessIdentity: inspect },
+      {
+        inspectProcessIdentity: inspect,
+        timeoutMs: deps.timeoutMs,
+        pollMs: deps.pollMs,
+      },
     );
     let released = false;
     let terminalKill: RecordedChromeTerminationOutcome | undefined;
     let pending: Promise<unknown> | undefined;
+
+    const runExactOperation = async <T>(
+      operation: (exactClient: ChromeClient) => Promise<T>,
+    ): Promise<ExactChromeEndpointOperationResult<T>> => {
+      while (pending) {
+        await pending.catch(() => undefined);
+      }
+      if (released) {
+        return { status: "unsafe", reason: "Exact Chrome endpoint authority was already released" };
+      }
+      if (terminalKill) return { status: "gone" };
+      const attempt = (async (): Promise<ExactChromeEndpointOperationResult<T>> => {
+        const binding = await inspectExactBinding();
+        if (binding.status === "gone") return { status: "gone" };
+        if (binding.status === "unsafe") return binding;
+        return { status: "completed", value: await operation(client) };
+      })();
+      pending = attempt;
+      try {
+        return await attempt;
+      } finally {
+        if (pending === attempt) pending = undefined;
+      }
+    };
 
     const kill: ChromeStableKill = async () => {
       while (pending) {
@@ -441,7 +520,18 @@ export async function retainChromeEndpointAuthority(
         };
       }
       if (terminalKill) return terminalKill;
-      const attempt = rawKill();
+      const attempt = (async (): Promise<RecordedChromeTerminationOutcome> => {
+        const binding = await inspectExactBinding();
+        if (binding.status === "gone") return await rawKill();
+        if (binding.status === "unsafe") {
+          return {
+            status: "unsafe",
+            pid: options.processIdentity.pid,
+            reason: binding.reason,
+          };
+        }
+        return await rawKill();
+      })();
       pending = attempt;
       try {
         const outcome = await attempt;
@@ -468,6 +558,7 @@ export async function retainChromeEndpointAuthority(
     return Object.freeze({
       browserWSEndpoint: endpointUrl.toString(),
       kill,
+      runExactOperation,
       release,
     });
   } catch (error) {
@@ -499,6 +590,56 @@ export async function retainExactChromeEndpointAuthority(
     userDataDir,
     processIdentity,
   });
+}
+
+export async function terminateChromeWithExactEndpointAuthority(
+  options: ChromeEndpointAuthorityOptions,
+  deps: ChromeEndpointAuthorityDeps = {},
+): Promise<RecordedChromeTerminationOutcome> {
+  const inspect = deps.inspectProcessIdentity ?? inspectChromeProcessIdentity;
+  let inspection: ChromeProcessIdentityInspection;
+  try {
+    inspection = await inspect(options.userDataDir, options.processIdentity);
+  } catch {
+    inspection = "unavailable";
+  }
+  if (inspection === "exited") {
+    return { status: "already-stopped", pid: options.processIdentity.pid };
+  }
+  if (inspection !== "current") {
+    return {
+      status: "unsafe",
+      pid: options.processIdentity.pid,
+      reason: "Exact Chrome process/profile generation could not be reverified before cleanup",
+    };
+  }
+
+  let authority: RetainedChromeEndpointAuthority;
+  try {
+    authority = await retainChromeEndpointAuthority(options, deps);
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid: options.processIdentity.pid,
+      reason: `Exact Chrome control channel is unavailable: ${error instanceof Error ? error.message : error}`,
+    };
+  }
+  const outcome = await authority.kill().catch((error: unknown) => ({
+    status: "unsafe" as const,
+    pid: options.processIdentity.pid,
+    reason: `Exact Chrome control teardown failed: ${error instanceof Error ? error.message : error}`,
+  }));
+  if (isSafeChromeTerminationOutcome(outcome)) return outcome;
+  try {
+    await authority.release();
+    return outcome;
+  } catch (error) {
+    return {
+      status: "unsafe",
+      pid: options.processIdentity.pid,
+      reason: `${outcome.reason}; exact endpoint release also failed: ${error instanceof Error ? error.message : error}`,
+    };
+  }
 }
 
 function createIdentityBoundChromeControlKill(

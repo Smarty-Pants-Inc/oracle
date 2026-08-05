@@ -180,22 +180,64 @@ describe("BrowserRunLifecycleController", () => {
     expect(lifecycle.isPromptCommitted()).toBe(true);
   });
 
-  test("retains verified committed authority when its persistence fails", async () => {
+  test("continues capture with exact authority when committed persistence fails", async () => {
     const persistRuntime = vi
       .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("session store unavailable"));
+    const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
+      completedBrowserCaptureCleanup(runtime),
+    );
     const lifecycle = new BrowserRunLifecycleController({
       getRuntime: remoteRuntime,
       persistRuntime,
-      settleResources: async (_mode, runtime) => completedBrowserCaptureCleanup(runtime),
+      settleResources,
     });
     lifecycle.markAcquired();
     const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 0);
 
     await expect(
       lifecycle.recordPromptCommitVerification(committedVerification, identity),
-    ).rejects.toMatchObject({
+    ).resolves.toBeUndefined();
+    const transaction = lifecycle.issueCapture({
+      answerText: "captured despite journal failure",
+      answerMarkdown: "captured despite journal failure",
+      tookMs: 1,
+      answerTokens: 4,
+      answerChars: 32,
+    });
+
+    expect(transaction.runtime.promptEpoch).toMatchObject({
+      status: "committed",
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+    });
+    expect(transaction.warnings).toContainEqual(
+      expect.objectContaining({ code: "prompt-commit-journal-pending" }),
+    );
+    await expect(lifecycle.settleIfUnpublished()).resolves.toBeNull();
+    expect(settleResources).not.toHaveBeenCalled();
+  });
+
+  test("does not reset or dispatch a follow-up while committed authority remains unjournaled", async () => {
+    const persistRuntime = vi
+      .fn(async (_runtime: BrowserRuntimeMetadata) => undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("commit journal unavailable"))
+      .mockRejectedValueOnce(new Error("commit journal still unavailable"));
+    const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
+      completedBrowserCaptureCleanup(runtime),
+    );
+    const lifecycle = new BrowserRunLifecycleController({
+      getRuntime: remoteRuntime,
+      persistRuntime,
+      settleResources,
+    });
+    lifecycle.markAcquired();
+    const identity = await lifecycle.beginPromptDispatch("review", 0, 0, 1);
+    await lifecycle.recordPromptCommitVerification(committedVerification, identity);
+
+    await expect(lifecycle.resetPrompt()).rejects.toMatchObject({
       details: {
         code: "prompt-epoch-persistence-failed",
         runtime: {
@@ -207,12 +249,21 @@ describe("BrowserRunLifecycleController", () => {
         },
       },
     });
-    expect(lifecycle.promptDispatch()).toMatchObject({ status: "committed" });
-    expect(lifecycle.promptEpoch()).toMatchObject({
-      status: "committed",
-      verifiedUserTurnId: "turn-0",
-      verifiedUserMessageId: "message-0",
+    await expect(lifecycle.beginPromptDispatch("follow up", 2, 1, 0)).rejects.toMatchObject({
+      details: { code: "browser-run-lifecycle-transition-invalid", phase: "capturing" },
     });
+    await expect(lifecycle.settleIfUnpublished()).resolves.toMatchObject({
+      status: "pending",
+      runtime: {
+        promptEpoch: expect.objectContaining({
+          status: "committed",
+          verifiedUserTurnId: "turn-0",
+          verifiedUserMessageId: "message-0",
+        }),
+        recoveryCleanupResult: { status: "pending" },
+      },
+    });
+    expect(settleResources).not.toHaveBeenCalled();
   });
 
   test.each([

@@ -97,6 +97,7 @@ export async function performSessionRun({
   let currentBrowser: SessionMetadata["browser"] = browserConfig
     ? { config: browserConfig }
     : sessionMeta.browser;
+  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(currentBrowser?.runtime);
   await sessionStore.updateSession(sessionMeta.id, {
     status: "running",
     startedAt: new Date().toISOString(),
@@ -124,9 +125,10 @@ export async function performSessionRun({
           runtime: BrowserRuntimeMetadata,
           modelSelection?: BrowserModelSelectionEvidence,
         ) => {
+          const authoritativeRuntime = runtimeAuthority.observeHint(runtime);
           const browser = {
             config: browserConfig,
-            runtime,
+            runtime: authoritativeRuntime,
             ...(modelSelection ? { modelSelection } : {}),
           };
           await sessionStore.updateSession(sessionMeta.id, {
@@ -147,9 +149,10 @@ export async function performSessionRun({
         },
         runnerDeps,
       );
+      const resultRuntime = runtimeAuthority.observeHint(result.runtime);
       currentBrowser = {
         config: browserConfig,
-        runtime: result.runtime,
+        runtime: resultRuntime,
         archive: result.archive,
         modelSelection: result.modelSelection,
         warnings: result.warnings,
@@ -191,7 +194,8 @@ export async function performSessionRun({
           });
         },
         persistRuntime: async (runtime) => {
-          currentBrowser = { ...currentBrowser, runtime };
+          const authoritativeRuntime = runtimeAuthority.observeHint(runtime);
+          currentBrowser = { ...currentBrowser, runtime: authoritativeRuntime };
           await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
         },
       });
@@ -574,12 +578,19 @@ export async function performSessionRun({
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
-    const errorBrowserRuntime = (
-      userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined
-    )?.runtime;
+    const capturedErrorRuntime = runtimeFromBrowserError(error);
+    const errorBrowserRuntime = runtimeAuthority.observeError(capturedErrorRuntime);
+    const cleanupCompletedAfterCapturedError = runtimeAuthority.didTerminalCleanupSupersedeError();
+    if (errorBrowserRuntime) {
+      currentBrowser = { ...currentBrowser, runtime: errorBrowserRuntime };
+    }
+    const authoritativeErrorDetails =
+      userError?.details && capturedErrorRuntime
+        ? { ...userError.details, runtime: errorBrowserRuntime }
+        : userError?.details;
     const browserCanReattach =
-      !browserConfig?.copyProfileSource ||
-      hasRemoteRecoveryAuthority(errorBrowserRuntime ?? currentBrowser?.runtime);
+      !cleanupCompletedAfterCapturedError &&
+      (!browserConfig?.copyProfileSource || hasRemoteRecoveryAuthority(errorBrowserRuntime));
     let reattachGuidanceLogged = false;
     const logBrowserReattachGuidance = (
       runtime: BrowserRuntimeMetadata | null | undefined,
@@ -610,7 +621,7 @@ export async function performSessionRun({
             error: {
               category: userError.category,
               message: userError.message,
-              details: userError.details,
+              details: authoritativeErrorDetails,
             },
           });
         }
@@ -628,7 +639,7 @@ export async function performSessionRun({
           error: {
             category: userError.category,
             message: userError.message,
-            details: userError.details,
+            details: authoritativeErrorDetails,
           },
         });
         throw error;
@@ -647,7 +658,7 @@ export async function performSessionRun({
         browser: {
           ...currentBrowser,
           config: browserConfig,
-          runtime: runtime ?? currentBrowser?.runtime,
+          runtime: recoverableRuntime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
       });
@@ -660,7 +671,7 @@ export async function performSessionRun({
         configuredIntervalMs > 0
           ? configuredIntervalMs
           : Math.max(1_000, Math.min(browserConfig?.timeoutMs ?? 30_000, 30_000));
-      await autoReattachUntilComplete({
+      const reattach = await autoReattachUntilComplete({
         sessionMeta,
         runtime: recoverableRuntime ?? undefined,
         browserConfig: {
@@ -677,6 +688,21 @@ export async function performSessionRun({
         log,
         maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
       });
+      if (reattach.outcome === "exhausted") {
+        currentBrowser = {
+          ...currentBrowser,
+          config: browserConfig,
+          runtime: reattach.runtime ?? recoverableRuntime,
+        };
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "running",
+          completedAt: undefined,
+          errorMessage: message,
+          mode,
+          browser: currentBrowser,
+          response: { status: "running", incompleteReason: "chrome-disconnected" },
+        });
+      }
       return;
     }
     if (assistantTimeout && mode === "browser" && browserCanReattach) {
@@ -689,7 +715,7 @@ export async function performSessionRun({
       const timeoutError = {
         category: userError.category,
         message: userError.message,
-        details: userError.details,
+        details: authoritativeErrorDetails,
       };
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       let autoRuntime = runtime ?? currentBrowser?.runtime;
@@ -788,9 +814,14 @@ export async function performSessionRun({
       errorBrowserRuntime.recoveryCleanupResult
         ? errorBrowserRuntime
         : undefined;
+    const clearCopiedProfileRuntime =
+      mode === "browser" &&
+      Boolean(browserConfig?.copyProfileSource) &&
+      !cleanupErrorRuntime &&
+      !hasRemoteRecoveryAuthority(errorBrowserRuntime);
     const browserRuntime =
-      mode === "browser" && (browserCanReattach || cleanupErrorRuntime)
-        ? errorBrowserRuntime
+      mode === "browser" && !clearCopiedProfileRuntime
+        ? (errorBrowserRuntime ?? currentBrowser?.runtime)
         : undefined;
     if (!cloudflareChallenge && browserCanReattach) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
@@ -804,7 +835,7 @@ export async function performSessionRun({
         ? {
             ...currentBrowser,
             config: browserConfig,
-            runtime: browserRuntime ?? currentBrowser?.runtime,
+            runtime: browserRuntime,
           }
         : undefined,
       ...(durableAnswerReceipt
@@ -818,7 +849,7 @@ export async function performSessionRun({
         ? {
             category: userError.category,
             message: userError.message,
-            details: userError.details,
+            details: authoritativeErrorDetails,
           }
         : undefined,
     });
@@ -845,6 +876,295 @@ function mergeArtifacts(
   }
   const values = Array.from(merged.values());
   return values.length > 0 ? values : undefined;
+}
+
+type BrowserPromptEpoch = NonNullable<BrowserRuntimeMetadata["promptEpoch"]>;
+
+/**
+ * Runtime hints are durable chronological observations. Error runtimes are snapshots captured
+ * before the error escaped, so they may only replace the latest hint when they carry strictly
+ * newer prompt or exact recovery authority. A terminal observation may explicitly clear the
+ * settled generation. This keeps cleanup removal terminal for that generation without preventing
+ * a later target/transaction generation from recovering.
+ */
+class MonotonicBrowserRuntimeAuthority {
+  private current: BrowserRuntimeMetadata | undefined;
+  private readonly settledAuthorities = new Map<string, Set<string>>();
+  private errorSupersededByTerminalCleanup = false;
+
+  constructor(initial: BrowserRuntimeMetadata | undefined) {
+    this.current = initial;
+  }
+
+  observeHint(next: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
+    return this.observe(next, "hint");
+  }
+
+  observeError(next: BrowserRuntimeMetadata | undefined): BrowserRuntimeMetadata | undefined {
+    this.errorSupersededByTerminalCleanup = false;
+    return next ? this.observe(next, "error") : this.current;
+  }
+
+  observeTerminal(next: BrowserRuntimeMetadata | undefined): BrowserRuntimeMetadata | undefined {
+    this.errorSupersededByTerminalCleanup = false;
+    return next ? this.observe(next, "terminal") : this.current;
+  }
+
+  didTerminalCleanupSupersedeError(): boolean {
+    return this.errorSupersededByTerminalCleanup;
+  }
+
+  private observe(
+    next: BrowserRuntimeMetadata,
+    source: "hint" | "error" | "terminal",
+  ): BrowserRuntimeMetadata {
+    const current = this.current;
+    if (!current) {
+      this.current = next;
+      return next;
+    }
+
+    const relation = comparePromptEpochs(current.promptEpoch, next.promptEpoch);
+    if (relation === "older" || relation === "conflict") return current;
+    if (relation === "newer") {
+      this.current = next;
+      return next;
+    }
+
+    const promptMerged = mergeCommittedPromptAuthority(current, next);
+    if (!promptMerged) return current;
+    const epochKey = promptEpochKey(promptMerged.promptEpoch ?? current.promptEpoch);
+    const currentHasCleanup = hasCleanupAuthority(current);
+    const nextHasCleanup = hasCleanupAuthority(promptMerged);
+
+    if (epochKey && currentHasCleanup && !nextHasCleanup && source !== "error") {
+      const settled = this.settledAuthorities.get(epochKey) ?? new Set<string>();
+      for (const authority of recoveryAuthorityKeys(current)) settled.add(authority);
+      this.settledAuthorities.set(epochKey, settled);
+      this.current = promptMerged;
+      return promptMerged;
+    }
+
+    const settled = epochKey ? this.settledAuthorities.get(epochKey) : undefined;
+    if (settled?.size && nextHasCleanup && !hasNewRecoveryAuthority(promptMerged, settled)) {
+      if (source === "error") this.errorSupersededByTerminalCleanup = true;
+      const retained = mergeWithoutCleanupRegression(current, promptMerged);
+      this.current = retained;
+      return retained;
+    }
+
+    if (source !== "error") {
+      this.current = promptMerged;
+      return promptMerged;
+    }
+
+    const selected = selectErrorRuntime(current, promptMerged);
+    this.current = selected;
+    return selected;
+  }
+}
+
+function comparePromptEpochs(
+  current: BrowserPromptEpoch | undefined,
+  candidate: BrowserPromptEpoch | undefined,
+): "same" | "newer" | "older" | "conflict" {
+  if (!current || !candidate) return "same";
+  if (candidate.followUpOrdinal !== current.followUpOrdinal) {
+    return candidate.followUpOrdinal > current.followUpOrdinal ? "newer" : "older";
+  }
+  if (promptEpochKey(current) !== promptEpochKey(candidate)) return "conflict";
+  if (
+    current.status === "committed" &&
+    candidate.status === "committed" &&
+    committedPromptIdentity(current) !== committedPromptIdentity(candidate)
+  ) {
+    return "conflict";
+  }
+  return "same";
+}
+
+function promptEpochKey(epoch: BrowserPromptEpoch | undefined): string | undefined {
+  if (!epoch) return undefined;
+  return JSON.stringify([epoch.epochId, epoch.promptSha256, epoch.followUpOrdinal]);
+}
+
+function committedPromptIdentity(
+  epoch: Extract<BrowserPromptEpoch, { status: "committed" }>,
+): string {
+  return JSON.stringify([
+    epoch.epochId,
+    epoch.promptSha256,
+    epoch.followUpOrdinal,
+    epoch.conversationId,
+    epoch.verifiedUserTurnIndex,
+    epoch.verifiedUserTurnId,
+    epoch.verifiedUserMessageId,
+  ]);
+}
+
+function mergeCommittedPromptAuthority(
+  current: BrowserRuntimeMetadata,
+  candidate: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata | null {
+  const currentEpoch = current.promptEpoch;
+  const candidateEpoch = candidate.promptEpoch;
+  if (candidateEpoch?.status === "committed") {
+    if (
+      candidate.conversationId !== undefined &&
+      candidate.conversationId !== candidateEpoch.conversationId
+    ) {
+      return null;
+    }
+    return {
+      ...candidate,
+      conversationId: candidate.conversationId ?? candidateEpoch.conversationId,
+    };
+  }
+  if (currentEpoch?.status !== "committed") return candidate;
+  return {
+    ...candidate,
+    promptEpoch: currentEpoch,
+    conversationId: current.conversationId ?? currentEpoch.conversationId,
+    ...(candidate.tabUrl === undefined && current.tabUrl !== undefined
+      ? { tabUrl: current.tabUrl }
+      : {}),
+  };
+}
+
+function hasCleanupAuthority(runtime: BrowserRuntimeMetadata): boolean {
+  return Boolean(runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult);
+}
+
+function cleanupRank(runtime: BrowserRuntimeMetadata): number {
+  return runtime.recoveryCleanupResult?.status === "failed"
+    ? 2
+    : hasCleanupAuthority(runtime)
+      ? 1
+      : 0;
+}
+
+function selectErrorRuntime(
+  current: BrowserRuntimeMetadata,
+  candidate: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  const currentAuthorities = new Set(recoveryAuthorityKeys(current));
+  const candidateAuthorities = recoveryAuthorityKeys(candidate);
+  const hasNewAuthority = candidateAuthorities.some(
+    (authority) => !currentAuthorities.has(authority),
+  );
+  if (hasNewAuthority && hasCoherentBrowserRecoveryAuthority(candidate)) return candidate;
+
+  const currentRank = cleanupRank(current);
+  const candidateRank = cleanupRank(candidate);
+  if (candidateRank > currentRank) return candidate;
+  if (candidateRank < currentRank) return mergeWithoutCleanupRegression(current, candidate);
+
+  const currentEpoch = current.promptEpoch;
+  const candidateEpoch = candidate.promptEpoch;
+  if (currentEpoch?.status !== "committed" && candidateEpoch?.status === "committed") {
+    return candidate;
+  }
+  return mergeWithoutCleanupRegression(current, candidate);
+}
+
+function mergeWithoutCleanupRegression(
+  current: BrowserRuntimeMetadata,
+  candidate: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  const merged: BrowserRuntimeMetadata = {
+    ...current,
+    ...(candidate.browserTransport ? { browserTransport: candidate.browserTransport } : {}),
+    ...(candidate.chromePid !== undefined ? { chromePid: candidate.chromePid } : {}),
+    ...(candidate.chromeProcessIdentity
+      ? { chromeProcessIdentity: candidate.chromeProcessIdentity }
+      : {}),
+    ...(candidate.chromePort !== undefined ? { chromePort: candidate.chromePort } : {}),
+    ...(candidate.chromeHost ? { chromeHost: candidate.chromeHost } : {}),
+    ...(candidate.chromeBrowserWSEndpoint
+      ? { chromeBrowserWSEndpoint: candidate.chromeBrowserWSEndpoint }
+      : {}),
+    ...(candidate.chromeProfileRoot ? { chromeProfileRoot: candidate.chromeProfileRoot } : {}),
+    ...(candidate.userDataDir ? { userDataDir: candidate.userDataDir } : {}),
+    ...(candidate.chromeTargetId ? { chromeTargetId: candidate.chromeTargetId } : {}),
+    ...(candidate.tabUrl ? { tabUrl: candidate.tabUrl } : {}),
+    ...(candidate.conversationId ? { conversationId: candidate.conversationId } : {}),
+    ...(candidate.promptEpoch ? { promptEpoch: candidate.promptEpoch } : {}),
+    ...(candidate.controllerPid !== undefined ? { controllerPid: candidate.controllerPid } : {}),
+  };
+  if (current.recoveryCleanupResources) {
+    merged.recoveryCleanupResources = current.recoveryCleanupResources;
+  }
+  if (current.recoveryCleanupResult) {
+    merged.recoveryCleanupResult = current.recoveryCleanupResult;
+  }
+  return merged;
+}
+
+function hasNewRecoveryAuthority(
+  runtime: BrowserRuntimeMetadata,
+  settled: ReadonlySet<string>,
+): boolean {
+  return (
+    hasCoherentBrowserRecoveryAuthority(runtime) &&
+    recoveryAuthorityKeys(runtime).some((authority) => !settled.has(authority))
+  );
+}
+
+function hasCoherentBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata): boolean {
+  if (!hasBrowserRecoveryAuthority(runtime)) return false;
+  const epoch = runtime.promptEpoch;
+  const conversationId =
+    epoch?.status === "committed" ? epoch.conversationId : runtime.conversationId;
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    if (conversationId && resource.conversationId && resource.conversationId !== conversationId) {
+      return false;
+    }
+    if (
+      epoch &&
+      resource.promptEpoch &&
+      comparePromptEpochs(epoch, resource.promptEpoch) !== "same"
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function recoveryAuthorityKeys(runtime: BrowserRuntimeMetadata): string[] {
+  const keys = new Set<string>();
+  addTargetAuthorityKey(keys, runtime.chromeTargetId, runtime.conversationId);
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    addTargetAuthorityKey(
+      keys,
+      resource.chromeTargetId,
+      resource.conversationId ?? runtime.conversationId,
+    );
+    if (resource.remoteRecovery?.transactionToken) {
+      keys.add(`remote:${resource.remoteRecovery.transactionToken}`);
+    }
+    if (resource.acquisition?.generationId) {
+      keys.add(`generation:${resource.acquisition.generationId}`);
+    }
+    if (resource.tabLease?.id) keys.add(`lease:${resource.tabLease.id}`);
+    if (resource.chromeProcessIdentity) {
+      const identity = resource.chromeProcessIdentity;
+      keys.add(
+        `process:${identity.pid}:${identity.processStartTime}:${identity.launchNonce}:${identity.normalizedUserDataDir}`,
+      );
+    } else if (resource.chromePid !== undefined) {
+      keys.add(`pid:${resource.chromePid}:${resource.userDataDir ?? ""}`);
+    }
+  }
+  return [...keys];
+}
+
+function addTargetAuthorityKey(
+  keys: Set<string>,
+  targetId: string | undefined,
+  conversationId: string | undefined,
+): void {
+  if (!targetId?.trim()) return;
+  keys.add(`target:${targetId.trim()}:${conversationId?.trim() ?? ""}`);
 }
 
 function formatError(error: unknown): string {
@@ -1291,6 +1611,7 @@ async function autoReattachUntilComplete({
     "browser-recovery.lock",
   );
   let retryRuntime = runtime;
+  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime);
 
   let attempt = 0;
   for (;;) {
@@ -1320,20 +1641,21 @@ async function autoReattachUntilComplete({
         recoveryLockPath,
         isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
         runtimeHintCb: async (latestRuntime) => {
-          authoritativeRuntime = latestRuntime;
-          retryRuntime = latestRuntime;
+          const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
+          authoritativeRuntime = persistedRuntime;
+          retryRuntime = persistedRuntime;
           await sessionStore.updateSession(sessionMeta.id, {
             browser: {
               ...browserMetadata,
               config: browserConfig,
-              runtime: latestRuntime,
+              runtime: persistedRuntime,
             },
           });
         },
       });
       captureSucceeded = true;
-      authoritativeRuntime = reattachResult.runtime;
-      retryRuntime = reattachResult.runtime;
+      authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
+      retryRuntime = authoritativeRuntime;
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const usage = {
@@ -1384,13 +1706,14 @@ async function autoReattachUntilComplete({
           remotePublicationAcknowledged = true;
         },
         persistRuntime: async (latestRuntime) => {
-          authoritativeRuntime = latestRuntime;
-          retryRuntime = latestRuntime;
+          const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
+          authoritativeRuntime = persistedRuntime;
+          retryRuntime = persistedRuntime;
           await sessionStore.updateSession(sessionMeta.id, {
             browser: {
               ...browserMetadata,
               config: browserConfig,
-              runtime: latestRuntime,
+              runtime: persistedRuntime,
             },
           });
         },
@@ -1449,7 +1772,15 @@ async function autoReattachUntilComplete({
       if (captureSucceeded) {
         const message = formatError(error);
         const userError = asOracleUserError(error);
-        const failureRuntime = runtimeFromBrowserError(error) ?? authoritativeRuntime;
+        const capturedFailureRuntime = runtimeFromBrowserError(error);
+        const failureRuntime =
+          runtimeAuthority.observeError(capturedFailureRuntime) ?? authoritativeRuntime;
+        authoritativeRuntime = failureRuntime;
+        retryRuntime = failureRuntime;
+        const failureDetails =
+          userError?.details && capturedFailureRuntime
+            ? { ...userError.details, runtime: failureRuntime }
+            : userError?.details;
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
@@ -1467,7 +1798,7 @@ async function autoReattachUntilComplete({
             ? {
                 category: userError.category,
                 message: userError.message,
-                details: userError.details,
+                details: failureDetails,
               }
             : { category: "internal", message },
         });
@@ -1479,26 +1810,37 @@ async function autoReattachUntilComplete({
         }
         throw error;
       }
-      const errorRuntime = runtimeFromBrowserError(error);
+      const capturedErrorRuntime = runtimeFromBrowserError(error);
+      const terminalAutoReattachError = isTerminalAutoReattachError(error);
+      const errorRuntime = terminalAutoReattachError
+        ? runtimeAuthority.observeTerminal(capturedErrorRuntime)
+        : runtimeAuthority.observeError(capturedErrorRuntime);
       if (errorRuntime) {
         authoritativeRuntime = errorRuntime;
         retryRuntime = errorRuntime;
       }
+      const cleanupCompletedAfterCapturedError =
+        runtimeAuthority.didTerminalCleanupSupersedeError();
       const message = formatError(error);
       const userError = asOracleUserError(error);
       if (
-        isTerminalAutoReattachError(error) ||
+        terminalAutoReattachError ||
+        cleanupCompletedAfterCapturedError ||
         retryRuntime.recoveryCleanupResult?.settlementMode !== undefined ||
-        (errorRuntime !== undefined && !hasResumableBrowserAuthority(errorRuntime))
+        (capturedErrorRuntime !== undefined && !hasResumableBrowserAuthority(errorRuntime))
       ) {
         const details = userError?.details as { stage?: string } | undefined;
         const incompleteReason =
           details?.stage === "connection-lost" ? "chrome-disconnected" : "incomplete-capture";
+        const terminalDetails =
+          userError?.details && capturedErrorRuntime
+            ? { ...userError.details, runtime: errorRuntime }
+            : userError?.details;
         const terminalError = userError
           ? {
               category: userError.category,
               message: userError.message,
-              details: userError.details,
+              details: terminalDetails,
             }
           : { category: "internal" as const, message };
         await sessionStore.updateSession(sessionMeta.id, {

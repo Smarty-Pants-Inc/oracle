@@ -18,6 +18,7 @@ const {
   retainBrowserTabLeaseTeardownAuthority,
   cleanupStaleProfileState,
   captureProfileDirectoryIdentity,
+  createChromeProcessLaunchClaim,
   verifyProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
   ownerKill,
@@ -45,6 +46,11 @@ const {
     canonicalPath: profileDir,
     device: "1",
     inode: "1",
+  })),
+  createChromeProcessLaunchClaim: vi.fn((generationId: string) => ({
+    version: 1 as const,
+    generationId,
+    nonce: "60000000-0000-4000-8000-000000000006",
   })),
   verifyProfileDirectoryIdentity: vi.fn(async () => true),
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
@@ -78,6 +84,7 @@ vi.mock("../../src/browser/manualChromeOwner.js", () => ({
 vi.mock("../../src/browser/profileState.js", () => ({
   cleanupStaleProfileState,
   captureProfileDirectoryIdentity,
+  createChromeProcessLaunchClaim,
   verifyProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
 }));
@@ -167,6 +174,7 @@ describe("openGeminiBrowserSession", () => {
       settle: teardownSettle,
     }));
     cleanupStaleProfileState.mockClear();
+    createChromeProcessLaunchClaim.mockClear();
     cleanupStaleProfileState.mockResolvedValue(true);
 
     acquireManualChromeOwner.mockResolvedValue({
@@ -227,7 +235,22 @@ describe("openGeminiBrowserSession", () => {
       }),
       expect.any(Function),
       "Gemini Deep Think",
+      {
+        launchClaim: {
+          version: 1,
+          generationId: expect.any(String),
+          nonce: "60000000-0000-4000-8000-000000000006",
+        },
+      },
     );
+    expect(session.runtime().recoveryCleanupResources?.[0]?.acquisition).toMatchObject({
+      processLaunchClaim: {
+        version: 1,
+        generationId: expect.any(String),
+        nonce: "60000000-0000-4000-8000-000000000006",
+      },
+      processOwnerDisposition: "close-on-last-lease",
+    });
     expect(leaseUpdate).toHaveBeenCalledWith({ chromeHost: "127.0.0.1", chromePort: 9222 });
     expect(connectWithNewTab).toHaveBeenCalledWith(
       9222,

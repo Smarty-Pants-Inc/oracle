@@ -233,6 +233,11 @@ async function runTwoTurnResetFailure(transport: Transport) {
   }));
   vi.doMock("../../src/browser/profileState.js", () => ({
     captureProfileDirectoryIdentity,
+    createChromeProcessLaunchClaim: (generationId: string) => ({
+      version: 1 as const,
+      generationId,
+      nonce: "b0000000-0000-4000-8000-00000000000b",
+    }),
     cleanupStaleProfileState: vi.fn().mockResolvedValue(undefined),
     acquireProfileRunLock: vi.fn(),
     isSafeChromeTerminationOutcome: vi.fn(() => true),
@@ -462,7 +467,7 @@ describe("semantic prompt epoch persistence", () => {
           stage: "browser-capture-finalization",
           code: "unpublished-cleanup-pending",
           runtime: {
-            promptEpoch: undefined,
+            promptEpoch: fixture.committedRuntime?.promptEpoch,
           },
         },
       });
@@ -471,7 +476,7 @@ describe("semantic prompt epoch persistence", () => {
           stage: "prompt-epoch-persistence",
           code: "prompt-epoch-persistence-failed",
           runtime: {
-            promptEpoch: undefined,
+            promptEpoch: fixture.committedRuntime?.promptEpoch,
           },
         },
       });
@@ -486,7 +491,10 @@ describe("semantic prompt epoch persistence", () => {
           verifiedUserMessageId: "message-0",
         }),
       );
-      expect(hasRecoverableChatGptConversation(runtime)).toBe(false);
+      expect(hasRecoverableChatGptConversation(runtime)).toBe(true);
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+      expect(fixture.killChrome).not.toHaveBeenCalled();
+      expect(fixture.closeConnection).not.toHaveBeenCalled();
     },
   );
 });

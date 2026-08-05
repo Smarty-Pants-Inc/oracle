@@ -155,6 +155,11 @@ describe("recoverConversationTab lease ownership", () => {
     vi.resetModules();
     vi.doMock("../../src/browser/profileState.js", () => ({
       captureProfileDirectoryIdentity: vi.fn(async () => profileDirectory),
+      createChromeProcessLaunchClaim: (generationId: string) => ({
+        version: 1 as const,
+        generationId,
+        nonce: "a0000000-0000-4000-8000-00000000000a",
+      }),
     }));
   });
 

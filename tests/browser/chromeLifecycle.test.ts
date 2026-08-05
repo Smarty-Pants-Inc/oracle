@@ -4,25 +4,31 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type {
-  ChromeLaunchResult,
-  StableChromeProcessHandle,
-} from "../../src/browser/chromeLifecycle.js";
 import {
-  captureProfileDirectoryIdentity,
-  type ChromeProcessIdentity,
-  type ProfileDirectoryIdentity,
+  closeBlankChromeTabsWithExactAuthority,
+  type ChromeLaunchResult,
+  type StableChromeProcessHandle,
+} from "../../src/browser/chromeLifecycle.js";
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
+import type {
+  ChromeProcessIdentity,
+  ChromeProcessLaunchClaim,
+  ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
-const cdpNewMock = vi.fn();
-const cdpCloseMock = vi.fn();
-const cdpListMock = vi.fn();
-const cdpMock = Object.assign(vi.fn(), {
-  // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
-  New: cdpNewMock,
-  // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
-  Close: cdpCloseMock,
-  // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
-  List: cdpListMock,
+import type { ChromeProcessIdentityInspection } from "../../src/browser/chromeProcessIdentity.js";
+const { cdpMock, cdpNewMock, cdpCloseMock, cdpListMock } = vi.hoisted(() => {
+  const cdpNewMock = vi.fn();
+  const cdpCloseMock = vi.fn();
+  const cdpListMock = vi.fn();
+  const cdpMock = Object.assign(vi.fn(), {
+    // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
+    New: cdpNewMock,
+    // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
+    Close: cdpCloseMock,
+    // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
+    List: cdpListMock,
+  });
+  return { cdpMock, cdpNewMock, cdpCloseMock, cdpListMock };
 });
 
 const resolveLocalChromeLaunchRoute = () => ({
@@ -52,12 +58,17 @@ function executablePathForPlatform(platform: NodeJS.Platform): string {
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "/usr/bin/google-chrome";
 }
+const TEST_LAUNCH_GENERATION_ID = "99999999-9999-4999-8999-999999999999";
+
+function testLaunchClaim(nonce: string): ChromeProcessLaunchClaim {
+  return { version: 1, generationId: TEST_LAUNCH_GENERATION_ID, nonce };
+}
 
 function processIdentity(
   userDataDir: string,
   pid: number,
   launchNonce: string,
-): ChromeProcessIdentity {
+): ChromeProcessIdentity & { launchClaim: ChromeProcessLaunchClaim } {
   const profileDirectory = syntheticProfileIdentity(userDataDir);
   return {
     pid,
@@ -68,6 +79,7 @@ function processIdentity(
         ? profileDirectory.canonicalPath.toLowerCase()
         : profileDirectory.canonicalPath,
     launchNonce,
+    launchClaim: testLaunchClaim(launchNonce),
     profileDirectory,
   };
 }
@@ -146,16 +158,6 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
 
-vi.doMock("../../src/browser/profileState.js", async () => {
-  const original = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
-    "../../src/browser/profileState.js",
-  );
-  return {
-    ...original,
-    cleanupStaleProfileState: vi.fn(async () => true),
-  };
-});
-
 describe("hidden macOS Chrome launch", () => {
   test("retains the exact hidden-launch control authority", async () => {
     const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
@@ -186,12 +188,20 @@ describe("hidden macOS Chrome launch", () => {
         hiddenMacLaunch,
         standardLaunch,
         captureProfileIdentity: async () => profile,
+        launchClaim: identity.launchClaim,
         writeOwner,
       },
     );
 
     expect(hiddenMacLaunch).toHaveBeenCalledWith(
-      expect.objectContaining({ userDataDir: profile.canonicalPath, requestedPort: 9222 }),
+      expect.objectContaining({
+        userDataDir: profile.canonicalPath,
+        requestedPort: 9222,
+        launchClaim: identity.launchClaim,
+        chromeFlags: expect.arrayContaining([
+          `--oracle-launch-claim=${identity.launchClaim.generationId}:${identity.launchClaim.nonce}`,
+        ]),
+      }),
     );
     expect(standardLaunch).not.toHaveBeenCalled();
     expect(writeOwner).toHaveBeenCalledWith(profile.canonicalPath, {
@@ -237,6 +247,7 @@ describe("hidden macOS Chrome launch", () => {
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
         hiddenMacLaunch,
         captureProfileIdentity: async () => profile,
+        launchClaim: identity.launchClaim,
         writeOwner,
       },
     );
@@ -384,7 +395,9 @@ describe("hidden macOS Chrome launch", () => {
     );
     const browserWSEndpoint = "ws://127.0.0.1:64305/devtools/browser/exact-generation";
     const discoverEndpoint = vi.fn(async () => ({ port: 64305, browserWSEndpoint }));
-    const inspectProcessIdentity = vi.fn(async () => "current" as const);
+    const inspectProcessIdentity = vi.fn(
+      async (): Promise<ChromeProcessIdentityInspection> => "current",
+    );
     const resolveListeningPid = vi.fn(async () => identity.pid);
     const mismatchedClientClose = vi.fn(async () => undefined);
     const mismatchedClient = {
@@ -476,6 +489,18 @@ describe("hidden macOS Chrome launch", () => {
     if (process.platform === "darwin") {
       expect(resolveListeningPid).toHaveBeenCalledWith(64305);
     }
+    const exactOperation = vi.fn(async () => "performed");
+    await expect(authority.runExactOperation?.(exactOperation)).resolves.toEqual({
+      status: "completed",
+      value: "performed",
+    });
+    expect(exactOperation).toHaveBeenCalledWith(exactClient);
+    inspectProcessIdentity.mockResolvedValueOnce("exited");
+    const replacementMutation = vi.fn(async () => "must-not-run");
+    await expect(authority.runExactOperation?.(replacementMutation)).resolves.toEqual({
+      status: "gone",
+    });
+    expect(replacementMutation).not.toHaveBeenCalled();
     await expect(authority.release()).rejects.toThrow(/transient endpoint release failure/i);
     await expect(authority.release()).resolves.toBeUndefined();
     await expect(authority.release()).resolves.toBeUndefined();
@@ -521,6 +546,7 @@ describe("stable Chrome process authority", () => {
       release: endpointRelease,
     };
     const retainEndpointAuthority = vi.fn(async () => retainedEndpointAuthority);
+    const captureProcessIdentity = vi.fn(async () => identity);
 
     const launched = await launchChrome(
       { ...resolveBrowserConfig({ debugPort: 9222 }), hideWindow: false },
@@ -530,11 +556,24 @@ describe("stable Chrome process authority", () => {
         standardLaunch: standardLaunch as never,
         resolveLaunchRoute: resolveLocalChromeLaunchRoute,
         captureProfileIdentity: async () => profile,
-        captureProcessIdentity: vi.fn(async () => identity),
+        launchClaim: identity.launchClaim,
+        captureProcessIdentity,
         inspectProcessIdentity: vi.fn(async () => "current" as const),
         retainEndpointAuthority,
         writeOwner: vi.fn(async () => undefined),
       },
+    );
+    expect(standardLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chromeFlags: expect.arrayContaining([
+          `--oracle-launch-claim=${identity.launchClaim.generationId}:${identity.launchClaim.nonce}`,
+        ]),
+      }),
+    );
+    expect(captureProcessIdentity).toHaveBeenCalledWith(
+      profile.canonicalPath,
+      identity.pid,
+      identity.launchClaim,
     );
 
     await expect(launched.kill()).resolves.toMatchObject({
@@ -605,6 +644,7 @@ describe("stable Chrome process authority", () => {
           standardLaunch: standardLaunch as never,
           resolveLaunchRoute: resolveLocalChromeLaunchRoute,
           captureProfileIdentity: async () => profile,
+          launchClaim: identity.launchClaim,
           captureProcessIdentity: vi.fn(async () => identity),
           inspectProcessIdentity: vi.fn(async () => "current" as const),
           retainEndpointAuthority,
@@ -957,14 +997,14 @@ describe("registerTerminationHooks", { timeout: 15_000 }, () => {
 
   test("clears stale hints with the exact physical profile identity", async () => {
     const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
-    const profileState = await import("../../src/browser/profileState.js");
-    const cleanupMock = vi.mocked(profileState.cleanupStaleProfileState);
     const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-manual-login-profile-"));
     const identity = await physicalProcessIdentity(
       userDataDir,
       1236,
       "88888888-8888-4888-8888-888888888888",
     );
+    const devToolsActivePort = path.join(userDataDir, "DevToolsActivePort");
+    await writeFile(devToolsActivePort, "9222\n/devtools/browser/stale\n");
     const kill = vi.fn(async () => ({
       status: "stopped" as const,
       pid: 1236,
@@ -980,10 +1020,7 @@ describe("registerTerminationHooks", { timeout: 15_000 }, () => {
     try {
       process.emit("SIGINT");
       await handled.promise;
-      expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, {
-        lockRemovalMode: "never",
-        expectedProfileIdentity: identity.profileDirectory,
-      });
+      expect(existsSync(devToolsActivePort)).toBe(false);
     } finally {
       removeHooks();
       await rm(userDataDir, { recursive: true, force: true });
@@ -1206,6 +1243,43 @@ describe("closeBlankChromeTabs", () => {
       id: "newtab-1",
     });
     expect(logger).toHaveBeenCalledWith("Closed 2 blank Chrome tabs.");
+  });
+
+  test("does not close replacement blank tabs after the exact generation exits", async () => {
+    const exactClient = {
+      Target: {
+        getTargets: vi.fn(async () => ({
+          targetInfos: [
+            { targetId: "blank-a", type: "page", url: "about:blank" },
+            { targetId: "blank-b", type: "page", url: "about:blank" },
+          ],
+        })),
+        closeTarget: vi.fn(async () => ({ success: true })),
+      },
+    };
+    const runExactOperation = vi
+      .fn()
+      .mockImplementationOnce(async (operation) => ({
+        status: "completed",
+        value: await operation(exactClient),
+      }))
+      .mockResolvedValueOnce({ status: "gone" });
+    const authority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/exact-old-generation",
+      kill: vi.fn(),
+      runExactOperation,
+      release: vi.fn(),
+    };
+
+    await expect(
+      closeBlankChromeTabsWithExactAuthority(
+        authority as never,
+        vi.fn<(message: string) => void>(),
+        { preserveOneBlank: true },
+      ),
+    ).resolves.toEqual({ status: "gone" });
+    expect(runExactOperation).toHaveBeenCalledTimes(2);
+    expect(exactClient.Target.closeTarget).not.toHaveBeenCalled();
   });
 
   test("preserves the same blank target across concurrent cleanup", async () => {

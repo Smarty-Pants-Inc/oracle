@@ -11,7 +11,12 @@ import type {
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
-import type { ChromeProcessIdentity, ProfileDirectoryIdentity } from "./browser/profileState.js";
+import type {
+  ChromeOwnerDisposition,
+  ChromeProcessIdentity,
+  ChromeProcessLaunchClaim,
+  ProfileDirectoryIdentity,
+} from "./browser/profileState.js";
 import type {
   TransportFailureReason,
   ApiProviderMode,
@@ -130,6 +135,10 @@ export interface BrowserRecoveryAcquisitionMetadata {
   pendingResource?: "tab-lease" | "chrome-process" | "chrome-target";
   /** The authority plane expected to record an exact owner after Chrome acquisition. */
   processOwnerProvenance?: BrowserProcessAcquisitionProvenance;
+  /** Durable pre-effect claim that must be observable on any Chrome launched for this generation. */
+  processLaunchClaim?: ChromeProcessLaunchClaim;
+  /** Owner disposition to publish if recovery promotes the launch claim after controller loss. */
+  processOwnerDisposition?: ChromeOwnerDisposition;
   /** Unique initial URL used to rediscover a target created inside a crash window. */
   targetMarkerUrl?: string;
 }

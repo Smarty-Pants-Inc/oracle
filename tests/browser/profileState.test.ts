@@ -250,6 +250,11 @@ describe("profileState", () => {
 
   test("captures a macOS Chrome generation from its audit token and physical text vnode", async () => {
     const userDataDir = "/tmp/oracle-mac-profile";
+    const launchClaim = {
+      version: 1 as const,
+      generationId: "40000000-0000-4000-8000-000000000004",
+      nonce: "50000000-0000-4000-8000-000000000005",
+    };
     const profileDirectory = {
       version: 1 as const,
       platform: "darwin" as const,
@@ -271,7 +276,7 @@ describe("profileState", () => {
       }
       if (file === "ps" && args.at(-1) === "command=") {
         return {
-          stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir}\n`,
+          stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir} --oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}\n`,
         };
       }
       throw new Error(`Unexpected process query: ${file} ${args.join(" ")}`);
@@ -282,12 +287,15 @@ describe("profileState", () => {
         platform: "darwin",
         execute,
         captureProfileIdentity: async () => profileDirectory,
+        launchClaim,
       }),
     ).resolves.toMatchObject({
       pid: 4321,
       processStartTime: "darwin-audit-pidversion:7001",
       executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       normalizedUserDataDir: userDataDir,
+      launchNonce: launchClaim.nonce,
+      launchClaim,
     });
     expect(execute).toHaveBeenCalledWith(
       "/usr/sbin/lsof",
@@ -894,5 +902,65 @@ describe("profileState", () => {
     expect(
       profileState.findChromeDebugTargetForProfileFromProcessListForTest(processList, dir, 64305),
     ).toEqual({ pid: 456, port: 64305 });
+  });
+
+  test("classifies an exact launch claim before DevTools is ready without adopting profile conflicts", () => {
+    const dir = "/Users/example/.oracle/browser-profile";
+    const claim = {
+      version: 1 as const,
+      generationId: "10000000-0000-4000-8000-000000000001",
+      nonce: "20000000-0000-4000-8000-000000000002",
+    };
+    const processList = `
+      455 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer --user-data-dir=${dir}
+      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --user-data-dir=${dir} --oracle-launch-claim=${claim.generationId}:${claim.nonce}
+      457 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=${dir} --oracle-launch-claim=${claim.generationId}:30000000-0000-4000-8000-000000000003
+      789 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/other
+    `;
+
+    expect(
+      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+        processList,
+        dir,
+        claim,
+      ),
+    ).toEqual({
+      exactMatches: [{ pid: 456, port: null }],
+      conflictingProfilePids: [457],
+    });
+    expect(
+      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+        processList,
+        dir,
+        claim,
+        64_305,
+      ).exactMatches,
+    ).toEqual([{ pid: 456, port: 64_305 }]);
+  });
+
+  test("classifies a quoted Windows launch claim without adopting an unclaimed profile process", () => {
+    const dir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
+    const claim = {
+      version: 1 as const,
+      generationId: "30000000-0000-4000-8000-000000000003",
+      nonce: "40000000-0000-4000-8000-000000000004",
+    };
+    const processList = String.raw`
+      567 "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=0 --user-data-dir="${dir}" --oracle-launch-claim=${claim.generationId}:${claim.nonce}
+      568 "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="${dir}"
+    `;
+
+    expect(
+      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+        processList,
+        dir,
+        claim,
+        61_234,
+        "win32",
+      ),
+    ).toEqual({
+      exactMatches: [{ pid: 567, port: 61_234 }],
+      conflictingProfilePids: [568],
+    });
   });
 });

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { Mock } from "vitest";
+import type * as ProfileStateModule from "../../src/browser/profileState.js";
 import type {
   BrowserRecoveryCleanupMetadata,
   BrowserRuntimeMetadata,
@@ -10,7 +11,11 @@ import type {
 import {
   captureProfileDirectoryIdentity,
   readOracleChromeOwner,
-  type ChromeProcessIdentity,
+} from "../../src/browser/profileState.js";
+import type {
+  ChromeProcessIdentity,
+  ChromeProcessLaunchClaim,
+  OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
@@ -24,11 +29,17 @@ type DisconnectFixtureOptions = {
   copiedProfile?: boolean;
   semanticProbeSucceeds?: boolean;
   runtimePersistenceFailsAfterCommit?: boolean;
+  disconnectDuringFinalArchive?: boolean;
+  ownerPublicationFailsAfterCapture?: boolean;
+  targetExitsDuringFinalArchive?: boolean;
+  finalIdentityChangesAfterArchive?: boolean;
 };
 
 type RemoteDisconnectFixtureOptions = {
   disconnectDuringSubmission?: boolean;
+  disconnectDuringFinalArchive?: boolean;
   runtimePersistenceFailsAfterCommit?: boolean;
+  targetExitsDuringFinalArchive?: boolean;
 };
 
 async function captureUnhandledRejections<T>(
@@ -52,7 +63,8 @@ const targetId = "recoverable-target";
 const conversationUrl = `https://chatgpt.com/c/${targetId}`;
 async function chromeProcessIdentity(
   userDataDir: string,
-  pid = 1234,
+  pid: number,
+  launchClaim: ChromeProcessLaunchClaim,
 ): Promise<ChromeProcessIdentity> {
   const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
   return {
@@ -68,7 +80,8 @@ async function chromeProcessIdentity(
       profileDirectory.platform === "win32"
         ? profileDirectory.canonicalPath.toLowerCase()
         : profileDirectory.canonicalPath,
-    launchNonce: "33333333-3333-4333-8333-333333333333",
+    launchNonce: launchClaim.nonce,
+    launchClaim,
     profileDirectory,
   };
 }
@@ -109,7 +122,6 @@ async function withRemoteLateDisconnectFixture(
     closeRemoteConnection: Mock;
     closeChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
-    runtimePersistenceError: Error;
     runtimeHints: BrowserRuntimeMetadata[];
     unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
@@ -127,8 +139,8 @@ async function withRemoteLateDisconnectFixture(
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
-    targetFound: true,
-    matchedUrl: conversationUrl,
+    targetFound: !options.targetExitsDuringFinalArchive,
+    matchedUrl: options.targetExitsDuringFinalArchive ? undefined : conversationUrl,
   });
   const client = createClient({
     onDisconnect: (handler) => {
@@ -144,7 +156,9 @@ async function withRemoteLateDisconnectFixture(
   });
   const archiveChatGptConversation = vi.fn(async () => {
     // The archive await is the last await before the completion atomicity check.
-    if (!options.disconnectDuringSubmission) disconnectHandler?.();
+    if (!options.disconnectDuringSubmission && options.disconnectDuringFinalArchive !== false) {
+      disconnectHandler?.();
+    }
     await Promise.resolve();
     return { mode: "always", attempted: true, archived: true, conversationUrl };
   });
@@ -316,7 +330,6 @@ async function withRemoteLateDisconnectFixture(
       connectToRemoteChromeTarget,
       providerObservedDispatchStart,
       committedTurnVerified,
-      runtimePersistenceError,
       runtimeHints,
       unhandledRejections,
     });
@@ -346,26 +359,68 @@ async function withDisconnectFixture(
     connectToRemoteChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
     verifyPromptCommitted: Mock;
+    verifyCommittedPromptTurn: Mock;
+    archiveChatGptConversation: Mock;
+    writeOracleChromeOwner: Mock;
     profileDir: string;
     processIdentity: ChromeProcessIdentity;
-    runtimePersistenceError: Error;
     runtimeHints: BrowserRuntimeMetadata[];
     unhandledRejections: unknown[];
     providerObservedDispatchStart: boolean;
+    committedTurnVerified: boolean;
   }) => Promise<void> | void,
 ): Promise<void> {
   let disconnectHandler: (() => void) | undefined;
   let profileDir = "";
   let processIdentity: ChromeProcessIdentity | null = null;
   let providerObservedDispatchStart = false;
+  let committedTurnVerified = false;
+  let assistantResponseAvailable = false;
+  let finalArchiveCompleted = false;
+  const ownerPublicationError = new Error("local Chrome owner publication unavailable");
+  const writeOracleChromeOwner = vi.fn();
+  const archiveChatGptConversation = vi.fn(async () => {
+    if (options.disconnectDuringFinalArchive) disconnectHandler?.();
+    await Promise.resolve();
+    finalArchiveCompleted = true;
+    return { mode: "always", attempted: true, archived: true, conversationUrl };
+  });
+  const verifyCommittedPromptTurn = vi.fn(async () => {
+    if (options.finalIdentityChangesAfterArchive && finalArchiveCompleted) {
+      throw new Error("committed turn identity changed after archive");
+    }
+    if (!providerObservedDispatchStart) {
+      throw new Error("Committed-turn verification preceded provider dispatch");
+    }
+    committedTurnVerified = true;
+  });
   const runtimePersistenceError = new Error("local runtime persistence unavailable");
   const runtimeHints: BrowserRuntimeMetadata[] = [];
   const closeChromeTarget = vi.fn().mockResolvedValue(true);
   const kill = vi.fn().mockResolvedValue({ status: "stopped", pid: 1234, signal: "SIGTERM" });
+  const closeChromeTargetWithExactAuthority = vi.fn(
+    async ({
+      targetId: exactTargetId,
+      logger,
+    }: {
+      targetId: string;
+      logger: (message: string) => void;
+    }) => {
+      const closed = await closeChromeTarget({
+        port: 9230,
+        targetId: exactTargetId,
+        host: "127.0.0.1",
+        logger,
+      });
+      return closed
+        ? ({ status: "completed" } as const)
+        : ({ status: "unsafe", reason: "target close was not confirmed" } as const);
+    },
+  );
   const probeChromeTargetLiveness = vi.fn().mockResolvedValue({
     endpointReachable: true,
-    targetFound: true,
-    matchedUrl: conversationUrl,
+    targetFound: !options.targetExitsDuringFinalArchive,
+    matchedUrl: options.targetExitsDuringFinalArchive ? undefined : conversationUrl,
   });
   const verifyPromptCommitted = vi.fn().mockImplementation(async () => {
     if (options.semanticProbeSucceeds === false) {
@@ -394,22 +449,49 @@ async function withDisconnectFixture(
   });
 
   vi.resetModules();
+  vi.doMock("../../src/browser/profileState.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof ProfileStateModule>();
+    writeOracleChromeOwner.mockImplementation(
+      async (userDataDir: string, owner: OracleChromeOwnerRecord) => {
+        if (options.ownerPublicationFailsAfterCapture) throw ownerPublicationError;
+        await actual.writeOracleChromeOwner(userDataDir, owner);
+      },
+    );
+    return { ...actual, writeOracleChromeOwner };
+  });
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-    launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => {
-      profileDir = userDataDir;
-      processIdentity = await chromeProcessIdentity(userDataDir);
-      return {
-        pid: 1234,
-        port: 9230,
-        process: { unref: vi.fn() },
-        kill,
-        processIdentity,
-      };
-    }),
+    launchChrome: vi.fn(
+      async (
+        _config: unknown,
+        userDataDir: string,
+        _logger: (message: string) => void,
+        deps?: { launchClaim?: ChromeProcessLaunchClaim },
+      ) => {
+        profileDir = userDataDir;
+        const launchClaim = deps?.launchClaim;
+        if (!launchClaim) throw new Error("launch claim was not supplied");
+        processIdentity = await chromeProcessIdentity(userDataDir, 1234, launchClaim);
+        return {
+          pid: 1234,
+          port: 9230,
+          process: { unref: vi.fn() },
+          remoteDebuggingPipes: null,
+          kill,
+          processIdentity,
+          endpointAuthority: {
+            browserWSEndpoint: "ws://127.0.0.1:9230/devtools/browser/disconnect-fixture",
+            kill,
+            release: vi.fn().mockResolvedValue(undefined),
+          },
+        };
+      },
+    ),
     registerTerminationHooks: vi.fn(() => vi.fn()),
     connectWithNewTab: vi.fn().mockResolvedValue({ client: primaryClient, targetId }),
     connectToRemoteChromeTarget,
     closeChromeTarget,
+    closeChromeTargetWithExactAuthority,
+    closeBlankChromeTabsWithExactAuthority: vi.fn().mockResolvedValue({ status: "completed" }),
     closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
   vi.doMock("../../src/browser/profileCopy.js", () => ({
@@ -426,12 +508,28 @@ async function withDisconnectFixture(
     ensureChatMode: vi.fn().mockResolvedValue("unchanged"),
     installJavaScriptDialogAutoDismissal: vi.fn(() => vi.fn()),
     clearPromptComposer: vi.fn().mockResolvedValue(undefined),
+    verifyCommittedPromptTurn,
     verifyPromptCommitted,
-    readAssistantSnapshot: vi.fn().mockResolvedValue(null),
+    readAssistantSnapshot: vi.fn(async () =>
+      assistantResponseAvailable
+        ? {
+            text: "completed answer",
+            html: "<p>completed answer</p>",
+            turnIndex: 1,
+            turnId: "assistant-turn-1",
+            messageId: "assistant-message-1",
+          }
+        : null,
+    ),
+    waitForAssistantResponse: vi.fn(async () => {
+      assistantResponseAvailable = true;
+      return { text: "completed answer", meta: {} };
+    }),
+    captureAssistantMarkdown: vi.fn().mockResolvedValue("completed answer"),
   }));
   vi.doMock("../../src/browser/conversationUrlMonitor.js", () => ({
     createConversationUrlMonitor: vi.fn(() => ({
-      update: vi.fn(),
+      update: vi.fn().mockResolvedValue(true),
       schedule: vi.fn(),
       stop: vi.fn().mockResolvedValue(undefined),
     })),
@@ -447,11 +545,57 @@ async function withDisconnectFixture(
   vi.doMock("../../src/browser/providerDomFlow.js", () => ({
     runProviderSubmissionFlow: vi.fn(() => {
       providerObservedDispatchStart = true;
+      if (options.disconnectDuringFinalArchive || options.finalIdentityChangesAfterArchive) {
+        return Promise.resolve({
+          status: "committed" as const,
+          verification: {
+            committedTurns: 1,
+            promptSha256: promptIdentitySha256("keep this submitted conversation"),
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+            conversationId: targetId,
+          },
+        });
+      }
       disconnectHandler?.();
       // Keep the provider dispatch in flight so the fixture can only advance through the
       // disconnect listener's fresh semantic assessment, never an event-loop timing race.
       return new Promise<never>(() => undefined);
     }),
+  }));
+  vi.doMock("../../src/browser/chatgptImages.js", () => ({
+    collectGeneratedImageArtifacts: vi.fn().mockResolvedValue({
+      answerText: "",
+      markdownSuffix: "",
+      generatedImages: [],
+      savedImages: [],
+      imageCount: 0,
+    }),
+  }));
+  vi.doMock("../../src/browser/chatgptFiles.js", () => ({
+    collectChatGptFileArtifacts: vi.fn().mockResolvedValue({
+      files: [],
+      savedFiles: [],
+      fileCount: 0,
+    }),
+  }));
+  vi.doMock("../../src/browser/artifacts.js", () => ({
+    appendArtifacts: vi.fn((_current: unknown, artifacts: unknown[]) => artifacts.filter(Boolean)),
+    saveBrowserTranscriptArtifact: vi.fn().mockResolvedValue({
+      path: path.join(os.tmpdir(), "transcript.md"),
+    }),
+  }));
+  vi.doMock("../../src/browser/actions/archiveConversation.js", () => ({
+    resolveBrowserArchiveDecision: vi.fn(() => ({
+      shouldArchive: true,
+      mode: "always",
+      reason: "requested",
+    })),
+    archiveChatGptConversation,
+  }));
+  vi.doMock("../../src/browser/actions/thinkingStatus.js", () => ({
+    startThinkingStatusMonitor: vi.fn(() => vi.fn()),
   }));
 
   try {
@@ -470,6 +614,10 @@ async function withDisconnectFixture(
           manualLogin: false,
           headless: true,
           modelStrategy: "ignore",
+          archiveConversations:
+            options.disconnectDuringFinalArchive || options.finalIdentityChangesAfterArchive
+              ? "always"
+              : "never",
           ...(options.copiedProfile
             ? { copyProfileSource: path.join(os.tmpdir(), "source-profile") }
             : {}),
@@ -497,24 +645,33 @@ async function withDisconnectFixture(
       connectToRemoteChromeTarget,
       probeChromeTargetLiveness,
       verifyPromptCommitted,
+      verifyCommittedPromptTurn,
+      archiveChatGptConversation,
+      writeOracleChromeOwner,
       profileDir,
       processIdentity,
-      runtimePersistenceError,
       runtimeHints,
       unhandledRejections,
       providerObservedDispatchStart,
+      committedTurnVerified,
     });
   } finally {
     if (profileDir) {
       await rm(profileDir, { recursive: true, force: true });
     }
     vi.doUnmock("../../src/browser/chromeLifecycle.js");
+    vi.doUnmock("../../src/browser/profileState.js");
     vi.doUnmock("../../src/browser/profileCopy.js");
     vi.doUnmock("../../src/browser/cookies.js");
     vi.doUnmock("../../src/browser/pageActions.js");
     vi.doUnmock("../../src/browser/conversationUrlMonitor.js");
     vi.doUnmock("../../src/browser/cdpLiveness.js");
     vi.doUnmock("../../src/browser/providerDomFlow.js");
+    vi.doUnmock("../../src/browser/chatgptImages.js");
+    vi.doUnmock("../../src/browser/chatgptFiles.js");
+    vi.doUnmock("../../src/browser/artifacts.js");
+    vi.doUnmock("../../src/browser/actions/archiveConversation.js");
+    vi.doUnmock("../../src/browser/actions/thinkingStatus.js");
     vi.resetModules();
   }
 }
@@ -598,14 +755,12 @@ describe("recoverable disconnect lifecycle", () => {
 
   test("publishes exact local recovery when committed authority persistence rejects", async () => {
     await withDisconnectFixture({ runtimePersistenceFailsAfterCommit: true }, async (fixture) => {
-      const persistenceFailure = (fixture.error as Error & { cause?: unknown }).cause;
       expect(fixture.providerObservedDispatchStart).toBe(true);
       expect(fixture.verifyPromptCommitted).toHaveBeenCalledTimes(1);
       expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
       expect(fixture.error).toMatchObject({
         details: {
           stage: "connection-lost",
-          code: "disconnect-assessment-failed",
           recoverableDisconnect: true,
           disconnectCause: "cdp-client-disconnect",
           runtime: {
@@ -639,22 +794,6 @@ describe("recoverable disconnect lifecycle", () => {
           },
         },
       });
-      expect(persistenceFailure).toMatchObject({
-        details: {
-          stage: "prompt-epoch-persistence",
-          code: "prompt-epoch-persistence-failed",
-          runtime: {
-            promptEpoch: expect.objectContaining({
-              status: "committed",
-              verifiedUserTurnId: "turn-1",
-              verifiedUserMessageId: "message-1",
-            }),
-          },
-        },
-      });
-      expect((persistenceFailure as Error & { cause?: unknown }).cause).toBe(
-        fixture.runtimePersistenceError,
-      );
       expect(
         fixture.runtimeHints.some((runtime) => runtime.promptEpoch?.status === "committed"),
       ).toBe(true);
@@ -668,6 +807,91 @@ describe("recoverable disconnect lifecycle", () => {
         disposition: "close-on-last-lease",
       });
     });
+  }, 30_000);
+
+  test("preserves a captured local answer when final target liveness and owner publication fail", async () => {
+    await withDisconnectFixture(
+      {
+        disconnectDuringFinalArchive: true,
+        ownerPublicationFailsAfterCapture: true,
+        targetExitsDuringFinalArchive: true,
+      },
+      async (fixture) => {
+        expect(fixture.providerObservedDispatchStart).toBe(true);
+        expect(fixture.committedTurnVerified).toBe(true);
+        expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+        expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
+        expect(await fixture.probeChromeTargetLiveness.mock.results[0]?.value).toMatchObject({
+          endpointReachable: true,
+          targetFound: false,
+        });
+        expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          answerText: "completed answer",
+          answerMarkdown: "completed answer",
+          archive: {
+            attempted: true,
+            archived: true,
+            conversationUrl,
+          },
+          promptEpoch: expect.objectContaining({
+            status: "committed",
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+            conversationId: targetId,
+          }),
+          warnings: expect.arrayContaining([
+            expect.objectContaining({ code: "browser-final-target-liveness-pending" }),
+            expect.objectContaining({ code: "browser-owner-publication-pending" }),
+          ]),
+          runtime: expect.objectContaining({
+            promptEpoch: expect.objectContaining({
+              status: "committed",
+              verifiedUserTurnId: "turn-0",
+              verifiedUserMessageId: "message-0",
+            }),
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromePid: 1234,
+                chromeProcessIdentity: fixture.processIdentity,
+                recoveryCleanup: expect.objectContaining({ ownsTarget: false }),
+              }),
+            ],
+          }),
+        });
+        if (
+          !fixture.error ||
+          typeof fixture.error !== "object" ||
+          !("runtime" in fixture.error) ||
+          !fixture.error.runtime ||
+          typeof fixture.error.runtime !== "object"
+        ) {
+          throw new Error("Captured answer did not expose projected local runtime metadata");
+        }
+        const projectedRuntime = fixture.error.runtime;
+        expect(Reflect.get(projectedRuntime, "chromeTargetId")).toBeUndefined();
+        const cleanupResources = Reflect.get(projectedRuntime, "recoveryCleanupResources");
+        if (
+          !Array.isArray(cleanupResources) ||
+          !cleanupResources[0] ||
+          typeof cleanupResources[0] !== "object"
+        ) {
+          throw new Error("Projected local runtime did not retain process cleanup authority");
+        }
+        expect(Reflect.get(cleanupResources[0], "chromeTargetId")).toBeUndefined();
+        expect(fixture.writeOracleChromeOwner).toHaveBeenCalledWith(fixture.profileDir, {
+          port: 9230,
+          processIdentity: fixture.processIdentity,
+          disposition: "close-on-last-lease",
+        });
+        expect(fixture.unhandledRejections).toEqual([]);
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+        expect(fixture.kill).not.toHaveBeenCalled();
+        await expect(access(fixture.profileDir)).resolves.toBeUndefined();
+        await expect(readOracleChromeOwner(fixture.profileDir)).resolves.toBeNull();
+      },
+    );
   }, 30_000);
 
   test("cleans an owned copied profile instead of retaining an otherwise recoverable disconnect", async () => {
@@ -689,6 +913,22 @@ describe("recoverable disconnect lifecycle", () => {
           host: "127.0.0.1",
         }),
       );
+      expect(fixture.kill).toHaveBeenCalledTimes(1);
+      await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  }, 30_000);
+
+  test("does not publish an answer after final committed-turn identity is lost", async () => {
+    await withDisconnectFixture({ finalIdentityChangesAfterArchive: true }, async (fixture) => {
+      expect(fixture.providerObservedDispatchStart).toBe(true);
+      expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalled();
+      expect(fixture.committedTurnVerified).toBe(true);
+      expect(fixture.archiveChatGptConversation).toHaveBeenCalled();
+      expect(fixture.error).toMatchObject({
+        message: "committed turn identity changed after archive",
+      });
+      expect(fixture.error).not.toHaveProperty("answerText");
+      expect(fixture.closeChromeTarget).toHaveBeenCalledWith(expect.objectContaining({ targetId }));
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
@@ -733,7 +973,6 @@ describe("recoverable disconnect lifecycle", () => {
     await withRemoteLateDisconnectFixture(
       "created",
       async (fixture) => {
-        const persistenceFailure = (fixture.error as Error & { cause?: unknown }).cause;
         expect(fixture.providerObservedDispatchStart).toBe(true);
         expect(fixture.archiveChatGptConversation).not.toHaveBeenCalled();
         expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
@@ -754,7 +993,6 @@ describe("recoverable disconnect lifecycle", () => {
         expect(fixture.error).toMatchObject({
           details: {
             stage: "connection-lost",
-            code: "disconnect-assessment-failed",
             recoverableDisconnect: true,
             disconnectCause: "cdp-client-disconnect",
             runtime: {
@@ -793,22 +1031,6 @@ describe("recoverable disconnect lifecycle", () => {
             },
           },
         });
-        expect(persistenceFailure).toMatchObject({
-          details: {
-            stage: "prompt-epoch-persistence",
-            code: "prompt-epoch-persistence-failed",
-            runtime: {
-              promptEpoch: expect.objectContaining({
-                status: "committed",
-                verifiedUserTurnId: "turn-0",
-                verifiedUserMessageId: "message-0",
-              }),
-            },
-          },
-        });
-        expect((persistenceFailure as Error & { cause?: unknown }).cause).toBe(
-          fixture.runtimePersistenceError,
-        );
         expect(
           fixture.runtimeHints.some((runtime) => runtime.promptEpoch?.status === "committed"),
         ).toBe(true);
@@ -820,74 +1042,128 @@ describe("recoverable disconnect lifecycle", () => {
     );
   });
 
-  test("recovers a committed remote target when it disconnects during the final archive await", async () => {
-    await withRemoteLateDisconnectFixture("created", async (fixture) => {
-      expect(fixture.providerObservedDispatchStart).toBe(true);
-      expect(fixture.committedTurnVerified).toBe(true);
-      expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
-        expect.objectContaining({ evaluate: expect.any(Function) }),
-        expect.objectContaining({
-          conversationId: targetId,
-          verifiedUserTurnIndex: 0,
-          verifiedUserTurnId: "turn-0",
-          verifiedUserMessageId: "message-0",
-        }),
-      );
-      expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
-      expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
-      expect(fixture.error).toBeInstanceOf(fixture.browserAutomationError);
-      expect(fixture.error).toMatchObject({
-        details: {
-          stage: "connection-lost",
-          recoverableDisconnect: true,
-          runtime: {
+  test("continues remote answer capture when committed authority persistence rejects", async () => {
+    await withRemoteLateDisconnectFixture(
+      "created",
+      async (fixture) => {
+        expect(fixture.providerObservedDispatchStart).toBe(true);
+        expect(fixture.committedTurnVerified).toBe(true);
+        expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+        expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          answerText: "completed answer",
+          answerMarkdown: "completed answer",
+          promptEpoch: expect.objectContaining({
+            status: "committed",
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
             conversationId: targetId,
-            promptEpoch: {
+          }),
+          warnings: expect.arrayContaining([
+            expect.objectContaining({ code: "prompt-commit-journal-pending" }),
+          ]),
+          runtime: expect.objectContaining({
+            promptEpoch: expect.objectContaining({
               status: "committed",
-              epochId: expect.any(String),
-              promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-              baselineTurns: 0,
-              followUpOrdinal: 0,
-              remainingFollowUps: 0,
-              verifiedUserTurnIndex: 0,
               verifiedUserTurnId: "turn-0",
               verifiedUserMessageId: "message-0",
-              conversationId: targetId,
-            },
-            recoveryCleanupResources: [
-              expect.objectContaining({
-                chromeHost: "remote.example",
-                chromePort: 9333,
-                chromeBrowserWSEndpoint: undefined,
-                chromeProfileRoot: undefined,
-                profileDirectoryIdentity: undefined,
-                userDataDir: undefined,
-                conversationId: targetId,
-                chromeTargetId: targetId,
-                promptEpoch: expect.objectContaining({
-                  status: "committed",
-                  verifiedUserTurnId: "turn-0",
-                  verifiedUserMessageId: "message-0",
-                  conversationId: targetId,
-                }),
-                tabLease: undefined,
-                recoveryCleanup: {
-                  ownsTarget: true,
-                  profileKind: "none",
-                  keepBrowser: false,
-                  closeOwnedTargetOnComplete: false,
-                },
-              }),
-            ],
-          },
-        },
-      });
-      expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
-      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
-    });
+            }),
+          }),
+        });
+        expect(
+          fixture.runtimeHints.some((runtime) => runtime.promptEpoch?.status === "committed"),
+        ).toBe(true);
+        expect(fixture.probeChromeTargetLiveness).not.toHaveBeenCalled();
+        expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+        expect(fixture.unhandledRejections).toEqual([]);
+      },
+      { disconnectDuringFinalArchive: false, runtimePersistenceFailsAfterCommit: true },
+    );
   });
 
-  test("records an attached remote fallback target as user-owned", async () => {
+  test("preserves a committed remote answer with no stale cleanup claim when the final archive loses its target", async () => {
+    await withRemoteLateDisconnectFixture(
+      "created",
+      async (fixture) => {
+        expect(fixture.providerObservedDispatchStart).toBe(true);
+        expect(fixture.committedTurnVerified).toBe(true);
+        expect(fixture.verifyCommittedPromptTurn).toHaveBeenCalledWith(
+          expect.objectContaining({ evaluate: expect.any(Function) }),
+          expect.objectContaining({
+            conversationId: targetId,
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+          }),
+        );
+        expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+        expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
+        expect(await fixture.probeChromeTargetLiveness.mock.results[0]?.value).toMatchObject({
+          endpointReachable: true,
+          targetFound: false,
+        });
+        expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
+        expect(fixture.error).toMatchObject({
+          answerText: "completed answer",
+          answerMarkdown: "completed answer",
+          archive: {
+            attempted: true,
+            archived: true,
+            conversationUrl,
+          },
+          promptEpoch: {
+            status: "committed",
+            epochId: expect.any(String),
+            promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            baselineTurns: 0,
+            followUpOrdinal: 0,
+            remainingFollowUps: 0,
+            verifiedUserTurnIndex: 0,
+            verifiedUserTurnId: "turn-0",
+            verifiedUserMessageId: "message-0",
+            conversationId: targetId,
+          },
+          warnings: expect.arrayContaining([
+            expect.objectContaining({ code: "browser-final-target-liveness-pending" }),
+          ]),
+          runtime: expect.objectContaining({
+            controllerPid: process.pid,
+            tabUrl: conversationUrl,
+            conversationId: targetId,
+            promptEpoch: expect.objectContaining({
+              status: "committed",
+              verifiedUserTurnId: "turn-0",
+              verifiedUserMessageId: "message-0",
+            }),
+          }),
+        });
+        if (
+          !fixture.error ||
+          typeof fixture.error !== "object" ||
+          !("runtime" in fixture.error) ||
+          !fixture.error.runtime ||
+          typeof fixture.error.runtime !== "object"
+        ) {
+          throw new Error("Captured answer did not expose projected browser runtime metadata");
+        }
+        const projectedRuntime = fixture.error.runtime;
+        expect(Reflect.get(projectedRuntime, "browserTransport")).toBeUndefined();
+        expect(Reflect.get(projectedRuntime, "chromeHost")).toBeUndefined();
+        expect(Reflect.get(projectedRuntime, "chromePort")).toBeUndefined();
+        expect(Reflect.get(projectedRuntime, "chromeTargetId")).toBeUndefined();
+        expect(Reflect.get(projectedRuntime, "recoveryCleanupResources")).toBeUndefined();
+        expect(Reflect.get(projectedRuntime, "recoveryCleanupResult")).toBeUndefined();
+        expect(fixture.unhandledRejections).toEqual([]);
+        expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+      },
+      { targetExitsDuringFinalArchive: true },
+    );
+  });
+
+  test("preserves an attached remote answer without claiming target ownership", async () => {
     await withRemoteLateDisconnectFixture("attached", async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
       expect(fixture.committedTurnVerified).toBe(true);
@@ -900,40 +1176,39 @@ describe("recoverable disconnect lifecycle", () => {
           verifiedUserMessageId: "message-0",
         }),
       );
+      expect(fixture.archiveChatGptConversation).toHaveBeenCalledTimes(1);
+      expect(fixture.error).not.toBeInstanceOf(fixture.browserAutomationError);
       expect(fixture.error).toMatchObject({
-        details: {
-          stage: "connection-lost",
-          recoverableDisconnect: true,
-          runtime: {
-            chromeTargetId: targetId,
-            recoveryCleanupResources: [
-              expect.objectContaining({
-                chromeHost: "remote.example",
-                chromePort: 9333,
-                chromeBrowserWSEndpoint: undefined,
-                chromeProfileRoot: undefined,
-                profileDirectoryIdentity: undefined,
-                userDataDir: undefined,
+        answerText: "completed answer",
+        warnings: expect.arrayContaining([
+          expect.objectContaining({ code: "browser-final-target-liveness-pending" }),
+        ]),
+        runtime: expect.objectContaining({
+          chromeTargetId: targetId,
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              chromeHost: "remote.example",
+              chromePort: 9333,
+              conversationId: targetId,
+              chromeTargetId: targetId,
+              promptEpoch: expect.objectContaining({
+                status: "committed",
+                verifiedUserTurnId: "turn-0",
+                verifiedUserMessageId: "message-0",
                 conversationId: targetId,
-                chromeTargetId: targetId,
-                promptEpoch: expect.objectContaining({
-                  status: "committed",
-                  verifiedUserTurnId: "turn-0",
-                  verifiedUserMessageId: "message-0",
-                  conversationId: targetId,
-                }),
-                tabLease: undefined,
-                recoveryCleanup: {
-                  ownsTarget: false,
-                  profileKind: "none",
-                  keepBrowser: false,
-                  closeOwnedTargetOnComplete: false,
-                },
               }),
-            ],
-          },
-        },
+              recoveryCleanup: {
+                ownsTarget: false,
+                profileKind: "none",
+                keepBrowser: false,
+                closeOwnedTargetOnComplete: false,
+              },
+            }),
+          ],
+        }),
       });
+      expect(fixture.unhandledRejections).toEqual([]);
+      expect(fixture.closeRemoteConnection).not.toHaveBeenCalled();
       expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
     });
   });

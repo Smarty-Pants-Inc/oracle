@@ -123,6 +123,11 @@ vi.mock("../../src/browser/config.js", () => ({
 vi.mock("../../src/browser/profileState.js", () => ({
   captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
+  createChromeProcessLaunchClaim: (generationId: string) => ({
+    version: 1 as const,
+    generationId,
+    nonce: "70000000-0000-4000-8000-000000000007",
+  }),
   isSafeChromeTerminationOutcome: (outcome: { status?: string }) =>
     outcome.status === "stopped" || outcome.status === "already-stopped",
   readDevToolsPort,

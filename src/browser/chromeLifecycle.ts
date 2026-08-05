@@ -7,7 +7,9 @@ import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
   assertProfileDirectoryIdentity,
+  buildChromeProcessLaunchClaimFlag,
   captureChromeProcessIdentity,
+  createChromeProcessLaunchClaim,
   captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
   findRunningChromeProcessForProfile,
@@ -16,8 +18,10 @@ import {
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
   sameProfileDirectoryIdentity,
+  sameChromeProcessLaunchClaim,
   writeOracleChromeOwner,
   type ChromeProcessIdentity,
+  type ChromeProcessLaunchClaim,
   type ProfileDirectoryIdentity,
   type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
@@ -65,6 +69,7 @@ interface StableChromeLauncher {
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
+  launchClaim?: ChromeProcessLaunchClaim;
   standardLaunch?: typeof launch;
   customHostLaunch?: typeof launchWithCustomHost;
   hiddenMacLaunch?: typeof launchHiddenMacChrome;
@@ -101,12 +106,14 @@ export async function launchChrome(
     { create: true },
   );
   const launchUserDataDir = profileDirectory.canonicalPath;
+  const launchClaim = deps.launchClaim ?? createChromeProcessLaunchClaim();
   const debugPort = config.debugPort ?? parseDebugPortEnv();
   const chromeFlags = buildChromeFlags(
     config.headless ?? false,
     debugBindAddress,
     config.hideWindow ?? false,
   );
+  chromeFlags.push(buildChromeProcessLaunchClaimFlag(launchClaim));
   const usingCopiedProfile = Boolean(config.copyProfileSource);
   if (usingCopiedProfile && config.chromeProfile) {
     chromeFlags.push(`--profile-directory=${config.chromeProfile}`);
@@ -130,6 +137,7 @@ export async function launchChrome(
       ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
       captureProcessIdentity: deps.captureProcessIdentity ?? captureChromeProcessIdentity,
       expectedProfileDirectory: profileDirectory,
+      launchClaim,
     });
   } else {
     const launched = usePatchedLauncher
@@ -179,7 +187,21 @@ export async function launchChrome(
       launcher,
       profileDirectory,
       deps.captureProcessIdentity ?? captureChromeProcessIdentity,
+      launchClaim,
     ));
+  if (!sameChromeProcessLaunchClaim(processIdentity.launchClaim, launchClaim)) {
+    const claimError = new Error(
+      `Launched Chrome for ${launchUserDataDir} did not expose the durable launch claim.`,
+    );
+    const rollback = await launcher.kill();
+    if (!isSafeChromeTerminationOutcome(rollback)) {
+      throw new AggregateError(
+        [claimError, new Error(rollback.reason)],
+        `Chrome launch claim was not observable, and safe launch rollback was unavailable.`,
+      );
+    }
+    throw claimError;
+  }
   const launchHost = launcher.host ?? connectHost ?? "127.0.0.1";
   let stableKill: ChromeStableKill;
   let endpointAuthority = launcher.endpointAuthority;
@@ -293,6 +315,7 @@ async function captureLaunchedChromeProcessIdentity(
   launcher: StableChromeLauncher,
   expectedProfileDirectory: ProfileDirectoryIdentity,
   capture: typeof captureChromeProcessIdentity,
+  launchClaim: ChromeProcessLaunchClaim,
 ): Promise<ChromeProcessIdentity> {
   const pid = launcher.pid;
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
@@ -309,7 +332,7 @@ async function captureLaunchedChromeProcessIdentity(
     throw identityError;
   }
   try {
-    const identity = await capture(userDataDir, pid);
+    const identity = await capture(userDataDir, pid, launchClaim);
     if (!sameProfileDirectoryIdentity(identity.profileDirectory, expectedProfileDirectory)) {
       throw new Error(`Physical profile authority changed while capturing Chrome identity.`);
     }
@@ -465,6 +488,7 @@ async function launchHiddenMacChrome({
   ignoreDefaultFlags,
   captureProcessIdentity,
   expectedProfileDirectory,
+  launchClaim,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
@@ -473,6 +497,7 @@ async function launchHiddenMacChrome({
   ignoreDefaultFlags?: boolean;
   captureProcessIdentity: typeof captureChromeProcessIdentity;
   expectedProfileDirectory: ProfileDirectoryIdentity;
+  launchClaim: ChromeProcessLaunchClaim;
 }): Promise<StableChromeLauncher> {
   const resolvedChromePath = chromePath ?? Launcher.getFirstInstallation();
   if (!resolvedChromePath) throw new Error("Chrome is not installed.");
@@ -507,14 +532,19 @@ async function launchHiddenMacChrome({
   await waitForDebugPort(endpoint.port);
   const listeningPid = await resolveListeningPortOwnerPid(endpoint.port);
   const discovered = listeningPid
-    ? await findRunningChromeProcessForProfile(userDataDir, debugPortArgument, listeningPid)
+    ? await findRunningChromeProcessForProfile(
+        userDataDir,
+        debugPortArgument,
+        listeningPid,
+        launchClaim,
+      )
     : null;
   if (!discovered) {
     throw new Error(
       `Hidden Chrome endpoint ${endpoint.port} could not be bound to its exact profile process.`,
     );
   }
-  const processIdentity = await captureProcessIdentity(userDataDir, discovered.pid);
+  const processIdentity = await captureProcessIdentity(userDataDir, discovered.pid, launchClaim);
   if (!sameProfileDirectoryIdentity(processIdentity.profileDirectory, expectedProfileDirectory)) {
     throw new Error(`Physical profile authority changed while binding hidden Chrome.`);
   }

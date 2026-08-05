@@ -49,7 +49,7 @@ describe("hasRecoverableChatGptConversation", () => {
     ).toBe(true);
   });
 
-  test("rejects locators without matching current prompt authority", () => {
+  test("requires matching current prompt authority but preserves committed turns before follow-ups", () => {
     expect(hasRecoverableChatGptConversation({ conversationId: "abc" })).toBe(false);
     expect(
       hasRecoverableChatGptConversation(
@@ -60,7 +60,7 @@ describe("hasRecoverableChatGptConversation", () => {
       tabUrl: "https://chatgpt.com/c/abc",
     });
     pendingFollowUp.promptEpoch.remainingFollowUps = 1;
-    expect(hasRecoverableChatGptConversation(pendingFollowUp)).toBe(false);
+    expect(hasRecoverableChatGptConversation(pendingFollowUp)).toBe(true);
   });
 
   test("rejects malformed or truncated prompt digests", () => {

@@ -23,7 +23,7 @@ import {
   type BrowserTabLease,
   type BrowserTabLeaseTeardownAuthority,
 } from "./tabLeaseRegistry.js";
-import { captureProfileDirectoryIdentity } from "./profileState.js";
+import { captureProfileDirectoryIdentity, createChromeProcessLaunchClaim } from "./profileState.js";
 import {
   OwnedBrowserResourceTransaction,
   completedBrowserCaptureCleanup,
@@ -238,6 +238,8 @@ export async function recoverConversationTab(
   const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   const waitForReady = options.waitForReady !== false;
   const generationId = randomUUID();
+  const launchClaim = createChromeProcessLaunchClaim(generationId);
+  const ownerDisposition = config.keepBrowser ? "preserve" : "close-on-last-lease";
   const leaseId = randomUUID();
   const targetMarkerUrl = `about:blank#oracle-recovery=${generationId}`;
   let profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
@@ -266,6 +268,7 @@ export async function recoverConversationTab(
       chromePid: chrome?.pid,
       chromeProcessIdentity: owner?.processIdentity,
       chromePort: target?.port ?? chrome?.port,
+      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
       chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -285,6 +288,7 @@ export async function recoverConversationTab(
       chromeProcessIdentity: owner?.processIdentity,
       profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
       chromePort: target?.port ?? chrome?.port,
+      chromeBrowserWSEndpoint: chrome?.endpointAuthority?.browserWSEndpoint,
       chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -300,13 +304,15 @@ export async function recoverConversationTab(
       acquisition: {
         generationId,
         processOwnerProvenance: "manual-canonical-owner",
+        processLaunchClaim: launchClaim,
+        processOwnerDisposition: ownerDisposition,
         ...(pendingResource ? { pendingResource } : {}),
         targetMarkerUrl,
       },
       recoveryCleanup: {
         ownsTarget: targetCleanupPending,
         profileKind: "manual-login",
-        keepBrowser: owner ? owner.disposition === "preserve" : true,
+        keepBrowser: owner ? owner.disposition === "preserve" : ownerDisposition === "preserve",
         closeOwnedTargetOnComplete: targetCleanupPending,
       },
     };
@@ -520,7 +526,8 @@ export async function recoverConversationTab(
     );
     owner = await resources.journalAcquisition({
       intentRuntime: runtime("chrome-process"),
-      acquire: () => acquireManualChromeOwner(userDataDir, config, logger, meta.id),
+      acquire: () =>
+        acquireManualChromeOwner(userDataDir, config, logger, meta.id, { launchClaim }),
       acquiredRuntime: (acquiredOwner) => {
         owner = acquiredOwner;
         return runtime();

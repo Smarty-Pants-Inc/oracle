@@ -6,13 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import chalk from "chalk";
-import CDP from "chrome-remote-interface";
-import type {
-  BrowserAttachment,
-  BrowserLogger,
-  ChromeClient,
-  CookieParam,
-} from "../browser/types.js";
+import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunTransaction } from "../browserMode.js";
 import type {
@@ -61,16 +55,17 @@ import {
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
 import {
-  inspectChromeProcessIdentity,
   readOracleChromeOwner,
   sameChromeProcessIdentity,
   type ChromeProcessIdentity,
   type ProfileStateLogger,
   type RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";
+import { terminateChromeWithExactEndpointAuthority } from "../browser/chromeEndpointAuthority.js";
 import { RemoteArtifactStore, RemoteArtifactUnavailableError } from "./artifactStore.js";
 import {
   RemoteTransactionCapacityError,
+  type DurableRemoteArtifactRegistration,
   type RemoteTransactionRecord,
   type ReconcileRemoteTransactionResult,
   RemoteTransactionStore,
@@ -216,7 +211,7 @@ export async function createRemoteServer(
           ? {}
           : {
               recoveryCleanup: {
-                terminateRecordedChromeForProfile: (profileDir, identity, cleanupLog) =>
+                terminateExactChromeForProfile: (profileDir, identity, cleanupLog) =>
                   (deps.exactChromeCleanup ?? terminateRemoteChromeWithExactControl)(
                     runtime,
                     profileDir,
@@ -645,17 +640,6 @@ async function terminateRemoteChromeWithExactControl(
       reason: "Persisted Chrome owner launch nonce or process identity no longer matches",
     };
   }
-  const inspection = await inspectChromeProcessIdentity(profileDir, identity).catch(
-    () => "unavailable" as const,
-  );
-  if (inspection === "exited") return { status: "already-stopped", pid: identity.pid };
-  if (inspection !== "current") {
-    return {
-      status: "unsafe",
-      pid: identity.pid,
-      reason: "Exact Chrome process generation could not be reverified before cleanup",
-    };
-  }
 
   const host = resource.chromeHost ?? "127.0.0.1";
   const port = resource.chromePort ?? owner.port;
@@ -666,103 +650,17 @@ async function terminateRemoteChromeWithExactControl(
       reason: "Durable Chrome control port does not match the persisted owner record",
     };
   }
-  let browserWSEndpoint = resource.chromeBrowserWSEndpoint;
-  if (!browserWSEndpoint) {
-    const hostForUrl = host.includes(":") ? `[${host}]` : host;
-    try {
-      const response = await fetch(`http://${hostForUrl}:${port}/json/version`, {
-        signal: AbortSignal.timeout(3_000),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const version = (await response.json()) as { webSocketDebuggerUrl?: unknown };
-      if (typeof version.webSocketDebuggerUrl !== "string") {
-        throw new Error("Chrome did not expose a browser control endpoint");
-      }
-      browserWSEndpoint = version.webSocketDebuggerUrl;
-    } catch (error) {
-      return {
-        status: "unsafe",
-        pid: identity.pid,
-        reason: `Exact Chrome control discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
+  const outcome = await terminateChromeWithExactEndpointAuthority({
+    host,
+    port,
+    browserWSEndpoint: resource.chromeBrowserWSEndpoint,
+    userDataDir: profileDir,
+    processIdentity: identity,
+  });
+  if (outcome.status === "stopped") {
+    logger?.(`Stopped exact Chrome process generation ${identity.pid} through Browser.close`);
   }
-  let endpoint: URL;
-  try {
-    endpoint = new URL(browserWSEndpoint);
-  } catch {
-    return {
-      status: "unsafe",
-      pid: identity.pid,
-      reason: "Durable Chrome browser control endpoint is invalid",
-    };
-  }
-  if (
-    endpoint.protocol !== "ws:" ||
-    endpoint.hostname !== host ||
-    Number.parseInt(endpoint.port, 10) !== port ||
-    !/^\/devtools\/browser\/[^/]+$/u.test(endpoint.pathname)
-  ) {
-    return {
-      status: "unsafe",
-      pid: identity.pid,
-      reason: "Durable Chrome browser control endpoint does not match its exact host and port",
-    };
-  }
-
-  let client: ChromeClient | null = null;
-  try {
-    client = (await CDP({ target: endpoint.toString(), local: true })) as ChromeClient;
-    await client.Browser.getVersion();
-    const processInfo = await client.SystemInfo.getProcessInfo();
-    const exactBrowser = processInfo.processInfo.some(
-      (process) => process.type === "browser" && process.id === identity.pid,
-    );
-    if (!exactBrowser) {
-      return {
-        status: "unsafe",
-        pid: identity.pid,
-        reason: "Chrome control channel is not bound to the persisted process generation",
-      };
-    }
-    const beforeClose = await inspectChromeProcessIdentity(profileDir, identity).catch(
-      () => "unavailable" as const,
-    );
-    if (beforeClose !== "current") {
-      return {
-        status: "unsafe",
-        pid: identity.pid,
-        reason: "Exact Chrome process generation changed before Browser.close",
-      };
-    }
-    await client.Browser.close();
-  } catch (error) {
-    return {
-      status: "unsafe",
-      pid: identity.pid,
-      reason: `Exact Chrome control channel failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  } finally {
-    await client?.close().catch(() => undefined);
-  }
-
-  const deadline = Date.now() + 7_000;
-  while (Date.now() < deadline) {
-    const afterClose = await inspectChromeProcessIdentity(profileDir, identity).catch(
-      () => "unavailable" as const,
-    );
-    if (afterClose === "exited") {
-      logger?.(`Stopped exact Chrome process generation ${identity.pid} through Browser.close`);
-      return { status: "stopped", pid: identity.pid, signal: "CONTROL_CHANNEL" };
-    }
-    if (afterClose === "unavailable") break;
-    await delay(100);
-  }
-  return {
-    status: "unsafe",
-    pid: identity.pid,
-    reason: "Exact Chrome process exit could not be proven after Browser.close",
-  };
+  return outcome;
 }
 
 async function handleRemoteRunRequest(params: {
@@ -911,12 +809,38 @@ async function handleRemoteRunRequest(params: {
       ...(result.savedFiles ?? []),
       ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
     ];
-    const registrations = await params.artifactStore.prepareRequiredArtifacts({
-      transactionToken: params.transactionToken,
-      runId,
-      artifacts: fileArtifacts,
-    });
-    const publicResult = projectRemotePublicResult(result);
+    let publishableResult = result;
+    let registrations: DurableRemoteArtifactRegistration[] = [];
+    try {
+      registrations = await params.artifactStore.prepareRequiredArtifacts({
+        transactionToken: params.transactionToken,
+        runId,
+        artifacts: fileArtifacts,
+      });
+    } catch (artifactError) {
+      const artifactMessage =
+        artifactError instanceof Error ? artifactError.message : String(artifactError);
+      publishableResult = {
+        ...result,
+        warnings: [
+          ...(result.warnings ?? []),
+          {
+            code: "remote-artifact-preparation-pending",
+            severity: "warning",
+            message: `The captured answer was preserved without remote artifact transfer: ${artifactMessage}`,
+            details: { stage: "remote-artifact-preparation" },
+          },
+        ],
+      };
+      sendEvent({
+        type: "log",
+        message: `[browser] Answer captured; remote artifact transfer remains unavailable: ${artifactMessage}`,
+      });
+      params.logger(
+        `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
+      );
+    }
+    const publicResult = projectRemotePublicResult(publishableResult);
     const record = await params.transactionStore.publishCapture({
       transactionToken: params.transactionToken,
       runId,
@@ -972,13 +896,16 @@ async function handleRemoteRunRequest(params: {
       runtime: recoverableRuntime,
       error: durableError,
     });
+    if (failedCapture) {
+      params.logger(
+        `[serve] Run ${runId} captured an exact answer but durable publication failed; retaining its runtime for non-abort recovery.`,
+      );
+    }
     const cleanupRequired =
-      Boolean(failedCapture) ||
-      (Boolean(recoverableRuntime) && error.details?.recoverableDisconnect !== true);
+      !failedCapture &&
+      Boolean(recoverableRuntime) &&
+      error.details?.recoverableDisconnect !== true;
     if (cleanupRequired && recoverableRuntime) {
-      if (failedCapture) {
-        params.transactionCoordinator.registerActive(params.transactionToken, failedCapture);
-      }
       record = (
         await params.transactionCoordinator.settle({
           transactionToken: params.transactionToken,

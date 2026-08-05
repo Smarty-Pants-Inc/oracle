@@ -18,6 +18,7 @@ import {
   retryBrowserRecoveryCleanup,
   type ReattachResult,
 } from "../browser/reattach.js";
+import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import {
   hasRecoverableChatGptConversation,
   isRecoverableChatGptConversationUrl,
@@ -350,6 +351,7 @@ export async function attachSession(
         cleanupLogger,
         {
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+          recoveryCleanup: { retainChromeEndpointAuthority },
           isRemotePublicationAcknowledged: () =>
             completedCleanupAcknowledged && cleanupRetryMode === "finalize",
         },

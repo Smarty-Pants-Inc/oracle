@@ -71,8 +71,14 @@ export async function settleManualChromeOwner(
       };
     }
   }
-
-  const termination = await owner.chrome.kill().catch((error: unknown) => ({
+  const endpointAuthority = owner.endpointAuthority;
+  if (!endpointAuthority) {
+    return {
+      status: "unsafe",
+      reason: "Canonical Chrome owner has no retained exact endpoint teardown authority",
+    };
+  }
+  const termination = await endpointAuthority.kill().catch((error: unknown) => ({
     status: "unsafe" as const,
     pid: owner.chrome.pid,
     reason: error instanceof Error ? error.message : String(error),

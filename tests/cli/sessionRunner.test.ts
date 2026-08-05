@@ -142,6 +142,37 @@ function createReattachResult(
   };
 }
 
+function createCleanupRuntime(
+  targetId: string,
+  status: "pending" | "failed" = "pending",
+): BrowserRuntimeMetadata {
+  return {
+    chromePort: 9222,
+    chromeHost: "127.0.0.1",
+    chromeTargetId: targetId,
+    tabUrl: "https://chatgpt.com/c/demo",
+    ...committedDemoAuthority,
+    recoveryCleanupResources: [
+      {
+        chromePort: 9222,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: targetId,
+        conversationId: "demo",
+        promptEpoch: committedDemoAuthority.promptEpoch,
+        recoveryCleanup: {
+          ownsTarget: true,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
+      },
+    ],
+    recoveryCleanupResult:
+      status === "failed"
+        ? { status, error: `cleanup failed for ${targetId}`, settlementMode: "abort" }
+        : { status },
+  };
+}
+
 async function withExactEnv<T>(
   updates: Record<string, string | undefined>,
   fn: () => Promise<T>,
@@ -1743,6 +1774,157 @@ describe("performSessionRun", () => {
       error: expect.objectContaining({
         details: expect.objectContaining({ code: "prompt-commit-timeout" }),
       }),
+    });
+  });
+
+  test("does not overwrite completed cleanup with the stale pending runtime on the escaping error", async () => {
+    const pendingRuntime = createCleanupRuntime("TARGET-SETTLED");
+    const completedRuntime: BrowserRuntimeMetadata = { ...pendingRuntime };
+    delete completedRuntime.recoveryCleanupResources;
+    delete completedRuntime.recoveryCleanupResult;
+    const automationError = new BrowserAutomationError("automation failed after cleanup", {
+      stage: "connection-lost",
+      recoverableDisconnect: true,
+      runtime: pendingRuntime,
+    });
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(pendingRuntime);
+      await deps?.persistRuntimeHint?.(completedRuntime);
+      throw automationError;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("automation failed after cleanup");
+    expect(resumeBrowserSession).not.toHaveBeenCalled();
+
+    const completedHintIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      ([, update]) =>
+        update.browser?.runtime?.chromeTargetId === "TARGET-SETTLED" &&
+        update.browser.runtime.recoveryCleanupResources === undefined,
+    );
+    expect(completedHintIndex).toBeGreaterThanOrEqual(0);
+    const updatesAfterCompletion =
+      sessionStoreMock.updateSession.mock.calls.slice(completedHintIndex);
+    for (const [, update] of updatesAfterCompletion) {
+      const persistedRuntime = update.browser?.runtime;
+      if (!persistedRuntime) continue;
+      expect(persistedRuntime).not.toHaveProperty("recoveryCleanupResources");
+      expect(persistedRuntime).not.toHaveProperty("recoveryCleanupResult");
+    }
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      browser: {
+        runtime: {
+          chromeTargetId: "TARGET-SETTLED",
+          conversationId: "demo",
+          promptEpoch: expect.objectContaining({ status: "committed", epochId: "epoch-demo" }),
+        },
+      },
+      error: {
+        details: {
+          runtime: expect.objectContaining({
+            chromeTargetId: "TARGET-SETTLED",
+            promptEpoch: expect.objectContaining({ status: "committed" }),
+          }),
+        },
+      },
+    });
+    expect(finalUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(finalUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
+    expect(finalUpdate?.error?.details?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(finalUpdate?.error?.details?.runtime).not.toHaveProperty("recoveryCleanupResult");
+  });
+
+  test("accepts a recoverable error runtime with a new exact target after prior cleanup completed", async () => {
+    const settledRuntime = createCleanupRuntime("TARGET-OLD");
+    const completedRuntime: BrowserRuntimeMetadata = { ...settledRuntime };
+    delete completedRuntime.recoveryCleanupResources;
+    delete completedRuntime.recoveryCleanupResult;
+    const newerRuntime = createCleanupRuntime("TARGET-NEW");
+    const automationError = new BrowserAutomationError("new target disconnected", {
+      stage: "execute-browser",
+      runtime: newerRuntime,
+    });
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(settledRuntime);
+      await deps?.persistRuntimeHint?.(completedRuntime);
+      throw automationError;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("new target disconnected");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime).toMatchObject({
+      chromeTargetId: "TARGET-NEW",
+      recoveryCleanupResult: { status: "pending" },
+      promptEpoch: expect.objectContaining({ status: "committed", epochId: "epoch-demo" }),
+    });
+    expect(finalUpdate?.error?.details?.runtime).toMatchObject({
+      chromeTargetId: "TARGET-NEW",
+      recoveryCleanupResult: { status: "pending" },
+    });
+  });
+
+  test("keeps failed cleanup authority over an older pending error snapshot", async () => {
+    const failedRuntime = createCleanupRuntime("TARGET-FAILED", "failed");
+    const stalePendingRuntime = createCleanupRuntime("TARGET-FAILED");
+    const automationError = new BrowserAutomationError("stale cleanup snapshot escaped", {
+      stage: "execute-browser",
+      runtime: stalePendingRuntime,
+    });
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(failedRuntime);
+      throw automationError;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("stale cleanup snapshot escaped");
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime?.recoveryCleanupResult).toEqual({
+      status: "failed",
+      error: "cleanup failed for TARGET-FAILED",
+      settlementMode: "abort",
+    });
+    expect(finalUpdate?.error?.details?.runtime).toMatchObject({
+      chromeTargetId: "TARGET-FAILED",
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "cleanup failed for TARGET-FAILED",
+        settlementMode: "abort",
+      },
     });
   });
 

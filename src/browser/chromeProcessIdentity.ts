@@ -16,6 +16,7 @@ export interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
   readOwner?: (userDataDir: string) => Promise<{ processIdentity: ChromeProcessIdentity } | null>;
+  launchClaim?: ChromeProcessLaunchClaim;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
   captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
   verifyProfileIdentity?: (
@@ -40,12 +41,63 @@ const executeProcessCommand: ProcessCommandExecutor = async (file, args) => {
   });
   return { stdout: String(stdout ?? "") };
 };
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const CHROME_LAUNCH_CLAIM_FLAG = "--oracle-launch-claim";
+
+export interface ChromeProcessLaunchClaim {
+  readonly version: 1;
+  readonly generationId: string;
+  readonly nonce: string;
+}
+
+export function createChromeProcessLaunchClaim(
+  generationId = randomUUID(),
+): ChromeProcessLaunchClaim {
+  const claim = parseChromeProcessLaunchClaim({ version: 1, generationId, nonce: randomUUID() });
+  if (!claim) throw new Error("Chrome launch claim generation must be a UUID v4");
+  return claim;
+}
+
+export function parseChromeProcessLaunchClaim(value: unknown): ChromeProcessLaunchClaim | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.generationId !== "string" ||
+    !UUID_V4_PATTERN.test(record.generationId) ||
+    typeof record.nonce !== "string" ||
+    !UUID_V4_PATTERN.test(record.nonce)
+  ) {
+    return null;
+  }
+  return Object.freeze({ version: 1, generationId: record.generationId, nonce: record.nonce });
+}
+
+export function sameChromeProcessLaunchClaim(
+  left: ChromeProcessLaunchClaim | undefined,
+  right: ChromeProcessLaunchClaim | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.version === right.version &&
+    left.generationId === right.generationId &&
+    left.nonce === right.nonce
+  );
+}
+
+export function buildChromeProcessLaunchClaimFlag(claim: ChromeProcessLaunchClaim): string {
+  const validated = parseChromeProcessLaunchClaim(claim);
+  if (!validated) throw new Error("Chrome launch claim is invalid");
+  return `${CHROME_LAUNCH_CLAIM_FLAG}=${validated.generationId}:${validated.nonce}`;
+}
+
 export interface ChromeProcessIdentity {
   readonly pid: number;
   readonly processStartTime: string;
   readonly executablePath: string;
   readonly normalizedUserDataDir: string;
   readonly launchNonce: string;
+  readonly launchClaim?: ChromeProcessLaunchClaim;
   readonly profileDirectory: ProfileDirectoryIdentity;
 }
 
@@ -60,8 +112,9 @@ interface ChromeProcessSnapshot {
 export async function captureChromeProcessIdentity(
   userDataDir: string,
   pid: number,
+  launchClaim?: ChromeProcessLaunchClaim,
 ): Promise<ChromeProcessIdentity> {
-  return captureChromeProcessIdentityWithDeps(userDataDir, pid, {});
+  return captureChromeProcessIdentityWithDeps(userDataDir, pid, { launchClaim });
 }
 
 export async function captureChromeProcessIdentityForTest(
@@ -78,6 +131,11 @@ async function captureChromeProcessIdentityWithDeps(
   deps: ChromeProcessIdentityDeps,
 ): Promise<ChromeProcessIdentity> {
   const platform = deps.platform ?? process.platform;
+  const launchClaim =
+    deps.launchClaim === undefined ? null : parseChromeProcessLaunchClaim(deps.launchClaim);
+  if (deps.launchClaim !== undefined && !launchClaim) {
+    throw new Error(`Cannot capture Chrome process identity with an invalid launch claim`);
+  }
   const profileDirectory = await (deps.captureProfileIdentity
     ? deps.captureProfileIdentity(userDataDir)
     : captureProfileDirectoryIdentity(userDataDir));
@@ -97,7 +155,8 @@ async function captureChromeProcessIdentityWithDeps(
     !snapshot.processStartTime.trim() ||
     !executablePath ||
     !isChromeExecutablePath(executablePath, platform) ||
-    !isChromeSnapshotForUserDataDir(snapshot, profileDirectory.canonicalPath, platform)
+    !isChromeSnapshotForUserDataDir(snapshot, profileDirectory.canonicalPath, platform) ||
+    (launchClaim && !isChromeSnapshotForLaunchClaim(snapshot, launchClaim))
   ) {
     throw new Error(`Chrome pid ${pid} does not have a stable identity for ${userDataDir}`);
   }
@@ -106,7 +165,8 @@ async function captureChromeProcessIdentityWithDeps(
     processStartTime: snapshot.processStartTime.trim(),
     executablePath,
     normalizedUserDataDir,
-    launchNonce: randomUUID(),
+    launchNonce: launchClaim?.nonce ?? randomUUID(),
+    ...(launchClaim ? { launchClaim } : {}),
     profileDirectory,
   });
 }
@@ -156,7 +216,8 @@ export async function inspectChromeProcessIdentityWithDeps(
   const executablePath = normalizeExecutablePath(snapshot.executablePath, platform);
   if (
     executablePath !== identity.executablePath ||
-    !isChromeSnapshotForUserDataDir(snapshot, identity.profileDirectory.canonicalPath, platform)
+    !isChromeSnapshotForUserDataDir(snapshot, identity.profileDirectory.canonicalPath, platform) ||
+    (identity.launchClaim && !isChromeSnapshotForLaunchClaim(snapshot, identity.launchClaim))
   ) {
     return "unavailable";
   }
@@ -173,6 +234,7 @@ export function sameChromeProcessIdentity(
     left.executablePath === right.executablePath &&
     left.normalizedUserDataDir === right.normalizedUserDataDir &&
     left.launchNonce === right.launchNonce &&
+    sameChromeProcessLaunchClaim(left.launchClaim, right.launchClaim) &&
     sameProfileDirectoryIdentity(left.profileDirectory, right.profileDirectory)
   );
 }
@@ -191,9 +253,15 @@ export function parseChromeProcessIdentity(
     typeof record.executablePath !== "string" ||
     typeof record.normalizedUserDataDir !== "string" ||
     typeof record.launchNonce !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-      record.launchNonce,
-    )
+    !UUID_V4_PATTERN.test(record.launchNonce)
+  ) {
+    return null;
+  }
+  const launchClaim =
+    record.launchClaim === undefined ? null : parseChromeProcessLaunchClaim(record.launchClaim);
+  if (
+    record.launchClaim !== undefined &&
+    (!launchClaim || launchClaim.nonce !== record.launchNonce)
   ) {
     return null;
   }
@@ -226,12 +294,46 @@ export function parseChromeProcessIdentity(
     executablePath,
     normalizedUserDataDir,
     launchNonce: record.launchNonce,
+    ...(launchClaim ? { launchClaim } : {}),
     profileDirectory,
   });
 }
 export interface RunningChromeDebugTarget {
   pid: number;
   port: number;
+}
+export interface RunningClaimedChromeProcess {
+  pid: number;
+  port: number | null;
+}
+export interface ChromeLaunchClaimProcessDiscovery {
+  exactMatches: readonly RunningClaimedChromeProcess[];
+  conflictingProfilePids: readonly number[];
+}
+
+interface RunningChromeProcessCommand {
+  pid: number;
+  commandLine: string;
+}
+
+export async function inspectRunningChromeProcessesForLaunchClaim(
+  userDataDir: string,
+  claim: ChromeProcessLaunchClaim,
+): Promise<ChromeLaunchClaimProcessDiscovery> {
+  const validated = parseChromeProcessLaunchClaim(claim);
+  if (!validated) throw new Error("Chrome launch claim is invalid");
+  const platform = process.platform;
+  const [activePort, processes] = await Promise.all([
+    readDevToolsPort(userDataDir),
+    listRunningChromeProcessCommands(platform, executeProcessCommand),
+  ]);
+  return inspectChromeProcessesForLaunchClaim(
+    processes,
+    userDataDir,
+    validated,
+    activePort,
+    platform,
+  );
 }
 
 export async function findRunningChromeDebugTargetForProfile(
@@ -257,6 +359,7 @@ export async function findRunningChromeProcessForProfile(
   userDataDir: string,
   expectedDebugPortArgument: number,
   expectedPid?: number,
+  expectedLaunchClaim?: ChromeProcessLaunchClaim,
 ): Promise<{ pid: number } | null> {
   if (process.platform === "win32") return null;
   try {
@@ -267,8 +370,20 @@ export async function findRunningChromeProcessForProfile(
       const pid = Number.parseInt(match[1] ?? "", 10);
       const command = match[2] ?? "";
       if (!Number.isFinite(pid) || pid <= 0 || (expectedPid && pid !== expectedPid)) continue;
-      if (!isChromeCommandForUserDataDir(command, userDataDir)) continue;
-      if (readRemoteDebuggingPortArgument(command) !== expectedDebugPortArgument) continue;
+      const tokens = tokenizeCommandLine(command);
+      if (!tokens || !isChromeCommandTokensForUserDataDir(tokens, userDataDir, process.platform)) {
+        continue;
+      }
+      if (
+        expectedLaunchClaim &&
+        !sameChromeProcessLaunchClaim(
+          readChromeProcessLaunchClaimArgument(tokens),
+          expectedLaunchClaim,
+        )
+      ) {
+        continue;
+      }
+      if (readRemoteDebuggingPortArgumentFromTokens(tokens) !== expectedDebugPortArgument) continue;
       return { pid };
     }
     return null;
@@ -303,6 +418,95 @@ export function findChromeDebugTargetForProfileFromProcessListForTest(
   activePort: number | null = null,
 ): RunningChromeDebugTarget | null {
   return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir, activePort);
+}
+
+export function inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+  processList: string,
+  userDataDir: string,
+  claim: ChromeProcessLaunchClaim,
+  activePort: number | null = null,
+  platform: NodeJS.Platform = process.platform,
+): ChromeLaunchClaimProcessDiscovery {
+  const validated = parseChromeProcessLaunchClaim(claim);
+  if (!validated) return { exactMatches: [], conflictingProfilePids: [] };
+  return inspectChromeProcessesForLaunchClaim(
+    parsePosixProcessCommands(processList),
+    userDataDir,
+    validated,
+    activePort,
+    platform,
+  );
+}
+
+function inspectChromeProcessesForLaunchClaim(
+  processes: readonly RunningChromeProcessCommand[],
+  userDataDir: string,
+  claim: ChromeProcessLaunchClaim,
+  activePort: number | null,
+  platform: NodeJS.Platform,
+): ChromeLaunchClaimProcessDiscovery {
+  const exactMatches = new Map<number, RunningClaimedChromeProcess>();
+  const conflictingProfilePids = new Set<number>();
+  for (const processCommand of processes) {
+    const tokens = tokenizeCommandLine(processCommand.commandLine);
+    if (
+      !tokens ||
+      !isChromeCommandTokensForUserDataDir(tokens, userDataDir, platform) ||
+      !hasRemoteDebuggingPortArgument(tokens)
+    ) {
+      continue;
+    }
+    if (!sameChromeProcessLaunchClaim(readChromeProcessLaunchClaimArgument(tokens), claim)) {
+      conflictingProfilePids.add(processCommand.pid);
+      continue;
+    }
+    const configuredPort = readRemoteDebuggingPortArgumentFromTokens(tokens);
+    const resolvedPort = configuredPort === 0 ? activePort : configuredPort;
+    const port = resolvedPort && resolvedPort > 0 && resolvedPort <= 65_535 ? resolvedPort : null;
+    exactMatches.set(processCommand.pid, { pid: processCommand.pid, port });
+  }
+  return {
+    exactMatches: [...exactMatches.values()].sort((left, right) => left.pid - right.pid),
+    conflictingProfilePids: [...conflictingProfilePids].sort((left, right) => left - right),
+  };
+}
+
+async function listRunningChromeProcessCommands(
+  platform: NodeJS.Platform,
+  execute: ProcessCommandExecutor,
+): Promise<readonly RunningChromeProcessCommand[]> {
+  if (platform !== "win32") {
+    const { stdout } = await execute("ps", ["-ax", "-o", "pid=", "-o", "command="]);
+    return parsePosixProcessCommands(stdout);
+  }
+  const { stdout } = await execute("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(chrome|chromium)\\.exe$' } | ForEach-Object { $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.CommandLine); '{0}:{1}' -f [int]$_.ProcessId, [Convert]::ToBase64String($bytes) }",
+  ]);
+  const processes: RunningChromeProcessCommand[] = [];
+  for (const line of stdout.split(/\r?\n/u)) {
+    const match = line.match(/^(\d+):([A-Za-z0-9+/=]+)$/u);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1] ?? "", 10);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const commandLine = Buffer.from(match[2] ?? "", "base64").toString("utf8");
+    if (commandLine) processes.push({ pid, commandLine });
+  }
+  return processes;
+}
+
+function parsePosixProcessCommands(processList: string): readonly RunningChromeProcessCommand[] {
+  const processes: RunningChromeProcessCommand[] = [];
+  for (const line of processList.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/u);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1] ?? "", 10);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    processes.push({ pid, commandLine: match[2] ?? "" });
+  }
+  return processes;
 }
 function tokenizeCommandLine(command: string): string[] | null {
   const tokens: string[] = [];
@@ -562,9 +766,54 @@ function isChromeSnapshotForUserDataDir(
     : isChromeCommandForUserDataDir(snapshot.commandLine, userDataDir, platform);
 }
 
+function isChromeSnapshotForLaunchClaim(
+  snapshot: ChromeProcessSnapshot,
+  claim: ChromeProcessLaunchClaim,
+): boolean {
+  const tokens = snapshot.commandTokens ?? tokenizeCommandLine(snapshot.commandLine);
+  return Boolean(
+    tokens && sameChromeProcessLaunchClaim(readChromeProcessLaunchClaimArgument(tokens), claim),
+  );
+}
+
+function readChromeProcessLaunchClaimArgument(
+  tokens: readonly string[],
+): ChromeProcessLaunchClaim | undefined {
+  const values: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? "";
+    const lower = token.toLowerCase();
+    if (lower === CHROME_LAUNCH_CLAIM_FLAG) {
+      const value = tokens[index + 1];
+      if (!value || value.startsWith("--")) return undefined;
+      values.push(value);
+      index += 1;
+    } else if (lower.startsWith(`${CHROME_LAUNCH_CLAIM_FLAG}=`)) {
+      values.push(token.slice(token.indexOf("=") + 1));
+    }
+  }
+  if (values.length !== 1) return undefined;
+  const parts = values[0]?.split(":") ?? [];
+  if (parts.length !== 2) return undefined;
+  return (
+    parseChromeProcessLaunchClaim({ version: 1, generationId: parts[0], nonce: parts[1] }) ??
+    undefined
+  );
+}
+
+function hasRemoteDebuggingPortArgument(tokens: readonly string[]): boolean {
+  return tokens.some((token) => {
+    const lower = token.toLowerCase();
+    return lower === "--remote-debugging-port" || lower.startsWith("--remote-debugging-port=");
+  });
+}
+
 function readRemoteDebuggingPortArgument(command: string): number | null {
   const tokens = tokenizeCommandLine(command);
-  if (!tokens) return null;
+  return tokens ? readRemoteDebuggingPortArgumentFromTokens(tokens) : null;
+}
+
+function readRemoteDebuggingPortArgumentFromTokens(tokens: readonly string[]): number | null {
   const values: string[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] ?? "";

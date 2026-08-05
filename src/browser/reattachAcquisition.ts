@@ -37,9 +37,9 @@ import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js"
 import { CHATGPT_URL } from "./constants.js";
 import {
   captureProfileDirectoryIdentity,
+  createChromeProcessLaunchClaim,
   inspectChromeProcessIdentity,
   sameChromeProcessIdentity,
-  terminateRecordedChromeForProfile,
   verifyProfileDirectoryIdentity,
 } from "./profileState.js";
 import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
@@ -345,6 +345,26 @@ export async function createOwnedRecoveryTargetConnection(
   }
 }
 
+function borrowManualOwnerEndpointAuthority(
+  authority: RetainedChromeEndpointAuthority,
+): RetainedChromeEndpointAuthority {
+  if (!authority.runExactOperation) {
+    return {
+      browserWSEndpoint: authority.browserWSEndpoint,
+      kill: authority.kill,
+      release: async () => undefined,
+    };
+  }
+  return {
+    browserWSEndpoint: authority.browserWSEndpoint,
+    kill: authority.kill,
+    runExactOperation<T>(operation: (client: ChromeClient) => Promise<T>) {
+      return authority.runExactOperation!(operation);
+    },
+    release: async () => undefined,
+  };
+}
+
 export async function resumeBrowserSessionViaNewChrome(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
@@ -363,6 +383,8 @@ export async function resumeBrowserSessionViaNewChrome(
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
   const acquisitionGenerationId = randomUUID();
+  const acquisitionLaunchClaim = createChromeProcessLaunchClaim(acquisitionGenerationId);
+  const acquisitionOwnerDisposition = resolved.keepBrowser ? "preserve" : "close-on-last-lease";
   const fallbackLeaseId = randomUUID();
   const fallbackTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
@@ -382,11 +404,13 @@ export async function resumeBrowserSessionViaNewChrome(
   const refreshFallbackRuntime = (
     pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
   ): BrowserRuntimeMetadata => {
+    const currentEndpointAuthority =
+      manualChromeOwner?.endpointAuthority ?? chrome?.endpointAuthority;
     const closesProcess = manualLogin
       ? manualChromeOwner?.disposition === "close-on-last-lease"
       : !resolved.keepBrowser;
     const ownsProcess = Boolean(chrome && closesProcess);
-    const profileKind = manualLogin ? "manual-login" : ownsProcess ? "temporary" : "none";
+    const profileKind = manualLogin ? "manual-login" : "temporary";
     const ownsTarget = pendingResource === "chrome-target" || Boolean(fallbackTargetId);
     const resource: BrowserRecoveryCleanupResourceMetadata = {
       chromePid: chrome?.pid,
@@ -394,6 +418,7 @@ export async function resumeBrowserSessionViaNewChrome(
       profileDirectoryIdentity:
         chrome?.processIdentity?.profileDirectory ?? fallbackProfileIdentity,
       chromePort: chrome?.port,
+      chromeBrowserWSEndpoint: currentEndpointAuthority?.browserWSEndpoint,
       chromeHost: chrome?.host ?? "127.0.0.1",
       chromeProfileRoot: userDataDir,
       userDataDir,
@@ -410,6 +435,8 @@ export async function resumeBrowserSessionViaNewChrome(
       acquisition: {
         generationId: acquisitionGenerationId,
         processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
+        processLaunchClaim: acquisitionLaunchClaim,
+        processOwnerDisposition: acquisitionOwnerDisposition,
         ...(pendingResource ? { pendingResource } : {}),
         targetMarkerUrl: fallbackTargetMarkerUrl,
       },
@@ -433,7 +460,7 @@ export async function resumeBrowserSessionViaNewChrome(
       chromeProcessIdentity: chrome?.processIdentity,
       chromePort: chrome?.port,
       chromeHost: chrome?.host ?? "127.0.0.1",
-      chromeBrowserWSEndpoint: undefined,
+      chromeBrowserWSEndpoint: currentEndpointAuthority?.browserWSEndpoint,
       chromeProfileRoot: userDataDir,
       userDataDir,
       chromeTargetId: fallbackTargetId ?? undefined,
@@ -495,52 +522,86 @@ export async function resumeBrowserSessionViaNewChrome(
     client = null;
 
     const authorityRuntime = fallbackRuntime ?? refreshFallbackRuntime();
-    const retainedChrome = retainedOwnedChrome;
-    const recordedTerminator =
-      deps.recoveryCleanup?.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile;
+    const retainedChrome =
+      retainedOwnedChrome ??
+      (manualChromeOwner?.endpointAuthority ? manualChromeOwner.chrome : null);
+    const fallbackExactTerminator = deps.recoveryCleanup?.terminateExactChromeForProfile;
+    const retainedEndpointAuthority =
+      manualChromeOwner?.endpointAuthority ?? retainedChrome?.endpointAuthority;
+    const cleanupEndpointAuthority =
+      manualChromeOwner?.endpointAuthority === retainedEndpointAuthority &&
+      retainedEndpointAuthority
+        ? borrowManualOwnerEndpointAuthority(retainedEndpointAuthority)
+        : retainedEndpointAuthority;
+    const fallbackRetainEndpointAuthority =
+      deps.recoveryCleanup?.retainChromeEndpointAuthority ?? retainChromeEndpointAuthority;
     const cleanupDeps: ReattachCleanupDeps = retainedChrome
       ? {
           ...deps.recoveryCleanup,
-          terminateRecordedChromeForProfile: async (
-            profileDir,
-            serializedIdentity,
-            cleanupLogger,
-          ) => {
-            if (path.resolve(profileDir) !== path.resolve(userDataDir)) {
-              return recordedTerminator(profileDir, serializedIdentity, cleanupLogger);
-            }
-            if (
-              retainedChrome.pid !== retainedChrome.processIdentity.pid ||
-              !sameChromeProcessIdentity(serializedIdentity, retainedChrome.processIdentity)
-            ) {
-              return {
-                status: "unsafe",
-                pid: serializedIdentity.pid,
-                reason: "Serialized Chrome process identity does not match the retained launch",
-              };
-            }
-            if (
-              !(await verifyProfileDirectoryIdentity(
-                profileDir,
-                retainedChrome.processIdentity.profileDirectory,
-              ))
-            ) {
-              return {
-                status: "unsafe",
-                pid: serializedIdentity.pid,
-                reason: "Serialized Chrome profile identity does not match the retained launch",
-              };
-            }
-            try {
-              return await retainedChrome.kill();
-            } catch (error) {
-              return {
-                status: "unsafe",
-                pid: retainedChrome.pid,
-                reason: error instanceof Error ? error.message : String(error),
-              };
-            }
-          },
+          retainChromeEndpointAuthority: cleanupEndpointAuthority
+            ? async (options: Parameters<typeof retainChromeEndpointAuthority>[0]) => {
+                if (
+                  path.resolve(options.userDataDir) === path.resolve(userDataDir) &&
+                  options.port === retainedChrome.port &&
+                  options.host === (retainedChrome.host ?? "127.0.0.1") &&
+                  sameChromeProcessIdentity(
+                    options.processIdentity,
+                    retainedChrome.processIdentity,
+                  ) &&
+                  (!options.browserWSEndpoint ||
+                    options.browserWSEndpoint === cleanupEndpointAuthority.browserWSEndpoint)
+                ) {
+                  return cleanupEndpointAuthority;
+                }
+                return fallbackRetainEndpointAuthority(options);
+              }
+            : deps.recoveryCleanup?.retainChromeEndpointAuthority,
+          terminateExactChromeForProfile: cleanupEndpointAuthority
+            ? fallbackExactTerminator
+            : async (profileDir, serializedIdentity, cleanupLogger) => {
+                if (path.resolve(profileDir) !== path.resolve(userDataDir)) {
+                  if (fallbackExactTerminator) {
+                    return fallbackExactTerminator(profileDir, serializedIdentity, cleanupLogger);
+                  }
+                  return {
+                    status: "unsafe",
+                    pid: serializedIdentity.pid,
+                    reason:
+                      "No exact Chrome teardown authority matches the retained launch profile",
+                  };
+                }
+                if (
+                  retainedChrome.pid !== retainedChrome.processIdentity.pid ||
+                  !sameChromeProcessIdentity(serializedIdentity, retainedChrome.processIdentity)
+                ) {
+                  return {
+                    status: "unsafe",
+                    pid: serializedIdentity.pid,
+                    reason: "Serialized Chrome process identity does not match the retained launch",
+                  };
+                }
+                if (
+                  !(await verifyProfileDirectoryIdentity(
+                    profileDir,
+                    retainedChrome.processIdentity.profileDirectory,
+                  ))
+                ) {
+                  return {
+                    status: "unsafe",
+                    pid: serializedIdentity.pid,
+                    reason: "Serialized Chrome profile identity does not match the retained launch",
+                  };
+                }
+                try {
+                  return await retainedChrome.kill();
+                } catch (error) {
+                  return {
+                    status: "unsafe",
+                    pid: retainedChrome.pid,
+                    reason: error instanceof Error ? error.message : String(error),
+                  };
+                }
+              },
         }
       : (deps.recoveryCleanup ?? {});
 
@@ -597,11 +658,14 @@ export async function resumeBrowserSessionViaNewChrome(
         resolved,
         logger,
         `reattach-${process.pid}`,
+        { launchClaim: acquisitionLaunchClaim },
       );
       manualChromeOwner = owner;
       chrome = owner.chrome;
     } else {
-      chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger);
+      chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger, {
+        launchClaim: acquisitionLaunchClaim,
+      });
     }
     if (
       chrome &&

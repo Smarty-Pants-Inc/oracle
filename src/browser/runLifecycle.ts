@@ -9,6 +9,7 @@ import type {
   BrowserRunTransaction,
 } from "./types.js";
 import {
+  markBrowserCaptureCleanupPending,
   OwnedBrowserResourceTransaction,
   type OwnedBrowserResourceTransactionAdapters,
 } from "./ownedBrowserResources.js";
@@ -159,6 +160,8 @@ export function createBrowserRunTransaction(
 
 export class BrowserRunLifecycleController {
   private state: BrowserRunLifecycleState = { kind: "acquiring" };
+  private promptCommitPersistenceFailure: BrowserAutomationError | null = null;
+  private promptResetPersistenceFailure: BrowserAutomationError | null = null;
 
   constructor(private readonly adapters: BrowserRunLifecycleAdapters) {}
 
@@ -197,6 +200,12 @@ export class BrowserRunLifecycleController {
     return this.promptEpoch()?.status === "committed";
   }
 
+  hasPendingPromptAuthorityJournal(): boolean {
+    return (
+      this.promptCommitPersistenceFailure !== null || this.promptResetPersistenceFailure !== null
+    );
+  }
+
   runtime(base = this.adapters.getRuntime()): BrowserRuntimeMetadata {
     if (this.state.kind === "published") {
       return this.state.settlement.runtime();
@@ -224,11 +233,29 @@ export class BrowserRunLifecycleController {
     ) {
       throw this.illegalTransition("reset prompt authority");
     }
+    const previousState = this.state;
+    if (previousState.kind === "capturing" && this.promptCommitPersistenceFailure) {
+      try {
+        await this.persistRuntime();
+        this.promptCommitPersistenceFailure = null;
+      } catch (cause) {
+        const persistenceFailure = this.promptAuthorityPersistenceError(cause);
+        this.promptCommitPersistenceFailure = persistenceFailure;
+        this.promptResetPersistenceFailure = persistenceFailure;
+        throw persistenceFailure;
+      }
+    }
     this.state = { kind: "ready" };
     try {
       await this.persistRuntime();
+      this.promptResetPersistenceFailure = null;
     } catch (cause) {
-      throw this.promptAuthorityPersistenceError(cause);
+      this.state = previousState;
+      const persistenceFailure = this.promptAuthorityPersistenceError(cause);
+      if (previousState.kind === "capturing") {
+        this.promptResetPersistenceFailure = persistenceFailure;
+      }
+      throw persistenceFailure;
     }
   }
 
@@ -299,10 +326,11 @@ export class BrowserRunLifecycleController {
     this.state = { kind: "capturing", dispatch: { ...pending, verification } };
     try {
       await this.persistRuntime();
+      this.promptCommitPersistenceFailure = null;
     } catch (cause) {
-      // Verification records an external post-effect fact. Keep that exact committed authority
-      // in memory so a disconnect recovery path can publish it even when durability fails.
-      throw this.promptAuthorityPersistenceError(cause);
+      // Verification records an external post-effect fact. Capture must continue with the
+      // exact committed authority in memory; a later reset retries this journal before send.
+      this.promptCommitPersistenceFailure = this.promptAuthorityPersistenceError(cause);
     }
     this.adapters.onPromptCommitted?.();
   }
@@ -326,8 +354,26 @@ export class BrowserRunLifecycleController {
       throw this.illegalTransition("issue captured result for caller publication");
     }
     const settlement = new BrowserCaptureSettlementController(this.adapters, this.runtime(base));
+    const publishedResult = this.promptCommitPersistenceFailure
+      ? {
+          ...result,
+          warnings: [
+            ...(result.warnings ?? []),
+            {
+              code: "prompt-commit-journal-pending",
+              severity: "warning" as const,
+              message:
+                "The prompt commit journal failed after verified dispatch; exact committed authority is retained by this capture transaction.",
+              details: {
+                stage: this.promptCommitPersistenceFailure.details?.stage,
+                code: this.promptCommitPersistenceFailure.details?.code,
+              },
+            },
+          ],
+        }
+      : result;
     this.state = { kind: "published", settlement };
-    return createBrowserRunTransaction(result, settlement);
+    return createBrowserRunTransaction(publishedResult, settlement);
   }
 
   /**
@@ -345,6 +391,17 @@ export class BrowserRunLifecycleController {
 
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
     if (this.state.kind === "published") return null;
+    if (this.state.kind === "capturing" && this.promptResetPersistenceFailure) {
+      const runtime = markBrowserCaptureCleanupPending(this.runtime(this.adapters.getRuntime()));
+      const settlement = new BrowserCaptureSettlementController(this.adapters, runtime);
+      this.state = { kind: "published", settlement };
+      return {
+        status: "pending",
+        runtime: settlement.runtime(),
+        error:
+          "Verified prompt authority could not be reset durably; answer capture and cleanup remain pending.",
+      };
+    }
     const settlement = new BrowserCaptureSettlementController(
       this.adapters,
       this.runtime(this.adapters.getRuntime()),

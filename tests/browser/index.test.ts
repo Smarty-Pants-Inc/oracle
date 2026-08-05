@@ -24,10 +24,10 @@ import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { __test__ as reattachTest } from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
-import {
-  captureProfileDirectoryIdentity,
-  writeOracleChromeOwner,
-  type ChromeProcessIdentity,
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
+import type {
+  ChromeProcessIdentity,
+  ChromeProcessLaunchClaim,
 } from "../../src/browser/profileState.js";
 
 describe("background-only browser policy", () => {
@@ -110,41 +110,47 @@ describe("local acquisition durability", () => {
     }
   });
 
-  test("retains exact temporary Chrome authority across a crash after launch before runtime persistence", async () => {
+  test("recovers one exact temporary Chrome generation after a crash before owner publication", async () => {
     const interruption = new Error("controller interrupted after Chrome launch");
     const runtimeHints: BrowserRuntimeMetadata[] = [];
     let profileDir: string | undefined;
     let ownerIdentity: ChromeProcessIdentity | undefined;
+    let launchClaim: ChromeProcessLaunchClaim | undefined;
 
     vi.resetModules();
     vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
       ...(await importOriginal<typeof ChromeLifecycleModule>()),
-      launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => {
-        profileDir = userDataDir;
-        const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
-        ownerIdentity = {
-          pid: 424_242,
-          processStartTime: "test-process-generation",
-          executablePath:
-            process.platform === "win32"
-              ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
-              : process.platform === "darwin"
-                ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-                : "/usr/bin/google-chrome",
-          normalizedUserDataDir:
-            process.platform === "win32"
-              ? profileDirectory.canonicalPath.toLowerCase()
-              : profileDirectory.canonicalPath,
-          launchNonce: "11111111-1111-4111-8111-111111111111",
-          profileDirectory,
-        };
-        await writeOracleChromeOwner(userDataDir, {
-          port: 9222,
-          processIdentity: ownerIdentity,
-          disposition: "close-on-last-lease",
-        });
-        throw interruption;
-      }),
+      launchChrome: vi.fn(
+        async (
+          _config: unknown,
+          userDataDir: string,
+          _logger: BrowserLogger,
+          deps?: { launchClaim?: ChromeProcessLaunchClaim },
+        ) => {
+          profileDir = userDataDir;
+          launchClaim = deps?.launchClaim;
+          if (!launchClaim) throw new Error("launch claim was not supplied");
+          const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+          ownerIdentity = {
+            pid: 424_242,
+            processStartTime: "test-process-generation",
+            executablePath:
+              process.platform === "win32"
+                ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
+                : process.platform === "darwin"
+                  ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                  : "/usr/bin/google-chrome",
+            normalizedUserDataDir:
+              process.platform === "win32"
+                ? profileDirectory.canonicalPath.toLowerCase()
+                : profileDirectory.canonicalPath,
+            launchNonce: launchClaim.nonce,
+            launchClaim,
+            profileDirectory,
+          };
+          throw interruption;
+        },
+      ),
     }));
 
     try {
@@ -167,27 +173,67 @@ describe("local acquisition durability", () => {
         acquisition: {
           pendingResource: "chrome-process",
           processOwnerProvenance: "temporary-launch",
+          processLaunchClaim: launchClaim,
+          processOwnerDisposition: "close-on-last-lease",
         },
         recoveryCleanup: { keepBrowser: false },
       });
       expect(crashResource?.chromeProcessIdentity).toBeUndefined();
+      if (!profileDir || !ownerIdentity || !launchClaim) {
+        throw new Error("launched Chrome test authority was not captured");
+      }
+      const persistedProfileDir = profileDir;
+      const persistedOwnerIdentity = ownerIdentity;
+      const persistedLaunchClaim = launchClaim;
 
-      const terminateRecordedChromeForProfile = vi.fn(async (_profileDir, identity) => {
-        expect(identity).toEqual(ownerIdentity);
-        return { status: "stopped" as const, pid: identity.pid, signal: "SIGTERM" as const };
-      });
+      const endpointKill = vi.fn(async () => ({
+        status: "stopped" as const,
+        pid: persistedOwnerIdentity.pid,
+        signal: "CONTROL_CHANNEL" as const,
+      }));
+      const releaseEndpointAuthority = vi.fn(async () => undefined);
+      const retainChromeEndpointAuthority = vi.fn(async () => ({
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recovered-launch",
+        kill: endpointKill,
+        release: releaseEndpointAuthority,
+      }));
+      const writeOracleChromeOwner = vi.fn(async () => undefined);
       const removeProfile = vi.fn(async () => true);
       const recoveryLogger: BrowserLogger = vi.fn((_message: string) => {});
       const recovery = await reattachTest.finalizeRecoveredRuntime(crashRuntime, recoveryLogger, {
+        verifyProfileDirectoryIdentity: vi.fn(async () => true),
+        readOracleChromeOwner: vi.fn(async () => null),
+        inspectRunningChromeProcessesForLaunchClaim: vi.fn(async (_candidateDir, claim) => {
+          expect(claim).toEqual(persistedLaunchClaim);
+          return {
+            exactMatches: [{ pid: persistedOwnerIdentity.pid, port: 9222 }],
+            conflictingProfilePids: [],
+          };
+        }),
+        captureChromeProcessIdentity: vi.fn(async (candidateDir, pid, claim) => {
+          expect(candidateDir).toBe(persistedProfileDir);
+          expect(pid).toBe(persistedOwnerIdentity.pid);
+          expect(claim).toEqual(persistedLaunchClaim);
+          return persistedOwnerIdentity;
+        }),
+        inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
+        retainChromeEndpointAuthority,
+        writeOracleChromeOwner,
         verifyChromeProcessIdentity: vi.fn(async () => true),
-        terminateRecordedChromeForProfile,
         removeProfile,
       });
 
+      expect(writeOracleChromeOwner).toHaveBeenCalledWith(persistedProfileDir, {
+        port: 9222,
+        processIdentity: persistedOwnerIdentity,
+        disposition: "close-on-last-lease",
+      });
+      expect(retainChromeEndpointAuthority).toHaveBeenCalledTimes(2);
+      expect(endpointKill).toHaveBeenCalledOnce();
+      expect(releaseEndpointAuthority).toHaveBeenCalledTimes(2);
       expect(recovery.status).toBe("completed");
       expect(recovery.runtime.recoveryCleanupResources).toBeUndefined();
-      expect(terminateRecordedChromeForProfile).toHaveBeenCalledOnce();
-      expect(removeProfile).toHaveBeenCalledWith(profileDir);
+      expect(removeProfile).toHaveBeenCalledWith(persistedProfileDir);
     } finally {
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
       vi.resetModules();

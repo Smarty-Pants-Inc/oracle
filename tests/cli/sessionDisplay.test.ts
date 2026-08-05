@@ -583,6 +583,9 @@ describe("attachSession rendering", () => {
       expect.any(Function),
       expect.objectContaining({
         recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryCleanup: {
+          retainChromeEndpointAuthority: expect.any(Function),
+        },
         isRemotePublicationAcknowledged: expect.any(Function),
       }),
       "finalize",
