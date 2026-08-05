@@ -164,7 +164,12 @@ describe("remote browser unpublished cleanup", () => {
     });
     const client = {
       Network: { enable: vi.fn(async () => undefined) },
-      Page: { enable: vi.fn(async () => undefined) },
+      Page: {
+        enable: vi.fn(async () => undefined),
+        navigate: vi.fn(async () => {
+          throw originalFailure;
+        }),
+      },
       Runtime: { enable: vi.fn(async () => undefined), evaluate },
       Input: {},
       DOM: { enable: vi.fn(async () => undefined) },
