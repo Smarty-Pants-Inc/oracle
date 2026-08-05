@@ -20,6 +20,8 @@ import type {
 } from "../../src/browser/types.js";
 import {
   captureProfileDirectoryIdentity,
+  readOracleChromeOwner,
+  writeOracleChromeOwner,
   type ChromeProcessIdentity,
 } from "../../src/browser/profileState.js";
 import type { RemoteRecoverySettlementOptions } from "../../src/remote/types.js";
@@ -230,6 +232,7 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     },
     processIdentity,
     source,
+    disposition: source === "launched" ? "close-on-last-lease" : "preserve",
   };
   const acquireManualChromeOwner = vi.fn(async () => {
     acquisitionOrder.push("acquire:chrome-process");
@@ -247,6 +250,7 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     acquisitionOrder.push(`persist:${pendingResource ?? "acquired"}`);
     runtimeHints.push(structuredClone(hintedRuntime));
   });
+  const releaseRecoveryLock = vi.fn(async () => undefined);
 
   const result = await resumeBrowserSession(
     withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/test-conversation" }),
@@ -257,6 +261,7 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     },
     vi.fn() as BrowserLogger,
     {
+      acquireRecoveryLock: vi.fn(async () => ({ release: releaseRecoveryLock })),
       acquireBrowserTabLease: acquireBrowserTabLease as never,
       acquireManualChromeOwner: acquireManualChromeOwner as never,
       createRecoveryTarget,
@@ -293,6 +298,7 @@ async function resumeFallbackWithManualOwner(profileDir: string, source: ManualO
     cleanupOrder,
     acquisitionOrder,
     runtimeHints,
+    releaseRecoveryLock,
     acquireBrowserTabLease,
     acquireManualChromeOwner,
     createRecoveryTarget,
@@ -829,6 +835,123 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     }
   });
 
+  test("keeps fallback process acquisition pending when its post-owner persistence is interrupted", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-crash-window-"));
+    const processIdentity = await physicalChromeProcessIdentity(profileDir, 5_151);
+    const interruption = new Error("controller interrupted after canonical owner creation");
+    const runtimeHints: BrowserRuntimeMetadata[] = [];
+    const retainedKill = vi.fn(async () => ({
+      status: "unsafe" as const,
+      pid: processIdentity.pid,
+      reason: "simulated process interruption retained no live kill handle",
+    }));
+    const releaseRecoveryLock = vi.fn(async () => undefined);
+    const owner = {
+      chrome: {
+        pid: processIdentity.pid,
+        port: 9222,
+        host: "127.0.0.1",
+        remoteDebuggingPipes: undefined,
+        processIdentity,
+        kill: retainedKill,
+      },
+      processIdentity,
+      source: "launched" as const,
+      disposition: "close-on-last-lease" as const,
+    };
+    const releaseBrowserTabLease = vi.fn(
+      async (
+        _profileDir: string,
+        _leaseId: string,
+        _logger?: BrowserLogger,
+        options?: {
+          onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
+          expectedProfileIdentity?: ChromeProcessIdentity["profileDirectory"];
+        },
+      ) => {
+        await options?.onRelease?.({ isLastLease: true });
+      },
+    );
+    const acquireManualChromeOwner = vi.fn(async () => {
+      await writeOracleChromeOwner(profileDir, {
+        port: owner.chrome.port,
+        processIdentity,
+        disposition: owner.disposition,
+      });
+      return owner;
+    });
+
+    try {
+      await expect(
+        resumeBrowserSession(
+          withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/crash-window" }),
+          { manualLogin: true, manualLoginProfileDir: profileDir, timeoutMs: 1_000 },
+          vi.fn() as BrowserLogger,
+          {
+            acquireBrowserTabLease: vi.fn(async () => ({
+              id: "crash-window-lease",
+              profileDirectory: processIdentity.profileDirectory,
+              update: vi.fn(async () => undefined),
+              release: vi.fn(async () => undefined),
+            })) as never,
+            acquireManualChromeOwner: acquireManualChromeOwner as never,
+            runtimeHintCb: async (hint) => {
+              runtimeHints.push(structuredClone(hint));
+              if (
+                hint.recoveryCleanupResources?.at(-1)?.acquisition?.pendingResource ===
+                "chrome-target"
+              ) {
+                throw interruption;
+              }
+            },
+            recoveryCleanup: { releaseBrowserTabLease },
+            acquireRecoveryLock: vi.fn(async () => ({ release: releaseRecoveryLock })),
+          },
+        ),
+      ).rejects.toMatchObject({ details: { code: "fallback-cleanup-pending" } });
+
+      expect(await readOracleChromeOwner(profileDir)).toMatchObject({
+        processIdentity,
+        disposition: "close-on-last-lease",
+      });
+      const crashRuntime = runtimeHints.find(
+        (hint) =>
+          hint.recoveryCleanupResources?.at(-1)?.acquisition?.pendingResource === "chrome-process",
+      );
+      if (!crashRuntime) throw new Error("Chrome process acquisition intent was not persisted");
+      const crashResource = crashRuntime?.recoveryCleanupResources?.at(-1);
+      expect(crashResource).toMatchObject({
+        acquisition: {
+          pendingResource: "chrome-process",
+          processOwnerProvenance: "manual-canonical-owner",
+        },
+      });
+      expect(crashResource?.chromeProcessIdentity).toBeUndefined();
+
+      const terminateRecordedChromeForProfile = vi.fn(async () => ({
+        status: "stopped" as const,
+        pid: processIdentity.pid,
+        signal: "SIGTERM" as const,
+      }));
+      const recovery = await __test__.finalizeRecoveredRuntime(
+        crashRuntime,
+        vi.fn() as BrowserLogger,
+        {
+          readOracleChromeOwner: vi.fn(async () => null),
+          terminateRecordedChromeForProfile,
+        },
+      );
+
+      expect(recovery.status).toBe("pending");
+      expect(recovery.runtime.recoveryCleanupResources).toEqual([crashResource]);
+      expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+      expect(retainedKill).not.toHaveBeenCalled();
+      expect(releaseRecoveryLock).toHaveBeenCalledOnce();
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
   test("fallback reattach uses retained kill authority for a temporary Chrome launch", async () => {
     let profileDir: string | null = null;
     const cleanupOrder: string[] = [];
@@ -947,6 +1070,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         cleanupStaleProfileState,
         kill,
         cleanupOrder,
+        releaseRecoveryLock,
       } = await resumeFallbackWithManualOwner(profileDir, "launched");
 
       expect(result.runtime.recoveryCleanupResources).toEqual([
@@ -968,6 +1092,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       expect(kill).toHaveBeenCalledOnce();
       expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
       expect(cleanupStaleProfileState).toHaveBeenCalledOnce();
+      expect(releaseRecoveryLock).toHaveBeenCalledOnce();
       expect(cleanupOrder).toEqual(["target", "lease", "kill", "cleanup-profile"]);
     } finally {
       await rm(profileDir, { recursive: true, force: true });
@@ -986,6 +1111,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
           cleanupStaleProfileState,
           kill,
           cleanupOrder,
+          releaseRecoveryLock,
         } = await resumeFallbackWithManualOwner(profileDir, source);
 
         expect(result.runtime.recoveryCleanupResources).toEqual([
@@ -994,7 +1120,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
             tabLease: expect.any(Object),
             recoveryCleanup: {
               ownsTarget: true,
-              profileKind: "none",
+              profileKind: "manual-login",
               keepBrowser: true,
               closeOwnedTargetOnComplete: true,
             },
@@ -1007,6 +1133,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
         expect(cleanupStaleProfileState).not.toHaveBeenCalled();
         expect(kill).not.toHaveBeenCalled();
+        expect(releaseRecoveryLock).toHaveBeenCalledOnce();
         expect(cleanupOrder).toEqual(["target", "lease"]);
       } finally {
         await rm(profileDir, { recursive: true, force: true });
@@ -2856,6 +2983,42 @@ describe("recovery resource finalization", { timeout: 15_000 }, () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("releases the recovery lock after pending cleanup and reacquires it for retry", async () => {
+    const runtime = withCommittedPromptEpoch();
+    const lockReleases = [vi.fn(async () => undefined), vi.fn(async () => undefined)];
+    let nextLock = 0;
+    const acquireRecoveryLock = vi.fn(async () => {
+      const release = lockReleases[nextLock];
+      nextLock += 1;
+      if (!release) throw new Error("unexpected recovery lock acquisition");
+      return { release };
+    });
+    let cleanupAttempt = 0;
+    const finalizeResources = vi.fn(async () => {
+      cleanupAttempt += 1;
+      return cleanupAttempt === 1
+        ? { status: "pending" as const, runtime, error: "cleanup remains pending" }
+        : { status: "completed" as const, runtime };
+    });
+    const result = await resumeBrowserSession(runtime, {}, vi.fn() as BrowserLogger, {
+      acquireRecoveryLock,
+      recoverSession: vi.fn(async () => ({
+        answerText: "captured",
+        answerMarkdown: "captured",
+        finalizeResources,
+      })),
+    });
+
+    await expect(result.finalize()).resolves.toMatchObject({ status: "pending" });
+    expect(acquireRecoveryLock).toHaveBeenCalledOnce();
+    expect(lockReleases[0]).toHaveBeenCalledOnce();
+
+    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+    expect(acquireRecoveryLock).toHaveBeenCalledTimes(2);
+    expect(lockReleases[1]).toHaveBeenCalledOnce();
+    expect(finalizeResources).toHaveBeenCalledTimes(2);
   });
 
   test("does not finalize resources after failed fallback recovery", async () => {

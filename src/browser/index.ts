@@ -213,10 +213,10 @@ function shouldKeepLocalBrowserOpen(options: {
 function shouldPreserveLocalOwnerForRecovery(options: {
   effectiveKeepBrowser: boolean;
   manualLogin: boolean;
-  ownerSource: ManualChromeOwner["source"];
+  ownerDisposition: ManualChromeOwner["disposition"];
 }): boolean {
   return (
-    options.effectiveKeepBrowser || (options.manualLogin && options.ownerSource !== "launched")
+    options.effectiveKeepBrowser || (options.manualLogin && options.ownerDisposition === "preserve")
   );
 }
 
@@ -1441,7 +1441,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       keepBrowser: shouldPreserveLocalOwnerForRecovery({
         effectiveKeepBrowser,
         manualLogin,
-        ownerSource: chromeOwnerSource,
+        ownerDisposition: chromeOwnerDisposition,
       }),
       closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
         runStatus,
@@ -1502,6 +1502,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           : undefined,
       acquisition: {
         generationId: acquisitionGenerationId,
+        processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
         ...(pendingResource ? { pendingResource } : {}),
         ...(config.browserTabRef ? {} : { targetMarkerUrl: acquisitionTargetMarkerUrl }),
       },
@@ -1512,9 +1513,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           ? shouldPreserveLocalOwnerForRecovery({
               effectiveKeepBrowser,
               manualLogin,
-              ownerSource: owner.source,
+              ownerDisposition: owner.disposition,
             })
-          : true,
+          : manualLogin
+            ? true
+            : effectiveKeepBrowser,
         closeOwnedTargetOnComplete: acquisitionOwnsTarget,
       },
     };
@@ -1615,6 +1618,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         chrome,
         processIdentity: chrome.processIdentity,
         source: "launched",
+        disposition: "close-on-last-lease",
       };
     }
     await persistLocalAcquisition(
@@ -1667,7 +1671,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     throw new Error("Chrome acquisition completed without an owner record.");
   }
   const acquiredChromeOwner = acquiredChrome;
-  const { chrome, source: chromeOwnerSource } = acquiredChromeOwner;
+  const {
+    chrome,
+    source: chromeOwnerSource,
+    disposition: chromeOwnerDisposition,
+  } = acquiredChromeOwner;
   const chromeHost = chrome.host ?? "127.0.0.1";
   if (tabLease) {
     await tabLease.update({
@@ -1746,7 +1754,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     removeTerminationHooks = registerTerminationHooks(
       chrome,
       userDataDir,
-      effectiveKeepBrowser || (manualLogin && chromeOwnerSource !== "launched"),
+      effectiveKeepBrowser || (manualLogin && chromeOwnerDisposition === "preserve"),
       logger,
       {
         isInFlight: () => runStatus !== "complete",
@@ -1786,6 +1794,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     });
     return disconnectAssessmentPromise;
   };
+  let manualOwnerSettled = false;
   let closedOwnedTargetId: string | null = null;
   let releasedTabLeaseId: string | null = null;
   async function settleLocalResources(
@@ -1812,7 +1821,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         ? pendingOwnsTarget && manualLogin
         : pendingOwnsTarget && finalizeTargetCloseDecision === true);
     let keepBrowserOpen = aborting
-      ? manualLogin && (effectiveKeepBrowser || chromeOwnerSource !== "launched")
+      ? manualLogin && (effectiveKeepBrowser || chromeOwnerDisposition === "preserve")
       : shouldKeepLocalBrowserOpen({
           effectiveKeepBrowser,
           preserveBrowserOnError,
@@ -1881,9 +1890,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             teardownError = settlement.reason;
             return false;
           }
+          manualOwnerSettled = true;
           if (settlement.status === "preserved") {
             keepBrowserOpen = true;
-            logger("[browser] Reused canonical Chrome owner; leaving shared Chrome running.");
+            logger("[browser] Preserved canonical Chrome owner; leaving shared Chrome running.");
           }
           return true;
         } catch (error) {
@@ -1952,6 +1962,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         logger(
           "[browser] Manual-login cleanup has no retained lease teardown authority; preserving Chrome resources.",
         );
+      }
+    }
+    if (manualLogin && chromeOwnerDisposition === "preserve" && !manualOwnerSettled) {
+      const settlement = await settleManualChromeOwner(userDataDir, acquiredChromeOwner, logger);
+      if (settlement.status === "unsafe") {
+        keepBrowserOpen = true;
+        errors.push(settlement.reason);
+        logger(`[browser] Preserving shared Chrome resources: ${settlement.reason}`);
+      } else {
+        manualOwnerSettled = true;
+        keepBrowserOpen = true;
       }
     }
     if (!keepBrowserOpen && !manualLogin) {
@@ -3290,6 +3311,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         await writeOracleChromeOwner(userDataDir, {
           port: chrome.port,
           processIdentity: chrome.processIdentity,
+          disposition: chromeOwnerDisposition,
         });
       } catch (ownerError) {
         logger(

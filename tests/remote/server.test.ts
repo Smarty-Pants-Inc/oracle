@@ -18,7 +18,11 @@ import {
   resumeRemoteBrowserTransaction,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
-import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
+import type {
+  BrowserRunOptions,
+  BrowserRunResult,
+  BrowserRunTransaction,
+} from "../../src/browserMode.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
 import type { ReattachDeps } from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
@@ -43,6 +47,13 @@ import {
   sameProfileDirectoryIdentity,
   writeOracleChromeOwner,
 } from "../../src/browser/profileState.js";
+import {
+  BrowserCaptureSettlementController,
+  completedBrowserCaptureCleanup,
+  createBrowserRunTransaction,
+  pendingBrowserCaptureCleanup,
+  type BrowserCaptureSettlementAdapters,
+} from "../../src/browser/runLifecycle.js";
 
 const CAN_LISTEN_LOCALHOST =
   spawnSync(
@@ -102,6 +113,32 @@ function browserTransaction(
       callbacks.finalize ?? (async () => ({ status: "completed", runtime: capturedRuntime })),
     abort: callbacks.abort ?? (async () => ({ status: "completed", runtime: capturedRuntime })),
   };
+}
+
+function lifecycleBrowserTransaction(
+  prompt: string,
+  result: BrowserRunResult,
+  runtime: BrowserRunTransaction["runtime"],
+  runtimeHintCb: BrowserRunOptions["runtimeHintCb"],
+  settleResources: BrowserCaptureSettlementAdapters["settleResources"],
+  followUpOrdinal = 0,
+): BrowserRunTransaction {
+  const conversationId = result.conversationId?.trim() || "remote-conversation";
+  const capturedRuntime: BrowserRunTransaction["runtime"] = {
+    ...runtime,
+    conversationId,
+    promptEpoch: committedPromptEpoch(prompt, conversationId, followUpOrdinal),
+  };
+  const settlement = new BrowserCaptureSettlementController(
+    {
+      persistRuntime: async (pendingRuntime) => {
+        await runtimeHintCb?.(pendingRuntime);
+      },
+      settleResources,
+    },
+    capturedRuntime,
+  );
+  return createBrowserRunTransaction({ ...result, conversationId }, settlement);
 }
 
 describe("remote browser service", { timeout: 15_000 }, () => {
@@ -326,6 +363,81 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       await server.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST).each(["finalize", "abort"] as const)(
+    "persists the exact bound %s runtime before executing live cleanup",
+    async (mode) => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), `oracle-remote-${mode}-runtime-`));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const cleanupMarker = path.join(tmpDir, "cleanup-pending");
+      await writeFile(cleanupMarker, "owned", "utf8");
+      const cleanupModes: Array<"finalize" | "abort"> = [];
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: `${mode}-target`,
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: `${mode}-target`,
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) =>
+            lifecycleBrowserTransaction(
+              options.prompt,
+              {
+                answerText: mode,
+                answerMarkdown: mode,
+                tookMs: 1,
+                answerTokens: 1,
+                answerChars: mode.length,
+              },
+              runtime,
+              options.runtimeHintCb,
+              async (settlementMode, pendingRuntime) => {
+                cleanupModes.push(settlementMode);
+                await rm(cleanupMarker);
+                return completedBrowserCaptureCleanup(pendingRuntime);
+              },
+            ),
+        },
+      );
+
+      try {
+        const transaction = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        })({ prompt: `${mode} exact settlement`, config: {} });
+        expect(existsSync(cleanupMarker)).toBe(true);
+        await expect(transaction[mode]()).resolves.toMatchObject({ status: "completed" });
+        expect(cleanupModes).toEqual([mode]);
+        expect(existsSync(cleanupMarker)).toBe(false);
+        const oppositeMode = mode === "finalize" ? "abort" : "finalize";
+        await expect(transaction[oppositeMode]()).rejects.toMatchObject({
+          details: { code: "settlement-mode-conflict" },
+        });
+
+        const recordName = (await readdir(transactionStoreDir)).find((name) =>
+          name.endsWith(".json"),
+        );
+        if (!recordName) throw new Error("missing durable remote transaction record");
+        await expect(
+          readFile(path.join(transactionStoreDir, recordName), "utf8"),
+        ).resolves.toContain(`"settlementMode": "${mode}"`);
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     },
   );
 
@@ -1327,9 +1439,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "retries pending remote finalization from durable cleanup authority",
+    "retries partial live cleanup only in its durable settlement mode",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-finalize-retry-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const firstCleanupMarker = path.join(tmpDir, "first-cleanup-pending");
+      const secondCleanupMarker = path.join(tmpDir, "second-cleanup-pending");
+      await writeFile(firstCleanupMarker, "owned", "utf8");
+      await writeFile(secondCleanupMarker, "owned", "utf8");
       const runtime: BrowserRunTransaction["runtime"] = {
         chromePort: 9222,
         recoveryCleanupResources: [
@@ -1344,28 +1461,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      let finalizationAttempt = 0;
-      const finalize = vi.fn(async () => {
-        finalizationAttempt += 1;
-        return finalizationAttempt === 1
-          ? {
-              status: "pending" as const,
-              runtime: {
-                ...runtime,
-                recoveryCleanupResult: { status: "failed" as const, error: "Chrome still busy" },
-              },
-              error: "Chrome still busy",
-            }
-          : { status: "completed" as const, runtime };
-      });
-      const retryCleanup = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      let cleanupAttempts = 0;
       const server = await createRemoteServer(
         { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
         {
-          transactionStoreDir: path.join(tmpDir, "transactions"),
-          retryCleanup,
+          transactionStoreDir,
           runBrowser: async (options) =>
-            browserTransaction(
+            lifecycleBrowserTransaction(
               options.prompt,
               {
                 answerText: "done",
@@ -1375,7 +1477,20 @@ describe("remote browser service", { timeout: 15_000 }, () => {
                 answerChars: 4,
               },
               runtime,
-              { finalize },
+              options.runtimeHintCb,
+              async (settlementMode, pendingRuntime) => {
+                cleanupAttempts += 1;
+                if (cleanupAttempts === 1) {
+                  await rm(firstCleanupMarker);
+                  return pendingBrowserCaptureCleanup(
+                    pendingRuntime,
+                    "Chrome still busy",
+                    settlementMode,
+                  );
+                }
+                await rm(secondCleanupMarker);
+                return completedBrowserCaptureCleanup(pendingRuntime);
+              },
             ),
         },
       );
@@ -1393,17 +1508,30 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             recoveryCleanupResult: { status: "failed", settlementMode: "finalize" },
           },
         });
-        await expect(
-          settleRemoteBrowserRecovery({
-            runtime: firstFinalization.runtime,
-            configuredHost: "attacker.invalid:9443",
-            authToken: "secret",
-          }),
-        ).resolves.toMatchObject({
-          status: "pending",
-          error: expect.stringContaining("refusing to send credentials"),
+        expect(cleanupAttempts).toBe(1);
+        expect(existsSync(firstCleanupMarker)).toBe(false);
+        expect(existsSync(secondCleanupMarker)).toBe(true);
+        await expect(transaction.abort()).rejects.toMatchObject({
+          details: { code: "settlement-mode-conflict" },
         });
-        expect(retryCleanup).not.toHaveBeenCalled();
+        expect(cleanupAttempts).toBe(1);
+
+        const recordName = (await readdir(transactionStoreDir)).find((name) =>
+          name.endsWith(".json"),
+        );
+        if (!recordName) throw new Error("missing durable remote transaction record");
+        const partialRecord = JSON.parse(
+          await readFile(path.join(transactionStoreDir, recordName), "utf8"),
+        );
+        expect(partialRecord).toMatchObject({
+          state: "pending",
+          settlementMode: "finalize",
+          runtime: {
+            recoveryCleanupResult: { status: "failed", settlementMode: "finalize" },
+          },
+          finalization: { status: "pending" },
+        });
+
         await expect(
           settleRemoteBrowserRecovery({
             runtime: firstFinalization.runtime,
@@ -1411,9 +1539,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             authToken: "secret",
           }),
         ).resolves.toMatchObject({ status: "completed" });
+        expect(cleanupAttempts).toBe(2);
+        expect(existsSync(secondCleanupMarker)).toBe(false);
         await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
-        expect(finalize).toHaveBeenCalledTimes(2);
-        expect(retryCleanup).not.toHaveBeenCalled();
+        expect(cleanupAttempts).toBe(2);
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -1601,6 +1730,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-restart-capture-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
+      const cleanupMarker = path.join(tmpDir, "recovered-cleanup-pending");
+      await writeFile(cleanupMarker, "owned", "utf8");
       let transactionToken = "";
       const prompt = "recover after restart";
       const runtime: BrowserRunTransaction["runtime"] = {
@@ -1652,12 +1783,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await first.close();
       }
 
-      const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
-      const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
+      const cleanupModes: Array<"finalize" | "abort"> = [];
       const resumeBrowser = vi.fn(
         async (
           journaledRuntime: BrowserRunTransaction["runtime"],
           browserConfig: BrowserSessionConfig | undefined,
+          _logger: BrowserLogger,
+          deps: ReattachDeps = {},
         ) => {
           expect(journaledRuntime).toMatchObject({
             chromePort: 9222,
@@ -1668,12 +1800,29 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             remoteChrome: null,
             attachRunning: false,
           });
+          const transaction = lifecycleBrowserTransaction(
+            prompt,
+            {
+              answerText: "recovered answer",
+              answerMarkdown: "recovered answer",
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 16,
+            },
+            journaledRuntime,
+            deps.runtimeHintCb,
+            async (settlementMode, pendingRuntime) => {
+              cleanupModes.push(settlementMode);
+              await rm(cleanupMarker);
+              return completedBrowserCaptureCleanup(pendingRuntime);
+            },
+          );
           return {
-            answerText: "recovered answer",
-            answerMarkdown: "recovered answer",
-            runtime: journaledRuntime,
-            finalize,
-            abort,
+            answerText: transaction.answerText,
+            answerMarkdown: transaction.answerMarkdown,
+            runtime: transaction.runtime,
+            finalize: transaction.finalize,
+            abort: transaction.abort,
           };
         },
       );
@@ -1715,8 +1864,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: { durablePublication: true },
         });
         expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
-        expect(finalize).toHaveBeenCalledOnce();
-        expect(abort).not.toHaveBeenCalled();
+        expect(cleanupModes).toEqual(["finalize"]);
+        expect(existsSync(cleanupMarker)).toBe(false);
       } finally {
         await restarted.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -2037,6 +2186,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await writeOracleChromeOwner(canonicalProfileDir, {
         port: chromePort,
         processIdentity: identity,
+        disposition: "close-on-last-lease",
       });
       const prompt = "restart cleanup authority";
       const transactionToken = "d".repeat(64);
@@ -2098,6 +2248,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           await expect(readOracleChromeOwner(recordedProfileDir)).resolves.toEqual({
             port: chromePort,
             processIdentity: identity,
+            disposition: "close-on-last-lease",
           });
           return {
             status: "stopped" as const,

@@ -207,7 +207,7 @@ export async function launchChrome(
   }
   const kill = await createOwnerBoundChromeKill(
     launchUserDataDir,
-    { port: launcher.port, processIdentity },
+    { port: launcher.port, processIdentity, disposition: "close-on-last-lease" },
     stableKill,
     { writeOwner: deps.writeOwner },
   );

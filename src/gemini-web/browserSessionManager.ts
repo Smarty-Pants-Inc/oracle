@@ -6,7 +6,11 @@ import { pendingBrowserCaptureCleanup } from "../browser/runLifecycle.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { connectWithNewTab, closeTab } from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
-import { acquireManualChromeOwner, type ManualChromeOwner } from "../browser/manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  settleManualChromeOwner,
+  type ManualChromeOwner,
+} from "../browser/manualChromeOwner.js";
 import {
   cleanupStaleProfileState,
   isSafeChromeTerminationOutcome,
@@ -47,7 +51,6 @@ export async function openGeminiBrowserSession(
   });
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
-  const keepBrowser = Boolean(resolvedConfig.keepBrowser);
   const tabLease = await acquireBrowserTabLease(profileDir, {
     maxConcurrentTabs: resolvedConfig.maxConcurrentTabs,
     timeoutMs: resolvedConfig.timeoutMs,
@@ -108,7 +111,7 @@ export async function openGeminiBrowserSession(
   let closeCompleted = false;
   let closeAttempt: Promise<void> | null = null;
   const teardownAuthority =
-    !keepBrowser && owner.source === "launched"
+    owner.disposition === "close-on-last-lease"
       ? retainBrowserTabLeaseTeardownAuthority(profileDir, tabLease, { logger })
       : null;
 
@@ -118,7 +121,7 @@ export async function openGeminiBrowserSession(
     return new Error(`Gemini browser session did not settle cleanly: ${action}${detail}`);
   };
 
-  const settleLaunchedOwner = async (): Promise<void> => {
+  const settleCloseOnLastLeaseOwner = async (): Promise<void> => {
     if (!ownerTerminated) {
       let termination: RecordedChromeTerminationOutcome;
       try {
@@ -217,7 +220,7 @@ export async function openGeminiBrowserSession(
       let teardownError: string | null = null;
       const outcome = await teardownAuthority.settle(async () => {
         try {
-          await settleLaunchedOwner();
+          await settleCloseOnLastLeaseOwner();
           return true;
         } catch (error) {
           teardownError = error instanceof Error ? error.message : String(error);
@@ -238,6 +241,12 @@ export async function openGeminiBrowserSession(
         throw cleanupFailure("could not release its browser tab lease", error);
       }
       leaseReleased = true;
+      const settlement = await settleManualChromeOwner(profileDir, owner, logger);
+      if (settlement.status === "unsafe") {
+        throw cleanupFailure(
+          `could not release its preserved Chrome authority: ${settlement.reason}`,
+        );
+      }
     }
     closeCompleted = true;
   };

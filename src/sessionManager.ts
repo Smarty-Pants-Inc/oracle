@@ -121,11 +121,15 @@ export interface BrowserRecoveryTabLeaseMetadata {
   id: string;
   profileDirectory: ProfileDirectoryIdentity;
 }
+export type BrowserProcessAcquisitionProvenance = "temporary-launch" | "manual-canonical-owner";
+
 export interface BrowserRecoveryAcquisitionMetadata {
   /** Stable authority generation shared by the intent and every acquired identity. */
   generationId: string;
   /** Side effect that may be in flight when this runtime snapshot is recovered. */
   pendingResource?: "tab-lease" | "chrome-process" | "chrome-target";
+  /** The authority plane expected to record an exact owner after Chrome acquisition. */
+  processOwnerProvenance?: BrowserProcessAcquisitionProvenance;
   /** Unique initial URL used to rediscover a target created inside a crash window. */
   targetMarkerUrl?: string;
 }

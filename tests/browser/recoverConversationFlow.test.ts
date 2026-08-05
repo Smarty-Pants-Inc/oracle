@@ -49,6 +49,64 @@ const readyHarvest = {
 // Each case dynamically imports the subject after installing isolated module mocks.
 const logger = (_message: string) => {};
 
+function retainBrowserTabLeaseTeardownAuthorityForTest(
+  _profileDir: string,
+  lease: {
+    release: (options?: {
+      onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
+    }) => Promise<void>;
+  },
+) {
+  let leaseReleased = false;
+  let wasLastLease = false;
+  return {
+    get leaseReleased() {
+      return leaseReleased;
+    },
+    async settle(teardown: () => Promise<boolean>) {
+      let teardownSucceeded = false;
+      if (!leaseReleased) {
+        await lease.release({
+          onRelease: async ({ isLastLease }) => {
+            wasLastLease = isLastLease;
+            if (isLastLease) teardownSucceeded = await teardown();
+          },
+        });
+        leaseReleased = true;
+      } else if (wasLastLease) {
+        teardownSucceeded = await teardown();
+      }
+      if (wasLastLease && !teardownSucceeded) {
+        return { status: "preserved" as const, reason: "teardown-unsafe" as const };
+      }
+      return {
+        status: "completed" as const,
+        disposition: wasLastLease
+          ? ("teardown-completed" as const)
+          : ("active-lease-handoff" as const),
+      };
+    },
+  };
+}
+
+async function settleManualChromeOwnerForTest(
+  _profileDir: string,
+  owner: {
+    disposition: "preserve" | "close-on-last-lease";
+    chrome: { kill: () => Promise<{ status: string; reason?: string }> };
+    endpointAuthority?: { release: () => Promise<void> };
+  },
+) {
+  if (owner.disposition === "preserve") {
+    await owner.endpointAuthority?.release();
+    return { status: "preserved" as const };
+  }
+  const outcome = await owner.chrome.kill();
+  return outcome.status === "stopped" || outcome.status === "already-stopped"
+    ? { status: "terminated" as const }
+    : { status: "unsafe" as const, reason: outcome.reason ?? "termination failed" };
+}
+
 describe("recoverConversationTab lease ownership", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -72,7 +130,7 @@ describe("recoverConversationTab lease ownership", () => {
     const chrome = { host: "127.0.0.1", port: 53999, kill: vi.fn(), process: undefined };
     const acquireManualChromeOwner = vi.fn(async () => {
       events.push("owner");
-      return { chrome, source: "recorded" as const };
+      return { chrome, source: "recorded" as const, disposition: "preserve" as const };
     });
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
@@ -81,12 +139,16 @@ describe("recoverConversationTab lease ownership", () => {
       openChatGptTarget,
       harvestChatGptTab: vi.fn(async () => readyHarvest),
     }));
-    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+      acquireManualChromeOwner,
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
+    }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
       DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
       normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
       acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 
@@ -138,13 +200,16 @@ describe("recoverConversationTab lease ownership", () => {
       acquireManualChromeOwner: vi.fn(async () => ({
         chrome: { host: "127.0.0.1", port: 53994, kill: vi.fn() },
         source: "recorded" as const,
+        disposition: "preserve" as const,
       })),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
       DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
       normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
       acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 
@@ -186,7 +251,11 @@ describe("recoverConversationTab lease ownership", () => {
         signal: "SIGTERM" as const,
       })),
     };
-    const acquireManualChromeOwner = vi.fn(async () => ({ chrome, source: "launched" as const }));
+    const acquireManualChromeOwner = vi.fn(async () => ({
+      chrome,
+      source: "launched" as const,
+      disposition: "close-on-last-lease" as const,
+    }));
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -194,12 +263,16 @@ describe("recoverConversationTab lease ownership", () => {
       openChatGptTarget,
       harvestChatGptTab: vi.fn(async () => readyHarvest),
     }));
-    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({ acquireManualChromeOwner }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+      acquireManualChromeOwner,
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
+    }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
       DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
       normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
       acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 
@@ -215,6 +288,9 @@ describe("recoverConversationTab lease ownership", () => {
     });
     expect(closeChromeTarget).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(
+      expect.objectContaining({ onRelease: expect.any(Function) }),
+    );
     expect(chrome.kill).toHaveBeenCalledTimes(1);
   });
 
@@ -244,13 +320,19 @@ describe("recoverConversationTab lease ownership", () => {
       harvestChatGptTab: vi.fn(async () => ({ ...readyHarvest, assistantCount: 0 })),
     }));
     vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
-      acquireManualChromeOwner: vi.fn(async () => ({ chrome, source: "launched" as const })),
+      acquireManualChromeOwner: vi.fn(async () => ({
+        chrome,
+        source: "launched" as const,
+        disposition: "close-on-last-lease" as const,
+      })),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
       DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
       normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
       acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 
@@ -292,7 +374,12 @@ describe("recoverConversationTab lease ownership", () => {
       harvestChatGptTab: vi.fn(),
     }));
     vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
-      acquireManualChromeOwner: vi.fn(async () => ({ chrome, source: "launched" as const })),
+      acquireManualChromeOwner: vi.fn(async () => ({
+        chrome,
+        source: "launched" as const,
+        disposition: "close-on-last-lease" as const,
+      })),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
@@ -303,6 +390,7 @@ describe("recoverConversationTab lease ownership", () => {
         update: vi.fn(async () => undefined),
         release,
       })),
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 
@@ -339,13 +427,16 @@ describe("recoverConversationTab lease ownership", () => {
       acquireManualChromeOwner: vi.fn(async () => ({
         chrome: { host: "127.0.0.1", port: 53996, kill: vi.fn() },
         source: "recorded" as const,
+        disposition: "preserve" as const,
       })),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({ closeChromeTarget }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
       DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
       normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
       acquireBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
     vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
 

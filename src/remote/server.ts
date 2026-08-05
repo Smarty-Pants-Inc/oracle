@@ -60,6 +60,7 @@ import { delay, normalizeChatgptUrl, estimateTokenCount } from "../browser/utils
 import { sanitizeArtifactFilename, sanitizeArtifactMimeType } from "../browser/artifacts.js";
 import type {
   BrowserRemotePromptRequestIdentity,
+  BrowserModelSelectionEvidence,
   BrowserRuntimeMetadata,
   BrowserSessionConfig,
   SessionArtifact,
@@ -901,9 +902,13 @@ async function handleRemoteRunRequest(params: {
       sessionId: payload.options.sessionId,
       followUpPrompts: payload.options.followUpPrompts,
       runtimeHintCb: (runtime, modelSelection) =>
-        params.transactionStore
-          .journalRuntime(params.transactionToken, runtime, modelSelection)
-          .then(() => undefined),
+        persistRemoteBrowserRuntime({
+          transactionStore: params.transactionStore,
+          transactionToken: params.transactionToken,
+          runtime,
+          modelSelection,
+          phase: "running",
+        }),
     });
     assertBrowserRunTransaction(capture);
     const capturedTransaction = capture;
@@ -1147,12 +1152,13 @@ async function serveRemoteTransactionRetry(params: {
           record.browserConfig,
           params.logger,
           {
-            runtimeHintCb: async (runtime) => {
-              await params.transactionStore.journalRecoveryRuntime(
-                record.transactionToken,
+            runtimeHintCb: (runtime) =>
+              persistRemoteBrowserRuntime({
+                transactionStore: params.transactionStore,
+                transactionToken: record.transactionToken,
                 runtime,
-              );
-            },
+                phase: "recovery",
+              }),
           },
         );
       } catch (rawError) {
@@ -1308,6 +1314,28 @@ async function serveRemoteTransactionSettlement(params: {
     }
     throw error;
   }
+}
+
+async function persistRemoteBrowserRuntime(params: {
+  transactionStore: RemoteTransactionStore;
+  transactionToken: string;
+  runtime: BrowserRuntimeMetadata;
+  modelSelection?: BrowserModelSelectionEvidence;
+  phase: "running" | "recovery";
+}): Promise<void> {
+  if (params.runtime.recoveryCleanupResult?.settlementMode) {
+    await params.transactionStore.persistSettlementRuntime(params.transactionToken, params.runtime);
+    return;
+  }
+  if (params.phase === "running") {
+    await params.transactionStore.journalRuntime(
+      params.transactionToken,
+      params.runtime,
+      params.modelSelection,
+    );
+    return;
+  }
+  await params.transactionStore.journalRecoveryRuntime(params.transactionToken, params.runtime);
 }
 
 function browserTransactionFromRecoveredSession(

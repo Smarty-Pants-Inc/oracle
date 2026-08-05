@@ -197,6 +197,7 @@ describe("hidden macOS Chrome launch", () => {
     expect(writeOwner).toHaveBeenCalledWith(profile.canonicalPath, {
       port: 9222,
       processIdentity: identity,
+      disposition: "close-on-last-lease",
     });
     await expect(launched.kill()).resolves.toMatchObject({
       status: "stopped",
@@ -612,7 +613,7 @@ describe("stable Chrome process authority", () => {
     await expect(
       createOwnerBoundChromeKill(
         identity.profileDirectory.canonicalPath,
-        { port: 9222, processIdentity: identity },
+        { port: 9222, processIdentity: identity, disposition: "close-on-last-lease" },
         stableKill,
         {
           writeOwner: vi.fn(async () => {
@@ -645,7 +646,7 @@ describe("stable Chrome process authority", () => {
     }));
     const kill = await createOwnerBoundChromeKill(
       identity.profileDirectory.canonicalPath,
-      { port: 9222, processIdentity: identity },
+      { port: 9222, processIdentity: identity, disposition: "close-on-last-lease" },
       stableKill,
       { writeOwner },
     );
@@ -654,6 +655,7 @@ describe("stable Chrome process authority", () => {
     expect(writeOwner).toHaveBeenCalledWith(identity.profileDirectory.canonicalPath, {
       port: 9222,
       processIdentity: identity,
+      disposition: "close-on-last-lease",
     });
   });
 });

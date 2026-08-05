@@ -1,28 +1,33 @@
-import type { BrowserChrome } from "./manualChromeOwner.js";
+import {
+  acquireManualChromeOwner,
+  settleManualChromeOwner,
+  type ManualChromeOwner,
+} from "./manualChromeOwner.js";
 import type {
   BrowserRecoveryCleanupResourceMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
 import type { SessionMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
+import type { BrowserLogger } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { promptIdentitySha256 } from "./actions/promptComposer.js";
 import { closeChromeTarget } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { CHATGPT_URL } from "./constants.js";
-import { isImageOnlyUiChromeText } from "./index.js";
-import { acquireManualChromeOwner } from "./manualChromeOwner.js";
-import { isSafeChromeTerminationOutcome } from "./profileState.js";
+import {
+  retainBrowserTabLeaseTeardownAuthority,
+  acquireBrowserTabLease,
+  type BrowserTabLease,
+} from "./tabLeaseRegistry.js";
 import {
   isRecoverableChatGptConversationUrl,
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
 } from "./reattachability.js";
-import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
-import { buildConversationUrl } from "./reattachHelpers.js";
+import { isImageOnlyUiChromeText } from "./index.js";
 import { harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
-
+import { buildConversationUrl } from "./reattachHelpers.js";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
 
@@ -180,32 +185,31 @@ interface RecoveredConversationCleanupController {
 function createRecoveredConversationCleanup({
   userDataDir,
   lease,
-  getLaunchedChrome,
-  config,
+  getOwner,
   logger,
   locator,
 }: {
   userDataDir: string;
   lease: BrowserTabLease;
-  getLaunchedChrome: () => BrowserChrome | null;
-  config: ResolvedBrowserConfig;
+  getOwner: () => ManualChromeOwner | null;
   logger: BrowserLogger;
   locator: CommittedPromptEpochLocator;
 }): RecoveredConversationCleanupController {
   let target: { host: string; port: number; targetId: string } | null = null;
   let leaseReleased = false;
   let processSettled = false;
+  const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(userDataDir, lease, { logger });
   let completed = false;
   let inFlight: Promise<RecoveredConversationCleanupResult> | null = null;
 
   const pendingResource = (): BrowserRecoveryCleanupResourceMetadata => {
-    const launchedChrome = getLaunchedChrome();
-    const ownsProcess = Boolean(launchedChrome && !config.keepBrowser && !processSettled);
+    const owner = getOwner();
+    const ownsProcess = Boolean(owner?.disposition === "close-on-last-lease" && !processSettled);
     return {
-      chromePid: ownsProcess ? launchedChrome?.pid : undefined,
-      chromeProcessIdentity: ownsProcess ? launchedChrome?.processIdentity : undefined,
-      chromePort: target?.port ?? launchedChrome?.port,
-      chromeHost: target?.host ?? launchedChrome?.host ?? "127.0.0.1",
+      chromePid: ownsProcess ? owner?.chrome.pid : undefined,
+      chromeProcessIdentity: ownsProcess ? owner?.processIdentity : undefined,
+      chromePort: target?.port ?? owner?.chrome.port,
+      chromeHost: target?.host ?? owner?.chrome.host ?? "127.0.0.1",
       chromeProfileRoot: ownsProcess ? userDataDir : undefined,
       userDataDir,
       chromeTargetId: target?.targetId,
@@ -247,40 +251,40 @@ function createRecoveredConversationCleanup({
         }
         target = null;
       }
+      const owner = getOwner();
+      if (owner?.disposition === "close-on-last-lease") {
+        const outcome = await teardownAuthority.settle(async () => {
+          const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
+          processSettled = settlement.status === "terminated";
+          return processSettled;
+        });
+        leaseReleased = teardownAuthority.leaseReleased;
+        if (outcome.status === "preserved") {
+          return pending(
+            `Recovered Chrome settlement remains pending: ${outcome.error ?? outcome.reason}`,
+          );
+        }
+        completed = true;
+        return { status: "completed" };
+      }
 
       if (!leaseReleased) {
-        let terminationError: string | null = null;
         try {
-          await lease.release({
-            onRelease: async ({ isLastLease }) => {
-              const launchedChrome = getLaunchedChrome();
-              if (!isLastLease || !launchedChrome || config.keepBrowser) return;
-              try {
-                const outcome = await launchedChrome.kill();
-                if (isSafeChromeTerminationOutcome(outcome)) {
-                  processSettled = true;
-                } else {
-                  terminationError = outcome.reason;
-                }
-              } catch (error) {
-                terminationError = error instanceof Error ? error.message : String(error);
-              }
-            },
-          });
+          await lease.release();
           leaseReleased = true;
         } catch (error) {
           return pending(
             `Recovered browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        if (terminationError) {
-          return pending(`Recovered Chrome termination remains pending: ${terminationError}`);
-        }
       }
-
-      const launchedChrome = getLaunchedChrome();
-      if (launchedChrome && !config.keepBrowser && !processSettled) {
-        return pending("Recovered Chrome termination remains pending after lease release.");
+      if (owner?.disposition === "preserve") {
+        const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
+        if (settlement.status === "unsafe") {
+          return pending(
+            `Recovered Chrome authority release remains pending: ${settlement.reason}`,
+          );
+        }
       }
       completed = true;
       return { status: "completed" };
@@ -364,12 +368,11 @@ export async function recoverConversationTab(
     logger,
     sessionId: meta.id,
   });
-  let launchedChrome: BrowserChrome | null = null;
+  let owner: ManualChromeOwner | null = null;
   const recoveredCleanup = createRecoveredConversationCleanup({
     userDataDir,
     lease,
-    getLaunchedChrome: () => launchedChrome,
-    config,
+    getOwner: () => owner,
     logger,
     locator,
   });
@@ -430,9 +433,8 @@ export async function recoverConversationTab(
     logger(
       `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
     );
-    const owner = await acquireManualChromeOwner(userDataDir, config, logger, meta.id);
+    owner = await acquireManualChromeOwner(userDataDir, config, logger, meta.id);
     const { chrome } = owner;
-    launchedChrome = owner.source === "launched" ? chrome : null;
     const host = chrome.host ?? "127.0.0.1";
     const port = chrome.port;
     const targetId = await openChatGptTarget({ host, port, url });

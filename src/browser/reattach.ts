@@ -29,11 +29,7 @@ import {
   type RemoteChromeConnection,
   type RemoteTargetInfo,
 } from "./chromeLifecycle.js";
-import {
-  acquireManualChromeOwner,
-  type BrowserChrome,
-  type ManualChromeOwnerSource,
-} from "./manualChromeOwner.js";
+import { acquireManualChromeOwner, type BrowserChrome } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
@@ -41,11 +37,17 @@ import {
   cleanupStaleProfileState,
   captureProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
+  readOracleChromeOwner,
   removeProfileDirectoryIfIdentityMatches,
-  terminateRecordedChromeForProfile,
   sameChromeProcessIdentity,
+  sameProfileDirectoryIdentity,
+  terminateRecordedChromeForProfile,
+  verifyChromeProcessIdentity,
   verifyProfileDirectoryIdentity,
+  type ChromeOwnerDisposition,
+  type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
+  type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
 import {
   acquireBrowserTabLease,
@@ -82,6 +84,8 @@ export interface ReattachCleanupDeps {
   closeChromeTarget?: typeof closeChromeTarget;
   listChromeTargets?: typeof listRemoteChromeTargets;
   terminateRecordedChromeForProfile?: typeof terminateRecordedChromeForProfile;
+  readOracleChromeOwner?: typeof readOracleChromeOwner;
+  verifyChromeProcessIdentity?: typeof verifyChromeProcessIdentity;
   cleanupStaleProfileState?: typeof cleanupStaleProfileState;
   teardownBrowserResourcesIfNoActiveLeases?: typeof teardownBrowserResourcesIfNoActiveLeases;
   removeProfile?: (profileDir: string) => Promise<boolean>;
@@ -221,12 +225,17 @@ export async function resumeBrowserSession(
       ? null
       : requireCommittedPromptEpochLocator(runtime);
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
-  const recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);
-  let lockHeld = true;
+  const acquireRecoveryLock = deps.acquireRecoveryLock ?? acquireReattachRecoveryLock;
+  let recoveryLock: ReattachRecoveryLock | null = await acquireRecoveryLock(lockPath);
+  const ensureRecoveryLock = async (): Promise<void> => {
+    if (recoveryLock) return;
+    recoveryLock = await acquireRecoveryLock(lockPath);
+  };
   const releaseRecoveryLock = async (): Promise<void> => {
-    if (!lockHeld) return;
-    await recoveryLock.release();
-    lockHeld = false;
+    const heldLock = recoveryLock;
+    if (!heldLock) return;
+    await heldLock.release();
+    if (recoveryLock === heldLock) recoveryLock = null;
   };
   const recoverSession =
     deps.recoverSession ??
@@ -250,9 +259,20 @@ export async function resumeBrowserSession(
     const settlement = new BrowserCaptureSettlementController(
       {
         persistRuntime: async (pendingRuntime) => {
-          await deps.runtimeHintCb?.(pendingRuntime);
+          await ensureRecoveryLock();
+          try {
+            await deps.runtimeHintCb?.(pendingRuntime);
+          } catch (error) {
+            await releaseRecoveryLock().catch((lockError) => {
+              logger(
+                `Failed to release recovery lock after runtime persistence error: ${lockError instanceof Error ? lockError.message : String(lockError)}`,
+              );
+            });
+            throw error;
+          }
         },
         settleResources: async (mode, pendingRuntime) => {
+          await ensureRecoveryLock();
           let result: ReattachFinalizationResult;
           try {
             const captureSettler =
@@ -277,13 +297,12 @@ export async function resumeBrowserSession(
               error.details.runtime !== null
                 ? (error.details.runtime as BrowserRuntimeMetadata)
                 : pendingRuntime;
-            return pendingFinalization(
+            result = pendingFinalization(
               errorRuntime,
               error instanceof Error ? error.message : String(error),
               mode,
             );
           }
-          if (result.status !== "completed") return result;
           try {
             await releaseRecoveryLock();
           } catch (error) {
@@ -714,6 +733,156 @@ type RecoveryCleanupGroup = {
   key: string;
   entries: RecoveryCleanupEntry[];
 };
+type PendingProcessAcquisitionResolution =
+  | { status: "resolved"; resource: BrowserRecoveryCleanupResourceMetadata }
+  | { status: "settled" }
+  | { status: "pending"; resource: BrowserRecoveryCleanupResourceMetadata; error: string };
+
+async function reconcilePendingProcessAcquisition(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+  logger: BrowserLogger,
+  deps: ReattachCleanupDeps,
+): Promise<PendingProcessAcquisitionResolution> {
+  if (
+    resource.acquisition?.pendingResource !== "chrome-process" ||
+    resource.chromeProcessIdentity
+  ) {
+    return { status: "resolved", resource };
+  }
+
+  const provenance = resource.acquisition.processOwnerProvenance;
+  if (provenance !== "temporary-launch" && provenance !== "manual-canonical-owner") {
+    return {
+      status: "pending",
+      resource,
+      error: "Chrome process acquisition provenance is missing or invalid",
+    };
+  }
+  const profileDir = resource.userDataDir;
+  const expectedProfile = physicalProfileDirectoryIdentity(resource.profileDirectoryIdentity);
+  if (!profileDir || !expectedProfile) {
+    return {
+      status: "pending",
+      resource,
+      error: "Chrome process acquisition profile authority is incomplete",
+    };
+  }
+  if (!(await verifyProfileDirectoryIdentity(profileDir, expectedProfile))) {
+    if (await cleanupProfileAbsent(profileDir)) return { status: "settled" };
+    return {
+      status: "pending",
+      resource,
+      error: "Chrome process acquisition profile authority changed",
+    };
+  }
+
+  let owner: OracleChromeOwnerRecord | null;
+  try {
+    owner = await (deps.readOracleChromeOwner ?? readOracleChromeOwner)(profileDir);
+  } catch (error) {
+    return {
+      status: "pending",
+      resource,
+      error: `Chrome process acquisition owner lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (!owner) {
+    return {
+      status: "pending",
+      resource,
+      error: "Chrome process acquisition owner record is missing",
+    };
+  }
+  if (!sameProfileDirectoryIdentity(owner.processIdentity.profileDirectory, expectedProfile)) {
+    return {
+      status: "pending",
+      resource,
+      error: "Chrome process acquisition owner profile does not match the recorded profile",
+    };
+  }
+
+  const processIdentity = owner.processIdentity;
+  let exactOwner: boolean;
+  try {
+    exactOwner = await (deps.verifyChromeProcessIdentity ?? verifyChromeProcessIdentity)(
+      profileDir,
+      processIdentity,
+    );
+  } catch (error) {
+    return {
+      status: "pending",
+      resource,
+      error: `Chrome process acquisition exact owner verification failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const withOwner = (keepBrowser: boolean): BrowserRecoveryCleanupResourceMetadata => ({
+    ...resource,
+    chromePid: processIdentity.pid,
+    chromeProcessIdentity: processIdentity,
+    chromePort: owner.port,
+    profileDirectoryIdentity: processIdentity.profileDirectory,
+    recoveryCleanup: {
+      ...resource.recoveryCleanup,
+      profileKind:
+        provenance === "manual-canonical-owner"
+          ? "manual-login"
+          : resource.recoveryCleanup.profileKind,
+      keepBrowser,
+    },
+  });
+  if (!exactOwner) {
+    let termination: RecordedChromeTerminationOutcome;
+    try {
+      termination = await (
+        deps.terminateRecordedChromeForProfile ?? terminateRecordedChromeForProfile
+      )(profileDir, processIdentity, logger);
+    } catch (error) {
+      return {
+        status: "pending",
+        resource,
+        error: `Chrome process acquisition absence check failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    if (isSafeChromeTerminationOutcome(termination)) {
+      return { status: "resolved", resource: withOwner(false) };
+    }
+    return {
+      status: "pending",
+      resource,
+      error: `Chrome process acquisition exact authority is unresolved: ${termination.reason}`,
+    };
+  }
+
+  return {
+    status: "resolved",
+    resource: withOwner(
+      provenance === "manual-canonical-owner"
+        ? owner.disposition === "preserve"
+        : resource.recoveryCleanup.keepBrowser,
+    ),
+  };
+}
+
+async function reconcilePendingProcessAcquisitions(
+  runtime: BrowserRuntimeMetadata,
+  logger: BrowserLogger,
+  deps: ReattachCleanupDeps,
+): Promise<{ runtime: BrowserRuntimeMetadata; pending: RecoveryCleanupEntry[]; errors: string[] }> {
+  const resources: BrowserRecoveryCleanupResourceMetadata[] = [];
+  const pending: RecoveryCleanupEntry[] = [];
+  const errors: string[] = [];
+  for (const [order, resource] of (runtime.recoveryCleanupResources ?? []).entries()) {
+    const resolution = await reconcilePendingProcessAcquisition(resource, logger, deps);
+    if (resolution.status === "settled") continue;
+    if (resolution.status === "pending") {
+      pending.push({ resource: resolution.resource, order });
+      errors.push(resolution.error);
+      continue;
+    }
+    resources.push(resolution.resource);
+  }
+  return { runtime: { ...runtime, recoveryCleanupResources: resources }, pending, errors };
+}
 
 async function finalizeRecoveredRuntime(
   runtime: BrowserRuntimeMetadata,
@@ -721,9 +890,10 @@ async function finalizeRecoveredRuntime(
   deps: ReattachCleanupDeps = {},
   mode: "finalize" | "abort" = "finalize",
 ): Promise<ReattachFinalizationResult> {
-  const groups = groupRecoveryCleanupResources(runtime);
-  const pending: RecoveryCleanupEntry[] = [];
-  const errors: string[] = [];
+  const reconciliation = await reconcilePendingProcessAcquisitions(runtime, logger, deps);
+  const groups = groupRecoveryCleanupResources(reconciliation.runtime);
+  const pending: RecoveryCleanupEntry[] = [...reconciliation.pending];
+  const errors: string[] = [...reconciliation.errors];
 
   for (const group of groups) {
     const result = await finalizeRecoveryCleanupGroup(group, logger, deps, mode);
@@ -732,7 +902,7 @@ async function finalizeRecoveredRuntime(
   }
 
   if (pending.length === 0) {
-    const completedRuntime = { ...runtime };
+    const completedRuntime = { ...reconciliation.runtime };
     delete completedRuntime.recoveryCleanupResources;
     delete completedRuntime.recoveryCleanupResult;
     return { status: "completed", runtime: completedRuntime };
@@ -890,6 +1060,7 @@ async function finalizeRecoveryCleanupGroup(
 
     let teardownViaLeaseAttempted = false;
     let teardownViaLeaseError: string | null = null;
+    let manualOwnerRetainedByOtherLease = false;
     const releaseLease = deps.releaseBrowserTabLease ?? releaseBrowserTabLease;
     const seenLeaseIds = new Set<string>();
     for (const entry of group.entries) {
@@ -911,7 +1082,10 @@ async function finalizeRecoveryCleanupGroup(
             !preserveProcess &&
             teardownEntry.resource.recoveryCleanup.profileKind === "manual-login"
               ? async ({ isLastLease }) => {
-                  if (!isLastLease) return;
+                  if (!isLastLease) {
+                    manualOwnerRetainedByOtherLease = true;
+                    return;
+                  }
                   teardownViaLeaseAttempted = true;
                   teardownViaLeaseError = await teardownLocalRecoveryGroup(
                     teardownEntry.resource,
@@ -944,6 +1118,7 @@ async function finalizeRecoveryCleanupGroup(
       }
       return { pending, errors };
     }
+    if (manualOwnerRetainedByOtherLease) return { pending, errors };
 
     if (!teardownEntry || teardownEntries.length === 0 || preserveProcess) {
       return { pending, errors };
@@ -1744,7 +1919,7 @@ async function resumeBrowserSessionViaNewChrome(
   const fallbackLeaseId = randomUUID();
   const fallbackTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const inheritedRecoveryCleanupResources = [...(runtime.recoveryCleanupResources ?? [])];
-  let manualChromeOwnerSource: ManualChromeOwnerSource | null = null;
+  let manualChromeOwnerDisposition: ChromeOwnerDisposition | null = null;
   let fallbackLease: BrowserTabLease | null = null;
   let chrome: BrowserChrome | null = null;
   let retainedOwnedChrome: BrowserChrome | null = null;
@@ -1755,16 +1930,11 @@ async function resumeBrowserSessionViaNewChrome(
   const refreshFallbackRuntime = (
     pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
   ): BrowserRuntimeMetadata => {
-    const ownsProcess = Boolean(
-      chrome && !resolved.keepBrowser && (!manualLogin || manualChromeOwnerSource === "launched"),
-    );
-    const profileKind = ownsProcess
-      ? manualLogin
-        ? "manual-login"
-        : "temporary"
-      : manualLogin || chrome
-        ? "none"
-        : "temporary";
+    const closesProcess = manualLogin
+      ? manualChromeOwnerDisposition === "close-on-last-lease"
+      : !resolved.keepBrowser;
+    const ownsProcess = Boolean(chrome && closesProcess);
+    const profileKind = manualLogin ? "manual-login" : ownsProcess ? "temporary" : "none";
     const ownsTarget = pendingResource === "chrome-target" || Boolean(fallbackTargetId);
     const resource: BrowserRecoveryCleanupResourceMetadata = {
       chromePid: chrome?.pid,
@@ -1787,13 +1957,20 @@ async function resumeBrowserSessionViaNewChrome(
           : undefined,
       acquisition: {
         generationId: acquisitionGenerationId,
+        processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
         ...(pendingResource ? { pendingResource } : {}),
         targetMarkerUrl: fallbackTargetMarkerUrl,
       },
       recoveryCleanup: {
         ownsTarget,
         profileKind,
-        keepBrowser: !ownsProcess,
+        keepBrowser:
+          pendingResource === "tab-lease" ||
+          (manualLogin
+            ? manualChromeOwnerDisposition === "preserve"
+            : chrome
+              ? !ownsProcess
+              : Boolean(resolved.keepBrowser)),
         closeOwnedTargetOnComplete: ownsTarget,
       },
     };
@@ -1914,11 +2091,14 @@ async function resumeBrowserSessionViaNewChrome(
         `reattach-${process.pid}`,
       );
       chrome = owner.chrome;
-      manualChromeOwnerSource = owner.source;
+      manualChromeOwnerDisposition = owner.disposition;
     } else {
       chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger);
     }
-    if (!resolved.keepBrowser && (!manualLogin || manualChromeOwnerSource === "launched")) {
+    if (
+      chrome &&
+      (manualLogin ? manualChromeOwnerDisposition === "close-on-last-lease" : !resolved.keepBrowser)
+    ) {
       retainedOwnedChrome = chrome;
     }
     await persistFallbackRuntime("chrome-target");

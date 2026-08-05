@@ -495,6 +495,7 @@ describe("recoverable disconnect lifecycle", () => {
       await expect(readOracleChromeOwner(fixture.profileDir)).resolves.toEqual({
         port: 9230,
         processIdentity: fixture.processIdentity,
+        disposition: "close-on-last-lease",
       });
     });
   }, 30_000);

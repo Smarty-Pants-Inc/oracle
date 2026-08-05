@@ -73,9 +73,12 @@ export interface ChromeProcessIdentity {
   readonly profileDirectory: ProfileDirectoryIdentity;
 }
 
+export type ChromeOwnerDisposition = "preserve" | "close-on-last-lease";
+
 export interface OracleChromeOwnerRecord {
   readonly port: number;
   readonly processIdentity: ChromeProcessIdentity;
+  readonly disposition: ChromeOwnerDisposition;
 }
 
 interface ChromeProcessSnapshot {
@@ -610,9 +613,11 @@ function parseOracleChromeOwnerRecord(
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   if (
-    Object.keys(record).length !== 2 ||
     !Object.hasOwn(record, "port") ||
-    !Object.hasOwn(record, "processIdentity")
+    !Object.hasOwn(record, "processIdentity") ||
+    Object.keys(record).some(
+      (key) => key !== "port" && key !== "processIdentity" && key !== "disposition",
+    )
   ) {
     return null;
   }
@@ -623,11 +628,18 @@ function parseOracleChromeOwnerRecord(
   ) {
     return null;
   }
+  const disposition =
+    record.disposition === undefined
+      ? "preserve"
+      : record.disposition === "preserve" || record.disposition === "close-on-last-lease"
+        ? record.disposition
+        : null;
   const processIdentity = parseChromeProcessIdentity(record.processIdentity, platform);
-  if (!processIdentity) return null;
+  if (!processIdentity || !disposition) return null;
   return Object.freeze({
     port: record.port as number,
     processIdentity,
+    disposition,
   });
 }
 

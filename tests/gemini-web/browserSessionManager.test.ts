@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { openGeminiBrowserSession } from "../../src/gemini-web/browserSessionManager.js";
+import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 
 type Teardown = () => Promise<boolean>;
 
@@ -10,6 +11,7 @@ const {
   connectWithNewTab,
   closeTab,
   acquireManualChromeOwner,
+  settleManualChromeOwner,
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   cleanupStaleProfileState,
@@ -28,6 +30,7 @@ const {
   connectWithNewTab: vi.fn(),
   closeTab: vi.fn(async () => true),
   acquireManualChromeOwner: vi.fn(),
+  settleManualChromeOwner: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
   retainBrowserTabLeaseTeardownAuthority: vi.fn(),
   cleanupStaleProfileState: vi.fn(async () => true),
@@ -63,6 +66,7 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => ({
 
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
   acquireManualChromeOwner,
+  settleManualChromeOwner,
 }));
 
 vi.mock("../../src/browser/profileState.js", () => ({
@@ -121,6 +125,16 @@ describe("openGeminiBrowserSession", () => {
     connectWithNewTab.mockReset();
     closeTab.mockClear();
     acquireManualChromeOwner.mockReset();
+    settleManualChromeOwner.mockReset();
+    settleManualChromeOwner.mockImplementation(
+      async (_profileDir: string, owner: ManualChromeOwner) => {
+        if (owner.disposition === "preserve") {
+          await owner.endpointAuthority?.release();
+          return { status: "preserved" as const };
+        }
+        return { status: "terminated" as const };
+      },
+    );
     acquireBrowserTabLease.mockReset();
     retainBrowserTabLeaseTeardownAuthority.mockReset();
     retainBrowserTabLeaseTeardownAuthority.mockImplementation(() => ({
@@ -142,6 +156,7 @@ describe("openGeminiBrowserSession", () => {
       },
       processIdentity,
       source: "launched",
+      disposition: "close-on-last-lease",
     });
     acquireBrowserTabLease.mockResolvedValue({
       id: "lease-1",
@@ -200,8 +215,9 @@ describe("openGeminiBrowserSession", () => {
     );
   });
 
-  it("returns the exact reused owner identity and never terminates it", async () => {
+  it("releases retained endpoint authority for a preserved exact owner", async () => {
     const profileDir = path.join(tempRoot, "reused-profile");
+    const endpointRelease = vi.fn(async () => undefined);
     acquireManualChromeOwner.mockResolvedValueOnce({
       chrome: {
         port: 9333,
@@ -212,6 +228,8 @@ describe("openGeminiBrowserSession", () => {
       },
       processIdentity,
       source: "recorded",
+      disposition: "preserve",
+      endpointAuthority: { release: endpointRelease },
     });
 
     const session = await openGeminiBrowserSession({
@@ -224,6 +242,12 @@ describe("openGeminiBrowserSession", () => {
     expect(session.processIdentity).toBe(processIdentity);
     expect(closeTab).toHaveBeenCalledWith(9333, "target-1", expect.any(Function), "127.0.0.1");
     expect(leaseRelease).toHaveBeenCalledTimes(1);
+    expect(settleManualChromeOwner).toHaveBeenCalledWith(
+      profileDir,
+      expect.objectContaining({ disposition: "preserve" }),
+      expect.any(Function),
+    );
+    expect(endpointRelease).toHaveBeenCalledOnce();
     expect(ownerKill).not.toHaveBeenCalled();
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
     expect(retainBrowserTabLeaseTeardownAuthority).not.toHaveBeenCalled();
@@ -250,8 +274,20 @@ describe("openGeminiBrowserSession", () => {
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
   });
 
-  it("terminates only its launched canonical owner after the last lease releases", async () => {
+  it("retains teardown authority for a recorded close-on-last-lease owner", async () => {
     const profileDir = path.join(tempRoot, "last-lease-profile");
+    acquireManualChromeOwner.mockResolvedValueOnce({
+      chrome: {
+        port: 9222,
+        pid: processIdentity.pid,
+        host: "127.0.0.1",
+        processIdentity,
+        kill: ownerKill,
+      },
+      processIdentity,
+      source: "recorded",
+      disposition: "close-on-last-lease",
+    });
     const session = await openGeminiBrowserSession({
       browserConfig: { manualLoginProfileDir: profileDir },
       keepBrowserDefault: false,

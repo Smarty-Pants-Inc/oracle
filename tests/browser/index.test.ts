@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import type * as ManualLoginProfileModule from "../../src/browser/manualLoginProfile.js";
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
+import type * as ChromeLifecycleModule from "../../src/browser/chromeLifecycle.js";
 import {
   __test__,
   classifyPreservedBrowserErrorForTest,
@@ -20,6 +21,14 @@ import {
 } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import { __test__ as reattachTest } from "../../src/browser/reattach.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
+import type { BrowserLogger } from "../../src/browser/types.js";
+import {
+  captureProfileDirectoryIdentity,
+  writeOracleChromeOwner,
+  type ChromeProcessIdentity,
+} from "../../src/browser/profileState.js";
 
 describe("background-only browser policy", () => {
   test("rejects attach-running before browser discovery can touch the primary browser", async () => {
@@ -98,6 +107,91 @@ describe("local acquisition durability", () => {
       vi.doUnmock("../../src/browser/manualLoginProfile.js");
       vi.resetModules();
       await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retains exact temporary Chrome authority across a crash after launch before runtime persistence", async () => {
+    const interruption = new Error("controller interrupted after Chrome launch");
+    const runtimeHints: BrowserRuntimeMetadata[] = [];
+    let profileDir: string | undefined;
+    let ownerIdentity: ChromeProcessIdentity | undefined;
+
+    vi.resetModules();
+    vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeLifecycleModule>()),
+      launchChrome: vi.fn(async (_config: unknown, userDataDir: string) => {
+        profileDir = userDataDir;
+        const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+        ownerIdentity = {
+          pid: 424_242,
+          processStartTime: "test-process-generation",
+          executablePath:
+            process.platform === "win32"
+              ? String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`.toLowerCase()
+              : process.platform === "darwin"
+                ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                : "/usr/bin/google-chrome",
+          normalizedUserDataDir:
+            process.platform === "win32"
+              ? profileDirectory.canonicalPath.toLowerCase()
+              : profileDirectory.canonicalPath,
+          launchNonce: "11111111-1111-4111-8111-111111111111",
+          profileDirectory,
+        };
+        await writeOracleChromeOwner(userDataDir, {
+          port: 9222,
+          processIdentity: ownerIdentity,
+          disposition: "close-on-last-lease",
+        });
+        throw interruption;
+      }),
+    }));
+
+    try {
+      // This test intentionally loads the runner after installing its module mock.
+      const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        isolatedRunBrowserMode({
+          prompt: "test",
+          config: { cookieSync: false },
+          runtimeHintCb: async (runtime) => {
+            runtimeHints.push(structuredClone(runtime));
+          },
+        }),
+      ).rejects.toBe(interruption);
+
+      const crashRuntime = runtimeHints.at(-1);
+      if (!crashRuntime) throw new Error("Chrome process acquisition intent was not persisted");
+      const crashResource = crashRuntime.recoveryCleanupResources?.at(-1);
+      expect(crashResource).toMatchObject({
+        acquisition: {
+          pendingResource: "chrome-process",
+          processOwnerProvenance: "temporary-launch",
+        },
+        recoveryCleanup: { keepBrowser: false },
+      });
+      expect(crashResource?.chromeProcessIdentity).toBeUndefined();
+
+      const terminateRecordedChromeForProfile = vi.fn(async (_profileDir, identity) => {
+        expect(identity).toEqual(ownerIdentity);
+        return { status: "stopped" as const, pid: identity.pid, signal: "SIGTERM" as const };
+      });
+      const removeProfile = vi.fn(async () => true);
+      const recoveryLogger: BrowserLogger = vi.fn((_message: string) => {});
+      const recovery = await reattachTest.finalizeRecoveredRuntime(crashRuntime, recoveryLogger, {
+        verifyChromeProcessIdentity: vi.fn(async () => true),
+        terminateRecordedChromeForProfile,
+        removeProfile,
+      });
+
+      expect(recovery.status).toBe("completed");
+      expect(recovery.runtime.recoveryCleanupResources).toBeUndefined();
+      expect(terminateRecordedChromeForProfile).toHaveBeenCalledOnce();
+      expect(removeProfile).toHaveBeenCalledWith(profileDir);
+    } finally {
+      vi.doUnmock("../../src/browser/chromeLifecycle.js");
+      vi.resetModules();
+      if (profileDir) await rm(profileDir, { recursive: true, force: true });
     }
   });
 });
@@ -222,17 +316,16 @@ describe("recoverable disconnect policy", () => {
   });
 
   test.each([
-    ["launched", false],
-    ["recorded", true],
-    ["rediscovered", true],
+    ["close-on-last-lease", false],
+    ["preserve", true],
   ] as const)(
-    "preserves %s manual-login owners only when recovery lacks kill authority",
-    (ownerSource, expected) => {
+    "preserves manual-login owners according to their %s disposition",
+    (ownerDisposition, expected) => {
       expect(
         __test__.shouldPreserveLocalOwnerForRecovery({
           effectiveKeepBrowser: false,
           manualLogin: true,
-          ownerSource,
+          ownerDisposition,
         }),
       ).toBe(expected);
     },

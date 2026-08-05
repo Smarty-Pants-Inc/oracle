@@ -237,6 +237,64 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("persists settlement runtime only for the exact bound mode and controller generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-settlement-runtime-"));
+    const transactionToken = "7".repeat(64);
+    const controllerGeneration = "settlement-controller-generation";
+    const finalizeRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    };
+    const abortRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+    };
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration,
+      });
+      await begin(store, transactionToken);
+      await expect(
+        store.persistSettlementRuntime(transactionToken, finalizeRuntime),
+      ).rejects.toThrow("transaction in state running");
+      await publish(store, transactionToken);
+
+      await expect(
+        store.persistSettlementRuntime(transactionToken, finalizeRuntime),
+      ).rejects.toThrow("durable settlement binding");
+      await store.bindSettlement({
+        transactionToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await expect(store.persistSettlementRuntime(transactionToken, abortRuntime)).rejects.toThrow(
+        "exact durable settlement mode",
+      );
+
+      const staleStore = await RemoteTransactionStore.open({
+        directory: root,
+        controllerGeneration: "stale-settlement-controller",
+      });
+      await expect(
+        staleStore.persistSettlementRuntime(transactionToken, finalizeRuntime),
+      ).rejects.toThrow("stale remote controller generation");
+
+      await expect(
+        store.persistSettlementRuntime(transactionToken, finalizeRuntime),
+      ).resolves.toMatchObject({
+        state: "pending",
+        settlementMode: "finalize",
+        runtime: {
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        },
+        runtimeJournaledAt: expect.any(String),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an unbound capture for restart and exposes only a durably bound shutdown mode", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-store-"));
     const transactionToken = "0".repeat(64);

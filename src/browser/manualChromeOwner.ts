@@ -20,6 +20,7 @@ import {
   verifyDevToolsReachable,
   verifyProfileDirectoryIdentity,
   writeOracleChromeOwner,
+  type ChromeOwnerDisposition,
   type ChromeProcessIdentity,
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
@@ -35,6 +36,7 @@ export interface ManualChromeOwner {
   readonly chrome: BrowserChrome;
   readonly processIdentity: ChromeProcessIdentity;
   readonly source: ManualChromeOwnerSource;
+  readonly disposition: ChromeOwnerDisposition;
   readonly endpointAuthority?: RetainedChromeEndpointAuthority;
 }
 
@@ -64,7 +66,7 @@ export async function settleManualChromeOwner(
   logger: BrowserLogger,
   deps: Pick<ManualChromeOwnerDeps, "cleanupProfileState"> = {},
 ): Promise<ManualChromeOwnerSettlement> {
-  if (owner.source !== "launched") {
+  if (owner.disposition === "preserve") {
     try {
       await owner.endpointAuthority?.release();
       return { status: "preserved" };
@@ -173,7 +175,15 @@ export async function acquireManualChromeOwner(
         pid = requirePositiveInteger(chrome.pid, "pid", profileDir);
         port = requirePositiveInteger(chrome.port, "DevTools port", profileDir);
         processIdentity = requireProcessIdentity(chrome.processIdentity, pid, profileDir);
-        await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
+        await persistCanonicalOwner(
+          profileDir,
+          {
+            port,
+            processIdentity,
+            disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
+          },
+          deps,
+        );
       } catch (error) {
         const termination = await chrome.kill().catch(() => ({
           status: "unsafe" as const,
@@ -192,7 +202,12 @@ export async function acquireManualChromeOwner(
       logger(
         `Launched canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`,
       );
-      acquiredOwner = { chrome, processIdentity, source: "launched" };
+      acquiredOwner = {
+        chrome,
+        processIdentity,
+        source: "launched",
+        disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
+      };
     }
   } catch (error) {
     acquisitionFailed = true;
@@ -209,7 +224,7 @@ export async function acquireManualChromeOwner(
       );
     }
     failures.push(releaseError instanceof Error ? releaseError : new Error(String(releaseError)));
-    if (acquiredOwner?.source === "launched") {
+    if (acquiredOwner?.disposition === "close-on-last-lease") {
       const termination = await acquiredOwner.chrome.kill().catch((terminationError: unknown) => ({
         status: "unsafe" as const,
         pid: acquiredOwner?.chrome.pid,
@@ -299,6 +314,7 @@ async function findExistingManualChromeOwner(
       chrome: reusableChrome(recordedPort, recordedPid, recordedIdentity, endpointAuthority),
       processIdentity: recordedIdentity,
       source: "recorded",
+      disposition: recordedOwner.disposition,
       endpointAuthority,
     };
   }
@@ -344,7 +360,11 @@ async function findExistingManualChromeOwner(
       );
     }
     try {
-      await persistCanonicalOwner(profileDir, { port, processIdentity }, deps);
+      await persistCanonicalOwner(
+        profileDir,
+        { port, processIdentity, disposition: "preserve" },
+        deps,
+      );
     } catch (error) {
       try {
         await endpointAuthority.release();
@@ -364,6 +384,7 @@ async function findExistingManualChromeOwner(
       chrome: reusableChrome(port, pid, processIdentity, endpointAuthority),
       processIdentity,
       source: "rediscovered",
+      disposition: "preserve",
       endpointAuthority,
     };
   }
@@ -417,6 +438,7 @@ async function persistCanonicalOwner(
   if (
     !persistedOwner ||
     persistedOwner.port !== owner.port ||
+    persistedOwner.disposition !== owner.disposition ||
     !sameChromeProcessIdentity(persistedOwner.processIdentity, owner.processIdentity)
   ) {
     await writeOwner(profileDir, owner);
@@ -426,6 +448,7 @@ async function persistCanonicalOwner(
   if (
     !verifiedOwner ||
     verifiedOwner.port !== owner.port ||
+    verifiedOwner.disposition !== owner.disposition ||
     !sameChromeProcessIdentity(verifiedOwner.processIdentity, owner.processIdentity) ||
     !identityVerified
   ) {

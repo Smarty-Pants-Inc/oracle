@@ -114,6 +114,7 @@ describe("profileState", () => {
       await profileState.writeOracleChromeOwner(dir, {
         port: 12345,
         processIdentity: aliveIdentity,
+        disposition: "preserve",
       });
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
@@ -134,11 +135,13 @@ describe("profileState", () => {
       await profileState.writeOracleChromeOwner(dir, {
         port: 12345,
         processIdentity: deadIdentity,
+        disposition: "close-on-last-lease",
       });
       expect(existsSync(path.join(dir, "oracle-chrome-owner.json"))).toBe(true);
       await expect(profileState.readOracleChromeOwner(dir)).resolves.toEqual({
         port: 12345,
         processIdentity: deadIdentity,
+        disposition: "close-on-last-lease",
       });
       await profileState.cleanupStaleProfileState(dir, undefined, {
         lockRemovalMode: "if_oracle_pid_dead",
@@ -156,7 +159,11 @@ describe("profileState", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-terminate-"));
     try {
       const identity = await physicalChromeIdentity(dir);
-      await profileState.writeOracleChromeOwner(dir, { port: 12345, processIdentity: identity });
+      await profileState.writeOracleChromeOwner(dir, {
+        port: 12345,
+        processIdentity: identity,
+        disposition: "close-on-last-lease",
+      });
       const originalSnapshot = {
         pid: identity.pid,
         processStartTime: identity.processStartTime,
@@ -165,7 +172,11 @@ describe("profileState", () => {
       };
       await expect(
         profileState.verifyChromeProcessIdentityForTest(dir, identity, {
-          readOwner: async () => ({ port: 12345, processIdentity: identity }),
+          readOwner: async () => ({
+            port: 12345,
+            processIdentity: identity,
+            disposition: "close-on-last-lease",
+          }),
           readProcessSnapshot: async () => originalSnapshot,
           verifyProfileIdentity: async () => true,
           isProcessAlive: () => true,
@@ -175,7 +186,11 @@ describe("profileState", () => {
       const signalByPid = vi.fn(async () => ({ stdout: "SUCCESS" }));
       await expect(
         profileState.terminateRecordedChromeForProfileForTest(dir, identity, undefined, {
-          readOwner: async () => ({ port: 12345, processIdentity: identity }),
+          readOwner: async () => ({
+            port: 12345,
+            processIdentity: identity,
+            disposition: "close-on-last-lease",
+          }),
           readProcessSnapshot: async () => ({
             ...originalSnapshot,
             processStartTime: "reused-process-generation",
@@ -323,7 +338,11 @@ describe("profileState", () => {
       profileState.verifyChromeProcessIdentityForTest(userDataDir, identity, {
         platform: "darwin",
         execute,
-        readOwner: async () => ({ port: 45_678, processIdentity: identity }),
+        readOwner: async () => ({
+          port: 45_678,
+          processIdentity: identity,
+          disposition: "close-on-last-lease",
+        }),
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
       });
@@ -347,7 +366,11 @@ describe("profileState", () => {
     await expect(
       profileState.terminateRecordedChromeForProfileForTest(profileDir, identity, undefined, {
         platform: "win32",
-        readOwner: async () => ({ port: 12345, processIdentity: identity }),
+        readOwner: async () => ({
+          port: 12345,
+          processIdentity: identity,
+          disposition: "close-on-last-lease",
+        }),
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
         isChromeUsingUserDataDir: async () => false,
@@ -433,7 +456,11 @@ describe("profileState", () => {
     const verifyWithBoot = (bootId: string) =>
       profileState.verifyChromeProcessIdentityForTest(userDataDir, identity, {
         platform: "linux",
-        readOwner: async () => ({ port: 45_678, processIdentity: identity }),
+        readOwner: async () => ({
+          port: 45_678,
+          processIdentity: identity,
+          disposition: "close-on-last-lease",
+        }),
         readProcessSnapshot: async () => ({
           pid: identity.pid,
           processStartTime: `linux:${bootId}:987654`,
@@ -479,6 +506,7 @@ describe("profileState", () => {
         await profileState.writeOracleChromeOwner(profileDir, {
           port: 45678,
           processIdentity: identity,
+          disposition: "close-on-last-lease",
         });
         expect(
           JSON.parse(await readFile(path.join(profileDir, "oracle-chrome-owner.json"), "utf8")),
@@ -660,7 +688,11 @@ describe("profileState", () => {
       await rename(profileDir, movedDir);
       await mkdir(profileDir);
       await expect(
-        profileState.writeOracleChromeOwner(profileDir, { port: 12345, processIdentity: identity }),
+        profileState.writeOracleChromeOwner(profileDir, {
+          port: 12345,
+          processIdentity: identity,
+          disposition: "close-on-last-lease",
+        }),
       ).rejects.toThrow(/does not belong|physical profile/i);
       expect(existsSync(path.join(profileDir, "oracle-chrome-owner.json"))).toBe(false);
     } finally {

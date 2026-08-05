@@ -8,6 +8,7 @@ import type {
 } from "../../src/browser/profileState.js";
 import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
+import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 
 const {
@@ -23,6 +24,7 @@ const {
   delay,
   captureProfileDirectoryIdentity,
   acquireManualChromeOwner,
+  settleManualChromeOwner,
   acquireBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   teardownSettle,
@@ -54,6 +56,7 @@ const {
     }),
   ),
   acquireManualChromeOwner: vi.fn(),
+  settleManualChromeOwner: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
   retainBrowserTabLeaseTeardownAuthority: vi.fn(),
   teardownSettle: vi.fn(),
@@ -123,6 +126,7 @@ vi.mock("../../src/browser/profileState.js", () => ({
 }));
 vi.mock("../../src/browser/manualChromeOwner.js", () => ({
   acquireManualChromeOwner,
+  settleManualChromeOwner,
 }));
 vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
   DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
@@ -177,6 +181,16 @@ describe("gemini-web executor", () => {
     killChrome.mockClear();
     captureProfileDirectoryIdentity.mockClear();
     acquireManualChromeOwner.mockReset();
+    settleManualChromeOwner.mockReset();
+    settleManualChromeOwner.mockImplementation(
+      async (_profileDir: string, owner: ManualChromeOwner) => {
+        if (owner.disposition === "preserve") {
+          await owner.endpointAuthority?.release();
+          return { status: "preserved" as const };
+        }
+        return { status: "terminated" as const };
+      },
+    );
     acquireBrowserTabLease.mockReset();
     retainBrowserTabLeaseTeardownAuthority.mockReset();
     teardownState.leaseReleased = false;
@@ -200,27 +214,33 @@ describe("gemini-web executor", () => {
       host: "127.0.0.1",
       kill: killChrome,
     });
-    acquireManualChromeOwner.mockImplementation(async (profileDir: string, config, logger) => {
-      const profileDirectory = await captureProfileDirectoryIdentity(profileDir, { create: true });
-      const chrome = await launchChrome(config, profileDir, logger);
-      const ownerRecord: OracleChromeOwnerRecord = {
-        port: chrome.port,
-        processIdentity: {
-          pid: chrome.pid,
-          processStartTime: "2026-08-04T00:00:00.000Z",
-          executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-          normalizedUserDataDir: profileDirectory.canonicalPath,
-          launchNonce: "executor-test-owner",
-          profileDirectory,
-        },
-      };
-      await writeOracleChromeOwner(profileDir, ownerRecord);
-      return {
-        chrome: { ...chrome, processIdentity: ownerRecord.processIdentity },
-        processIdentity: ownerRecord.processIdentity,
-        source: "launched" as const,
-      };
-    });
+    acquireManualChromeOwner.mockImplementation(
+      async (profileDir: string, config: { keepBrowser: boolean }, logger) => {
+        const profileDirectory = await captureProfileDirectoryIdentity(profileDir, {
+          create: true,
+        });
+        const chrome = await launchChrome(config, profileDir, logger);
+        const ownerRecord: OracleChromeOwnerRecord = {
+          port: chrome.port,
+          processIdentity: {
+            pid: chrome.pid,
+            processStartTime: "2026-08-04T00:00:00.000Z",
+            executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            normalizedUserDataDir: profileDirectory.canonicalPath,
+            launchNonce: "executor-test-owner",
+            profileDirectory,
+          },
+          disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
+        };
+        await writeOracleChromeOwner(profileDir, ownerRecord);
+        return {
+          chrome: { ...chrome, processIdentity: ownerRecord.processIdentity },
+          processIdentity: ownerRecord.processIdentity,
+          source: "launched" as const,
+          disposition: ownerRecord.disposition,
+        };
+      },
+    );
     acquireBrowserTabLease.mockImplementation(async (profileDir: string) => ({
       id: "lease-1",
       profileDirectory: await captureProfileDirectoryIdentity(profileDir, { create: true }),
@@ -621,6 +641,8 @@ describe("gemini-web executor", () => {
     ]);
     expect(closeTab).toHaveBeenCalledTimes(1);
     expect(killChrome).toHaveBeenCalledTimes(1);
+    await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+    expect(killChrome).toHaveBeenCalledTimes(1);
   });
 
   it("persists exact prompt and cleanup authority before a post-binding response failure", async () => {
@@ -796,8 +818,14 @@ describe("gemini-web executor", () => {
       log: () => {},
     });
 
+    expect(settleManualChromeOwner).not.toHaveBeenCalled();
     expect(closeTab).not.toHaveBeenCalled();
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+    expect(settleManualChromeOwner).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ disposition: "preserve" }),
+      expect.any(Function),
+    );
     expect(closeTab).toHaveBeenCalledWith(9222, "target-1", expect.any(Function), "127.0.0.1");
     expect(killChrome).not.toHaveBeenCalled();
   });

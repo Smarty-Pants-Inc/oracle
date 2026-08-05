@@ -178,6 +178,10 @@ type RemoteTransactionTransition =
       runtime: BrowserRuntimeMetadata;
     }
   | {
+      type: "persist-settlement-runtime";
+      runtime: BrowserRuntimeMetadata;
+    }
+  | {
       type: "publish-capture";
       runId: string;
       result: RemotePublicRunResult;
@@ -390,6 +394,22 @@ export class RemoteTransactionStore {
     ).record;
   }
 
+  /**
+   * Persists controller runtime only after capture publication and exact durable
+   * settlement binding. Running and unbound recovery journaling remain separate.
+   */
+  async persistSettlementRuntime(
+    transactionToken: string,
+    runtime: BrowserRuntimeMetadata,
+  ): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(transactionToken, {
+        type: "persist-settlement-runtime",
+        runtime,
+      })
+    ).record;
+  }
+
   async publishCapture(params: {
     transactionToken: string;
     runId: string;
@@ -584,6 +604,30 @@ export class RemoteTransactionStore {
         }
         if (record.settlementMode) {
           throw new Error("Cannot journal recovery runtime after cleanup settlement is bound");
+        }
+        record.runtime = transition.runtime;
+        record.runtimeJournaledAt = this.nowIso();
+        return { persist: true };
+      }
+      case "persist-settlement-runtime": {
+        if (record.state !== "pending") {
+          throw new Error(
+            `Cannot persist settlement runtime for transaction in state ${record.state}`,
+          );
+        }
+        if (record.controllerGeneration !== this.controllerGeneration) {
+          throw new Error(
+            "Cannot persist settlement runtime from a stale remote controller generation",
+          );
+        }
+        const runtimeSettlementMode = transition.runtime.recoveryCleanupResult?.settlementMode;
+        if (!record.settlementMode) {
+          throw new Error("Cannot persist settlement runtime without a durable settlement binding");
+        }
+        if (runtimeSettlementMode !== record.settlementMode) {
+          throw new Error(
+            "Cannot persist settlement runtime without its exact durable settlement mode",
+          );
         }
         record.runtime = transition.runtime;
         record.runtimeJournaledAt = this.nowIso();
