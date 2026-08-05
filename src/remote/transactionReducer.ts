@@ -2,172 +2,61 @@ import { isDeepStrictEqual } from "node:util";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
-import type { RemotePublicRunResult } from "./types.js";
 import type {
+  AppliedRemoteTransactionTransition,
   DurableRemoteArtifactDeliveryReceipt,
   DurableRemoteArtifactRegistration,
   DurableRemoteAutomationError,
   DurableRemoteCaptureWarning,
   DurableRemoteStagedCapture,
-  ExpiredRemoteTransactionSettlement,
-  ReconcileRemoteTransactionResult,
-  RemoteTransactionControllerShutdownAction,
+  RemoteTransactionBeginRecord,
+  RemoteTransactionSettlementAuthority,
   RemoteTransactionRecord,
-} from "./transactionStore.js";
+  RemoteTransactionReducerContext,
+  RemoteTransactionTransition,
+  RemoteTransactionTransitionType,
+} from "./transactionModel.js";
+import {
+  authoritativeRemoteSettlementMode,
+  isTerminalRemoteTransactionState,
+  missingRequiredArtifactDeliveries,
+  RemoteTransactionValidationError,
+  validateRemoteArtifactDeliveryReceipt,
+  validateRemoteArtifactOwnership,
+  remoteTransactionSettlementPhase,
+  validateRemoteStagedCapture,
+  validateRemoteTransactionRecord,
+} from "./transactionValidation.js";
+import {
+  REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
+  type RemotePublicRunResult,
+} from "./types.js";
 
 export class RemoteTransactionTransitionError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    readonly settlementAuthority?: RemoteTransactionSettlementAuthority,
   ) {
     super(message);
     this.name = "RemoteTransactionTransitionError";
   }
 }
 
-interface RemoteTransactionTransitionDefinitions {
-  "renew-lease": {
-    params: Record<never, never>;
-    outcome: undefined;
-  };
-  "journal-runtime": {
-    params: {
-      runtime: BrowserRuntimeMetadata;
-      modelSelection?: BrowserModelSelectionEvidence;
-    };
-    outcome: undefined;
-  };
-  "journal-recovery-runtime": {
-    params: { runtime: BrowserRuntimeMetadata };
-    outcome: undefined;
-  };
-  "persist-settlement-runtime": {
-    params: { runtime: BrowserRuntimeMetadata };
-    outcome: undefined;
-  };
-  "stage-capture": {
-    params: {
-      runId: string;
-      result: RemotePublicRunResult;
-      runtime: BrowserRuntimeMetadata;
-      modelSelection?: BrowserModelSelectionEvidence;
-      artifacts: DurableRemoteArtifactRegistration[];
-    };
-    outcome: undefined;
-  };
-  "promote-staged-capture": {
-    params: {
-      result?: RemotePublicRunResult;
-      runtime?: BrowserRuntimeMetadata;
-      warning?: DurableRemoteCaptureWarning;
-      stripTargetAuthority: boolean;
-    };
-    outcome: undefined;
-  };
-  "invalidate-staged-capture": {
-    params: {
-      runtime?: BrowserRuntimeMetadata;
-      error: DurableRemoteAutomationError;
-    };
-    outcome: undefined;
-  };
-  "publish-capture": {
-    params: {
-      runId: string;
-      result: RemotePublicRunResult;
-      runtime: BrowserRuntimeMetadata;
-      modelSelection?: BrowserModelSelectionEvidence;
-      artifacts: DurableRemoteArtifactRegistration[];
-    };
-    outcome: undefined;
-  };
-  "record-failure": {
-    params: {
-      runtime?: BrowserRuntimeMetadata;
-      error: DurableRemoteAutomationError;
-    };
-    outcome: undefined;
-  };
-  "record-artifact-delivery": {
-    params: {
-      artifactId: string;
-      receipt: DurableRemoteArtifactDeliveryReceipt;
-    };
-    outcome: DurableRemoteArtifactDeliveryReceipt;
-  };
-  "bind-settlement": {
-    params: {
-      mode: "finalize" | "abort";
-      durablePublication: boolean;
-    };
-    outcome:
-      | { status: "bound"; cleanupRuntime: BrowserRuntimeMetadata }
-      | { status: "completed"; finalization: BrowserCaptureFinalizationResult };
-  };
-  "complete-settlement": {
-    params: {
-      mode: "finalize" | "abort";
-      finalization: BrowserCaptureFinalizationResult;
-    };
-    outcome: undefined;
-  };
-  "prepare-controller-shutdown": {
-    params: Record<never, never>;
-    outcome: RemoteTransactionControllerShutdownAction;
-  };
-  "reconcile-controller": {
-    params: {
-      buildError: (
-        record: RemoteTransactionRecord,
-        hadRuntimeAuthority: boolean,
-      ) => DurableRemoteAutomationError;
-    };
-    outcome: ReconcileRemoteTransactionResult | null;
-  };
-  expire: {
-    params: {
-      expectedLeaseExpiresAt: string;
-      buildError: (
-        record: RemoteTransactionRecord,
-        hadRuntimeAuthority: boolean,
-      ) => DurableRemoteAutomationError;
-    };
-    outcome: ExpiredRemoteTransactionSettlement | null;
-  };
-}
-
-export type RemoteTransactionTransitionType = keyof RemoteTransactionTransitionDefinitions;
-
-export type RemoteTransactionTransition<
-  Type extends RemoteTransactionTransitionType = RemoteTransactionTransitionType,
-> = {
-  [Kind in Type]: { type: Kind } & RemoteTransactionTransitionDefinitions[Kind]["params"];
-}[Type];
-
-export type RemoteTransactionTransitionOutcome<Type extends RemoteTransactionTransitionType> =
-  RemoteTransactionTransitionDefinitions[Type]["outcome"];
-
-export interface AppliedRemoteTransactionTransition<Type extends RemoteTransactionTransitionType> {
-  persist: boolean;
-  outcome: RemoteTransactionTransitionOutcome<Type>;
-}
-
-export interface RemoteTransactionReducerContext {
-  controllerGeneration: string;
-  now: () => number;
-  nowIso: () => string;
-}
+type RemoteTransactionReduction<Type extends RemoteTransactionTransitionType> = Omit<
+  AppliedRemoteTransactionTransition<Type>,
+  "record"
+>;
 
 type RemoteTransactionReducer<Type extends RemoteTransactionTransitionType> = (
   record: RemoteTransactionRecord,
   transition: RemoteTransactionTransition<Type>,
   context: RemoteTransactionReducerContext,
-) => AppliedRemoteTransactionTransition<Type>;
+) => RemoteTransactionReduction<Type>;
 
 type RemoteTransactionReducers = {
   [Type in RemoteTransactionTransitionType]: RemoteTransactionReducer<Type>;
 };
-
 const reducers: RemoteTransactionReducers = {
   "renew-lease": (record, _transition, context) => {
     if (isTerminalRemoteTransactionState(record.state)) {
@@ -213,8 +102,14 @@ const reducers: RemoteTransactionReducers = {
       throw new Error("Cannot persist settlement runtime without a durable settlement binding");
     }
     if (runtimeSettlementMode !== record.settlementMode) {
-      throw new Error(
-        "Cannot persist settlement runtime without its exact durable settlement mode",
+      throw new RemoteTransactionTransitionError(
+        "transaction_settlement_conflict",
+        "Settlement runtime does not match the exact durable settlement mode",
+        {
+          mode: record.settlementMode,
+          outcome: "bound",
+          state: record.state,
+        },
       );
     }
     record.runtime = transition.runtime;
@@ -229,8 +124,6 @@ const reducers: RemoteTransactionReducers = {
     if (record.runId !== transition.runId) {
       throw new Error("Remote capture run identity changed before durable staging");
     }
-    assertStagedPromptIdentity(record, transition.runtime);
-    assertArtifactRegistrationsOwned(record, transition.artifacts);
     const stagedCapture: DurableRemoteStagedCapture = {
       result: transition.result,
       runtime: transition.runtime,
@@ -238,6 +131,7 @@ const reducers: RemoteTransactionReducers = {
       artifacts: transition.artifacts.length > 0 ? transition.artifacts : undefined,
       stagedAt: context.nowIso(),
     };
+    assertValidRemoteStagedCapture(record, stagedCapture);
     if (record.stagedCapture) {
       const existing = record.stagedCapture;
       assertCapturePromotionMatchesStage(existing, stagedCapture.result, stagedCapture.runtime);
@@ -268,6 +162,7 @@ const reducers: RemoteTransactionReducers = {
         artifacts: stagedCapture.artifacts ?? existing.artifacts,
         stagedAt: existing.stagedAt,
       };
+      assertValidRemoteStagedCapture(record, enriched);
       if (isDeepStrictEqual(existing, enriched)) {
         return { persist: false, outcome: undefined };
       }
@@ -339,8 +234,8 @@ const reducers: RemoteTransactionReducers = {
     if (record.runId !== transition.runId) {
       throw new Error("Remote capture run identity changed before durable commit");
     }
-    assertStagedPromptIdentity(record, transition.runtime);
-    assertArtifactRegistrationsOwned(record, transition.artifacts);
+    assertPublishedPromptIdentity(record, transition.runtime);
+    validateRemoteArtifactOwnership(record, transition.artifacts);
     let result = transition.result;
     if (record.stagedCapture) {
       assertCapturePromotionMatchesStage(
@@ -399,7 +294,7 @@ const reducers: RemoteTransactionReducers = {
       (artifact) => artifact.descriptor.artifactId === transition.artifactId,
     );
     if (!registration) throw new Error("Remote artifact registration does not exist");
-    validateArtifactDeliveryReceipt(registration, transition.receipt);
+    validateRemoteArtifactDeliveryReceipt(registration, transition.receipt);
     if (registration.deliveryReceipt) {
       if (!sameArtifactDeliveryReceipt(registration.deliveryReceipt, transition.receipt)) {
         throw new Error("Remote artifact already has a different delivery receipt");
@@ -429,29 +324,80 @@ const reducers: RemoteTransactionReducers = {
         "Transaction did not retain browser cleanup authority",
       );
     }
-    if (record.state === "finalized" || record.state === "aborted") {
-      throw new RemoteTransactionTransitionError(
-        "transaction_already_settled",
-        `Transaction was already ${record.state}`,
-      );
-    }
     if (!record.runtime) throw new Error("Nonterminal transaction lacks runtime authority");
+    const authoritativeMode = authoritativeRemoteSettlementMode(record);
+    if (authoritativeMode && authoritativeMode !== transition.mode) {
+      throw settlementAuthorityConflict(record, authoritativeMode);
+    }
     if (record.state === "recoverable-error" && transition.mode === "finalize") {
       throw new RemoteTransactionTransitionError(
         "transaction_has_no_capture",
         "Recoverable browser authority has no durably captured answer to finalize",
       );
     }
-    const runtimeSettlementMode = record.runtime.recoveryCleanupResult?.settlementMode;
-    const authoritativeMode = record.settlementMode ?? runtimeSettlementMode;
-    if (authoritativeMode && authoritativeMode !== transition.mode) {
+    let persist = false;
+    if (record.controllerGeneration !== context.controllerGeneration) {
+      record.controllerGeneration = context.controllerGeneration;
+      persist = true;
+    }
+    if (record.settlementMode !== transition.mode) {
+      record.settlementMode = transition.mode;
+      persist = true;
+    }
+    if (transition.mode === "finalize" && transition.durablePublication) {
+      const missingDeliveries = missingRequiredArtifactDeliveries(record);
+      if (missingDeliveries.length > 0) {
+        throw new RemoteTransactionTransitionError(
+          "required_artifact_delivery_incomplete",
+          `${missingDeliveries.length} required artifact delivery receipt(s) are missing`,
+        );
+      }
+      if (!record.publicationAcknowledgedAt) {
+        record.publicationAcknowledgedAt = context.nowIso();
+        persist = true;
+      }
+    }
+    return {
+      persist,
+      outcome: { status: "bound", cleanupRuntime: record.runtime },
+    };
+  },
+  "begin-settlement-execution": (record, transition, context) => {
+    const completed = completedSettlement(record, transition.mode);
+    if (completed) {
+      return {
+        persist: false,
+        outcome: { status: "completed", finalization: completed },
+      };
+    }
+    if (record.state === "running") {
       throw new RemoteTransactionTransitionError(
-        "transaction_settlement_conflict",
-        `Transaction is already bound to ${authoritativeMode}`,
+        "transaction_running",
+        "Transaction is still running",
       );
     }
+    if (record.state === "failed") {
+      throw new RemoteTransactionTransitionError(
+        "transaction_failed",
+        "Transaction did not retain browser cleanup authority",
+      );
+    }
+    const authoritativeMode = authoritativeRemoteSettlementMode(record);
+    if (!authoritativeMode) {
+      throw new RemoteTransactionTransitionError(
+        "transaction_settlement_unbound",
+        "Transaction cleanup mode is not durably bound",
+      );
+    }
+    if (authoritativeMode !== transition.mode) {
+      throw settlementAuthorityConflict(record, authoritativeMode);
+    }
+    if (!record.settlementMode) {
+      throw new Error("Cannot execute cleanup before materializing its durable settlement binding");
+    }
+    if (!record.runtime) throw new Error("Bound transaction lacks runtime authority");
     if (transition.mode === "finalize") {
-      if (!transition.durablePublication) {
+      if (!record.publicationAcknowledgedAt) {
         throw new RemoteTransactionTransitionError(
           "durable_publication_ack_required",
           "Durable answer publication acknowledgement is required",
@@ -464,20 +410,40 @@ const reducers: RemoteTransactionReducers = {
           `${missingDeliveries.length} required artifact delivery receipt(s) are missing`,
         );
       }
-      record.publicationAcknowledgedAt ??= context.nowIso();
     }
+    const cleanupRuntime = markBrowserCaptureCleanupPending(record.runtime, transition.mode);
+    const controllerChanged = record.controllerGeneration !== context.controllerGeneration;
+    const executionStarted = !record.settlementExecutionStartedAt;
     record.controllerGeneration = context.controllerGeneration;
-    record.settlementMode = transition.mode;
-    const cleanupRuntime =
-      record.runtime.recoveryCleanupResources?.length || record.runtime.recoveryCleanupResult
-        ? record.runtime
-        : { ...record.runtime, recoveryCleanupResult: { status: "pending" as const } };
-    record.runtime = markBrowserCaptureCleanupPending(cleanupRuntime, transition.mode);
-    return { persist: true, outcome: { status: "bound", cleanupRuntime: record.runtime } };
+    record.settlementExecutionStartedAt ??= context.nowIso();
+    if (
+      isDeepStrictEqual(cleanupRuntime, record.runtime) &&
+      !controllerChanged &&
+      !executionStarted
+    ) {
+      return {
+        persist: false,
+        outcome: { status: "executing", cleanupRuntime: record.runtime },
+      };
+    }
+    record.runtime = cleanupRuntime;
+    return {
+      persist: true,
+      outcome: { status: "executing", cleanupRuntime },
+    };
   },
   "complete-settlement": (record, transition, context) => {
-    if (record.settlementMode !== transition.mode) {
+    const completed = completedSettlement(record, transition.mode);
+    if (completed) return { persist: false, outcome: undefined };
+    const authoritativeMode = authoritativeRemoteSettlementMode(record);
+    if (authoritativeMode && authoritativeMode !== transition.mode) {
+      throw settlementAuthorityConflict(record, authoritativeMode);
+    }
+    if (!record.settlementMode) {
       throw new Error("Cannot complete cleanup without its exact durable settlement binding");
+    }
+    if (remoteTransactionSettlementPhase(record) === "mode-bound") {
+      throw new Error("Cannot complete cleanup before durable settlement execution begins");
     }
     if (!record.runtime) throw new Error("Bound transaction lacks runtime authority");
     if (transition.finalization.status === "pending") {
@@ -511,7 +477,7 @@ const reducers: RemoteTransactionReducers = {
       return { persist: false, outcome: { action: "preserve" } };
     }
     if (record.settlementMode === "finalize" && !record.publicationAcknowledgedAt) {
-      throw new Error("Finalize-bound transaction lacks durable publication acknowledgement");
+      return { persist: false, outcome: { action: "preserve" } };
     }
     return {
       persist: false,
@@ -599,27 +565,59 @@ const reducers: RemoteTransactionReducers = {
   },
 };
 
+export function createRemoteTransactionRecord(
+  begin: RemoteTransactionBeginRecord,
+  context: RemoteTransactionReducerContext,
+): RemoteTransactionRecord {
+  const updatedAt = context.nowIso();
+  const record: RemoteTransactionRecord = {
+    ...begin,
+    updatedAt,
+    controllerGeneration: context.controllerGeneration,
+    state: "running",
+    capacityReservationBytes: REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
+    leaseExpiresAt: new Date(Date.parse(updatedAt) + context.leaseDurationMs).toISOString(),
+  };
+  validateRemoteTransactionRecord(record, {
+    expectedTransactionToken: record.transactionToken,
+    maximumLeaseDurationMs: context.leaseDurationMs,
+  });
+  return record;
+}
+
 export function applyRemoteTransactionTransition<Type extends RemoteTransactionTransitionType>(
   record: RemoteTransactionRecord,
   transition: RemoteTransactionTransition<Type>,
   context: RemoteTransactionReducerContext,
 ): AppliedRemoteTransactionTransition<Type> {
+  validateRemoteTransactionRecord(record, {
+    expectedTransactionToken: record.transactionToken,
+    maximumLeaseDurationMs: context.leaseDurationMs,
+  });
+  const nextRecord = structuredClone(record);
   const reducer = reducers[transition.type] as RemoteTransactionReducer<Type>;
-  return reducer(record, transition, context);
+  const reduction = reducer(nextRecord, transition, context);
+  if (!reduction.persist) return { record, ...reduction };
+  finalizeRemoteTransactionTransition(nextRecord, context);
+  validateRemoteTransactionRecord(nextRecord, {
+    expectedTransactionToken: record.transactionToken,
+    maximumLeaseDurationMs: context.leaseDurationMs,
+  });
+  return { record: nextRecord, ...reduction };
 }
 
-export function isTerminalRemoteTransactionState(
-  state: RemoteTransactionRecord["state"],
-): state is "finalized" | "aborted" | "failed" {
-  return state === "finalized" || state === "aborted" || state === "failed";
-}
-
-export function missingRequiredArtifactDeliveries(
-  record: Pick<RemoteTransactionRecord, "artifacts">,
-): DurableRemoteArtifactRegistration[] {
-  return (record.artifacts ?? []).filter(
-    (artifact) => artifact.descriptor.required && !artifact.deliveryReceipt,
-  );
+function finalizeRemoteTransactionTransition(
+  record: RemoteTransactionRecord,
+  context: RemoteTransactionReducerContext,
+): void {
+  const updatedAt = context.nowIso();
+  record.updatedAt = updatedAt;
+  record.capacityReservationBytes =
+    record.state === "running" ? REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES : undefined;
+  if (!isTerminalRemoteTransactionState(record.state)) {
+    record.leaseExpiresAt = new Date(Date.parse(updatedAt) + context.leaseDurationMs).toISOString();
+  }
+  redactTerminalRecord(record, updatedAt);
 }
 
 function assertCurrentController(
@@ -632,17 +630,37 @@ function assertCurrentController(
   }
 }
 
+function settlementAuthorityConflict(
+  record: RemoteTransactionRecord,
+  mode: "finalize" | "abort",
+): RemoteTransactionTransitionError {
+  const settlementAuthority: RemoteTransactionSettlementAuthority = {
+    mode,
+    outcome: "bound",
+    state: record.state,
+  };
+  return new RemoteTransactionTransitionError(
+    "transaction_settlement_conflict",
+    `Transaction is already bound to ${mode}`,
+    settlementAuthority,
+  );
+}
+
 function completedSettlement(
   record: RemoteTransactionRecord,
   requestedMode: "finalize" | "abort",
 ): BrowserCaptureFinalizationResult | null {
   if (!isTerminalRemoteTransactionState(record.state)) return null;
   const settledMode = record.terminalAudit?.settlementMode;
+  if (!settledMode) {
+    if (record.state === "failed") return null;
+    throw new Error("Terminal remote transaction lacks authoritative settlement mode");
+  }
   if (settledMode !== requestedMode) {
-    if (record.state === "failed" && !settledMode) return null;
     throw new RemoteTransactionTransitionError(
       "transaction_already_settled",
       `Transaction was already ${record.state}`,
+      { mode: settledMode, outcome: "completed", state: record.state },
     );
   }
   if (!record.finalization || record.finalization.status !== "completed") {
@@ -651,7 +669,27 @@ function completedSettlement(
   return record.finalization;
 }
 
-function assertStagedPromptIdentity(
+function assertValidRemoteStagedCapture(
+  record: RemoteTransactionRecord,
+  staged: DurableRemoteStagedCapture,
+): void {
+  try {
+    validateRemoteStagedCapture(record, staged);
+  } catch (error) {
+    if (
+      error instanceof RemoteTransactionValidationError &&
+      error.code === "staged_capture_invalid"
+    ) {
+      throw new RemoteTransactionTransitionError(
+        "staged_capture_identity_mismatch",
+        "Staged remote capture does not match the exact prompt and conversation identity",
+      );
+    }
+    throw error;
+  }
+}
+
+function assertPublishedPromptIdentity(
   record: Pick<RemoteTransactionRecord, "requestIdentity">,
   runtime: BrowserRuntimeMetadata,
 ): void {
@@ -756,6 +794,7 @@ function commitCapture(
   record.stagedCapture = undefined;
   record.error = undefined;
   record.settlementMode = undefined;
+  record.settlementExecutionStartedAt = undefined;
   record.publicationAcknowledgedAt = undefined;
   record.finalization = undefined;
   record.restartRecovery = undefined;
@@ -822,40 +861,44 @@ function projectRunningRecordToFailure(
   return state;
 }
 
-function assertArtifactRegistrationsOwned(
-  record: RemoteTransactionRecord,
-  artifacts: DurableRemoteArtifactRegistration[],
-): void {
-  const artifactIds = new Set<string>();
-  for (const artifact of artifacts) {
-    if (
-      artifact.transactionToken !== record.transactionToken ||
-      artifact.descriptor.runId !== record.runId ||
-      !artifact.canonicalPath ||
-      artifactIds.has(artifact.descriptor.artifactId)
-    ) {
-      throw new Error("Remote artifact registration is not uniquely owned by its transaction");
-    }
-    artifactIds.add(artifact.descriptor.artifactId);
-    if (artifact.deliveryReceipt) {
-      validateArtifactDeliveryReceipt(artifact, artifact.deliveryReceipt);
-    }
-  }
-}
-
-function validateArtifactDeliveryReceipt(
-  registration: DurableRemoteArtifactRegistration,
-  receipt: DurableRemoteArtifactDeliveryReceipt,
-): void {
-  if (
-    !receipt.receiptId ||
-    !Number.isFinite(Date.parse(receipt.deliveredAt)) ||
-    !Number.isSafeInteger(receipt.byteSize) ||
-    receipt.byteSize !== registration.descriptor.byteSize ||
-    receipt.sha256 !== registration.descriptor.sha256
-  ) {
-    throw new Error("Remote artifact delivery receipt does not match registered content");
-  }
+function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: string): void {
+  if (!isTerminalRemoteTransactionState(record.state)) return;
+  const promptEpoch = record.runtime?.promptEpoch ?? record.finalization?.runtime.promptEpoch;
+  record.terminalAudit ??= {
+    redactedAt,
+    settlementMode: record.settlementMode,
+    publicationAcknowledgedAt: record.publicationAcknowledgedAt,
+    artifacts: (record.artifacts ?? []).map((artifact) => ({
+      artifactId: artifact.descriptor.artifactId,
+      runId: artifact.descriptor.runId,
+      required: artifact.descriptor.required,
+      deliveryReceipt: artifact.deliveryReceipt,
+    })),
+    errorCode: record.error?.code,
+    errorStage: record.error?.stage,
+  };
+  record.finalization =
+    record.finalization?.status === "completed"
+      ? {
+          status: "completed",
+          runtime: promptEpoch ? { promptEpoch } : {},
+        }
+      : undefined;
+  record.result = undefined;
+  record.capacityReservationBytes = undefined;
+  Reflect.deleteProperty(record, "requestIdentity");
+  Reflect.deleteProperty(record, "browserConfig");
+  Reflect.deleteProperty(record, "leaseExpiresAt");
+  record.runtime = undefined;
+  record.runtimeJournaledAt = undefined;
+  record.modelSelection = undefined;
+  record.artifacts = undefined;
+  record.stagedCapture = undefined;
+  record.error = undefined;
+  record.settlementMode = undefined;
+  Reflect.deleteProperty(record, "settlementExecutionStartedAt");
+  record.publicationAcknowledgedAt = undefined;
+  record.restartRecovery = undefined;
 }
 
 function sameArtifactDeliveryReceipt(

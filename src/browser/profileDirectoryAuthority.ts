@@ -90,7 +90,7 @@ async function rejectProfileSymlinkTraversal(
     try {
       entry = await lstat(current);
     } catch (error) {
-      if (options.allowMissing && readErrorCode(error) === "ENOENT") return;
+      if (options.allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
     if (!entry.isSymbolicLink()) continue;
@@ -139,9 +139,4 @@ export function parseProfileDirectoryIdentity(
 
 function pathForPlatform(platform: NodeJS.Platform): PlatformPath {
   return platform === "win32" ? path.win32 : path.posix;
-}
-
-function readErrorCode(error: unknown): unknown {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return error.code;
 }

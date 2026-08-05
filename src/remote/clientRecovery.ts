@@ -18,11 +18,15 @@ import {
 } from "./transactionClientRuntime.js";
 import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
+  RemoteSettlementBindResponseSchema,
+  RemoteSettlementConflictResponseSchema,
   RemoteTransactionRetryResponseSchema,
   RemoteTransactionSettlementResponseSchema,
   type RemoteBrowserAutomationErrorPayload,
   type RemoteRecoverySettlementOptions,
   type RemoteRunTransactionPayload,
+  type RemoteSettlementBindResponse,
+  type RemoteSettlementAuthority,
   type RemoteTransactionRetryResponse,
   type RemoteTransactionSettlementResponse,
 } from "./types.js";
@@ -53,35 +57,55 @@ export async function settleRemoteBrowserRecovery(
   if (persistedMode && persistedMode !== mode) {
     throw settlementModeConflict(mode, persistedMode, params.runtime);
   }
-  const settlementRuntime = bindRemoteSettlementMode(params.runtime, mode);
   if (!params.authToken?.trim()) {
-    return pending(
-      "Remote cleanup authentication is unavailable; configure ORACLE_REMOTE_TOKEN.",
-      settlementRuntime,
-    );
+    return pending("Remote cleanup authentication is unavailable; configure ORACLE_REMOTE_TOKEN.");
   }
   if (authority.host !== params.configuredHost) {
     return pending(
       `Remote cleanup host mismatch; refusing to send credentials to ${authority.host}.`,
-      settlementRuntime,
     );
   }
   let endpoint: { hostname: string; port: number };
   try {
     endpoint = parseRemoteHost(params.configuredHost);
   } catch (error) {
-    return pending(error instanceof Error ? error.message : String(error), settlementRuntime);
+    return pending(error instanceof Error ? error.message : String(error));
   }
-  return await settleRemoteBrowserTransaction({
-    ...endpoint,
-    token: params.authToken,
-    host: authority.host,
-    transactionToken: authority.transactionToken,
-    recoveryState: authority.state,
-    mode,
-    runtime: settlementRuntime,
-    deadlines: resolveRemoteTransportDeadlines(params.deadlines),
-  });
+  const deadlines = resolveRemoteTransportDeadlines(params.deadlines);
+  try {
+    const settlementRuntime = await bindRemoteBrowserSettlement({
+      ...endpoint,
+      token: params.authToken,
+      host: authority.host,
+      transactionToken: authority.transactionToken,
+      recoveryState: authority.state,
+      mode,
+      runtime: params.runtime,
+      deadlines,
+    });
+    return await settleRemoteBrowserTransaction({
+      ...endpoint,
+      token: params.authToken,
+      host: authority.host,
+      transactionToken: authority.transactionToken,
+      recoveryState: authority.state,
+      mode,
+      runtime: settlementRuntime,
+      deadlines,
+    });
+  } catch (error) {
+    if (
+      error instanceof BrowserAutomationError &&
+      error.details?.code !== "remote-settlement-binding-transport-failed"
+    ) {
+      throw error;
+    }
+    const runtime =
+      error instanceof BrowserAutomationError && error.details?.runtime
+        ? (error.details.runtime as BrowserRuntimeMetadata)
+        : params.runtime;
+    return pending(error instanceof Error ? error.message : String(error), runtime);
+  }
 }
 
 export async function recoverRemoteRunTransaction(params: {
@@ -393,6 +417,140 @@ export function assertPromptEpochMatchesRequestIdentity(
     );
   }
 }
+function convergeRemoteSettlementAuthority(
+  runtime: BrowserRuntimeMetadata,
+  authority: RemoteSettlementAuthority,
+): BrowserRuntimeMetadata {
+  if (authority.outcome === "completed") {
+    const resourceRuntime = projectRemoteRecoveryRuntime(
+      { cleanup: { status: "completed" } },
+      null,
+    );
+    return projectRemoteRecoveryFinalization(
+      runtime,
+      { status: "completed", runtime: resourceRuntime },
+      authority.mode,
+    ).runtime;
+  }
+  const unboundRuntime = { ...runtime };
+  delete unboundRuntime.recoveryCleanupResult;
+  return markBrowserCaptureCleanupPending(unboundRuntime, authority.mode);
+}
+
+export async function bindRemoteBrowserSettlement(params: {
+  transactionToken: string;
+  recoveryState: BrowserRemoteRecoveryMetadata["state"];
+  hostname: string;
+  port: number;
+  token?: string;
+  host: string;
+  mode: "finalize" | "abort";
+  runtime: BrowserRuntimeMetadata;
+  deadlines: ResolvedRemoteTransportDeadlines;
+}): Promise<BrowserRuntimeMetadata> {
+  const response = await postRemoteJson({
+    hostname: params.hostname,
+    port: params.port,
+    path: `/transactions/${params.transactionToken}/bind`,
+    token: params.token,
+    body: { mode: params.mode, durablePublication: params.mode === "finalize" },
+    overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
+    idleTimeoutMs: params.deadlines.socketIdleTimeoutMs,
+    operation: `Remote ${params.mode} binding request`,
+  }).catch((error): never => {
+    if (
+      error instanceof BrowserAutomationError &&
+      error.details?.code !== "remote-authentication-transport-failed"
+    ) {
+      throw error;
+    }
+    const runtime = markBrowserCaptureCleanupPending(params.runtime, params.mode);
+    throw new BrowserAutomationError(
+      `Remote ${params.mode} binding remains retryable after a transport failure.`,
+      {
+        stage: "remote-settlement-binding",
+        code: "remote-settlement-binding-transport-failed",
+        transactionToken: params.transactionToken,
+        recoverableDisconnect: true,
+        runtime,
+      },
+      error,
+    );
+  });
+  if (response.statusCode === 409) {
+    const conflict = RemoteSettlementConflictResponseSchema.safeParse(response.json);
+    if (!conflict.success) {
+      throw new BrowserAutomationError(response.errorMessage, {
+        stage: "remote-settlement-binding",
+        statusCode: response.statusCode,
+        transactionToken: params.transactionToken,
+        recoverableDisconnect: true,
+        runtime: params.runtime,
+      });
+    }
+    const authoritativeRuntime = convergeRemoteSettlementAuthority(
+      params.runtime,
+      conflict.data.settlementAuthority,
+    );
+    throw settlementModeConflict(
+      params.mode,
+      conflict.data.settlementAuthority.mode,
+      authoritativeRuntime,
+      conflict.data.settlementAuthority,
+    );
+  }
+  if (response.statusCode !== 200) {
+    throw new BrowserAutomationError(response.errorMessage, {
+      stage: "remote-settlement-binding",
+      statusCode: response.statusCode,
+      transactionToken: params.transactionToken,
+      recoverableDisconnect: true,
+      runtime: params.runtime,
+    });
+  }
+  const binding = RemoteSettlementBindResponseSchema.parse(
+    response.json,
+  ) as RemoteSettlementBindResponse;
+  if (binding.transactionToken !== params.transactionToken) {
+    throw new BrowserAutomationError("Remote settlement binding token did not match the request.", {
+      stage: "remote-protocol",
+      transactionToken: params.transactionToken,
+      recoverableDisconnect: true,
+      runtime: params.runtime,
+    });
+  }
+  const currentAuthority = findRemoteRecoveryAuthority(params.runtime);
+  const remoteRecovery =
+    binding.settlementAuthority.outcome === "bound"
+      ? ({
+          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+          host: params.host,
+          transactionToken: params.transactionToken,
+          state: params.recoveryState,
+          requestIdentity: currentAuthority?.requestIdentity,
+        } satisfies BrowserRemoteRecoveryMetadata)
+      : null;
+  const resourceRuntime = projectRemoteRecoveryRuntime(binding.runtime, remoteRecovery);
+  const authoritativeRuntime =
+    binding.settlementAuthority.outcome === "completed"
+      ? projectRemoteRecoveryFinalization(params.runtime, {
+          status: "completed",
+          runtime: resourceRuntime,
+        }).runtime
+      : bindRemoteSettlementMode(
+          projectRemoteRecoveryRuntime(binding.runtime, remoteRecovery, params.runtime),
+          binding.settlementAuthority.mode,
+        );
+  if (binding.settlementAuthority.mode !== params.mode) {
+    throw settlementModeConflict(
+      params.mode,
+      binding.settlementAuthority.mode,
+      authoritativeRuntime,
+      binding.settlementAuthority,
+    );
+  }
+  return authoritativeRuntime;
+}
 
 export async function settleRemoteBrowserTransaction(params: {
   transactionToken: string;
@@ -405,66 +563,107 @@ export async function settleRemoteBrowserTransaction(params: {
   runtime: BrowserRuntimeMetadata;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<BrowserCaptureFinalizationResult> {
-  try {
-    const response = await postRemoteJson({
-      hostname: params.hostname,
-      port: params.port,
-      path: `/transactions/${params.transactionToken}/${params.mode}`,
-      token: params.token,
-      body: params.mode === "finalize" ? { durablePublication: true } : {},
-      overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
-      idleTimeoutMs: params.deadlines.socketIdleTimeoutMs,
-      operation: `Remote ${params.mode} request`,
-    });
-    if (response.statusCode !== 200) {
+  let transportError: unknown;
+  const response = await postRemoteJson({
+    hostname: params.hostname,
+    port: params.port,
+    path: `/transactions/${params.transactionToken}/${params.mode}`,
+    token: params.token,
+    body: params.mode === "finalize" ? { durablePublication: true } : {},
+    overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
+    idleTimeoutMs: params.deadlines.socketIdleTimeoutMs,
+    operation: `Remote ${params.mode} request`,
+  }).catch((error) => {
+    transportError = error;
+    return null;
+  });
+  if (!response) {
+    if (
+      transportError instanceof BrowserAutomationError &&
+      transportError.details?.code !== "remote-authentication-transport-failed"
+    ) {
+      throw transportError;
+    }
+    const message = `Remote ${params.mode} remains retryable after a transport failure: ${
+      transportError instanceof Error ? transportError.message : String(transportError)
+    }`;
+    return pendingBrowserCaptureCleanup(params.runtime, message, params.mode);
+  }
+  if (response.statusCode === 409) {
+    const conflict = RemoteSettlementConflictResponseSchema.safeParse(response.json);
+    if (!conflict.success) {
       throw new BrowserAutomationError(response.errorMessage, {
         stage: `remote-${params.mode}`,
         statusCode: response.statusCode,
         transactionToken: params.transactionToken,
+        recoverableDisconnect: true,
+        runtime: params.runtime,
       });
     }
-    const settlement = RemoteTransactionSettlementResponseSchema.parse(
-      response.json,
-    ) as RemoteTransactionSettlementResponse;
-    if (settlement.transactionToken !== params.transactionToken) {
-      throw new BrowserAutomationError("Remote settlement token did not match the request.", {
-        stage: "remote-protocol",
-        transactionToken: params.transactionToken,
-      });
-    }
-    const expectedTerminalState = params.mode === "finalize" ? "finalized" : "aborted";
-    if (settlement.state !== "pending" && settlement.state !== expectedTerminalState) {
-      throw new BrowserAutomationError(
-        `Remote settlement state ${settlement.state} is inconsistent with ${params.mode}.`,
-        { stage: "remote-protocol", transactionToken: params.transactionToken },
-      );
-    }
-    const keepRecovery = settlement.finalization.status === "pending";
-    const currentAuthority = findRemoteRecoveryAuthority(params.runtime);
-    const remoteRecovery = keepRecovery
-      ? ({
-          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-          host: params.host,
-          transactionToken: params.transactionToken,
-          state: params.recoveryState,
-          requestIdentity: currentAuthority?.requestIdentity,
-        } satisfies BrowserRemoteRecoveryMetadata)
-      : null;
-    const resourceRuntime = projectRemoteRecoveryRuntime(
-      settlement.finalization.runtime,
-      remoteRecovery,
+    const authoritativeRuntime = convergeRemoteSettlementAuthority(
+      params.runtime,
+      conflict.data.settlementAuthority,
     );
-    const resourceFinalization =
-      settlement.finalization.status === "pending"
-        ? pendingBrowserCaptureCleanup(resourceRuntime, settlement.finalization.error, params.mode)
-        : ({ status: "completed", runtime: resourceRuntime } as const);
-    return projectRemoteRecoveryFinalization(params.runtime, resourceFinalization, params.mode);
-  } catch (error) {
-    const message = `Remote ${params.mode} remains retryable: ${
-      error instanceof Error ? error.message : String(error)
-    }`;
-    return pendingBrowserCaptureCleanup(params.runtime, message, params.mode);
+    throw settlementModeConflict(
+      params.mode,
+      conflict.data.settlementAuthority.mode,
+      authoritativeRuntime,
+      conflict.data.settlementAuthority,
+    );
   }
+  if (response.statusCode !== 200) {
+    throw new BrowserAutomationError(response.errorMessage, {
+      stage: `remote-${params.mode}`,
+      statusCode: response.statusCode,
+      transactionToken: params.transactionToken,
+    });
+  }
+  const settlement = RemoteTransactionSettlementResponseSchema.parse(
+    response.json,
+  ) as RemoteTransactionSettlementResponse;
+  if (settlement.transactionToken !== params.transactionToken) {
+    throw new BrowserAutomationError("Remote settlement token did not match the request.", {
+      stage: "remote-protocol",
+      transactionToken: params.transactionToken,
+    });
+  }
+  const expectedTerminalState = params.mode === "finalize" ? "finalized" : "aborted";
+  if (settlement.state !== "pending" && settlement.state !== expectedTerminalState) {
+    throw new BrowserAutomationError(
+      `Remote settlement state ${settlement.state} is inconsistent with ${params.mode}.`,
+      { stage: "remote-protocol", transactionToken: params.transactionToken },
+    );
+  }
+  if (
+    settlement.settlementAuthority.mode !== params.mode ||
+    settlement.settlementAuthority.outcome !==
+      (settlement.finalization.status === "completed" ? "completed" : "bound")
+  ) {
+    throw new BrowserAutomationError(
+      "Remote settlement response contradicted its authoritative binding.",
+      { stage: "remote-protocol", transactionToken: params.transactionToken },
+    );
+  }
+  const keepRecovery = settlement.finalization.status === "pending";
+  const currentAuthority = findRemoteRecoveryAuthority(params.runtime);
+  const remoteRecovery = keepRecovery
+    ? ({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        host: params.host,
+        transactionToken: params.transactionToken,
+        state: params.recoveryState,
+        requestIdentity: currentAuthority?.requestIdentity,
+      } satisfies BrowserRemoteRecoveryMetadata)
+    : null;
+  const resourceRuntime = projectRemoteRecoveryRuntime(
+    settlement.finalization.runtime,
+    remoteRecovery,
+  );
+  const resourceFinalization =
+    settlement.finalization.status === "pending"
+      ? pendingBrowserCaptureCleanup(resourceRuntime, settlement.finalization.error, params.mode)
+      : ({ status: "completed", runtime: resourceRuntime } as const);
+  return projectRemoteRecoveryFinalization(params.runtime, resourceFinalization, params.mode);
 }
 
 export function bindRemoteSettlementMode(
@@ -489,14 +688,16 @@ export function settlementModeConflict(
   requestedMode: "finalize" | "abort",
   persistedMode: "finalize" | "abort",
   runtime: BrowserRuntimeMetadata,
+  settlementAuthority?: RemoteSettlementAuthority,
 ): BrowserAutomationError {
   return new BrowserAutomationError(
     `Remote recovery is already bound to ${persistedMode} settlement; refusing ${requestedMode}.`,
     {
       stage: "remote-settlement",
-      code: "settlement-mode-conflict",
-      recoverableDisconnect: true,
+      recoverableDisconnect: settlementAuthority?.outcome !== "completed",
       runtime,
+      code: settlementAuthority ? "remote-settlement-mode-conflict" : "settlement-mode-conflict",
+      ...(settlementAuthority ? { settlementAuthority } : {}),
     },
   );
 }

@@ -24,7 +24,8 @@ import {
   terminalTransactionRetryResponse,
 } from "./transactionProtocol.js";
 import { settleExpiredRemoteTransaction } from "./transactionServer.js";
-import { type RemoteTransactionRecord, RemoteTransactionStore } from "./transactionStore.js";
+import type { RemoteTransactionRecord } from "./transactionModel.js";
+import { RemoteTransactionStore } from "./transactionStore.js";
 import { RemoteRetryRequestSchema, type RemoteTransactionRetryResponse } from "./types.js";
 
 type RecoverableRemoteTransactionRecord = RemoteTransactionRecord & {
@@ -161,7 +162,10 @@ export async function serveRemoteTransactionRetry(
     sendJson(params.res, outcome.statusCode, outcome.body);
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {
-      sendJson(params.res, error.statusCode, { error: error.code, message: error.message });
+      sendJson(params.res, error.statusCode, {
+        error: error.code,
+        ...(error.settlementAuthority ? { settlementAuthority: error.settlementAuthority } : {}),
+      });
       return;
     }
     throw error;

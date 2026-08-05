@@ -1,3 +1,4 @@
+import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
 import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
 import type { ConversationUrlMonitor } from "./conversationUrlMonitor.js";
 import type { BrowserAutomationError } from "../oracle/errors.js";
@@ -10,6 +11,7 @@ export interface LocalBrowserRunState {
   lastUrl: string | undefined;
   ownsTarget: boolean;
   isolatedTargetId: string | null;
+  targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
   client: ChromeClient | null;
   browserRuntime: ChromeClient["Runtime"] | null;
   modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -31,6 +33,7 @@ export function createLocalBrowserRunState(tabLease: BrowserTabLease | null): Lo
     lastUrl: undefined,
     ownsTarget: true,
     isolatedTargetId: null,
+    targetCloseCapability: undefined,
     client: null,
     browserRuntime: null,
     modelSelectionEvidence: undefined,

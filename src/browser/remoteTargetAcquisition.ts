@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { connectToRemoteChrome } from "./chromeLifecycle.js";
+import { closeChromeTargetWithExactAuthority, connectToRemoteChrome } from "./chromeLifecycle.js";
 import { clearStaleChatGptConversationCookies } from "./cookies.js";
 import {
   navigateToChatGPT,
@@ -28,6 +28,7 @@ import { enableFocusEmulation } from "./coordinatorPolicy.js";
 import { installRemoteDisconnectHandler } from "./remoteDisconnectSettlement.js";
 import type { ChromeClient } from "./types.js";
 import type { RemoteBrowserExecutionContext } from "./remoteExecutionContext.js";
+import { retainChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 
 export interface RemoteBrowserTarget {
   client: ChromeClient;
@@ -101,6 +102,27 @@ export async function acquireRemoteBrowserTarget(
     context.remoteTargetId = context.connection.targetId;
     context.ownsTarget = context.connection.ownership === "created";
     context.attachedExistingTab = context.connection.ownership === "attached";
+    if (context.ownsTarget) {
+      const targetCloseAuthority = context.connection.targetCloseAuthority;
+      if (!targetCloseAuthority) {
+        await context.persistRuntime();
+        throw new Error(
+          "Created remote Chrome target has no retained exact live close authority; the target was preserved.",
+        );
+      }
+      const targetId = context.connection.targetId;
+      context.targetCloseCapability = retainChromeTargetCloseCapability({
+        generationId: context.acquisitionGenerationId,
+        targetId,
+        close: (closeLogger) =>
+          closeChromeTargetWithExactAuthority({
+            authority: targetCloseAuthority,
+            targetId,
+            logger: closeLogger,
+          }),
+        release: () => targetCloseAuthority.release(),
+      });
+    }
   }
   await context.persistRuntime();
   if (context.tabLease && context.remoteTargetId) {

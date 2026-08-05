@@ -85,6 +85,14 @@ function createReattachResult(
     answerText,
     answerMarkdown,
     runtime: capturedRuntime,
+    bindSettlement: vi.fn(async (mode: "finalize" | "abort") =>
+      capturedRuntime.recoveryCleanupResources?.length
+        ? {
+            ...capturedRuntime,
+            recoveryCleanupResult: { status: "pending" as const, settlementMode: mode },
+          }
+        : capturedRuntime,
+    ),
     finalize: vi.fn(async () => {
       await onFinalize?.();
       return { status: "completed" as const, runtime: finalizedRuntime };
@@ -375,7 +383,7 @@ describe("browser reattach end-to-end (simulated)", () => {
       );
       const updated = await sessionStore.readSession(sessionMeta.id);
       expect(updated?.status).toBe("completed");
-      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/demo");
+      expect(updated?.browser?.runtime).not.toHaveProperty("tabUrl");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -516,7 +524,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         resumeMock.mock.invocationCallOrder[0] ?? 0,
       );
       const updated = await sessionStore.readSession(sessionMeta.id);
-      expect(updated?.browser?.runtime?.tabUrl).toBe("https://chatgpt.com/c/deep-project");
+      expect(updated?.browser?.runtime).not.toHaveProperty("tabUrl");
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -668,6 +676,12 @@ describe("browser reattach end-to-end (simulated)", () => {
             chromeProfileRoot: profileDir,
             userDataDir: profileDir,
             chromeTargetId: "t-1",
+            targetCloseCapability: {
+              version: 1,
+              generationId: "termination-generation",
+              capabilityId: "termination-target-capability",
+            },
+            acquisition: { generationId: "termination-generation" },
             recoveryCleanup: {
               ownsTarget: true,
               profileKind: "temporary",

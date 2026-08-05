@@ -60,6 +60,11 @@ export function recoveryCleanupResourceKey(
     resource.chromeBrowserWSEndpoint ?? null,
     resource.chromeProcessIdentity?.launchNonce ?? null,
     profileDirectoryIdentityKey(resource.profileDirectoryIdentity) ?? null,
+    [
+      resource.targetCloseCapability?.version ?? null,
+      resource.targetCloseCapability?.generationId ?? null,
+      resource.targetCloseCapability?.capabilityId ?? null,
+    ],
     resource.acquisition?.generationId ?? null,
     resource.acquisition?.pendingResource ?? null,
     [
@@ -154,6 +159,7 @@ export function teardownOnlyEntry(entry: RecoveryCleanupEntry): RecoveryCleanupE
     resource: {
       ...entry.resource,
       chromeTargetId: undefined,
+      targetCloseCapability: undefined,
       recoveryCleanup: {
         ...entry.resource.recoveryCleanup,
         ownsTarget: false,

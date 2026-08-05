@@ -1,4 +1,5 @@
 import { formatElapsed } from "../oracle/format.js";
+import type { LaunchedChrome } from "chrome-launcher";
 import {
   launchChrome,
   retainChromeEndpointAuthority,
@@ -7,6 +8,7 @@ import {
 } from "./chromeLifecycle.js";
 import {
   acquireProfileRunLock,
+  captureChromeProcessIdentity,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
   isSafeChromeTerminationOutcome,
@@ -27,13 +29,15 @@ import {
 } from "./profileState.js";
 import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
 import { delay } from "./utils.js";
+import { releaseManualChromeOwnerEndpointAuthority } from "./manualChromeOwnerSettlement.js";
 
 export type ManualChromeOwnerSource = "recorded" | "rediscovered" | "launched";
 
-export type BrowserChrome = ChromeLaunchResult;
+export type BrowserChrome = LaunchedChrome & { host?: string };
 
 export interface ManualChromeOwner {
-  readonly chrome: BrowserChrome;
+  readonly chrome: ChromeLaunchResult;
+  readonly compatibilityChrome?: BrowserChrome;
   readonly processIdentity: ChromeProcessIdentity;
   readonly source: ManualChromeOwnerSource;
   readonly disposition: ChromeOwnerDisposition;
@@ -42,7 +46,9 @@ export interface ManualChromeOwner {
 
 export interface ManualChromeOwnerDeps {
   acquireProfileLock?: typeof acquireProfileRunLock;
+  captureProcessIdentity?: typeof captureChromeProcessIdentity;
   cleanupProfileState?: typeof cleanupStaleProfileState;
+  compatibilityMaybeReuse?: ManualLoginChromeReuse;
   discoverExactProfileChrome?: typeof findRunningChromeDebugTargetForProfile;
   isOwnerProcessAlive?: typeof isProcessAlive;
   launchClaim?: ChromeProcessLaunchClaim;
@@ -55,11 +61,34 @@ export interface ManualChromeOwnerDeps {
   writeOwner?: typeof writeOracleChromeOwner;
 }
 
+interface ManualLoginReusableChrome extends BrowserChrome {
+  processIdentity?: ChromeProcessIdentity;
+  endpointAuthority?: RetainedChromeEndpointAuthority;
+}
+
+type ManualLoginChromeReuse = (
+  userDataDir: string,
+  logger: BrowserLogger,
+  options: { waitForPortMs?: number },
+) => Promise<ManualLoginReusableChrome | null>;
+type ManualLoginChromeLaunch = (
+  config: ResolvedBrowserConfig,
+  userDataDir: string,
+  logger: BrowserLogger,
+) => Promise<BrowserChrome>;
+
+interface AcquireManualLoginChromeForRunDeps extends Omit<
+  ManualChromeOwnerDeps,
+  "compatibilityMaybeReuse" | "launch"
+> {
+  maybeReuse?: ManualLoginChromeReuse;
+  launch?: ManualLoginChromeLaunch;
+}
+
 export {
   releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type ManualChromeOwnerSettlement,
-  type ManualChromeOwnerSettlementDeps,
 } from "./manualChromeOwnerSettlement.js";
 
 /**
@@ -90,13 +119,21 @@ export async function acquireManualChromeOwner(
   let acquisitionFailed = false;
   let acquisitionError: unknown;
   try {
-    const existing = await findExistingManualChromeOwner(
-      profileDir,
-      config.reuseChromeWaitMs,
-      logger,
-      launchLock.profileDirectory,
-      deps,
-    );
+    const existing = deps.compatibilityMaybeReuse
+      ? await acquireCompatibilityManualChromeOwner(
+          profileDir,
+          config,
+          logger,
+          launchLock.profileDirectory,
+          deps,
+        )
+      : await findExistingManualChromeOwner(
+          profileDir,
+          config.reuseChromeWaitMs,
+          logger,
+          launchLock.profileDirectory,
+          deps,
+        );
     if (existing) {
       acquiredOwner = existing;
     } else {
@@ -210,13 +247,9 @@ export async function acquireManualChromeOwner(
   try {
     await launchLock.release();
   } catch (releaseError) {
-    const failures: Error[] = [];
-    if (acquisitionFailed) {
-      failures.push(
-        acquisitionError instanceof Error ? acquisitionError : new Error(String(acquisitionError)),
-      );
-    }
-    failures.push(releaseError instanceof Error ? releaseError : new Error(String(releaseError)));
+    const failures: unknown[] = [];
+    if (acquisitionFailed) failures.push(acquisitionError);
+    failures.push(releaseError);
     if (acquiredOwner?.disposition === "close-on-last-lease") {
       const termination = await acquiredOwner.chrome.kill().catch((terminationError: unknown) => ({
         status: "unsafe" as const,
@@ -231,13 +264,14 @@ export async function acquireManualChromeOwner(
       try {
         await acquiredOwner.endpointAuthority.release();
       } catch (error) {
-        failures.push(error instanceof Error ? error : new Error(String(error)));
+        failures.push(error);
       }
     }
     if (failures.length > 1) {
       throw new AggregateError(
         failures,
         `Canonical Chrome owner acquisition or lock release did not settle safely.`,
+        { cause: failures[0] },
       );
     }
     throw releaseError;
@@ -250,6 +284,152 @@ export async function acquireManualChromeOwner(
     );
   }
   return acquiredOwner;
+}
+
+export async function acquireManualLoginChromeForRun(
+  userDataDir: string,
+  config: ResolvedBrowserConfig,
+  logger: BrowserLogger,
+  sessionId?: string,
+  deps: AcquireManualLoginChromeForRunDeps = {},
+): Promise<{ chrome: BrowserChrome; reusedChrome: LaunchedChrome | null }> {
+  const { maybeReuse, launch, ...ownerDeps } = deps;
+  let compatibilityLaunchedChrome: BrowserChrome | null = null;
+  const compatibilityLaunch: ManualChromeOwnerDeps["launch"] | undefined = launch
+    ? async (launchConfig, launchUserDataDir, launchLogger) => {
+        const launched = await launch(launchConfig, launchUserDataDir, launchLogger);
+        compatibilityLaunchedChrome = launched;
+        return (await retainCompatibilityChromeAuthority(launched, launchUserDataDir, ownerDeps))
+          .chrome;
+      }
+    : undefined;
+  const owner = await acquireManualChromeOwner(userDataDir, config, logger, sessionId, {
+    ...ownerDeps,
+    compatibilityMaybeReuse: maybeReuse,
+    launch: compatibilityLaunch,
+  });
+  const chrome =
+    owner.compatibilityChrome ??
+    compatibilityLaunchedChrome ??
+    (owner.source === "launched"
+      ? launchedCompatibilityChrome(owner.chrome)
+      : borrowedCompatibilityChrome(owner.chrome));
+  const reusedChrome = owner.source === "launched" ? null : chrome;
+  if (reusedChrome || compatibilityLaunchedChrome) {
+    await releaseManualChromeOwnerEndpointAuthority(owner);
+  }
+  return { chrome, reusedChrome };
+}
+
+async function acquireCompatibilityManualChromeOwner(
+  profileDir: string,
+  config: ResolvedBrowserConfig,
+  logger: BrowserLogger,
+  expectedProfileDirectory: ProfileDirectoryIdentity,
+  deps: ManualChromeOwnerDeps,
+): Promise<ManualChromeOwner | null> {
+  const reusable = await deps.compatibilityMaybeReuse?.(profileDir, logger, {
+    waitForPortMs: config.reuseChromeWaitMs,
+  });
+  if (!reusable) return null;
+
+  const authority = await retainCompatibilityChromeAuthority(
+    reusable,
+    profileDir,
+    deps,
+    expectedProfileDirectory,
+  );
+  const { pid, port, processIdentity, endpointAuthority, chrome } = authority;
+  const disposition = config.keepBrowser ? "preserve" : "close-on-last-lease";
+  await persistCanonicalOwner(profileDir, { port, processIdentity, disposition }, deps);
+  logger(`Reusing canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
+  return {
+    compatibilityChrome: reusable,
+    chrome,
+    processIdentity,
+    source: "rediscovered",
+    disposition,
+    endpointAuthority,
+  };
+}
+
+function launchedCompatibilityChrome(chrome: ChromeLaunchResult): BrowserChrome {
+  return {
+    pid: chrome.pid,
+    port: chrome.port,
+    host: chrome.host,
+    process: chrome.process as LaunchedChrome["process"],
+    remoteDebuggingPipes: chrome.remoteDebuggingPipes,
+    kill: async () => {
+      const termination = await chrome.kill();
+      if (!isSafeChromeTerminationOutcome(termination)) {
+        throw new Error(
+          `Canonical Chrome owner could not be terminated safely: ${termination.reason}`,
+        );
+      }
+    },
+  };
+}
+
+function borrowedCompatibilityChrome(chrome: ChromeLaunchResult): BrowserChrome {
+  return {
+    pid: chrome.pid,
+    port: chrome.port,
+    host: chrome.host,
+    process: undefined as unknown as LaunchedChrome["process"],
+    remoteDebuggingPipes: chrome.remoteDebuggingPipes,
+    kill: async () => undefined,
+  };
+}
+async function retainCompatibilityChromeAuthority(
+  chrome: ManualLoginReusableChrome,
+  profileDir: string,
+  deps: ManualChromeOwnerDeps,
+  expectedProfileDirectory?: ProfileDirectoryIdentity,
+): Promise<{
+  pid: number;
+  port: number;
+  processIdentity: ChromeProcessIdentity;
+  endpointAuthority: RetainedChromeEndpointAuthority;
+  chrome: ChromeLaunchResult;
+}> {
+  const pid = requirePositiveInteger(chrome.pid, "Chrome pid", profileDir);
+  const port = requirePositiveInteger(chrome.port, "Chrome DevTools port", profileDir);
+  const processIdentity = chrome.processIdentity
+    ? requireProcessIdentity(chrome.processIdentity, pid, profileDir)
+    : await (deps.captureProcessIdentity ?? captureChromeProcessIdentity)(profileDir, pid);
+  if (
+    expectedProfileDirectory &&
+    !sameProfileDirectoryIdentity(processIdentity.profileDirectory, expectedProfileDirectory)
+  ) {
+    throw new Error(
+      `Reused Chrome process identity does not match the canonical profile authority for ${profileDir}`,
+    );
+  }
+  const endpointAuthority =
+    chrome.endpointAuthority ??
+    (await (deps.retainEndpointAuthority ?? retainChromeEndpointAuthority)({
+      host: chrome.host ?? "127.0.0.1",
+      port,
+      userDataDir: profileDir,
+      processIdentity,
+    }));
+  return {
+    pid,
+    port,
+    processIdentity,
+    endpointAuthority,
+    chrome: {
+      pid,
+      port,
+      host: chrome.host,
+      process: undefined,
+      remoteDebuggingPipes: chrome.remoteDebuggingPipes,
+      processIdentity,
+      endpointAuthority,
+      kill: endpointAuthority.kill,
+    } as unknown as ChromeLaunchResult,
+  };
 }
 
 async function findExistingManualChromeOwner(
@@ -404,7 +584,7 @@ function reusableChrome(
   pid: number,
   processIdentity: ChromeProcessIdentity,
   endpointAuthority: RetainedChromeEndpointAuthority,
-): BrowserChrome {
+): ChromeLaunchResult {
   return {
     port,
     pid,
@@ -412,7 +592,7 @@ function reusableChrome(
     endpointAuthority,
     kill: endpointAuthority.kill,
     process: undefined,
-  } as unknown as BrowserChrome;
+  } as unknown as ChromeLaunchResult;
 }
 
 function requireProcessIdentity(

@@ -5,12 +5,14 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
   mkdir,
+  lstat,
   mkdtemp,
   readFile,
   readdir,
   rename,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -100,23 +102,34 @@ test("uses the Darwin audit pidversion rather than second-resolution lstart", as
   expect(execute.mock.calls.every(([file]) => file === "/usr/bin/lsappinfo")).toBe(true);
 });
 
-test("fails closed for malformed or mismatched Darwin audit identity", async () => {
-  for (const stdout of [
+test("falls back from malformed or mismatched Darwin audit identity", async () => {
+  for (const appInfo of [
     "pid = 4321 token=[pid=4321 pV:not-a-number]",
     "pid = 4321 token=[pid=9876 pV:7001]",
     "pid = 9876 token=[pid=4321 pV:7001]",
   ]) {
-    const provider = createPlatformProcessGenerationProvider({
-      platform: "darwin",
-      execute: async () => ({ stdout }),
+    const execute = vi.fn(async (file: string) => {
+      if (file === "/usr/bin/lsappinfo") return { stdout: appInfo };
+      if (file === "/usr/bin/python3") return { stdout: "4321:1785945427:287123\n" };
+      throw new Error(`Unexpected process query: ${file}`);
     });
-    await expect(provider.readProcessGeneration(4321)).resolves.toBeNull();
+    const provider = createPlatformProcessGenerationProvider({ platform: "darwin", execute });
+
+    await expect(provider.readProcessGeneration(4321)).resolves.toBe(
+      "darwin-kernel-start:1785945427:287123",
+    );
+    expect(execute.mock.calls.map(([file]) => file)).toEqual([
+      "/usr/bin/lsappinfo",
+      "/usr/bin/python3",
+    ]);
   }
 });
 
 test("uses the kernel microsecond launch generation for an ordinary Darwin CLI process", async () => {
   const execute = vi.fn(async (file: string, _args: string[]) => {
-    if (file === "/usr/bin/lsappinfo") return { stdout: "" };
+    if (file === "/usr/bin/lsappinfo") {
+      return { stdout: "No LaunchServices application registered for pid 4321\n" };
+    }
     if (file === "/usr/bin/python3") return { stdout: "4321:1785945427:287123\n" };
     throw new Error(`Unexpected process query: ${file}`);
   });
@@ -128,6 +141,19 @@ test("uses the kernel microsecond launch generation for an ordinary Darwin CLI p
   expect(execute).toHaveBeenNthCalledWith(1, "/usr/bin/lsappinfo", ["info", "4321"]);
   expect(execute.mock.calls[1]?.[0]).toBe("/usr/bin/python3");
   expect(execute.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(["-c", "4321"]));
+
+  const mismatchedKernelProvider = createPlatformProcessGenerationProvider({
+    platform: "darwin",
+    execute: async (file) => ({
+      stdout:
+        file === "/usr/bin/lsappinfo"
+          ? "No LaunchServices application registered for pid 4321\n"
+          : file === "/usr/bin/python3"
+            ? "9876:1785945427:287123\n"
+            : "",
+    }),
+  });
+  await expect(mismatchedKernelProvider.readProcessGeneration(4321)).resolves.toBeNull();
 });
 
 test("uses sample launch time only when the fast kernel probe is unavailable", async () => {
@@ -661,7 +687,7 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
-  test.runIf(process.platform !== "win32")(
+  test.runIf(process.platform === "linux" || process.platform === "darwin")(
     "bound helper deletes only the attested root generation after pathname substitution",
     async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-"));
@@ -704,6 +730,79 @@ describe("crash-recoverable filesystem lock", () => {
       }
     },
   );
+
+  test.runIf(process.platform === "linux" || process.platform === "darwin")(
+    "deletes an ordinary isolated generation with the bound helper",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-bound-delete-"));
+      const candidatePath = path.join(root, "candidate");
+      await mkdir(path.join(candidatePath, "nested"), { recursive: true });
+      await writeFile(path.join(candidatePath, "nested", "owned-marker"), "delete");
+      try {
+        const isolation = await isolateDirectoryGenerationForRemoval(
+          candidatePath,
+          async (generationPath) => (await stat(generationPath)).isDirectory(),
+        );
+        expect(isolation.status).toBe("isolated");
+        if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+
+        await expect(
+          removeIsolatedDirectoryGeneration(isolation.rootPath),
+        ).resolves.toBeUndefined();
+        await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(stat(candidatePath)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("bound deletion unlinks external directory links and stays pending when unsupported", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-device-boundary-"));
+    const candidatePath = path.join(root, "candidate");
+    const externalPath = path.join(root, "external");
+    await mkdir(candidatePath);
+    await mkdir(externalPath);
+    await writeFile(path.join(externalPath, "preserve"), "outside-generation", "utf8");
+    await symlink(
+      externalPath,
+      path.join(candidatePath, "external-link"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const generationDevice = (await lstat(candidatePath, { bigint: true })).dev;
+
+    try {
+      const isolation = await isolateDirectoryGenerationForRemoval(
+        candidatePath,
+        async (generationPath) => (await stat(generationPath)).isDirectory(),
+      );
+      expect(isolation.status).toBe("isolated");
+      if (isolation.status !== "isolated") throw new Error("Expected isolated generation");
+
+      let removalError: unknown;
+      try {
+        await removeIsolatedDirectoryGeneration(isolation.rootPath);
+      } catch (error) {
+        removalError = error;
+      }
+      if (process.platform === "linux" || process.platform === "darwin") {
+        expect(removalError).toBeUndefined();
+        expect(generationDevice).not.toBe(0n);
+        await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        const detail = String(removalError);
+        expect(detail).toMatch(/descriptor-rooted directory api/i);
+        expect(detail).toMatch(/exit 1 signal null/i);
+        expect((await stat(isolation.rootPath)).isDirectory()).toBe(true);
+        expect((await stat(`${isolation.rootPath}.cleanup-journal.json`)).isFile()).toBe(true);
+      }
+      await expect(readFile(path.join(externalPath, "preserve"), "utf8")).resolves.toBe(
+        "outside-generation",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("malformed isolated cleanup journals fail closed", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-cleanup-journal-"));
@@ -771,6 +870,54 @@ describe("crash-recoverable filesystem lock", () => {
     }
   });
 
+  test("directory quarantine rejects a physically replaced generation with a cloned owner", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-directory-race-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const movedGeneration = path.join(root, "moved-original-generation");
+    const stalePid = 41_141;
+    const ownerRaw = `${JSON.stringify({
+      version: 1,
+      pid: stalePid,
+      processStartIdentity: "stale-generation",
+      ownerNonce: "cloned-owner",
+      createdAt: new Date().toISOString(),
+    })}\n`;
+    let ownerAlive = false;
+    try {
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), ownerRaw, "utf8");
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            processIdentityProvider: createProcessIdentityProvider(
+              40_145,
+              async (pid) => (pid === stalePid ? "stale-generation" : "current-generation"),
+              (pid) => (pid === stalePid ? (ownerAlive ? "alive" : "dead") : "alive"),
+            ),
+            afterStaleLockQuarantine: async (quarantinedPath) => {
+              await rename(quarantinedPath, movedGeneration);
+              await mkdir(quarantinedPath);
+              await writeFile(path.join(quarantinedPath, "owner.json"), ownerRaw, "utf8");
+              await writeFile(path.join(quarantinedPath, "replacement-marker"), "preserve", "utf8");
+              ownerAlive = true;
+            },
+          },
+        ),
+      ).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      await expect(readFile(path.join(movedGeneration, "owner.json"), "utf8")).resolves.toBe(
+        ownerRaw,
+      );
+      await expect(readFile(path.join(lockPath, "replacement-marker"), "utf8")).resolves.toBe(
+        "preserve",
+      );
+      await expect(readFile(path.join(lockPath, "owner.json"), "utf8")).resolves.toBe(ownerRaw);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("legacy file with unknown pid liveness remains authoritative", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-legacy-unknown-"));
     const lockPath = path.join(root, "oracle-automation.lock");
@@ -796,6 +943,36 @@ describe("crash-recoverable filesystem lock", () => {
         ),
       ).rejects.toBeInstanceOf(FilesystemLockBusyError);
       await expect(readFile(lockPath, "utf8")).resolves.toBe(legacyRaw);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("release refuses a cloned owner record in a replacement directory generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-release-generation-"));
+    const lockPath = path.join(root, "recovery.lock");
+    const movedGeneration = path.join(root, "moved-owned-generation");
+    const lock = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {},
+      {
+        processIdentityProvider: createProcessIdentityProvider(40_142, async () => "owned-start"),
+      },
+    );
+    try {
+      const ownerRaw = await readFile(path.join(lockPath, "owner.json"), "utf8");
+      await rename(lockPath, movedGeneration);
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), ownerRaw, "utf8");
+      await writeFile(path.join(lockPath, "replacement-marker"), "preserve", "utf8");
+
+      await expect(lock.release()).rejects.toThrow(/generation changed/i);
+      await expect(readFile(path.join(lockPath, "replacement-marker"), "utf8")).resolves.toBe(
+        "preserve",
+      );
+      await expect(readFile(path.join(movedGeneration, "owner.json"), "utf8")).resolves.toBe(
+        ownerRaw,
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

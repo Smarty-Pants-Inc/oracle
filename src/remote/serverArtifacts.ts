@@ -7,32 +7,18 @@ import {
   RemoteArtifactDeliveryReceiptRequestSchema,
   type RemoteArtifactDeliveryReceiptRequest,
 } from "./types.js";
-import { authenticateRemoteRequest, readRequestBody, sendJson } from "./serverHttp.js";
+import { readRequestBody, sendJson } from "./serverHttp.js";
 import { renewAuthenticatedTransactionLease } from "./serverTransactionRuntime.js";
 
 export async function serveRemoteArtifact(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
-  authToken: string;
   artifactStore: RemoteArtifactStore;
-  transactionStore: RemoteTransactionStore;
   logger: (message: string) => void;
-  verbose: boolean;
+  transactionStore: RemoteTransactionStore;
   transactionToken: string;
   artifactId: string;
 }): Promise<void> {
-  if (
-    !authenticateRemoteRequest(
-      params.req,
-      params.res,
-      params.authToken,
-      params.logger,
-      params.verbose,
-      "/transactions/.../artifacts/...",
-    )
-  ) {
-    return;
-  }
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
     params.transactionToken,

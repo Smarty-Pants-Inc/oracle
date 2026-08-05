@@ -236,6 +236,10 @@ async function runTwoTurnResetFailure(transport: Transport) {
       client,
       targetId: "epoch-target",
       ownership: "created",
+      targetCloseAuthority: {
+        runExactOperation: vi.fn(),
+        release: closeConnection,
+      },
       close: closeConnection,
     }),
     connectToRemoteChromeTarget: vi.fn(),
@@ -359,6 +363,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
       mode: "never",
       reason: "disabled",
     })),
+    archiveResultHasCommittedEffectAuthority: vi.fn(() => false),
     archiveChatGptConversation: vi.fn(),
   }));
   vi.doMock("../../src/browser/actions/thinkingStatus.js", () => ({
@@ -522,8 +527,8 @@ describe("semantic prompt epoch persistence", () => {
         expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
         expect(fixture.killChrome).toHaveBeenCalledOnce();
       } else {
-        expect(fixture.closeChromeTarget).toHaveBeenCalledOnce();
-        expect(fixture.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+        expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+        expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
         expect(fixture.killChrome).not.toHaveBeenCalled();
       }
     },

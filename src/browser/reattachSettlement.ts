@@ -17,7 +17,7 @@ import {
 } from "./reattachAcquisition.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 import type { CommittedPromptEpochLocator } from "./reattachability.js";
-import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattach.js";
+import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
 
 export interface ReattachSettlementLockAuthority {
   ensure: () => Promise<void>;
@@ -109,6 +109,7 @@ export function createReattachSettlement(
     get runtime() {
       return settlement.runtime();
     },
+    bindSettlement: (mode) => settlement.bindSettlement(mode),
     finalize: () => settlement.settle("finalize"),
     abort: () => settlement.settle("abort"),
   };

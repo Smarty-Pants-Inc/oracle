@@ -1,22 +1,24 @@
-import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
-import type { BrowserRunTransaction } from "../browserMode.js";
+import type { BrowserCaptureFinalizationResult, BrowserRunTransaction } from "../browser/types.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureFinalization,
 } from "../browser/runLifecycle.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import {
-  type RemoteTransactionRecord,
-  RemoteTransactionStore,
-  RemoteTransactionTransitionError,
-} from "./transactionStore.js";
+import type {
+  RemoteTransactionRecord,
+  RemoteTransactionSettlementAuthority,
+  RemoteTransactionSettlementBinding,
+} from "./transactionModel.js";
+import { RemoteTransactionTransitionError } from "./transactionReducer.js";
+import { RemoteTransactionStore } from "./transactionStore.js";
 
 export class RemoteTransactionConflictError extends Error {
   constructor(
     readonly statusCode: number,
     readonly code: string,
     message: string,
+    readonly settlementAuthority?: RemoteTransactionSettlementAuthority,
   ) {
     super(message);
     this.name = "RemoteTransactionConflictError";
@@ -26,6 +28,12 @@ export class RemoteTransactionConflictError extends Error {
 export interface RemoteTransactionSettlementOutcome {
   record: RemoteTransactionRecord;
   finalization: BrowserCaptureFinalizationResult;
+}
+
+export interface RemoteTransactionSettlementBindingOutcome {
+  record: RemoteTransactionRecord;
+  settlementAuthority: RemoteTransactionSettlementAuthority;
+  finalization?: BrowserCaptureFinalizationResult;
 }
 
 export interface RemoteTransactionCoordinatorOptions {
@@ -66,29 +74,72 @@ export class RemoteTransactionCoordinator {
     return [...this.#activeTransactions.keys()];
   }
 
+  async bindSettlement(params: {
+    transactionToken: string;
+    mode: "finalize" | "abort";
+    durablePublication: boolean;
+  }): Promise<RemoteTransactionSettlementBindingOutcome> {
+    let binding: RemoteTransactionSettlementBinding;
+    try {
+      binding = await this.#transactionStore.bindSettlement(params);
+    } catch (error) {
+      if (error instanceof RemoteTransactionTransitionError) {
+        throw new RemoteTransactionConflictError(
+          409,
+          error.code,
+          error.message,
+          error.settlementAuthority,
+        );
+      }
+      throw error;
+    }
+    return {
+      record: binding.record,
+      settlementAuthority: {
+        mode: binding.record.settlementMode ?? params.mode,
+        outcome: binding.status === "completed" ? "completed" : "bound",
+        state: binding.record.state,
+      },
+      ...(binding.status === "completed" ? { finalization: binding.finalization } : {}),
+    };
+  }
+
   async settle(params: {
     transactionToken: string;
     mode: "finalize" | "abort";
     durablePublication: boolean;
   }): Promise<RemoteTransactionSettlementOutcome> {
-    let binding;
-    try {
-      binding = await this.#transactionStore.bindSettlement(params);
-    } catch (error) {
-      if (error instanceof RemoteTransactionTransitionError) {
-        throw new RemoteTransactionConflictError(409, error.code, error.message);
-      }
-      throw error;
-    }
-    if (binding.status === "completed") {
+    const binding = await this.bindSettlement(params);
+    if (binding.settlementAuthority.outcome === "completed") {
       if (!binding.finalization) {
         throw new Error("Completed remote transaction lacks finalization result");
       }
       return { record: binding.record, finalization: binding.finalization };
     }
-    const runtime = binding.cleanupRuntime;
-    const mode = binding.record.settlementMode;
-    if (!mode) throw new Error("Bound transaction lacks exact runtime authority");
+
+    let execution;
+    try {
+      execution = await this.#transactionStore.beginSettlementExecution({
+        transactionToken: params.transactionToken,
+        mode: binding.settlementAuthority.mode,
+      });
+    } catch (error) {
+      if (error instanceof RemoteTransactionTransitionError) {
+        throw new RemoteTransactionConflictError(
+          409,
+          error.code,
+          error.message,
+          error.settlementAuthority,
+        );
+      }
+      throw error;
+    }
+    if (execution.status === "completed") {
+      return { record: execution.record, finalization: execution.finalization };
+    }
+    const runtime = execution.cleanupRuntime;
+    const mode = execution.record.settlementMode;
+    if (!mode) throw new Error("Executing transaction lacks exact runtime authority");
 
     const active = this.#activeTransactions.get(params.transactionToken);
     const rawFinalization = active

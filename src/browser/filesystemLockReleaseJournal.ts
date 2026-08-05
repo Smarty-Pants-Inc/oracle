@@ -2,8 +2,9 @@ import path from "node:path";
 import {
   canonicalFilesystemLockPath,
   filesystemLockReleaseKey,
-  replayPendingIsolatedDirectoryRemovals,
-} from "./filesystemLockPrimitives.js";
+  LOCK_MUTATION_DIRECTORY_SUFFIX,
+} from "./filesystemLockModel.js";
+import { replayPendingIsolatedDirectoryRemovals } from "./filesystemLockDirectoryRemoval.js";
 
 export {
   canonicalFilesystemLockPath,
@@ -75,7 +76,7 @@ export function retainFilesystemLockRelease(
 export async function retryPendingFilesystemLockReleases(lockPath: string): Promise<void> {
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
   await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath);
-  await replayPendingIsolatedDirectoryRemovals(`${canonicalPath}.mutations`);
+  await replayPendingIsolatedDirectoryRemovals(`${canonicalPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`);
   const pending = [...retainedReleases.values()].filter(
     (entry) => entry.lockPath === canonicalPath && entry.pending,
   );

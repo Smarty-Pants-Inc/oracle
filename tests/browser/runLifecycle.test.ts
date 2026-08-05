@@ -1,8 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import {
+  BrowserCaptureSettlementController,
   BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
+  createBrowserRunTransaction,
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
@@ -103,6 +105,23 @@ describe("BrowserRunLifecycleController", () => {
       }),
     ]);
     expect(settleResources).not.toHaveBeenCalled();
+    const persistenceCountBeforeBind = persistRuntime.mock.calls.length;
+    const boundRuntime = await transaction.bindSettlement("finalize");
+    expect(boundRuntime.recoveryCleanupResult).toEqual({
+      status: "pending",
+      settlementMode: "finalize",
+    });
+    expect(transaction.runtime).toBe(boundRuntime);
+    expect(settleResources).not.toHaveBeenCalled();
+    await expect(transaction.bindSettlement("finalize")).resolves.toBe(boundRuntime);
+    expect(persistRuntime).toHaveBeenCalledTimes(persistenceCountBeforeBind + 1);
+    await expect(transaction.bindSettlement("abort")).rejects.toMatchObject({
+      details: {
+        code: "browser-run-lifecycle-settlement-conflict",
+        requestedMode: "abort",
+        boundMode: "finalize",
+      },
+    });
     expect(await lifecycle.settleIfUnpublished()).toBeNull();
 
     const finalization = await transaction.finalize();
@@ -128,6 +147,114 @@ describe("BrowserRunLifecycleController", () => {
       }),
     );
   });
+
+  test("never executes cleanup when bind-only persistence fails", async () => {
+    const persistenceError = new Error("runtime store unavailable");
+    const persistRuntime = vi
+      .fn<(runtime: BrowserRuntimeMetadata) => Promise<void>>()
+      .mockRejectedValueOnce(persistenceError)
+      .mockResolvedValue(undefined);
+    const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
+      completedBrowserCaptureCleanup(runtime),
+    );
+    const settlement = new BrowserCaptureSettlementController(
+      {
+        persistRuntime,
+        settleResources,
+      },
+      remoteRuntime(),
+    );
+    const transaction = createBrowserRunTransaction(
+      {
+        answerText: "captured answer",
+        answerMarkdown: "captured answer",
+        tookMs: 1,
+        answerTokens: 2,
+        answerChars: 15,
+      },
+      settlement,
+    );
+
+    await expect(transaction.bindSettlement("finalize")).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        code: "browser-settlement-binding-persistence-failed",
+        requestedMode: "finalize",
+        runtime: expect.objectContaining({
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+        }),
+      },
+      cause: persistenceError,
+    });
+    expect(transaction.runtime.recoveryCleanupResult).toEqual({
+      status: "pending",
+      settlementMode: "finalize",
+    });
+    await expect(transaction.bindSettlement("abort")).rejects.toMatchObject({
+      details: {
+        code: "browser-run-lifecycle-settlement-conflict",
+        boundMode: "finalize",
+        requestedMode: "abort",
+      },
+    });
+    await expect(transaction.bindSettlement("finalize")).resolves.toMatchObject({
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    });
+    expect(persistRuntime).toHaveBeenCalledTimes(2);
+    expect(settleResources).not.toHaveBeenCalled();
+  });
+
+  test.each(["finalize", "abort"] as const)(
+    "%s returns pending when binding persistence fails and retries without early cleanup",
+    async (mode) => {
+      const persistenceError = new Error("runtime store unavailable");
+      const persistRuntime = vi
+        .fn<(runtime: BrowserRuntimeMetadata) => Promise<void>>()
+        .mockRejectedValueOnce(persistenceError)
+        .mockResolvedValue(undefined);
+      const settleResources = vi.fn(async (_mode, runtime: BrowserRuntimeMetadata) =>
+        completedBrowserCaptureCleanup(runtime),
+      );
+      const settlement = new BrowserCaptureSettlementController(
+        { persistRuntime, settleResources },
+        remoteRuntime(),
+      );
+      const transaction = createBrowserRunTransaction(
+        {
+          answerText: "captured answer",
+          answerMarkdown: "captured answer",
+          tookMs: 1,
+          answerTokens: 2,
+          answerChars: 15,
+        },
+        settlement,
+      );
+      const oppositeMode = mode === "finalize" ? "abort" : "finalize";
+
+      await expect(transaction[mode]()).resolves.toMatchObject({
+        status: "pending",
+        error: `Browser ${mode} authority could not be durably bound before cleanup.`,
+        runtime: {
+          recoveryCleanupResult: {
+            status: "pending",
+            settlementMode: mode,
+          },
+        },
+      });
+      expect(settleResources).not.toHaveBeenCalled();
+      await expect(transaction[oppositeMode]()).rejects.toMatchObject({
+        details: {
+          code: "browser-run-lifecycle-settlement-conflict",
+          requestedMode: oppositeMode,
+          boundMode: mode,
+        },
+      });
+
+      await expect(transaction[mode]()).resolves.toMatchObject({ status: "completed" });
+      expect(persistRuntime).toHaveBeenCalledTimes(2);
+      expect(settleResources).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test("resets committed authority before a follow-up and rejects superseded evidence", async () => {
     const lifecycle = new BrowserRunLifecycleController({
@@ -427,11 +554,10 @@ describe("BrowserRunLifecycleController", () => {
 
     await expect(transaction.finalize()).resolves.toMatchObject({
       status: "pending",
-      error: persistenceError.message,
+      error: "Browser finalize authority could not be durably bound before cleanup.",
       runtime: {
         recoveryCleanupResult: {
-          status: "failed",
-          error: persistenceError.message,
+          status: "pending",
           settlementMode: "finalize",
         },
       },

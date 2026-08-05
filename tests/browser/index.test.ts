@@ -200,6 +200,7 @@ describe("local acquisition durability", () => {
           prompt: "test",
           config: {
             cookieSync: false,
+            manualLogin: false,
             copyProfileSource: path.join(os.tmpdir(), "oracle-copy-profile-source"),
           },
           runtimeHintCb: async (runtime) => {
@@ -1255,6 +1256,30 @@ describe("browser conversation archiving", () => {
     expect(runtime.evaluate).toHaveBeenCalledTimes(2);
   });
 
+  test("does not archive interrupted A after the controlled tab moves to B", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: { value: "https://chatgpt.com/c/b" },
+      }),
+    };
+
+    await expect(
+      maybeArchiveInterruptedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        conversationUrl: "https://chatgpt.com/c/a",
+        followUpCount: 0,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "archive-authority-mismatch",
+      conversationUrl: "https://chatgpt.com/c/a",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
   test("does not attempt interrupted archive before a conversation exists", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValueOnce({
@@ -1274,7 +1299,7 @@ describe("browser conversation archiving", () => {
         followUpCount: 0,
       }),
     ).resolves.toBeNull();
-    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
   test("does not attempt archive when required local artifacts were not saved", async () => {
@@ -1282,6 +1307,26 @@ describe("browser conversation archiving", () => {
       evaluate: vi.fn(),
     };
     const log = vi.fn();
+    const promptLocator = {
+      epoch: {
+        status: "committed" as const,
+        epochId: "archive-artifact-failure",
+        promptSha256: "0".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "turn-abc",
+        verifiedUserMessageId: "message-abc",
+        conversationId: "abc",
+      },
+      conversationId: "abc",
+      promptSha256: "0".repeat(64),
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-abc",
+      verifiedUserMessageId: "message-abc",
+      conversationUrls: ["https://chatgpt.com/c/abc"],
+    };
 
     await expect(
       maybeArchiveCompletedConversationForTest({
@@ -1289,6 +1334,7 @@ describe("browser conversation archiving", () => {
         logger: log as never,
         config: resolveBrowserConfig({ archiveConversations: "always" }),
         conversationUrl: "https://chatgpt.com/c/abc",
+        promptLocator,
         followUpCount: 0,
         requiredArtifactsSaved: false,
       }),

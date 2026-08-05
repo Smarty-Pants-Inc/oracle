@@ -17,6 +17,14 @@ import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import * as sessionManager from "../../src/sessionManager.js";
+import {
+  REMOTE_HEALTH_CLIENT_NONCE_HEADER,
+  REMOTE_PROTOCOL_HEADER,
+  REMOTE_REQUEST_PROOF_HEADER,
+  REMOTE_SERVER_GENERATION_HEADER,
+  RemoteRequestAuthenticator,
+  createRemoteHealthAuthenticationProof,
+} from "../../src/remote/auth.js";
 
 function committedPromptEpoch(prompt: string) {
   return {
@@ -62,6 +70,102 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   if (!parsed || typeof parsed !== "object") throw new Error("expected JSON object request");
   return Object.fromEntries(Object.entries(parsed));
+}
+function createAuthenticatedServer(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>,
+  options: { handleBind?: boolean } = {},
+): http.Server {
+  const rootKey = "secret";
+  const serverGeneration = "client-transport-test-generation";
+  const authenticator = new RemoteRequestAuthenticator({ rootKey, serverGeneration });
+  const server = http.createServer();
+  server.on("checkContinue", (req, res) => {
+    const authentication = authenticator.authenticate(req);
+    if ("statusCode" in authentication) {
+      res.writeHead(authentication.statusCode, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: authentication.code }));
+      return;
+    }
+    res.writeEarlyHints({
+      link: "</health>; rel=preconnect",
+      [REMOTE_SERVER_GENERATION_HEADER]: authentication.serverGeneration,
+      [REMOTE_REQUEST_PROOF_HEADER]: authentication.requestProof,
+    });
+    res.writeContinue();
+    server.emit("request", req, res);
+  });
+  server.on("request", (req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      const protocol = String(req.headers[REMOTE_PROTOCOL_HEADER] ?? "");
+      const clientNonce = String(req.headers[REMOTE_HEALTH_CLIENT_NONCE_HEADER] ?? "");
+      if (
+        protocol !== String(REMOTE_TRANSACTION_PROTOCOL_VERSION) ||
+        !/^[a-f0-9]{64}$/u.test(clientNonce)
+      ) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_health_challenge" }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          version: "test",
+          uptimeSeconds: 1,
+          capabilities: {
+            artifactTransfer: true,
+            artifactProtocolVersion: 1,
+            transactionProtocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            maxArtifactBytes: 1,
+            maxRequestBytes: 1,
+            maxAttachmentBytes: 1,
+            maxTotalAttachmentBytes: 1,
+            maxAttachments: 1,
+            maxPromptChars: 1,
+            transportSecurity: "loopback-http",
+            boundedRequestDeadlines: true,
+            boundedTransactionStore: true,
+          },
+          authentication: createRemoteHealthAuthenticationProof({
+            rootKey,
+            serverGeneration,
+            clientNonce,
+          }),
+        }),
+      );
+      return;
+    }
+    const authentication = authenticator.verified(req) ?? authenticator.authenticate(req);
+    if ("statusCode" in authentication) {
+      res.writeHead(authentication.statusCode, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: authentication.code }));
+      return;
+    }
+    void (async () => {
+      const bindMatch = /^\/transactions\/([a-f0-9]{64})\/bind$/u.exec(req.url ?? "");
+      if (options.handleBind !== false && req.method === "POST" && bindMatch) {
+        const request = await readJson(req);
+        const mode = request.mode === "abort" ? "abort" : "finalize";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            transactionToken: bindMatch[1],
+            settlementAuthority: { mode, outcome: "bound", state: "pending" },
+            runtime: { cleanup: { status: "pending" } },
+          }),
+        );
+        return;
+      }
+      await handler(req, res);
+    })().catch((error) => {
+      if (res.headersSent) res.destroy(error instanceof Error ? error : new Error(String(error)));
+      else {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "test_handler_failed" }));
+      }
+    });
+  });
+  return server;
 }
 
 function transactionEvent(transactionToken: string, prompt: string, artifacts: unknown[] = []) {
@@ -124,7 +228,7 @@ const deadlines = {
 
 describe("remote client transport deadlines", () => {
   it("times out held run and retry requests while preserving opaque retry authority", async () => {
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (runTransactionToken(req)) {
         await readJson(req);
         return;
@@ -162,7 +266,7 @@ describe("remote client transport deadlines", () => {
   });
 
   it("returns pending settlement authority when finalize holds the socket open", async () => {
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);
@@ -211,7 +315,7 @@ describe("remote client transport deadlines", () => {
       required: true,
     };
     let settlementRequests = 0;
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);
@@ -259,7 +363,7 @@ describe("remote client transport deadlines", () => {
   it("persists exact pre-receipt authority before sending a run request", async () => {
     const events: string[] = [];
     const persistedRuntimes: BrowserRuntimeMetadata[] = [];
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (!transactionToken) {
         res.statusCode = 404;
@@ -314,7 +418,7 @@ describe("remote client transport deadlines", () => {
   it("does not send the run request when pre-receipt persistence fails", async () => {
     let runRequests = 0;
     const persistedRuntimes: BrowserRuntimeMetadata[] = [];
-    const server = http.createServer((req, res) => {
+    const server = createAuthenticatedServer((req, res) => {
       if (runTransactionToken(req)) runRequests += 1;
       res.statusCode = 500;
       res.end();
@@ -358,7 +462,7 @@ describe("remote client transport deadlines", () => {
   it("rejects explicit tab authority before remote persistence or request dispatch", async () => {
     let requests = 0;
     const runtimeHintCb = vi.fn();
-    const server = http.createServer((_req, res) => {
+    const server = createAuthenticatedServer((_req, res) => {
       requests += 1;
       res.statusCode = 500;
       res.end();
@@ -389,7 +493,7 @@ describe("remote client transport deadlines", () => {
   });
 
   it("rehydrates an abort-bound recoverable error into one authority and one settlement field", async () => {
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (!transactionToken) {
         res.statusCode = 404;
@@ -444,7 +548,7 @@ describe("remote client transport deadlines", () => {
 
   it("rejects a wire settlement mode that conflicts with persisted cleanup result", async () => {
     const transactionToken = "f".repeat(64);
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url !== `/transactions/${transactionToken}/retry`) {
         res.statusCode = 404;
         res.end();
@@ -546,7 +650,7 @@ describe("remote client transport deadlines", () => {
     async (_state, mode, outcome, code) => {
       const transactionToken = "1".repeat(64);
       let retryRequests = 0;
-      const server = http.createServer(async (req, res) => {
+      const server = createAuthenticatedServer(async (req, res) => {
         if (req.url !== `/transactions/${transactionToken}/retry`) {
           res.statusCode = 404;
           res.end();
@@ -588,7 +692,7 @@ describe("remote client transport deadlines", () => {
   it("treats a pruned terminal retry as definitive and clears remote authority", async () => {
     const transactionToken = "2".repeat(64);
     let retryRequests = 0;
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url === `/transactions/${transactionToken}/retry`) {
         retryRequests += 1;
         await readJson(req);
@@ -624,13 +728,18 @@ describe("remote client transport deadlines", () => {
   it("stops retrying after a server conflict while preserving exact remote authority", async () => {
     const transactionToken = "3".repeat(64);
     let retryRequests = 0;
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url === `/transactions/${transactionToken}/retry`) {
         retryRequests += 1;
         await readJson(req);
       }
       res.writeHead(409, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "transaction_settlement_conflict" }));
+      res.end(
+        JSON.stringify({
+          error: "transaction_settlement_conflict",
+          settlementAuthority: { mode: "abort", outcome: "bound", state: "pending" },
+        }),
+      );
     });
     const port = await listen(server);
     const host = `127.0.0.1:${port}`;
@@ -694,7 +803,7 @@ describe("remote client transport deadlines", () => {
       browserConfig: {},
       options: {},
     } satisfies RemoteRunPayload);
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url === `/transactions/${transactionToken}/retry`) {
         await readJson(req);
         res.setHeader("content-type", "application/json");
@@ -750,7 +859,7 @@ describe("remote client transport deadlines", () => {
       browserConfig: {},
       options: {},
     } satisfies RemoteRunPayload);
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url === `/transactions/${transactionToken}/retry`) {
         await readJson(req);
         res.setHeader("content-type", "application/json");
@@ -818,7 +927,7 @@ describe("remote client transport deadlines", () => {
       ...committedPromptEpoch(prompt),
       verifiedUserTurnId: "persisted-turn",
     };
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       if (req.url === `/transactions/${transactionToken}/retry`) {
         await readJson(req);
         res.setHeader("content-type", "application/json");
@@ -869,11 +978,174 @@ describe("remote client transport deadlines", () => {
     }
   });
 
+  it.each([
+    ["bound", "pending", "transaction_settlement_conflict", true],
+    ["completed", "finalized", "transaction_already_settled", false],
+  ] as const)(
+    "converges an opposite-mode bind conflict to the authoritative %s outcome",
+    async (outcome, state, errorCode, recoverableDisconnect) => {
+      const prompt = `canonical ${outcome} conflict`;
+      let settlementRequests = 0;
+      const server = createAuthenticatedServer(
+        async (req, res) => {
+          const transactionToken = runTransactionToken(req);
+          if (transactionToken) {
+            const request = await readJson(req);
+            res.setHeader("content-type", "application/x-ndjson");
+            res.end(
+              `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt)))}\n`,
+            );
+            return;
+          }
+          const bind = /^\/transactions\/([a-f0-9]{64})\/bind$/u.exec(req.url ?? "");
+          if (bind) {
+            await readJson(req);
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: errorCode,
+                settlementAuthority: { mode: "finalize", outcome, state },
+              }),
+            );
+            return;
+          }
+          if (/^\/transactions\/[a-f0-9]{64}\/(finalize|abort)$/u.test(req.url ?? "")) {
+            settlementRequests += 1;
+          }
+          res.statusCode = 404;
+          res.end();
+        },
+        { handleBind: false },
+      );
+      const port = await listen(server);
+      try {
+        const transaction = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${port}`,
+          token: "secret",
+          deadlines,
+        })({ prompt, config: {} });
+        const caught = await transaction.abort().then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(caught).toMatchObject({
+          name: "BrowserAutomationError",
+          details: {
+            code: "remote-settlement-mode-conflict",
+            recoverableDisconnect,
+            settlementAuthority: { mode: "finalize", outcome, state },
+          },
+        });
+        if (outcome === "bound") {
+          expect(transaction.runtime).toMatchObject({
+            recoveryCleanupResult: { settlementMode: "finalize" },
+          });
+        } else {
+          expect(transaction.runtime).not.toHaveProperty("recoveryCleanupResult");
+          expect(transaction.runtime).not.toHaveProperty("recoveryCleanupResources");
+        }
+        expect(settlementRequests).toBe(0);
+      } finally {
+        await close(server);
+      }
+    },
+  );
+
+  it("keeps explicit bind failures throwable without starting cleanup", async () => {
+    const prompt = "explicit bind persistence";
+    let bindRequests = 0;
+    let settlementRequests = 0;
+    let persistenceAttempts = 0;
+    const server = createAuthenticatedServer(
+      async (req, res) => {
+        const transactionToken = runTransactionToken(req);
+        if (transactionToken) {
+          const request = await readJson(req);
+          res.setHeader("content-type", "application/x-ndjson");
+          res.end(
+            `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt)))}\n`,
+          );
+          return;
+        }
+        const bind = /^\/transactions\/([a-f0-9]{64})\/bind$/u.exec(req.url ?? "");
+        if (bind) {
+          bindRequests += 1;
+          await readJson(req);
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              transactionToken: bind[1],
+              settlementAuthority: { mode: "abort", outcome: "bound", state: "pending" },
+              runtime: { cleanup: { status: "pending" } },
+            }),
+          );
+          return;
+        }
+        const abort = /^\/transactions\/([a-f0-9]{64})\/abort$/u.exec(req.url ?? "");
+        if (abort) {
+          settlementRequests += 1;
+          await readJson(req);
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              transactionToken: abort[1],
+              state: "aborted",
+              settlementAuthority: { mode: "abort", outcome: "completed", state: "aborted" },
+              finalization: {
+                status: "completed",
+                runtime: {
+                  promptEpoch: committedPromptEpoch(prompt),
+                  cleanup: { status: "completed" },
+                },
+              },
+            }),
+          );
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      },
+      { handleBind: false },
+    );
+    const port = await listen(server);
+    try {
+      const transaction = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "secret",
+        deadlines,
+      })({
+        prompt,
+        config: {},
+        runtimeHintCb: async (runtime) => {
+          if (!runtime.recoveryCleanupResult?.settlementMode) return;
+          persistenceAttempts += 1;
+          if (persistenceAttempts === 1) throw new Error("metadata fsync failed");
+        },
+      });
+
+      await expect(transaction.bindSettlement("abort")).rejects.toMatchObject({
+        details: { code: "settlement-authority-persistence-failed" },
+      });
+      expect(transaction.runtime).toMatchObject({
+        recoveryCleanupResult: { settlementMode: "abort" },
+      });
+      expect(bindRequests).toBe(1);
+      expect(settlementRequests).toBe(0);
+
+      await expect(transaction.abort()).resolves.toMatchObject({ status: "completed" });
+      expect(persistenceAttempts).toBe(2);
+      expect(bindRequests).toBe(1);
+      expect(settlementRequests).toBe(1);
+    } finally {
+      await close(server);
+    }
+  });
+
   it("persists one settlement mode before request and retries only that mode", async () => {
     const events: string[] = [];
     let finalizeAttempts = 0;
     let prompt = "settlement mode";
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);
@@ -899,6 +1171,11 @@ describe("remote client transport deadlines", () => {
               ? {
                   transactionToken: settlement[1],
                   state: "pending",
+                  settlementAuthority: {
+                    mode: "finalize",
+                    outcome: "bound",
+                    state: "pending",
+                  },
                   finalization: {
                     status: "pending",
                     runtime: {
@@ -911,6 +1188,11 @@ describe("remote client transport deadlines", () => {
               : {
                   transactionToken: settlement[1],
                   state: "finalized",
+                  settlementAuthority: {
+                    mode: "finalize",
+                    outcome: "completed",
+                    state: "finalized",
+                  },
                   finalization: {
                     status: "completed",
                     runtime: {
@@ -976,7 +1258,7 @@ describe("remote client transport deadlines", () => {
     const events: string[] = [];
     let settlementPersistenceAttempts = 0;
     const prompt = "settlement persistence retry";
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);
@@ -993,6 +1275,11 @@ describe("remote client transport deadlines", () => {
           JSON.stringify({
             transactionToken: settlement[1],
             state: settlement[2] === "finalize" ? "finalized" : "aborted",
+            settlementAuthority: {
+              mode: settlement[2],
+              outcome: "completed",
+              state: settlement[2] === "finalize" ? "finalized" : "aborted",
+            },
             finalization: {
               status: "completed",
               runtime: {
@@ -1027,15 +1314,14 @@ describe("remote client transport deadlines", () => {
         },
       });
 
-      await expect(transaction.finalize()).rejects.toMatchObject({
-        name: "BrowserAutomationError",
-        details: {
-          stage: "remote-runtime-persistence",
-          code: "settlement-authority-persistence-failed",
-          recoverableDisconnect: true,
-        },
+      await expect(transaction.finalize()).resolves.toMatchObject({
+        status: "pending",
+        runtime: { recoveryCleanupResult: { settlementMode: "finalize" } },
+        error: expect.stringContaining("persist remote finalize settlement authority"),
       });
-      expect(transaction.runtime.recoveryCleanupResult).not.toHaveProperty("settlementMode");
+      expect(transaction.runtime.recoveryCleanupResult).toMatchObject({
+        settlementMode: "finalize",
+      });
       expect(events).toEqual(["persist:finalize:1"]);
 
       await expect(transaction.abort()).rejects.toMatchObject({
@@ -1089,7 +1375,7 @@ describe("remote client transport deadlines", () => {
     let artifactGets = 0;
     let receiptCount = 0;
     let observedAtReceipt: { contents: Buffer; mode: number; partExists: boolean } | undefined;
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);
@@ -1188,7 +1474,7 @@ describe("remote client transport deadlines", () => {
     await fsPromises.mkdir(artifactsDirectory, { recursive: true });
     await fsPromises.writeFile(finalPath, "corrupt!");
     let artifactGets = 0;
-    const server = http.createServer(async (req, res) => {
+    const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
         const request = await readJson(req);

@@ -1,12 +1,8 @@
 export { runBrowserMode } from "./browserCoordinator.js";
 export { __test__ } from "./localBrowserCoordinator.js";
 
-export type {
-  BrowserAutomationConfig,
-  BrowserRunOptions,
-  BrowserRunResult,
-  BrowserRunTransaction,
-} from "./types.js";
+export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
+export { acquireManualLoginChromeForRun, type BrowserChrome } from "./manualChromeOwner.js";
 export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
 export {
   parseDuration,

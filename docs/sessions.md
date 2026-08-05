@@ -86,6 +86,12 @@ oracle --engine browser \
 ```
 
 See [Browser Mode](browser-mode.md) for the full set.
+Browser cleanup authority is version-bound. Sessions created before Oracle persisted opaque,
+generation-bound target-close capabilities cannot safely reconstruct destructive tab cleanup after
+an upgrade or controller restart. Oracle leaves those targets open and reports cleanup as pending;
+complete the old session from its still-running controller when possible, or restart the session
+with the current Oracle version. Saved DevTools host, port, websocket, target id, and marker URL are
+diagnostic metadata only and are never used to reconstruct permission to close a tab.
 
 ## Restart
 

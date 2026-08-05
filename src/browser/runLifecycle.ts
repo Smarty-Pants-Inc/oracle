@@ -9,7 +9,6 @@ import type {
   BrowserRunTransaction,
 } from "./types.js";
 import {
-  markBrowserCaptureCleanupPending,
   OwnedBrowserResourceTransaction,
   type OwnedBrowserResourceTransactionAdapters,
 } from "./ownedBrowserResources.js";
@@ -153,6 +152,7 @@ export function createBrowserRunTransaction(
     get runtime() {
       return settlement.runtime();
     },
+    bindSettlement: (mode) => settlement.bindSettlement(mode),
     finalize: () => settlement.settle("finalize"),
     abort: () => settlement.settle("abort"),
   };
@@ -391,15 +391,6 @@ export class BrowserRunLifecycleController {
 
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
     if (this.state.kind === "published") return null;
-    if (this.state.kind === "capturing" && this.promptResetPersistenceFailure) {
-      const runtime = markBrowserCaptureCleanupPending(
-        this.runtime(this.adapters.getRuntime()),
-        "abort",
-      );
-      const settlement = new BrowserCaptureSettlementController(this.adapters, runtime);
-      this.state = { kind: "published", settlement };
-      return settlement.settle("abort");
-    }
     const settlement = new BrowserCaptureSettlementController(
       this.adapters,
       this.runtime(this.adapters.getRuntime()),

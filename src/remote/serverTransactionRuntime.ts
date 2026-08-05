@@ -13,9 +13,14 @@ import {
   RemoteTransactionConflictError,
   type RemoteTransactionCoordinator,
 } from "./transactionCoordinator.js";
-import { settlementResponse } from "./transactionProtocol.js";
-import { type RemoteTransactionRecord, type RemoteTransactionStore } from "./transactionStore.js";
-import { RemoteAbortRequestSchema, RemoteFinalizeRequestSchema } from "./types.js";
+import { settlementBindingResponse, settlementResponse } from "./transactionProtocol.js";
+import type { RemoteTransactionRecord } from "./transactionModel.js";
+import type { RemoteTransactionStore } from "./transactionStore.js";
+import {
+  RemoteAbortRequestSchema,
+  RemoteBindSettlementRequestSchema,
+  RemoteFinalizeRequestSchema,
+} from "./types.js";
 import { readRequestBody, sendJson } from "./serverHttp.js";
 
 export async function terminateRemoteChromeWithExactControl(
@@ -91,6 +96,60 @@ export function isAbortWorthyRemoteCaptureMismatch(error: unknown): boolean {
   );
 }
 
+export async function serveRemoteTransactionBinding(params: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  transactionToken: string;
+  transactionStore: RemoteTransactionStore;
+  transactionCoordinator: RemoteTransactionCoordinator;
+}): Promise<void> {
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
+  let request;
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    request = RemoteBindSettlementRequestSchema.parse(raw ? JSON.parse(raw) : {});
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_settlement_binding_request" });
+    return;
+  }
+  try {
+    const binding = await params.transactionCoordinator.bindSettlement({
+      transactionToken: params.transactionToken,
+      mode: request.mode,
+      durablePublication: request.durablePublication,
+    });
+    sendJson(
+      params.res,
+      200,
+      settlementBindingResponse(binding.record, binding.settlementAuthority, binding.finalization),
+    );
+  } catch (error) {
+    if (error instanceof RemoteTransactionConflictError) {
+      sendJson(params.res, error.statusCode, {
+        error: error.code,
+        ...(error.settlementAuthority ? { settlementAuthority: error.settlementAuthority } : {}),
+      });
+      return;
+    }
+    if (error instanceof Error && error.message.includes("does not exist")) {
+      sendJson(params.res, 404, { error: "transaction_not_found" });
+      return;
+    }
+    throw error;
+  }
+}
+
 export async function serveRemoteTransactionSettlement(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
@@ -140,7 +199,10 @@ export async function serveRemoteTransactionSettlement(params: {
     sendJson(params.res, 200, settlementResponse(outcome.record, outcome.finalization));
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {
-      sendJson(params.res, error.statusCode, { error: error.code, message: error.message });
+      sendJson(params.res, error.statusCode, {
+        error: error.code,
+        ...(error.settlementAuthority ? { settlementAuthority: error.settlementAuthority } : {}),
+      });
       return;
     }
     if (error instanceof Error && error.message.includes("does not exist")) {

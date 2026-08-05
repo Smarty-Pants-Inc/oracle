@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
-import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
+import type {
+  BrowserRecoveryCleanupMetadata,
+  BrowserRecoveryTargetCloseCapabilityMetadata,
+} from "../sessionManager.js";
 import type { BrowserAutomationError } from "../oracle/errors.js";
 import type { ProfileDirectoryIdentity } from "./profileState.js";
 import type { BrowserTabLease } from "./tabLeaseRegistry.js";
@@ -56,6 +59,7 @@ export interface RemoteBrowserExecutionContext {
   client: ChromeClient | null;
   browserRuntime: ChromeClient["Runtime"] | null;
   remoteTargetId: string | null;
+  targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | null;
   tabLease: BrowserTabLease | null;
   lastUrl: string | undefined;
   modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -76,6 +80,7 @@ export interface RemoteBrowserExecutionContext {
   disconnectAssessmentFailure: BrowserAutomationError | null;
   rejectDisconnect: (reason?: unknown) => void;
   closedRemoteTargetId: string | null;
+  closedRemoteTargetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | null;
   releasedRemoteTabLeaseId: string | null;
   escapingFailure: unknown;
   buildRuntimeBase: (
@@ -154,6 +159,7 @@ export function createRemoteBrowserExecutionContext(
     client: null,
     browserRuntime: null,
     remoteTargetId: null,
+    targetCloseCapability: null,
     tabLease: null,
     lastUrl: undefined,
     modelSelectionEvidence: undefined,
@@ -174,6 +180,7 @@ export function createRemoteBrowserExecutionContext(
     disconnectAssessmentFailure: null,
     rejectDisconnect,
     closedRemoteTargetId: null,
+    closedRemoteTargetCloseCapability: null,
     releasedRemoteTabLeaseId: null,
     escapingFailure: undefined,
     buildRuntimeBase: () => {
@@ -234,6 +241,10 @@ export function createRemoteBrowserExecutionContext(
           context.tabLease?.profileDirectory ?? context.remoteLeaseProfileIdentity,
         userDataDir: remoteLeaseProfileDir ?? undefined,
         chromeTargetId: context.remoteTargetId ?? undefined,
+        targetCloseCapability:
+          context.ownsTarget && context.closedRemoteTargetId !== context.remoteTargetId
+            ? (context.targetCloseCapability ?? undefined)
+            : undefined,
         conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
         tabLease:
           remoteLeaseProfileDir && context.remoteLeaseProfileIdentity

@@ -28,6 +28,18 @@ interface OwnedBrowserAcquisitionIntent {
 type OwnedBrowserResourceTransactionState =
   | { kind: "open"; runtime: BrowserRuntimeMetadata }
   | {
+      kind: "binding";
+      mode: BrowserCaptureSettlementMode;
+      runtime: BrowserRuntimeMetadata;
+      completion: Promise<BrowserRuntimeMetadata>;
+    }
+  | {
+      kind: "binding-pending";
+      mode: BrowserCaptureSettlementMode;
+      runtime: BrowserRuntimeMetadata;
+    }
+  | { kind: "bound"; mode: BrowserCaptureSettlementMode; runtime: BrowserRuntimeMetadata }
+  | {
       kind: "settling";
       mode: BrowserCaptureSettlementMode;
       runtime: BrowserRuntimeMetadata;
@@ -64,6 +76,20 @@ function settlementModeConflict(
       requestedMode,
       boundMode,
     },
+  );
+}
+
+function isSettlementModeConflict(error: unknown): error is BrowserAutomationError {
+  return (
+    error instanceof BrowserAutomationError &&
+    error.details?.code === "browser-run-lifecycle-settlement-conflict"
+  );
+}
+
+function isSettlementBindingPersistenceFailure(error: unknown): error is BrowserAutomationError {
+  return (
+    error instanceof BrowserAutomationError &&
+    error.details?.code === "browser-settlement-binding-persistence-failed"
   );
 }
 
@@ -135,7 +161,12 @@ function assertAcquiredRuntime(
       ? Boolean(matching.tabLease?.id && matching.tabLease.profileDirectory)
       : intent.pendingResource === "chrome-process"
         ? Boolean(matching.chromeProcessIdentity)
-        : Boolean(matching.chromeTargetId && matching.acquisition?.targetMarkerUrl);
+        : Boolean(
+            matching.chromeTargetId &&
+            matching.acquisition?.targetMarkerUrl &&
+            matching.targetCloseCapability?.generationId === intent.generationId &&
+            matching.targetCloseCapability.capabilityId,
+          );
   if (!exactAuthorityPresent) {
     throw new BrowserAutomationError(
       `Owned browser acquisition result did not persist exact ${intent.pendingResource} authority.`,
@@ -299,18 +330,34 @@ export function projectBrowserCaptureFinalization(
 
 export function projectBrowserRetryableCleanupRuntime(
   runtime: BrowserRuntimeMetadata,
-  completed: { targetId?: string | null; tabLeaseId?: string | null },
+  completed: {
+    targetId?: string | null;
+    targetCloseCapability?: {
+      generationId: string;
+      capabilityId: string;
+    } | null;
+    tabLeaseId?: string | null;
+  },
 ): BrowserRuntimeMetadata {
   const targetId = completed.targetId ?? null;
+  const targetCloseCapability = completed.targetCloseCapability ?? null;
   const tabLeaseId = completed.tabLeaseId ?? null;
   if (!targetId && !tabLeaseId) return runtime;
+  let targetAuthoritySettled = false;
   const resources = runtime.recoveryCleanupResources?.map((resource) => {
-    const targetCompleted = Boolean(targetId && resource.chromeTargetId === targetId);
+    const capabilityMatches = targetCloseCapability
+      ? resource.targetCloseCapability?.generationId === targetCloseCapability.generationId &&
+        resource.targetCloseCapability.capabilityId === targetCloseCapability.capabilityId
+      : true;
+    const targetCompleted = Boolean(
+      targetId && resource.chromeTargetId === targetId && capabilityMatches,
+    );
+    if (targetCompleted) targetAuthoritySettled = true;
     const leaseCompleted = Boolean(tabLeaseId && resource.tabLease?.id === tabLeaseId);
     if (!targetCompleted && !leaseCompleted) return resource;
     return {
       ...resource,
-      ...(targetCompleted ? { chromeTargetId: undefined } : {}),
+      ...(targetCompleted ? { chromeTargetId: undefined, targetCloseCapability: undefined } : {}),
       ...(leaseCompleted ? { tabLease: undefined } : {}),
       recoveryCleanup: targetCompleted
         ? {
@@ -323,7 +370,9 @@ export function projectBrowserRetryableCleanupRuntime(
   });
   return {
     ...runtime,
-    ...(targetId && runtime.chromeTargetId === targetId ? { chromeTargetId: undefined } : {}),
+    ...(targetAuthoritySettled && runtime.chromeTargetId === targetId
+      ? { chromeTargetId: undefined }
+      : {}),
     ...(resources ? { recoveryCleanupResources: resources } : {}),
   };
 }
@@ -339,11 +388,21 @@ export class OwnedBrowserResourceTransaction {
     private readonly adapters: OwnedBrowserResourceTransactionAdapters,
     runtime: BrowserRuntimeMetadata,
   ) {
-    this.state = { kind: "open", runtime: projectPendingBrowserCleanupAuthority(runtime) };
+    const projectedRuntime = projectPendingBrowserCleanupAuthority(runtime);
+    const boundMode = cleanupSettlementMode(projectedRuntime);
+    this.state = boundMode
+      ? { kind: "bound", mode: boundMode, runtime: projectedRuntime }
+      : { kind: "open", runtime: projectedRuntime };
   }
 
   runtime(): BrowserRuntimeMetadata {
-    if (this.state.kind === "open" || this.state.kind === "settling") {
+    if (
+      this.state.kind === "open" ||
+      this.state.kind === "binding" ||
+      this.state.kind === "binding-pending" ||
+      this.state.kind === "bound" ||
+      this.state.kind === "settling"
+    ) {
       return this.state.runtime;
     }
     return this.state.result.runtime;
@@ -399,9 +458,47 @@ export class OwnedBrowserResourceTransaction {
     return acquired;
   }
 
-  settle(mode: BrowserCaptureSettlementMode): Promise<BrowserCaptureFinalizationResult> {
+  bindSettlement(mode: BrowserCaptureSettlementMode): Promise<BrowserRuntimeMetadata> {
     if (this.state.kind === "open") {
       assertSettlementMode(this.state.runtime, mode, "open");
+      return this.beginSettlementBinding(mode, this.state.runtime);
+    }
+    if (this.state.kind === "binding") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(settlementModeConflict(mode, this.state.mode, this.state.kind));
+      }
+      return this.state.completion;
+    }
+    if (this.state.kind === "binding-pending") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(settlementModeConflict(mode, this.state.mode, this.state.kind));
+      }
+      return this.beginSettlementBinding(mode, this.state.runtime);
+    }
+    if (this.state.mode !== mode) {
+      return Promise.reject(settlementModeConflict(mode, this.state.mode, this.state.kind));
+    }
+    return Promise.resolve(this.runtime());
+  }
+
+  settle(mode: BrowserCaptureSettlementMode): Promise<BrowserCaptureFinalizationResult> {
+    if (
+      this.state.kind === "open" ||
+      this.state.kind === "binding" ||
+      this.state.kind === "binding-pending"
+    ) {
+      return this.bindSettlement(mode).then(
+        () => this.settle(mode),
+        (error: unknown) => {
+          if (!isSettlementBindingPersistenceFailure(error)) throw error;
+          return { status: "pending" as const, runtime: this.runtime(), error: error.message };
+        },
+      );
+    }
+    if (this.state.kind === "bound") {
+      if (this.state.mode !== mode) {
+        return Promise.reject(settlementModeConflict(mode, this.state.mode, this.state.kind));
+      }
       return this.beginSettlement(mode, this.state.runtime);
     }
     if (this.state.kind === "settling") {
@@ -422,6 +519,38 @@ export class OwnedBrowserResourceTransaction {
     return Promise.resolve(this.state.result);
   }
 
+  private beginSettlementBinding(
+    mode: BrowserCaptureSettlementMode,
+    runtime: BrowserRuntimeMetadata,
+  ): Promise<BrowserRuntimeMetadata> {
+    const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
+    const completion = Promise.resolve()
+      .then(async () => {
+        await this.adapters.persistRuntime?.(boundRuntime);
+        this.state = { kind: "bound", mode, runtime: boundRuntime };
+        return boundRuntime;
+      })
+      .catch((error) => {
+        if (isSettlementModeConflict(error)) {
+          this.state = { kind: "open", runtime };
+          throw error;
+        }
+        this.state = { kind: "binding-pending", mode, runtime: boundRuntime };
+        throw new BrowserAutomationError(
+          `Browser ${mode} authority could not be durably bound before cleanup.`,
+          {
+            stage: "browser-run-lifecycle",
+            code: "browser-settlement-binding-persistence-failed",
+            requestedMode: mode,
+            runtime: boundRuntime,
+          },
+          error,
+        );
+      });
+    this.state = { kind: "binding", mode, runtime: boundRuntime, completion };
+    return completion;
+  }
+
   private beginSettlement(
     mode: BrowserCaptureSettlementMode,
     runtime: BrowserRuntimeMetadata,
@@ -429,7 +558,6 @@ export class OwnedBrowserResourceTransaction {
     const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
     const completion = Promise.resolve()
       .then(async () => {
-        await this.adapters.persistRuntime?.(boundRuntime);
         const resourceResult = await this.adapters.settleResources(mode, boundRuntime);
         return projectBrowserCaptureFinalization(boundRuntime, resourceResult, mode);
       })
@@ -438,7 +566,7 @@ export class OwnedBrowserResourceTransaction {
           error instanceof BrowserAutomationError &&
           error.details?.code === "browser-run-lifecycle-settlement-conflict"
         ) {
-          this.state = { kind: "open", runtime };
+          this.state = { kind: "bound", mode, runtime };
           throw error;
         }
         return pendingBrowserCaptureCleanup(

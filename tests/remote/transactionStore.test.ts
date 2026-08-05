@@ -11,7 +11,7 @@ import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type {
   DurableRemoteArtifactRegistration,
   DurableRemoteAutomationError,
-} from "../../src/remote/transactionStore.js";
+} from "../../src/remote/transactionModel.js";
 import {
   RemoteTransactionCapacityError,
   RemoteTransactionStore,
@@ -175,6 +175,10 @@ describe("RemoteTransactionStore", () => {
           durablePublication: true,
         }),
       ).resolves.toMatchObject({ status: "bound", record: { state: "pending" } });
+      await store.beginSettlementExecution({
+        transactionToken: finalizedToken,
+        mode: "finalize",
+      });
       await expect(
         store.completeSettlement({
           transactionToken: finalizedToken,
@@ -209,6 +213,20 @@ describe("RemoteTransactionStore", () => {
           durablePublication: true,
         }),
       ).resolves.toMatchObject({ status: "completed" });
+      await expect(
+        store.bindSettlement({
+          transactionToken: finalizedToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).rejects.toMatchObject({
+        code: "transaction_already_settled",
+        settlementAuthority: {
+          mode: "finalize",
+          outcome: "completed",
+          state: "finalized",
+        },
+      });
 
       await begin(store, retriedToken);
       await store.recordRecoverableFailure({
@@ -224,6 +242,10 @@ describe("RemoteTransactionStore", () => {
         transactionToken: retriedToken,
         mode: "abort",
         durablePublication: false,
+      });
+      await store.beginSettlementExecution({
+        transactionToken: retriedToken,
+        mode: "abort",
       });
       await expect(
         store.completeSettlement({
@@ -319,7 +341,10 @@ describe("RemoteTransactionStore", () => {
           mode: "finalize",
           durablePublication: true,
         }),
-      ).rejects.toMatchObject({ code: "transaction_settlement_conflict" });
+      ).rejects.toMatchObject({
+        code: "transaction_settlement_conflict",
+        settlementAuthority: { mode: "abort", outcome: "bound", state: "pending" },
+      });
       await expect(store.read(transactionToken)).resolves.toMatchObject({
         state: "pending",
         runtime: { recoveryCleanupResult: { settlementMode: "abort" } },
@@ -546,17 +571,18 @@ describe("RemoteTransactionStore", () => {
       message: "Cannot record artifact delivery",
     },
     {
-      name: "finalize without durable publication",
+      name: "finalize execution without durable publication",
       setup: async (store, token) => {
         await begin(store, token);
         await publish(store, token);
-      },
-      act: async (store, token) =>
-        store.bindSettlement({
+        await store.bindSettlement({
           transactionToken: token,
           mode: "finalize",
           durablePublication: false,
-        }),
+        });
+      },
+      act: async (store, token) =>
+        store.beginSettlementExecution({ transactionToken: token, mode: "finalize" }),
       message: "Durable answer publication acknowledgement is required",
     },
     {
@@ -848,6 +874,10 @@ describe("RemoteTransactionStore", () => {
         mode: "finalize",
         durablePublication: true,
       });
+      await current.beginSettlementExecution({
+        transactionToken: finalizedToken,
+        mode: "finalize",
+      });
       await current.completeSettlement({
         transactionToken: finalizedToken,
         mode: "finalize",
@@ -968,6 +998,10 @@ describe("RemoteTransactionStore", () => {
         mode: "abort",
         durablePublication: false,
       });
+      await restarted.beginSettlementExecution({
+        transactionToken: runtimeToken,
+        mode: "abort",
+      });
       await expect(
         restarted.completeSettlement({
           transactionToken: runtimeToken,
@@ -1022,6 +1056,7 @@ describe("RemoteTransactionStore", () => {
         runtime,
       });
       expect(expiredRuntime).not.toHaveProperty("modelSelection");
+      await store.beginSettlementExecution({ transactionToken: runtimeToken, mode: "abort" });
       await expect(
         store.completeSettlement({
           transactionToken: runtimeToken,
@@ -1142,6 +1177,7 @@ describe("RemoteTransactionStore", () => {
         mode: "abort",
         durablePublication: false,
       });
+      await store.beginSettlementExecution({ transactionToken, mode: "abort" });
       await store.completeSettlement({
         transactionToken,
         mode: "abort",

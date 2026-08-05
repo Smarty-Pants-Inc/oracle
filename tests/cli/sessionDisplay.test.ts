@@ -793,7 +793,10 @@ describe("attachSession rendering", () => {
         browser: { config: {}, runtime: {} },
         error: expect.objectContaining({
           category: "browser-automation",
-          details: expect.objectContaining({ stage: "browser-acquisition-recovery", runtime: {} }),
+          details: expect.objectContaining({
+            stage: "browser-acquisition-recovery",
+            code: "browser-acquisition-cleanup-completed",
+          }),
         }),
       }),
     );
@@ -1064,6 +1067,7 @@ describe("attachSession rendering", () => {
       answerText: "remote answer",
       answerMarkdown: "remote answer",
       runtime: capturedRuntime,
+      bindSettlement: vi.fn(async () => capturedRuntime),
       finalize,
       abort: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
     });
@@ -1092,7 +1096,7 @@ describe("attachSession rendering", () => {
     expect(finalize).toHaveBeenCalledOnce();
   });
 
-  test("persists the terminal remote runtime carried by a manual reattach error", async () => {
+  test("retains pending remote authority when a manual reattach error omits terminal settlement", async () => {
     const staleRuntime: BrowserRuntimeMetadata = {
       recoveryCleanupResources: [
         {
@@ -1158,7 +1162,7 @@ describe("attachSession rendering", () => {
       .map(([, patch]) => patch.browser?.runtime)
       .filter((candidate) => candidate !== undefined);
     expect(runtimeUpdates).toContainEqual(hintedRuntime);
-    expect(runtimeUpdates.at(-1)).toEqual(terminalRuntime);
+    expect(runtimeUpdates.at(-1)).toEqual(hintedRuntime);
   });
 
   test("persists a verified answer receipt before manual reattach completion and cleanup", async () => {
@@ -1210,6 +1214,7 @@ describe("attachSession rendering", () => {
       answerText: "Recovered answer",
       answerMarkdown: "Recovered **answer**",
       runtime: recoverableMeta.browser?.runtime,
+      bindSettlement: vi.fn(async () => recoverableMeta.browser?.runtime ?? {}),
       finalize,
       abort,
     });
@@ -1295,6 +1300,7 @@ describe("attachSession rendering", () => {
       answerText: "Recovered answer",
       answerMarkdown: "Recovered answer",
       runtime: recoverableMeta.browser?.runtime,
+      bindSettlement: vi.fn(async () => recoverableMeta.browser?.runtime ?? {}),
       finalize,
       abort,
     });

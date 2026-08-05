@@ -206,16 +206,19 @@ export type BrowserCaptureFinalizationResult =
 export interface BrowserRunTransaction extends BrowserRunResult {
   /** Complete serializable locator and cleanup authority persisted before this transaction is returned. */
   runtime: BrowserRuntimeMetadata;
+  /** Durably select a settlement mode without executing cleanup effects. Repeated same-mode binds are idempotent. */
+  bindSettlement: (mode: "finalize" | "abort") => Promise<BrowserRuntimeMetadata>;
   /**
    * Acknowledge durable answer/session publication, then retire resources. The first settlement call
-   * binds the transaction to finalize. Pending results retry from their latest runtime when finalize
-   * is called again; completed results are memoized, and abort rejects after binding.
+   * binds the transaction to finalize. A binding persistence failure returns pending without starting
+   * cleanup; later finalize calls retry the bind. Completed results are memoized, and abort rejects
+   * after binding.
    */
   finalize: () => Promise<BrowserCaptureFinalizationResult>;
   /**
    * Dispose newly owned resources when capture publication fails. The first settlement call binds the
-   * transaction to abort. Pending results retry from their latest runtime when abort is called again;
-   * completed results are memoized, and finalize rejects after binding.
+   * transaction to abort. A binding persistence failure returns pending without starting cleanup;
+   * later abort calls retry the bind. Completed results are memoized, and finalize rejects after binding.
    */
   abort: () => Promise<BrowserCaptureFinalizationResult>;
 }

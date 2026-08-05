@@ -2,7 +2,7 @@ import http from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import chalk from "chalk";
-import type { BrowserLogger } from "../browser/types.js";
+import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
 import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
 import type {
@@ -10,10 +10,11 @@ import type {
   ProfileStateLogger,
   RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";
-import { runBrowserMode, type BrowserRunTransaction } from "../browserMode.js";
+import { runBrowserModeTransaction } from "../browser/browserCoordinator.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { RemoteArtifactStore } from "./artifactStore.js";
+import { RemoteRequestAuthenticator } from "./auth.js";
 import {
   assertLoopbackRemoteBind,
   REMOTE_PLAINTEXT_TRANSPORT_GUIDANCE,
@@ -30,10 +31,8 @@ import {
   settleRemoteControllerShutdown,
   sweepExpiredRemoteTransactions,
 } from "./transactionServer.js";
-import {
-  type ReconcileRemoteTransactionResult,
-  RemoteTransactionStore,
-} from "./transactionStore.js";
+import type { ReconcileRemoteTransactionResult } from "./transactionModel.js";
+import { RemoteTransactionStore } from "./transactionStore.js";
 import {
   DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS,
   DEFAULT_REMOTE_RUN_OVERALL_TIMEOUT_MS,
@@ -41,7 +40,9 @@ import {
 } from "./types.js";
 
 interface RemoteServerDeps {
-  runBrowser?: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  runBrowser?: (
+    options: Parameters<typeof runBrowserModeTransaction>[0],
+  ) => Promise<BrowserRunTransaction>;
   resumeBrowser?: typeof resumeBrowserSession;
   transactionStoreDir?: string;
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
@@ -63,12 +64,18 @@ export async function createRemoteServer(
 ): Promise<RemoteServerInstance> {
   const bindHost = options.host ?? "127.0.0.1";
   assertLoopbackRemoteBind(bindHost);
-  const runBrowser = deps.runBrowser ?? runBrowserMode;
+  const runBrowser = deps.runBrowser ?? runBrowserModeTransaction;
   const resumeBrowser = deps.resumeBrowser ?? resumeBrowserSession;
   const injectedRetryCleanup = deps.retryCleanup;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
-  const authToken = options.token ?? randomBytes(16).toString("hex");
+  const authToken = options.token ?? randomBytes(32).toString("hex");
+  const legacyToken = options.legacyToken?.trim() || undefined;
+  if (legacyToken && legacyToken === authToken) {
+    throw new Error(
+      "Legacy bearer credential must be distinct from the transaction HMAC root key.",
+    );
+  }
   const startedAt = Date.now();
   server.headersTimeout = DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS;
   server.requestTimeout = DEFAULT_REMOTE_RUN_OVERALL_TIMEOUT_MS;
@@ -81,6 +88,10 @@ export async function createRemoteServer(
   const transactionStoreDir =
     deps.transactionStoreDir ?? path.join(getOracleHomeDir(), "remote-transactions");
   const controllerGeneration = deps.controllerGeneration ?? randomUUID();
+  const requestAuthenticator = new RemoteRequestAuthenticator({
+    rootKey: authToken,
+    serverGeneration: controllerGeneration,
+  });
   const controllerLock = await acquireCrashRecoverableFilesystemLock(
     path.join(transactionStoreDir, ".controller.lock"),
     {
@@ -264,6 +275,9 @@ export async function createRemoteServer(
     cleanupLogger,
     verbose,
     authToken,
+    legacyToken,
+    controllerGeneration,
+    requestAuthenticator,
     startedAt,
     transactionStore,
     artifactStore,

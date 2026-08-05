@@ -10,15 +10,8 @@ import {
   verifyCommittedPromptTurn,
 } from "./pageActions.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
-import {
-  launchChrome,
-  connectToRemoteChromeTarget,
-  listRemoteChromeTargets,
-  connectToChromeTargetWithExactAuthority,
-} from "./chromeLifecycle.js";
-import { acquireManualChromeOwner } from "./manualChromeOwner.js";
+import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
-import { acquireBrowserTabLease } from "./tabLeaseRegistry.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 import {
   extractConversationIdFromUrl,
@@ -33,10 +26,7 @@ import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import {
   defaultRecoveryLockPath,
   finalizeRecoveredRuntime,
-  immutablePromptIdentity,
   recoveryCleanupGroupKey,
-  type ReattachCleanupDeps,
-  type ReattachFinalizationResult,
 } from "./reattachCleanup.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
 export type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
@@ -44,55 +34,25 @@ import {
   assertSameCommittedPromptEpoch,
   buildCommittedConversationUrl,
   createOwnedRecoveryTargetConnection,
-  extractRecoverableConversationId,
-  pickTarget,
-  refreshAttachRuntime,
   requireCommittedPromptEpochLocator,
   resumeBrowserSessionViaNewChrome,
-  selectTarget,
 } from "./reattachAcquisition.js";
+import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
+export type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
+import {
+  extractRecoverableConversationId,
+  pickTarget,
+  selectTarget,
+  type ExplicitTargetSelectionFailure,
+} from "./reattachTargetSelection.js";
+import {
+  exactOwnedTargetGeneration,
+  reconcileReattachTargetAuthority,
+  refreshAttachRuntime,
+} from "./reattachTargetAuthority.js";
 import { createReattachSettlement } from "./reattachSettlement.js";
 export { retryBrowserRecoveryCleanup } from "./reattachSettlement.js";
 
-export interface ReattachCapture {
-  answerText: string;
-  answerMarkdown: string;
-  runtime?: BrowserRuntimeMetadata;
-  finalizeResources?: () => Promise<ReattachFinalizationResult>;
-  abortResources?: () => Promise<ReattachFinalizationResult>;
-}
-
-export interface ReattachDeps {
-  listTargets?: () => Promise<TargetInfoLite[]>;
-  connect?: (options?: unknown) => Promise<ChromeClient>;
-  waitForAssistantResponse?: typeof waitForAssistantResponse;
-  captureAssistantMarkdown?: typeof captureAssistantMarkdown;
-  waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
-  waitForConversationHydration?: typeof waitForResumedConversationHydration;
-  verifyCommittedPromptTurn?: typeof verifyCommittedPromptTurn;
-  launchChrome?: typeof launchChrome;
-  acquireBrowserTabLease?: typeof acquireBrowserTabLease;
-  acquireManualChromeOwner?: typeof acquireManualChromeOwner;
-  connectRecoveryTargetWithExactAuthority?: typeof connectToChromeTargetWithExactAuthority;
-  recoverSession?: (
-    runtime: BrowserRuntimeMetadata,
-    config: BrowserSessionConfig | undefined,
-  ) => Promise<ReattachCapture>;
-  recoveryCleanup?: ReattachCleanupDeps;
-  recoveryLockPath?: string;
-  acquireRecoveryLock?: (lockPath: string) => Promise<ReattachRecoveryLock>;
-  isRemotePublicationAcknowledged?: () => boolean;
-  resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
-  runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
-}
-
-export interface ReattachResult {
-  answerText: string;
-  answerMarkdown: string;
-  runtime: BrowserRuntimeMetadata;
-  finalize: () => Promise<ReattachFinalizationResult>;
-  abort: () => Promise<ReattachFinalizationResult>;
-}
 function remoteRecoveryAuthority(runtime: BrowserRuntimeMetadata) {
   return runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
     ?.remoteRecovery;
@@ -110,8 +70,6 @@ class ClassifiedReattachError extends Error {
     if (cause) (this as Error & { cause?: unknown }).cause = cause;
   }
 }
-
-type ExplicitTargetSelectionFailure = "missing" | "ambiguous" | "mismatched" | "unsupported";
 
 function explicitTargetAuthorityError(
   browserTabRef: string,
@@ -329,43 +287,9 @@ export async function resumeBrowserSession(
           "Stored Chrome target is unavailable or no longer matches the committed conversation.",
         );
       }
-      const target = selection.target;
-      const targetId = target.targetId ?? target.id;
-      if (!targetId) {
-        throw new ClassifiedReattachError(
-          "stale-runtime",
-          "Selected Chrome target did not provide a target id.",
-        );
-      }
-      const previousTargetId = liveRuntime.chromeTargetId;
-      const selectedResources = [...(liveRuntime.recoveryCleanupResources ?? [])];
-      const promptIdentity = JSON.stringify(immutablePromptIdentity(liveRuntime.promptEpoch));
-      for (let index = selectedResources.length - 1; index >= 0; index -= 1) {
-        const resource = selectedResources[index];
-        if (!resource) continue;
-        const samePrompt =
-          JSON.stringify(immutablePromptIdentity(resource.promptEpoch)) === promptIdentity;
-        const sameTarget = previousTargetId
-          ? resource.chromeTargetId === previousTargetId
-          : !resource.chromeTargetId;
-        if (!samePrompt || !sameTarget) continue;
-        selectedResources[index] = {
-          ...resource,
-          chromeHost: host,
-          chromePort: port,
-          chromeBrowserWSEndpoint: browserWSEndpoint,
-          chromeTargetId: targetId,
-          recoveryCleanup: explicitTabRef
-            ? { ...resource.recoveryCleanup, ownsTarget: false }
-            : resource.recoveryCleanup,
-        };
-        break;
-      }
-      liveRuntime = {
-        ...liveRuntime,
-        chromeTargetId: targetId,
-        recoveryCleanupResources: selectedResources,
-      };
+      const targetId = selection.targetId;
+      const reconciledTarget = reconcileReattachTargetAuthority(liveRuntime, targetId);
+      liveRuntime = reconciledTarget.runtime;
       const connection = await classifyReattachFailure(
         "recoverable-transport",
         `Unable to connect to Chrome target ${targetId}.`,
@@ -546,6 +470,8 @@ export const __test__ = {
   openConversationFromSidebar,
   finalizeRecoveredRuntime,
   refreshAttachRuntime,
+  reconcileReattachTargetAuthority,
+  exactOwnedTargetGeneration,
   recoveryCleanupGroupKey,
   defaultRecoveryLockPath,
   createOwnedRecoveryTargetConnection,

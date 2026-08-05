@@ -1,18 +1,22 @@
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
-import type { DurableRemoteAutomationError, RemoteTransactionRecord } from "./transactionStore.js";
+import type { DurableRemoteAutomationError, RemoteTransactionRecord } from "./transactionModel.js";
 import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteBrowserAutomationErrorSchema,
   RemoteRunTransactionPayloadSchema,
+  RemoteSettlementBindResponseSchema,
   RemoteTransactionRetryResponseSchema,
   RemoteTransactionSettlementResponseSchema,
   type RemoteBrowserAutomationErrorPayload,
   type RemotePublicRuntime,
   type RemoteRunTransactionPayload,
+  type RemoteSettlementBindResponse,
   type RemoteTransactionRetryResponse,
   type RemoteTransactionSettlementResponse,
 } from "./types.js";
+const REMOTE_PENDING_SETTLEMENT_MESSAGE =
+  "Remote browser cleanup remains pending; retry the same settlement mode.";
 
 export function projectRemotePublicRuntime(
   runtime: BrowserRuntimeMetadata,
@@ -50,14 +54,42 @@ export function settlementResponse(
   finalization: BrowserCaptureFinalizationResult,
 ): RemoteTransactionSettlementResponse {
   const cleanupStatus = finalization.status === "completed" ? "completed" : "pending";
+  const mode = record.settlementMode ?? record.terminalAudit?.settlementMode;
+  if (!mode) throw new Error("Remote settlement response lacks bound mode authority");
   return RemoteTransactionSettlementResponseSchema.parse({
     transactionToken: record.transactionToken,
     state: record.state,
+    settlementAuthority: {
+      mode,
+      outcome: finalization.status === "completed" ? "completed" : "bound",
+      state: record.state,
+    },
     finalization: {
       status: finalization.status,
       runtime: projectRemotePublicRuntime(finalization.runtime, cleanupStatus),
-      ...(finalization.status === "pending" ? { error: finalization.error } : {}),
+      ...(finalization.status === "pending" ? { error: REMOTE_PENDING_SETTLEMENT_MESSAGE } : {}),
     },
+  });
+}
+
+export function settlementBindingResponse(
+  record: RemoteTransactionRecord,
+  settlementAuthority: {
+    mode: "finalize" | "abort";
+    outcome: "bound" | "completed";
+    state: RemoteTransactionRecord["state"];
+  },
+  finalization?: BrowserCaptureFinalizationResult,
+): RemoteSettlementBindResponse {
+  const runtime = finalization?.runtime ?? record.runtime;
+  if (!runtime) throw new Error("Remote settlement binding lacks durable runtime authority");
+  return RemoteSettlementBindResponseSchema.parse({
+    transactionToken: record.transactionToken,
+    settlementAuthority,
+    runtime: projectRemotePublicRuntime(
+      runtime,
+      settlementAuthority.outcome === "completed" ? "completed" : "pending",
+    ),
   });
 }
 

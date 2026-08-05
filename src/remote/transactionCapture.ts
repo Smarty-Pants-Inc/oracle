@@ -1,4 +1,5 @@
-import type { BrowserRunResult, BrowserRunTransaction } from "../browserMode.js";
+import type { BrowserRunResult } from "../browserMode.js";
+import type { BrowserRunTransaction } from "../browser/types.js";
 import type { ReattachResult } from "../browser/reattach.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -6,7 +7,7 @@ import type {
   BrowserRemotePromptRequestIdentity,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
-import type { DurableRemoteAutomationError } from "./transactionStore.js";
+import type { DurableRemoteAutomationError } from "./transactionModel.js";
 import { RemotePublicRunResultSchema, type RemotePublicRunResult } from "./types.js";
 
 export function assertBrowserRunTransaction(
@@ -18,6 +19,8 @@ export function assertBrowserRunTransaction(
     !("runtime" in value) ||
     typeof value.runtime !== "object" ||
     value.runtime === null ||
+    !("bindSettlement" in value) ||
+    typeof value.bindSettlement !== "function" ||
     !("finalize" in value) ||
     typeof value.finalize !== "function" ||
     !("abort" in value) ||
@@ -33,7 +36,13 @@ export function assertBrowserRunTransaction(
 export function browserRunResultFromTransaction(
   transaction: BrowserRunTransaction,
 ): BrowserRunResult {
-  const { runtime: _runtime, finalize: _finalize, abort: _abort, ...result } = transaction;
+  const {
+    runtime: _runtime,
+    bindSettlement: _bindSettlement,
+    finalize: _finalize,
+    abort: _abort,
+    ...result
+  } = transaction;
   return result;
 }
 
@@ -57,6 +66,7 @@ export function browserTransactionFromRecoveredSession(
     answerChars: recovered.answerText.length,
     conversationId: recovered.runtime.conversationId,
     runtime: recovered.runtime,
+    bindSettlement: recovered.bindSettlement,
     finalize: recovered.finalize,
     abort: recovered.abort,
   };

@@ -3,10 +3,15 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { BrowserAttachment, BrowserLogger, BrowserRunResult } from "../browser/types.js";
+import type {
+  BrowserAttachment,
+  BrowserLogger,
+  BrowserRunResult,
+  BrowserRunTransaction,
+} from "../browser/types.js";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
-import type { runBrowserMode, BrowserRunTransaction } from "../browserMode.js";
+import type { runBrowserModeTransaction } from "../browser/browserCoordinator.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
   BrowserRuntimeMetadata,
@@ -14,6 +19,7 @@ import type {
   SessionArtifact,
 } from "../sessionManager.js";
 import type { RemoteArtifactStore } from "./artifactStore.js";
+import { sanitizeArtifactFilename } from "../browser/artifacts.js";
 import {
   assertBrowserRunTransaction,
   assertCapturedPromptIdentity,
@@ -23,14 +29,19 @@ import {
   projectRemotePublicResult,
   serializeDurableBrowserAutomationError,
 } from "./transactionCapture.js";
+import {
+  RemoteLegacyRunPayloadSchema,
+  RemoteLegacyTextResultSchema,
+  type RemoteLegacyRunEvent,
+  type RemoteLegacyRunPayload,
+} from "./legacyProtocol.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
 import { remoteBrowserAutomationError, remoteTransactionPayload } from "./transactionProtocol.js";
-import {
-  RemoteTransactionCapacityError,
-  type DurableRemoteArtifactRegistration,
-  type RemoteTransactionRecord,
-  type RemoteTransactionStore,
-} from "./transactionStore.js";
+import type {
+  DurableRemoteArtifactRegistration,
+  RemoteTransactionRecord,
+} from "./transactionModel.js";
+import { RemoteTransactionCapacityError, type RemoteTransactionStore } from "./transactionStore.js";
 import {
   buildRemotePromptRequestIdentity,
   MAX_REMOTE_REQUEST_BYTES,
@@ -40,13 +51,7 @@ import {
   type RemoteRunEvent,
   type RemoteRunPayload,
 } from "./types.js";
-import {
-  formatSocket,
-  readRequestBody,
-  RemoteRequestError,
-  sanitizeName,
-  sendJson,
-} from "./serverHttp.js";
+import { formatSocket, readRequestBody, RemoteRequestError, sendJson } from "./serverHttp.js";
 import {
   isAbortWorthyRemoteCaptureMismatch,
   persistRemoteBrowserRuntime,
@@ -57,7 +62,10 @@ export async function handleRemoteRunRequest(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
   options: RemoteServerOptions;
-  runBrowser: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  runBrowser: (
+    options: Parameters<typeof runBrowserModeTransaction>[0],
+  ) => Promise<BrowserRunTransaction>;
+  protocol: "transaction-v3" | "legacy-text-v1";
   logger: (message: string) => void;
   verbose: boolean;
   transactionToken: string;
@@ -68,7 +76,7 @@ export async function handleRemoteRunRequest(params: {
   let payload: RemoteRunPayload;
   try {
     const body = await readRequestBody(params.req, MAX_REMOTE_REQUEST_BYTES);
-    payload = validateRemoteRunPayload(JSON.parse(body));
+    payload = validateRemoteRunPayload(JSON.parse(body), params.protocol);
   } catch (error) {
     const requestError =
       error instanceof RemoteRequestError
@@ -125,14 +133,15 @@ export async function handleRemoteRunRequest(params: {
   let runDir: string | null = null;
   params.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
-  const sendEvent = (event: RemoteRunEvent): boolean => {
+  const sendEvent = (event: RemoteRunEvent | RemoteLegacyRunEvent): boolean => {
     if (params.res.destroyed || params.res.writableEnded) return false;
     return params.res.write(`${JSON.stringify(event)}\n`);
   };
   const automationLogger: BrowserLogger = ((message?: string) => {
-    if (typeof message === "string") sendEvent({ type: "log", message });
+    if (params.protocol === "transaction-v3" && typeof message === "string") {
+      sendEvent({ type: "log", message });
+    }
   }) as BrowserLogger;
-  automationLogger.verbose = Boolean(payload.options.verbose);
   const persistExactStagedCapture = async (
     result: BrowserRunResult,
     runtime: BrowserRuntimeMetadata,
@@ -155,34 +164,49 @@ export async function handleRemoteRunRequest(params: {
     ];
     let stagedResult = result;
     let registrations: DurableRemoteArtifactRegistration[] = [];
-    try {
-      registrations = await params.artifactStore.prepareRequiredArtifacts({
-        transactionToken: params.transactionToken,
-        runId,
-        artifacts: fileArtifacts,
-      });
-    } catch (artifactError) {
-      const artifactMessage =
-        artifactError instanceof Error ? artifactError.message : String(artifactError);
+    if (params.protocol === "legacy-text-v1" && fileArtifacts.length > 0) {
       stagedResult = {
         ...result,
         warnings: [
           ...(result.warnings ?? []),
           {
-            code: "remote-artifact-preparation-pending",
+            code: "legacy-remote-artifacts-host-only",
             severity: "warning",
-            message: `The captured answer was preserved without remote artifact transfer: ${artifactMessage}`,
-            details: { stage: "remote-artifact-preparation" },
+            message:
+              "Generated files remain on the remote host and require explicit manual transfer; legacy text compatibility never claims artifact delivery.",
           },
         ],
       };
-      sendEvent({
-        type: "log",
-        message: `[browser] Answer captured; remote artifact transfer remains unavailable: ${artifactMessage}`,
-      });
-      params.logger(
-        `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
-      );
+    } else {
+      try {
+        registrations = await params.artifactStore.prepareRequiredArtifacts({
+          transactionToken: params.transactionToken,
+          runId,
+          artifacts: fileArtifacts,
+        });
+      } catch (artifactError) {
+        const artifactMessage =
+          artifactError instanceof Error ? artifactError.message : String(artifactError);
+        stagedResult = {
+          ...result,
+          warnings: [
+            ...(result.warnings ?? []),
+            {
+              code: "remote-artifact-preparation-pending",
+              severity: "warning",
+              message: `The captured answer was preserved without remote artifact transfer: ${artifactMessage}`,
+              details: { stage: "remote-artifact-preparation" },
+            },
+          ],
+        };
+        sendEvent({
+          type: "log",
+          message: `[browser] Answer captured; remote artifact transfer remains unavailable: ${artifactMessage}`,
+        });
+        params.logger(
+          `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
+        );
+      }
     }
     try {
       stagedRecord = await params.transactionStore.stageCapture({
@@ -274,7 +298,7 @@ export async function handleRemoteRunRequest(params: {
       throw new Error("Remote transaction lost its exact pre-archive staged capture");
     }
     const registrations = stagedCapture.artifacts ?? [];
-    const publicResult = projectRemotePublicResult(result);
+    const publicResult = stagedCapture.result;
     let record: RemoteTransactionRecord;
     try {
       record = await params.transactionStore.publishCapture({
@@ -309,6 +333,28 @@ export async function handleRemoteRunRequest(params: {
     durableCapture = true;
     params.transactionCoordinator.registerActive(params.transactionToken, capturedTransaction);
 
+    if (params.protocol === "legacy-text-v1") {
+      const settlement = await params.transactionCoordinator.settle({
+        transactionToken: params.transactionToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      if (settlement.finalization.status !== "completed") {
+        sendEvent({
+          type: "error",
+          message: "Remote answer was captured, but durable cleanup remains pending on the host.",
+        });
+        return;
+      }
+      sendEvent({
+        type: "result",
+        result: RemoteLegacyTextResultSchema.parse(record.result),
+      });
+      params.logger(
+        `[serve] Legacy text run ${runId} finalized durably in ${Date.now() - runStartedAt}ms`,
+      );
+      return;
+    }
     if (registrations.length > 0) {
       sendEvent({
         type: "log",
@@ -381,7 +427,11 @@ export async function handleRemoteRunRequest(params: {
         })
       ).record;
     }
-    sendEvent({ type: "error", error: remoteBrowserAutomationError(record) });
+    if (params.protocol === "legacy-text-v1") {
+      sendEvent({ type: "error", message: "Remote browser automation failed." });
+    } else {
+      sendEvent({ type: "error", error: remoteBrowserAutomationError(record) });
+    }
     params.logger(
       `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
     );
@@ -391,7 +441,13 @@ export async function handleRemoteRunRequest(params: {
   }
 }
 
-function validateRemoteRunPayload(value: unknown): RemoteRunPayload {
+function validateRemoteRunPayload(
+  value: unknown,
+  protocol: "transaction-v3" | "legacy-text-v1",
+): RemoteRunPayload {
+  if (protocol === "legacy-text-v1") {
+    return adaptLegacyRunPayload(RemoteLegacyRunPayloadSchema.parse(value));
+  }
   const parsed = RemoteRunPayloadSchema.safeParse(value);
   if (parsed.success) return parsed.data as RemoteRunPayload;
   const issue = parsed.error.issues[0];
@@ -409,6 +465,47 @@ function validateRemoteRunPayload(value: unknown): RemoteRunPayload {
   const message = issue?.message ?? "Invalid remote run request";
   const statusCode = /exceed|too big|maximum/i.test(message) ? 413 : 400;
   throw new RemoteRequestError(statusCode, "invalid_request", message);
+}
+
+function adaptLegacyRunPayload(payload: RemoteLegacyRunPayload): RemoteRunPayload {
+  const attachment = (value: RemoteLegacyRunPayload["attachments"][number]) => ({
+    fileName: value.fileName,
+    displayPath: value.displayPath,
+    sizeBytes: Buffer.from(value.contentBase64, "base64").byteLength,
+    contentBase64: value.contentBase64,
+  });
+  return RemoteRunPayloadSchema.parse({
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    prompt: payload.prompt,
+    attachments: payload.attachments.map(attachment),
+    fallbackSubmission: payload.fallbackSubmission
+      ? {
+          prompt: payload.fallbackSubmission.prompt,
+          attachments: payload.fallbackSubmission.attachments.map(attachment),
+        }
+      : undefined,
+    browserConfig: {
+      chatgptUrl: payload.browserConfig.chatgptUrl ?? payload.browserConfig.url,
+      timeoutMs: payload.browserConfig.timeoutMs,
+      inputTimeoutMs: payload.browserConfig.inputTimeoutMs,
+      attachmentTimeoutMs: payload.browserConfig.attachmentTimeoutMs,
+      assistantRecheckDelayMs: payload.browserConfig.assistantRecheckDelayMs,
+      assistantRecheckTimeoutMs: payload.browserConfig.assistantRecheckTimeoutMs,
+      desiredModel: payload.browserConfig.desiredModel,
+      modelStrategy: payload.browserConfig.modelStrategy,
+      thinkingTime: payload.browserConfig.thinkingTime,
+      researchMode: payload.browserConfig.researchMode,
+      archiveConversations: payload.browserConfig.archiveConversations,
+      resumeConversationUrl: payload.browserConfig.resumeConversationUrl,
+    },
+    options: {
+      heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
+      verbose: payload.options.verbose,
+      sessionId: payload.options.sessionId,
+      followUpPrompts: payload.options.followUpPrompts,
+      keepConversationTab: payload.browserConfig.keepBrowser === true,
+    },
+  });
 }
 
 function buildEffectiveRemoteBrowserConfig(
@@ -445,7 +542,7 @@ async function materializeRemoteAttachments(
 ): Promise<BrowserAttachment[]> {
   const materialized: BrowserAttachment[] = [];
   for (const [index, attachment] of attachments.entries()) {
-    const safeName = sanitizeName(attachment.fileName || `${fallbackName}-${index + 1}`);
+    const safeName = sanitizeArtifactFilename(attachment.fileName, `${fallbackName}-${index + 1}`);
     const filePath = path.join(directory, `${index + 1}-${safeName}`);
     const payload = Buffer.from(attachment.contentBase64, "base64");
     await writeFile(filePath, payload, { mode: 0o600 });

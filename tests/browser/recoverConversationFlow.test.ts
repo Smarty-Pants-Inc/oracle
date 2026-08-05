@@ -219,7 +219,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: vi.fn(),
       connectWithNewTab: vi.fn(),
       closeChromeTargetWithExactAuthority,
       connectWithNewTabWithExactAuthority: connectWithExactTarget("target-reused", events),
@@ -335,7 +334,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: vi.fn(),
       connectWithNewTab: vi.fn(),
       closeChromeTargetWithExactAuthority,
       connectWithNewTabWithExactAuthority: connectWithExactTarget("target-retry"),
@@ -359,6 +357,12 @@ describe("recoverConversationTab lease ownership", () => {
             chromeHost: "127.0.0.1",
             chromePort: 53994,
             chromeTargetId: "target-retry",
+            targetCloseCapability: {
+              version: 1,
+              generationId: expect.any(String),
+              capabilityId: expect.any(String),
+            },
+            acquisition: { generationId: expect.any(String) },
             tabLease: { id: "lease-retry", profileDirectory },
             recoveryCleanup: { ownsTarget: true },
           },
@@ -420,7 +424,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: vi.fn(),
       connectWithNewTab: vi.fn(),
       closeChromeTargetWithExactAuthority,
       connectWithNewTabWithExactAuthority: connectWithExactTarget("target-launched"),
@@ -498,7 +501,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: vi.fn(),
       connectWithNewTab: vi.fn(),
       closeChromeTargetWithExactAuthority,
       connectWithNewTabWithExactAuthority: connectWithExactTarget("target-error"),
@@ -532,7 +534,6 @@ describe("recoverConversationTab lease ownership", () => {
     const ownerIdentity = processIdentity(53995);
     const generationBCreateTarget = vi.fn();
     const generationBAttachTarget = vi.fn();
-    const generationBCloseTarget = vi.fn();
     const exactAuthority = {
       ...endpointAuthority(53995),
       runExactOperation: vi.fn(async (_operation: () => Promise<unknown>) => ({
@@ -571,7 +572,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: generationBCloseTarget,
       closeChromeTargetWithExactAuthority,
       connectWithNewTab: generationBCreateTarget,
       connectWithNewTabWithExactAuthority: vi.fn(async (authority: typeof exactAuthority) => {
@@ -605,17 +605,28 @@ describe("recoverConversationTab lease ownership", () => {
     expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(generationBCreateTarget).not.toHaveBeenCalled();
     expect(generationBAttachTarget).not.toHaveBeenCalled();
-    expect(generationBCloseTarget).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
     expect(chrome.kill).toHaveBeenCalledTimes(1);
   });
 
-  test("preserves raw target operations only for an explicitly non-owned endpoint", async () => {
-    const release = vi.fn(async () => undefined);
-    const rawConnectWithNewTab = connectWithExactTarget("remote-target");
-    const rawCloseChromeTarget = vi.fn(async () => true);
+  test("cleans an explicitly non-owned endpoint only through its retained live authority", async () => {
+    const closeConnection = vi.fn(async () => undefined);
+    const releaseLease = vi.fn(async () => undefined);
+    const liveTargetAuthority = {
+      runExactOperation: vi.fn(),
+      release: closeConnection,
+    };
+    const createRemoteTarget = connectWithExactTarget("remote-target");
+    const liveConnectWithNewTab = vi.fn(async () => ({
+      ...(await createRemoteTarget()),
+      ownership: "created" as const,
+      targetCloseAuthority: liveTargetAuthority,
+      close: closeConnection,
+    }));
+    const closeChromeTargetWithExactAuthority = vi.fn(async () => ({
+      status: "completed" as const,
+    }));
     const connectWithNewTabWithExactAuthority = vi.fn();
-    const closeChromeTargetWithExactAuthority = vi.fn();
     const acquireManualChromeOwner = vi.fn();
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
@@ -629,9 +640,8 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: rawCloseChromeTarget,
       closeChromeTargetWithExactAuthority,
-      connectWithNewTab: rawConnectWithNewTab,
+      connectWithNewTabWithRetainedLiveAuthority: liveConnectWithNewTab,
       connectWithNewTabWithExactAuthority,
     }));
     vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
@@ -641,7 +651,7 @@ describe("recoverConversationTab lease ownership", () => {
         id: "lease-remote",
         profileDirectory,
         update: vi.fn(async () => undefined),
-        release,
+        release: releaseLease,
       })),
       retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
     }));
@@ -654,18 +664,21 @@ describe("recoverConversationTab lease ownership", () => {
     });
 
     expect(recovered).toMatchObject({ host: "remote.example", port: 9444, ref: "remote-target" });
-    expect(rawConnectWithNewTab).toHaveBeenCalledWith(
+    expect(liveConnectWithNewTab).toHaveBeenCalledWith(
       9444,
       logger,
       expect.stringMatching(/^about:blank#oracle-recovery=/),
       "remote.example",
-      { fallbackToDefault: false, retries: 6 },
+      { retries: 6 },
     );
     expect(connectWithNewTabWithExactAuthority).not.toHaveBeenCalled();
     expect(acquireManualChromeOwner).not.toHaveBeenCalled();
     await expect(recovered.cleanup("finalize")).resolves.toMatchObject({ status: "completed" });
-    expect(rawCloseChromeTarget).toHaveBeenCalledOnce();
-    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
+      expect.objectContaining({ authority: liveTargetAuthority, targetId: "remote-target" }),
+    );
+    expect(closeConnection).toHaveBeenCalledOnce();
+    expect(releaseLease).toHaveBeenCalledOnce();
   });
 
   test("releases each recovery before another recovery can acquire the single available tab lease", async () => {
@@ -715,7 +728,6 @@ describe("recoverConversationTab lease ownership", () => {
       releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
     }));
     vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
-      closeChromeTarget: vi.fn(),
       connectWithNewTab: vi.fn(),
       closeChromeTargetWithExactAuthority,
       connectWithNewTabWithExactAuthority: vi.fn(async () => {

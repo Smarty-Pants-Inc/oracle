@@ -112,6 +112,7 @@ export async function publishLocalBrowserResult({
       logger,
       config,
       conversationUrl: state.lastUrl,
+      promptLocator: artifactPromptLocator,
       followUpCount: 0,
       requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
     });
@@ -226,6 +227,7 @@ export async function publishLocalBrowserResult({
     logger,
     config,
     conversationUrl: state.lastUrl,
+    promptLocator: artifactPromptLocator,
     followUpCount: followUpPrompts.length,
     requiredArtifactsSaved:
       Boolean(transcriptArtifact) &&

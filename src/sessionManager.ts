@@ -103,10 +103,13 @@ export interface BrowserRecoveryCleanupMetadata {
   closeOwnedTargetOnComplete?: boolean;
 }
 
+export type BrowserRecoveryCleanupFailureClassification = "legacy-session-target-authority";
+
 export interface BrowserRecoveryCleanupResultMetadata {
   status: "pending" | "failed";
   error?: string;
   settlementMode?: "finalize" | "abort";
+  classification?: BrowserRecoveryCleanupFailureClassification;
 }
 
 export interface BrowserRemotePromptRequestIdentity {
@@ -126,6 +129,15 @@ export interface BrowserRecoveryTabLeaseMetadata {
   id: string;
   profileDirectory: ProfileDirectoryIdentity;
 }
+export interface BrowserRecoveryTargetCloseCapabilityMetadata {
+  /** Schema version for the lookup-only capability reference. */
+  version: 1;
+  /** Browser acquisition generation that retained the live target authority. */
+  generationId: string;
+  /** Opaque in-process lookup id; never sufficient to reconstruct CDP authority. */
+  capabilityId: string;
+}
+
 export type BrowserProcessAcquisitionProvenance = "temporary-launch" | "manual-canonical-owner";
 
 export interface BrowserRecoveryAcquisitionMetadata {
@@ -157,6 +169,7 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   promptEpoch?: BrowserPromptEpoch;
   remoteRecovery?: BrowserRemoteRecoveryMetadata;
   tabLease?: BrowserRecoveryTabLeaseMetadata;
+  targetCloseCapability?: BrowserRecoveryTargetCloseCapabilityMetadata;
   acquisition?: BrowserRecoveryAcquisitionMetadata;
   recoveryCleanup: BrowserRecoveryCleanupMetadata;
 }

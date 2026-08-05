@@ -13,11 +13,6 @@ export type ManualChromeOwnerSettlement =
   | { status: "preserved" }
   | { status: "unsafe"; reason: string };
 
-export interface ManualChromeOwnerSettlementDeps {
-  cleanupProfileState?: typeof cleanupStaleProfileState;
-  readOwner?: typeof readOracleChromeOwner;
-}
-
 export async function releaseManualChromeOwnerEndpointAuthority(
   owner: ManualChromeOwner,
 ): Promise<void> {
@@ -28,11 +23,10 @@ export async function settleManualChromeOwner(
   profileDir: string,
   owner: ManualChromeOwner,
   logger: BrowserLogger,
-  deps: ManualChromeOwnerSettlementDeps = {},
 ): Promise<ManualChromeOwnerSettlement> {
   let current: OracleChromeOwnerRecord | null;
   try {
-    current = await (deps.readOwner ?? readOracleChromeOwner)(profileDir);
+    current = await readOracleChromeOwner(profileDir);
   } catch (error) {
     return {
       status: "unsafe",
@@ -88,7 +82,7 @@ export async function settleManualChromeOwner(
   }
   let cleaned: boolean;
   try {
-    cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(profileDir, logger, {
+    cleaned = await cleanupStaleProfileState(profileDir, logger, {
       lockRemovalMode: "never",
       expectedProfileIdentity: owner.processIdentity.profileDirectory,
     });

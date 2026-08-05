@@ -62,11 +62,13 @@ export async function finalizeRecoveredRuntime(
   const groups = groupRecoveryCleanupResources(reconciliation.runtime);
   const pending: RecoveryCleanupEntry[] = [...reconciliation.pending];
   const errors: string[] = [...reconciliation.errors];
+  let classification: RecoveryCleanupPhaseResult["classification"];
 
   for (const group of groups) {
     const result = await finalizeRecoveryCleanupGroup(group, logger, deps, mode);
     pending.push(...result.pending);
     errors.push(...result.errors);
+    classification ??= result.classification;
   }
 
   if (pending.length === 0) {
@@ -81,7 +83,13 @@ export async function finalizeRecoveredRuntime(
   }
 
   const error = [...new Set(errors)].join("; ") || "Browser recovery cleanup remains pending";
-  const pendingRuntime = rebuildPendingCleanupRuntime(runtime, pending, error, mode);
+  const pendingRuntime = rebuildPendingCleanupRuntime(
+    runtime,
+    pending,
+    error,
+    mode,
+    classification,
+  );
   return projectBrowserCaptureFinalization(
     runtime,
     { status: "pending", runtime: pendingRuntime, error },
@@ -94,6 +102,7 @@ function rebuildPendingCleanupRuntime(
   entries: RecoveryCleanupEntry[],
   error: string,
   settlementMode: ReattachSettlementMode,
+  classification?: RecoveryCleanupPhaseResult["classification"],
 ): BrowserRuntimeMetadata {
   const ordered = [...entries].sort((left, right) => left.order - right.order);
   const resources: BrowserRecoveryCleanupResourceMetadata[] = [];
@@ -107,7 +116,7 @@ function rebuildPendingCleanupRuntime(
   return projectBrowserCaptureCleanupRuntime(runtime, {
     ...runtime,
     recoveryCleanupResources: resources,
-    recoveryCleanupResult: { status: "failed", error, settlementMode },
+    recoveryCleanupResult: { status: "failed", error, settlementMode, classification },
   });
 }
 

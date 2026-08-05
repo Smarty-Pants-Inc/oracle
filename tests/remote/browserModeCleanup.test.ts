@@ -20,7 +20,13 @@ describe("remote browser unpublished cleanup", () => {
   test("surfaces abort-bound target and lease cleanup authority and retries it", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-cleanup-retry-"));
     const originalFailure = new Error("remote navigation failed before publication");
-    const closeChromeTarget = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const closeChromeTargetWithExactAuthority = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "unsafe" as const,
+        reason: "Remote Chrome target close was not confirmed",
+      })
+      .mockResolvedValueOnce({ status: "completed" as const });
     const closeClient = vi.fn(async () => undefined);
     const client = {
       Network: { enable: vi.fn(async () => undefined) },
@@ -46,9 +52,13 @@ describe("remote browser unpublished cleanup", () => {
           client,
           targetId: "remote-cleanup-target",
           ownership: "created" as const,
-          close: vi.fn(async () => undefined),
+          targetCloseAuthority: {
+            runExactOperation: vi.fn(),
+            release: closeClient,
+          },
+          close: closeClient,
         })),
-        closeChromeTarget,
+        closeChromeTargetWithExactAuthority,
       };
     });
     vi.doMock("../../src/browser/pageActions.js", async (importOriginal) => {
@@ -127,13 +137,12 @@ describe("remote browser unpublished cleanup", () => {
       await expect(
         retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, {
           acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
-          recoveryCleanup: { closeChromeTarget },
         }),
       ).resolves.toMatchObject({ status: "completed" });
       expect(
         JSON.parse(await readFile(path.join(profileDir, "oracle-tab-leases.json"), "utf8")),
       ).toMatchObject({ leases: [] });
-      expect(closeChromeTarget).toHaveBeenCalledTimes(2);
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(2);
       expect(closeClient).toHaveBeenCalledOnce();
     } finally {
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -152,6 +161,9 @@ describe("remote browser unpublished cleanup", () => {
     const persistedRuntimes: BrowserRuntimeMetadata[] = [];
     const borrowedRuntimes: BrowserRuntimeMetadata[] = [];
     const closeChromeTarget = vi.fn(async () => true);
+    const closeChromeTargetWithExactAuthority = vi.fn(async () => ({
+      status: "completed" as const,
+    }));
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression === "location.href") return { result: { value: "about:blank" } };
       if (expression.includes("const title = String(document.title")) {
@@ -190,10 +202,15 @@ describe("remote browser unpublished cleanup", () => {
             client,
             targetId,
             ownership: "created" as const,
+            targetCloseAuthority: {
+              runExactOperation: vi.fn(),
+              release: vi.fn(async () => undefined),
+            },
             close: vi.fn(async () => undefined),
           };
         }),
         closeChromeTarget,
+        closeChromeTargetWithExactAuthority,
       };
     });
     vi.doMock("../../src/browser/liveTabs.js", () => ({
@@ -281,29 +298,22 @@ describe("remote browser unpublished cleanup", () => {
       const markerUrl = markerResource.acquisition?.targetMarkerUrl;
       expect(markerUrl).toBe(`about:blank#oracle-acquisition=${markerGenerationId}`);
       if (!markerUrl) throw new Error("direct target marker URL was not persisted");
-      const listChromeTargets = vi.fn(async () => [
-        { targetId: "marker-discovered-target", type: "page", url: markerUrl },
-      ]);
+      const listChromeTargetsWithExactAuthority = vi.fn();
       await expect(
         reattachTest.finalizeRecoveredRuntime(
           markerRuntime,
           vi.fn() as BrowserLogger,
-          { closeChromeTarget, listChromeTargets },
+          { closeChromeTargetWithExactAuthority, listChromeTargetsWithExactAuthority },
           "abort",
         ),
-      ).resolves.toMatchObject({ status: "completed" });
-      expect(listChromeTargets).toHaveBeenCalledWith({
-        host: "remote.example",
-        port: 9333,
-        browserWSEndpoint: undefined,
+      ).resolves.toMatchObject({
+        status: "pending",
+        error: expect.stringContaining(
+          "target acquisition ended before exact target close authority was published",
+        ),
       });
-      expect(closeChromeTarget).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          host: "remote.example",
-          port: 9333,
-          targetId: "marker-discovered-target",
-        }),
-      );
+      expect(listChromeTargetsWithExactAuthority).not.toHaveBeenCalled();
+      expect(closeChromeTarget).not.toHaveBeenCalled();
 
       await runBrowserMode({
         prompt: "borrowed tab remains unowned",

@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
-import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browserMode.js";
+import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browser/types.js";
 import {
   buildBrowserRunWarningsForTest,
   runBrowserSessionExecution,
@@ -23,6 +23,7 @@ function browserTransaction(
   return {
     ...result,
     runtime,
+    bindSettlement: async () => runtime,
     finalize: async () => ({ status: "completed", runtime }),
     abort: async () => ({ status: "completed", runtime }),
   };

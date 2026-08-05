@@ -1,5 +1,4 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserLogger, BrowserRunOptions, BrowserRunResult } from "./types.js";
 
@@ -69,44 +68,9 @@ export function projectRuntimeAfterChromeTargetLoss(
   runtime: BrowserRuntimeMetadata,
 ): BrowserRuntimeMetadata {
   const projected: BrowserRuntimeMetadata = { ...runtime };
+  // Endpoint liveness can disprove the current attachment, but it cannot prove that the recorded
+  // target generation was closed. Keep the exact cleanup resource and opaque close capability
+  // intact; only clear the non-authoritative top-level selection used for live capture.
   delete projected.chromeTargetId;
-  const remainingResources: BrowserRecoveryCleanupResourceMetadata[] = [];
-  for (const resource of runtime.recoveryCleanupResources ?? []) {
-    if (!resource.chromeTargetId) {
-      remainingResources.push(resource);
-      continue;
-    }
-    const hasNonTargetAuthority = Boolean(
-      resource.chromePid ||
-      resource.chromeProcessIdentity ||
-      resource.profileDirectoryIdentity ||
-      resource.userDataDir ||
-      resource.tabLease,
-    );
-    if (!hasNonTargetAuthority) continue;
-    remainingResources.push({
-      ...resource,
-      chromeTargetId: undefined,
-      recoveryCleanup: {
-        ...resource.recoveryCleanup,
-        ownsTarget: false,
-        closeOwnedTargetOnComplete: false,
-      },
-    });
-  }
-  if (remainingResources.length > 0) {
-    projected.recoveryCleanupResources = remainingResources;
-  } else {
-    delete projected.browserTransport;
-    delete projected.chromePid;
-    delete projected.chromeProcessIdentity;
-    delete projected.chromePort;
-    delete projected.chromeHost;
-    delete projected.chromeBrowserWSEndpoint;
-    delete projected.chromeProfileRoot;
-    delete projected.userDataDir;
-    delete projected.recoveryCleanupResources;
-    delete projected.recoveryCleanupResult;
-  }
   return projected;
 }

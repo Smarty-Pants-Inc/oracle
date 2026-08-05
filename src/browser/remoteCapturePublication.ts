@@ -61,6 +61,7 @@ async function settlePublishedRemoteCapture(
     logger: context.logger,
     config: context.config,
     conversationUrl: context.lastUrl,
+    promptLocator,
     followUpCount,
     requiredArtifactsSaved,
   });

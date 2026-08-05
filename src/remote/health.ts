@@ -1,8 +1,16 @@
+import { randomBytes } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import {
+  REMOTE_HEALTH_CLIENT_NONCE_HEADER,
+  REMOTE_PROTOCOL_HEADER,
+  verifyRemoteHealthAuthenticationProof,
+} from "./auth.js";
+import { RemoteLegacyHealthResponseSchema } from "./legacyProtocol.js";
+import {
   DEFAULT_REMOTE_SOCKET_IDLE_TIMEOUT_MS,
   MAX_REMOTE_ARTIFACT_BYTES,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteHealthResponseSchema,
   type RemoteArtifactCapabilities,
 } from "./types.js";
@@ -10,11 +18,14 @@ import { parsePlaintextRemoteEndpoint } from "./remoteServiceConfig.js";
 
 export interface RemoteHealthResult {
   ok: boolean;
+  protocol?: "transaction-v3" | "legacy-text-v1";
   statusCode?: number;
   error?: string;
   version?: string;
   uptimeSeconds?: number;
+  serverGeneration?: string;
   capabilities?: RemoteArtifactCapabilities;
+  legacyArtifactCapabilityAdvertised?: boolean;
 }
 
 export async function checkTcpConnection(
@@ -57,11 +68,15 @@ export async function checkTcpConnection(
 export async function checkRemoteHealth({
   host,
   token,
+  legacyToken,
+  allowLegacyTextProtocol = false,
   timeoutMs = 5000,
   idleTimeoutMs = Math.min(timeoutMs, DEFAULT_REMOTE_SOCKET_IDLE_TIMEOUT_MS),
 }: {
   host: string;
   token?: string;
+  legacyToken?: string;
+  allowLegacyTextProtocol?: boolean;
   timeoutMs?: number;
   idleTimeoutMs?: number;
 }): Promise<RemoteHealthResult> {
@@ -71,49 +86,113 @@ export async function checkRemoteHealth({
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-  const headers: Record<string, string> = { accept: "application/json" };
-  if (token) headers.authorization = `Bearer ${token}`;
+  if (
+    allowLegacyTextProtocol &&
+    token?.trim() &&
+    legacyToken?.trim() &&
+    token.trim() === legacyToken.trim()
+  ) {
+    return {
+      ok: false,
+      error:
+        "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
+    };
+  }
+
   try {
-    const response = await requestJson({
+    if (token?.trim()) {
+      const clientNonce = randomBytes(32).toString("hex");
+      const current = await requestJson({
+        ...endpoint,
+        path: "/health",
+        headers: {
+          accept: "application/json",
+          [REMOTE_PROTOCOL_HEADER]: String(REMOTE_TRANSACTION_PROTOCOL_VERSION),
+          [REMOTE_HEALTH_CLIENT_NONCE_HEADER]: clientNonce,
+        },
+        overallTimeoutMs: timeoutMs,
+        idleTimeoutMs,
+      });
+      if (current.statusCode === 200) {
+        const parsed = RemoteHealthResponseSchema.safeParse(current.json);
+        if (!parsed.success) {
+          return {
+            ok: false,
+            statusCode: current.statusCode,
+            error: `invalid remote health protocol: ${parsed.error.issues[0]?.message ?? "unknown schema error"}`,
+          };
+        }
+        if (
+          !verifyRemoteHealthAuthenticationProof(token, clientNonce, parsed.data.authentication)
+        ) {
+          return {
+            ok: false,
+            statusCode: current.statusCode,
+            error: "remote health generation proof was invalid",
+          };
+        }
+        return {
+          ok: true,
+          protocol: "transaction-v3",
+          statusCode: current.statusCode,
+          version: parsed.data.version,
+          uptimeSeconds: parsed.data.uptimeSeconds,
+          serverGeneration: parsed.data.authentication.serverGeneration,
+          capabilities: {
+            ...parsed.data.capabilities,
+            maxArtifactBytes: Math.min(
+              parsed.data.capabilities.maxArtifactBytes,
+              MAX_REMOTE_ARTIFACT_BYTES,
+            ),
+          },
+        };
+      }
+      if (!allowLegacyTextProtocol) {
+        const error =
+          extractErrorMessage(current.json, current.bodyText) ?? `HTTP ${current.statusCode}`;
+        return { ok: false, statusCode: current.statusCode, error };
+      }
+    } else if (!allowLegacyTextProtocol) {
+      return { ok: false, error: "Remote transaction HMAC root key is missing." };
+    }
+
+    if (!allowLegacyTextProtocol) {
+      return { ok: false, error: "Legacy text protocol is disabled." };
+    }
+    if (!legacyToken?.trim()) {
+      return {
+        ok: false,
+        error: "Legacy text protocol requires a distinct scoped legacy bearer credential.",
+      };
+    }
+    const legacy = await requestJson({
       ...endpoint,
       path: "/health",
-      headers,
+      headers: { accept: "application/json", authorization: `Bearer ${legacyToken}` },
       overallTimeoutMs: timeoutMs,
       idleTimeoutMs,
     });
-    if (response.statusCode === 200) {
-      const parsed = RemoteHealthResponseSchema.safeParse(response.json);
-      if (!parsed.success) {
-        return {
-          ok: false,
-          statusCode: response.statusCode,
-          error: `invalid remote health protocol: ${parsed.error.issues[0]?.message ?? "unknown schema error"}`,
-        };
-      }
-      return {
-        ok: true,
-        statusCode: response.statusCode,
-        version: parsed.data.version,
-        uptimeSeconds: parsed.data.uptimeSeconds,
-        capabilities: {
-          ...parsed.data.capabilities,
-          maxArtifactBytes: Math.min(
-            parsed.data.capabilities.maxArtifactBytes,
-            MAX_REMOTE_ARTIFACT_BYTES,
-          ),
-        },
-      };
+    if (legacy.statusCode !== 200) {
+      const error =
+        extractErrorMessage(legacy.json, legacy.bodyText) ?? `HTTP ${legacy.statusCode}`;
+      return { ok: false, statusCode: legacy.statusCode, error };
     }
-    if (response.statusCode === 404) {
+    const parsed = RemoteLegacyHealthResponseSchema.safeParse(legacy.json);
+    if (!parsed.success) {
       return {
         ok: false,
-        statusCode: response.statusCode,
-        error: "remote host does not expose /health (upgrade oracle on the host and retry)",
+        statusCode: legacy.statusCode,
+        error: `invalid legacy remote health protocol: ${parsed.error.issues[0]?.message ?? "unknown schema error"}`,
       };
     }
-    const error =
-      extractErrorMessage(response.json, response.bodyText) ?? `HTTP ${response.statusCode}`;
-    return { ok: false, statusCode: response.statusCode, error };
+    return {
+      ok: true,
+      protocol: "legacy-text-v1",
+      statusCode: legacy.statusCode,
+      version: parsed.data.version,
+      uptimeSeconds: parsed.data.uptimeSeconds,
+      legacyArtifactCapabilityAdvertised: parsed.data.capabilities?.artifactTransfer === true,
+    };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

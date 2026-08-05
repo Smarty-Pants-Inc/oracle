@@ -8,12 +8,12 @@ import {
 } from "../browser/artifacts.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactDescriptor } from "./types.js";
-import {
-  type DurableRemoteArtifactDeliveryReceipt,
-  type DurableRemoteArtifactRegistration,
-  type DurableRemoteFileIdentity,
-  RemoteTransactionStore,
-} from "./transactionStore.js";
+import type {
+  DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactRegistration,
+  DurableRemoteFileIdentity,
+} from "./transactionModel.js";
+import { RemoteTransactionStore } from "./transactionStore.js";
 
 export interface RemoteArtifactStoreOptions {
   transactionStore: RemoteTransactionStore;

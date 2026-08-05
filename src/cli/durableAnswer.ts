@@ -2,29 +2,32 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { open, mkdir, lstat } from "node:fs/promises";
 import type { Stats } from "node:fs";
-import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionStore.js";
+import type {
+  BrowserRuntimeMetadata,
+  SessionArtifact,
+  SessionMetadata,
+  SessionModelRun,
+} from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import type { BrowserCaptureFinalizationResult, BrowserRunTransaction } from "../browser/types.js";
 import {
   bindBrowserCaptureCleanupSettlement,
   pendingBrowserCaptureCleanup,
 } from "../browser/runLifecycle.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
+import {
+  clearBrowserCapturePublicationJournal,
+  projectCompletedBrowserMetadataAudit,
+  readBrowserCapturePublicationJournal,
+  sanitizeBrowserPublicationMessage,
+  sanitizeBrowserPublicationRuntime,
+  writeBrowserCapturePublicationJournal,
+  type BrowserCapturePublicationJournal,
+} from "./browserPublicationJournal.js";
 
 export interface DurableBrowserAnswerReceipt {
   artifact: SessionArtifact;
-  sha256: string;
-  sizeBytes: number;
-}
-
-export interface PublishedBrowserAnswerState {
-  published: true;
-  receipt: DurableBrowserAnswerReceipt;
-}
-
-export interface PublishedBrowserCaptureFailure extends PublishedBrowserAnswerState {
-  finalization: BrowserCaptureFinalizationResult;
 }
 
 export interface PersistDurableBrowserAnswerOptions {
@@ -32,6 +35,151 @@ export interface PersistDurableBrowserAnswerOptions {
   answer: string;
   logHeader?: string;
   replaceLog?: boolean;
+}
+
+export interface BrowserCapturePublicationAcknowledgement {
+  isPublished: () => boolean;
+  acknowledge: () => void;
+}
+
+export function createBrowserCapturePublicationAcknowledgement(): BrowserCapturePublicationAcknowledgement {
+  let published = false;
+  return {
+    isPublished: () => published,
+    acknowledge: () => {
+      published = true;
+    },
+  };
+}
+
+type RuntimeAuthorityPersistence =
+  | { status: "persisted"; recoveredError?: string }
+  | { status: "pending"; error: string };
+
+type ModelRunProjection =
+  | { status: "not-requested" }
+  | { status: "persisted"; recoveredError?: string }
+  | { status: "pending"; error: string };
+
+export interface PublishedBrowserCapture {
+  published: true;
+  receipt: DurableBrowserAnswerReceipt;
+  artifacts: SessionArtifact[];
+  finalization: BrowserCaptureFinalizationResult;
+  runtimeAuthority: RuntimeAuthorityPersistence;
+  modelRun: ModelRunProjection;
+}
+
+export interface PublishCompletedBrowserCaptureOptions {
+  answer: PersistDurableBrowserAnswerOptions;
+  transaction: Pick<BrowserRunTransaction, "runtime" | "bindSettlement" | "finalize" | "abort">;
+  browser: NonNullable<SessionMetadata["browser"]>;
+  existingArtifacts?: SessionArtifact[];
+  prepareArtifacts?: () => Promise<SessionArtifact[] | undefined>;
+  usage?: SessionMetadata["usage"];
+  elapsedMs?: number;
+  response?: SessionMetadata["response"];
+  model?: string;
+  projectRuntime?: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata;
+  acknowledgement?: BrowserCapturePublicationAcknowledgement;
+  log?: (message: string) => void;
+  label?: string;
+  persistAnswer?: typeof persistDurableBrowserAnswer;
+}
+
+/**
+ * Publishes a completed browser capture through a crash-recoverable four-phase transaction:
+ * stage durable answer/artifacts, bind FINALIZE remotely and locally, commit audit-only completed
+ * projections, then execute idempotent finalize effects. Only a pre-stage failure may select ABORT.
+ */
+export async function publishCompletedBrowserCapture(
+  options: PublishCompletedBrowserCaptureOptions,
+): Promise<PublishedBrowserCapture> {
+  const label = options.label ?? "Browser answer";
+  const projectRuntime = options.projectRuntime ?? ((runtime) => runtime);
+  let journal = await readBrowserCapturePublicationJournal(options.answer.sessionId);
+  if (journal) {
+    assertJournalMatchesCapture(journal, options.transaction.runtime);
+    journal = await recognizeCommittedPublication(journal);
+  } else {
+    try {
+      journal = await stageBrowserCapture(options, projectRuntime);
+    } catch (stageError) {
+      return abortPreStageFailure(options, stageError, projectRuntime);
+    }
+  }
+
+  if (journal.phase === "staged") {
+    journal = await bindFinalizeAuthority(options, journal, projectRuntime);
+  }
+
+  if (journal.phase === "finalize-bound") {
+    await persistFinalizeBoundRuntime(options, journal);
+    journal = await commitStagedPublication(options, journal, label);
+  }
+
+  options.acknowledgement?.acknowledge();
+  const modelRun = await persistCompletedModelRun(options, journal.completedAt, label);
+
+  let finalization: BrowserCaptureFinalizationResult;
+  try {
+    finalization = bindBrowserCaptureCleanupSettlement(
+      await options.transaction.finalize(),
+      "finalize",
+    );
+  } catch (finalizeError) {
+    finalization = pendingBrowserCaptureCleanup(
+      runtimeFromBrowserError(finalizeError) ?? journal.runtime,
+      `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`,
+      "finalize",
+    );
+  }
+  finalization = {
+    ...finalization,
+    runtime: projectRuntime(finalization.runtime),
+  };
+  if (finalization.status === "pending") {
+    finalization = {
+      ...finalization,
+      error: sanitizeBrowserPublicationMessage(finalization.error),
+    };
+  }
+
+  try {
+    await persistFinalizationState(options, journal, finalization);
+    return completedPublication(journal, finalization, { status: "persisted" }, modelRun);
+  } catch (persistenceError) {
+    const authorityError = runtimeAuthorityPersistenceFailure(
+      journal,
+      finalization,
+      persistenceError,
+    );
+    if (!isRuntimeAuthorityPersistenceFailure(authorityError)) throw authorityError;
+    try {
+      await persistFinalizationState(options, journal, finalization);
+      const recoveredError = formatError(authorityError);
+      options.log?.(
+        `${label} published; recovered final cleanup authority persistence after retry: ${recoveredError}`,
+      );
+      return completedPublication(
+        journal,
+        finalization,
+        { status: "persisted", recoveredError },
+        modelRun,
+      );
+    } catch (retryError) {
+      const message = formatError(retryError);
+      options.log?.(
+        `${label} published; exact cleanup authority persistence remains deferred after retry: ${message}`,
+      );
+      return completedPublication(
+        journal,
+        finalization,
+        { status: "pending", error: message },
+        modelRun,
+      );
+    }
+  }
 }
 
 export async function persistDurableBrowserAnswer(
@@ -52,7 +200,7 @@ export async function persistDurableBrowserAnswer(
   if (options.logHeader) {
     const logPayload = Buffer.from(`${options.logHeader}\nAnswer:\n${options.answer}\n`, "utf8");
     if (options.replaceLog) {
-      await writeDurableFile(paths.log, logPayload);
+      await writeFileAtomicDurable(paths.log, logPayload);
     } else {
       await appendDurableFile(paths.log, logPayload);
     }
@@ -70,184 +218,16 @@ export async function persistDurableBrowserAnswer(
       transfer: { status: "not-needed" },
       origin: { mode: "local" },
     },
-    sha256,
-    sizeBytes: payload.byteLength,
   };
 }
 
-export interface BrowserCapturePublicationTransaction {
-  runtime: BrowserRuntimeMetadata;
-  finalize: () => Promise<BrowserCaptureFinalizationResult>;
-  abort: () => Promise<BrowserCaptureFinalizationResult>;
-}
-
-export interface PublishBrowserCaptureOptions<T> {
-  answerOptions: PersistDurableBrowserAnswerOptions;
-  transaction: BrowserCapturePublicationTransaction;
-  prepare: (receipt: DurableBrowserAnswerReceipt) => Promise<T> | T;
-  publish: (receipt: DurableBrowserAnswerReceipt, prepared: T) => Promise<void> | void;
-  persistRuntime: (runtime: BrowserRuntimeMetadata) => Promise<void> | void;
-  persistAnswer?: typeof persistDurableBrowserAnswer;
-}
-
-export interface PublishedBrowserCapture<T> extends PublishedBrowserAnswerState {
-  prepared: T;
-  finalization: BrowserCaptureFinalizationResult;
-}
-
-export async function publishBrowserCapture<T>(
-  options: PublishBrowserCaptureOptions<T>,
-): Promise<PublishedBrowserCapture<T>> {
-  const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
-  let receipt: DurableBrowserAnswerReceipt | undefined;
-  let prepared!: T;
-  try {
-    receipt = await persistAnswer(options.answerOptions);
-    prepared = await options.prepare(receipt);
-    await options.publish(receipt, prepared);
-  } catch (publicationError) {
-    await abortFailedBrowserCapture(options, publicationError, receipt);
-  }
-  if (!receipt) {
-    throw new Error("Browser capture publication completed without a durable answer receipt");
-  }
-  const publishedAnswer: PublishedBrowserAnswerState = { published: true, receipt };
-
-  let finalization: BrowserCaptureFinalizationResult;
-  try {
-    finalization = bindBrowserCaptureCleanupSettlement(
-      await options.transaction.finalize(),
-      "finalize",
-    );
-  } catch (finalizeError) {
-    const cleanupError = `Browser cleanup finalize failed and remains retryable: ${formatError(finalizeError)}`;
-    finalization = pendingBrowserCaptureCleanup(
-      runtimeFromBrowserError(finalizeError) ?? options.transaction.runtime,
-      cleanupError,
-      "finalize",
-    );
-  }
-
-  try {
-    await options.persistRuntime(finalization.runtime);
-  } catch (persistenceError) {
-    throw new BrowserAutomationError(
-      `Browser answer was published, but exact cleanup authority could not be persisted: ${formatError(persistenceError)}`,
-      {
-        stage: "browser-capture-finalization",
-        code: "runtime-authority-persistence-failed",
-        runtime: finalization.runtime,
-        publishedAnswer,
-        finalization,
-        answerReceipt: receipt,
-        cleanupStatus: finalization.status,
-        ...(finalization.status === "pending" ? { cleanupError: finalization.error } : {}),
-      },
-      persistenceError,
-    );
-  }
-
-  return { ...publishedAnswer, prepared, finalization };
-}
-
-export function publishedBrowserCaptureFailureFromError(
+export function durableBrowserAnswerReceiptFromError(
   error: unknown,
-): PublishedBrowserCaptureFailure | undefined {
+): DurableBrowserAnswerReceipt | undefined {
   if (!(error instanceof BrowserAutomationError)) return undefined;
-  if (error.details?.code !== "runtime-authority-persistence-failed") return undefined;
-  const publishedAnswer = error.details.publishedAnswer;
-  const finalization = error.details.finalization;
-  if (!isPublishedBrowserAnswerState(publishedAnswer)) return undefined;
-  if (!isBrowserCaptureFinalizationResult(finalization)) return undefined;
-  return { ...publishedAnswer, finalization };
-}
-
-function isPublishedBrowserAnswerState(value: unknown): value is PublishedBrowserAnswerState {
-  if (!value || typeof value !== "object") return false;
-  if (!("published" in value) || value.published !== true || !("receipt" in value)) return false;
-  const receipt = value.receipt;
-  return Boolean(receipt && typeof receipt === "object" && "artifact" in receipt);
-}
-
-function isBrowserCaptureFinalizationResult(
-  value: unknown,
-): value is BrowserCaptureFinalizationResult {
-  if (!value || typeof value !== "object") return false;
-  if (!("status" in value) || !("runtime" in value)) return false;
-  return (
-    (value.status === "completed" || value.status === "pending") &&
-    Boolean(value.runtime && typeof value.runtime === "object")
-  );
-}
-
-async function abortFailedBrowserCapture<T>(
-  options: PublishBrowserCaptureOptions<T>,
-  publicationError: unknown,
-  receipt: DurableBrowserAnswerReceipt | undefined,
-): Promise<never> {
-  let abortion: BrowserCaptureFinalizationResult;
-  try {
-    abortion = bindBrowserCaptureCleanupSettlement(await options.transaction.abort(), "abort");
-  } catch (abortError) {
-    const cleanupError = `Browser cleanup abort failed and remains retryable: ${formatError(abortError)}`;
-    const runtime = pendingBrowserCaptureCleanup(
-      runtimeFromBrowserError(abortError) ?? options.transaction.runtime,
-      cleanupError,
-      "abort",
-    ).runtime;
-    await persistAbortRuntime(options, runtime, publicationError, receipt, abortError);
-    throw new BrowserAutomationError(
-      `Browser answer publication failed (${formatError(publicationError)}); capture abort failed and remains retryable: ${formatError(abortError)}`,
-      {
-        stage: "browser-capture-publication",
-        code: "publication-abort-failed",
-        runtime,
-        answerReceipt: receipt,
-        abortError: formatError(abortError),
-      },
-      publicationError,
-    );
-  }
-
-  await persistAbortRuntime(options, abortion.runtime, publicationError, receipt);
-  if (abortion.status === "pending") {
-    throw new BrowserAutomationError(
-      `Browser answer publication failed (${formatError(publicationError)}); cleanup remains retryable: ${abortion.error}`,
-      {
-        stage: "browser-capture-publication",
-        code: "publication-failed-cleanup-pending",
-        runtime: abortion.runtime,
-        answerReceipt: receipt,
-        cleanupError: abortion.error,
-      },
-      publicationError,
-    );
-  }
-  throw publicationError;
-}
-
-async function persistAbortRuntime<T>(
-  options: PublishBrowserCaptureOptions<T>,
-  runtime: BrowserRuntimeMetadata,
-  publicationError: unknown,
-  receipt: DurableBrowserAnswerReceipt | undefined,
-  abortError?: unknown,
-): Promise<void> {
-  try {
-    await options.persistRuntime(runtime);
-  } catch (persistenceError) {
-    throw new BrowserAutomationError(
-      `Browser answer publication failed (${formatError(publicationError)}); exact abort authority could not be persisted: ${formatError(persistenceError)}`,
-      {
-        stage: "browser-capture-publication",
-        code: "abort-authority-persistence-failed",
-        runtime,
-        answerReceipt: receipt,
-        ...(abortError ? { abortError: formatError(abortError) } : {}),
-      },
-      publicationError,
-    );
-  }
+  const receipt = error.details?.answerReceipt;
+  if (!receipt || typeof receipt !== "object" || !("artifact" in receipt)) return undefined;
+  return receipt as DurableBrowserAnswerReceipt;
 }
 
 export function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata | undefined {
@@ -258,8 +238,443 @@ export function runtimeFromBrowserError(error: unknown): BrowserRuntimeMetadata 
     : undefined;
 }
 
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+async function stageBrowserCapture(
+  options: PublishCompletedBrowserCaptureOptions,
+  projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
+): Promise<BrowserCapturePublicationJournal> {
+  const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
+  const receipt = await persistAnswer(options.answer);
+  try {
+    const preparedArtifacts = await options.prepareArtifacts?.();
+    const artifacts = mergeArtifacts(options.existingArtifacts, [
+      ...(preparedArtifacts ?? []),
+      receipt.artifact,
+    ]);
+    const runtime = projectRuntime(options.transaction.runtime);
+    const journal: BrowserCapturePublicationJournal = {
+      version: 1,
+      sessionId: options.answer.sessionId,
+      phase: "staged",
+      receipt,
+      artifacts,
+      completedAt: new Date().toISOString(),
+      usage: options.usage,
+      elapsedMs: options.elapsedMs,
+      response: options.response,
+      model: options.model,
+      browserAudit: projectCompletedBrowserMetadataAudit(options.browser, runtime),
+      runtime,
+    };
+    await writeBrowserCapturePublicationJournal(journal);
+    return journal;
+  } catch (error) {
+    throw new BrowserAutomationError(
+      `Browser capture staging failed after the answer became durable: ${formatError(error)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "browser-capture-staging-failed",
+        runtime: options.transaction.runtime,
+        answerReceipt: receipt,
+      },
+      error,
+    );
+  }
+}
+
+async function bindFinalizeAuthority(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+  projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
+): Promise<BrowserCapturePublicationJournal> {
+  let boundRuntime = journal.runtime;
+  try {
+    boundRuntime = await options.transaction.bindSettlement("finalize");
+    boundRuntime = projectRuntime(boundRuntime);
+  } catch (error) {
+    throw new BrowserAutomationError(
+      `Browser answer is durably staged, but FINALIZE authority could not be bound: ${formatError(error)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "finalize-binding-pending",
+        runtime: runtimeFromBrowserError(error) ?? boundRuntime,
+        answerReceipt: journal.receipt,
+      },
+      error,
+    );
+  }
+  const boundJournal: BrowserCapturePublicationJournal = {
+    ...journal,
+    phase: "finalize-bound",
+    runtime: sanitizeBrowserPublicationRuntime(boundRuntime, "finalize-bound"),
+    browserAudit: projectCompletedBrowserMetadataAudit(options.browser, boundRuntime),
+  };
+  try {
+    await writeBrowserCapturePublicationJournal(boundJournal);
+  } catch (error) {
+    throw new BrowserAutomationError(
+      `FINALIZE authority is bound, but its publication journal remains pending: ${formatError(error)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "finalize-binding-journal-persistence-failed",
+        runtime: boundRuntime,
+        answerReceipt: journal.receipt,
+      },
+      error,
+    );
+  }
+  return boundJournal;
+}
+
+async function persistFinalizeBoundRuntime(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+): Promise<void> {
+  try {
+    await sessionStore.updateSession(options.answer.sessionId, {
+      browser: { ...options.browser, runtime: journal.runtime },
+    });
+  } catch (error) {
+    try {
+      await sessionStore.updateSession(options.answer.sessionId, {
+        browser: { ...options.browser, runtime: journal.runtime },
+      });
+    } catch (retryError) {
+      throw new BrowserAutomationError(
+        `FINALIZE authority is bound, but its local session projection remains pending: ${formatError(retryError)}`,
+        {
+          stage: "browser-capture-publication",
+          code: "finalize-local-binding-persistence-failed",
+          runtime: journal.runtime,
+          answerReceipt: journal.receipt,
+          firstError: formatError(error),
+        },
+        retryError,
+      );
+    }
+  }
+}
+
+async function commitStagedPublication(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+  label: string,
+): Promise<BrowserCapturePublicationJournal> {
+  try {
+    await persistCompletedSession(options, journal, journal.runtime);
+  } catch (error) {
+    try {
+      await persistCompletedSession(options, journal, journal.runtime);
+    } catch (retryError) {
+      throw new BrowserAutomationError(
+        `${label} remains staged under FINALIZE authority because completed publication failed: ${formatError(retryError)}`,
+        {
+          stage: "browser-capture-publication",
+          code: "finalize-bound-publication-pending",
+          runtime: journal.runtime,
+          answerReceipt: journal.receipt,
+          firstError: formatError(error),
+        },
+        retryError,
+      );
+    }
+  }
+  options.acknowledgement?.acknowledge();
+  const publishedJournal = { ...journal, phase: "published" as const };
+  try {
+    await writeBrowserCapturePublicationJournal(publishedJournal);
+  } catch (error) {
+    options.log?.(
+      `${label} completed projection is durable; publication journal phase update remains retryable: ${formatError(error)}`,
+    );
+  }
+  return publishedJournal;
+}
+
+async function recognizeCommittedPublication(
+  journal: BrowserCapturePublicationJournal,
+): Promise<BrowserCapturePublicationJournal> {
+  if (journal.phase !== "finalize-bound") return journal;
+  const metadata = await sessionStore.readSession(journal.sessionId);
+  if (
+    metadata?.status !== "completed" ||
+    !metadata.artifacts?.some(
+      (artifact) =>
+        artifact.path === journal.receipt.artifact.path &&
+        artifact.sha256 === journal.receipt.artifact.sha256,
+    )
+  ) {
+    return journal;
+  }
+  return { ...journal, phase: "published" };
+}
+
+async function persistCompletedSession(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+  runtime: BrowserRuntimeMetadata,
+  cleanupErrorCode?: string,
+): Promise<void> {
+  await sessionStore.updateSession(options.answer.sessionId, {
+    status: "completed",
+    completedAt: journal.completedAt,
+    usage: journal.usage,
+    elapsedMs: journal.elapsedMs,
+    errorMessage: undefined,
+    browser: projectCompletedBrowserMetadataAudit(options.browser, runtime, cleanupErrorCode),
+    artifacts: journal.artifacts,
+    response: journal.response,
+    transport: undefined,
+    error: undefined,
+  });
+}
+
+async function persistCompletedModelRun(
+  options: PublishCompletedBrowserCaptureOptions,
+  completedAt: string,
+  label: string,
+): Promise<ModelRunProjection> {
+  if (!options.model) return { status: "not-requested" };
+  const updates: Partial<SessionModelRun> = {
+    status: "completed",
+    completedAt,
+    usage: options.usage,
+    response: { status: "completed" },
+    transport: undefined,
+    error: undefined,
+  };
+  try {
+    await sessionStore.updateModelRun(options.answer.sessionId, options.model, updates);
+    return { status: "persisted" };
+  } catch (error) {
+    const firstError = formatError(error);
+    try {
+      await sessionStore.updateModelRun(options.answer.sessionId, options.model, updates);
+      options.log?.(
+        `${label} published; recovered model-run projection after retry: ${firstError}`,
+      );
+      return { status: "persisted", recoveredError: firstError };
+    } catch (retryError) {
+      const message = formatError(retryError);
+      options.log?.(`${label} published; model-run projection failed after retry: ${message}`);
+      return { status: "pending", error: message };
+    }
+  }
+}
+
+async function persistFinalizationState(
+  options: PublishCompletedBrowserCaptureOptions,
+  journal: BrowserCapturePublicationJournal,
+  finalization: BrowserCaptureFinalizationResult,
+): Promise<void> {
+  if (finalization.status === "pending") {
+    const pendingJournal: BrowserCapturePublicationJournal = {
+      ...journal,
+      phase: "cleanup-pending",
+      runtime: sanitizeBrowserPublicationRuntime(
+        finalization.runtime,
+        "browser-cleanup-finalize-pending",
+      ),
+      cleanupErrorCode: "browser-cleanup-finalize-pending",
+      cleanupErrorMessage: projectCompletedBrowserMetadataAudit(
+        options.browser,
+        finalization.runtime,
+        "browser-cleanup-finalize-pending",
+      ).runtime?.recoveryCleanupResult?.error,
+    };
+    await writeBrowserCapturePublicationJournal(pendingJournal);
+    await persistCompletedSession(
+      options,
+      pendingJournal,
+      finalization.runtime,
+      "browser-cleanup-finalize-pending",
+    );
+    return;
+  }
+  await persistCompletedSession(options, journal, finalization.runtime);
+  await clearBrowserCapturePublicationJournal(options.answer.sessionId);
+}
+
+async function abortPreStageFailure(
+  options: PublishCompletedBrowserCaptureOptions,
+  stageError: unknown,
+  projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
+): Promise<never> {
+  let boundRuntime: BrowserRuntimeMetadata;
+  try {
+    boundRuntime = projectRuntime(await options.transaction.bindSettlement("abort"));
+  } catch (bindingError) {
+    throw new BrowserAutomationError(
+      `Browser capture staging failed (${formatError(stageError)}); ABORT authority could not be bound: ${formatError(bindingError)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "abort-binding-failed",
+        runtime: runtimeFromBrowserError(bindingError) ?? options.transaction.runtime,
+        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+      },
+      stageError,
+    );
+  }
+  try {
+    await sessionStore.updateSession(options.answer.sessionId, {
+      browser: { ...options.browser, runtime: boundRuntime },
+    });
+  } catch (persistenceError) {
+    throw new BrowserAutomationError(
+      `Browser capture staging failed (${formatError(stageError)}); bound ABORT authority could not be projected locally: ${formatError(persistenceError)}`,
+      {
+        stage: "browser-capture-publication",
+        code: "abort-authority-persistence-failed",
+        runtime: boundRuntime,
+        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+      },
+      stageError,
+    );
+  }
+
+  let abortion: BrowserCaptureFinalizationResult;
+  try {
+    abortion = bindBrowserCaptureCleanupSettlement(await options.transaction.abort(), "abort");
+  } catch (abortError) {
+    abortion = pendingBrowserCaptureCleanup(
+      runtimeFromBrowserError(abortError) ?? boundRuntime,
+      `Browser cleanup abort failed and remains retryable: ${formatError(abortError)}`,
+      "abort",
+    );
+  }
+  if (abortion.status === "pending") {
+    abortion = {
+      ...abortion,
+      error: sanitizeBrowserPublicationMessage(abortion.error),
+    };
+  }
+  const abortionRuntime = projectRuntime(abortion.runtime);
+  try {
+    await sessionStore.updateSession(options.answer.sessionId, {
+      browser: { ...options.browser, runtime: abortionRuntime },
+    });
+  } catch (error) {
+    try {
+      await sessionStore.updateSession(options.answer.sessionId, {
+        browser: { ...options.browser, runtime: abortionRuntime },
+      });
+    } catch (retryError) {
+      throw new BrowserAutomationError(
+        `Browser capture staging failed (${formatError(stageError)}); cleanup authority projection failed: ${formatError(retryError)}`,
+        {
+          stage: "browser-capture-publication",
+          code: "abort-authority-persistence-failed",
+          runtime: abortionRuntime,
+          answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+          firstError: formatError(error),
+        },
+        retryError,
+      );
+    }
+  }
+  if (abortion.status === "pending") {
+    throw new BrowserAutomationError(
+      `Browser capture staging failed (${formatError(stageError)}); cleanup remains retryable: ${abortion.error}`,
+      {
+        stage: "browser-capture-publication",
+        code: "publication-failed-cleanup-pending",
+        runtime: abortionRuntime,
+        answerReceipt: durableBrowserAnswerReceiptFromError(stageError),
+        cleanupError: abortion.error,
+      },
+      stageError,
+    );
+  }
+  throw stageError;
+}
+
+function runtimeAuthorityPersistenceFailure(
+  journal: BrowserCapturePublicationJournal,
+  finalization: BrowserCaptureFinalizationResult,
+  persistenceError: unknown,
+): BrowserAutomationError {
+  return new BrowserAutomationError(
+    `Browser answer was published, but exact cleanup authority could not be persisted: ${formatError(persistenceError)}`,
+    {
+      stage: "browser-capture-finalization",
+      code: "runtime-authority-persistence-failed",
+      runtime: finalization.runtime,
+      publishedAnswer: { published: true, receipt: journal.receipt },
+      finalization,
+      answerReceipt: journal.receipt,
+      cleanupStatus: finalization.status,
+      ...(finalization.status === "pending" ? { cleanupError: finalization.error } : {}),
+    },
+    persistenceError,
+  );
+}
+
+function isRuntimeAuthorityPersistenceFailure(error: unknown): boolean {
+  return (
+    error instanceof BrowserAutomationError &&
+    error.details?.code === "runtime-authority-persistence-failed"
+  );
+}
+
+function completedPublication(
+  journal: BrowserCapturePublicationJournal,
+  finalization: BrowserCaptureFinalizationResult,
+  runtimeAuthority: RuntimeAuthorityPersistence,
+  modelRun: ModelRunProjection,
+): PublishedBrowserCapture {
+  return {
+    published: true,
+    receipt: journal.receipt,
+    artifacts: journal.artifacts,
+    finalization,
+    runtimeAuthority,
+    modelRun,
+  };
+}
+
+function assertJournalMatchesCapture(
+  journal: BrowserCapturePublicationJournal,
+  runtime: BrowserRuntimeMetadata,
+): void {
+  const journalEpoch = journal.runtime.promptEpoch;
+  const runtimeEpoch = runtime.promptEpoch;
+  if (!journalEpoch || !runtimeEpoch) return;
+  const journalIdentity = JSON.stringify([
+    journalEpoch.epochId,
+    journalEpoch.promptSha256,
+    journalEpoch.followUpOrdinal,
+    journalEpoch.status === "committed" ? journalEpoch.conversationId : null,
+  ]);
+  const runtimeIdentity = JSON.stringify([
+    runtimeEpoch.epochId,
+    runtimeEpoch.promptSha256,
+    runtimeEpoch.followUpOrdinal,
+    runtimeEpoch.status === "committed" ? runtimeEpoch.conversationId : null,
+  ]);
+  if (journalIdentity !== runtimeIdentity) {
+    throw new BrowserAutomationError(
+      "Refusing to recover a staged browser publication with a different prompt authority.",
+      {
+        stage: "browser-capture-publication",
+        code: "staged-publication-authority-mismatch",
+        runtime: journal.runtime,
+        answerReceipt: journal.receipt,
+      },
+    );
+  }
+}
+
+function mergeArtifacts(
+  existing: SessionArtifact[] | undefined,
+  additions: SessionArtifact[],
+): SessionArtifact[] {
+  const merged = new Map<string, SessionArtifact>();
+  for (const artifact of existing ?? []) {
+    merged.set(`${artifact.kind}:${artifact.path}`, artifact);
+  }
+  for (const artifact of additions) {
+    merged.set(`${artifact.kind}:${artifact.path}`, artifact);
+  }
+  return Array.from(merged.values());
 }
 
 async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<void> {
@@ -268,7 +683,7 @@ async function ensureDurableFile(targetPath: string, payload: Buffer): Promise<v
     entry = await lstat(targetPath);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
-    await writeDurableFile(targetPath, payload);
+    await writeFileAtomicDurable(targetPath, payload);
     entry = await lstat(targetPath);
   }
   if (!entry.isFile()) {
@@ -316,10 +731,6 @@ function isUnchangedFile(
   );
 }
 
-async function writeDurableFile(targetPath: string, payload: Buffer): Promise<void> {
-  await writeFileAtomicDurable(targetPath, payload);
-}
-
 async function appendDurableFile(targetPath: string, payload: Buffer): Promise<void> {
   await mkdir(path.dirname(targetPath), { recursive: true });
   const handle = await open(targetPath, "a", 0o600);
@@ -332,7 +743,11 @@ async function appendDurableFile(targetPath: string, payload: Buffer): Promise<v
 }
 
 function readErrorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : undefined;
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+function formatError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return sanitizeBrowserPublicationMessage(message) || "browser publication failed";
 }

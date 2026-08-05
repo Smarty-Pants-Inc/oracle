@@ -1,4 +1,10 @@
 import type http from "node:http";
+import {
+  REMOTE_AUTH_SCHEME_HEADER,
+  REMOTE_BODY_SHA256_HEADER,
+  remoteBodySha256,
+  type RemoteRequestAuthenticator,
+} from "./auth.js";
 import { REMOTE_TRANSACTION_TOKEN_PATTERN } from "./types.js";
 
 export class RemoteRequestError extends Error {
@@ -12,22 +18,35 @@ export class RemoteRequestError extends Error {
   }
 }
 
-export function authenticateRemoteRequest(
+export function authenticateLegacyRemoteRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  authToken: string,
+  legacyToken: string | undefined,
   logger: (message: string) => void,
   verbose: boolean,
   endpoint: string,
 ): boolean {
-  if ((req.headers.authorization ?? "") === `Bearer ${authToken}`) return true;
+  if (legacyToken && (req.headers.authorization ?? "") === `Bearer ${legacyToken}`) return true;
   if (verbose) {
     logger(
-      `[serve] Unauthorized ${endpoint} attempt from ${formatSocket(req)} (missing/invalid token)`,
+      `[serve] Unauthorized legacy ${endpoint} attempt from ${formatSocket(req)} (missing/invalid scoped credential)`,
     );
   }
   sendJson(res, 401, { error: "unauthorized" });
   return false;
+}
+
+export function authenticateCurrentRemoteRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  authenticator: RemoteRequestAuthenticator,
+): boolean {
+  const authentication = authenticator.verified(req) ?? authenticator.authenticate(req);
+  if ("statusCode" in authentication) {
+    sendJson(res, authentication.statusCode, { error: authentication.code });
+    return false;
+  }
+  return true;
 }
 
 export function sendJson(res: http.ServerResponse, statusCode: number, value: unknown): void {
@@ -35,10 +54,13 @@ export function sendJson(res: http.ServerResponse, statusCode: number, value: un
   res.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   res.end(JSON.stringify(value));
 }
+export function matchLegacyRunRequest(req: http.IncomingMessage): boolean {
+  return req.method === "POST" && req.url === "/runs";
+}
 
 export function matchTransactionRequest(
   req: http.IncomingMessage,
-): { transactionToken: string; action: "run" | "finalize" | "abort" | "retry" } | null {
+): { transactionToken: string; action: "run" | "bind" | "finalize" | "abort" | "retry" } | null {
   if (req.method !== "POST" || !req.url) return null;
   let pathname: string;
   try {
@@ -46,7 +68,7 @@ export function matchTransactionRequest(
   } catch {
     return null;
   }
-  const match = /^\/transactions\/([^/]+)\/(run|finalize|abort|retry)$/.exec(pathname);
+  const match = /^\/transactions\/([^/]+)\/(run|bind|finalize|abort|retry)$/.exec(pathname);
   if (!match) return null;
   let transactionToken: string;
   try {
@@ -57,7 +79,7 @@ export function matchTransactionRequest(
   if (!REMOTE_TRANSACTION_TOKEN_PATTERN.test(transactionToken)) return null;
   return {
     transactionToken,
-    action: match[2] as "run" | "finalize" | "abort" | "retry",
+    action: match[2] as "run" | "bind" | "finalize" | "abort" | "retry",
   };
 }
 
@@ -118,6 +140,7 @@ export function matchArtifactRequest(
 export async function readRequestBody(
   req: http.IncomingMessage,
   maximumBytes: number,
+  expectedSha256?: string,
 ): Promise<string> {
   const contentLengthHeader = req.headers["content-length"];
   const contentLength =
@@ -146,11 +169,20 @@ export async function readRequestBody(
     }
     chunks.push(buffer);
   }
-  return Buffer.concat(chunks, receivedBytes).toString("utf8");
-}
-
-export function sanitizeName(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const body = Buffer.concat(chunks, receivedBytes);
+  const signedBodySha256 =
+    expectedSha256 ??
+    (req.headers[REMOTE_AUTH_SCHEME_HEADER]
+      ? String(req.headers[REMOTE_BODY_SHA256_HEADER] ?? "")
+      : undefined);
+  if (signedBodySha256 && remoteBodySha256(body) !== signedBodySha256) {
+    throw new RemoteRequestError(
+      401,
+      "request_body_authentication_failed",
+      "Authenticated request body did not match its signed digest",
+    );
+  }
+  return body.toString("utf8");
 }
 
 export function formatSocket(req: http.IncomingMessage): string {

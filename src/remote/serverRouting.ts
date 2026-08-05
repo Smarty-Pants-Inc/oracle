@@ -1,20 +1,34 @@
+import { randomBytes } from "node:crypto";
 import type http from "node:http";
-import type { BrowserLogger } from "../browser/types.js";
+import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
 import type { resumeBrowserSession } from "../browser/reattach.js";
-import type { runBrowserMode, BrowserRunTransaction } from "../browserMode.js";
+import type { runBrowserModeTransaction } from "../browser/browserCoordinator.js";
 import { getCliVersion } from "../version.js";
+import {
+  REMOTE_HEALTH_CLIENT_NONCE_HEADER,
+  REMOTE_PROTOCOL_HEADER,
+  REMOTE_REQUEST_PROOF_HEADER,
+  REMOTE_SERVER_GENERATION_HEADER,
+  createRemoteHealthAuthenticationProof,
+  type RemoteRequestAuthenticator,
+} from "./auth.js";
 import type { RemoteArtifactStore } from "./artifactStore.js";
 import { serveRemoteArtifact, serveRemoteArtifactReceipt } from "./serverArtifacts.js";
 import { handleRemoteRunRequest } from "./serverExecution.js";
 import {
-  authenticateRemoteRequest,
+  authenticateCurrentRemoteRequest,
+  authenticateLegacyRemoteRequest,
   formatSocket,
   matchArtifactReceiptRequest,
   matchArtifactRequest,
+  matchLegacyRunRequest,
   matchTransactionRequest,
   sendJson,
 } from "./serverHttp.js";
-import { serveRemoteTransactionSettlement } from "./serverTransactionRuntime.js";
+import {
+  serveRemoteTransactionBinding,
+  serveRemoteTransactionSettlement,
+} from "./serverTransactionRuntime.js";
 import type { RemoteServerOptions } from "./serverTypes.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
 import { serveRemoteTransactionRetry } from "./transactionRetryRoute.js";
@@ -49,15 +63,20 @@ const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
 
 export interface RemoteRequestRouterDeps {
   options: RemoteServerOptions;
-  runBrowser: (options: Parameters<typeof runBrowserMode>[0]) => Promise<BrowserRunTransaction>;
+  runBrowser: (
+    options: Parameters<typeof runBrowserModeTransaction>[0],
+  ) => Promise<BrowserRunTransaction>;
   resumeBrowser: typeof resumeBrowserSession;
   logger: (message: string) => void;
   cleanupLogger: BrowserLogger;
   verbose: boolean;
   authToken: string;
+  legacyToken?: string;
+  controllerGeneration: string;
+  requestAuthenticator: RemoteRequestAuthenticator;
   startedAt: number;
-  transactionStore: RemoteTransactionStore;
   artifactStore: RemoteArtifactStore;
+  transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
   admitControllerOperation: () => (() => void) | null;
   isClosing: () => boolean;
@@ -72,6 +91,22 @@ export function attachRemoteRequestRouter(
   server: http.Server,
   deps: RemoteRequestRouterDeps,
 ): void {
+  server.on("checkContinue", (req, res) => {
+    const authentication = deps.requestAuthenticator.authenticate(req);
+    if ("statusCode" in authentication) {
+      sendJson(res, authentication.statusCode, { error: authentication.code });
+      return;
+    }
+    // Node suppresses a 103 Early Hints response unless it contains Link.
+    res.writeEarlyHints({
+      link: "</health>; rel=preconnect",
+      [REMOTE_SERVER_GENERATION_HEADER]: authentication.serverGeneration,
+      [REMOTE_REQUEST_PROOF_HEADER]: authentication.requestProof,
+    });
+    res.writeContinue();
+    server.emit("request", req, res);
+  });
+
   server.on("request", async (req, res) => {
     let releaseControllerOperation: (() => void) | null = null;
     try {
@@ -81,8 +116,35 @@ export function attachRemoteRequestRouter(
         return;
       }
       if (req.method === "GET" && req.url === "/health") {
+        const protocol = String(req.headers[REMOTE_PROTOCOL_HEADER] ?? "");
+        const clientNonce = String(req.headers[REMOTE_HEALTH_CLIENT_NONCE_HEADER] ?? "");
+        if (protocol === String(REMOTE_TRANSACTION_PROTOCOL_VERSION)) {
+          if (!/^[a-f0-9]{64}$/u.test(clientNonce)) {
+            sendJson(res, 400, { error: "invalid_health_challenge" });
+            return;
+          }
+          sendJson(res, 200, {
+            ok: true,
+            version: getCliVersion(),
+            uptimeSeconds: Math.round((Date.now() - deps.startedAt) / 1000),
+            capabilities: ARTIFACT_CAPABILITIES,
+            authentication: createRemoteHealthAuthenticationProof({
+              rootKey: deps.authToken,
+              serverGeneration: deps.controllerGeneration,
+              clientNonce,
+            }),
+          });
+          return;
+        }
         if (
-          !authenticateRemoteRequest(req, res, deps.authToken, deps.logger, deps.verbose, "/health")
+          !authenticateLegacyRemoteRequest(
+            req,
+            res,
+            deps.legacyToken,
+            deps.logger,
+            deps.verbose,
+            "/health",
+          )
         ) {
           return;
         }
@@ -90,7 +152,6 @@ export function attachRemoteRequestRouter(
           ok: true,
           version: getCliVersion(),
           uptimeSeconds: Math.round((Date.now() - deps.startedAt) / 1000),
-          capabilities: ARTIFACT_CAPABILITIES,
         });
         return;
       }
@@ -101,20 +162,52 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      const artifactReceiptMatch = matchArtifactReceiptRequest(req);
-      if (artifactReceiptMatch) {
+      if (matchLegacyRunRequest(req)) {
         if (
-          !authenticateRemoteRequest(
+          !authenticateLegacyRemoteRequest(
             req,
             res,
-            deps.authToken,
+            deps.legacyToken,
             deps.logger,
             deps.verbose,
-            "/transactions/.../artifacts/.../receipt",
+            "/runs",
           )
         ) {
           return;
         }
+        await deps.sweepExpiredAuthority(true);
+        if (deps.isClosing()) {
+          sendJson(res, 503, { error: "server_closing" });
+          return;
+        }
+        if (deps.isBrowserWorkBusy()) {
+          sendJson(res, 409, { error: "busy" });
+          return;
+        }
+        deps.startBrowserWork();
+        try {
+          await handleRemoteRunRequest({
+            req,
+            res,
+            protocol: "legacy-text-v1",
+            options: deps.options,
+            runBrowser: deps.runBrowser,
+            logger: deps.logger,
+            verbose: deps.verbose,
+            transactionToken: randomBytes(32).toString("hex"),
+            transactionStore: deps.transactionStore,
+            artifactStore: deps.artifactStore,
+            transactionCoordinator: deps.transactionCoordinator,
+          });
+        } finally {
+          deps.finishBrowserWork();
+        }
+        return;
+      }
+
+      const artifactReceiptMatch = matchArtifactReceiptRequest(req);
+      if (artifactReceiptMatch) {
+        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         await serveRemoteArtifactReceipt({
           req,
           res,
@@ -128,34 +221,22 @@ export function attachRemoteRequestRouter(
 
       const artifactMatch = matchArtifactRequest(req);
       if (artifactMatch) {
+        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         await serveRemoteArtifact({
           req,
           res,
-          authToken: deps.authToken,
           artifactStore: deps.artifactStore,
           transactionStore: deps.transactionStore,
-          logger: deps.logger,
-          verbose: deps.verbose,
           transactionToken: artifactMatch.transactionToken,
           artifactId: artifactMatch.artifactId,
+          logger: deps.logger,
         });
         return;
       }
 
       const transactionMatch = matchTransactionRequest(req);
       if (transactionMatch) {
-        if (
-          !authenticateRemoteRequest(
-            req,
-            res,
-            deps.authToken,
-            deps.logger,
-            deps.verbose,
-            `/transactions/${transactionMatch.action}`,
-          )
-        ) {
-          return;
-        }
+        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         if (transactionMatch.action === "run") {
           await deps.sweepExpiredAuthority(true);
           if (deps.isClosing()) {
@@ -177,6 +258,7 @@ export function attachRemoteRequestRouter(
               req,
               res,
               options: deps.options,
+              protocol: "transaction-v3",
               runBrowser: deps.runBrowser,
               logger: deps.logger,
               verbose: deps.verbose,
@@ -188,6 +270,16 @@ export function attachRemoteRequestRouter(
           } finally {
             deps.finishBrowserWork();
           }
+          return;
+        }
+        if (transactionMatch.action === "bind") {
+          await serveRemoteTransactionBinding({
+            req,
+            res,
+            transactionToken: transactionMatch.transactionToken,
+            transactionStore: deps.transactionStore,
+            transactionCoordinator: deps.transactionCoordinator,
+          });
           return;
         }
         if (transactionMatch.action === "retry") {

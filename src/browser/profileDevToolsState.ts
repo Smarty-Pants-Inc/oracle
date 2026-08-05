@@ -7,11 +7,6 @@ import {
   type ProfileStateLogger,
 } from "./profileDirectoryAuthority.js";
 
-function readErrorCode(error: unknown): unknown {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return error.code;
-}
-
 const DEVTOOLS_ACTIVE_PORT_FILENAME = "DevToolsActivePort";
 const DEVTOOLS_ACTIVE_PORT_RELATIVE_PATHS = [
   DEVTOOLS_ACTIVE_PORT_FILENAME,
@@ -26,7 +21,7 @@ export async function readDevToolsPort(userDataDir: string): Promise<number | nu
   try {
     profile = await captureProfileDirectoryIdentity(userDataDir);
   } catch (error) {
-    if (readErrorCode(error) === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
   for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
@@ -51,7 +46,7 @@ export async function readDevToolsPort(userDataDir: string): Promise<number | nu
       const port = Number.parseInt(firstLine, 10);
       if (port > 0 && port <= 65_535) return port;
     } catch (error) {
-      if (readErrorCode(error) !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       await assertProfileDirectoryIdentity(userDataDir, profile, "DevTools authority read");
     }
   }

@@ -1,10 +1,10 @@
-import type { BrowserRunTransaction } from "../browserMode.js";
+import type { BrowserRunTransaction } from "../browser/types.js";
 import type {
   DurableRemoteAutomationError,
   ReconcileRemoteTransactionResult,
   RemoteTransactionRecord,
-  RemoteTransactionStore,
-} from "./transactionStore.js";
+} from "./transactionModel.js";
+import type { RemoteTransactionStore } from "./transactionStore.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
 
 interface RemoteTransactionServerAuthority {

@@ -12,6 +12,18 @@ import {
   __test__ as serverTest,
   type RemoteServerInstance,
 } from "../../src/remote/server.js";
+import {
+  REMOTE_HEALTH_CLIENT_NONCE_HEADER,
+  REMOTE_PROTOCOL_HEADER,
+  REMOTE_REQUEST_PROOF_HEADER,
+  REMOTE_SERVER_GENERATION_HEADER,
+  RemoteRequestAuthenticator,
+  createRemoteAuthenticatedRequest,
+  createRemoteHealthAuthenticationProof,
+  verifyRemoteRequestProof,
+  type RemoteAuthenticatedRequest,
+} from "../../src/remote/auth.js";
+import { checkRemoteHealth } from "../../src/remote/health.js";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
@@ -19,12 +31,8 @@ import {
   resumeRemoteBrowserTransaction,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
-import type {
-  BrowserRunOptions,
-  BrowserRunResult,
-  BrowserRunTransaction,
-} from "../../src/browserMode.js";
-import type { BrowserLogger } from "../../src/browser/types.js";
+import type { BrowserRunOptions, BrowserRunResult } from "../../src/browserMode.js";
+import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
 import type { ReattachDeps, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
@@ -110,6 +118,7 @@ function browserTransaction(
     ...result,
     conversationId,
     runtime: capturedRuntime,
+    bindSettlement: async () => capturedRuntime,
     finalize:
       callbacks.finalize ?? (async () => ({ status: "completed", runtime: capturedRuntime })),
     abort: callbacks.abort ?? (async () => ({ status: "completed", runtime: capturedRuntime })),
@@ -143,6 +152,134 @@ function lifecycleBrowserTransaction(
 }
 
 describe("remote browser service", { timeout: 15_000 }, () => {
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "keeps the legacy bearer scoped to predecessor health and text runs",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-legacy-auth-"));
+      const server = await createRemoteServer(
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "v3-root-key",
+          legacyToken: "legacy-bearer",
+          logger: () => {},
+        },
+        { transactionStoreDir: path.join(tmpDir, "transactions") },
+      );
+      try {
+        await expect(
+          httpGetJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: "/health",
+            headers: { authorization: "Bearer v3-root-key" },
+          }),
+        ).resolves.toMatchObject({ statusCode: 401 });
+        await expect(
+          httpGetJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: "/health",
+            headers: { authorization: "Bearer legacy-bearer" },
+          }),
+        ).resolves.toMatchObject({ statusCode: 200, json: { ok: true } });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: "/runs",
+            body: {},
+            headers: { authorization: "Bearer v3-root-key" },
+          }),
+        ).resolves.toMatchObject({ statusCode: 401 });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: "/runs",
+            body: {},
+            headers: { authorization: "Bearer legacy-bearer" },
+          }),
+        ).resolves.toMatchObject({ statusCode: 400 });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "returns canonical bound and completed authority on opposite-mode conflicts",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-http-conflict-"));
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir: path.join(tmpDir, "transactions"),
+          runBrowser: async (options) =>
+            browserTransaction(options.prompt, {
+              answerText: "answer",
+              answerMarkdown: "answer",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 6,
+            }),
+        },
+      );
+      try {
+        const transaction = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        })({ prompt: "canonical HTTP conflict", config: {} });
+        const transactionToken = transaction.runtime.recoveryCleanupResources?.find(
+          (resource) => resource.remoteRecovery,
+        )?.remoteRecovery?.transactionToken;
+        if (!transactionToken) throw new Error("missing remote transaction authority");
+
+        await transaction.bindSettlement("finalize");
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/bind`,
+            token: "secret",
+            body: { mode: "abort", durablePublication: false },
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 409,
+          json: {
+            error: "transaction_settlement_conflict",
+            settlementAuthority: { mode: "finalize", outcome: "bound", state: "pending" },
+          },
+        });
+
+        await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/abort`,
+            token: "secret",
+            body: {},
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 409,
+          json: {
+            error: "transaction_already_settled",
+            settlementAuthority: {
+              mode: "finalize",
+              outcome: "completed",
+              state: "finalized",
+            },
+          },
+        });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "streams logs and returns results via client executor",
     async () => {
@@ -1230,20 +1367,38 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         const artifact = transaction?.artifacts?.[0];
         if (!artifact) throw new Error("missing durable artifact receipt target");
 
+        const receiptPath = `/transactions/${transactionToken}/artifacts/${artifact.artifactId}/receipt`;
+        const receiptBody = Buffer.from(
+          JSON.stringify({ sha256: artifact.sha256, byteSize: artifact.byteSize }),
+        );
+        const receiptAuthentication = await prepareTestAuthentication({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: receiptPath,
+          token: "secret",
+          method: "POST",
+          body: receiptBody,
+        });
         const receiptRequest = http.request({
           hostname: "127.0.0.1",
           port: server.port,
-          path: `/transactions/${transactionToken}/artifacts/${artifact.artifactId}/receipt`,
+          path: receiptPath,
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            authorization: "Bearer secret",
+            "Content-Length": receiptBody.byteLength,
+            Expect: "100-continue",
+            ...(receiptAuthentication ? receiptAuthentication.authentication.headers : {}),
           },
         });
         receiptRequest.on("error", () => {});
-        receiptRequest.end(
-          JSON.stringify({ sha256: artifact.sha256, byteSize: artifact.byteSize }),
-        );
+        sendTestRequestBody({
+          req: receiptRequest,
+          authentication: receiptAuthentication,
+          method: "POST",
+          path: receiptPath,
+          body: receiptBody,
+        });
         await mutationStarted.promise;
         receiptRequest.destroy();
 
@@ -1334,10 +1489,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${rejectedTransactionToken}/run`,
-          token: "secret",
           body: remoteRunPayload(),
         }).then(
-          () => new Error("remote listener still accepted work during tunnel teardown"),
+          (response) =>
+            new Error(
+              `remote listener still accepted work during tunnel teardown: ${JSON.stringify(response)}`,
+            ),
           (error: unknown) => error,
         );
       });
@@ -1696,7 +1853,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
                   await rm(firstCleanupMarker);
                   return pendingBrowserCaptureCleanup(
                     pendingRuntime,
-                    "Chrome still busy",
+                    "Chrome still busy at /private/host/profile via ws://127.0.0.1:9222/private",
                     settlementMode,
                   );
                 }
@@ -1720,6 +1877,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             recoveryCleanupResult: { status: "failed", settlementMode: "finalize" },
           },
         });
+        if (firstFinalization.status !== "pending") {
+          throw new Error("expected first remote cleanup finalization to remain pending");
+        }
+        expect(firstFinalization.error).toBe(
+          "Remote browser cleanup remains pending; retry the same settlement mode.",
+        );
+        expect(firstFinalization.error).not.toContain("/private/host/profile");
+        expect(firstFinalization.error).not.toContain("ws://");
         expect(cleanupAttempts).toBe(1);
         expect(existsSync(firstCleanupMarker)).toBe(false);
         expect(existsSync(secondCleanupMarker)).toBe(true);
@@ -2033,6 +2198,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             answerText: transaction.answerText,
             answerMarkdown: transaction.answerMarkdown,
             runtime: transaction.runtime,
+            bindSettlement: transaction.bindSettlement,
             finalize: transaction.finalize,
             abort: transaction.abort,
           };
@@ -2385,6 +2551,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             answerMarkdown: "recovered answer",
             conversationId: "remote-conversation",
             runtime: acquiredTarget,
+            bindSettlement: vi.fn(async () => acquiredTarget),
             finalize,
             abort,
           };
@@ -2455,6 +2622,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         answerText: "wrong answer",
         answerMarkdown: "wrong answer",
         runtime: mismatchedRuntime,
+        bindSettlement: vi.fn(async () => mismatchedRuntime),
         finalize: vi.fn(async () => ({ status: "completed" as const, runtime: mismatchedRuntime })),
         abort,
       }));
@@ -2587,6 +2755,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         runtime,
         settlementMode: "abort",
       });
+      await seeded.beginSettlementExecution({ transactionToken, mode: "abort" });
       await seeded.completeSettlement({
         transactionToken,
         mode: "abort",
@@ -2676,6 +2845,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           answerText: "one answer",
           answerMarkdown: "one answer",
           runtime,
+          bindSettlement: vi.fn(async () => runtime),
           finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
           abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
         };
@@ -3491,6 +3661,86 @@ function createArtifactDescriptor(
   };
 }
 
+function createAuthenticatedTestServer(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
+): http.Server {
+  const rootKey = "secret";
+  const serverGeneration = "remote-server-test-generation";
+  const authenticator = new RemoteRequestAuthenticator({ rootKey, serverGeneration });
+  const server = http.createServer();
+  server.on("checkContinue", (req, res) => {
+    const authentication = authenticator.authenticate(req);
+    if ("statusCode" in authentication) {
+      res.writeHead(authentication.statusCode, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: authentication.code }));
+      return;
+    }
+    res.writeEarlyHints({
+      link: "</health>; rel=preconnect",
+      [REMOTE_SERVER_GENERATION_HEADER]: authentication.serverGeneration,
+      [REMOTE_REQUEST_PROOF_HEADER]: authentication.requestProof,
+    });
+    res.writeContinue();
+    server.emit("request", req, res);
+  });
+  server.on("request", (req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      const protocol = String(req.headers[REMOTE_PROTOCOL_HEADER] ?? "");
+      const clientNonce = String(req.headers[REMOTE_HEALTH_CLIENT_NONCE_HEADER] ?? "");
+      if (
+        protocol !== String(REMOTE_TRANSACTION_PROTOCOL_VERSION) ||
+        !/^[a-f0-9]{64}$/u.test(clientNonce)
+      ) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "authentication_required" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          version: "test",
+          uptimeSeconds: 1,
+          capabilities: {
+            artifactTransfer: true,
+            artifactProtocolVersion: 1,
+            transactionProtocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
+            maxRequestBytes: MAX_REMOTE_REQUEST_BYTES,
+            maxAttachmentBytes: MAX_REMOTE_ATTACHMENT_BYTES,
+            maxTotalAttachmentBytes: MAX_REMOTE_TOTAL_ATTACHMENT_BYTES,
+            maxAttachments: MAX_REMOTE_ATTACHMENTS,
+            maxPromptChars: MAX_REMOTE_PROMPT_CHARS,
+            transportSecurity: "loopback-http",
+            boundedRequestDeadlines: true,
+            boundedTransactionStore: true,
+          },
+          authentication: createRemoteHealthAuthenticationProof({
+            rootKey,
+            serverGeneration,
+            clientNonce,
+          }),
+        }),
+      );
+      return;
+    }
+    const authentication = authenticator.verified(req) ?? authenticator.authenticate(req);
+    if ("statusCode" in authentication) {
+      res.writeHead(authentication.statusCode, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: authentication.code }));
+      return;
+    }
+    void handler(req, res).catch((error) => {
+      if (res.headersSent) res.destroy(error instanceof Error ? error : new Error(String(error)));
+      else {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "test_handler_failed" }));
+      }
+    });
+  });
+  return server;
+}
+
 async function createFakeArtifactBridge({
   descriptor,
   payload,
@@ -3507,86 +3757,98 @@ async function createFakeArtifactBridge({
   let artifactRequestCount = 0;
   let activeTransactionToken: string | null = null;
   let activePromptEpoch = committedPromptEpoch("remote");
-  const server = http.createServer((req, res) => {
-    void (async () => {
-      const runMatch = /^\/transactions\/([a-f0-9]{64})\/run$/u.exec(req.url ?? "");
-      if (req.method === "POST" && runMatch) {
-        const routeTransactionToken = runMatch[1]!;
-        const runPayload = JSON.parse(await readIncomingBody(req)) as {
-          prompt: string;
-          transactionToken?: unknown;
-        };
-        if (runPayload.transactionToken !== undefined) {
-          throw new Error("transaction token must not be serialized in the run body");
-        }
-        activeTransactionToken = routeTransactionToken;
-        activePromptEpoch = committedPromptEpoch(runPayload.prompt);
-        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-        res.end(
-          `${JSON.stringify({
-            type: "transaction",
-            transaction: {
-              protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-              transactionToken: transactionTokenOverride ?? routeTransactionToken,
-              runId: descriptor.runId,
-              result: {
-                answerText: "done",
-                answerMarkdown: "done",
-                tookMs: 1,
-                answerTokens: 1,
-                answerChars: 4,
-              },
-              runtime: { promptEpoch: activePromptEpoch, cleanup: { status: "pending" } },
-              artifacts: [descriptor],
-              state: "pending",
-            },
-          })}\n`,
-        );
-        return;
+  const server = createAuthenticatedTestServer(async (req, res) => {
+    const runMatch = /^\/transactions\/([a-f0-9]{64})\/run$/u.exec(req.url ?? "");
+    if (req.method === "POST" && runMatch) {
+      const routeTransactionToken = runMatch[1]!;
+      const runPayload = JSON.parse(await readIncomingBody(req)) as {
+        prompt: string;
+        transactionToken?: unknown;
+      };
+      if (runPayload.transactionToken !== undefined) {
+        throw new Error("transaction token must not be serialized in the run body");
       }
-      const settlementMatch = /^\/transactions\/([a-f0-9]{64})\/(finalize|abort)$/.exec(
-        req.url ?? "",
+      activeTransactionToken = routeTransactionToken;
+      activePromptEpoch = committedPromptEpoch(runPayload.prompt);
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.end(
+        `${JSON.stringify({
+          type: "transaction",
+          transaction: {
+            protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+            transactionToken: transactionTokenOverride ?? routeTransactionToken,
+            runId: descriptor.runId,
+            result: {
+              answerText: "done",
+              answerMarkdown: "done",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 4,
+            },
+            runtime: { promptEpoch: activePromptEpoch, cleanup: { status: "pending" } },
+            artifacts: [descriptor],
+            state: "pending",
+          },
+        })}\n`,
       );
-      if (req.method === "POST" && settlementMatch) {
-        await readIncomingBody(req);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            transactionToken: settlementMatch[1],
-            state: settlementMatch[2] === "finalize" ? "finalized" : "aborted",
-            finalization: {
-              status: "completed",
-              runtime: { promptEpoch: activePromptEpoch, cleanup: { status: "completed" } },
-            },
-          }),
-        );
-        return;
-      }
-      const artifactPath = activeTransactionToken
-        ? `/transactions/${activeTransactionToken}/artifacts/${encodeURIComponent(descriptor.artifactId)}`
-        : null;
-      if (req.method === "POST" && artifactPath && req.url === `${artifactPath}/receipt`) {
-        await readIncomingBody(req);
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      if (req.method === "GET" && artifactPath && req.url === artifactPath) {
-        artifactRequestCount += 1;
-        res.writeHead(200, {
-          "Content-Type": "application/zip",
-          "X-Oracle-Artifact-Sha256": descriptor.sha256,
-        });
-        res.write(payload);
-        res.end();
-        return;
-      }
-      res.writeHead(404);
+      return;
+    }
+    const bindMatch = /^\/transactions\/([a-f0-9]{64})\/bind$/u.exec(req.url ?? "");
+    if (req.method === "POST" && bindMatch) {
+      const body = JSON.parse(await readIncomingBody(req)) as { mode?: unknown };
+      const mode = body.mode === "abort" ? "abort" : "finalize";
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          transactionToken: bindMatch[1],
+          settlementAuthority: { mode, outcome: "bound", state: "pending" },
+          runtime: { promptEpoch: activePromptEpoch, cleanup: { status: "pending" } },
+        }),
+      );
+      return;
+    }
+    const settlementMatch = /^\/transactions\/([a-f0-9]{64})\/(finalize|abort)$/.exec(
+      req.url ?? "",
+    );
+    if (req.method === "POST" && settlementMatch) {
+      await readIncomingBody(req);
+      const mode = settlementMatch[2] === "abort" ? "abort" : "finalize";
+      const state = mode === "finalize" ? "finalized" : "aborted";
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          transactionToken: settlementMatch[1],
+          state,
+          settlementAuthority: { mode, outcome: "completed", state },
+          finalization: {
+            status: "completed",
+            runtime: { promptEpoch: activePromptEpoch, cleanup: { status: "completed" } },
+          },
+        }),
+      );
+      return;
+    }
+    const artifactPath = activeTransactionToken
+      ? `/transactions/${activeTransactionToken}/artifacts/${encodeURIComponent(descriptor.artifactId)}`
+      : null;
+    if (req.method === "POST" && artifactPath && req.url === `${artifactPath}/receipt`) {
+      await readIncomingBody(req);
+      res.writeHead(204);
       res.end();
-    })().catch((error) => {
-      res.writeHead(500);
-      res.end(error instanceof Error ? error.message : String(error));
-    });
+      return;
+    }
+    if (req.method === "GET" && artifactPath && req.url === artifactPath) {
+      artifactRequestCount += 1;
+      res.writeHead(200, {
+        "Content-Type": "application/zip",
+        "X-Oracle-Artifact-Sha256": descriptor.sha256,
+      });
+      res.write(payload);
+      res.end();
+      return;
+    }
+    res.writeHead(404);
+    res.end();
   });
   const listenDeferred = Promise.withResolvers<void>();
   server.once("error", listenDeferred.reject);
@@ -3607,17 +3869,125 @@ async function createFakeArtifactBridge({
   };
 }
 
-async function httpGetJson({
+async function prepareTestAuthentication({
   hostname,
   port,
   path,
   token,
+  method,
+  body,
 }: {
   hostname: string;
   port: number;
   path: string;
   token?: string;
+  method: string;
+  body: Buffer;
+}): Promise<{ rootKey: string; authentication: RemoteAuthenticatedRequest } | null> {
+  const rootKey = token?.trim();
+  if (!rootKey) return null;
+  const host = hostname.includes(":") ? `[${hostname}]:${port}` : `${hostname}:${port}`;
+  const health = await checkRemoteHealth({ host, token: rootKey });
+  if (!health.ok || health.protocol !== "transaction-v3" || !health.serverGeneration) {
+    throw new Error(`test remote generation proof failed: ${health.error ?? "unavailable"}`);
+  }
+  return {
+    rootKey,
+    authentication: createRemoteAuthenticatedRequest({
+      rootKey,
+      serverGeneration: health.serverGeneration,
+      method,
+      path,
+      body,
+    }),
+  };
+}
+
+function sendTestRequestBody({
+  req,
+  authentication,
+  method,
+  path,
+  body,
+}: {
+  req: http.ClientRequest;
+  authentication: { rootKey: string; authentication: RemoteAuthenticatedRequest } | null;
+  method: string;
+  path: string;
+  body: Buffer;
+}): void {
+  if (!authentication) {
+    req.end(body);
+    return;
+  }
+  let proofVerified = false;
+  let continueReceived = false;
+  let bodySent = false;
+  const send = () => {
+    if (bodySent || !proofVerified || !continueReceived) return;
+    bodySent = true;
+    req.end(body);
+  };
+  req.on("information", (information) => {
+    if (information.statusCode !== 103) return;
+    const proof = String(information.headers[REMOTE_REQUEST_PROOF_HEADER] ?? "");
+    if (
+      !verifyRemoteRequestProof({
+        rootKey: authentication.rootKey,
+        method,
+        path,
+        authentication: authentication.authentication,
+        proof,
+      })
+    ) {
+      req.destroy(new Error("test remote returned an invalid request proof"));
+      return;
+    }
+    proofVerified = true;
+    send();
+  });
+  req.on("continue", () => {
+    continueReceived = true;
+    send();
+  });
+  req.flushHeaders();
+}
+
+async function httpGetJson({
+  hostname,
+  port,
+  path,
+  token,
+  headers,
+}: {
+  hostname: string;
+  port: number;
+  path: string;
+  token?: string;
+  headers?: Record<string, string>;
 }): Promise<{ statusCode: number; json: Record<string, unknown> | null }> {
+  if (path === "/health" && token?.trim()) {
+    const host = hostname.includes(":") ? `[${hostname}]:${port}` : `${hostname}:${port}`;
+    const health = await checkRemoteHealth({ host, token });
+    return {
+      statusCode: health.statusCode ?? 0,
+      json: {
+        ok: health.ok,
+        ...(health.version ? { version: health.version } : {}),
+        ...(health.uptimeSeconds !== undefined ? { uptimeSeconds: health.uptimeSeconds } : {}),
+        ...(health.capabilities ? { capabilities: health.capabilities } : {}),
+        ...(health.error ? { error: health.error } : {}),
+      },
+    };
+  }
+  const authentication = await prepareTestAuthentication({
+    hostname,
+    port,
+    path,
+    token,
+    method: "GET",
+    body: Buffer.alloc(0),
+  });
   const deferred = Promise.withResolvers<{
     statusCode: number;
     json: Record<string, unknown> | null;
@@ -3628,7 +3998,10 @@ async function httpGetJson({
       port,
       path,
       method: "GET",
-      headers: token ? { authorization: `Bearer ${token}` } : undefined,
+      headers: {
+        ...(headers ?? {}),
+        ...(authentication ? authentication.authentication.headers : {}),
+      },
     },
     (res) => {
       readIncomingBody(res)
@@ -3658,14 +4031,24 @@ async function httpPostJson({
   path,
   token,
   body,
+  headers,
 }: {
   hostname: string;
   port: number;
   path: string;
   token?: string;
   body: unknown;
+  headers?: Record<string, string>;
 }): Promise<{ statusCode: number; json: Record<string, unknown> | null }> {
   const serialized = Buffer.from(JSON.stringify(body));
+  const authentication = await prepareTestAuthentication({
+    hostname,
+    port,
+    path,
+    token,
+    method: "POST",
+    body: serialized,
+  });
   const deferred = Promise.withResolvers<{
     statusCode: number;
     json: Record<string, unknown> | null;
@@ -3679,7 +4062,10 @@ async function httpPostJson({
       headers: {
         "Content-Type": "application/json",
         "Content-Length": serialized.byteLength,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(headers ?? {}),
+        ...(authentication
+          ? { Expect: "100-continue", ...authentication.authentication.headers }
+          : {}),
       },
     },
     (res) => {
@@ -3699,7 +4085,7 @@ async function httpPostJson({
     },
   );
   req.on("error", deferred.reject);
-  req.end(serialized);
+  sendTestRequestBody({ req, authentication, method: "POST", path, body: serialized });
   return await deferred.promise;
 }
 
@@ -3717,6 +4103,14 @@ async function httpPostNdjson({
   body: unknown;
 }): Promise<{ statusCode: number; events: Array<Record<string, unknown>> }> {
   const serialized = Buffer.from(JSON.stringify(body));
+  const authentication = await prepareTestAuthentication({
+    hostname,
+    port,
+    path,
+    token,
+    method: "POST",
+    body: serialized,
+  });
   const deferred = Promise.withResolvers<{
     statusCode: number;
     events: Array<Record<string, unknown>>;
@@ -3730,7 +4124,9 @@ async function httpPostNdjson({
       headers: {
         "Content-Type": "application/json",
         "Content-Length": serialized.byteLength,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(authentication
+          ? { Expect: "100-continue", ...authentication.authentication.headers }
+          : {}),
       },
     },
     (res) => {
@@ -3752,7 +4148,7 @@ async function httpPostNdjson({
     },
   );
   req.on("error", deferred.reject);
-  req.end(serialized);
+  sendTestRequestBody({ req, authentication, method: "POST", path, body: serialized });
   return await deferred.promise;
 }
 
@@ -3770,6 +4166,14 @@ async function postJsonAndDisconnect({
   body: unknown;
 }): Promise<void> {
   const serialized = Buffer.from(JSON.stringify(body));
+  const authentication = await prepareTestAuthentication({
+    hostname,
+    port,
+    path,
+    token,
+    method: "POST",
+    body: serialized,
+  });
   const deferred = Promise.withResolvers<void>();
   const req = http.request(
     {
@@ -3780,7 +4184,9 @@ async function postJsonAndDisconnect({
       headers: {
         "Content-Type": "application/json",
         "Content-Length": serialized.byteLength,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(authentication
+          ? { Expect: "100-continue", ...authentication.authentication.headers }
+          : {}),
       },
     },
     (res) => {
@@ -3789,7 +4195,7 @@ async function postJsonAndDisconnect({
     },
   );
   req.on("error", deferred.reject);
-  req.end(serialized);
+  sendTestRequestBody({ req, authentication, method: "POST", path, body: serialized });
   await deferred.promise;
 }
 

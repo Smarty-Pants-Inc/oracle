@@ -10,7 +10,7 @@ import {
   isolateDirectoryGenerationForRemoval,
   removeIsolatedDirectoryGeneration,
   replayPendingIsolatedDirectoryRemovals,
-} from "./filesystemLockPrimitives.js";
+} from "./filesystemLockDirectoryRemoval.js";
 import {
   assertProfileDirectoryIdentity,
   captureProfileDirectoryIdentity,

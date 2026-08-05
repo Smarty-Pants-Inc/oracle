@@ -2,12 +2,11 @@ import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.j
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { settleRemoteBrowserRecovery } from "../remote/client.js";
 import type {
-  closeChromeTarget,
   closeChromeTargetWithExactAuthority,
   listChromeTargetsWithExactAuthority,
-  listRemoteChromeTargets,
   retainChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
+import type { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 import type {
   acquireProfileRunLock,
   captureChromeProcessIdentity,
@@ -27,10 +26,9 @@ import type {
 import type { BrowserCaptureFinalizationResult } from "./types.js";
 
 export interface ReattachCleanupDeps {
-  closeChromeTarget?: typeof closeChromeTarget;
   closeChromeTargetWithExactAuthority?: typeof closeChromeTargetWithExactAuthority;
-  listChromeTargets?: typeof listRemoteChromeTargets;
   listChromeTargetsWithExactAuthority?: typeof listChromeTargetsWithExactAuthority;
+  closeChromeTargetWithRetainedCapability?: typeof closeChromeTargetWithRetainedCapability;
   retainChromeEndpointAuthority?: typeof retainChromeEndpointAuthority;
   captureChromeProcessIdentity?: typeof captureChromeProcessIdentity;
   inspectRunningChromeProcessesForLaunchClaim?: typeof inspectRunningChromeProcessesForLaunchClaim;
@@ -65,6 +63,7 @@ export interface RecoveryCleanupGroup {
 }
 
 export interface RecoveryCleanupPhaseResult {
+  classification?: "legacy-session-target-authority";
   pending: RecoveryCleanupEntry[];
   errors: string[];
 }

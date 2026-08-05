@@ -3,7 +3,7 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeAll, afterAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("../../src/oracle.ts", async () => {
   const actual = await vi.importActual<typeof import("../../src/oracle.ts")>("../../src/oracle.ts");
@@ -89,6 +89,7 @@ import { getCliVersion } from "../../src/version.ts";
 import { deriveModelOutputPath } from "../../src/cli/sessionRunner.ts";
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
+import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
 
 const baseSessionMeta: SessionMetadata = {
   id: "sess-1",
@@ -121,7 +122,6 @@ const committedDemoAuthority = {
 const log = vi.fn();
 const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
-const originalPlatform = process.platform;
 
 function createReattachResult(
   answerText: string,
@@ -138,10 +138,18 @@ function createReattachResult(
   const finalizedRuntime = { ...capturedRuntime };
   delete finalizedRuntime.recoveryCleanupResources;
   delete finalizedRuntime.recoveryCleanupResult;
+  const bindSettlement = vi.fn(async () => capturedRuntime);
   const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
   const abort = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
   return {
-    value: { answerText, answerMarkdown, runtime: capturedRuntime, finalize, abort },
+    value: {
+      answerText,
+      answerMarkdown,
+      runtime: capturedRuntime,
+      bindSettlement,
+      finalize,
+      abort,
+    },
     finalize,
     abort,
   };
@@ -251,18 +259,12 @@ async function withExactEnv<T>(
   }
 }
 
-beforeAll(() => {
-  // Force macOS platform so browser-mode paths are reachable in Linux/Windows CI
-  Object.defineProperty(process, "platform", { value: "darwin" });
-});
-
-afterAll(() => {
-  Object.defineProperty(process, "platform", { value: originalPlatform });
-});
-
-beforeEach(() => {
+beforeEach(async () => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
+  const testSessionDir = path.join(os.tmpdir(), "oracle-test-session");
+  await fsPromises.rm(testSessionDir, { recursive: true, force: true });
+  await fsPromises.mkdir(testSessionDir, { recursive: true });
   Object.values(sessionStoreMock).forEach((fn) => {
     if (typeof fn === "function" && "mockReset" in fn) {
       fn.mockReset();
@@ -281,8 +283,6 @@ beforeEach(() => {
       sha256: "answer-sha256",
       sizeBytes: 6,
     },
-    sha256: "answer-sha256",
-    sizeBytes: 6,
   });
   vi.mocked(ensureSessionArtifacts).mockImplementation(
     async ({ existingArtifacts }) => existingArtifacts,
@@ -292,7 +292,17 @@ beforeEach(() => {
     rejected: [],
     elapsedMs: 0,
   });
-  sessionStoreMock.updateModelRun.mockResolvedValue(undefined);
+  sessionStoreMock.updateSession.mockImplementation(async (sessionId, updates) => ({
+    ...baseSessionMeta,
+    id: sessionId,
+    ...updates,
+  }));
+  sessionStoreMock.updateModelRun.mockImplementation(async (_sessionId, model, updates) => ({
+    model,
+    status: "running",
+    ...updates,
+  }));
+  sessionStoreMock.readSession.mockResolvedValue(null);
   sessionStoreMock.createLogWriter.mockReturnValue({
     logLine: vi.fn(),
     writeChunk: vi.fn(),
@@ -1232,6 +1242,10 @@ describe("performSessionRun", () => {
       answerText: "Answer",
       promptText: "Normalized submitted prompt",
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
+      bindSettlement: vi.fn(async () => ({
+        ...pendingRuntime,
+        recoveryCleanupResult: { status: "pending" as const, settlementMode: "finalize" as const },
+      })),
       finalize,
       abort,
     });
@@ -1258,8 +1272,7 @@ describe("performSessionRun", () => {
       status: "completed",
       browser: expect.objectContaining({
         runtime: expect.objectContaining({
-          chromePid: 123,
-          recoveryCleanupResult: { status: "pending" },
+          recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
         }),
         modelSelection: expect.objectContaining({ resolvedLabel: "Pro" }),
         warnings: [expect.objectContaining({ code: "browser-pro-fast-large-run" })],
@@ -1274,9 +1287,14 @@ describe("performSessionRun", () => {
       ],
     });
     expect(completedUpdate).toHaveProperty("errorMessage", undefined);
-    expect(cleanupUpdate).toMatchObject({
-      browser: expect.objectContaining({ runtime: finalizedRuntime }),
-    });
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("chromePid");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("chromeTargetId");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("userDataDir");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(cleanupUpdate?.browser?.runtime).not.toHaveProperty("chromePid");
+    expect(cleanupUpdate?.browser?.runtime).not.toHaveProperty("chromeTargetId");
+    expect(cleanupUpdate?.browser?.runtime).not.toHaveProperty("userDataDir");
+    expect(cleanupUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
     expect(finalize).toHaveBeenCalledTimes(1);
     expect(abort).not.toHaveBeenCalled();
     expect(vi.mocked(persistDurableBrowserAnswer)).toHaveBeenCalledWith({
@@ -1284,7 +1302,11 @@ describe("performSessionRun", () => {
       answer: "Answer",
     });
     expect(vi.mocked(ensureSessionArtifacts)).toHaveBeenCalledWith(
-      expect.objectContaining({ prompt: "Normalized submitted prompt" }),
+      expect.objectContaining({
+        sessionId: baseSessionMeta.id,
+        prompt: "Normalized submitted prompt",
+        logger: expect.any(Function),
+      }),
     );
     expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
@@ -1345,6 +1367,10 @@ describe("performSessionRun", () => {
       elapsedMs: 100,
       runtime,
       answerText: "durable remote answer",
+      bindSettlement: vi.fn(async () => ({
+        ...runtime,
+        recoveryCleanupResult: { status: "pending" as const, settlementMode: "finalize" as const },
+      })),
       finalize,
       abort,
     });
@@ -1362,24 +1388,27 @@ describe("performSessionRun", () => {
 
     expect(finalize).toHaveBeenCalledOnce();
     expect(abort).not.toHaveBeenCalled();
-    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
-      browser: {
-        runtime: {
-          chromeTargetId: "remote-finalize-target",
-          recoveryCleanupResources: [
-            expect.objectContaining({
-              remoteRecovery: expect.objectContaining({
-                transactionToken: "a".repeat(64),
-                state: "pending",
-              }),
+    const completedRuntime =
+      sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]?.browser?.runtime;
+    expect(completedRuntime?.recoveryCleanupResult).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("bridge temporarily unavailable"),
+      settlementMode: "finalize",
+    });
+    expect(completedRuntime).not.toHaveProperty("chromeTargetId");
+    expect(completedRuntime).not.toHaveProperty("recoveryCleanupResources");
+    expect(await readBrowserCapturePublicationJournal(baseSessionMeta.id)).toMatchObject({
+      phase: "cleanup-pending",
+      runtime: {
+        chromeTargetId: "remote-finalize-target",
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            remoteRecovery: expect.objectContaining({
+              transactionToken: "a".repeat(64),
+              state: "pending",
             }),
-          ],
-          recoveryCleanupResult: {
-            status: "failed",
-            error: expect.stringContaining("bridge temporarily unavailable"),
-            settlementMode: "finalize",
-          },
-        },
+          }),
+        ],
       },
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("cleanup remains pending"));
@@ -1422,18 +1451,24 @@ describe("performSessionRun", () => {
       elapsedMs: 500,
       runtime: capturedRuntime,
       answerText: "published answer",
+      bindSettlement: vi.fn(async () => ({
+        ...capturedRuntime,
+        recoveryCleanupResult: { status: "pending" as const, settlementMode: "finalize" as const },
+      })),
       finalize,
       abort,
     });
     let failedFinalRuntimeWrite = false;
-    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+    sessionStoreMock.updateSession.mockImplementation(async (sessionId, patch) => {
       if (
         !failedFinalRuntimeWrite &&
-        patch.browser?.runtime?.recoveryCleanupResult?.settlementMode === "finalize"
+        patch.status === "completed" &&
+        patch.browser?.runtime?.recoveryCleanupResult?.status === "failed"
       ) {
         failedFinalRuntimeWrite = true;
         throw new Error("final runtime metadata fsync failed once");
       }
+      return { ...baseSessionMeta, id: sessionId, ...patch };
     });
 
     await performSessionRun({
@@ -1465,8 +1500,27 @@ describe("performSessionRun", () => {
     expect(
       sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
     ).toBe(false);
-    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
-      browser: { runtime: retryableRuntime },
+    const finalAuditRuntime =
+      sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]?.browser?.runtime;
+    expect(finalAuditRuntime?.recoveryCleanupResult).toMatchObject({
+      status: "failed",
+      error: "browser-cleanup-finalize-pending: target close remains retryable",
+      settlementMode: "finalize",
+    });
+    expect(finalAuditRuntime).not.toHaveProperty("chromeTargetId");
+    expect(finalAuditRuntime).not.toHaveProperty("tabUrl");
+    expect(finalAuditRuntime).not.toHaveProperty("recoveryCleanupResources");
+    expect(await readBrowserCapturePublicationJournal(baseSessionMeta.id)).toMatchObject({
+      phase: "cleanup-pending",
+      runtime: {
+        chromeTargetId: "published-runtime-target",
+        recoveryCleanupResources: expect.any(Array),
+        recoveryCleanupResult: {
+          status: "failed",
+          error: "browser-cleanup-finalize-pending: target close remains retryable",
+          settlementMode: "finalize",
+        },
+      },
     });
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,
@@ -1487,7 +1541,7 @@ describe("performSessionRun", () => {
     );
   });
 
-  test("aborts after terminal metadata publication fails and retains the answer receipt", async () => {
+  test("keeps FINALIZE authority after a transient terminal metadata failure", async () => {
     const pendingRuntime: BrowserRuntimeMetadata = {
       chromePort: 9222,
       chromeTargetId: "fallback-target",
@@ -1513,50 +1567,51 @@ describe("performSessionRun", () => {
       runtime: pendingRuntime,
       answerText: "captured but not yet durable",
       artifacts: [{ kind: "transcript", path: "/tmp/pending-transcript.md" }],
+      bindSettlement: vi.fn(async () => ({
+        ...pendingRuntime,
+        recoveryCleanupResult: { status: "pending" as const, settlementMode: "finalize" as const },
+      })),
       finalize,
       abort,
     });
     let failedCompletedWrite = false;
-    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+    sessionStoreMock.updateSession.mockImplementation(async (sessionId, patch) => {
       if (!failedCompletedWrite && patch.status === "completed") {
         failedCompletedWrite = true;
         throw new Error("terminal metadata disk full");
       }
+      return { ...baseSessionMeta, id: sessionId, ...patch };
     });
 
-    await expect(
-      performSessionRun({
-        sessionMeta: baseSessionMeta,
-        runOptions: baseRunOptions,
-        mode: "browser",
-        browserConfig: { chromePath: null },
-        cwd: "/tmp",
-        log,
-        write,
-        version: cliVersion,
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(failedCompletedWrite).toBe(true);
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+    ).toBe(false);
+    expect(sessionStoreMock.updateSession.mock.calls).toContainEqual([
+      baseSessionMeta.id,
+      expect.objectContaining({
+        status: "completed",
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({
+            path: "/tmp/durable-browser-answer.md",
+            sha256: "answer-sha256",
+          }),
+        ]),
       }),
-    ).rejects.toThrow("terminal metadata disk full");
-
-    expect(finalize).not.toHaveBeenCalled();
-    expect(abort).toHaveBeenCalledOnce();
-    const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
-      (call) => call[1]?.status === "completed",
-    );
-    const errorCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
-      (call) => call[1]?.status === "error",
-    );
-    expect(errorCallIndex).toBeGreaterThan(completedCallIndex);
-    const errorUpdate = sessionStoreMock.updateSession.mock.calls[errorCallIndex]?.[1];
-    expect(errorUpdate).toMatchObject({
-      status: "error",
-      browser: { runtime: {} },
-      artifacts: [
-        expect.objectContaining({
-          path: "/tmp/durable-browser-answer.md",
-          sha256: "answer-sha256",
-        }),
-      ],
-    });
+    ]);
   });
 
   test("keeps the published answer completed when optional model-run projection fails", async () => {
@@ -1572,6 +1627,7 @@ describe("performSessionRun", () => {
       elapsedMs: 500,
       runtime,
       answerText: "captured answer",
+      bindSettlement: vi.fn(async () => runtime),
       finalize,
       abort,
     });
@@ -1645,6 +1701,7 @@ describe("performSessionRun", () => {
       elapsedMs: 500,
       runtime: pendingRuntime,
       answerText: "captured answer",
+      bindSettlement: vi.fn(async () => pendingRuntime),
       finalize,
       abort,
     });
@@ -1703,6 +1760,7 @@ describe("performSessionRun", () => {
       elapsedMs: 500,
       runtime,
       answerText: "browser answer",
+      bindSettlement: vi.fn(async () => runtime),
       finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
       abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
     });
@@ -2230,6 +2288,7 @@ describe("performSessionRun", () => {
       elapsedMs: 100,
       runtime: freshRuntime,
       answerText: "replacement browser answer",
+      bindSettlement: vi.fn(async () => freshRuntime),
       finalize,
       abort,
     });
@@ -2688,8 +2747,20 @@ describe("performSessionRun", () => {
     expect(completedUpdate).toMatchObject({
       status: "completed",
       response: { status: "completed" },
-      browser: { runtime: recoveredRuntime },
+      browser: {
+        runtime: {
+          conversationId: "demo",
+          promptEpoch: committedDemoAuthority.promptEpoch,
+          recoveryCleanupResult: { status: "pending" },
+        },
+      },
     });
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("chromeHost");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("chromePort");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("chromeTargetId");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("tabUrl");
+    expect(completedUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(await readBrowserCapturePublicationJournal(baseSessionMeta.id)).toBeNull();
     expect(reattach.finalize).toHaveBeenCalledOnce();
     expect(reattach.abort).not.toHaveBeenCalled();
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
@@ -3250,18 +3321,21 @@ describe("performSessionRun", () => {
       answerText: "auto published text",
       answerMarkdown: "auto published markdown",
       runtime: capturedRuntime,
+      bindSettlement: vi.fn(async () => capturedRuntime),
       finalize,
       abort,
     });
     let failedFinalRuntimeWrite = false;
-    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+    sessionStoreMock.updateSession.mockImplementation(async (sessionId, patch) => {
       if (
         !failedFinalRuntimeWrite &&
-        patch.browser?.runtime?.recoveryCleanupResult?.settlementMode === "finalize"
+        patch.status === "completed" &&
+        patch.browser?.runtime?.recoveryCleanupResult?.status === "failed"
       ) {
         failedFinalRuntimeWrite = true;
         throw new Error("auto final runtime metadata fsync failed once");
       }
+      return { ...baseSessionMeta, id: sessionId, ...patch };
     });
 
     await performSessionRun({
@@ -3299,8 +3373,36 @@ describe("performSessionRun", () => {
     expect(
       sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
     ).toBe(false);
-    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
-      browser: { runtime: retryableRuntime },
+    const completedAuditRuntime =
+      sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]?.browser?.runtime;
+    expect(completedAuditRuntime).toMatchObject({
+      conversationId: "demo",
+      promptEpoch: committedDemoAuthority.promptEpoch,
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "browser-cleanup-finalize-pending: reattach cleanup remains retryable",
+        settlementMode: "finalize",
+      },
+    });
+    expect(completedAuditRuntime).not.toHaveProperty("chromeHost");
+    expect(completedAuditRuntime).not.toHaveProperty("chromePort");
+    expect(completedAuditRuntime).not.toHaveProperty("chromeTargetId");
+    expect(completedAuditRuntime).not.toHaveProperty("tabUrl");
+    expect(completedAuditRuntime).not.toHaveProperty("recoveryCleanupResources");
+    expect(await readBrowserCapturePublicationJournal(baseSessionMeta.id)).toMatchObject({
+      phase: "cleanup-pending",
+      runtime: {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: "AUTO-PUBLISHED-TARGET",
+        tabUrl: "https://chatgpt.com/c/demo",
+        recoveryCleanupResources: expect.any(Array),
+        recoveryCleanupResult: {
+          status: "failed",
+          error: "browser-cleanup-finalize-pending: reattach cleanup remains retryable",
+          settlementMode: "finalize",
+        },
+      },
     });
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,

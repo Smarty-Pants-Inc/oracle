@@ -9,7 +9,7 @@ import type {
   BrowserRuntimeMetadata,
   SessionArtifact,
 } from "../sessionStore.js";
-import { runBrowserMode } from "../browserMode.js";
+import { runBrowserModeTransaction } from "./browserCoordinator.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
@@ -44,6 +44,7 @@ export interface BrowserExecutionResult {
   answerText: string;
   promptText?: string;
   artifacts?: SessionArtifact[];
+  bindSettlement: BrowserRunTransaction["bindSettlement"];
   finalize: () => Promise<BrowserCaptureFinalizationResult>;
   abort: () => Promise<BrowserCaptureFinalizationResult>;
 }
@@ -58,7 +59,7 @@ interface RunBrowserSessionArgs {
 export interface BrowserSessionRunnerDeps {
   assemblePrompt?: typeof assembleBrowserPrompt;
   executeBrowser?: (
-    options: Parameters<typeof runBrowserMode>[0],
+    options: Parameters<typeof runBrowserModeTransaction>[0],
   ) => Promise<BrowserRunTransaction>;
   persistRuntimeHint?: (
     runtime: BrowserRuntimeMetadata,
@@ -74,6 +75,8 @@ function assertBrowserRunTransaction(result: unknown): asserts result is Browser
     typeof result.runtime !== "object" ||
     result.runtime === null ||
     !("finalize" in result) ||
+    !("bindSettlement" in result) ||
+    typeof result.bindSettlement !== "function" ||
     typeof result.finalize !== "function" ||
     !("abort" in result) ||
     typeof result.abort !== "function"
@@ -163,7 +166,7 @@ export async function runBrowserSessionExecution(
   deps: BrowserSessionRunnerDeps = {},
 ): Promise<BrowserExecutionResult> {
   const assemblePrompt = deps.assemblePrompt ?? assembleBrowserPrompt;
-  const executeBrowser = deps.executeBrowser ?? runBrowserMode;
+  const executeBrowser = deps.executeBrowser ?? runBrowserModeTransaction;
   const promptArtifacts = await assemblePrompt(runOptions, { cwd });
   if (runOptions.verbose) {
     log(
@@ -335,6 +338,7 @@ export async function runBrowserSessionExecution(
     answerText,
     promptText: promptArtifacts.composerText,
     artifacts: savedArtifacts,
+    bindSettlement: browserTransaction.bindSettlement,
     finalize: browserTransaction.finalize,
     abort: browserTransaction.abort,
   };

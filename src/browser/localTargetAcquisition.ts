@@ -1,9 +1,13 @@
-import { connectWithNewTabWithExactAuthority } from "./chromeLifecycle.js";
+import {
+  closeChromeTargetWithExactAuthority,
+  connectWithNewTabWithExactAuthority,
+} from "./chromeLifecycle.js";
 import { connectToExistingChatGptTab } from "./liveTabs.js";
 import { describeDevtoolsFirewallHint } from "./localExecutionContext.js";
 import type { LocalBrowserAcquisition } from "./localAcquisition.js";
 import type { LocalBrowserRunState } from "./localRunState.js";
 import type { BrowserLogger } from "./types.js";
+import { retainChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 
 export interface LocalTargetAcquisitionContext {
   acquisition: LocalBrowserAcquisition;
@@ -24,6 +28,7 @@ export async function acquireExactLocalBrowserTarget({
     config,
     manualLogin,
     acquisitionTargetMarkerUrl,
+    acquisitionGenerationId,
     settlementEndpointAuthority,
   } = acquisition;
   try {
@@ -60,6 +65,18 @@ export async function acquireExactLocalBrowserTarget({
       state.isolatedTargetId = connection.targetId ?? null;
       state.lastTargetId = connection.targetId ?? undefined;
       state.ownsTarget = Boolean(connection.targetId);
+      if (connection.targetId) {
+        state.targetCloseCapability = retainChromeTargetCloseCapability({
+          generationId: acquisitionGenerationId,
+          targetId: connection.targetId,
+          close: (closeLogger) =>
+            closeChromeTargetWithExactAuthority({
+              authority: settlementEndpointAuthority,
+              targetId: connection.targetId as string,
+              logger: closeLogger,
+            }),
+        });
+      }
     }
     await publishRuntime();
     if (state.tabLease && state.isolatedTargetId) {

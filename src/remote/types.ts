@@ -211,38 +211,26 @@ export const RemoteCommittedPromptEpochSchema = z
   })
   .strict();
 
-const RemotePendingCleanupSchema = z.object({ status: z.literal("pending") }).strict();
-const RemoteCompletedCleanupSchema = z.object({ status: z.literal("completed") }).strict();
-
-export const RemotePublicRuntimeSchema = z.union([
-  z
-    .object({
-      promptEpoch: RemoteCommittedPromptEpochSchema.optional(),
-      cleanup: RemotePendingCleanupSchema,
-    })
-    .strict(),
-  z
-    .object({
-      promptEpoch: RemoteCommittedPromptEpochSchema.optional(),
-      cleanup: RemoteCompletedCleanupSchema,
-    })
-    .strict(),
+const RemoteCleanupSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("pending") }).strict(),
+  z.object({ status: z.literal("completed") }).strict(),
 ]);
+const RemotePendingCleanupSchema = RemoteCleanupSchema.options[0];
+const RemoteCompletedCleanupSchema = RemoteCleanupSchema.options[1];
 
-export const RemoteCapturedPublicRuntimeSchema = z.union([
-  z
-    .object({
-      promptEpoch: RemoteCommittedPromptEpochSchema,
-      cleanup: RemotePendingCleanupSchema,
-    })
-    .strict(),
-  z
-    .object({
-      promptEpoch: RemoteCommittedPromptEpochSchema,
-      cleanup: RemoteCompletedCleanupSchema,
-    })
-    .strict(),
-]);
+export const RemotePublicRuntimeSchema = z
+  .object({
+    promptEpoch: RemoteCommittedPromptEpochSchema.optional(),
+    cleanup: RemoteCleanupSchema,
+  })
+  .strict();
+
+export const RemoteCapturedPublicRuntimeSchema = z
+  .object({
+    promptEpoch: RemoteCommittedPromptEpochSchema,
+    cleanup: RemoteCleanupSchema,
+  })
+  .strict();
 
 const RemoteArchiveResultSchema = z
   .object({
@@ -433,6 +421,49 @@ const RemoteCompletedFinalizationSchema = z
       .strict(),
   })
   .strict();
+export const RemoteSettlementAuthoritySchema = z
+  .object({
+    mode: z.enum(["finalize", "abort"]),
+    outcome: z.enum(["bound", "completed"]),
+    state: z.enum(["running", "pending", "finalized", "aborted", "recoverable-error", "failed"]),
+  })
+  .strict()
+  .superRefine((authority, context) => {
+    if (
+      authority.outcome === "bound" &&
+      authority.state !== "pending" &&
+      authority.state !== "recoverable-error"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "bound settlement authority requires a pending or recoverable state",
+      });
+    }
+    if (
+      authority.outcome === "completed" &&
+      authority.state !== (authority.mode === "finalize" ? "finalized" : "aborted")
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "completed settlement authority contradicts its mode or terminal state",
+      });
+    }
+  });
+
+export const RemoteSettlementBindResponseSchema = z
+  .object({
+    transactionToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
+    settlementAuthority: RemoteSettlementAuthoritySchema,
+    runtime: RemotePublicRuntimeSchema,
+  })
+  .strict();
+
+export const RemoteSettlementConflictResponseSchema = z
+  .object({
+    error: z.string().min(1).max(128),
+    settlementAuthority: RemoteSettlementAuthoritySchema,
+  })
+  .strict();
 const RemoteTerminalRetryOutcomeSchema = z.discriminatedUnion("state", [
   z
     .object({
@@ -475,6 +506,7 @@ export const RemoteTransactionSettlementResponseSchema = z.discriminatedUnion("s
     .object({
       transactionToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
       state: z.literal("pending"),
+      settlementAuthority: RemoteSettlementAuthoritySchema,
       finalization: RemotePendingFinalizationSchema,
     })
     .strict(),
@@ -482,6 +514,7 @@ export const RemoteTransactionSettlementResponseSchema = z.discriminatedUnion("s
     .object({
       transactionToken: z.string().regex(REMOTE_TRANSACTION_TOKEN_PATTERN),
       state: z.enum(["finalized", "aborted"]),
+      settlementAuthority: RemoteSettlementAuthoritySchema,
       finalization: RemoteCompletedFinalizationSchema,
     })
     .strict(),
@@ -491,11 +524,35 @@ export const RemoteFinalizeRequestSchema = z
   .object({ durablePublication: z.literal(true) })
   .strict();
 export const RemoteAbortRequestSchema = z.object({}).strict();
+export const RemoteBindSettlementRequestSchema = z
+  .object({
+    mode: z.enum(["finalize", "abort"]),
+    durablePublication: z.boolean(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (request.durablePublication !== (request.mode === "finalize")) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "durablePublication must be true only for finalize",
+      });
+    }
+  });
 export const RemoteRetryRequestSchema = z.object({}).strict();
 export const RemoteArtifactDeliveryReceiptRequestSchema = z
   .object({
     sha256: z.string().regex(SHA256_PATTERN),
     byteSize: z.number().int().positive().max(MAX_REMOTE_ARTIFACT_BYTES),
+  })
+  .strict();
+
+export const RemoteHealthAuthenticationSchema = z
+  .object({
+    scheme: z.literal("oracle-hmac-sha256-v1"),
+    serverGeneration: z.string().min(1).max(128),
+    clientNonce: z.string().regex(SHA256_PATTERN),
+    serverNonce: z.string().regex(SHA256_PATTERN),
+    proof: z.string().regex(SHA256_PATTERN),
   })
   .strict();
 
@@ -505,6 +562,7 @@ export const RemoteHealthResponseSchema = z
     version: z.string().min(1).max(128),
     uptimeSeconds: z.number().int().nonnegative(),
     capabilities: RemoteArtifactCapabilitiesSchema,
+    authentication: RemoteHealthAuthenticationSchema,
   })
   .strict();
 
@@ -543,6 +601,11 @@ export type RemoteBrowserAutomationErrorPayload = z.infer<
 export type RemoteTransactionRetryResponse = z.infer<typeof RemoteTransactionRetryResponseSchema>;
 export type RemoteTransactionSettlementResponse = z.infer<
   typeof RemoteTransactionSettlementResponseSchema
+>;
+export type RemoteSettlementAuthority = z.infer<typeof RemoteSettlementAuthoritySchema>;
+export type RemoteSettlementBindResponse = z.infer<typeof RemoteSettlementBindResponseSchema>;
+export type RemoteSettlementConflictResponse = z.infer<
+  typeof RemoteSettlementConflictResponseSchema
 >;
 export type RemoteRunEvent = z.infer<typeof RemoteRunEventSchema>;
 

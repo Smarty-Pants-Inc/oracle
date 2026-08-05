@@ -2,9 +2,10 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
-import type { BrowserRunTransaction } from "../../src/browserMode.js";
-import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionStore.js";
+import type { BrowserRunTransaction } from "../../src/browser/types.js";
+import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionModel.js";
 import { RemoteTransactionCoordinator } from "../../src/remote/transactionCoordinator.js";
+import { settlementResponse } from "../../src/remote/transactionProtocol.js";
 import {
   BrowserCaptureSettlementController,
   completedBrowserCaptureCleanup,
@@ -123,6 +124,7 @@ describe("RemoteTransactionCoordinator", () => {
       const active: BrowserRunTransaction = {
         ...capturedResult,
         runtime,
+        bindSettlement: vi.fn(async () => runtime),
         finalize,
         abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
       };
@@ -166,6 +168,11 @@ describe("RemoteTransactionCoordinator", () => {
       expect(finalize).toHaveBeenCalledTimes(2);
       expect(coordinator.hasActive(transactionToken)).toBe(false);
       const finalizedRecord = await store.read(transactionToken);
+      if (!finalizedRecord?.finalization) throw new Error("missing terminal finalization");
+      expect(settlementResponse(finalizedRecord, finalizedRecord.finalization)).toMatchObject({
+        state: "finalized",
+        settlementAuthority: { mode: "finalize", outcome: "completed", state: "finalized" },
+      });
       expect(finalizedRecord).toMatchObject({
         state: "finalized",
         terminalAudit: {
@@ -204,6 +211,7 @@ describe("RemoteTransactionCoordinator", () => {
       coordinator.registerActive(transactionToken, {
         ...capturedResult,
         runtime,
+        bindSettlement: vi.fn(async () => runtime),
         finalize,
         abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
       });
@@ -238,6 +246,7 @@ describe("RemoteTransactionCoordinator", () => {
       coordinator.registerActive(transactionToken, {
         ...capturedResult,
         runtime,
+        bindSettlement: vi.fn(async () => runtime),
         finalize,
         abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
       });

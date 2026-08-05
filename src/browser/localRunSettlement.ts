@@ -1,9 +1,9 @@
-import type { BrowserRecoveryCleanupMetadata } from "../sessionManager.js";
+import type {
+  BrowserRecoveryCleanupMetadata,
+  BrowserRecoveryTargetCloseCapabilityMetadata,
+} from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import {
-  closeBlankChromeTabsWithExactAuthority,
-  closeChromeTargetWithExactAuthority,
-} from "./chromeLifecycle.js";
+import { closeBlankChromeTabsWithExactAuthority } from "./chromeLifecycle.js";
 import { settleManualChromeOwner } from "./manualChromeOwner.js";
 import {
   isSafeChromeTerminationOutcome,
@@ -33,6 +33,7 @@ import type {
   BrowserLogger,
   BrowserRunOptions,
 } from "./types.js";
+import { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 
 export interface LocalRunSettlementContext {
   acquisition: LocalBrowserAcquisition;
@@ -116,6 +117,7 @@ export function createLocalRunSettlementCoordinator({
         chromeProfileRoot: userDataDir,
         userDataDir,
         chromeTargetId: state.lastTargetId ?? state.isolatedTargetId ?? undefined,
+        targetCloseCapability: state.ownsTarget ? state.targetCloseCapability : undefined,
         conversationId: tabUrl ? extractConversationIdFromUrl(tabUrl) : undefined,
         tabLease: state.tabLease
           ? { id: state.tabLease.id, profileDirectory: state.tabLease.profileDirectory }
@@ -135,6 +137,7 @@ export function createLocalRunSettlementCoordinator({
 
   let manualOwnerSettled = false;
   let closedOwnedTargetId: string | null = null;
+  let closedOwnedTargetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | null = null;
   let releasedTabLeaseId: string | null = null;
 
   const settleLocalResources = async (
@@ -167,18 +170,18 @@ export function createLocalRunSettlementCoordinator({
           usingCopiedProfile,
         });
     if (shouldCloseOwnedRunTarget) {
-      if (!targetId || !chrome.port) {
-        errors.push("Owned Chrome target cleanup metadata is incomplete");
-      } else if (!settlementEndpointAuthority) {
-        errors.push("Owned Chrome target has no retained exact endpoint authority");
+      const capability = pendingResource?.targetCloseCapability;
+      if (!targetId || !capability) {
+        errors.push("Owned Chrome target has no retained exact close capability");
       } else {
-        const targetCleanup = await closeChromeTargetWithExactAuthority({
-          authority: settlementEndpointAuthority,
+        const targetCleanup = await closeChromeTargetWithRetainedCapability({
+          capability,
           targetId,
           logger,
         });
         if (targetCleanup.status === "completed" || targetCleanup.status === "gone") {
           closedOwnedTargetId = targetId;
+          closedOwnedTargetCloseCapability = capability;
         } else if (manualLogin || keepBrowserOpen) {
           errors.push(targetCleanup.reason);
         }
@@ -188,6 +191,7 @@ export function createLocalRunSettlementCoordinator({
       return pendingBrowserCaptureCleanup(
         projectBrowserRetryableCleanupRuntime(pendingRuntime, {
           targetId: closedOwnedTargetId,
+          targetCloseCapability: closedOwnedTargetCloseCapability,
           tabLeaseId: releasedTabLeaseId,
         }),
         errors.join("; "),
@@ -372,6 +376,7 @@ export function createLocalRunSettlementCoordinator({
     }
     const retryableRuntime = projectBrowserRetryableCleanupRuntime(pendingRuntime, {
       targetId: closedOwnedTargetId,
+      targetCloseCapability: closedOwnedTargetCloseCapability,
       tabLeaseId: releasedTabLeaseId,
     });
     return errors.length > 0

@@ -6,6 +6,7 @@ import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureFinalization,
+  projectBrowserRetryableCleanupRuntime,
 } from "../../src/browser/ownedBrowserResources.js";
 
 const profileDirectory = {
@@ -31,6 +32,10 @@ function acquisitionRuntime(
         chromePort: 9222,
         userDataDir: profileDirectory.canonicalPath,
         chromeTargetId: pendingResource === "chrome-target" ? undefined : "target-1",
+        targetCloseCapability:
+          pendingResource === "chrome-target"
+            ? undefined
+            : { version: 1, generationId: "generation-1", capabilityId: "capability-1" },
         tabLease: { id: "lease-1", profileDirectory },
         acquisition: {
           generationId: "generation-1",
@@ -257,5 +262,52 @@ describe("OwnedBrowserResourceTransaction", () => {
         boundMode: "abort",
       },
     });
+  });
+
+  it("redacts only the exact target generation that reached terminal cleanup", () => {
+    const first = acquisitionRuntime().recoveryCleanupResources?.[0];
+    if (!first) throw new Error("owned target fixture is missing");
+    const second = {
+      ...first,
+      acquisition: { ...first.acquisition, generationId: "generation-2" },
+      targetCloseCapability: {
+        version: 1 as const,
+        generationId: "generation-2",
+        capabilityId: "capability-2",
+      },
+    };
+    const runtime: BrowserRuntimeMetadata = {
+      ...acquisitionRuntime(),
+      recoveryCleanupResources: [first, second],
+    };
+
+    const projected = projectBrowserRetryableCleanupRuntime(runtime, {
+      targetId: "target-1",
+      targetCloseCapability: {
+        generationId: "generation-1",
+        capabilityId: "capability-1",
+      },
+    });
+
+    expect(projected.chromeTargetId).toBeUndefined();
+    expect(projected.recoveryCleanupResources?.[0]).toMatchObject({
+      chromeTargetId: undefined,
+      targetCloseCapability: undefined,
+      recoveryCleanup: { ownsTarget: false },
+    });
+    expect(projected.recoveryCleanupResources?.[1]).toEqual(second);
+  });
+
+  it("preserves target authority when terminal generation proof does not match", () => {
+    const runtime = acquisitionRuntime();
+    expect(
+      projectBrowserRetryableCleanupRuntime(runtime, {
+        targetId: "target-1",
+        targetCloseCapability: {
+          generationId: "generation-other",
+          capabilityId: "capability-other",
+        },
+      }),
+    ).toEqual(runtime);
   });
 });

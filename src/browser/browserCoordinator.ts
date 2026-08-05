@@ -14,10 +14,13 @@ import type {
   BrowserAttachment,
   BrowserLogger,
   BrowserRunOptions,
+  BrowserRunResult,
   BrowserRunTransaction,
 } from "./types.js";
 
-export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunTransaction> {
+export async function runBrowserModeTransaction(
+  options: BrowserRunOptions,
+): Promise<BrowserRunTransaction> {
   const promptText = options.prompt?.trim();
   if (!promptText) {
     throw new Error("Prompt text is required when using browser mode.");
@@ -107,4 +110,43 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     isResumingConversation,
     followUpPrompts,
   });
+}
+
+function projectPublicBrowserRunResult(transaction: BrowserRunTransaction): BrowserRunResult {
+  const {
+    runtime: _runtime,
+    bindSettlement: _bindSettlement,
+    finalize: _finalize,
+    abort: _abort,
+    chromePid: _chromePid,
+    chromeProcessIdentity: _chromeProcessIdentity,
+    chromePort: _chromePort,
+    chromeHost: _chromeHost,
+    chromeBrowserWSEndpoint: _chromeBrowserWSEndpoint,
+    chromeProfileRoot: _chromeProfileRoot,
+    userDataDir: _userDataDir,
+    chromeTargetId: _chromeTargetId,
+    tabUrl: _tabUrl,
+    controllerPid: _controllerPid,
+    ...result
+  } = transaction;
+  return result;
+}
+
+export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
+  const transaction = await runBrowserModeTransaction(options);
+  const finalization = await transaction.finalize();
+  const result = projectPublicBrowserRunResult(transaction);
+  if (finalization.status === "pending") {
+    result.warnings = [
+      ...(result.warnings ?? []),
+      {
+        code: "direct-finalize-cleanup-pending",
+        severity: "warning",
+        message: "The assistant answer is complete, but internal browser cleanup remains pending.",
+        details: { stage: "browser-capture-finalization" },
+      },
+    ];
+  }
+  return result;
 }

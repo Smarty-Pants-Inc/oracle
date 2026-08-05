@@ -1,8 +1,9 @@
 import CDP from "chrome-remote-interface";
 import type { BrowserLogger, ChromeClient } from "./types.js";
-import type {
-  ExactChromeEndpointOperationResult,
-  RetainedChromeEndpointAuthority,
+import {
+  discoverBrowserWebSocketEndpoint,
+  type ExactChromeEndpointOperationResult,
+  type RetainedChromeEndpointAuthority,
 } from "./chromeEndpointAuthority.js";
 import { delay } from "./utils.js";
 
@@ -14,6 +15,13 @@ export async function connectToChrome(
   const client = await CDP({ port, host });
   logger("Connected to Chrome DevTools protocol");
   return client;
+}
+
+class ExactTargetCleanupUnconfirmedError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "ExactTargetCleanupUnconfirmedError";
+  }
 }
 
 export async function connectToRemoteChrome(
@@ -35,24 +43,13 @@ export async function connectToRemoteChrome(
     });
   }
   if (targetUrl) {
-    const targetConnection = await connectToNewTarget(host, port, targetUrl, logger, {
-      opened: () => `Opened dedicated remote Chrome tab targeting ${targetUrl}`,
-      openFailed: (message) =>
-        `Failed to open dedicated remote Chrome tab (${message}); falling back to an existing page target.`,
-      attachFailed: (targetId, message) =>
-        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to an existing page target.`,
-      closeFailed: (targetId, message) =>
-        `Failed to close unused remote Chrome tab ${targetId}: ${message}`,
-    });
-    if (targetConnection) {
-      return {
-        client: targetConnection.client,
-        targetId: targetConnection.targetId,
-        ownership: "created",
-        close: async () => {
-          await targetConnection.client.close().catch(() => undefined);
-        },
-      };
+    try {
+      return await connectWithNewTabWithRetainedLiveAuthority(port, logger, targetUrl, host);
+    } catch (error) {
+      if (error instanceof ExactTargetCleanupUnconfirmedError) throw error;
+      logger(
+        `Failed to open dedicated remote Chrome tab with retained live authority (${error instanceof Error ? error.message : String(error)}); falling back to an existing page target.`,
+      );
     }
   }
   const targets = await listRemoteChromeTargets({ host, port });
@@ -67,11 +64,29 @@ export async function connectToRemoteChrome(
 }
 
 export type RemoteTargetOwnership = "created" | "attached";
+function shouldCloseTargetOnDispose(
+  ownership: RemoteTargetOwnership,
+  requested: boolean | undefined,
+): boolean {
+  return ownership === "created" && requested === true;
+}
+
+export interface RetainedLiveChromeTargetAuthority {
+  runExactOperation<T>(
+    operation: (client: ChromeClient) => Promise<T>,
+  ): Promise<ExactChromeEndpointOperationResult<T>>;
+  release(): Promise<void>;
+}
+export type ExactChromeTargetOperationAuthority = Pick<
+  RetainedChromeEndpointAuthority,
+  "runExactOperation"
+>;
 
 export interface RemoteChromeConnection {
   client: ChromeClient;
   targetId: string;
   ownership: RemoteTargetOwnership;
+  targetCloseAuthority?: RetainedLiveChromeTargetAuthority;
   browserWSEndpoint?: string;
   close: () => Promise<void>;
 }
@@ -79,6 +94,7 @@ export interface RemoteChromeConnection {
 export interface IsolatedTabConnection {
   client: ChromeClient;
   targetId?: string;
+  targetCloseAuthority?: RetainedLiveChromeTargetAuthority;
 }
 
 interface TargetConnectMessages {
@@ -165,6 +181,45 @@ export async function connectToRemoteChromeTarget(
   );
   const ownership: RemoteTargetOwnership = options.targetId ? "attached" : "created";
   let targetId = options.targetId;
+  let attachedSessionId: string | null = null;
+  let browserReleased = false;
+  let closeTargetOnRelease = shouldCloseTargetOnDispose(ownership, options.closeTargetOnDispose);
+  const releaseBrowser = async (): Promise<void> => {
+    if (browserReleased) return;
+    if (attachedSessionId) {
+      await browser.Target.detachFromTarget({ sessionId: attachedSessionId }).catch(
+        () => undefined,
+      );
+    }
+    if (closeTargetOnRelease && targetId) {
+      const closed = await browser.Target.closeTarget({ targetId });
+      if (closed.success === false) {
+        throw new Error(`Chrome rejected target close for ${targetId}`);
+      }
+      closeTargetOnRelease = false;
+    }
+    await browser.close();
+    browserReleased = true;
+  };
+  const targetCloseAuthority: RetainedLiveChromeTargetAuthority = {
+    runExactOperation: async (operation) => {
+      if (browserReleased) {
+        return {
+          status: "unsafe",
+          reason: "Retained live Chrome target authority has already been released",
+        };
+      }
+      try {
+        return { status: "completed", value: await operation(browser) };
+      } catch (error) {
+        return {
+          status: "unsafe",
+          reason: `Retained live Chrome target operation failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+    release: releaseBrowser,
+  };
   try {
     if (!targetId) {
       const created = await browser.Target.createTarget({
@@ -174,32 +229,38 @@ export async function connectToRemoteChromeTarget(
       logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
     }
     const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
+    attachedSessionId = attached.sessionId;
     const client = createSessionBoundChromeClient(browser, attached.sessionId);
     return {
       client,
       targetId,
       browserWSEndpoint: options.browserWSEndpoint,
       ownership,
-      close: async () => {
-        await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-          () => undefined,
-        );
-        if (options.closeTargetOnDispose && targetId) {
-          await browser.Target.closeTarget({ targetId }).catch(() => undefined);
-        }
-        await browser.close().catch(() => undefined);
-      },
+      targetCloseAuthority,
+      close: releaseBrowser,
     };
   } catch (error) {
+    let cleanupError: unknown;
     if (ownership === "created" && targetId) {
       try {
-        await browser.Target.closeTarget({ targetId });
+        const closed = await browser.Target.closeTarget({ targetId });
+        if (closed.success === false) {
+          throw new Error(`Chrome rejected cleanup of unused target ${targetId}`);
+        }
+        closeTargetOnRelease = false;
       } catch (closeError) {
+        cleanupError = closeError;
         const message = closeError instanceof Error ? closeError.message : String(closeError);
         logger(`Failed to close unused remote Chrome tab ${targetId}: ${message}`);
       }
     }
-    await browser.close().catch(() => undefined);
+    await releaseBrowser().catch(() => undefined);
+    if (cleanupError) {
+      throw new ExactTargetCleanupUnconfirmedError(
+        `Remote Chrome target acquisition failed and cleanup was not confirmed for ${targetId}`,
+        new AggregateError([error, cleanupError], "Remote target acquisition and cleanup failed"),
+      );
+    }
     throw error;
   }
 }
@@ -411,6 +472,41 @@ export async function connectWithNewTab(
   const client = await connectToChrome(port, logger, effectiveHost);
   return { client };
 }
+export async function connectWithNewTabWithRetainedLiveAuthority(
+  port: number,
+  logger: BrowserLogger,
+  initialUrl = "about:blank",
+  host = "127.0.0.1",
+  options?: { retries?: number; retryDelayMs?: number },
+): Promise<RemoteChromeConnection> {
+  const retries = Math.max(0, options?.retries ?? 0);
+  const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 250);
+  let attempt = 0;
+  while (attempt <= retries) {
+    try {
+      const endpoint = await discoverBrowserWebSocketEndpoint(host, port);
+      const connection = await connectToRemoteChromeTarget(host, port, logger, {
+        browserWSEndpoint: endpoint.browserWSEndpoint,
+        targetUrl: initialUrl,
+        closeTargetOnDispose: false,
+      });
+      if (!connection.targetCloseAuthority) {
+        await connection.close().catch(() => undefined);
+        throw new Error("Chrome connection did not retain exact live target authority.");
+      }
+      return connection;
+    } catch (error) {
+      if (error instanceof ExactTargetCleanupUnconfirmedError) throw error;
+      if (attempt >= retries) throw error;
+      attempt += 1;
+      logger(
+        `Failed to open isolated browser tab with retained live authority (${error instanceof Error ? error.message : String(error)}); retrying.`,
+      );
+      await delay(retryDelayMs * attempt);
+    }
+  }
+  throw new Error("Failed to open isolated browser tab with retained live authority");
+}
 
 export async function closeTab(
   port: number,
@@ -530,7 +626,7 @@ export type ExactChromeTargetCleanupResult =
   | { status: "unsafe"; reason: string };
 
 async function runExactEndpointOperation<T>(
-  authority: RetainedChromeEndpointAuthority,
+  authority: ExactChromeTargetOperationAuthority,
   operation: (client: ChromeClient) => Promise<T>,
 ): Promise<ExactChromeEndpointOperationResult<T>> {
   if (!authority.runExactOperation) {
@@ -560,13 +656,6 @@ export function requireExactChromeEndpointOperation<T>(
     );
   }
   throw new ExactChromeEndpointAuthorityError(`${operation}: ${result.reason}`);
-}
-
-class ExactTargetCleanupUnconfirmedError extends Error {
-  constructor(message: string, cause: unknown) {
-    super(message, { cause });
-    this.name = "ExactTargetCleanupUnconfirmedError";
-  }
 }
 
 export async function connectToChromeTargetWithExactAuthority(options: {
@@ -622,7 +711,7 @@ export async function connectToChromeTargetWithExactAuthority(options: {
       browserWSEndpoint: options.authority.browserWSEndpoint,
       close: async () => {
         await client.close().catch(() => undefined);
-        if (!options.closeTargetOnDispose) return;
+        if (!shouldCloseTargetOnDispose(ownership, options.closeTargetOnDispose)) return;
         const closed = await runExactEndpointOperation(options.authority, async (exactClient) =>
           exactClient.Target.closeTarget({ targetId: connectedTargetId }),
         );
@@ -689,7 +778,7 @@ export async function connectWithNewTabWithExactAuthority(
 }
 
 export async function listChromeTargetsWithExactAuthority(
-  authority: RetainedChromeEndpointAuthority,
+  authority: ExactChromeTargetOperationAuthority,
 ): Promise<ExactChromeEndpointOperationResult<RemoteTargetInfo[]>> {
   return await runExactEndpointOperation(authority, async (client) => {
     const targetInfos = (await client.Target.getTargets()).targetInfos ?? [];
@@ -703,7 +792,7 @@ export async function listChromeTargetsWithExactAuthority(
 }
 
 export async function closeChromeTargetWithExactAuthority(options: {
-  authority: RetainedChromeEndpointAuthority;
+  authority: ExactChromeTargetOperationAuthority;
   targetId: string;
   logger: BrowserLogger;
 }): Promise<ExactChromeTargetCleanupResult> {

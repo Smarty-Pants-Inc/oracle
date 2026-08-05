@@ -2,10 +2,14 @@ import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import {
   archiveChatGptConversation,
+  archiveResultHasCommittedEffectAuthority,
   resolveBrowserArchiveDecision,
 } from "./actions/archiveConversation.js";
 import { readAssistantSnapshot, verifyCommittedPromptTurn } from "./pageActions.js";
-import { isStableConversationUrl as isConversationUrl } from "./conversationUrl.js";
+import {
+  extractStableConversationIdFromUrl,
+  isStableConversationUrl as isConversationUrl,
+} from "./conversationUrl.js";
 import {
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
@@ -35,6 +39,7 @@ export async function maybeArchiveCompletedConversation({
   logger,
   config,
   conversationUrl,
+  promptLocator,
   followUpCount,
   requiredArtifactsSaved,
 }: {
@@ -42,6 +47,7 @@ export async function maybeArchiveCompletedConversation({
   logger: BrowserLogger;
   config: ResolvedBrowserConfig;
   conversationUrl?: string | null;
+  promptLocator: CommittedPromptEpochLocator;
   followUpCount: number;
   requiredArtifactsSaved: boolean;
 }): Promise<BrowserArchiveResult> {
@@ -77,6 +83,7 @@ export async function maybeArchiveCompletedConversation({
     logger,
     mode: decision.mode,
     conversationUrl,
+    promptLocator,
   });
 }
 
@@ -93,11 +100,22 @@ export async function maybeArchiveInterruptedConversation({
   conversationUrl?: string | null;
   followUpCount: number;
 }): Promise<BrowserArchiveResult | null> {
-  const currentUrl = await readConversationUrl(Runtime);
-  const resolvedUrl = currentUrl && isConversationUrl(currentUrl) ? currentUrl : conversationUrl;
-  if (!resolvedUrl || !isConversationUrl(resolvedUrl)) {
+  const expectedConversationId = extractStableConversationIdFromUrl(conversationUrl ?? "");
+  if (!expectedConversationId || !conversationUrl || !isConversationUrl(conversationUrl)) {
     return null;
   }
+  const currentUrl = await readConversationUrl(Runtime);
+  if (currentUrl && extractStableConversationIdFromUrl(currentUrl) !== expectedConversationId) {
+    logger("[browser] ChatGPT archive skipped after interrupted run (archive-authority-mismatch).");
+    return {
+      mode: config.archiveConversations,
+      attempted: false,
+      archived: false,
+      reason: "archive-authority-mismatch",
+      conversationUrl,
+    };
+  }
+  const resolvedUrl = conversationUrl;
   const decision = resolveBrowserArchiveDecision({
     mode: config.archiveConversations,
     chatgptUrl: config.chatgptUrl ?? config.url,
@@ -129,15 +147,18 @@ async function runChatGptArchive({
   logger,
   mode,
   conversationUrl,
+  promptLocator,
 }: {
   Runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
   mode: BrowserArchiveResult["mode"];
   conversationUrl?: string | null;
+  promptLocator?: CommittedPromptEpochLocator;
 }): Promise<BrowserArchiveResult> {
-  return archiveChatGptConversation(Runtime, logger, {
+  const archive = await archiveChatGptConversation(Runtime, logger, {
     mode,
     conversationUrl,
+    promptLocator,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger(`[browser] ChatGPT archive failed (${message}).`);
@@ -150,6 +171,18 @@ async function runChatGptArchive({
       error: message,
     };
   });
+  if (archive.reason === "archive-authority-mismatch") {
+    throw new BrowserAutomationError(
+      "ChatGPT archive authority no longer matches the committed conversation and prompt epoch.",
+      {
+        stage: "browser-archive",
+        code: "archive-authority-mismatch",
+        conversationId: promptLocator?.conversationId,
+        promptEpochId: promptLocator?.epoch.epochId,
+      },
+    );
+  }
+  return archive;
 }
 
 export function withInterruptedArchiveDetails(
@@ -269,21 +302,17 @@ export async function assertCommittedPromptEpochCurrent(
 }
 
 /**
- * An archive confirmation may deliberately navigate the controlled tab away
- * from its conversation. In that one confirmed case, the exact answer was
- * already verified before archiving and its source is no longer inspectable.
- * A conversation route, including a different conversation, remains subject
- * to the full committed-turn proof.
+ * A successful archive result is authoritative only because the destructive
+ * click was guarded inside the browser effect against the exact committed
+ * conversation and prompt epoch. If no archive effect occurred, the source
+ * remains inspectable and must still pass the ordinary publication guard.
  */
 export async function assertPostArchivePromptEpochCurrent(
   Runtime: ChromeClient["Runtime"],
   locator: CommittedPromptEpochLocator,
   archive: BrowserArchiveResult,
 ): Promise<void> {
-  if (archive.archived) {
-    const postArchiveUrl = await readConversationUrl(Runtime);
-    if (postArchiveUrl && !isConversationUrl(postArchiveUrl)) return;
-  }
+  if (archiveResultHasCommittedEffectAuthority(archive, locator)) return;
   await assertCommittedPromptEpochCurrent(Runtime, locator);
 }
 

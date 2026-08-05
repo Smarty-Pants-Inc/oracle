@@ -11,13 +11,12 @@ import type {
 } from "../sessionManager.js";
 import type { SessionMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js";
+import type { BrowserCaptureFinalizationResult, BrowserLogger, ChromeClient } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { promptIdentitySha256 } from "./actions/promptComposer.js";
 import {
-  closeChromeTarget,
   closeChromeTargetWithExactAuthority,
-  connectWithNewTab,
+  connectWithNewTabWithRetainedLiveAuthority,
   connectWithNewTabWithExactAuthority,
   type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
@@ -45,6 +44,10 @@ import {
 import { isImageOnlyUiChromeText } from "./index.js";
 import { harvestChatGptTab } from "./liveTabs.js";
 import { buildConversationUrl } from "./reattachHelpers.js";
+import {
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "./targetCloseAuthority.js";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
 
@@ -75,27 +78,6 @@ export interface NonOwnedRecoveryEndpoint extends RecoveryEndpoint {
 type RecoveryReadyEndpoint = RecoveryEndpoint & {
   endpointAuthority?: RetainedChromeEndpointAuthority;
 };
-
-type RecoveryTarget = RecoveryEndpoint & { targetId: string };
-
-function recoveryTargetFromRuntime(runtime: BrowserRuntimeMetadata): RecoveryTarget | null {
-  const resource = runtime.recoveryCleanupResources?.[0];
-  const host = resource?.chromeHost;
-  const port = resource?.chromePort;
-  const targetId = resource?.chromeTargetId;
-  if (
-    typeof host !== "string" ||
-    host.trim().length === 0 ||
-    typeof port !== "number" ||
-    !Number.isInteger(port) ||
-    port <= 0 ||
-    typeof targetId !== "string" ||
-    targetId.trim().length === 0
-  ) {
-    return null;
-  }
-  return { host, port, targetId };
-}
 
 /** Resolve the exact conversation URL authorized by a committed prompt epoch. */
 export function resolveRecoveryUrl(
@@ -267,8 +249,9 @@ export async function recoverConversationTab(
   let owner: ManualChromeOwner | null = null;
   let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let target: { host: string; port: number; targetId: string } | null = null;
+  const readTarget = (): { host: string; port: number; targetId: string } | null => target;
   let targetEndpointAuthority: RetainedChromeEndpointAuthority | null = null;
-  let targetIsNonOwned = false;
+  let targetCloseCapability: BrowserRecoveryCleanupResourceMetadata["targetCloseCapability"];
   let targetUrl: string | undefined;
   let targetClosed = false;
   let leaseReleased = false;
@@ -321,6 +304,7 @@ export async function recoverConversationTab(
       chromeProfileRoot: userDataDir,
       userDataDir,
       chromeTargetId: targetCleanupPending ? (target?.targetId ?? undefined) : undefined,
+      targetCloseCapability: targetCleanupPending ? targetCloseCapability : undefined,
       conversationId: locator.conversationId,
       promptEpoch: locator.epoch,
       tabLease: !leaseReleased
@@ -370,20 +354,16 @@ export async function recoverConversationTab(
     }
     if (target && !targetClosed && cleanup?.ownsTarget === true) {
       try {
-        if (targetEndpointAuthority) {
-          const closed = await closeChromeTargetWithExactAuthority({
-            authority: targetEndpointAuthority,
+        if (!targetCloseCapability) {
+          errors.push("Recovered target has no retained exact close capability");
+        } else {
+          const closed = await closeChromeTargetWithRetainedCapability({
+            capability: targetCloseCapability,
             targetId: target.targetId,
             logger,
           });
           if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
           else errors.push(closed.reason);
-        } else if (targetIsNonOwned) {
-          const closed = await closeChromeTarget({ ...target, logger });
-          if (!closed) errors.push(`Recovered target close was not confirmed: ${target.targetId}`);
-          else targetClosed = true;
-        } else {
-          errors.push("Recovered owned target has no retained exact endpoint authority");
         }
       } catch (error) {
         errors.push(
@@ -477,21 +457,58 @@ export async function recoverConversationTab(
     const opened = await resources.journalAcquisition({
       intentRuntime: runtime("chrome-target"),
       acquire: async () => {
-        const connection = endpointAuthority
-          ? await connectWithNewTabWithExactAuthority(endpointAuthority, logger, targetMarkerUrl, {
-              retries: 6,
-            })
-          : await connectWithNewTab(endpoint.port, logger, targetMarkerUrl, endpoint.host, {
-              fallbackToDefault: false,
-              retries: 6,
-            });
-        if (!connection.targetId) throw new Error("Recovered Chrome target is missing an id.");
-        return { client: connection.client, targetId: connection.targetId };
+        let client: ChromeClient;
+        let targetId: string;
+        let closeAuthority: Parameters<typeof closeChromeTargetWithExactAuthority>[0]["authority"];
+        let releaseCloseAuthority: (() => Promise<void>) | undefined;
+        if (endpointAuthority) {
+          const connection = await connectWithNewTabWithExactAuthority(
+            endpointAuthority,
+            logger,
+            targetMarkerUrl,
+            { retries: 6 },
+          );
+          if (!connection.targetId) {
+            await connection.client.close().catch(() => undefined);
+            throw new Error("Recovered Chrome target is missing an id.");
+          }
+          client = connection.client;
+          targetId = connection.targetId;
+          closeAuthority = endpointAuthority;
+        } else {
+          const connection = await connectWithNewTabWithRetainedLiveAuthority(
+            endpoint.port,
+            logger,
+            targetMarkerUrl,
+            endpoint.host,
+            { retries: 6 },
+          );
+          if (!connection.targetId || !connection.targetCloseAuthority) {
+            await connection.close().catch(() => undefined);
+            throw new Error("Recovered Chrome target has no retained exact live close authority.");
+          }
+          client = connection.client;
+          targetId = connection.targetId;
+          closeAuthority = connection.targetCloseAuthority;
+          releaseCloseAuthority = connection.close;
+        }
+        const capability = retainChromeTargetCloseCapability({
+          generationId,
+          targetId,
+          close: (closeLogger) =>
+            closeChromeTargetWithExactAuthority({
+              authority: closeAuthority,
+              targetId,
+              logger: closeLogger,
+            }),
+          ...(releaseCloseAuthority ? { release: releaseCloseAuthority } : {}),
+        });
+        return { client, targetId, capability };
       },
       acquiredRuntime: (connection) => {
         target = { ...endpoint, targetId: connection.targetId };
         targetEndpointAuthority = endpointAuthority ?? null;
-        targetIsNonOwned = nonOwned;
+        targetCloseCapability = connection.capability;
         targetClosed = false;
         targetUrl = targetMarkerUrl;
         return runtime();
@@ -556,14 +573,19 @@ export async function recoverConversationTab(
           cleanup: settle,
         };
       } catch (error) {
-        const failedTarget = recoveryTargetFromRuntime(resources.runtime());
+        const failedTarget = readTarget();
         if (failedTarget && !targetClosed) {
-          const closed = await closeChromeTarget({ ...failedTarget, logger }).catch(() => false);
-          if (!closed) throw error;
+          if (!targetCloseCapability) throw error;
+          const closed = await closeChromeTargetWithRetainedCapability({
+            capability: targetCloseCapability,
+            targetId: failedTarget.targetId,
+            logger,
+          }).catch(() => ({ status: "unsafe" as const, reason: "target cleanup failed" }));
+          if (closed.status !== "completed" && closed.status !== "gone") throw error;
           targetClosed = true;
           target = null;
           targetEndpointAuthority = null;
-          targetIsNonOwned = false;
+          targetCloseCapability = undefined;
           await resources.persist(runtime());
         }
         const message = error instanceof Error ? error.message : String(error);

@@ -4,10 +4,8 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
-import {
-  missingRequiredArtifactDeliveries,
-  RemoteTransactionStore,
-} from "../../src/remote/transactionStore.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
+import { missingRequiredArtifactDeliveries } from "../../src/remote/transactionValidation.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 
 const authority = {
@@ -160,6 +158,10 @@ describe("RemoteArtifactStore", () => {
         transactionToken,
         mode: "abort",
         durablePublication: false,
+      });
+      await restartedTransactionStore.beginSettlementExecution({
+        transactionToken,
+        mode: "abort",
       });
       await restartedTransactionStore.completeSettlement({
         transactionToken,

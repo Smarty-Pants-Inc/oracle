@@ -34,7 +34,6 @@ import {
   deriveNotificationSettingsFromMetadata,
 } from "./notifier.js";
 import { sessionStore } from "../sessionStore.js";
-import { wait } from "../sessionManager.js";
 import { runMultiModelApiSession, type MultiModelRunSummary } from "../oracle/multiModelRunner.js";
 import { MODEL_CONFIGS, DEFAULT_SYSTEM_PROMPT } from "../oracle/config.js";
 import { isKnownModel } from "../oracle/modelResolver.js";
@@ -46,30 +45,32 @@ import { formatFinishLine } from "../oracle/finishLine.js";
 import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
-import {
-  resumeBrowserSession,
-  retryBrowserRecoveryCleanup,
-  type ReattachResult,
-} from "../browser/reattach.js";
+import { retryBrowserRecoveryCleanup } from "../browser/reattach.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
   hasRecoverableChatGptConversation,
 } from "../browser/reattachability.js";
-import { estimateTokenCount } from "../browser/utils.js";
-import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../browser/types.js";
-import { formatElapsed } from "../oracle/format.js";
+import type { BrowserLogger } from "../browser/types.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/profileState.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
 import {
+  durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
-  publishBrowserCapture,
-  publishedBrowserCaptureFailureFromError,
+  publishCompletedBrowserCapture,
   runtimeFromBrowserError,
   type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
+import {
+  MonotonicBrowserRuntimeAuthority,
+  hasBrowserRecoveryAuthority,
+  hasRemoteRecoveryAuthority,
+  hasResumableBrowserAuthority,
+  retryableInitialBrowserRuntime,
+} from "./browserRuntimeAuthority.js";
+import { autoReattachUntilComplete } from "./autoReattachController.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -241,121 +242,72 @@ export async function performSessionRun({
         modelSelection: result.modelSelection,
         warnings: result.warnings,
       };
-      let publicationFinalization: BrowserCaptureFinalizationResult;
-      try {
-        const publication = await publishBrowserCapture({
-          answerOptions: {
+      const publication = await publishCompletedBrowserCapture({
+        answer: {
+          sessionId: sessionMeta.id,
+          answer: result.answerText,
+        },
+        transaction: result,
+        browser: currentBrowser ?? {
+          config: browserConfig,
+          runtime: resultRuntime,
+        },
+        existingArtifacts: sessionMeta.artifacts,
+        prepareArtifacts: async () =>
+          ensureSessionArtifacts({
             sessionId: sessionMeta.id,
-            answer: result.answerText ?? "",
-          },
-          transaction: result,
-          persistAnswer: persistDurableBrowserAnswer,
-          prepare: async (receipt) => {
-            durableAnswerReceipt = receipt;
-            const artifacts = await ensureSessionArtifacts({
-              sessionId: sessionMeta.id,
-              prompt: result.promptText ?? runOptions.prompt,
-              answerMarkdown: result.answerText ?? "",
-              conversationUrl: result.runtime.tabUrl,
-              browserConfig,
-              existingArtifacts: result.artifacts,
-              logger: ((message?: string) => message && log(dim(message))) as BrowserLogger,
-            });
-            return { artifacts };
-          },
-          publish: async (receipt, prepared) => {
-            await sessionStore.updateSession(sessionMeta.id, {
-              status: "completed",
-              completedAt: new Date().toISOString(),
-              usage: result.usage,
-              elapsedMs: result.elapsedMs,
-              errorMessage: undefined,
-              browser: currentBrowser,
-              artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, prepared.artifacts), [
-                receipt.artifact,
-              ]),
-              response: undefined,
-              transport: undefined,
-              error: undefined,
-            });
-          },
-          persistRuntime: async (runtime) => {
-            const authoritativeRuntime = runtimeAuthority.observeHint(runtime);
-            currentBrowser = { ...currentBrowser, runtime: authoritativeRuntime };
-            await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
-          },
-        });
-        publicationFinalization = publication.finalization;
-        try {
-          await sessionStore.updateSession(sessionMeta.id, {
-            status: "completed",
-            browser: currentBrowser,
-          });
-        } catch (projectionError) {
-          log(
-            dim(
-              `Browser answer published; final completed browser projection failed: ${formatError(projectionError)}`,
-            ),
-          );
-        }
-      } catch (error) {
-        const publishedFailure = publishedBrowserCaptureFailureFromError(error);
-        if (!publishedFailure) throw error;
-        durableAnswerReceipt = publishedFailure.receipt;
-        publicationFinalization = publishedFailure.finalization;
-        const authoritativeRuntime = runtimeAuthority.observeHint(publicationFinalization.runtime);
-        currentBrowser = { ...currentBrowser, runtime: authoritativeRuntime };
-        try {
-          await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
-          log(
-            dim(
-              `Browser answer published; recovered final cleanup authority persistence after retry: ${formatError(error)}`,
-            ),
-          );
-        } catch (retryError) {
-          log(
-            kleur.yellow(
-              `Browser answer published; exact cleanup authority persistence remains deferred after retry: ${formatError(retryError)}`,
-            ),
-          );
-        }
-      }
-      if (publicationFinalization.status === "pending") {
+            prompt: result.promptText ?? runOptions.prompt,
+            answerMarkdown: result.answerText,
+            conversationUrl: resultRuntime.tabUrl,
+            browserConfig,
+            existingArtifacts: mergeArtifacts(sessionMeta.artifacts, result.artifacts),
+            logger: createBrowserLogger(log),
+          }),
+        usage: result.usage,
+        response: { status: "completed" },
+        elapsedMs: result.elapsedMs,
+        model: modelForStatus,
+        label: "Browser answer",
+        log: (message) => log(dim(message)),
+        persistAnswer: persistDurableBrowserAnswer,
+        projectRuntime: (runtime) => {
+          const authoritativeRuntime = runtimeAuthority.observeHint(runtime);
+          currentBrowser = {
+            ...(currentBrowser ?? { config: browserConfig }),
+            config: browserConfig,
+            runtime: authoritativeRuntime,
+          };
+          return authoritativeRuntime;
+        },
+      });
+
+      durableAnswerReceipt = publication.receipt;
+      currentBrowser = {
+        ...(currentBrowser ?? { config: browserConfig }),
+        config: browserConfig,
+        runtime: publication.finalization.runtime,
+      };
+      if (publication.finalization.status === "pending") {
         log(
-          kleur.yellow(
-            `Browser capture completed; cleanup remains pending: ${publicationFinalization.error}`,
-          ),
+          dim("Browser cleanup remains pending; saved the answer and cleanup authority for retry."),
         );
       }
-      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
+      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText, log);
       await sendSessionNotification(
         {
           sessionId: sessionMeta.id,
           sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
           mode,
-          model: sessionMeta.model,
+          model: sessionMeta.model ?? runOptions.model,
           usage: result.usage,
-          characters: result.answerText?.length,
+          characters: result.answerText.length,
         },
         notificationSettings,
         log,
-        result.answerText?.slice(0, 140),
+        result.answerText.slice(0, 140),
       ).catch((error) => {
         log(dim(`Browser answer published; notification failed: ${formatError(error)}`));
       });
-      if (modelForStatus) {
-        await sessionStore
-          .updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "completed",
-            completedAt: new Date().toISOString(),
-            usage: result.usage,
-          })
-          .catch((error) => {
-            log(
-              dim(`Browser answer published; model-run projection failed: ${formatError(error)}`),
-            );
-          });
-      }
       return;
     }
     const multiModels = Array.isArray(runOptions.models) ? runOptions.models.filter(Boolean) : [];
@@ -686,6 +638,7 @@ export async function performSessionRun({
       error: undefined,
     });
   } catch (error: unknown) {
+    durableAnswerReceipt ??= durableBrowserAnswerReceiptFromError(error);
     const message = formatError(error);
     log(`ERROR: ${message}`);
     markErrorLogged(error);
@@ -807,6 +760,7 @@ export async function performSessionRun({
         modelForStatus,
         notificationSettings,
         log,
+        writeAssistantOutput,
         maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
       });
       if (reattach.outcome === "exhausted") {
@@ -873,6 +827,7 @@ export async function performSessionRun({
           modelForStatus,
           notificationSettings,
           log,
+          writeAssistantOutput,
         });
         if (reattach.outcome !== "exhausted") {
           return;
@@ -984,6 +939,14 @@ export async function performSessionRun({
   }
 }
 
+function createBrowserLogger(log: (message?: string) => void): BrowserLogger {
+  const logger = ((message?: string) => {
+    if (message) log(dim(message));
+  }) as BrowserLogger;
+  logger.sessionLog = log;
+  return logger;
+}
+
 function mergeArtifacts(
   existing: SessionArtifact[] | undefined,
   additions: SessionArtifact[] | undefined,
@@ -999,324 +962,8 @@ function mergeArtifacts(
   return values.length > 0 ? values : undefined;
 }
 
-type BrowserPromptEpoch = NonNullable<BrowserRuntimeMetadata["promptEpoch"]>;
-
-/**
- * Runtime hints are durable chronological observations. Error runtimes are snapshots captured
- * before the error escaped, so they may only replace the latest hint when they carry strictly
- * newer prompt or exact recovery authority. A terminal observation may explicitly clear the
- * settled generation. This keeps cleanup removal terminal for that generation without preventing
- * a later target/transaction generation from recovering.
- */
-class MonotonicBrowserRuntimeAuthority {
-  private current: BrowserRuntimeMetadata | undefined;
-  private readonly settledAuthorities = new Map<string, Set<string>>();
-  private errorSupersededByTerminalCleanup = false;
-
-  constructor(initial: BrowserRuntimeMetadata | undefined) {
-    this.current = initial;
-  }
-
-  observeHint(next: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-    return this.observe(next, "hint");
-  }
-
-  observeError(next: BrowserRuntimeMetadata | undefined): BrowserRuntimeMetadata | undefined {
-    this.errorSupersededByTerminalCleanup = false;
-    return next ? this.observe(next, "error") : this.current;
-  }
-
-  observeTerminal(next: BrowserRuntimeMetadata | undefined): BrowserRuntimeMetadata | undefined {
-    this.errorSupersededByTerminalCleanup = false;
-    return next ? this.observe(next, "terminal") : this.current;
-  }
-
-  didTerminalCleanupSupersedeError(): boolean {
-    return this.errorSupersededByTerminalCleanup;
-  }
-
-  private observe(
-    next: BrowserRuntimeMetadata,
-    source: "hint" | "error" | "terminal",
-  ): BrowserRuntimeMetadata {
-    const current = this.current;
-    if (!current) {
-      this.current = next;
-      return next;
-    }
-
-    const relation = comparePromptEpochs(current.promptEpoch, next.promptEpoch);
-    if (relation === "older" || relation === "conflict") return current;
-    if (relation === "newer") {
-      this.current = next;
-      return next;
-    }
-
-    const promptMerged = mergeCommittedPromptAuthority(current, next);
-    if (!promptMerged) return current;
-    const epochKey = promptEpochKey(promptMerged.promptEpoch ?? current.promptEpoch);
-    const currentHasCleanup = hasCleanupAuthority(current);
-    const nextHasCleanup = hasCleanupAuthority(promptMerged);
-
-    if (epochKey && currentHasCleanup && !nextHasCleanup && source !== "error") {
-      const settled = this.settledAuthorities.get(epochKey) ?? new Set<string>();
-      for (const authority of recoveryAuthorityKeys(current)) settled.add(authority);
-      this.settledAuthorities.set(epochKey, settled);
-      this.current = promptMerged;
-      return promptMerged;
-    }
-
-    const settled = epochKey ? this.settledAuthorities.get(epochKey) : undefined;
-    if (settled?.size && nextHasCleanup && !hasNewRecoveryAuthority(promptMerged, settled)) {
-      if (source === "error") this.errorSupersededByTerminalCleanup = true;
-      const retained = mergeWithoutCleanupRegression(current, promptMerged);
-      this.current = retained;
-      return retained;
-    }
-
-    if (source !== "error") {
-      this.current = promptMerged;
-      return promptMerged;
-    }
-
-    const selected = selectErrorRuntime(current, promptMerged);
-    this.current = selected;
-    return selected;
-  }
-}
-
-function comparePromptEpochs(
-  current: BrowserPromptEpoch | undefined,
-  candidate: BrowserPromptEpoch | undefined,
-): "same" | "newer" | "older" | "conflict" {
-  if (!current || !candidate) return "same";
-  if (candidate.followUpOrdinal !== current.followUpOrdinal) {
-    return candidate.followUpOrdinal > current.followUpOrdinal ? "newer" : "older";
-  }
-  if (promptEpochKey(current) !== promptEpochKey(candidate)) return "conflict";
-  if (
-    current.status === "committed" &&
-    candidate.status === "committed" &&
-    committedPromptIdentity(current) !== committedPromptIdentity(candidate)
-  ) {
-    return "conflict";
-  }
-  return "same";
-}
-
-function promptEpochKey(epoch: BrowserPromptEpoch | undefined): string | undefined {
-  if (!epoch) return undefined;
-  return JSON.stringify([epoch.epochId, epoch.promptSha256, epoch.followUpOrdinal]);
-}
-
-function committedPromptIdentity(
-  epoch: Extract<BrowserPromptEpoch, { status: "committed" }>,
-): string {
-  return JSON.stringify([
-    epoch.epochId,
-    epoch.promptSha256,
-    epoch.followUpOrdinal,
-    epoch.conversationId,
-    epoch.verifiedUserTurnIndex,
-    epoch.verifiedUserTurnId,
-    epoch.verifiedUserMessageId,
-  ]);
-}
-
-function mergeCommittedPromptAuthority(
-  current: BrowserRuntimeMetadata,
-  candidate: BrowserRuntimeMetadata,
-): BrowserRuntimeMetadata | null {
-  const currentEpoch = current.promptEpoch;
-  const candidateEpoch = candidate.promptEpoch;
-  if (candidateEpoch?.status === "committed") {
-    if (
-      candidate.conversationId !== undefined &&
-      candidate.conversationId !== candidateEpoch.conversationId
-    ) {
-      return null;
-    }
-    return {
-      ...candidate,
-      conversationId: candidate.conversationId ?? candidateEpoch.conversationId,
-    };
-  }
-  if (currentEpoch?.status !== "committed") return candidate;
-  return {
-    ...candidate,
-    promptEpoch: currentEpoch,
-    conversationId: current.conversationId ?? currentEpoch.conversationId,
-    ...(candidate.tabUrl === undefined && current.tabUrl !== undefined
-      ? { tabUrl: current.tabUrl }
-      : {}),
-  };
-}
-
-function hasCleanupAuthority(runtime: BrowserRuntimeMetadata): boolean {
-  return Boolean(runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult);
-}
-
-function cleanupRank(runtime: BrowserRuntimeMetadata): number {
-  return runtime.recoveryCleanupResult?.status === "failed"
-    ? 2
-    : hasCleanupAuthority(runtime)
-      ? 1
-      : 0;
-}
-
-function selectErrorRuntime(
-  current: BrowserRuntimeMetadata,
-  candidate: BrowserRuntimeMetadata,
-): BrowserRuntimeMetadata {
-  const currentAuthorities = new Set(recoveryAuthorityKeys(current));
-  const candidateAuthorities = recoveryAuthorityKeys(candidate);
-  const hasNewAuthority = candidateAuthorities.some(
-    (authority) => !currentAuthorities.has(authority),
-  );
-  if (hasNewAuthority && hasCoherentBrowserRecoveryAuthority(candidate)) return candidate;
-
-  const currentRank = cleanupRank(current);
-  const candidateRank = cleanupRank(candidate);
-  if (candidateRank > currentRank) return candidate;
-  if (candidateRank < currentRank) return mergeWithoutCleanupRegression(current, candidate);
-
-  const currentEpoch = current.promptEpoch;
-  const candidateEpoch = candidate.promptEpoch;
-  if (currentEpoch?.status !== "committed" && candidateEpoch?.status === "committed") {
-    return candidate;
-  }
-  return mergeWithoutCleanupRegression(current, candidate);
-}
-
-function mergeWithoutCleanupRegression(
-  current: BrowserRuntimeMetadata,
-  candidate: BrowserRuntimeMetadata,
-): BrowserRuntimeMetadata {
-  const merged: BrowserRuntimeMetadata = {
-    ...current,
-    ...(candidate.browserTransport ? { browserTransport: candidate.browserTransport } : {}),
-    ...(candidate.chromePid !== undefined ? { chromePid: candidate.chromePid } : {}),
-    ...(candidate.chromeProcessIdentity
-      ? { chromeProcessIdentity: candidate.chromeProcessIdentity }
-      : {}),
-    ...(candidate.chromePort !== undefined ? { chromePort: candidate.chromePort } : {}),
-    ...(candidate.chromeHost ? { chromeHost: candidate.chromeHost } : {}),
-    ...(candidate.chromeBrowserWSEndpoint
-      ? { chromeBrowserWSEndpoint: candidate.chromeBrowserWSEndpoint }
-      : {}),
-    ...(candidate.chromeProfileRoot ? { chromeProfileRoot: candidate.chromeProfileRoot } : {}),
-    ...(candidate.userDataDir ? { userDataDir: candidate.userDataDir } : {}),
-    ...(candidate.chromeTargetId ? { chromeTargetId: candidate.chromeTargetId } : {}),
-    ...(candidate.tabUrl ? { tabUrl: candidate.tabUrl } : {}),
-    ...(candidate.conversationId ? { conversationId: candidate.conversationId } : {}),
-    ...(candidate.promptEpoch ? { promptEpoch: candidate.promptEpoch } : {}),
-    ...(candidate.controllerPid !== undefined ? { controllerPid: candidate.controllerPid } : {}),
-  };
-  if (current.recoveryCleanupResources) {
-    merged.recoveryCleanupResources = current.recoveryCleanupResources;
-  }
-  if (current.recoveryCleanupResult) {
-    merged.recoveryCleanupResult = current.recoveryCleanupResult;
-  }
-  return merged;
-}
-
-function hasNewRecoveryAuthority(
-  runtime: BrowserRuntimeMetadata,
-  settled: ReadonlySet<string>,
-): boolean {
-  return (
-    hasCoherentBrowserRecoveryAuthority(runtime) &&
-    recoveryAuthorityKeys(runtime).some((authority) => !settled.has(authority))
-  );
-}
-
-function hasCoherentBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata): boolean {
-  if (!hasBrowserRecoveryAuthority(runtime)) return false;
-  const epoch = runtime.promptEpoch;
-  const conversationId =
-    epoch?.status === "committed" ? epoch.conversationId : runtime.conversationId;
-  for (const resource of runtime.recoveryCleanupResources ?? []) {
-    if (conversationId && resource.conversationId && resource.conversationId !== conversationId) {
-      return false;
-    }
-    if (
-      epoch &&
-      resource.promptEpoch &&
-      comparePromptEpochs(epoch, resource.promptEpoch) !== "same"
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function recoveryAuthorityKeys(runtime: BrowserRuntimeMetadata): string[] {
-  const keys = new Set<string>();
-  addTargetAuthorityKey(keys, runtime.chromeTargetId, runtime.conversationId);
-  for (const resource of runtime.recoveryCleanupResources ?? []) {
-    addTargetAuthorityKey(
-      keys,
-      resource.chromeTargetId,
-      resource.conversationId ?? runtime.conversationId,
-    );
-    if (resource.remoteRecovery?.transactionToken) {
-      keys.add(`remote:${resource.remoteRecovery.transactionToken}`);
-    }
-    if (resource.acquisition?.generationId) {
-      keys.add(`generation:${resource.acquisition.generationId}`);
-    }
-    if (resource.tabLease?.id) keys.add(`lease:${resource.tabLease.id}`);
-    if (resource.chromeProcessIdentity) {
-      const identity = resource.chromeProcessIdentity;
-      keys.add(
-        `process:${identity.pid}:${identity.processStartTime}:${identity.launchNonce}:${identity.normalizedUserDataDir}`,
-      );
-    } else if (resource.chromePid !== undefined) {
-      keys.add(`pid:${resource.chromePid}:${resource.userDataDir ?? ""}`);
-    }
-  }
-  return [...keys];
-}
-
-function addTargetAuthorityKey(
-  keys: Set<string>,
-  targetId: string | undefined,
-  conversationId: string | undefined,
-): void {
-  if (!targetId?.trim()) return;
-  keys.add(`target:${targetId.trim()}:${conversationId?.trim() ?? ""}`);
-}
-
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function retryableInitialBrowserRuntime(
-  runtime: BrowserRuntimeMetadata | null | undefined,
-): BrowserRuntimeMetadata | undefined {
-  if (!runtime?.recoveryCleanupResources?.length || !runtime.recoveryCleanupResult) {
-    return undefined;
-  }
-  if (hasPendingChromeAcquisitionIntent(runtime)) {
-    return hasExactPendingChromeAcquisitionAuthority(runtime) ? runtime : undefined;
-  }
-  return hasCoherentBrowserRecoveryAuthority(runtime) ? runtime : undefined;
-}
-
-function hasRemoteRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
-  return Boolean(runtime?.recoveryCleanupResources?.some((resource) => resource.remoteRecovery));
-}
-
-function hasBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
-  return hasRemoteRecoveryAuthority(runtime) || hasRecoverableChatGptConversation(runtime);
-}
-
-function hasResumableBrowserAuthority(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
-  return (
-    (hasRemoteRecoveryAuthority(runtime) && !runtime?.recoveryCleanupResult?.settlementMode) ||
-    hasRecoverableChatGptConversation(runtime)
-  );
 }
 
 function providerFailureContextForModel(
@@ -1654,409 +1301,6 @@ async function writeAssistantOutput(
       }
     }
     log(dim(`write-output failed (${reason}); session completed anyway.`));
-  }
-}
-
-type AutoReattachOutcome = {
-  outcome: "completed" | "terminal" | "exhausted";
-  runtime?: BrowserRuntimeMetadata;
-};
-function isTerminalAutoReattachError(error: unknown): boolean {
-  const userError = asOracleUserError(error);
-  if (userError?.category !== "browser-automation") return false;
-  const details = userError.details as
-    | {
-        code?: string;
-        reattachable?: boolean;
-        reattachClassification?: string;
-        recoverableDisconnect?: boolean;
-      }
-    | undefined;
-  return (
-    details?.recoverableDisconnect === false ||
-    details?.reattachable === false ||
-    details?.reattachClassification === "explicit-selector-terminal" ||
-    details?.code === "committed-prompt-identity-mismatch"
-  );
-}
-
-async function autoReattachUntilComplete({
-  sessionMeta,
-  runtime,
-  browserConfig,
-  browserMetadata,
-  runOptions,
-  modelForStatus,
-  notificationSettings,
-  log,
-  maxAttempts,
-}: {
-  sessionMeta: SessionMetadata;
-  runtime?: BrowserRuntimeMetadata;
-  browserConfig?: BrowserSessionConfig;
-  browserMetadata?: SessionMetadata["browser"];
-  runOptions: RunOracleOptions;
-  modelForStatus?: string;
-  notificationSettings: NotificationSettings;
-  log: (message?: string) => void;
-  maxAttempts?: number;
-}): Promise<AutoReattachOutcome> {
-  if (!runtime || !browserConfig) {
-    log(dim("Auto-reattach disabled: missing runtime or browser config."));
-    return { outcome: "exhausted" };
-  }
-  const delayMs = Math.max(0, browserConfig.autoReattachDelayMs ?? 0);
-  const intervalMs = Math.max(0, browserConfig.autoReattachIntervalMs ?? 0);
-  if (intervalMs <= 0) {
-    return { outcome: "exhausted", runtime };
-  }
-  const timeoutMs =
-    Math.max(0, browserConfig.autoReattachTimeoutMs ?? 0) ||
-    Math.max(0, browserConfig.timeoutMs ?? 0) ||
-    120_000;
-  const maxTotalMs = 2 * 60 * 60 * 1000; // 2h hard cap; avoid infinite polling by default.
-  const maxDeadline = Date.now() + maxTotalMs;
-  const attemptLimit =
-    typeof maxAttempts === "number" && maxAttempts > 0
-      ? Math.floor(maxAttempts)
-      : Number.POSITIVE_INFINITY;
-
-  if (delayMs > 0) {
-    log(dim(`Auto-reattach starting in ${formatElapsed(delayMs)}...`));
-    await wait(delayMs);
-  }
-  if (Number.isFinite(attemptLimit)) {
-    log(dim(`Auto-reattach will try up to ${attemptLimit} attempt(s).`));
-  } else {
-    log(
-      dim(`Auto-reattach will stop after ${formatElapsed(maxTotalMs)} if no answer is captured.`),
-    );
-  }
-
-  const logger: BrowserLogger = ((message?: string) => {
-    if (message) {
-      log(dim(message));
-    }
-  }) as BrowserLogger;
-  logger.verbose = true;
-  const recoveryLockPath = path.join(
-    (await sessionStore.getPaths(sessionMeta.id)).dir,
-    "browser-recovery.lock",
-  );
-  let retryRuntime = runtime;
-  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime);
-
-  let attempt = 0;
-  for (;;) {
-    const remainingBudgetMs = maxDeadline - Date.now();
-    if (remainingBudgetMs <= 0) {
-      log(
-        dim(
-          `Auto-reattach stopped after ${formatElapsed(maxTotalMs)} without capturing an answer.`,
-        ),
-      );
-      return { outcome: "exhausted", runtime: retryRuntime };
-    }
-    attempt += 1;
-    log(dim(`Auto-reattach attempt ${attempt}...`));
-    let captureSucceeded = false;
-    let durablyCompleted = false;
-    let reattachResult: ReattachResult | null = null;
-    let answerReceipt: DurableBrowserAnswerReceipt | undefined;
-    let authoritativeRuntime = retryRuntime;
-    let remotePublicationAcknowledged = false;
-    try {
-      const reattachConfig: BrowserSessionConfig = {
-        ...browserConfig,
-        timeoutMs,
-      };
-      reattachResult = await resumeBrowserSession(retryRuntime, reattachConfig, logger, {
-        recoveryLockPath,
-        isRemotePublicationAcknowledged: () => remotePublicationAcknowledged,
-        runtimeHintCb: async (latestRuntime) => {
-          const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
-          authoritativeRuntime = persistedRuntime;
-          retryRuntime = persistedRuntime;
-          await sessionStore.updateSession(sessionMeta.id, {
-            browser: {
-              ...browserMetadata,
-              config: browserConfig,
-              runtime: persistedRuntime,
-            },
-          });
-        },
-      });
-      captureSucceeded = true;
-      authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
-      retryRuntime = authoritativeRuntime;
-      const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
-      const outputTokens = estimateTokenCount(answerText);
-      const usage = {
-        inputTokens: 0,
-        outputTokens,
-        reasoningTokens: 0,
-        totalTokens: outputTokens,
-      };
-      let publicationFinalization: BrowserCaptureFinalizationResult;
-      try {
-        const publication = await publishBrowserCapture({
-          answerOptions: {
-            sessionId: sessionMeta.id,
-            answer: answerText,
-            logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
-          },
-          transaction: reattachResult,
-          persistAnswer: persistDurableBrowserAnswer,
-          prepare: async (receipt) => {
-            answerReceipt = receipt;
-            const artifacts = await ensureSessionArtifacts({
-              sessionId: sessionMeta.id,
-              prompt: runOptions.prompt,
-              answerMarkdown: answerText,
-              conversationUrl: reattachResult?.runtime.tabUrl,
-              browserConfig,
-              existingArtifacts: sessionMeta.artifacts,
-              logger,
-            });
-            return { artifacts };
-          },
-          publish: async (receipt, prepared) => {
-            await sessionStore.updateSession(sessionMeta.id, {
-              status: "completed",
-              completedAt: new Date().toISOString(),
-              usage,
-              errorMessage: undefined,
-              browser: {
-                ...browserMetadata,
-                config: browserConfig,
-                runtime: reattachResult?.runtime ?? authoritativeRuntime,
-              },
-              artifacts: mergeArtifacts(mergeArtifacts(sessionMeta.artifacts, prepared.artifacts), [
-                receipt.artifact,
-              ]),
-              response: { status: "completed" },
-              error: undefined,
-              transport: undefined,
-            });
-            remotePublicationAcknowledged = true;
-          },
-          persistRuntime: async (latestRuntime) => {
-            const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
-            authoritativeRuntime = persistedRuntime;
-            retryRuntime = persistedRuntime;
-            await sessionStore.updateSession(sessionMeta.id, {
-              browser: {
-                ...browserMetadata,
-                config: browserConfig,
-                runtime: persistedRuntime,
-              },
-            });
-          },
-        });
-        publicationFinalization = publication.finalization;
-      } catch (error) {
-        const publishedFailure = publishedBrowserCaptureFailureFromError(error);
-        if (!publishedFailure) throw error;
-        durablyCompleted = true;
-        answerReceipt = publishedFailure.receipt;
-        publicationFinalization = publishedFailure.finalization;
-        const persistedRuntime = runtimeAuthority.observeHint(publicationFinalization.runtime);
-        authoritativeRuntime = persistedRuntime;
-        retryRuntime = persistedRuntime;
-        try {
-          await sessionStore.updateSession(sessionMeta.id, {
-            browser: {
-              ...browserMetadata,
-              config: browserConfig,
-              runtime: persistedRuntime,
-            },
-          });
-          log(
-            dim(
-              `Auto-reattach answer published; recovered final cleanup authority persistence after retry: ${formatError(error)}`,
-            ),
-          );
-        } catch (retryError) {
-          log(
-            kleur.yellow(
-              `Auto-reattach answer published; exact cleanup authority persistence remains deferred after retry: ${formatError(retryError)}`,
-            ),
-          );
-        }
-      }
-      durablyCompleted = true;
-      if (publicationFinalization.status === "pending") {
-        log(
-          kleur.yellow(
-            `Auto-reattach completed; browser cleanup remains pending: ${publicationFinalization.error}`,
-          ),
-        );
-      } else {
-        log(kleur.green("Auto-reattach succeeded; session marked completed."));
-      }
-      await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
-      await sendSessionNotification(
-        {
-          sessionId: sessionMeta.id,
-          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-          mode: sessionMeta.mode ?? "browser",
-          model: sessionMeta.model ?? runOptions.model,
-          usage: { inputTokens: 0, outputTokens },
-          characters: answerText.length,
-        },
-        notificationSettings,
-        log,
-        answerText.slice(0, 140),
-      ).catch((error) => {
-        log(dim(`Auto-reattach answer published; notification failed: ${formatError(error)}`));
-      });
-      if (modelForStatus) {
-        await sessionStore
-          .updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "completed",
-            completedAt: new Date().toISOString(),
-            usage,
-          })
-          .catch((error) => {
-            log(
-              dim(
-                `Auto-reattach answer published; model-run projection failed: ${formatError(error)}`,
-              ),
-            );
-          });
-      }
-      return { outcome: "completed", runtime: retryRuntime };
-    } catch (error) {
-      if (durablyCompleted) {
-        log(
-          dim(
-            `Auto-reattach completed, but a post-publication side effect failed: ${formatError(error)}`,
-          ),
-        );
-        return { outcome: "completed", runtime: retryRuntime };
-      }
-      if (captureSucceeded) {
-        const message = formatError(error);
-        const userError = asOracleUserError(error);
-        const capturedFailureRuntime = runtimeFromBrowserError(error);
-        const failureRuntime =
-          runtimeAuthority.observeError(capturedFailureRuntime) ?? authoritativeRuntime;
-        authoritativeRuntime = failureRuntime;
-        retryRuntime = failureRuntime;
-        const failureDetails =
-          userError?.details && capturedFailureRuntime
-            ? { ...userError.details, runtime: failureRuntime }
-            : userError?.details;
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          errorMessage: message,
-          browser: {
-            ...browserMetadata,
-            config: browserConfig,
-            runtime: failureRuntime,
-          },
-          ...(answerReceipt
-            ? { artifacts: mergeArtifacts(sessionMeta.artifacts, [answerReceipt.artifact]) }
-            : {}),
-          response: { status: "error", incompleteReason: "incomplete-capture" },
-          error: userError
-            ? {
-                category: userError.category,
-                message: userError.message,
-                details: failureDetails,
-              }
-            : { category: "internal", message },
-        });
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-          });
-        }
-        throw error;
-      }
-      const capturedErrorRuntime = runtimeFromBrowserError(error);
-      const terminalAutoReattachError = isTerminalAutoReattachError(error);
-      const errorRuntime = terminalAutoReattachError
-        ? runtimeAuthority.observeTerminal(capturedErrorRuntime)
-        : runtimeAuthority.observeError(capturedErrorRuntime);
-      if (errorRuntime) {
-        authoritativeRuntime = errorRuntime;
-        retryRuntime = errorRuntime;
-      }
-      const cleanupCompletedAfterCapturedError =
-        runtimeAuthority.didTerminalCleanupSupersedeError();
-      const message = formatError(error);
-      const userError = asOracleUserError(error);
-      if (
-        terminalAutoReattachError ||
-        cleanupCompletedAfterCapturedError ||
-        retryRuntime.recoveryCleanupResult?.settlementMode !== undefined ||
-        (capturedErrorRuntime !== undefined && !hasResumableBrowserAuthority(errorRuntime))
-      ) {
-        const details = userError?.details as { stage?: string } | undefined;
-        const incompleteReason =
-          details?.stage === "connection-lost" ? "chrome-disconnected" : "incomplete-capture";
-        const terminalDetails =
-          userError?.details && capturedErrorRuntime
-            ? { ...userError.details, runtime: errorRuntime }
-            : userError?.details;
-        const terminalError = userError
-          ? {
-              category: userError.category,
-              message: userError.message,
-              details: terminalDetails,
-            }
-          : { category: "internal" as const, message };
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          errorMessage: message,
-          browser: {
-            ...browserMetadata,
-            config: browserConfig,
-            runtime: retryRuntime,
-          },
-          response: { status: "error", incompleteReason },
-          error: terminalError,
-        });
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-            response: { status: "error", incompleteReason },
-            error: terminalError,
-          });
-        }
-        log(dim(`Auto-reattach stopped on terminal browser outcome: ${message}`));
-        return { outcome: "terminal", runtime: retryRuntime };
-      }
-      if (errorRuntime) {
-        await sessionStore.updateSession(sessionMeta.id, {
-          browser: {
-            ...browserMetadata,
-            config: browserConfig,
-            runtime: retryRuntime,
-          },
-        });
-      }
-      log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
-    }
-    if (attempt >= attemptLimit) {
-      log(dim(`Auto-reattach stopped after ${attempt} attempt(s) without capturing an answer.`));
-      return { outcome: "exhausted", runtime: retryRuntime };
-    }
-    const remainingAfterAttemptMs = maxDeadline - Date.now();
-    if (remainingAfterAttemptMs <= 0) {
-      log(
-        dim(
-          `Auto-reattach stopped after ${formatElapsed(maxTotalMs)} without capturing an answer.`,
-        ),
-      );
-      return { outcome: "exhausted", runtime: retryRuntime };
-    }
-    await wait(Math.min(intervalMs, remainingAfterAttemptMs));
   }
 }
 

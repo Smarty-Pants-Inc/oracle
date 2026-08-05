@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,12 +9,12 @@ import {
   positionChromeWindowOffscreen,
   registerTerminationHooks,
   type RetainedChromeEndpointAuthority,
+  type ChromeLaunchResult,
 } from "./chromeLifecycle.js";
 import {
   acquireManualChromeOwner,
   releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
-  type BrowserChrome,
   type ManualChromeOwner,
 } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
@@ -29,7 +30,10 @@ import type {
   ChromeClient,
   ResolvedBrowserConfig,
 } from "./types.js";
-import type { BrowserRuntimeMetadata } from "../sessionManager.js";
+import type {
+  BrowserRecoveryTargetCloseCapabilityMetadata,
+  BrowserRuntimeMetadata,
+} from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import {
   OwnedBrowserResourceTransaction,
@@ -65,6 +69,11 @@ import {
 import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
+
+import {
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "./targetCloseAuthority.js";
 
 async function connectOwnedProjectSourcesTarget(
   endpointAuthority: RetainedChromeEndpointAuthority,
@@ -123,6 +132,7 @@ export async function runBrowserProjectSources(
     ? manualProfileDir
     : await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-"));
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
+  const targetGenerationId = randomUUID();
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
     logger(`Manual login mode enabled; reusing persistent profile at ${userDataDir}`);
@@ -136,10 +146,11 @@ export async function runBrowserProjectSources(
 
   let tabLease: BrowserTabLease | null = null;
   let owner: ManualChromeOwner | null = null;
-  let chrome: BrowserChrome | null = null;
+  let chrome: ChromeLaunchResult | null = null;
   let endpointAuthority: RetainedChromeEndpointAuthority | null = null;
   let manualLeaseTeardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let isolatedTargetId: string | null = null;
+  let targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
   let client: ChromeClient | null = null;
   let removeTerminationHooks: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
@@ -182,6 +193,7 @@ export async function runBrowserProjectSources(
           chromeProfileRoot: userDataDir,
           userDataDir,
           chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
+          targetCloseCapability: targetCleanupPending ? targetCloseCapability : undefined,
           tabLease:
             tabLease && !leaseReleased
               ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
@@ -220,12 +232,12 @@ export async function runBrowserProjectSources(
     }
     await client?.close().catch(() => undefined);
     if (shouldCloseTarget && isolatedTargetId && chrome && !targetClosed) {
-      if (!endpointAuthority) {
-        errors.push("Project Sources target has no retained exact endpoint authority");
+      if (!targetCloseCapability) {
+        errors.push("Project Sources target has no retained exact close capability");
       } else {
         try {
-          const closed = await closeChromeTargetWithExactAuthority({
-            authority: endpointAuthority,
+          const closed = await closeChromeTargetWithRetainedCapability({
+            capability: targetCloseCapability,
             targetId: isolatedTargetId,
             logger,
           });
@@ -405,6 +417,18 @@ export async function runBrowserProjectSources(
     );
     client = connection.client;
     isolatedTargetId = connection.targetId ?? null;
+    if (isolatedTargetId) {
+      targetCloseCapability = retainChromeTargetCloseCapability({
+        generationId: targetGenerationId,
+        targetId: isolatedTargetId,
+        close: (closeLogger) =>
+          closeChromeTargetWithExactAuthority({
+            authority: endpointAuthority as RetainedChromeEndpointAuthority,
+            targetId: isolatedTargetId as string,
+            logger: closeLogger,
+          }),
+      });
+    }
     if (tabLease && isolatedTargetId) {
       await tabLease.update({
         chromeHost,

@@ -1,6 +1,6 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { closeChromeTarget } from "./chromeLifecycle.js";
+import { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
@@ -120,29 +120,40 @@ export async function settleRemoteResources(
     );
   }
   const targetId = pendingResource?.chromeTargetId ?? null;
-  const targetCleanupCompleted = Boolean(targetId && context.closedRemoteTargetId === targetId);
+  const targetCloseCapability = pendingResource?.targetCloseCapability ?? null;
+  const completedCapability = context.closedRemoteTargetCloseCapability;
+  const targetCleanupCompleted = Boolean(
+    targetId &&
+    targetCloseCapability &&
+    context.closedRemoteTargetId === targetId &&
+    completedCapability?.generationId === targetCloseCapability.generationId &&
+    completedCapability.capabilityId === targetCloseCapability.capabilityId,
+  );
   const shouldCloseOwnedRemoteTarget =
     !targetCleanupCompleted &&
     (aborting ? pendingOwnsTarget : pendingOwnsTarget && finalizeTargetCloseDecision === true);
   if (shouldCloseOwnedRemoteTarget) {
-    if (!targetId) {
-      errors.push("Owned remote Chrome target cleanup metadata is incomplete");
+    if (!targetId || !targetCloseCapability) {
+      errors.push("Owned remote Chrome target has no retained exact close capability");
     } else {
-      const closed = await closeChromeTarget({
-        port: context.port,
+      const closed = await closeChromeTargetWithRetainedCapability({
+        capability: targetCloseCapability,
         targetId,
         logger: context.logger,
-        host: context.host,
-        browserWSEndpoint: context.browserWSEndpoint,
       });
-      if (closed) context.closedRemoteTargetId = targetId;
-      else errors.push("Remote Chrome target close was not confirmed");
+      if (closed.status === "completed" || closed.status === "gone") {
+        context.closedRemoteTargetId = targetId;
+        context.closedRemoteTargetCloseCapability = targetCloseCapability;
+      } else {
+        errors.push(closed.reason);
+      }
     }
   }
   if (errors.length > 0) {
     return pendingBrowserCaptureCleanup(
       projectRetryableCleanupRuntime(pendingRuntime, {
         targetId: context.closedRemoteTargetId,
+        targetCloseCapability: context.closedRemoteTargetCloseCapability,
         tabLeaseId: context.releasedRemoteTabLeaseId,
       }),
       errors.join("; "),
@@ -162,18 +173,31 @@ export async function settleRemoteResources(
       );
     }
   }
-  if (
-    context.retainRemoteConnectionForSettlement &&
-    !context.connectionClosedUnexpectedly &&
-    context.connection
-  ) {
-    await context.connection.close();
+  const targetAuthorityReleased = Boolean(
+    targetId &&
+    targetCloseCapability &&
+    context.closedRemoteTargetId === targetId &&
+    context.closedRemoteTargetCloseCapability?.generationId ===
+      targetCloseCapability.generationId &&
+    context.closedRemoteTargetCloseCapability.capabilityId === targetCloseCapability.capabilityId,
+  );
+  if (targetAuthorityReleased) {
     context.retainRemoteConnectionForSettlement = false;
+  } else if (!context.connectionClosedUnexpectedly && context.connection) {
+    try {
+      await context.connection.close();
+      context.retainRemoteConnectionForSettlement = false;
+    } catch (error) {
+      errors.push(
+        `Remote Chrome connection release failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   const totalSeconds = (Date.now() - context.startedAt) / 1000;
   context.logger(`Remote session complete • ${totalSeconds.toFixed(1)}s total`);
   const retryableRuntime = projectRetryableCleanupRuntime(pendingRuntime, {
     targetId: context.closedRemoteTargetId,
+    targetCloseCapability: context.closedRemoteTargetCloseCapability,
     tabLeaseId: context.releasedRemoteTabLeaseId,
   });
   return errors.length > 0
@@ -304,6 +328,7 @@ export async function finalizeRemoteBrowserRun(
   await context.conversationUrlMonitor?.stop();
   try {
     if (
+      !context.ownsTarget &&
       !context.retainRemoteConnectionForSettlement &&
       !context.lifecycle.hasPendingPromptAuthorityJournal()
     ) {

@@ -7,6 +7,7 @@
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
 - Browser: submit uploaded prompts whenever ChatGPT exposes an enabled send button even if secondary attachment evidence is stale, and close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 - Browser: serialize manual-login Chrome ownership across normal runs, Project Sources, and recovery, reusing only exact-profile owners while keeping PID authority stable and tab leases independent.
+- Browser: bind deferred tab cleanup to opaque, generation-scoped live close capabilities instead of reconstructing destructive authority from saved DevTools addresses, target ids, or marker URLs. Pre-upgrade browser sessions without this capability now stay cleanup-pending and preserve the tab; complete them with the original running controller or restart them under the current version.
 
 ## 0.17.0 — 2026-08-02
 

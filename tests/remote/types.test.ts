@@ -4,6 +4,7 @@ import {
   RemoteBrowserAutomationErrorSchema,
   RemoteRunPayloadSchema,
   RemoteRunTransactionPayloadSchema,
+  RemoteSettlementAuthoritySchema,
   RemoteTransactionSettlementResponseSchema,
   RemoteTransactionRetryResponseSchema,
 } from "../../src/remote/types.js";
@@ -73,6 +74,7 @@ describe("remote public protocol schemas", () => {
       RemoteTransactionSettlementResponseSchema.safeParse({
         transactionToken,
         state: "finalized",
+        settlementAuthority: { mode: "finalize", outcome: "bound", state: "pending" },
         finalization: {
           status: "pending",
           runtime: { promptEpoch, cleanup: { status: "pending" } },
@@ -84,10 +86,42 @@ describe("remote public protocol schemas", () => {
       RemoteTransactionSettlementResponseSchema.safeParse({
         transactionToken,
         state: "pending",
+        settlementAuthority: { mode: "finalize", outcome: "completed", state: "finalized" },
         finalization: {
           status: "completed",
           runtime: { promptEpoch, cleanup: { status: "completed" } },
         },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects settlement authorities whose mode, outcome, and state contradict", () => {
+    expect(
+      RemoteSettlementAuthoritySchema.safeParse({
+        mode: "finalize",
+        outcome: "bound",
+        state: "pending",
+      }).success,
+    ).toBe(true);
+    expect(
+      RemoteSettlementAuthoritySchema.safeParse({
+        mode: "abort",
+        outcome: "completed",
+        state: "aborted",
+      }).success,
+    ).toBe(true);
+    expect(
+      RemoteSettlementAuthoritySchema.safeParse({
+        mode: "finalize",
+        outcome: "completed",
+        state: "aborted",
+      }).success,
+    ).toBe(false);
+    expect(
+      RemoteSettlementAuthoritySchema.safeParse({
+        mode: "abort",
+        outcome: "bound",
+        state: "finalized",
       }).success,
     ).toBe(false);
   });

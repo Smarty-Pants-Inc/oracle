@@ -1,149 +1,41 @@
-import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import path from "node:path";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
-import type {
-  BrowserModelSelectionEvidence,
-  BrowserRemotePromptRequestIdentity,
-  BrowserRuntimeMetadata,
-  BrowserSessionConfig,
-} from "../sessionManager.js";
+import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
-  RemotePublicRunResultSchema,
-  type RemoteArtifactDescriptor,
-  type RemotePublicRunResult,
-} from "./types.js";
+  applyRemoteTransactionTransition,
+  createRemoteTransactionRecord,
+} from "./transactionReducer.js";
+import type {
+  DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactRegistration,
+  DurableRemoteAutomationError,
+  DurableRemoteCaptureWarning,
+  ExpiredRemoteTransactionSettlement,
+  ReconcileRemoteTransactionResult,
+  RemoteTransactionBeginRecord,
+  RemoteTransactionControllerShutdownPlan,
+  RemoteTransactionRecord,
+  RemoteTransactionSettlementBinding,
+  RemoteTransactionSettlementExecution,
+  RemoteTransactionTransition,
+  RemoteTransactionTransitionOutcome,
+  RemoteTransactionTransitionType,
+} from "./transactionModel.js";
+import {
+  isTerminalRemoteTransactionState,
+  validateRemoteTransactionRecord,
+} from "./transactionValidation.js";
 import {
   MAX_REMOTE_TRANSACTION_RECORDS,
   MAX_REMOTE_TRANSACTION_STORE_BYTES,
   REMOTE_TERMINAL_RETENTION_MS,
-  REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
-  REMOTE_TRANSACTION_PROTOCOL_VERSION,
   REMOTE_TRANSACTION_TOKEN_PATTERN,
+  type RemotePublicRunResult,
 } from "./types.js";
-import {
-  applyRemoteTransactionTransition,
-  isTerminalRemoteTransactionState,
-  missingRequiredArtifactDeliveries,
-  type RemoteTransactionTransition,
-  type RemoteTransactionTransitionOutcome,
-  type RemoteTransactionTransitionType,
-} from "./transactionReducer.js";
-
-export {
-  missingRequiredArtifactDeliveries,
-  RemoteTransactionTransitionError,
-} from "./transactionReducer.js";
 
 const MAX_REMOTE_TRANSACTION_LEASE_MS = 24 * 60 * 60 * 1000;
-const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
-
-export type RemoteTransactionState =
-  | "running"
-  | "pending"
-  | "finalized"
-  | "aborted"
-  | "recoverable-error"
-  | "failed";
-
-export interface DurableRemoteArtifactDeliveryReceipt {
-  receiptId: string;
-  deliveredAt: string;
-  byteSize: number;
-  sha256: string;
-}
-
-export interface DurableRemoteFileIdentity {
-  device: string;
-  inode: string;
-  birthtimeNs: string;
-  ctimeNs: string;
-}
-
-export interface DurableRemoteAutomationError {
-  name: "BrowserAutomationError";
-  category: "browser-automation";
-  message: string;
-  code?: string;
-  stage?: string;
-  recoverableDisconnect: boolean;
-}
-
-export interface DurableRemoteArtifactRegistration {
-  descriptor: RemoteArtifactDescriptor & { required: boolean };
-  transactionToken: string;
-  canonicalPath: string;
-  fileIdentity: DurableRemoteFileIdentity;
-  deliveryReceipt?: DurableRemoteArtifactDeliveryReceipt;
-}
-
-export interface DurableRemoteTerminalAudit {
-  redactedAt: string;
-  settlementMode?: "finalize" | "abort";
-  publicationAcknowledgedAt?: string;
-  artifacts: Array<{
-    artifactId: string;
-    runId: string;
-    required: boolean;
-    deliveryReceipt?: DurableRemoteArtifactDeliveryReceipt;
-  }>;
-  errorCode?: string;
-  errorStage?: string;
-}
-export interface DurableRemoteCaptureWarning {
-  code: string;
-  message: string;
-}
-
-export interface DurableRemoteStagedCapture {
-  result: RemotePublicRunResult;
-  runtime: BrowserRuntimeMetadata;
-  modelSelection?: BrowserModelSelectionEvidence;
-  artifacts?: DurableRemoteArtifactRegistration[];
-  stagedAt: string;
-}
-
-export interface RemoteControllerRestartRecovery {
-  previousControllerGeneration: string;
-  reconciledAt: string;
-  reason: "controller-generation-changed";
-}
-
-export interface RemoteTransactionRecord {
-  protocolVersion: typeof REMOTE_TRANSACTION_PROTOCOL_VERSION;
-  transactionToken: string;
-  runId: string;
-  createdAt: string;
-  updatedAt: string;
-  controllerGeneration: string;
-  state: RemoteTransactionState;
-  capacityReservationBytes?: number;
-  requestIdentity: BrowserRemotePromptRequestIdentity;
-  browserConfig: BrowserSessionConfig;
-  leaseExpiresAt: string;
-  result?: RemotePublicRunResult;
-  runtime?: BrowserRuntimeMetadata;
-  runtimeJournaledAt?: string;
-  modelSelection?: BrowserModelSelectionEvidence;
-  artifacts?: DurableRemoteArtifactRegistration[];
-  stagedCapture?: DurableRemoteStagedCapture;
-  error?: DurableRemoteAutomationError;
-  settlementMode?: "finalize" | "abort";
-  publicationAcknowledgedAt?: string;
-  finalization?: BrowserCaptureFinalizationResult;
-  restartRecovery?: RemoteControllerRestartRecovery;
-  terminalAudit?: DurableRemoteTerminalAudit;
-}
-
-export type RemoteTransactionBeginRecord = Pick<
-  RemoteTransactionRecord,
-  | "protocolVersion"
-  | "transactionToken"
-  | "runId"
-  | "createdAt"
-  | "requestIdentity"
-  | "browserConfig"
->;
 
 export interface RemoteTransactionStoreOptions {
   directory: string;
@@ -154,42 +46,6 @@ export interface RemoteTransactionStoreOptions {
   now?: () => number;
   leaseDurationMs?: number;
 }
-
-export interface ReconcileRemoteTransactionResult {
-  transactionToken: string;
-  previousControllerGeneration: string;
-  state: "recoverable-error" | "failed";
-  hadRuntimeAuthority: boolean;
-}
-
-export type RemoteTransactionSettlementBinding =
-  | {
-      record: RemoteTransactionRecord;
-      status: "bound";
-      cleanupRuntime: BrowserRuntimeMetadata;
-    }
-  | {
-      record: RemoteTransactionRecord;
-      status: "completed";
-      finalization: BrowserCaptureFinalizationResult;
-    };
-
-export interface ExpiredRemoteTransactionSettlement {
-  mode: "finalize" | "abort";
-  durablePublication: boolean;
-}
-export type RemoteTransactionControllerShutdownAction =
-  | { action: "release" | "preserve" }
-  | {
-      action: "settle";
-      mode: "finalize" | "abort";
-      durablePublication: boolean;
-    };
-
-export type RemoteTransactionControllerShutdownPlan = RemoteTransactionControllerShutdownAction & {
-  record: RemoteTransactionRecord;
-};
-
 export class RemoteTransactionStore {
   readonly directory: string;
   readonly controllerGeneration: string;
@@ -234,17 +90,16 @@ export class RemoteTransactionStore {
   }
 
   async begin(record: RemoteTransactionBeginRecord): Promise<void> {
-    const updatedAt = this.nowIso();
-    const persisted: RemoteTransactionRecord = {
-      ...record,
-      updatedAt,
+    const persisted = createRemoteTransactionRecord(record, {
       controllerGeneration: this.controllerGeneration,
-      state: "running",
-      capacityReservationBytes: REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
-      leaseExpiresAt: new Date(Date.parse(updatedAt) + this.#leaseDurationMs).toISOString(),
-    };
-    validateRemoteTransactionRecord(persisted);
-    this.validateLeaseBound(persisted);
+      leaseDurationMs: this.#leaseDurationMs,
+      now: this.#now,
+      nowIso: () => this.nowIso(),
+    });
+    validateRemoteTransactionRecord(persisted, {
+      expectedTransactionToken: persisted.transactionToken,
+      maximumLeaseDurationMs: this.#leaseDurationMs,
+    });
     const contents = serializeRecord(persisted);
     await this.withMaintenanceLock(async () => {
       await this.pruneExpiredTerminalRecords();
@@ -274,8 +129,10 @@ export class RemoteTransactionStore {
     const targetPath = this.recordPath(transactionToken);
     try {
       const parsed = JSON.parse(await readFile(targetPath, "utf8")) as RemoteTransactionRecord;
-      validateRemoteTransactionRecord(parsed, transactionToken);
-      this.validateLeaseBound(parsed);
+      validateRemoteTransactionRecord(parsed, {
+        expectedTransactionToken: transactionToken,
+        maximumLeaseDurationMs: this.#leaseDurationMs,
+      });
       return parsed;
     } catch (error) {
       if (readErrorCode(error) === "ENOENT") return null;
@@ -481,6 +338,17 @@ export class RemoteTransactionStore {
     return { record: transition.record, ...transition.outcome };
   }
 
+  async beginSettlementExecution(params: {
+    transactionToken: string;
+    mode: "finalize" | "abort";
+  }): Promise<RemoteTransactionSettlementExecution> {
+    const transition = await this.transition(params.transactionToken, {
+      type: "begin-settlement-execution",
+      mode: params.mode,
+    });
+    return { record: transition.record, ...transition.outcome };
+  }
+
   async completeSettlement(params: {
     transactionToken: string;
     mode: "finalize" | "abort";
@@ -557,28 +425,24 @@ export class RemoteTransactionStore {
       const originalRunId = record.runId;
       const applied = applyRemoteTransactionTransition(record, transition, {
         controllerGeneration: this.controllerGeneration,
+        leaseDurationMs: this.#leaseDurationMs,
         now: this.#now,
         nowIso: () => this.nowIso(),
       });
       if (applied.persist) {
-        if (record.transactionToken !== transactionToken || record.runId !== originalRunId) {
+        if (
+          applied.record.transactionToken !== transactionToken ||
+          applied.record.runId !== originalRunId
+        ) {
           throw new Error("Remote transaction identity cannot change during a transition");
         }
-        const updatedAt = this.nowIso();
-        record.updatedAt = updatedAt;
-        record.capacityReservationBytes =
-          record.state === "running" ? REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES : undefined;
-        if (!isTerminalRemoteTransactionState(record.state)) {
-          record.leaseExpiresAt = new Date(
-            Date.parse(updatedAt) + this.#leaseDurationMs,
-          ).toISOString();
-        }
-        redactTerminalRecord(record, updatedAt);
-        validateRemoteTransactionRecord(record, transactionToken);
-        this.validateLeaseBound(record);
-        await this.write(record);
+        validateRemoteTransactionRecord(applied.record, {
+          expectedTransactionToken: transactionToken,
+          maximumLeaseDurationMs: this.#leaseDurationMs,
+        });
+        await this.write(applied.record);
       }
-      return { record, outcome: applied.outcome };
+      return { record: applied.record, outcome: applied.outcome };
     });
   }
 
@@ -645,8 +509,10 @@ export class RemoteTransactionStore {
       let record: RemoteTransactionRecord;
       try {
         record = JSON.parse(await readFile(targetPath, "utf8")) as RemoteTransactionRecord;
-        validateRemoteTransactionRecord(record, match[1]);
-        this.validateLeaseBound(record);
+        validateRemoteTransactionRecord(record, {
+          expectedTransactionToken: match[1],
+          maximumLeaseDurationMs: this.#leaseDurationMs,
+        });
       } catch (error) {
         if (readErrorCode(error) === "ENOENT") continue;
         throw error;
@@ -684,8 +550,10 @@ export class RemoteTransactionStore {
       const candidate = JSON.parse(
         await readFile(candidatePath, "utf8"),
       ) as RemoteTransactionRecord;
-      validateRemoteTransactionRecord(candidate, match[1]);
-      this.validateLeaseBound(candidate);
+      validateRemoteTransactionRecord(candidate, {
+        expectedTransactionToken: match[1],
+        maximumLeaseDurationMs: this.#leaseDurationMs,
+      });
       const chargedBytes = Math.max(fileStat.size, candidate.capacityReservationBytes ?? 0);
       records += 1;
       storedBytes += chargedBytes;
@@ -720,19 +588,6 @@ export class RemoteTransactionStore {
   private nowIso(): string {
     return new Date(this.#now()).toISOString();
   }
-
-  private validateLeaseBound(record: RemoteTransactionRecord): void {
-    if (isTerminalRemoteTransactionState(record.state)) return;
-    const updatedAt = Date.parse(record.updatedAt);
-    const leaseExpiresAt = Date.parse(record.leaseExpiresAt ?? "");
-    if (
-      !Number.isFinite(leaseExpiresAt) ||
-      leaseExpiresAt <= updatedAt ||
-      leaseExpiresAt - updatedAt > this.#leaseDurationMs
-    ) {
-      throw new Error("Remote transaction lease exceeds the configured bound");
-    }
-  }
 }
 
 export class RemoteTransactionCapacityError extends Error {
@@ -752,318 +607,8 @@ export class RemoteTransactionCapacityError extends Error {
   }
 }
 
-function assertArtifactRegistrationsOwned(
-  record: RemoteTransactionRecord,
-  artifacts: DurableRemoteArtifactRegistration[],
-): void {
-  const artifactIds = new Set<string>();
-  for (const artifact of artifacts) {
-    if (
-      artifact.transactionToken !== record.transactionToken ||
-      artifact.descriptor.runId !== record.runId ||
-      !artifact.canonicalPath ||
-      artifactIds.has(artifact.descriptor.artifactId)
-    ) {
-      throw new Error("Remote artifact registration is not uniquely owned by its transaction");
-    }
-    artifactIds.add(artifact.descriptor.artifactId);
-    if (artifact.deliveryReceipt) {
-      validateArtifactDeliveryReceipt(artifact, artifact.deliveryReceipt);
-    }
-  }
-}
-
-function validateArtifactDeliveryReceipt(
-  registration: DurableRemoteArtifactRegistration,
-  receipt: DurableRemoteArtifactDeliveryReceipt,
-): void {
-  if (
-    !receipt.receiptId ||
-    !Number.isFinite(Date.parse(receipt.deliveredAt)) ||
-    !Number.isSafeInteger(receipt.byteSize) ||
-    receipt.byteSize !== registration.descriptor.byteSize ||
-    receipt.sha256 !== registration.descriptor.sha256
-  ) {
-    throw new Error("Remote artifact delivery receipt does not match registered content");
-  }
-}
-
 function serializeRecord(record: RemoteTransactionRecord): Buffer {
   return Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
-}
-
-function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: string): void {
-  if (!isTerminalRemoteTransactionState(record.state)) return;
-  const promptEpoch = record.runtime?.promptEpoch ?? record.finalization?.runtime.promptEpoch;
-  record.terminalAudit ??= {
-    redactedAt,
-    settlementMode: record.settlementMode,
-    publicationAcknowledgedAt: record.publicationAcknowledgedAt,
-    artifacts: (record.artifacts ?? []).map((artifact) => ({
-      artifactId: artifact.descriptor.artifactId,
-      runId: artifact.descriptor.runId,
-      required: artifact.descriptor.required,
-      deliveryReceipt: artifact.deliveryReceipt,
-    })),
-    errorCode: record.error?.code,
-    errorStage: record.error?.stage,
-  };
-  record.finalization =
-    record.finalization?.status === "completed"
-      ? {
-          status: "completed",
-          runtime: promptEpoch ? { promptEpoch } : {},
-        }
-      : undefined;
-  record.result = undefined;
-  record.capacityReservationBytes = undefined;
-  Reflect.deleteProperty(record, "requestIdentity");
-  Reflect.deleteProperty(record, "browserConfig");
-  Reflect.deleteProperty(record, "leaseExpiresAt");
-  record.runtime = undefined;
-  record.runtimeJournaledAt = undefined;
-  record.modelSelection = undefined;
-  record.artifacts = undefined;
-  record.stagedCapture = undefined;
-  record.error = undefined;
-  record.settlementMode = undefined;
-  record.publicationAcknowledgedAt = undefined;
-  record.restartRecovery = undefined;
-}
-
-function validateRemoteTransactionRecord(
-  record: RemoteTransactionRecord,
-  expectedTransactionToken?: string,
-): void {
-  if (
-    record.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
-    !REMOTE_TRANSACTION_TOKEN_PATTERN.test(record.transactionToken) ||
-    (expectedTransactionToken && record.transactionToken !== expectedTransactionToken) ||
-    typeof record.runId !== "string" ||
-    !record.runId ||
-    typeof record.createdAt !== "string" ||
-    !Number.isFinite(Date.parse(record.createdAt)) ||
-    typeof record.updatedAt !== "string" ||
-    !Number.isFinite(Date.parse(record.updatedAt)) ||
-    !["running", "pending", "finalized", "aborted", "recoverable-error", "failed"].includes(
-      record.state,
-    )
-  ) {
-    throw new Error("Invalid remote transaction record");
-  }
-  if (typeof record.controllerGeneration !== "string" || !record.controllerGeneration) {
-    throw new Error("Remote transaction record is missing controller generation");
-  }
-  if (
-    (record.state === "running" &&
-      record.capacityReservationBytes !== REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES) ||
-    (record.state !== "running" && record.capacityReservationBytes !== undefined)
-  ) {
-    throw new Error("Remote transaction capacity reservation does not match its state");
-  }
-
-  if (isTerminalRemoteTransactionState(record.state)) {
-    validateTerminalRemoteTransactionRecord(record);
-    return;
-  }
-
-  const requestIdentity = record.requestIdentity;
-  if (
-    !requestIdentity ||
-    !Array.isArray(requestIdentity.acceptedPromptSha256) ||
-    requestIdentity.acceptedPromptSha256.length === 0 ||
-    requestIdentity.acceptedPromptSha256.length > 64 ||
-    !requestIdentity.acceptedPromptSha256.every((sha256) => SHA256_PATTERN.test(sha256)) ||
-    !Number.isSafeInteger(requestIdentity.followUpOrdinal) ||
-    requestIdentity.followUpOrdinal < 0 ||
-    requestIdentity.remainingFollowUps !== 0 ||
-    !record.browserConfig ||
-    typeof record.browserConfig !== "object" ||
-    Array.isArray(record.browserConfig) ||
-    typeof record.leaseExpiresAt !== "string" ||
-    !Number.isFinite(Date.parse(record.leaseExpiresAt))
-  ) {
-    throw new Error("Nonterminal remote transaction is missing bounded request authority");
-  }
-  if (
-    record.runtimeJournaledAt !== undefined &&
-    (!record.runtime || !Number.isFinite(Date.parse(record.runtimeJournaledAt)))
-  ) {
-    throw new Error("Remote transaction runtime journal is invalid");
-  }
-  if (record.runtime && (typeof record.runtime !== "object" || Array.isArray(record.runtime))) {
-    throw new Error("Remote transaction runtime authority is invalid");
-  }
-  if (record.finalization) validatePendingFinalization(record.finalization);
-  assertArtifactRegistrationsOwned(record, record.artifacts ?? []);
-  if (record.stagedCapture) validateStagedCapture(record);
-
-  switch (record.state) {
-    case "running":
-      if (
-        (record.stagedCapture && !record.runtime) ||
-        record.result ||
-        record.artifacts ||
-        record.error ||
-        record.settlementMode ||
-        record.publicationAcknowledgedAt ||
-        record.finalization ||
-        record.restartRecovery
-      ) {
-        throw new Error("Running remote transaction contains post-capture state");
-      }
-      return;
-    case "pending":
-      if (
-        !record.runtime ||
-        !record.result ||
-        record.stagedCapture ||
-        record.error ||
-        record.restartRecovery
-      ) {
-        throw new Error("Pending remote transaction requires runtime and captured result only");
-      }
-      if (!record.settlementMode) {
-        if (record.publicationAcknowledgedAt || record.finalization) {
-          throw new Error("Unbound pending transaction contains settlement state");
-        }
-        return;
-      }
-      if (record.runtime.recoveryCleanupResult?.settlementMode !== record.settlementMode) {
-        throw new Error("Bound pending transaction runtime lost its exact settlement mode");
-      }
-      if (record.settlementMode === "finalize") {
-        if (
-          !record.publicationAcknowledgedAt ||
-          !Number.isFinite(Date.parse(record.publicationAcknowledgedAt)) ||
-          missingRequiredArtifactDeliveries(record).length > 0
-        ) {
-          throw new Error("Finalize-bound transaction lacks publication or artifact durability");
-        }
-      } else if (record.publicationAcknowledgedAt) {
-        throw new Error("Abort-bound transaction cannot acknowledge answer publication");
-      }
-      return;
-    case "recoverable-error":
-      if (
-        !record.runtime ||
-        !record.error ||
-        !record.error.recoverableDisconnect ||
-        record.result ||
-        record.artifacts ||
-        record.modelSelection ||
-        record.publicationAcknowledgedAt ||
-        record.settlementMode === "finalize" ||
-        (record.finalization && record.settlementMode !== "abort")
-      ) {
-        throw new Error("Recoverable remote transaction lacks exact runtime failure authority");
-      }
-      if (
-        record.settlementMode === "abort" &&
-        record.runtime.recoveryCleanupResult?.settlementMode !== "abort"
-      ) {
-        throw new Error("Abort-bound recovery runtime lost its exact settlement mode");
-      }
-      return;
-  }
-}
-function validateStagedCapture(record: RemoteTransactionRecord): void {
-  const staged = record.stagedCapture;
-  if (!staged) return;
-  const epoch = staged.runtime?.promptEpoch;
-  if (
-    !Number.isFinite(Date.parse(staged.stagedAt)) ||
-    !staged.runtime ||
-    typeof staged.runtime !== "object" ||
-    Array.isArray(staged.runtime) ||
-    epoch?.status !== "committed" ||
-    !record.requestIdentity.acceptedPromptSha256.includes(epoch.promptSha256) ||
-    epoch.followUpOrdinal !== record.requestIdentity.followUpOrdinal ||
-    epoch.remainingFollowUps !== record.requestIdentity.remainingFollowUps ||
-    staged.runtime.conversationId !== epoch.conversationId
-  ) {
-    throw new Error("Staged remote capture lacks exact prompt and conversation identity");
-  }
-  RemotePublicRunResultSchema.parse(staged.result);
-  assertArtifactRegistrationsOwned(record, staged.artifacts ?? []);
-}
-
-function validatePendingFinalization(finalization: BrowserCaptureFinalizationResult): void {
-  if (
-    finalization.status !== "pending" ||
-    typeof finalization.error !== "string" ||
-    !finalization.error ||
-    !finalization.runtime ||
-    typeof finalization.runtime !== "object" ||
-    Array.isArray(finalization.runtime)
-  ) {
-    throw new Error("Nonterminal remote transaction finalization must remain pending");
-  }
-}
-
-function validateTerminalRemoteTransactionRecord(record: RemoteTransactionRecord): void {
-  const audit = record.terminalAudit;
-  if (
-    !audit ||
-    !Number.isFinite(Date.parse(audit.redactedAt)) ||
-    audit.artifacts.some((artifact) => artifact.runId !== record.runId)
-  ) {
-    throw new Error("Terminal remote transaction audit is invalid");
-  }
-  if (
-    record.capacityReservationBytes !== undefined ||
-    record.requestIdentity ||
-    record.browserConfig ||
-    record.leaseExpiresAt ||
-    record.result ||
-    record.runtime ||
-    record.runtimeJournaledAt ||
-    record.modelSelection ||
-    record.artifacts ||
-    record.stagedCapture ||
-    record.error ||
-    record.settlementMode ||
-    record.publicationAcknowledgedAt ||
-    record.restartRecovery ||
-    (record.finalization && record.finalization.status !== "completed")
-  ) {
-    throw new Error("Terminal remote transaction contains unredacted authority");
-  }
-  if (record.finalization && !record.finalization.runtime) {
-    throw new Error("Terminal finalization lacks redacted runtime metadata");
-  }
-  if (record.state === "finalized") {
-    if (
-      audit.settlementMode !== "finalize" ||
-      !audit.publicationAcknowledgedAt ||
-      !Number.isFinite(Date.parse(audit.publicationAcknowledgedAt)) ||
-      !record.finalization
-    ) {
-      throw new Error("Finalized remote transaction lacks completed finalize settlement");
-    }
-    return;
-  }
-  if (record.state === "aborted") {
-    if (
-      audit.settlementMode !== "abort" ||
-      audit.publicationAcknowledgedAt ||
-      !record.finalization
-    ) {
-      throw new Error("Aborted remote transaction lacks completed abort settlement");
-    }
-    return;
-  }
-  if (audit.settlementMode) {
-    if (
-      audit.settlementMode !== "abort" ||
-      audit.publicationAcknowledgedAt ||
-      !record.finalization
-    ) {
-      throw new Error("Failed remote transaction cleanup settlement is invalid");
-    }
-  } else if (record.finalization) {
-    throw new Error("Pre-authority failed transaction cannot contain finalization state");
-  }
 }
 
 async function syncDirectory(directory: string): Promise<void> {

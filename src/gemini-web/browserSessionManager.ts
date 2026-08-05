@@ -8,6 +8,7 @@ import type {
   ChromeClient,
 } from "../browser/types.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
 import {
   OwnedBrowserResourceTransaction,
   completedBrowserCaptureCleanup,
@@ -38,6 +39,10 @@ import {
   type BrowserTabLease,
   type BrowserTabLeaseTeardownAuthority,
 } from "../browser/tabLeaseRegistry.js";
+import {
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "../browser/targetCloseAuthority.js";
 
 export interface GeminiBrowserSession {
   profileDir: string;
@@ -90,6 +95,7 @@ export async function openGeminiBrowserSession(
   let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
   let endpointAuthority: RetainedChromeEndpointAuthority | null = null;
   let targetId: string | null = null;
+  let targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
   let client: ChromeClient | null = null;
   let targetClosed = false;
   let clientClosed = false;
@@ -132,6 +138,7 @@ export async function openGeminiBrowserSession(
           chromeProfileRoot: profileDir,
           userDataDir: profileDir,
           chromeTargetId: targetCleanupPending ? (targetId ?? undefined) : undefined,
+          targetCloseCapability: targetCleanupPending ? targetCloseCapability : undefined,
           tabLease: !leaseReleased
             ? {
                 id: tabLease?.id ?? leaseId,
@@ -179,12 +186,12 @@ export async function openGeminiBrowserSession(
       );
     }
     if (shouldCloseTarget && targetId && !targetClosed) {
-      if (!endpointAuthority) {
-        errors.push("Owned Gemini target has no retained exact endpoint authority");
+      if (!targetCloseCapability) {
+        errors.push("Owned Gemini target has no retained exact close capability");
       } else {
         try {
-          const closed = await closeChromeTargetWithExactAuthority({
-            authority: endpointAuthority,
+          const closed = await closeChromeTargetWithRetainedCapability({
+            capability: targetCloseCapability,
             targetId,
             logger,
           });
@@ -323,11 +330,22 @@ export async function openGeminiBrowserSession(
           { retries: 6 },
         );
         if (!opened.targetId) throw new Error("Failed to create an isolated Gemini browser tab.");
-        return { client: opened.client, targetId: opened.targetId };
+        const capability = retainChromeTargetCloseCapability({
+          generationId,
+          targetId: opened.targetId,
+          close: (closeLogger) =>
+            closeChromeTargetWithExactAuthority({
+              authority: acquiredEndpointAuthority,
+              targetId: opened.targetId as string,
+              logger: closeLogger,
+            }),
+        });
+        return { client: opened.client, targetId: opened.targetId, capability };
       },
       acquiredRuntime: (opened) => {
         client = opened.client;
         targetId = opened.targetId;
+        targetCloseCapability = opened.capability;
         return runtime();
       },
     });

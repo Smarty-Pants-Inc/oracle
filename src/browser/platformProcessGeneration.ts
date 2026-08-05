@@ -145,9 +145,8 @@ async function readDarwinProcessGeneration(
   }
   const auditGeneration = parseDarwinAuditPidVersion(appInfo, pid);
   if (auditGeneration) return auditGeneration;
-  // lsappinfo registers application processes only. A nonempty untrusted-looking response must
-  // not silently change identity sources, but an empty registration is normal for CLI processes.
-  if (appInfo.trim()) return null;
+  // Ordinary CLI processes can produce nonempty LaunchServices diagnostics or other non-audit
+  // output. Accept only the exact audit identity above; otherwise continue to kernel providers.
 
   const kernelGeneration = await readDarwinKernelProcessGeneration(pid, execute, timeoutMs);
   if (kernelGeneration) return kernelGeneration;

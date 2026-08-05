@@ -74,6 +74,7 @@ function createSettledGeminiTransaction(
     get runtime() {
       return settlement.runtime();
     },
+    bindSettlement: (mode) => settlement.bindSettlement(mode),
     finalize: () => settlement.settle("finalize"),
     abort: () => settlement.settle("abort"),
   };

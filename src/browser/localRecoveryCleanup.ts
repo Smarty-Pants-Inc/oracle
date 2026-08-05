@@ -1,16 +1,6 @@
 import { createHash } from "node:crypto";
-import {
-  closeChromeTarget,
-  closeChromeTargetWithExactAuthority,
-  listChromeTargetsWithExactAuthority,
-  listRemoteChromeTargets,
-  type RemoteTargetInfo,
-  type RetainedChromeEndpointAuthority,
-} from "./chromeLifecycle.js";
-import {
-  bindPersistedLocalEndpoint,
-  requiresExactLocalTargetBinding,
-} from "./pendingProcessAcquisition.js";
+import type { RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
+import { bindPersistedLocalEndpoint } from "./pendingProcessAcquisition.js";
 import {
   recoveryCleanupResourceKey,
   removeReleasedLeaseAuthority,
@@ -31,7 +21,9 @@ import type {
 } from "./reattachCleanupTypes.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
 import { releaseBrowserTabLease } from "./tabLeaseRegistry.js";
+import { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 import type { BrowserLogger } from "./types.js";
+
 export async function finalizeLocalRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
   logger: BrowserLogger,
@@ -42,14 +34,25 @@ export async function finalizeLocalRecoveryCleanupGroup(
   const errors: string[] = [];
   const pendingKeys = new Set<string>();
   const releasedLeaseIds = new Set<string>();
+  const settledTargetCapabilities = new Set<string>();
+  const processSubsumedTargets: RecoveryCleanupEntry[] = [];
+  let classification: RecoveryCleanupPhaseResult["classification"];
   const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
   const addPending = (entry: RecoveryCleanupEntry, error: string): void => {
-    const key = recoveryCleanupResourceKey(entry.resource);
+    const capabilityId = entry.resource.targetCloseCapability?.capabilityId;
+    const pendingEntry =
+      capabilityId && settledTargetCapabilities.has(capabilityId)
+        ? teardownOnlyEntry(entry)
+        : entry;
+    const key = recoveryCleanupResourceKey(pendingEntry.resource);
     if (!pendingKeys.has(key)) {
       pendingKeys.add(key);
-      pending.push(entry);
+      pending.push(pendingEntry);
     }
     errors.push(`Cleanup group ${groupLabel}: ${error}`);
+  };
+  const retainProcessSubsumedTargets = (error: string): void => {
+    for (const entry of processSubsumedTargets) addPending(entry, error);
   };
 
   let endpointAuthority: RetainedChromeEndpointAuthority | undefined;
@@ -87,7 +90,8 @@ export async function finalizeLocalRecoveryCleanupGroup(
         if (!cleanup.closeOwnedTargetOnComplete) continue;
       }
       const targetKey =
-        resource.chromeTargetId ?? `missing:${recoveryCleanupResourceKey(resource)}`;
+        resource.targetCloseCapability?.capabilityId ??
+        `missing:${recoveryCleanupResourceKey(resource)}`;
       const targetEntries = targets.get(targetKey);
       if (targetEntries) targetEntries.push(entry);
       else targets.set(targetKey, [entry]);
@@ -110,30 +114,19 @@ export async function finalizeLocalRecoveryCleanupGroup(
     connectionEntry ??= teardownRepresentative ?? group.entries[group.entries.length - 1];
     const connectionResource = connectionEntry?.resource;
     endpointPendingEntry = connectionEntry ?? teardownEntry;
-    let connectionPort = connectionResource
-      ? (connectionResource.chromePort ??
-        inferPortFromBrowserWSEndpoint(connectionResource.chromeBrowserWSEndpoint))
-      : undefined;
-    let connectionHost = connectionResource?.chromeHost ?? "127.0.0.1";
-    let connectionEndpoint = connectionResource?.chromeBrowserWSEndpoint;
     let recordedProcessExited = false;
 
-    const exactTargetBindingRequired =
-      targets.size > 0 &&
-      (!connectionResource || requiresExactLocalTargetBinding(connectionResource));
     const exactTeardownBindingRequired =
       teardownEntries.length > 0 &&
       !preserveProcess &&
       Boolean(teardownEntry?.resource.chromeProcessIdentity) &&
       !deps.terminateExactChromeForProfile;
 
-    if (exactTargetBindingRequired || exactTeardownBindingRequired) {
+    if (exactTeardownBindingRequired) {
       if (!connectionResource) {
-        const message = "Local Chrome cleanup endpoint metadata is missing";
-        for (const targetEntries of targets.values()) {
-          for (const entry of targetEntries) addPending(entry, message);
+        if (teardownEntry) {
+          addPending(teardownEntry, "Local Chrome cleanup endpoint metadata is missing");
         }
-        if (teardownEntry) addPending(teardownEntry, message);
         return { pending, errors };
       }
       try {
@@ -142,110 +135,75 @@ export async function finalizeLocalRecoveryCleanupGroup(
           recordedProcessExited = true;
         } else {
           endpointAuthority = binding.authority;
-          connectionHost = binding.host;
-          connectionPort = binding.port;
-          connectionEndpoint = binding.browserWSEndpoint;
         }
       } catch (error) {
         const message = `Exact Chrome endpoint authentication failed: ${error instanceof Error ? error.message : String(error)}`;
-        if (exactTargetBindingRequired) {
-          for (const targetEntries of targets.values()) {
-            for (const entry of targetEntries) addPending(entry, message);
-          }
-        }
         if (exactTeardownBindingRequired && teardownEntry) addPending(teardownEntry, message);
         return { pending, errors };
       }
     }
 
     if (!recordedProcessExited) {
-      let discoveredTargets: RemoteTargetInfo[] | null = null;
-      let exactTargetFailure: string | null = null;
       targetCleanup: for (const targetEntries of targets.values()) {
         const representative = targetEntries[0];
         if (!representative) continue;
         const resource = representative.resource;
-        let targetId = resource.chromeTargetId;
-        const targetMarkerUrl = resource.acquisition?.targetMarkerUrl;
-        if (!targetId && targetMarkerUrl && connectionResource && connectionPort) {
-          try {
-            if (endpointAuthority) {
-              const listed = await (
-                deps.listChromeTargetsWithExactAuthority ?? listChromeTargetsWithExactAuthority
-              )(endpointAuthority);
-              if (listed.status === "gone") {
-                recordedProcessExited = true;
-                break targetCleanup;
-              }
-              if (listed.status === "unsafe") {
-                exactTargetFailure = listed.reason;
-                break targetCleanup;
-              }
-              discoveredTargets ??= listed.value;
-            } else {
-              discoveredTargets ??= await (deps.listChromeTargets ?? listRemoteChromeTargets)({
-                host: connectionHost,
-                port: connectionPort,
-                browserWSEndpoint: connectionEndpoint,
-              });
-            }
-            const matches = discoveredTargets.filter(
-              (target) =>
-                target.type === "page" && target.url === targetMarkerUrl && target.targetId,
-            );
-            if (matches.length === 0) continue;
-            if (matches.length === 1) targetId = matches[0]?.targetId;
-            else {
-              for (const entry of targetEntries) {
-                addPending(
-                  entry,
-                  `Owned Chrome target acquisition marker is ambiguous: ${targetMarkerUrl}`,
-                );
-              }
-              continue;
-            }
-          } catch (error) {
-            for (const entry of targetEntries) {
-              addPending(
-                entry,
-                `Chrome target acquisition recovery failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-            continue;
-          }
+        const targetId = resource.chromeTargetId;
+        const capability = resource.targetCloseCapability;
+        if (
+          !targetId &&
+          resource.acquisition?.pendingResource === "chrome-target" &&
+          teardownEntry &&
+          teardownEntries.length > 0 &&
+          !preserveProcess &&
+          (endpointAuthority || deps.terminateExactChromeForProfile)
+        ) {
+          processSubsumedTargets.push(...targetEntries);
+          continue;
         }
-        if (!targetId || !connectionResource || !connectionPort) {
+        if (!targetId) {
+          const message =
+            resource.acquisition?.pendingResource === "chrome-target"
+              ? "Chrome target acquisition ended before exact target close authority was published; the target was preserved"
+              : "Owned Chrome target cleanup metadata is incomplete; the target was preserved";
+          for (const entry of targetEntries) addPending(entry, message);
+          continue;
+        }
+        if (!capability) {
+          classification = "legacy-session-target-authority";
           for (const entry of targetEntries) {
-            addPending(entry, "Owned Chrome target cleanup metadata is incomplete");
+            addPending(
+              entry,
+              "Pre-upgrade browser session has no generation-bound target cleanup capability. Oracle cannot safely reconstruct it from the saved endpoint or marker; the target was preserved. Complete or restart the browser session with the current Oracle version",
+            );
+          }
+          continue;
+        }
+        if (
+          resource.acquisition?.generationId &&
+          capability.generationId !== resource.acquisition.generationId
+        ) {
+          for (const entry of targetEntries) {
+            addPending(
+              entry,
+              "Persisted target close capability is not bound to the recorded acquisition generation; the target was preserved",
+            );
           }
           continue;
         }
         try {
-          if (endpointAuthority) {
-            const closed = await (
-              deps.closeChromeTargetWithExactAuthority ?? closeChromeTargetWithExactAuthority
-            )({ authority: endpointAuthority, targetId, logger });
-            if (closed.status === "gone") {
-              recordedProcessExited = true;
-              break targetCleanup;
-            }
-            if (closed.status === "unsafe") {
-              exactTargetFailure = closed.reason;
-              break targetCleanup;
-            }
-          } else {
-            const closed = await (deps.closeChromeTarget ?? closeChromeTarget)({
-              host: connectionHost,
-              port: connectionPort,
-              browserWSEndpoint: connectionEndpoint,
-              targetId,
-              logger,
-            });
-            if (!closed) {
-              for (const entry of targetEntries) {
-                addPending(entry, `Chrome target close was not confirmed: ${targetId}`);
-              }
-            }
+          const closed = await (
+            deps.closeChromeTargetWithRetainedCapability ?? closeChromeTargetWithRetainedCapability
+          )({ capability, targetId, logger });
+          if (closed.status === "completed" || closed.status === "gone") {
+            settledTargetCapabilities.add(capability.capabilityId);
+          }
+          if (closed.status === "gone") {
+            recordedProcessExited = true;
+            break targetCleanup;
+          }
+          if (closed.status === "unsafe" || closed.status === "unavailable") {
+            for (const entry of targetEntries) addPending(entry, closed.reason);
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -254,26 +212,22 @@ export async function finalizeLocalRecoveryCleanupGroup(
           }
         }
       }
-      if (exactTargetFailure) {
-        for (const targetEntries of targets.values()) {
-          for (const entry of targetEntries) {
-            addPending(entry, `Exact Chrome target cleanup was unsafe: ${exactTargetFailure}`);
-          }
-        }
-      }
     }
 
-    if (
-      pending.length > 0 &&
-      teardownEntry &&
-      teardownEntries.length > 0 &&
-      !preserveProcess &&
-      !pending.some((entry) => requestsProcessTeardown(entry.resource))
-    ) {
-      addPending(teardownEntry, "Process teardown deferred until target cleanup completes");
-      return { pending, errors };
+    if (pending.length > 0) {
+      if (
+        teardownEntry &&
+        teardownEntries.length > 0 &&
+        !preserveProcess &&
+        !pending.some((entry) => requestsProcessTeardown(entry.resource))
+      ) {
+        addPending(teardownEntry, "Process teardown deferred until target cleanup completes");
+      }
+      retainProcessSubsumedTargets(
+        "Exact process teardown did not run; unresolved target acquisition authority was preserved",
+      );
+      return { pending, errors, classification };
     }
-    if (pending.length > 0) return { pending, errors };
 
     let teardownViaLeaseAttempted = false;
     let teardownViaLeaseError: string | null = null;
@@ -337,9 +291,17 @@ export async function finalizeLocalRecoveryCleanupGroup(
           "Process teardown deferred until lease cleanup completes",
         );
       }
+      retainProcessSubsumedTargets(
+        "Exact process teardown did not run; unresolved target acquisition authority was preserved",
+      );
       return { pending, errors };
     }
-    if (manualOwnerRetainedByOtherLease) return { pending, errors };
+    if (manualOwnerRetainedByOtherLease) {
+      retainProcessSubsumedTargets(
+        "Chrome was retained by another active lease; unresolved target acquisition authority was preserved",
+      );
+      return { pending, errors };
+    }
     if (!teardownEntry || teardownEntries.length === 0 || preserveProcess) {
       return { pending, errors };
     }
@@ -364,11 +326,17 @@ export async function finalizeLocalRecoveryCleanupGroup(
 
       if (teardownError) {
         addPending(removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds), teardownError);
+        retainProcessSubsumedTargets(
+          "Exact process teardown did not complete; unresolved target acquisition authority was preserved",
+        );
       }
     } catch (error) {
       addPending(
         removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds),
         error instanceof Error ? error.message : String(error),
+      );
+      retainProcessSubsumedTargets(
+        "Exact process teardown did not complete; unresolved target acquisition authority was preserved",
       );
     }
     return { pending, errors };
