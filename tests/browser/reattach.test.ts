@@ -890,7 +890,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     try {
       const result = await resumeBrowserSession(
         withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/test-conversation" }),
-        { cookieSync: false, headless: true, timeoutMs: 1_000 },
+        { cookieSync: false, headless: true, manualLogin: false, timeoutMs: 1_000 },
         vi.fn() as BrowserLogger,
         {
           launchChrome: acquireTemporaryChromeOwner as never,
