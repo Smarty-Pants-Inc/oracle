@@ -3042,8 +3042,8 @@ describe("performSessionRun", () => {
         followUpOrdinal: 0,
         remainingFollowUps: 0,
         verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: "gemini-dom-turn:0:accepted",
-        verifiedUserMessageId: "gemini-dom-turn:0:accepted",
+        verifiedUserTurnId: "data-message-id:gemini-user-current",
+        verifiedUserMessageId: "data-message-id:gemini-user-current",
         conversationId: "gemini-target-1",
       },
       recoveryCleanupResources: [

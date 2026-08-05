@@ -269,20 +269,16 @@ describe("promptComposer", () => {
     }
   });
 
-  test("does not fallback from a stale oversized alert when the accepted long turn text is unavailable", async () => {
+  test("does not fallback when React replaces a stale oversized alert with identical semantics", async () => {
     vi.useFakeTimers();
     try {
       const acceptedLongPrompt = "x".repeat(50_000);
-      const alertAttributes: Record<string, string> = {};
       const staleAlert = {
         innerText: "The message you submitted was too long. Please submit something shorter.",
         textContent: "The message you submitted was too long. Please submit something shorter.",
         getBoundingClientRect: () => ({ width: 320, height: 40 }),
-        getAttribute: (name: string) => alertAttributes[name] ?? null,
-        setAttribute: (name: string, value: string) => {
-          alertAttributes[name] = value;
-        },
       };
+      let visibleAlert = staleAlert;
       const acceptedTurnWithoutText = {
         dataset: { turn: "user" },
         getAttribute: (name: string) =>
@@ -300,7 +296,7 @@ describe("promptComposer", () => {
           ) {
             return [acceptedTurnWithoutText];
           }
-          return selector === '[role="alert"]' ? [staleAlert] : [];
+          return selector === '[role="alert"]' ? [visibleAlert] : [];
         },
       };
       class FakeTextArea {}
@@ -319,10 +315,8 @@ describe("promptComposer", () => {
       const rejectionBaseline = await promptComposer.capturePromptTooLargeRejectionBaseline(
         runtime as never,
       );
-      expect(rejectionBaseline).toMatchObject({
-        token: expect.any(String),
-        entries: [{ marker: expect.any(String), fingerprint: expect.any(String) }],
-      });
+      expect(Object.values(rejectionBaseline?.fingerprintCounts ?? {})).toEqual([1]);
+      visibleAlert = { ...staleAlert };
       const submit = vi.fn(async () => {
         await promptComposer.verifyPromptCommitted(
           runtime as never,
@@ -369,8 +363,7 @@ describe("promptComposer", () => {
     try {
       const oversizedPrompt = "x".repeat(50_000);
       const rejectionBaseline = {
-        token: "dispatch-baseline",
-        entries: [],
+        fingerprintCounts: {},
       };
       const runtime = {
         evaluate: vi.fn().mockResolvedValue({

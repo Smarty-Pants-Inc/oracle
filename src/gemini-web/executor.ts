@@ -21,7 +21,10 @@ import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { delay } from "../browser/utils.js";
 import { runGeminiWebWithFallback, saveFirstGeminiImageFromOutput } from "./client.js";
-import { geminiDeepThinkDomProvider } from "../browser/providers/index.js";
+import {
+  geminiDeepThinkDomProvider,
+  hasImmutableGeminiPromptIdentity,
+} from "../browser/providers/geminiDeepThinkDomProvider.js";
 import { resolveGeminiWebModel, type GeminiWebModelId } from "./models.js";
 import type { GeminiWebOptions, GeminiWebResponse } from "./types.js";
 import { openGeminiBrowserSession, type GeminiBrowserSession } from "./browserSessionManager.js";
@@ -413,12 +416,18 @@ async function runGeminiDeepThinkViaBrowser(
     if (lifecycle.isPromptCommitted()) {
       const runtime = lifecycle.publishRecovery();
       const message = error instanceof Error ? error.message : String(error);
+      const reattachable = hasImmutableGeminiPromptIdentity(runtime.promptEpoch);
+      const recoveryMessage = reattachable
+        ? "the live browser session was preserved for recovery"
+        : "the live browser session was preserved without exact reattach authority";
       throw new BrowserAutomationError(
-        `Gemini response capture failed after verified prompt commit; the live browser session was preserved for recovery: ${message}`,
+        `Gemini response capture failed after verified prompt commit; ${recoveryMessage}: ${message}`,
         {
           stage: "gemini-response-capture",
-          code: "gemini-response-capture-recoverable",
-          reattachable: true,
+          code: reattachable
+            ? "gemini-response-capture-recoverable"
+            : "gemini-reattach-authority-unavailable",
+          reattachable,
           runtime,
         },
         error,

@@ -38,6 +38,8 @@ import {
   clearBrowserCapturePublicationJournal,
   readBrowserCapturePublicationJournal,
   sanitizeBrowserPublicationMessage,
+  sanitizeBrowserPublicationRuntime,
+  writeBrowserCapturePublicationJournal,
   type BrowserCapturePublicationJournal,
 } from "./browserPublicationJournal.js";
 import {
@@ -519,6 +521,34 @@ function createPersistedBrowserPublicationTransaction(
       persistRuntime: async (runtime) => {
         await sessionStore.updateSession(sessionId, {
           browser: { ...(metadata.browser ?? journal.browserAudit), runtime },
+        });
+      },
+      persistSettlementResult: async (runtime) => {
+        // A completed close may be evicted after acknowledgement, so persist its replay projection
+        // in the publication journal before OwnedBrowserResourceTransaction acknowledges it.
+        const currentJournal = await readBrowserCapturePublicationJournal(sessionId);
+        if (
+          !currentJournal ||
+          currentJournal.receipt.artifact.path !== journal.receipt.artifact.path ||
+          currentJournal.receipt.artifact.sha256 !== journal.receipt.artifact.sha256
+        ) {
+          throw new Error(
+            "Recovered browser settlement journal authority changed before persistence",
+          );
+        }
+        const cleanupPending = Boolean(
+          runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult,
+        );
+        const cleanupErrorCode = cleanupPending ? "browser-cleanup-finalize-pending" : undefined;
+        const persistedRuntime = sanitizeBrowserPublicationRuntime(runtime, cleanupErrorCode);
+        await writeBrowserCapturePublicationJournal({
+          ...currentJournal,
+          phase: cleanupPending ? "cleanup-pending" : "published",
+          runtime: persistedRuntime,
+          cleanupErrorCode,
+          cleanupErrorMessage: cleanupPending
+            ? persistedRuntime.recoveryCleanupResult?.error
+            : undefined,
         });
       },
       settleResources: async (mode, runtime) => {

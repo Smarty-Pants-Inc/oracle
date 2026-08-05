@@ -3,7 +3,6 @@ import { CHATGPT_URL } from "../browser/constants.js";
 import { resolveRecoveryUrl } from "../browser/recoverConversation.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { isRecoverableChatGptConversationUrl } from "../browser/reattachability.js";
-import { DEFAULT_MODEL } from "../oracle/config.js";
 import type { ModelName } from "../oracle/types.js";
 
 export interface BrowserFollowupResolution {
@@ -19,16 +18,16 @@ export interface FollowupSessionReader {
 
 const EXACT_CONVERSATION_ID = /^[a-zA-Z0-9-]+$/;
 
-/** Pre-epoch sessions identify the ChatGPT browser provider only through mode and model. */
-function isLegacyChatGptBrowserSession(metadata: SessionMetadata): boolean {
+/** Browser follow-ups may reuse only a positively identified, non-Codex ChatGPT model. */
+function resolveChatGptBrowserModel(metadata: SessionMetadata): ModelName | null {
   const metadataMode: unknown = metadata.mode;
   const optionsMode: unknown = metadata.options?.mode;
-  if (metadataMode === undefined && optionsMode === undefined) return false;
+  if (metadataMode === undefined && optionsMode === undefined) return null;
   if (
     (metadataMode !== undefined && metadataMode !== "browser") ||
     (optionsMode !== undefined && optionsMode !== "browser")
   ) {
-    return false;
+    return null;
   }
 
   const rawMetadataModel: unknown = metadata.model;
@@ -43,18 +42,19 @@ function isLegacyChatGptBrowserSession(metadata: SessionMetadata): boolean {
       : undefined;
   if (
     (rawMetadataModel !== undefined && !metadataModel) ||
-    (rawOptionsModel !== undefined && !optionsModel)
-  ) {
-    return false;
-  }
-  if (
+    (rawOptionsModel !== undefined && !optionsModel) ||
     (!metadataModel && !optionsModel) ||
     (metadataModel && optionsModel && metadataModel !== optionsModel)
   ) {
-    return false;
+    return null;
   }
   const model = optionsModel ?? metadataModel;
-  return Boolean(model?.startsWith("gpt-") && !model.includes("codex"));
+  return model?.startsWith("gpt-") && !model.includes("codex") ? model : null;
+}
+
+/** Pre-epoch sessions identify the ChatGPT browser provider only through mode and model. */
+function isLegacyChatGptBrowserSession(metadata: SessionMetadata): boolean {
+  return resolveChatGptBrowserModel(metadata) !== null;
 }
 
 /** Legacy metadata may authorize only a conversation URL for a new run, never old cleanup state. */
@@ -99,6 +99,7 @@ export function resolveBrowserResumeConversationUrl(
   metadata: SessionMetadata,
   fallbackBaseUrl = CHATGPT_URL,
 ): string | null {
+  if (!resolveChatGptBrowserModel(metadata)) return null;
   return (
     resolveRecoveryUrl(metadata, fallbackBaseUrl) ?? resolveCompletedLegacyConversationUrl(metadata)
   );
@@ -124,6 +125,12 @@ export async function resolveBrowserFollowupReference(
   if (mode !== "browser" && !hasBrowserMetadata) {
     return null;
   }
+  const model = resolveChatGptBrowserModel(metadata);
+  if (!model) {
+    throw new Error(
+      `Session ${trimmed} is not a supported ChatGPT browser session; browser follow-ups require an explicitly stored non-Codex GPT model.`,
+    );
+  }
 
   const resumeConversationUrl = resolveBrowserResumeConversationUrl(metadata);
   if (!resumeConversationUrl) {
@@ -135,11 +142,6 @@ export async function resolveBrowserFollowupReference(
   if (!parentBrowserConfig) {
     throw new Error(`Session ${trimmed} is missing its stored browser configuration.`);
   }
-  const storedModel = metadata.options?.model ?? metadata.model;
-  const model =
-    typeof storedModel === "string" && storedModel.startsWith("gpt-")
-      ? (storedModel as ModelName)
-      : DEFAULT_MODEL;
   return {
     sessionId: metadata.id,
     resumeConversationUrl,

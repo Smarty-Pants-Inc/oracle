@@ -818,7 +818,7 @@ describe("gemini-web executor", () => {
     },
   );
 
-  it("never aborts an accepted Gemini turn that has no provider id", async () => {
+  it("preserves an accepted provider-id-less Gemini turn without advertising exact reattach", async () => {
     const evaluateNormally = runtimeEvaluate.getMockImplementation();
     if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
     runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
@@ -855,8 +855,8 @@ describe("gemini-web executor", () => {
     ).rejects.toMatchObject({
       name: "BrowserAutomationError",
       details: {
-        code: "gemini-response-capture-recoverable",
-        reattachable: true,
+        code: "gemini-reattach-authority-unavailable",
+        reattachable: false,
         runtime: {
           promptEpoch: {
             status: "committed",

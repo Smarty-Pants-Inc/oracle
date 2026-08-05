@@ -15,6 +15,25 @@ import { joinSelectors } from "../providerDomFlow.js";
 
 const UI_TIMEOUT_MS = 60_000;
 const RESPONSE_TIMEOUT_MS = 10 * 60_000;
+const GEMINI_DOM_TURN_ID_PREFIX = "gemini-dom-turn:";
+
+export function hasImmutableGeminiPromptIdentity(
+  identity:
+    | {
+        status?: string;
+        verifiedUserTurnId?: string;
+        verifiedUserMessageId?: string;
+      }
+    | null
+    | undefined,
+): boolean {
+  const userTurnId = identity?.verifiedUserTurnId?.trim();
+  return Boolean(
+    userTurnId &&
+    identity?.verifiedUserMessageId?.trim() === userTurnId &&
+    !userTurnId.startsWith(GEMINI_DOM_TURN_ID_PREFIX),
+  );
+}
 
 interface GeminiPromptBaseline {
   userQueryCount: number;
@@ -566,10 +585,11 @@ async function submitPrompt(ctx: ProviderDomFlowContext): Promise<PromptCommitEv
   const promptSha256 = promptIdentitySha256(ctx.prompt);
   const verifiedUserTurnIndex =
     submission.baseline.userQueryCount + submission.baseline.responseCount;
-  // Some Gemini builds omit provider ids. The unique post-baseline DOM position plus
-  // the committed prompt hash is still exact authority and survives in this synthetic id.
+  // Provider-id-less turns are safe only while this live baseline remains intact.
+  // Persist the correlation for audit, but exact reattach rejects this synthetic identity.
   const verifiedUserTurnId =
-    submission.baseline.userStableId ?? `gemini-dom-turn:${verifiedUserTurnIndex}:${promptSha256}`;
+    submission.baseline.userStableId ??
+    `${GEMINI_DOM_TURN_ID_PREFIX}${verifiedUserTurnIndex}:${promptSha256}`;
   const verification: PromptCommitVerification = {
     committedTurns: verifiedUserTurnIndex + 1,
     promptSha256,
@@ -745,6 +765,17 @@ export async function recoverCommittedGeminiDeepThinkResponse(
   promptLocator: CommittedPromptEpochLocator,
   timeoutMs: number,
 ): Promise<{ text: string }> {
+  if (!hasImmutableGeminiPromptIdentity(promptLocator)) {
+    throw new BrowserAutomationError(
+      "Committed Gemini prompt lacks an immutable provider user identity for exact reattach.",
+      {
+        stage: "prompt-epoch",
+        code: "gemini-reattach-authority-unavailable",
+        reattachable: false,
+      },
+    );
+  }
+  const immutableUserId = promptLocator.verifiedUserTurnId.trim();
   const responseTurnSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseTurn);
   const responseTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseText);
   const responseCompleteSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseComplete);
@@ -792,8 +823,23 @@ export async function recoverCommittedGeminiDeepThinkResponse(
     );
     const entries = parseResponseProbe(payload);
     if (entries) {
-      const submittedUser = entries[promptLocator.verifiedUserTurnIndex];
-      if (submittedUser) {
+      let submittedUserIndex = -1;
+      for (const [index, entry] of entries.entries()) {
+        if (entry.stableId !== immutableUserId) continue;
+        if (submittedUserIndex >= 0) {
+          throw new BrowserAutomationError(
+            "Gemini rendered the committed provider user identity more than once during reattach.",
+            {
+              stage: "prompt-epoch",
+              code: "committed-prompt-identity-mismatch",
+              reattachable: false,
+            },
+          );
+        }
+        submittedUserIndex = index;
+      }
+      if (submittedUserIndex >= 0) {
+        const submittedUser = entries[submittedUserIndex];
         if (
           submittedUser.kind !== "user" ||
           promptIdentitySha256(submittedUser.text) !== promptLocator.promptSha256
@@ -804,11 +850,7 @@ export async function recoverCommittedGeminiDeepThinkResponse(
           );
         }
         const completedResponses: Array<GeminiRawTurnDescriptor & { kind: "response" }> = [];
-        for (
-          let index = promptLocator.verifiedUserTurnIndex + 1;
-          index < entries.length;
-          index += 1
-        ) {
+        for (let index = submittedUserIndex + 1; index < entries.length; index += 1) {
           const entry = entries[index];
           if (entry.kind === "user") break;
           if (isCompletedGeminiResponse(entry)) completedResponses.push(entry);

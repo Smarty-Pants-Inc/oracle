@@ -675,7 +675,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     await rm(profileDir, { recursive: true, force: true });
   }, 15_000);
 
-  test("harvests the exact committed Gemini target without resubmitting", async () => {
+  test("harvests the exact committed Gemini provider identity after DOM history shift", async () => {
     const promptSha256 = promptIdentitySha256("New request");
     const runtime = {
       chromePort: 51559,
@@ -690,8 +690,8 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         followUpOrdinal: 0,
         remainingFollowUps: 0,
         verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: `gemini-dom-turn:0:${promptSha256}`,
-        verifiedUserMessageId: `gemini-dom-turn:0:${promptSha256}`,
+        verifiedUserTurnId: "data-message-id:user-current",
+        verifiedUserMessageId: "data-message-id:user-current",
         conversationId: "gemini-target-1",
       },
     } satisfies BrowserRuntimeMetadata;
@@ -714,13 +714,27 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
                   kind: "user",
                   postBaseline: true,
                   text: "New request",
-                  stableId: null,
+                  stableId: "data-message-id:user-older",
+                },
+                {
+                  kind: "response",
+                  postBaseline: true,
+                  text: "wrong repeated-prompt answer",
+                  stableId: "data-message-id:response-older",
+                  completionMarked: true,
+                  visibleSpinner: false,
+                },
+                {
+                  kind: "user",
+                  postBaseline: true,
+                  text: "New request",
+                  stableId: "data-message-id:user-current",
                 },
                 {
                   kind: "response",
                   postBaseline: true,
                   text: "exact recovered Gemini answer",
-                  stableId: null,
+                  stableId: "data-message-id:response-current",
                   completionMarked: true,
                   visibleSpinner: false,
                 },
@@ -763,6 +777,109 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(close).toHaveBeenCalledTimes(1);
     await result.abort();
+  });
+
+  test("refuses synthetic Gemini DOM authority after history shift and repeated prompt", async () => {
+    const promptSha256 = promptIdentitySha256("New request");
+    const syntheticUserId = `gemini-dom-turn:0:${promptSha256}`;
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "gemini-target-1",
+      conversationId: "gemini-target-1",
+      promptEpoch: {
+        status: "committed" as const,
+        epochId: "gemini-epoch-1",
+        promptSha256,
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: syntheticUserId,
+        verifiedUserMessageId: syntheticUserId,
+        conversationId: "gemini-target-1",
+      },
+    } satisfies BrowserRuntimeMetadata;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "1+1") return { result: { value: 2 } };
+      if (expression.includes("const ordered =")) {
+        return {
+          result: {
+            value: JSON.stringify({
+              entries: [
+                {
+                  kind: "user",
+                  postBaseline: true,
+                  text: "New request",
+                  stableId: null,
+                },
+                {
+                  kind: "response",
+                  postBaseline: true,
+                  text: "wrong repeated-prompt answer",
+                  stableId: "data-message-id:response-older",
+                  completionMarked: true,
+                  visibleSpinner: false,
+                },
+                {
+                  kind: "user",
+                  postBaseline: true,
+                  text: "New request",
+                  stableId: null,
+                },
+                {
+                  kind: "response",
+                  postBaseline: true,
+                  text: "unidentifiable original answer",
+                  stableId: "data-message-id:response-current",
+                  completionMarked: true,
+                  visibleSpinner: false,
+                },
+              ],
+            }),
+          },
+        };
+      }
+      return { result: { value: null } };
+    });
+    const close = vi.fn(async () => undefined);
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(async () => undefined), evaluate },
+      DOM: { enable: vi.fn(async () => undefined) },
+      close,
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const recoverSession = vi.fn();
+    const release = vi.fn(async () => undefined);
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { desiredModel: "gemini-3-pro-deep-think", timeoutMs: 2_000 },
+        createBrowserLogger(),
+        {
+          listTargets: vi.fn(async () => [
+            {
+              targetId: "gemini-target-1",
+              type: "page",
+              url: "https://gemini.google.com/app/conversation-1",
+            },
+          ]),
+          connect,
+          recoverSession,
+          acquireRecoveryLock: vi.fn(async () => ({ release })),
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        code: "gemini-reattach-authority-unavailable",
+        reattachable: false,
+      },
+    });
+    expect(
+      evaluate.mock.calls.some(([input]) => input.expression.includes("const ordered =")),
+    ).toBe(false);
+    expect(recoverSession).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   test("never reopens or resubmits when the exact committed Gemini target is missing", async () => {

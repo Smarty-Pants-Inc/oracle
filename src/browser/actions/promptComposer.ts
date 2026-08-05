@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   INPUT_SELECTORS,
@@ -34,7 +34,6 @@ const PROMPT_TOO_LARGE_REJECTION_SELECTORS = [
 ] as const;
 const PROMPT_TOO_LARGE_REJECTION_PATTERN =
   "message (?:you submitted|is) (?:was )?too long|submit something shorter|maximum (?:message|context) length|reduce (?:the )?length of (?:your )?(?:message|prompt)";
-const PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE = "data-oracle-prompt-rejection-baseline";
 
 function buildPromptTooLargeRejectionReaderExpression(): string {
   return `const readVisiblePromptTooLargeRejections = () => {
@@ -153,14 +152,12 @@ export interface PromptCommitVerification {
 
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
 interface PromptTooLargeRejectionBaseline {
-  token: string;
-  entries: Array<{ marker: string; fingerprint: string }>;
+  fingerprintCounts: Record<string, number>;
 }
 
 async function capturePromptTooLargeRejectionBaseline(
   Runtime: ChromeClient["Runtime"],
 ): Promise<PromptTooLargeRejectionBaseline | undefined> {
-  const token = randomUUID();
   const { result } = await Runtime.evaluate({
     expression: `(() => {
       const isVisible = (node) => {
@@ -169,19 +166,16 @@ async function capturePromptTooLargeRejectionBaseline(
         return rect.width > 0 && rect.height > 0;
       };
       ${buildPromptTooLargeRejectionReaderExpression()}
-      const token = ${JSON.stringify(token)};
-      const markerAttribute = ${JSON.stringify(PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE)};
-      const entries = readVisiblePromptTooLargeRejections().map(({ node, fingerprint }, index) => {
-        const marker = token + ':' + index;
-        node.setAttribute(markerAttribute, marker);
-        return { marker, fingerprint };
-      });
-      return { token, entries };
+      const fingerprintCounts = {};
+      for (const { fingerprint } of readVisiblePromptTooLargeRejections()) {
+        fingerprintCounts[fingerprint] = (fingerprintCounts[fingerprint] ?? 0) + 1;
+      }
+      return { fingerprintCounts };
     })()`,
     returnByValue: true,
   });
   const value = result.value as PromptTooLargeRejectionBaseline | undefined;
-  if (value?.token !== token || !Array.isArray(value.entries)) return undefined;
+  if (!value?.fingerprintCounts || typeof value.fingerprintCounts !== "object") return undefined;
   return value;
 }
 
@@ -993,9 +987,6 @@ export async function verifyPromptCommitted(
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const rejectionBaselineLiteral = JSON.stringify(promptTooLargeRejectionBaseline ?? null);
-  const rejectionMarkerAttributeLiteral = JSON.stringify(
-    PROMPT_TOO_LARGE_REJECTION_MARKER_ATTRIBUTE,
-  );
   // Only a full normalized prompt match in a new user turn can commit this epoch.
   // Prefixes, substrings, and historical repeated turns are never commit authority.
   const script = `(() => {
@@ -1004,7 +995,6 @@ export async function verifyPromptCommitted(
     const inputSelectors = ${inputSelectorsLiteral};
     const baseline = ${baseline};
     const rejectionBaseline = ${rejectionBaselineLiteral};
-    const rejectionMarkerAttribute = ${rejectionMarkerAttributeLiteral};
     ${buildPromptIdentityNormalizationExpression()}
     ${buildConversationTurnIdentityExpression()}
     ${buildReadUserPromptTextExpression()}
@@ -1056,14 +1046,16 @@ export async function verifyPromptCommitted(
       return promptText === null ? '' : normalizePromptIdentity(promptText);
     });
     ${buildPromptTooLargeRejectionReaderExpression()}
-    const rejectionBaselineEntries = new Map(
-      (rejectionBaseline?.entries ?? []).map(({ marker, fingerprint }) => [marker, fingerprint]),
-    );
+    const currentRejectionFingerprintCounts = {};
+    for (const { fingerprint } of readVisiblePromptTooLargeRejections()) {
+      currentRejectionFingerprintCounts[fingerprint] =
+        (currentRejectionFingerprintCounts[fingerprint] ?? 0) + 1;
+    }
+    const baselineRejectionFingerprintCounts = rejectionBaseline?.fingerprintCounts ?? {};
     const promptTooLargeRejectedForDispatch = Boolean(
-      rejectionBaseline && readVisiblePromptTooLargeRejections().some(({ node, fingerprint }) => {
-        const marker = node.getAttribute(rejectionMarkerAttribute);
-        return typeof marker !== 'string' || rejectionBaselineEntries.get(marker) !== fingerprint;
-      }),
+      rejectionBaseline && Object.entries(currentRejectionFingerprintCounts).some(
+        ([fingerprint, count]) => count > (baselineRejectionFingerprintCounts[fingerprint] ?? 0),
+      ),
     );
     return {
       baseline,

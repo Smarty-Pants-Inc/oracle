@@ -26,6 +26,16 @@ import {
 import chalk from "chalk";
 import path from "node:path";
 import { BrowserAutomationError } from "../../src/oracle/errors.ts";
+import {
+  completedBrowserCaptureCleanup,
+  pendingBrowserCaptureCleanup,
+} from "../../src/browser/ownedBrowserResources.ts";
+import {
+  __test__ as targetCloseAuthorityTest,
+  acknowledgeChromeTargetCloseCapability,
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "../../src/browser/targetCloseAuthority.ts";
 
 const waitMock = vi.hoisted(() => vi.fn());
 const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
@@ -33,6 +43,7 @@ const retryBrowserRecoveryCleanupMock = vi.hoisted(() => vi.fn());
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 const saveBrowserTranscriptArtifactMock = vi.hoisted(() => vi.fn());
 const saveDeepResearchReportArtifactMock = vi.hoisted(() => vi.fn());
+const writeFileAtomicDurableMock = vi.hoisted(() => vi.fn());
 const sessionStoreMock = vi.hoisted(() => ({
   readSession: vi.fn(),
   readLog: vi.fn(),
@@ -53,7 +64,7 @@ vi.mock("../../src/sessionStore.ts", () => ({
 
 vi.mock("../../src/sessionManager.ts", () => ({
   wait: vi.fn(),
-  writeFileAtomicDurable: vi.fn(),
+  writeFileAtomicDurable: writeFileAtomicDurableMock,
   syncDirectoryIfSupported: vi.fn(),
 }));
 vi.mock("../../src/browser/reattach.ts", () => ({
@@ -224,9 +235,11 @@ beforeEach(() => {
     persistDurableBrowserAnswerMock,
     saveBrowserTranscriptArtifactMock,
     saveDeepResearchReportArtifactMock,
+    writeFileAtomicDurableMock,
   ]) {
     mock.mockReset();
   }
+  writeFileAtomicDurableMock.mockResolvedValue(undefined);
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/sessions");
   sessionStoreMock.getPaths.mockResolvedValue({
     dir: "/tmp/sessions/sess",
@@ -246,6 +259,7 @@ afterEach(async () => {
   Object.defineProperty(process.stdout, "isTTY", { value: originalIsTty, configurable: true });
   chalk.level = originalChalkLevel;
   vi.restoreAllMocks();
+  targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
   await Promise.all(
     tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
   );
@@ -860,6 +874,115 @@ describe("attachSession rendering", () => {
     expect(
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
     ).toBe(true);
+  });
+
+  test("replays a durably journaled close after final session persistence fails and tombstones churn", async () => {
+    const answer = "published answer with completed target cleanup";
+    const targetId = "recovered-owned-target";
+    const generationId = "90000000-0000-4000-8000-000000000009";
+    const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+    const logger = vi.fn<(message: string) => void>();
+    const targetCloseCapability = retainChromeTargetCloseCapability({
+      generationId,
+      targetId,
+      close: closeTarget,
+    });
+    const runtime: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: targetId,
+          targetCloseCapability,
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    };
+    const journal = await installBrowserPublicationJournal("published", runtime, answer);
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      mode: "browser",
+      browser: { config: {}, runtime },
+      artifacts: [journal.receipt.artifact],
+    };
+    writeFileAtomicDurableMock.mockImplementation(
+      async (targetPath: string, payload: string | Uint8Array) => {
+        await writeFile(targetPath, payload);
+      },
+    );
+    sessionStoreMock.updateSession
+      .mockRejectedValueOnce(new Error("final session store unavailable"))
+      .mockRejectedValueOnce(new Error("final session store still unavailable"))
+      .mockResolvedValue(undefined);
+    readSessionMetadataMock.mockResolvedValue(completedMeta);
+    retryBrowserRecoveryCleanupMock.mockImplementation(
+      async (pendingRuntime: BrowserRuntimeMetadata) => {
+        const resource = pendingRuntime.recoveryCleanupResources?.[0];
+        if (!resource?.chromeTargetId || !resource.targetCloseCapability) {
+          return completedBrowserCaptureCleanup(pendingRuntime);
+        }
+        const closeResult = await closeChromeTargetWithRetainedCapability({
+          capability: resource.targetCloseCapability,
+          targetId: resource.chromeTargetId,
+          logger,
+        });
+        return closeResult.status === "completed" || closeResult.status === "gone"
+          ? completedBrowserCaptureCleanup(pendingRuntime)
+          : pendingBrowserCaptureCleanup(pendingRuntime, closeResult.reason, "finalize");
+      },
+    );
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    const persistedSettlement = await readBrowserCapturePublicationJournal("sess");
+    expect(persistedSettlement).toMatchObject({
+      phase: "published",
+      runtime: { browserTransport: "cdp" },
+    });
+    expect(persistedSettlement?.runtime.recoveryCleanupResources).toBeUndefined();
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledTimes(2);
+    expect(closeTarget).toHaveBeenCalledOnce();
+
+    const churnCount = targetCloseAuthorityTest.retainedTerminalTargetCloseCapabilityLimit + 1;
+    for (let index = 0; index < churnCount; index += 1) {
+      const churnTargetId = `churn-target-${index}`;
+      const churnCapability = retainChromeTargetCloseCapability({
+        generationId: `churn-generation-${index}`,
+        targetId: churnTargetId,
+        close: async () => ({ status: "completed" as const }),
+      });
+      await closeChromeTargetWithRetainedCapability({
+        capability: churnCapability,
+        targetId: churnTargetId,
+        logger,
+      });
+      acknowledgeChromeTargetCloseCapability({
+        capability: churnCapability,
+        targetId: churnTargetId,
+      });
+    }
+    await expect(
+      closeChromeTargetWithRetainedCapability({
+        capability: targetCloseCapability,
+        targetId,
+        logger,
+      }),
+    ).resolves.toMatchObject({ status: "unavailable" });
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledTimes(2);
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[1]?.[0]?.recoveryCleanupResources,
+    ).toBeUndefined();
+    expect(closeTarget).toHaveBeenCalledOnce();
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
   });
 
   test("discards a stale preparing journal when persisted ABORT authority has no receipt", async () => {

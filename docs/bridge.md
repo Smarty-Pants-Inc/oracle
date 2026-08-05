@@ -15,7 +15,7 @@ The transfer protocol is pull-based and keeps secrets local to the host:
 
 1. The browser host saves the ChatGPT file to its local session artifacts directory as before.
 2. The host emits only a redacted artifact descriptor over the existing NDJSON run stream: artifact id, safe filename, MIME type, byte size, SHA-256, validation status, and coarse source kind. It does not expose cookies, bearer tokens, signed ChatGPT download URLs, or Windows filesystem paths.
-3. The Linux client fetches `GET /runs/<runId>/artifacts/<artifactId>` with the same bridge bearer token, writes to `~/.oracle/sessions/<sessionId>/artifacts/`, verifies size and SHA-256, validates ZIP structure when applicable, and only then publishes the final path in session metadata.
+3. The Linux client fetches `GET /runs/<runId>/artifacts/<artifactId>` with the same transaction-v3 connection key, writes to `~/.oracle/sessions/<sessionId>/artifacts/`, verifies size and SHA-256, validates ZIP structure when applicable, and only then publishes the final path in session metadata.
 4. If transfer fails, Oracle keeps the text response and records a warning with manual fallback instructions. Open the ChatGPT browser on the Windows host, use the visible download button/link in the current assistant response, and copy the file to a cloud-readable path yourself.
 
 Operational notes:
@@ -61,7 +61,7 @@ scp "$env:USERPROFILE\.oracle\bridge-connection.json" user@your-linux-host:~/bri
 Then on the Linux host:
 
 ```bash
-oracle bridge client --connect ~/bridge-connection.json --write-config --test
+oracle bridge client --connect ~/bridge-connection.json
 ```
 
 This writes the loopback endpoint and modern v3 key to `browser.remoteHost` and `browser.remoteToken`. Bridge client rejects non-loopback connection artifacts even with `--no-test`.
@@ -82,8 +82,7 @@ There is no silent downgrade.
   oracle bridge client \
     --connect 127.0.0.1:9473 \
     --legacy-token <predecessor-bearer> \
-    --allow-legacy-text-protocol \
-    --write-config --test
+    --allow-legacy-text-protocol
   ```
 
   To configure modern v3 plus fallback concurrently, use a normal connection artifact and pass a legacy token that differs from its modern connection token.

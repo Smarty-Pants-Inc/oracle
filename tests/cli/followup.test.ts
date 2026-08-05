@@ -11,6 +11,7 @@ const baseMetadata: SessionMetadata = {
   createdAt: "2026-01-01T00:00:00.000Z",
   status: "completed",
   options: {},
+  model: "gpt-5.5-pro",
 };
 
 function committedRuntime(
@@ -95,6 +96,25 @@ describe("browser follow-up resolution", () => {
         resumeConversationUrl: "https://chatgpt.com/c/resume-me",
       },
     });
+  });
+
+  test("rejects committed Gemini sessions before projecting ChatGPT followup authority", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      id: "gemini-browser-slug",
+      mode: "browser",
+      model: "gemini-3.1-pro",
+      browser: {
+        config: {},
+        runtime: committedRuntime("gemini-conversation"),
+      },
+    };
+    const store = { readSession: vi.fn(async () => metadata) };
+
+    expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
+    await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
+      /not a supported ChatGPT browser session/,
+    );
   });
 
   test("leaves stored API sessions on the existing API follow-up path", async () => {
@@ -198,7 +218,7 @@ describe("browser follow-up resolution", () => {
       expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
       const store = { readSession: vi.fn(async () => metadata) };
       await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
-        /one exact ChatGPT conversation/s,
+        /not a supported ChatGPT browser session/,
       );
     },
   );
@@ -239,7 +259,7 @@ describe("browser follow-up resolution", () => {
       expect(resolveBrowserResumeConversationUrl(metadata)).toBeNull();
       const store = { readSession: vi.fn(async () => metadata) };
       await expect(resolveBrowserFollowupReference(metadata.id, store)).rejects.toThrow(
-        /one exact ChatGPT conversation/s,
+        /not a supported ChatGPT browser session/,
       );
     },
   );

@@ -8,7 +8,10 @@ export type BrowserCaptureSettlementMode = "finalize" | "abort";
 export interface OwnedBrowserResourceTransactionAdapters {
   /** Durable acquisition and bound-pending authority, written before effects. */
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
-  /** Durable completed/failed projection, written after cleanup; stores with atomic settlement may omit it. */
+  /**
+   * Durable completed/failed projection, written after cleanup. Omission keeps terminal target-close
+   * capabilities unacknowledged; atomic stores must acknowledge through their own durable authority.
+   */
   persistSettlementResult?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
   settleResources: (
     mode: BrowserCaptureSettlementMode,
@@ -602,8 +605,10 @@ export class OwnedBrowserResourceTransaction {
       .then(async (result) => {
         const boundResult = bindBrowserCaptureCleanupSettlement(result, mode);
         try {
-          await this.adapters.persistSettlementResult?.(boundResult.runtime);
-          acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
+          if (this.adapters.persistSettlementResult) {
+            await this.adapters.persistSettlementResult(boundResult.runtime);
+            acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
+          }
         } catch (error) {
           const retryRuntime =
             boundResult.status === "pending" ? boundResult.runtime : boundRuntime;
