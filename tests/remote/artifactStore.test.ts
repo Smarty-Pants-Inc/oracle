@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   access,
   mkdir,
+  lstat,
   mkdtemp,
   open,
   readFile,
@@ -519,6 +520,61 @@ describe("RemoteArtifactStore", () => {
 
       now += 1_001;
       await expect(store.list()).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed before persisting a zero-birthtime artifact namespace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-zero-birth-"));
+    const transactionToken = "0".repeat(64);
+    const actualFs = await vi.importActual<Record<string, unknown> & { lstat: typeof lstat }>(
+      "node:fs/promises",
+    );
+    const mockedLstat = vi.fn(async (...args: unknown[]) => {
+      const entry = await Reflect.apply(actualFs.lstat, actualFs, args);
+      const [candidatePath] = args;
+      if (!path.basename(String(candidatePath)).startsWith("remote-")) return entry;
+      return new Proxy(entry, {
+        get(target, property, receiver) {
+          return property === "birthtimeNs" ? 0n : Reflect.get(target, property, receiver);
+        },
+      });
+    });
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, lstat: mockedLstat }));
+    // Test-isolated reload is required because the generic identity module captured lstat before vi.doMock.
+    const { RemoteArtifactStore: IsolatedRemoteArtifactStore } =
+      await import("../../src/remote/artifactStore.js");
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await openTransactionStore({
+        directory: path.join(root, "transactions"),
+      });
+      const begun = await begin(store, transactionToken, "run-zero-birth");
+      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+
+      await expect(
+        artifacts.createArtifactWriteAuthority({
+          transactionToken,
+          runId: "run-zero-birth",
+        }),
+      ).rejects.toThrow(/ORACLE_HOME_DIR.*stable nonzero birth time/i);
+      const failed = await store.read(transactionToken);
+      expect(failed).toMatchObject({
+        state: "failed",
+        artifactNamespaceState: "uninitialized",
+        terminalAudit: {
+          errorCode: "remote-artifact-namespace-initialization-failed",
+          errorStage: "remote-artifact-namespace-initialization",
+        },
+      });
+      expect(failed).not.toHaveProperty("artifactNamespaceIdentity");
+      await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       vi.doUnmock("node:fs/promises");
       vi.resetModules();

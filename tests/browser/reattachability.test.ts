@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { hasRecoverableChatGptConversation } from "../../src/browser/reattachability.js";
+import {
+  hasRecoverableChatGptConversation,
+  hasRecoverableGeminiConversation,
+} from "../../src/browser/reattachability.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 
 function recoverableRuntime(
   conversationId: string,
@@ -19,6 +23,66 @@ function recoverableRuntime(
       verifiedUserMessageId: "message-0",
       conversationId,
     },
+  };
+}
+
+function recoverableGeminiRuntime(): BrowserRuntimeMetadata {
+  const targetId = "gemini-target-1";
+  const generationId = "gemini-generation-1";
+  const promptEpoch = {
+    status: "committed" as const,
+    epochId: "gemini-epoch-1",
+    promptSha256: "b".repeat(64),
+    baselineTurns: 0,
+    followUpOrdinal: 0,
+    remainingFollowUps: 0,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "data-message-id:user-current",
+    verifiedUserMessageId: "data-message-id:user-current",
+    conversationId: targetId,
+  };
+  return {
+    chromePort: 9222,
+    chromeTargetId: targetId,
+    tabUrl: `about:blank#oracle-acquisition=${generationId}`,
+    conversationId: targetId,
+    promptEpoch,
+    recoveryCleanupResources: [
+      {
+        chromeTargetId: targetId,
+        conversationId: targetId,
+        promptEpoch,
+        targetCloseCapability: {
+          version: 1,
+          generationId,
+          capabilityId: "gemini-target-capability-1",
+          targetId,
+        },
+        tabLease: {
+          id: "gemini-tab-lease-1",
+          generationId,
+          profileDirectory: {
+            version: 2,
+            platform: process.platform,
+            canonicalPath: "/tmp/oracle-gemini-profile",
+            device: "1",
+            inode: "2",
+            birthtimeNs: "3",
+          },
+        },
+        acquisition: {
+          generationId,
+          targetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
+        },
+        recoveryCleanup: {
+          ownsTarget: true,
+          profileKind: "manual-login",
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
+        },
+      },
+    ],
+    recoveryCleanupResult: { status: "pending" },
   };
 }
 
@@ -110,5 +174,36 @@ describe("hasRecoverableChatGptConversation", () => {
     expect(hasRecoverableChatGptConversation({ tabUrl: "https://chatgpt.com/#/c/abc" })).toBe(
       false,
     );
+  });
+});
+
+describe("hasRecoverableGeminiConversation", () => {
+  const geminiConfig = { desiredModel: "gemini-3-pro-deep-think" };
+
+  test("accepts executor-style committed Gemini target authority with an acquisition marker", () => {
+    expect(hasRecoverableGeminiConversation(recoverableGeminiRuntime(), geminiConfig)).toBe(true);
+  });
+
+  test("requires Gemini model configuration and immutable provider identity", () => {
+    const runtime = recoverableGeminiRuntime();
+    expect(hasRecoverableGeminiConversation(runtime, { desiredModel: "gpt-5.2-pro" })).toBe(false);
+    const syntheticPromptEpoch = {
+      ...runtime.promptEpoch!,
+      verifiedUserTurnId: "gemini-dom-turn:0:synthetic",
+      verifiedUserMessageId: "gemini-dom-turn:0:synthetic",
+    };
+    runtime.promptEpoch = syntheticPromptEpoch;
+    runtime.recoveryCleanupResources![0]!.promptEpoch = syntheticPromptEpoch;
+    expect(hasRecoverableGeminiConversation(runtime, geminiConfig)).toBe(false);
+  });
+
+  test("rejects target and acquisition capability mismatches", () => {
+    const targetMismatch = recoverableGeminiRuntime();
+    targetMismatch.recoveryCleanupResources![0]!.chromeTargetId = "foreign-target";
+    expect(hasRecoverableGeminiConversation(targetMismatch, geminiConfig)).toBe(false);
+
+    const markerMismatch = recoverableGeminiRuntime();
+    markerMismatch.tabUrl = "about:blank#oracle-acquisition=foreign-generation";
+    expect(hasRecoverableGeminiConversation(markerMismatch, geminiConfig)).toBe(false);
   });
 });

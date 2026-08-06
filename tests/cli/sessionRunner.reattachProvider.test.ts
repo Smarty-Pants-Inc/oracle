@@ -153,29 +153,55 @@ beforeEach(async () => {
 
 describe("performSessionRun", () => {
   test("keeps committed Gemini capture failures running for exact reattach", async () => {
+    const generationId = "gemini-generation-1";
+    const promptEpoch = {
+      status: "committed" as const,
+      epochId: "gemini-epoch-1",
+      promptSha256: "d".repeat(64),
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "data-message-id:gemini-user-current",
+      verifiedUserMessageId: "data-message-id:gemini-user-current",
+      conversationId: "gemini-target-1",
+    };
     const runtime = {
       chromePort: 9222,
       chromeHost: "127.0.0.1",
       chromeTargetId: "gemini-target-1",
+      tabUrl: `about:blank#oracle-acquisition=${generationId}`,
       conversationId: "gemini-target-1",
-      promptEpoch: {
-        status: "committed" as const,
-        epochId: "gemini-epoch-1",
-        promptSha256: "d".repeat(64),
-        baselineTurns: 0,
-        followUpOrdinal: 0,
-        remainingFollowUps: 0,
-        verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: "data-message-id:gemini-user-current",
-        verifiedUserMessageId: "data-message-id:gemini-user-current",
-        conversationId: "gemini-target-1",
-      },
+      promptEpoch,
       recoveryCleanupResources: [
         {
           chromePort: 9222,
           chromeHost: "127.0.0.1",
           chromeTargetId: "gemini-target-1",
           conversationId: "gemini-target-1",
+          promptEpoch,
+          targetCloseCapability: {
+            version: 1 as const,
+            generationId,
+            capabilityId: "gemini-target-capability-1",
+            targetId: "gemini-target-1",
+          },
+          tabLease: {
+            id: "gemini-tab-lease-1",
+            generationId,
+            profileDirectory: {
+              version: 2 as const,
+              platform: process.platform,
+              canonicalPath: "/tmp/oracle-gemini-profile",
+              device: "1",
+              inode: "2",
+              birthtimeNs: "3",
+            },
+          },
+          acquisition: {
+            generationId,
+            targetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
+          },
           recoveryCleanup: {
             ownsTarget: true,
             profileKind: "manual-login" as const,

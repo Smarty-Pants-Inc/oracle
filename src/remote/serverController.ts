@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import chalk from "chalk";
 import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
-import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock.js";
+import {
+  acquireCrashRecoverableFilesystemLock,
+  type CrashRecoverableFilesystemLockDeps,
+} from "../browser/filesystemLock.js";
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
 import type {
   ChromeProcessIdentity,
@@ -37,7 +40,11 @@ import {
   sweepExpiredRemoteTransactions,
 } from "./transactionServer.js";
 import type { ReconcileRemoteTransactionResult } from "./transactionModel.js";
-import { RemoteTransactionStore } from "./transactionStore.js";
+import {
+  assertRemoteTransactionStoreRootAuthority,
+  prepareRemoteTransactionStoreRoot,
+  RemoteTransactionStore,
+} from "./transactionStore.js";
 import {
   DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS,
   DEFAULT_REMOTE_RUN_OVERALL_TIMEOUT_MS,
@@ -66,6 +73,7 @@ interface RemoteServerDeps {
   transactionLeaseDurationMs?: number;
   transactionStoreNow?: () => number;
   leaseSweepIntervalMs?: number;
+  controllerLockDeps?: CrashRecoverableFilesystemLockDeps;
 }
 
 export async function createRemoteServer(
@@ -111,20 +119,29 @@ export async function createRemoteServer(
     rootKey: authToken,
     serverGeneration: controllerGeneration,
   });
+  const transactionStoreRoot = await prepareRemoteTransactionStoreRoot({
+    directory: transactionStoreDir,
+    integrityKeyPath: transactionIntegrityKeyPath,
+  });
   const controllerLock = await acquireCrashRecoverableFilesystemLock(
-    path.join(transactionStoreDir, ".controller.lock"),
+    path.join(transactionStoreRoot.directory, ".controller.lock"),
     {
       sessionId: `remote-controller:${controllerGeneration}`,
+      createParent: false,
+      expectedParentIdentity: transactionStoreRoot.storeRootIdentity,
     },
+    deps.controllerLockDeps,
   );
   let transactionStore: RemoteTransactionStore;
   try {
+    await assertRemoteTransactionStoreRootAuthority(transactionStoreRoot);
     transactionStore = await RemoteTransactionStore.open({
       directory: transactionStoreDir,
       integrityKeyPath: transactionIntegrityKeyPath,
       leaseDurationMs: deps.transactionLeaseDurationMs,
       now: deps.transactionStoreNow,
       controllerGeneration,
+      rootAuthority: transactionStoreRoot,
     });
   } catch (error) {
     await controllerLock.release().catch(() => undefined);

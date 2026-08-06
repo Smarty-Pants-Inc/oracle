@@ -109,7 +109,7 @@ export async function autoReattachUntilComplete({
     "browser-recovery.lock",
   );
   let retryRuntime = runtime;
-  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime);
+  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime, browserConfig);
   const publication = new BrowserPublicationTransaction();
 
   let attempt = 0;
@@ -328,7 +328,8 @@ export async function autoReattachUntilComplete({
         terminalAutoReattachError ||
         cleanupCompletedAfterCapturedError ||
         retryRuntime.recoveryCleanupResult?.settlementMode !== undefined ||
-        (capturedErrorRuntime !== undefined && !hasResumableBrowserAuthority(errorRuntime))
+        (capturedErrorRuntime !== undefined &&
+          !hasResumableBrowserAuthority(errorRuntime, browserConfig))
       ) {
         const details = userError?.details as { stage?: string } | undefined;
         const incompleteReason =

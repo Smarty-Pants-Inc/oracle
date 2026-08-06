@@ -17,6 +17,72 @@ import {
   type FakeTarget,
 } from "./reattachTestHelpers.js";
 
+function executorStyleGeminiRecoveryRuntime(options: {
+  targetId: string;
+  promptSha256: string;
+  userId: string;
+}): BrowserRuntimeMetadata {
+  const generationId = `generation-${options.targetId}`;
+  const promptEpoch = {
+    status: "committed" as const,
+    epochId: `epoch-${options.targetId}`,
+    promptSha256: options.promptSha256,
+    baselineTurns: 0,
+    followUpOrdinal: 0,
+    remainingFollowUps: 0,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: options.userId,
+    verifiedUserMessageId: options.userId,
+    conversationId: options.targetId,
+  };
+  return {
+    chromePort: 51559,
+    chromeHost: "127.0.0.1",
+    chromeTargetId: options.targetId,
+    tabUrl: `about:blank#oracle-acquisition=${generationId}`,
+    conversationId: options.targetId,
+    promptEpoch,
+    recoveryCleanupResources: [
+      {
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        chromeTargetId: options.targetId,
+        conversationId: options.targetId,
+        promptEpoch,
+        targetCloseCapability: {
+          version: 1,
+          generationId,
+          capabilityId: `capability-${options.targetId}`,
+          targetId: options.targetId,
+        },
+        tabLease: {
+          id: `lease-${options.targetId}`,
+          generationId,
+          profileDirectory: {
+            version: 2,
+            platform: process.platform,
+            canonicalPath: `/tmp/oracle-${options.targetId}`,
+            device: "1",
+            inode: "2",
+            birthtimeNs: "3",
+          },
+        },
+        acquisition: {
+          generationId,
+          targetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
+        },
+        recoveryCleanup: {
+          ownsTarget: true,
+          profileKind: "manual-login",
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
+        },
+      },
+    ],
+    recoveryCleanupResult: { status: "pending" },
+  };
+}
+
 describe("resumeBrowserSession", { timeout: 15_000 }, () => {
   test("selects target and captures markdown via stubs", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-profile-"));
@@ -172,24 +238,11 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
 
   test("harvests the exact committed Gemini provider identity after DOM history shift", async () => {
     const promptSha256 = promptIdentitySha256("New request");
-    const runtime = {
-      chromePort: 51559,
-      chromeHost: "127.0.0.1",
-      chromeTargetId: "gemini-target-1",
-      conversationId: "gemini-target-1",
-      promptEpoch: {
-        status: "committed" as const,
-        epochId: "gemini-epoch-1",
-        promptSha256,
-        baselineTurns: 0,
-        followUpOrdinal: 0,
-        remainingFollowUps: 0,
-        verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: "data-message-id:user-current",
-        verifiedUserMessageId: "data-message-id:user-current",
-        conversationId: "gemini-target-1",
-      },
-    } satisfies BrowserRuntimeMetadata;
+    const runtime = executorStyleGeminiRecoveryRuntime({
+      targetId: "gemini-target-1",
+      promptSha256,
+      userId: "data-message-id:user-current",
+    });
     const listTargets = vi.fn(async () => [
       {
         targetId: "gemini-target-1",
@@ -277,24 +330,11 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
   test("refuses synthetic Gemini DOM authority after history shift and repeated prompt", async () => {
     const promptSha256 = promptIdentitySha256("New request");
     const syntheticUserId = `gemini-dom-turn:0:${promptSha256}`;
-    const runtime = {
-      chromePort: 51559,
-      chromeHost: "127.0.0.1",
-      chromeTargetId: "gemini-target-1",
-      conversationId: "gemini-target-1",
-      promptEpoch: {
-        status: "committed" as const,
-        epochId: "gemini-epoch-1",
-        promptSha256,
-        baselineTurns: 0,
-        followUpOrdinal: 0,
-        remainingFollowUps: 0,
-        verifiedUserTurnIndex: 0,
-        verifiedUserTurnId: syntheticUserId,
-        verifiedUserMessageId: syntheticUserId,
-        conversationId: "gemini-target-1",
-      },
-    } satisfies BrowserRuntimeMetadata;
+    const runtime = executorStyleGeminiRecoveryRuntime({
+      targetId: "gemini-target-1",
+      promptSha256,
+      userId: syntheticUserId,
+    });
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
       if (expression === "1+1") return { result: { value: 2 } };
       if (expression.includes("const ordered =")) {
@@ -374,23 +414,16 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       evaluate.mock.calls.some(([input]) => input.expression.includes("const ordered =")),
     ).toBe(false);
     expect(recoverSession).not.toHaveBeenCalled();
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
   });
 
   test("never reopens or resubmits when the exact committed Gemini target is missing", async () => {
-    const baseRuntime = withCommittedPromptEpoch({
-      chromePort: 51559,
-      chromeHost: "127.0.0.1",
-      chromeTargetId: "gemini-target-missing",
-      conversationId: "gemini-target-missing",
+    const runtime = executorStyleGeminiRecoveryRuntime({
+      targetId: "gemini-target-missing",
+      promptSha256: promptIdentitySha256("New request"),
+      userId: "data-message-id:user-current",
     });
-    const runtime: BrowserRuntimeMetadata = {
-      ...baseRuntime,
-      promptEpoch: {
-        ...baseRuntime.promptEpoch!,
-        promptSha256: promptIdentitySha256("New request"),
-      },
-    };
     const recoverSession = vi.fn();
     const release = vi.fn(async () => undefined);
 

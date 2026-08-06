@@ -1,13 +1,15 @@
 import path from "node:path";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import type { BrowserRemoteRecoveryMetadata } from "../sessionManager.js";
+import type { BrowserRemoteRecoveryMetadata, BrowserSessionConfig } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../remote/types.js";
 import {
   assertRemoteTransactionToken,
   isRemoteTransactionToken,
 } from "../remote/transactionToken.js";
+import { resolveGeminiWebModel } from "../gemini-web/models.js";
 import { extractStableConversationIdFromUrl, isStableConversationUrl } from "./conversationUrl.js";
+import { hasImmutableGeminiPromptIdentity } from "./providers/geminiDeepThinkDomProvider.js";
 import {
   parseChromeProcessIdentity,
   parseChromeProcessLaunchClaim,
@@ -193,6 +195,114 @@ export function hasRecoverableChatGptConversation(
 ): boolean {
   const locator = resolveCommittedPromptEpochLocator(runtime);
   return locator !== null && locator.epoch.remainingFollowUps === 0;
+}
+
+function isGeminiRecoveryTabUrl(candidate: string | undefined): boolean {
+  if (candidate === undefined) return true;
+  const trimmed = candidate.trim();
+  if (/^about:blank#oracle-acquisition=[^#\s]+$/u.test(trimmed)) return true;
+  try {
+    const url = new URL(trimmed);
+    return (
+      url.protocol === "https:" &&
+      !url.port &&
+      url.hostname === "gemini.google.com" &&
+      (url.pathname === "/app" || url.pathname.startsWith("/app/"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function sameCommittedPromptEpoch(
+  expected: CommittedBrowserPromptEpoch,
+  candidate: BrowserRuntimeMetadata["promptEpoch"],
+): boolean {
+  return (
+    candidate?.status === "committed" &&
+    candidate.epochId === expected.epochId &&
+    candidate.promptSha256 === expected.promptSha256 &&
+    candidate.baselineTurns === expected.baselineTurns &&
+    candidate.followUpOrdinal === expected.followUpOrdinal &&
+    candidate.remainingFollowUps === expected.remainingFollowUps &&
+    candidate.verifiedUserTurnIndex === expected.verifiedUserTurnIndex &&
+    candidate.verifiedUserTurnId === expected.verifiedUserTurnId &&
+    candidate.verifiedUserMessageId === expected.verifiedUserMessageId &&
+    candidate.conversationId === expected.conversationId
+  );
+}
+
+export function resolveCommittedGeminiPromptEpochLocator(
+  runtime: BrowserRuntimeMetadata | null | undefined,
+  config: BrowserSessionConfig | null | undefined,
+): CommittedPromptEpochLocator | null {
+  if (
+    !runtime ||
+    resolveGeminiWebModel(config?.desiredModel) !== "gemini-3-pro-deep-think" ||
+    !isGeminiRecoveryTabUrl(runtime.tabUrl)
+  ) {
+    return null;
+  }
+
+  const runtimeWithoutTabUrl: BrowserRuntimeMetadata = { ...runtime };
+  delete runtimeWithoutTabUrl.tabUrl;
+  const locator = resolveCommittedPromptEpochLocator(runtimeWithoutTabUrl);
+  if (
+    !locator ||
+    locator.epoch.remainingFollowUps !== 0 ||
+    !hasImmutableGeminiPromptIdentity(locator.epoch)
+  ) {
+    return null;
+  }
+
+  const targetId = runtime.chromeTargetId?.trim();
+  if (!targetId || locator.conversationId !== targetId) return null;
+
+  let boundOwnedTarget = false;
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    const resourceTargetId = resource.chromeTargetId?.trim();
+    if (resourceTargetId && resourceTargetId !== targetId) return null;
+    if (resource.conversationId !== undefined && resource.conversationId !== targetId) return null;
+    if (resource.promptEpoch && !sameCommittedPromptEpoch(locator.epoch, resource.promptEpoch)) {
+      return null;
+    }
+    if (!resource.recoveryCleanup.ownsTarget) continue;
+    if (boundOwnedTarget) return null;
+
+    const acquisitionGeneration = resource.acquisition?.generationId?.trim();
+    const capability = resource.targetCloseCapability;
+    const acquisitionMarker = acquisitionGeneration
+      ? `about:blank#oracle-acquisition=${acquisitionGeneration}`
+      : undefined;
+    const lease = resource.tabLease;
+    if (
+      resourceTargetId !== targetId ||
+      !acquisitionMarker ||
+      resource.acquisition?.targetMarkerUrl !== acquisitionMarker ||
+      (runtime.tabUrl?.startsWith("about:blank#oracle-acquisition=") &&
+        runtime.tabUrl !== acquisitionMarker) ||
+      !capability ||
+      capability.version !== 1 ||
+      capability.targetId !== targetId ||
+      capability.generationId !== acquisitionGeneration ||
+      !capability.capabilityId.trim() ||
+      !lease ||
+      !lease.id.trim() ||
+      lease.generationId !== acquisitionGeneration ||
+      !resource.promptEpoch
+    ) {
+      return null;
+    }
+    boundOwnedTarget = true;
+  }
+  return boundOwnedTarget ? locator : null;
+}
+
+export function hasRecoverableGeminiConversation(
+  runtime: BrowserRuntimeMetadata | null | undefined,
+  config: BrowserSessionConfig | null | undefined,
+): boolean {
+  return resolveCommittedGeminiPromptEpochLocator(runtime, config) !== null;
 }
 
 export function hasPendingChromeAcquisitionIntent(

@@ -8,6 +8,7 @@ import {
 } from "../browser/artifacts.js";
 import {
   capturePhysicalDirectoryIdentity,
+  PhysicalDirectoryIdentityUnavailableError,
   samePhysicalDirectoryIdentity,
 } from "../browser/filesystemLockDirectoryIdentity.js";
 import {
@@ -85,7 +86,7 @@ export class RemoteArtifactStore {
         }
         throw error;
       }
-      namespaceIdentity = await capturePhysicalDirectoryIdentity(namespaceDirectory);
+      namespaceIdentity = await captureArtifactNamespaceIdentity(namespaceDirectory);
       await this.#transactionStore.bindArtifactNamespaceIdentity({
         ...params,
         identity: namespaceIdentity,
@@ -329,7 +330,7 @@ export class RemoteArtifactStore {
     const identity = record.artifactNamespaceIdentity;
     if (!identity) {
       try {
-        await capturePhysicalDirectoryIdentity(namespaceDirectory);
+        await captureArtifactNamespaceIdentity(namespaceDirectory);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
       }
@@ -339,7 +340,7 @@ export class RemoteArtifactStore {
     const verifyIdentity = async (candidatePath: string): Promise<boolean> => {
       try {
         return samePhysicalDirectoryIdentity(
-          await capturePhysicalDirectoryIdentity(candidatePath),
+          await captureArtifactNamespaceIdentity(candidatePath),
           identity,
         );
       } catch (error) {
@@ -359,7 +360,7 @@ export class RemoteArtifactStore {
     }
     if (!currentMatches) {
       try {
-        await capturePhysicalDirectoryIdentity(namespaceDirectory);
+        await captureArtifactNamespaceIdentity(namespaceDirectory);
         return false;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
@@ -466,7 +467,7 @@ export class RemoteArtifactStore {
     const namespaceDirectory = this.namespaceDirectory(artifactNamespace);
     if (
       !samePhysicalDirectoryIdentity(
-        await capturePhysicalDirectoryIdentity(namespaceDirectory),
+        await captureArtifactNamespaceIdentity(namespaceDirectory),
         expectedIdentity,
       )
     ) {
@@ -480,7 +481,7 @@ export class RemoteArtifactStore {
     if (
       canonicalArtifactsDirectory !== expectedDirectory ||
       !samePhysicalDirectoryIdentity(
-        await capturePhysicalDirectoryIdentity(namespaceDirectory),
+        await captureArtifactNamespaceIdentity(namespaceDirectory),
         expectedIdentity,
       )
     ) {
@@ -527,6 +528,20 @@ export class RemoteArtifactStore {
       throw new Error("Remote artifact is outside its exact transaction artifact namespace");
     }
     return canonicalPath;
+  }
+}
+
+async function captureArtifactNamespaceIdentity(
+  directoryPath: string,
+): Promise<DurableRemoteArtifactNamespaceIdentity> {
+  try {
+    return await capturePhysicalDirectoryIdentity(directoryPath);
+  } catch (error) {
+    if (!(error instanceof PhysicalDirectoryIdentityUnavailableError)) throw error;
+    throw new Error(
+      `Remote artifact namespace ${directoryPath} cannot establish durable replacement-safe authority. Move ORACLE_HOME_DIR to a filesystem with stable nonzero birth time.`,
+      { cause: error },
+    );
   }
 }
 

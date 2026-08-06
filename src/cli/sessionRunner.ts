@@ -49,7 +49,6 @@ import { settleBrowserRecoveryCleanup } from "../browser/reattach.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
-  hasRecoverableChatGptConversation,
 } from "../browser/reattachability.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../browser/types.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
@@ -117,7 +116,7 @@ export async function performSessionRun({
   };
   const restartCandidateRuntime = sessionMeta.browser?.runtime;
   const retainedInitialRuntime = browserConfig
-    ? retryableInitialBrowserRuntime(restartCandidateRuntime)
+    ? retryableInitialBrowserRuntime(restartCandidateRuntime, browserConfig)
     : undefined;
   let currentBrowser: SessionMetadata["browser"] = browserConfig
     ? {
@@ -125,7 +124,10 @@ export async function performSessionRun({
         ...(retainedInitialRuntime ? { runtime: retainedInitialRuntime } : {}),
       }
     : sessionMeta.browser;
-  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(retainedInitialRuntime);
+  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(
+    retainedInitialRuntime,
+    browserConfig,
+  );
   await sessionStore.updateSession(sessionMeta.id, {
     status: "running",
     startedAt: new Date().toISOString(),
@@ -155,8 +157,7 @@ export async function performSessionRun({
       Boolean(
         restartRuntime?.recoveryCleanupResources?.length && restartRuntime.recoveryCleanupResult,
       ) &&
-      !hasRemoteRecoveryAuthority(restartRuntime) &&
-      !hasRecoverableChatGptConversation(restartRuntime);
+      !hasBrowserRecoveryAuthority(restartRuntime, browserConfig);
     if (hasCleanupOnlyRestart && restartRuntime) {
       if (
         hasPendingChromeAcquisitionIntent(restartRuntime) &&
@@ -764,7 +765,7 @@ export async function performSessionRun({
         );
         return;
       }
-      if (!hasBrowserRecoveryAuthority(runtime)) return;
+      if (!hasBrowserRecoveryAuthority(runtime, browserConfig)) return;
       reattachGuidanceLogged = true;
       log(formatBrowserReattachGuidance(sessionMeta.id));
     };
@@ -775,7 +776,7 @@ export async function performSessionRun({
         ? (userError.details as { reattachable?: boolean } | undefined)?.reattachable === true
         : (userError.details as { recoverableDisconnect?: boolean } | undefined)
             ?.recoverableDisconnect === true;
-      const hasRecoveryAuthority = hasResumableBrowserAuthority(recoverableRuntime);
+      const hasRecoveryAuthority = hasResumableBrowserAuthority(recoverableRuntime, browserConfig);
       if (!recoveryAuthorized || !hasRecoveryAuthority) {
         log(
           dim(
@@ -895,7 +896,7 @@ export async function performSessionRun({
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       let autoRuntime = runtime ?? currentBrowser?.runtime;
       const willAutoReattach =
-        autoReattachIntervalMs > 0 && hasResumableBrowserAuthority(autoRuntime);
+        autoReattachIntervalMs > 0 && hasResumableBrowserAuthority(autoRuntime, browserConfig);
       if (willAutoReattach) {
         const timeoutRecoveryRuntime = autoRuntime as BrowserRuntimeMetadata;
         await persistBrowserSessionOutcome(sessionMeta.id, {

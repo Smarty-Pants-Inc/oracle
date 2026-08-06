@@ -253,6 +253,69 @@ function committedPromptAuthority(conversationId: string): BrowserRuntimeMetadat
   };
 }
 
+function committedGeminiRecoveryAuthority(): BrowserRuntimeMetadata {
+  const targetId = "gemini-target-1";
+  const generationId = "gemini-generation-1";
+  const promptEpoch = {
+    status: "committed" as const,
+    epochId: "gemini-epoch-1",
+    promptSha256: "d".repeat(64),
+    baselineTurns: 0,
+    followUpOrdinal: 0,
+    remainingFollowUps: 0,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "data-message-id:gemini-user-current",
+    verifiedUserMessageId: "data-message-id:gemini-user-current",
+    conversationId: targetId,
+  };
+  return {
+    chromeHost: "127.0.0.1",
+    chromePort: 9222,
+    chromeTargetId: targetId,
+    tabUrl: `about:blank#oracle-acquisition=${generationId}`,
+    conversationId: targetId,
+    promptEpoch,
+    recoveryCleanupResources: [
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeTargetId: targetId,
+        conversationId: targetId,
+        promptEpoch,
+        targetCloseCapability: {
+          version: 1,
+          generationId,
+          capabilityId: "gemini-target-capability-1",
+          targetId,
+        },
+        tabLease: {
+          id: "gemini-tab-lease-1",
+          generationId,
+          profileDirectory: {
+            version: 2,
+            platform: process.platform,
+            canonicalPath: "/tmp/oracle-gemini-profile",
+            device: "1",
+            inode: "2",
+            birthtimeNs: "3",
+          },
+        },
+        acquisition: {
+          generationId,
+          targetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
+        },
+        recoveryCleanup: {
+          ownsTarget: true,
+          profileKind: "manual-login",
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
+        },
+      },
+    ],
+    recoveryCleanupResult: { status: "pending" },
+  };
+}
+
 function pendingChromeProcessAcquisitionRuntime(): BrowserRuntimeMetadata {
   const userDataDir = path.resolve("/tmp/oracle-display-acquisition");
   const generationId = "70000000-0000-4000-8000-000000000007";
@@ -1648,6 +1711,54 @@ describe("attachSession rendering", () => {
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
     ).toBe(false);
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+  });
+
+  test("reattaches executor-style committed Gemini authority from an acquisition marker", async () => {
+    const runtime = committedGeminiRecoveryAuthority();
+    const errorMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: {
+        config: { desiredModel: "gemini-3-pro-deep-think", timeoutMs: 2_000 },
+        runtime,
+      },
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+      error: {
+        category: "browser-automation",
+        message: "Gemini response capture remains pending",
+        details: {
+          stage: "gemini-response-capture",
+          code: "gemini-response-capture-recoverable",
+          reattachable: true,
+          runtime,
+        },
+      },
+    };
+    resumeBrowserSessionMock.mockRejectedValueOnce(
+      new BrowserAutomationError("Gemini answer is still generating", {
+        stage: "gemini-response-capture",
+        code: "gemini-reattach-capture-pending",
+        reattachable: true,
+        runtime,
+      }),
+    );
+    sessionStoreMock.updateSession.mockResolvedValue(errorMeta);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const recovered = await orchestrateBrowserAttachAuthority("sess", errorMeta);
+
+    expect(resumeBrowserSessionMock).toHaveBeenCalledWith(
+      runtime,
+      expect.objectContaining({ desiredModel: "gemini-3-pro-deep-think" }),
+      expect.any(Function),
+      expect.objectContaining({ sessionId: "sess" }),
+    );
+    expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith("sess", {
+      browser: { ...errorMeta.browser, runtime },
+    });
+    expect(recovered).toBe(errorMeta);
   });
 
   test("aborts owned Gemini resources when immutable response identity is unavailable", async () => {

@@ -38,6 +38,7 @@ import {
   syncDirectoryIfPresent,
   type PhysicalDirectoryIdentity,
 } from "./filesystemLockIo.js";
+import { samePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 export { FilesystemLockReleasePendingError } from "./filesystemLockGenerationRelease.js";
 export {
   isolateDirectoryGenerationForRemoval,
@@ -86,6 +87,7 @@ export interface CrashRecoverableFilesystemLockOptions {
   adoptCurrentProcessGeneration?: boolean;
   /** Tab-lease registry only: a live or unknown current Windows PID remains unreclaimable. */
   processGenerationPolicy?: "strict" | "allow-unstable-current-win32";
+  expectedParentIdentity?: PhysicalDirectoryIdentity;
 }
 
 export interface CrashRecoverableFilesystemLockDeps {
@@ -163,6 +165,13 @@ export async function acquireCrashRecoverableFilesystemLock(
   const startedAt = now();
   const mutationDeadlineMs = timeoutMs === 0 ? startedAt : startedAt + timeoutMs;
   const parentPath = path.dirname(lockPath);
+  const assertExpectedParentIdentity = async (): Promise<void> => {
+    if (!options.expectedParentIdentity) return;
+    const currentParentIdentity = await capturePhysicalDirectoryIdentity(parentPath);
+    if (!samePhysicalDirectoryIdentity(currentParentIdentity, options.expectedParentIdentity)) {
+      throw new Error(`Filesystem lock parent generation changed at ${parentPath}`);
+    }
+  };
   const mutationOptions: FilesystemLockMutationOptions = {
     owner: mutationOwner,
     now,
@@ -176,9 +185,13 @@ export async function acquireCrashRecoverableFilesystemLock(
     beforeRequestRemoval: deps.beforeMutationRequestRemoval,
   };
 
+  if (options.expectedParentIdentity && options.createParent !== false) {
+    throw new Error("Expected filesystem lock parent identity requires createParent: false");
+  }
   if (options.createParent !== false) {
     await mkdir(parentPath, { recursive: true });
   }
+  await assertExpectedParentIdentity();
   await retryPendingFilesystemLockReleases(lockPath);
 
   const completeAcquisition = (
@@ -206,14 +219,31 @@ export async function acquireCrashRecoverableFilesystemLock(
       release: retainedRelease.release,
     };
   };
+  const completeVerifiedAcquisition = async (
+    acquiredOwner: FilesystemLockOwnerRecord,
+    expectedGeneration: FilesystemLockGeneration,
+    mutationLease?: FilesystemLockMutationLease,
+  ): Promise<CrashRecoverableFilesystemLock> => {
+    const acquired = completeAcquisition(acquiredOwner, expectedGeneration, mutationLease);
+    try {
+      await assertExpectedParentIdentity();
+      return acquired;
+    } catch (error) {
+      await acquired.release().catch(() => undefined);
+      throw error;
+    }
+  };
 
   let preparedLockPath: string | undefined;
   let preparedLockIdentity: PhysicalDirectoryIdentity | undefined;
   try {
+    await assertExpectedParentIdentity();
     preparedLockPath = await mkdtemp(`${lockPath}.publishing-`);
     preparedLockIdentity = await capturePhysicalDirectoryIdentity(preparedLockPath);
+    await assertExpectedParentIdentity();
     await writeLockOwner(preparedLockPath, owner);
     await deps.beforeLockPublication?.(preparedLockPath);
+    await assertExpectedParentIdentity();
     const preparedGeneration = await captureFilesystemLockDirectoryGeneration(
       preparedLockPath,
       encodeFilesystemLockOwner(owner),
@@ -222,11 +252,15 @@ export async function acquireCrashRecoverableFilesystemLock(
     for (;;) {
       if (
         !(await hasFilesystemLockMutationRequests(lockPath)) &&
-        (await publishPreparedLockGeneration(preparedLockPath, lockPath))
+        (await publishPreparedLockGeneration(
+          preparedLockPath,
+          lockPath,
+          assertExpectedParentIdentity,
+        ))
       ) {
         preparedLockPath = undefined;
         preparedLockIdentity = undefined;
-        return completeAcquisition(owner, preparedGeneration);
+        return await completeVerifiedAcquisition(owner, preparedGeneration);
       }
 
       let inspection = await inspectExistingLock(lockPath, {
@@ -245,7 +279,7 @@ export async function acquireCrashRecoverableFilesystemLock(
         (inspection.owner.sessionId === undefined ||
           inspection.owner.sessionId === options.sessionId)
       ) {
-        return completeAcquisition(
+        return await completeVerifiedAcquisition(
           inspection.owner,
           await captureFilesystemLockDirectoryGeneration(
             lockPath,
@@ -255,6 +289,7 @@ export async function acquireCrashRecoverableFilesystemLock(
       }
       let attemptedReclamation = false;
       if (inspection.status === "stale") {
+        await assertExpectedParentIdentity();
         const mutationLease = await acquireFilesystemLockMutationLease(
           lockPath,
           mutationOptions,
@@ -263,11 +298,17 @@ export async function acquireCrashRecoverableFilesystemLock(
         if (mutationLease === null) throw new FilesystemLockBusyError(lockPath);
         let retainMutationLease = false;
         try {
-          if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+          if (
+            await publishPreparedLockGeneration(
+              preparedLockPath,
+              lockPath,
+              assertExpectedParentIdentity,
+            )
+          ) {
             retainMutationLease = true;
             preparedLockPath = undefined;
             preparedLockIdentity = undefined;
-            return completeAcquisition(owner, preparedGeneration, mutationLease);
+            return await completeVerifiedAcquisition(owner, preparedGeneration, mutationLease);
           }
           inspection = await inspectExistingLock(lockPath, {
             nowMs: now(),
@@ -277,6 +318,7 @@ export async function acquireCrashRecoverableFilesystemLock(
           });
           if (inspection.status === "stale") {
             await deps.beforeStaleLockQuarantine?.();
+            await assertExpectedParentIdentity();
             await quarantineStaleLock(
               lockPath,
               createNonce(),
@@ -284,11 +326,17 @@ export async function acquireCrashRecoverableFilesystemLock(
               deps.afterStaleLockQuarantine,
             );
             attemptedReclamation = true;
-            if (await publishPreparedLockGeneration(preparedLockPath, lockPath)) {
+            if (
+              await publishPreparedLockGeneration(
+                preparedLockPath,
+                lockPath,
+                assertExpectedParentIdentity,
+              )
+            ) {
               retainMutationLease = true;
               preparedLockPath = undefined;
               preparedLockIdentity = undefined;
-              return completeAcquisition(owner, preparedGeneration, mutationLease);
+              return await completeVerifiedAcquisition(owner, preparedGeneration, mutationLease);
             }
           }
         } finally {
@@ -387,8 +435,11 @@ export async function readProcessStartIdentity(
 async function publishPreparedLockGeneration(
   preparedLockPath: string,
   lockPath: string,
+  assertParentAuthority: () => Promise<void> = async () => undefined,
 ): Promise<boolean> {
+  await assertParentAuthority();
   if (await lockPathExists(lockPath)) return false;
+  await assertParentAuthority();
   try {
     await renameLockPath(preparedLockPath, lockPath);
   } catch (error) {

@@ -12,6 +12,7 @@ import {
   runBridgeHost,
 } from "../../src/cli/bridge/host.js";
 import { startReverseTunnel } from "../../src/cli/bridge/reverseTunnel.js";
+import { WINDOWS_BRIDGE_CHILD_READINESS_STDOUT } from "../../src/cli/bridge/childProtocol.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import type { RemoteServerLifecycle, RemoteServerOptions } from "../../src/remote/server.js";
 import {
@@ -21,6 +22,7 @@ import {
 import * as fsDurability from "../../src/fsDurability.js";
 import * as sessionManager from "../../src/sessionManager.js";
 
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
 const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
@@ -39,6 +41,7 @@ interface FakeBridgeChild {
 function createFakeBridgeChild(
   onCredentials: (payload: string, readiness: Readable) => void | Promise<void>,
   pid = 4242,
+  readinessOnStdout = false,
 ): FakeBridgeChild {
   const stdinWrites: Buffer[] = [];
   const readiness = new Readable({ read() {} });
@@ -79,8 +82,13 @@ function createFakeBridgeChild(
   Object.assign(emitter, {
     pid,
     stdin,
-    stdio: [stdin, null, null, readiness],
-    stdout: null,
+    stdio: [
+      stdin,
+      readinessOnStdout ? readiness : null,
+      null,
+      readinessOnStdout ? null : readiness,
+    ],
+    stdout: readinessOnStdout ? readiness : null,
     stderr: null,
     unref,
     kill,
@@ -403,6 +411,70 @@ describe("bridge host detached child transport", () => {
     }
   });
 
+  it("launches Windows background hosts inside a trusted kill-on-close Job supervisor", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-windows-job-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    const spawnChild = vi.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+    );
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await runBridgeHost(
+        {
+          background: true,
+          token: MODERN_TOKEN,
+          writeConnection: artifactPath,
+          ssh: "synthetic-host",
+        },
+        {
+          spawn: spawnChild,
+          backgroundPlatform: "win32",
+          generateReadinessNonce: () => READINESS_NONCE,
+          env: { PATH: String.raw`C:\attacker`, ORACLE_REMOTE_TOKEN: MODERN_TOKEN },
+        },
+      );
+
+      expect(spawnChild).toHaveBeenCalledOnce();
+      const [command, args, options] = spawnChild.mock.calls[0]!;
+      expect(command).toBe(resolveWindowsPowerShellExecutable());
+      expect(command).not.toMatch(/(?:^|[\\/])taskkill(?:\.exe)?$/iu);
+      expect(args.slice(0, 4)).toEqual([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+      ]);
+      const supervisorScript = Buffer.from(args[4]!, "base64").toString("utf16le");
+      expect(supervisorScript).toContain("KillOnClose");
+      expect(supervisorScript).toContain("AssignProcessToJobObject");
+      expect(supervisorScript).not.toContain("taskkill");
+      expect(options.stdio).toEqual(["pipe", "pipe", expect.any(Number)]);
+      expect(options.env?.[WINDOWS_BRIDGE_CHILD_READINESS_STDOUT]).toBe("1");
+      const launchConfig = JSON.parse(
+        Buffer.from(String(options.env?.ORACLE_BRIDGE_CHILD_LAUNCH_CONFIG), "base64").toString(
+          "utf8",
+        ),
+      ) as { file: string; arguments: string };
+      expect(launchConfig.file).toBe(process.execPath);
+      expect(launchConfig.arguments).toContain("--background-child");
+      expect(JSON.stringify(options.env)).not.toContain(MODERN_TOKEN);
+      expect(JSON.stringify(options.env)).not.toContain(READINESS_NONCE);
+      expect(harness.kill).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("requires authenticated readiness before replacing prior artifact or pid state", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-not-ready-"));
     const artifactPath = path.join(tempDir, "connection.json");
@@ -541,16 +613,23 @@ describe("bridge host detached child transport", () => {
     await fs.writeFile(artifactPath, oldArtifact);
     await fs.writeFile(pidPath, oldPid);
     setOracleHomeDirOverrideForTest(tempDir);
-    const harness = createFakeBridgeChild((_payload, readiness) => {
-      readiness.push(readinessPayload(READINESS_NONCE));
-      readiness.push(null);
-    }, 0);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      0,
+      true,
+    );
     const shutdownRequested = Promise.withResolvers<void>();
     let tunnelLive = true;
     harness.kill.mockImplementation(() => {
       shutdownRequested.resolve();
       return true;
     });
+    const spawnChild = vi.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+    );
     const durableWrite = sessionManager.writeFileAtomicDurable;
     let failPublishedArtifact = true;
     let rollbackStarted = false;
@@ -571,7 +650,8 @@ describe("bridge host detached child transport", () => {
       const publication = runBridgeHost(
         { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
         {
-          spawn: () => harness.child,
+          spawn: spawnChild,
+          backgroundPlatform: "win32",
           generateReadinessNonce: () => READINESS_NONCE,
         },
       );
@@ -586,11 +666,75 @@ describe("bridge host detached child transport", () => {
       await expect(publication).rejects.toThrow(/injected directory sync failure/i);
       expect(tunnelLive).toBe(false);
       expect(harness.kill).toHaveBeenCalledOnce();
+      expect(spawnChild).toHaveBeenCalledOnce();
+      expect(spawnChild.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());
+      expect(spawnChild.mock.calls.flat().join(" ")).not.toContain("taskkill");
       expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
       expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
       expect(syncDirectory).toHaveBeenCalledWith(tempDir);
     } finally {
       harness.exit();
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never falls back to ambient executables or a reused PID after Windows supervisor exit", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-windows-exit-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    const oldArtifact = '{"old":"artifact"}\n';
+    const oldPid = "8181\n";
+    await fs.writeFile(artifactPath, oldArtifact);
+    await fs.writeFile(pidPath, oldPid);
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    const spawnChild = vi.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+    );
+    const durableWrite = sessionManager.writeFileAtomicDurable;
+    let jobDrained = false;
+    let rollbackObserved = false;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        if (targetPath === artifactPath && jobDrained) rollbackObserved = true;
+        await durableWrite(targetPath, data, mode);
+        if (targetPath === pidPath && !jobDrained) {
+          jobDrained = true;
+          harness.exit(1, null);
+        }
+      },
+    );
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: spawnChild,
+            backgroundPlatform: "win32",
+            generateReadinessNonce: () => READINESS_NONCE,
+            env: { PATH: String.raw`C:\attacker` },
+          },
+        ),
+      ).rejects.toThrow(/exited during state publication/i);
+      expect(jobDrained).toBe(true);
+      expect(rollbackObserved).toBe(true);
+      expect(harness.kill).not.toHaveBeenCalled();
+      expect(spawnChild).toHaveBeenCalledOnce();
+      expect(spawnChild.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());
+      expect(spawnChild.mock.calls.flat().join(" ")).not.toContain("taskkill");
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
+    } finally {
+      harness.exit(1, null);
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });

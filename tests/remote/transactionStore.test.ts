@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs/promises";
@@ -1281,6 +1281,61 @@ describe("RemoteTransactionStore", () => {
       expect((await readTransactionEnvelope(restarted, transactionToken)).revision).toBe(3);
       await restarted.journalRecoveryRuntime(transactionToken, runtime);
       expect((await readTransactionEnvelope(restarted, transactionToken)).revision).toBe(4);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("repairs an exact post-publication create alias before restart record scanning", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-create-alias-restart-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "d".repeat(64);
+    const tempPath = path.join(
+      directory,
+      `.${transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      const first = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(first, transactionToken, "create-alias-run");
+      const targetPath = first.recordPath(transactionToken);
+      await fs.link(targetPath, tempPath);
+      await expect(fs.lstat(targetPath, { bigint: true })).resolves.toMatchObject({ nlink: 2n });
+
+      const restarted = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+
+      await expect(fs.lstat(tempPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.lstat(targetPath, { bigint: true })).resolves.toMatchObject({ nlink: 1n });
+      await expect(restarted.read(transactionToken)).resolves.toMatchObject({
+        transactionToken,
+        runId: "create-alias-run",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a substituted create publication temp alias", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-create-alias-substitute-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "e".repeat(64);
+    const tempPath = path.join(
+      directory,
+      `.${transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      const first = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(first, transactionToken, "substituted-alias-run");
+      const targetPath = first.recordPath(transactionToken);
+      const targetBytes = await fs.readFile(targetPath);
+      await fs.writeFile(tempPath, targetBytes, { mode: 0o600 });
+
+      await expect(
+        RemoteTransactionStore.open({ directory, integrityKeyPath }),
+      ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
+      await expect(fs.readFile(targetPath)).resolves.toEqual(targetBytes);
+      await expect(fs.readFile(tempPath)).resolves.toEqual(targetBytes);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

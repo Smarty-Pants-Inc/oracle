@@ -14,7 +14,6 @@ import { acquireReattachRecoveryLock } from "../browser/reattachLock.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
-  hasRecoverableChatGptConversation,
   isRecoverableChatGptConversationUrl,
   resolveCommittedPromptEpochLocator,
 } from "../browser/reattachability.js";
@@ -34,7 +33,9 @@ import {
 } from "./durableAnswer.js";
 import { sanitizeBrowserPublicationMessage } from "./browserPublicationJournal.js";
 import {
+  hasBrowserRecoveryAuthority,
   hasRemoteRecoveryAuthority,
+  hasResumableBrowserAuthority,
   MonotonicBrowserRuntimeAuthority,
 } from "./browserRuntimeAuthority.js";
 import { formatError } from "./errorUtils.js";
@@ -86,8 +87,7 @@ export async function orchestrateBrowserAttachAuthority(
     !workerAlive &&
     hasPendingChromeAcquisitionIntent(completedRuntime) &&
     hasExactPendingChromeAcquisitionAuthority(completedRuntime) &&
-    !hasRemoteRecoveryAuthority(completedRuntime) &&
-    !hasRecoverableChatGptConversation(completedRuntime);
+    !hasBrowserRecoveryAuthority(completedRuntime, metadata.browser?.config);
   if (
     publicationJournal &&
     publication.isPublished() &&
@@ -185,8 +185,7 @@ export async function orchestrateBrowserAttachAuthority(
     metadata.mode === "browser" &&
     staleAcquisitionLifecycle &&
     pendingAcquisitionIntent &&
-    !hasRemoteRecoveryAuthority(runtime) &&
-    !hasRecoverableChatGptConversation(runtime);
+    !hasBrowserRecoveryAuthority(runtime, metadata.browser?.config);
   const exactPendingAcquisitionAuthority = hasExactPendingChromeAcquisitionAuthority(runtime);
   const automaticAcquisitionCleanupMode =
     acquisitionOnlyCleanup && exactPendingAcquisitionAuthority ? "abort" : null;
@@ -347,7 +346,7 @@ export async function orchestrateBrowserAttachAuthority(
   const hasRecoverableConversation =
     publicationJournal !== null ||
     hasResumableRemoteAuthority ||
-    hasRecoverableChatGptConversation(runtime);
+    hasResumableBrowserAuthority(runtime, metadata.browser?.config);
   const recoverableDisconnect = readBooleanErrorDetail(metadata, "recoverableDisconnect");
   const disconnectRecoveryAuthorized =
     !hasChromeDisconnect || hasResumableRemoteAuthority || recoverableDisconnect === true;
@@ -386,7 +385,7 @@ export async function orchestrateBrowserAttachAuthority(
     );
   }
 
-  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime);
+  const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime, metadata.browser?.config);
   let authoritativeRuntime = runtime;
   let answerPublished = false;
 

@@ -37,6 +37,10 @@ export interface BrowserRecoverySettlementOutcome {
 
 export type BrowserRecoverySettlementMode = "finalize" | "abort";
 
+type ReattachPromptLocatorResolver = (
+  runtime: BrowserRuntimeMetadata,
+) => CommittedPromptEpochLocator;
+
 export interface RetryBrowserRecoveryCleanupDeps extends Pick<
   ReattachDeps,
   "recoveryCleanup" | "recoveryLockPath" | "acquireRecoveryLock" | "isRemotePublicationAcknowledged"
@@ -67,6 +71,7 @@ const RECOVERY_LOCK_RELEASE_PENDING =
 export function bindCurrentBrowserRecoveryRuntime(
   proposedRuntime: BrowserRuntimeMetadata,
   currentRuntime: BrowserRuntimeMetadata,
+  resolvePromptLocator: ReattachPromptLocatorResolver = requireCommittedPromptEpochLocator,
 ): BrowserRuntimeMetadata {
   const requestedMode = proposedRuntime.recoveryCleanupResult?.settlementMode;
   const proposedHasCleanupAuthority = Boolean(
@@ -105,8 +110,8 @@ export function bindCurrentBrowserRecoveryRuntime(
   }
   if (proposedHasCommittedPrompt && currentHasCommittedPrompt) {
     assertSameCommittedPromptEpoch(
-      requireCommittedPromptEpochLocator(proposedRuntime),
-      requireCommittedPromptEpochLocator(currentRuntime),
+      resolvePromptLocator(proposedRuntime),
+      resolvePromptLocator(currentRuntime),
     );
   }
   if (
@@ -125,13 +130,14 @@ export function createReattachSettlement(
   logger: BrowserLogger,
   deps: ReattachDeps,
   lockAuthority: ReattachSettlementLockAuthority,
+  resolvePromptLocator: ReattachPromptLocatorResolver = requireCommittedPromptEpochLocator,
 ): ReattachResult {
   const { runtime: captureRuntime, finalizeResources, abortResources, ...capturedResult } = capture;
   const ownerId = deps.sessionId?.trim();
   const runtimeForCapture = markBrowserCaptureCleanupPending(
     captureRuntime ?? authoritativeRuntime,
   );
-  const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
+  const captureLocator = resolvePromptLocator(runtimeForCapture);
   if (expectedPromptLocator) assertSameCommittedPromptEpoch(expectedPromptLocator, captureLocator);
   const persistRuntime = async (
     result: ReattachFinalizationResult,
@@ -151,6 +157,7 @@ export function createReattachSettlement(
           const authoritativeBoundRuntime = bindCurrentBrowserRecoveryRuntime(
             pendingRuntime,
             currentRuntime,
+            resolvePromptLocator,
           );
           await deps.runtimeHintCb?.(authoritativeBoundRuntime);
           return authoritativeBoundRuntime;

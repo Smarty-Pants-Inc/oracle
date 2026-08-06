@@ -1,8 +1,9 @@
-import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
   hasRecoverableChatGptConversation,
+  hasRecoverableGeminiConversation,
 } from "../browser/reattachability.js";
 
 type BrowserPromptEpoch = NonNullable<BrowserRuntimeMetadata["promptEpoch"]>;
@@ -16,9 +17,11 @@ export class MonotonicBrowserRuntimeAuthority {
   private current: BrowserRuntimeMetadata | undefined;
   private readonly settledAuthorities = new Map<string, Set<string>>();
   private errorSupersededByTerminalCleanup = false;
+  private readonly config: BrowserSessionConfig | undefined;
 
-  constructor(initial: BrowserRuntimeMetadata | undefined) {
+  constructor(initial: BrowserRuntimeMetadata | undefined, config?: BrowserSessionConfig) {
     this.current = initial;
+    this.config = config;
   }
 
   observeHint(next: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
@@ -71,7 +74,11 @@ export class MonotonicBrowserRuntimeAuthority {
     }
 
     const settled = epochKey ? this.settledAuthorities.get(epochKey) : undefined;
-    if (settled?.size && nextHasCleanup && !hasNewRecoveryAuthority(promptMerged, settled)) {
+    if (
+      settled?.size &&
+      nextHasCleanup &&
+      !hasNewRecoveryAuthority(promptMerged, settled, this.config)
+    ) {
       if (source === "error") this.errorSupersededByTerminalCleanup = true;
       const retained = mergeWithoutCleanupRegression(current, promptMerged);
       this.current = retained;
@@ -83,7 +90,7 @@ export class MonotonicBrowserRuntimeAuthority {
       return promptMerged;
     }
 
-    const selected = selectErrorRuntime(current, promptMerged);
+    const selected = selectErrorRuntime(current, promptMerged, this.config);
     this.current = selected;
     return selected;
   }
@@ -91,6 +98,7 @@ export class MonotonicBrowserRuntimeAuthority {
 
 export function retryableInitialBrowserRuntime(
   runtime: BrowserRuntimeMetadata | null | undefined,
+  config?: BrowserSessionConfig,
 ): BrowserRuntimeMetadata | undefined {
   if (!runtime?.recoveryCleanupResources?.length || !runtime.recoveryCleanupResult) {
     return undefined;
@@ -98,7 +106,8 @@ export function retryableInitialBrowserRuntime(
   if (hasPendingChromeAcquisitionIntent(runtime)) {
     return hasExactPendingChromeAcquisitionAuthority(runtime) ? runtime : undefined;
   }
-  return !hasBrowserRecoveryAuthority(runtime) || hasCoherentBrowserRecoveryAuthority(runtime)
+  return !hasBrowserRecoveryAuthority(runtime, config) ||
+    hasCoherentBrowserRecoveryAuthority(runtime, config)
     ? runtime
     : undefined;
 }
@@ -111,16 +120,23 @@ export function hasRemoteRecoveryAuthority(
 
 export function hasBrowserRecoveryAuthority(
   runtime: BrowserRuntimeMetadata | null | undefined,
+  config?: BrowserSessionConfig,
 ): boolean {
-  return hasRemoteRecoveryAuthority(runtime) || hasRecoverableChatGptConversation(runtime);
+  return (
+    hasRemoteRecoveryAuthority(runtime) ||
+    hasRecoverableChatGptConversation(runtime) ||
+    hasRecoverableGeminiConversation(runtime, config)
+  );
 }
 
 export function hasResumableBrowserAuthority(
   runtime: BrowserRuntimeMetadata | null | undefined,
+  config?: BrowserSessionConfig,
 ): boolean {
   return (
     (hasRemoteRecoveryAuthority(runtime) && !runtime?.recoveryCleanupResult?.settlementMode) ||
-    hasRecoverableChatGptConversation(runtime)
+    hasRecoverableChatGptConversation(runtime) ||
+    hasRecoverableGeminiConversation(runtime, config)
   );
 }
 
@@ -206,13 +222,14 @@ function cleanupRank(runtime: BrowserRuntimeMetadata): number {
 function selectErrorRuntime(
   current: BrowserRuntimeMetadata,
   candidate: BrowserRuntimeMetadata,
+  config?: BrowserSessionConfig,
 ): BrowserRuntimeMetadata {
   const currentAuthorities = new Set(recoveryAuthorityKeys(current));
   const candidateAuthorities = recoveryAuthorityKeys(candidate);
   const hasNewAuthority = candidateAuthorities.some(
     (authority) => !currentAuthorities.has(authority),
   );
-  if (hasNewAuthority && hasCoherentBrowserRecoveryAuthority(candidate)) return candidate;
+  if (hasNewAuthority && hasCoherentBrowserRecoveryAuthority(candidate, config)) return candidate;
 
   const currentRank = cleanupRank(current);
   const candidateRank = cleanupRank(candidate);
@@ -263,15 +280,19 @@ function mergeWithoutCleanupRegression(
 function hasNewRecoveryAuthority(
   runtime: BrowserRuntimeMetadata,
   settled: ReadonlySet<string>,
+  config?: BrowserSessionConfig,
 ): boolean {
   return (
-    hasCoherentBrowserRecoveryAuthority(runtime) &&
+    hasCoherentBrowserRecoveryAuthority(runtime, config) &&
     recoveryAuthorityKeys(runtime).some((authority) => !settled.has(authority))
   );
 }
 
-function hasCoherentBrowserRecoveryAuthority(runtime: BrowserRuntimeMetadata): boolean {
-  if (!hasBrowserRecoveryAuthority(runtime)) return false;
+function hasCoherentBrowserRecoveryAuthority(
+  runtime: BrowserRuntimeMetadata,
+  config?: BrowserSessionConfig,
+): boolean {
+  if (!hasBrowserRecoveryAuthority(runtime, config)) return false;
   const epoch = runtime.promptEpoch;
   const conversationId =
     epoch?.status === "committed" ? epoch.conversationId : runtime.conversationId;

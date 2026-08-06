@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -8,6 +7,7 @@ import { syncDirectoryIfPresent } from "../../fsDurability.js";
 import { getOracleHomeDir } from "../../oracleHome.js";
 import { assertRemoteCredential } from "../../remote/auth.js";
 import { writeFileAtomicDurable } from "../../sessionManager.js";
+import { resolveWindowsPowerShellExecutable } from "../../windowsSystemExecutable.js";
 
 export const BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES = 512;
 export const BRIDGE_HOST_READINESS_PAYLOAD_MAX_BYTES = 256;
@@ -16,6 +16,128 @@ const BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS = 5_000;
 const BRIDGE_HOST_IPC_VERSION = 1;
 const BRIDGE_HOST_READINESS_NONCE_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+const WINDOWS_BRIDGE_CHILD_LAUNCH_CONFIG = "ORACLE_BRIDGE_CHILD_LAUNCH_CONFIG";
+export const WINDOWS_BRIDGE_CHILD_READINESS_STDOUT = "ORACLE_BRIDGE_CHILD_READINESS_STDOUT";
+const WINDOWS_BRIDGE_JOB_SUPERVISOR_SCRIPT = String.raw`$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class OracleBridgeJob {
+  private const uint KillOnClose = 0x00002000;
+  [StructLayout(LayoutKind.Sequential)] private struct BasicLimits { public long A; public long B; public uint Flags; public UIntPtr C; public UIntPtr D; public uint E; public UIntPtr F; public uint G; public uint H; }
+  [StructLayout(LayoutKind.Sequential)] private struct IoCounters { public ulong A; public ulong B; public ulong C; public ulong D; public ulong E; public ulong F; }
+  [StructLayout(LayoutKind.Sequential)] private struct ExtendedLimits { public BasicLimits Basic; public IoCounters Io; public UIntPtr A; public UIntPtr B; public UIntPtr C; public UIntPtr D; }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] private static extern bool SetInformationJobObject(IntPtr job, int kind, IntPtr info, uint length);
+  [DllImport("kernel32.dll", SetLastError=true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError=true)] private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)] private static extern bool CloseHandle(IntPtr handle);
+  public static IntPtr Create() {
+    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    var limits = new ExtendedLimits(); limits.Basic.Flags = KillOnClose;
+    int size = Marshal.SizeOf(typeof(ExtendedLimits)); IntPtr pointer = Marshal.AllocHGlobal(size);
+    try {
+      Marshal.StructureToPtr(limits, pointer, false);
+      if (!SetInformationJobObject(job, 9, pointer, (uint)size)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      return job;
+    } catch { CloseHandle(job); throw; } finally { Marshal.FreeHGlobal(pointer); }
+  }
+  public static void Assign(IntPtr job, IntPtr process) { if (!AssignProcessToJobObject(job, process)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+  public static void Terminate(IntPtr job) { if (!TerminateJobObject(job, 1)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+  public static void Close(IntPtr job) { if (job != IntPtr.Zero) CloseHandle(job); }
+}
+'@
+$job = [IntPtr]::Zero
+$child = $null
+$exitCode = 1
+try {
+  $encodedConfig = [Environment]::GetEnvironmentVariable('${WINDOWS_BRIDGE_CHILD_LAUNCH_CONFIG}', 'Process')
+  [Environment]::SetEnvironmentVariable('${WINDOWS_BRIDGE_CHILD_LAUNCH_CONFIG}', $null, 'Process')
+  if ([String]::IsNullOrWhiteSpace($encodedConfig)) { throw 'missing launch configuration' }
+  $config = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedConfig)) | ConvertFrom-Json)
+  if ([String]::IsNullOrWhiteSpace([string]$config.file)) { throw 'missing child executable' }
+  $job = [OracleBridgeJob]::Create()
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = [string]$config.file
+  $start.Arguments = [string]$config.arguments
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardInput = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  $child = New-Object Diagnostics.Process
+  $child.StartInfo = $start
+  if (!$child.Start()) { throw 'child process did not start' }
+  [OracleBridgeJob]::Assign($job, $child.Handle)
+  $stdoutCopy = $child.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())
+  $stderrCopy = $child.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())
+  [Console]::OpenStandardInput().CopyTo($child.StandardInput.BaseStream)
+  $child.StandardInput.Close()
+  $child.WaitForExit()
+  $stdoutCopy.GetAwaiter().GetResult()
+  $stderrCopy.GetAwaiter().GetResult()
+  $exitCode = $child.ExitCode
+} catch {
+  [Console]::Error.WriteLine('Bridge host Windows supervisor failed.')
+} finally {
+  if ($job -ne [IntPtr]::Zero) { try { [OracleBridgeJob]::Terminate($job) } catch {} }
+  elseif ($null -ne $child -and !$child.HasExited) { try { $child.Kill() } catch {} }
+  if ($null -ne $child -and !$child.HasExited) { try { $child.WaitForExit(5000) | Out-Null } catch {} }
+  if ($job -ne [IntPtr]::Zero) { [OracleBridgeJob]::Close($job) }
+}
+exit $exitCode`;
+const WINDOWS_BRIDGE_JOB_SUPERVISOR_ENCODED = Buffer.from(
+  WINDOWS_BRIDGE_JOB_SUPERVISOR_SCRIPT,
+  "utf16le",
+).toString("base64");
+
+function quoteWindowsCommandLineArgument(value: string): string {
+  if (value.length > 0 && !/[\s"]/u.test(value)) return value;
+  let result = '"';
+  let backslashes = 0;
+  for (const character of value) {
+    if (character === "\\") backslashes += 1;
+    else if (character === '"') {
+      result += "\\".repeat(backslashes * 2 + 1) + '"';
+      backslashes = 0;
+    } else {
+      result += "\\".repeat(backslashes) + character;
+      backslashes = 0;
+    }
+  }
+  return `${result}${"\\".repeat(backslashes * 2)}"`;
+}
+
+function buildWindowsBridgeSupervisorLaunch(
+  childArgs: readonly string[],
+  parentEnv: NodeJS.ProcessEnv,
+): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const config = Buffer.from(
+    JSON.stringify({
+      file: process.execPath,
+      arguments: childArgs.map(quoteWindowsCommandLineArgument).join(" "),
+    }),
+    "utf8",
+  ).toString("base64");
+  return {
+    command: resolveWindowsPowerShellExecutable(),
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      WINDOWS_BRIDGE_JOB_SUPERVISOR_ENCODED,
+    ],
+    env: {
+      ...parentEnv,
+      [WINDOWS_BRIDGE_CHILD_LAUNCH_CONFIG]: config,
+      [WINDOWS_BRIDGE_CHILD_READINESS_STDOUT]: "1",
+    },
+  };
+}
 
 export interface BridgeHostCredentials {
   token: string;
@@ -354,8 +476,12 @@ async function waitForBridgeHostChildExit(child: ChildProcess, timeoutMs: number
   }
 }
 
-function signalBridgeHostChildTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (process.platform !== "win32" && child.pid && child.pid > 0) {
+function signalBridgeHostChildTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  platform: NodeJS.Platform,
+): void {
+  if (platform !== "win32" && child.pid && child.pid > 0) {
     try {
       process.kill(-child.pid, signal);
       return;
@@ -366,26 +492,19 @@ function signalBridgeHostChildTree(child: ChildProcess, signal: NodeJS.Signals):
   child.kill(signal);
 }
 
-async function forceTerminateBridgeHostChildTree(child: ChildProcess): Promise<void> {
-  if (process.platform === "win32" && child.pid && child.pid > 0) {
-    const taskkill = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    await waitForBridgeHostChildExit(taskkill, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
-    return;
-  }
-  signalBridgeHostChildTree(child, "SIGKILL");
-}
-
-async function terminateBridgeHostChildTree(child: ChildProcess): Promise<void> {
+async function terminateBridgeHostChildTree(
+  child: ChildProcess,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  // On Windows the retained direct child is the kill-on-close Job Object supervisor. Its exit
+  // closes the only job handle, so an already-observed exit is tree authority, not a raw PID cue.
   if (bridgeHostChildExited(child)) return;
-  signalBridgeHostChildTree(child, "SIGTERM");
+  signalBridgeHostChildTree(child, "SIGTERM", platform);
   try {
     await waitForBridgeHostChildExit(child, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
   } catch (shutdownError) {
     try {
-      await forceTerminateBridgeHostChildTree(child);
+      signalBridgeHostChildTree(child, "SIGKILL", platform);
       await waitForBridgeHostChildExit(child, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
     } catch (forceError) {
       throw new AggregateError(
@@ -523,8 +642,10 @@ export async function spawnReadyBridgeHostChildAndPublish(
     parentEnv: NodeJS.ProcessEnv;
     readinessNonce: string;
     readinessTimeoutMs: number;
+    platform?: NodeJS.Platform;
   },
 ): Promise<BridgeHostSpawnResult> {
+  const platform = deps.platform ?? process.platform;
   const oracleHome = getOracleHomeDir();
   await fs.mkdir(oracleHome, { recursive: true, mode: 0o700 });
   const logPath = path.join(oracleHome, "bridge-host.log");
@@ -561,9 +682,16 @@ export async function spawnReadyBridgeHostChildAndPublish(
   const protectedValues = [payload.token, payload.legacyToken, payload.readinessNonce].filter(
     (value): value is string => value !== undefined,
   );
+  const parentEnv = buildBridgeHostBackgroundEnvironment(deps.parentEnv, payload);
+  const launch =
+    platform === "win32"
+      ? buildWindowsBridgeSupervisorLaunch(args, parentEnv)
+      : { command: process.execPath, args, env: parentEnv };
   if (
-    [process.execPath, ...args].some((value) =>
-      protectedValues.some((protectedValue) => value.includes(protectedValue)),
+    [launch.command, ...launch.args, ...Object.values(launch.env)].some(
+      (value) =>
+        value !== undefined &&
+        protectedValues.some((protectedValue) => value.includes(protectedValue)),
     )
   ) {
     throw new Error("Bridge host background options contain protected IPC material.");
@@ -571,14 +699,21 @@ export async function spawnReadyBridgeHostChildAndPublish(
 
   const logHandle = await fs.open(logPath, "a");
   let child: ChildProcess | undefined;
+  let publicationCleanupHandled = false;
   try {
-    child = deps.spawnChild(process.execPath, args, {
+    child = deps.spawnChild(launch.command, launch.args, {
       detached: true,
-      stdio: ["pipe", logHandle.fd, logHandle.fd, "pipe"],
-      env: buildBridgeHostBackgroundEnvironment(deps.parentEnv, payload),
+      stdio:
+        platform === "win32"
+          ? ["pipe", "pipe", logHandle.fd]
+          : ["pipe", logHandle.fd, logHandle.fd, "pipe"],
+      env: launch.env,
       windowsHide: true,
     });
-    const readinessInput = child.stdio[3] as UnrefReadable | null | undefined;
+    const readinessInput = (platform === "win32" ? child.stdout : child.stdio[3]) as
+      | UnrefReadable
+      | null
+      | undefined;
     if (!child.stdin || !readinessInput || child.pid === undefined) {
       throw new Error(
         "Bridge host background child started without the required pipes or process ID.",
@@ -629,22 +764,22 @@ export async function spawnReadyBridgeHostChildAndPublish(
       child.off("exit", markChildExited);
       return { artifact, logPath, pidPath, pid: childPid };
     } catch (error) {
-      const cleanupErrors: unknown[] = [];
+      publicationCleanupHandled = true;
       try {
         // Drain the ready child tree before rolling published state back.
-        await terminateBridgeHostChildTree(child);
+        await terminateBridgeHostChildTree(child, platform);
       } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
+        throw new AggregateError(
+          [error, cleanupError],
+          "Bridge host background state publication failed before the child tree could be drained.",
+        );
       }
       try {
         await restoreFileSnapshots(rollbackEntries);
       } catch (restoreError) {
-        cleanupErrors.push(restoreError);
-      }
-      if (cleanupErrors.length > 0) {
         throw new AggregateError(
-          [error, ...cleanupErrors],
-          "Bridge host background state publication failed and cleanup could not be completed.",
+          [error, restoreError],
+          "Bridge host background state publication failed after the child tree was drained, but rollback failed.",
         );
       }
       throw error;
@@ -653,7 +788,7 @@ export async function spawnReadyBridgeHostChildAndPublish(
       child.off("exit", markChildExited);
     }
   } catch (error) {
-    if (child) await terminateBridgeHostChildTree(child);
+    if (child && !publicationCleanupHandled) await terminateBridgeHostChildTree(child, platform);
     throw error;
   } finally {
     await logHandle.close().catch(() => undefined);

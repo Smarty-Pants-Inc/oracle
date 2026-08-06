@@ -48,7 +48,7 @@ Useful flags:
 - Print the connection string (includes token): `--print`
 - Print only the token: `--print-token`
 - SSH port/custom args: `--ssh-extra-args "-p 2222"`. On native Windows, multiplexing/control options (`-M`, `-S`, `-O`, `ControlMaster`, `ControlPath`, and `ControlPersist`) are rejected; use key or agent authentication supported by Windows OpenSSH.
-- Background mode (writes pid/log files under `~/.oracle`): `--background`. The detached child receives both bridge credentials through a bounded one-shot inherited pipe, not through argv or environment; the parent closes the pipe and publishes the connection/PID files only after nonce-authenticated child readiness. The child reports ready only after the same authenticated remote-side forward probe succeeds; failure tears down the SSH child and preserves prior published state.
+- Background mode (writes pid/log files under `~/.oracle`): `--background`. The detached child receives both bridge credentials through a bounded one-shot inherited pipe, not through argv or environment; the parent closes the pipe and publishes the connection/PID files only after nonce-authenticated child readiness. On Windows, the recorded PID is a trusted System32 PowerShell supervisor that owns the Node host and every SSH descendant in a kill-on-close Job Object; supervisor exit or rollback drains that job without ambient `taskkill` lookup or raw-PID reuse. The child reports ready only after the same authenticated remote-side forward probe succeeds, and rollback starts only after the owned tree is stopped.
 
 ## 2) Linux: configure the client once
 

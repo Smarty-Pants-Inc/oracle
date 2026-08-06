@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { chmod, link, lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   capturePhysicalDirectoryIdentity,
@@ -20,6 +20,8 @@ import {
 import { MAX_REMOTE_TRANSACTION_STORE_BYTES } from "./types.js";
 
 const REMOTE_TRANSACTION_INTEGRITY_KEY_BYTES = 32;
+const REMOTE_TRANSACTION_CREATE_TEMP_PATTERN =
+  /^\.([a-f0-9]{64})\.[1-9][0-9]*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
 
 export type RemoteTransactionPublicationCheckpoint =
   | "namespace-publication"
@@ -79,7 +81,18 @@ export async function loadRemoteTransactionIntegrityKey(
   },
 ): Promise<RemoteTransactionIntegrityKey> {
   const directory = path.dirname(integrityKeyPath);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
+  if (options.expectedDirectoryIdentity) {
+    const initialDirectoryIdentity = await capturePhysicalDirectoryIdentity(directory);
+    if (
+      !samePhysicalDirectoryIdentity(options.expectedDirectoryIdentity, initialDirectoryIdentity)
+    ) {
+      throw new Error(
+        "Remote transaction integrity key directory generation changed before key use",
+      );
+    }
+  } else {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+  }
   if (options.platform !== "win32") await chmod(directory, 0o700);
   await syncDirectory(directory);
   const directoryIdentity = await capturePhysicalDirectoryIdentity(directory);
@@ -285,14 +298,79 @@ export async function publishSerializedRecord(options: {
   }
 }
 
+export async function repairStaleCreatePublicationAliases(options: {
+  directory: string;
+  platform: NodeJS.Platform;
+  assertIntegrityAuthority: () => Promise<void>;
+  authenticateTarget: (targetPath: string, transactionToken: string) => Promise<void>;
+}): Promise<void> {
+  await options.assertIntegrityAuthority();
+  const candidates = new Map<string, string>();
+  for (const name of await readdir(options.directory)) {
+    const transactionToken = REMOTE_TRANSACTION_CREATE_TEMP_PATTERN.exec(name)?.[1];
+    if (!transactionToken) continue;
+    if (candidates.has(transactionToken)) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+    candidates.set(transactionToken, name);
+  }
+
+  for (const [transactionToken, name] of [...candidates].sort()) {
+    const tempPath = path.join(options.directory, name);
+    const targetPath = path.join(options.directory, `${transactionToken}.json`);
+    const tempBefore = await lstat(tempPath, { bigint: true });
+    const targetBefore = await lstat(targetPath, { bigint: true });
+    if (
+      !isProtectedTransactionRecordFile(tempBefore, options.platform, 2n) ||
+      !isProtectedTransactionRecordFile(targetBefore, options.platform, 2n) ||
+      !samePhysicalFile(tempBefore, targetBefore)
+    ) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+
+    await options.assertIntegrityAuthority();
+    const tempConfirmed = await lstat(tempPath, { bigint: true });
+    const targetConfirmed = await lstat(targetPath, { bigint: true });
+    if (
+      !samePhysicalFile(tempBefore, tempConfirmed) ||
+      !samePhysicalFile(targetBefore, targetConfirmed) ||
+      !samePhysicalFile(tempConfirmed, targetConfirmed)
+    ) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+
+    await unlink(tempPath);
+    await options.assertIntegrityAuthority();
+    const targetAfterUnlink = await lstat(targetPath, { bigint: true });
+    if (
+      !isPhysicalTransactionRecordFile(targetAfterUnlink, options.platform) ||
+      !sameFileGeneration(targetConfirmed, targetAfterUnlink) ||
+      targetConfirmed.size !== targetAfterUnlink.size ||
+      targetConfirmed.mode !== targetAfterUnlink.mode
+    ) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+    await syncDirectory(options.directory);
+    await options.authenticateTarget(targetPath, transactionToken);
+  }
+}
+
 export function isPhysicalTransactionRecordFile(
   entry: BigIntStats,
   platform: NodeJS.Platform,
 ): boolean {
+  return isProtectedTransactionRecordFile(entry, platform, 1n);
+}
+
+function isProtectedTransactionRecordFile(
+  entry: BigIntStats,
+  platform: NodeJS.Platform,
+  linkCount: bigint,
+): boolean {
   return (
     entry.isFile() &&
     !entry.isSymbolicLink() &&
-    entry.nlink === 1n &&
+    entry.nlink === linkCount &&
     (platform === "win32" || ((entry.mode & 0o777n) === 0o600n && isOwnedByControllerUser(entry)))
   );
 }

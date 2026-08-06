@@ -26,6 +26,24 @@ describe("physical directory identity", () => {
     expect(parsePhysicalDirectoryIdentity({ device: "1", inode: "2" })).toBeNull();
     expect(parsePhysicalDirectoryIdentity({ ...identity, extra: true })).toBeNull();
   });
+
+  test("never authenticates a durable zero-birthtime replacement generation", () => {
+    const zeroBirthtimeIdentity = { ...identity, birthtimeNs: "0" };
+    const replacementWithReusedInode = { ...zeroBirthtimeIdentity };
+
+    expect(parsePhysicalDirectoryIdentity(zeroBirthtimeIdentity)).toBeNull();
+    expect(samePhysicalDirectoryIdentity(zeroBirthtimeIdentity, replacementWithReusedInode)).toBe(
+      false,
+    );
+    expect(
+      parsePhysicalDirectoryIdentity(zeroBirthtimeIdentity, { allowZeroBirthtime: true }),
+    ).toEqual(zeroBirthtimeIdentity);
+    expect(
+      samePhysicalDirectoryIdentity(zeroBirthtimeIdentity, replacementWithReusedInode, {
+        allowZeroBirthtime: true,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("filesystem lock directory removal protocol", () => {

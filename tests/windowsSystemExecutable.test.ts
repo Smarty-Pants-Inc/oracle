@@ -2,7 +2,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { createPlatformProcessGenerationProvider } from "../src/browser/platformProcessGeneration.js";
-import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
+import {
+  resolveWindowsPowerShellExecutable,
+  resolveWindowsPowerShellExecutableForPlatform,
+} from "../src/windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
 const ATTACKER_SYSTEM_ROOT = String.raw`D:\Users\attacker\Windows`;
@@ -11,6 +14,33 @@ const ATTACKER_PATH = String.raw`D:\Users\attacker\bin`;
 const WINDOWS_POWERSHELL_GLOBALROOT = String.raw`\\?\GLOBALROOT\SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`;
 const WINDOWS_POWERSHELL_CANONICAL =
   /^[A-Za-z]:\\(?:(?!\.{1,2}\\)[^\\]+\\)*System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/iu;
+
+const KERNEL_RESOLVED_POWERSHELL = String.raw`D:\ActiveWindows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+
+test("uses the fixed GLOBALROOT source for a kernel-resolved active Windows root", () => {
+  const inputs: string[] = [];
+  const nativeRealpath = (input: string) => {
+    inputs.push(input);
+    return KERNEL_RESOLVED_POWERSHELL;
+  };
+
+  expect(resolveWindowsPowerShellExecutableForPlatform("win32", nativeRealpath)).toBe(
+    KERNEL_RESOLVED_POWERSHELL,
+  );
+  expect(inputs).toEqual([WINDOWS_POWERSHELL_GLOBALROOT]);
+});
+
+test.each([
+  [String.raw`\\server\share\System32\WindowsPowerShell\v1.0\powershell.exe`, "UNC"],
+  [String.raw`\\.\C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, "device"],
+  [String.raw`C:System32\WindowsPowerShell\v1.0\powershell.exe`, "drive-relative"],
+  [String.raw`C:\Windows\..\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, "traversal"],
+  ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\\", "ambiguous"],
+])("rejects a %s native realpath result", (resolved) => {
+  expect(() => resolveWindowsPowerShellExecutableForPlatform("win32", () => resolved)).toThrow(
+    "Windows PowerShell resolution did not yield the canonical System32 executable",
+  );
+});
 
 describe("resolveWindowsPowerShellExecutable", () => {
   test("rejects attacker-controlled inherited Windows executable variables", () => {

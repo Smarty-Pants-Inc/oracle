@@ -165,10 +165,12 @@ async function captureAuthenticatedProfileDirectory(
       !samePhysicalDirectoryIdentity(
         physicalDirectoryIdentityFromStats(before),
         physicalDirectoryIdentityFromStats(authenticated),
+        { allowZeroBirthtime: true },
       ) ||
       !samePhysicalDirectoryIdentity(
         physicalDirectoryIdentityFromStats(authenticated),
         physicalDirectoryIdentityFromStats(after),
+        { allowZeroBirthtime: true },
       )
     ) {
       throw new Error(
@@ -190,6 +192,7 @@ async function captureAuthenticatedProfileDirectory(
       !samePhysicalDirectoryIdentity(
         physicalDirectoryIdentityFromStats(authenticated),
         physicalDirectoryIdentityFromStats(finalEntry),
+        { allowZeroBirthtime: true },
       )
     ) {
       throw new Error(
@@ -547,19 +550,21 @@ export function parseProfileDirectoryIdentity(
   ) {
     return null;
   }
-  const physical = parsePhysicalDirectoryIdentity({
-    device: record.device,
-    inode: record.inode,
-    birthtimeNs: record.birthtimeNs,
-  });
-  if (!physical) return null;
   const canonicalPath = pathForPlatform(platform).resolve(record.canonicalPath);
-  if (
-    record.version === BIRTHTIME_PROFILE_IDENTITY_VERSION &&
-    Object.keys(record).sort().join(",") ===
-      "birthtimeNs,canonicalPath,device,inode,platform,version" &&
-    physical.birthtimeNs !== "0"
-  ) {
+  if (record.version === BIRTHTIME_PROFILE_IDENTITY_VERSION) {
+    const physical = parsePhysicalDirectoryIdentity({
+      device: record.device,
+      inode: record.inode,
+      birthtimeNs: record.birthtimeNs,
+    });
+    if (
+      !physical ||
+      Object.keys(record).sort().join(",") !==
+        "birthtimeNs,canonicalPath,device,inode,platform,version" ||
+      physical.birthtimeNs === "0"
+    ) {
+      return null;
+    }
     return Object.freeze({
       version: BIRTHTIME_PROFILE_IDENTITY_VERSION,
       platform,
@@ -572,14 +577,21 @@ export function parseProfileDirectoryIdentity(
     platform !== "linux" ||
     Object.keys(record).sort().join(",") !==
       "birthtimeNs,canonicalPath,device,generationMarker,inode,platform,version" ||
-    physical.birthtimeNs !== "0" ||
-    physical.inode === "0" ||
     !record.generationMarker ||
     typeof record.generationMarker !== "object" ||
     Array.isArray(record.generationMarker)
   ) {
     return null;
   }
+  const physical = parsePhysicalDirectoryIdentity(
+    {
+      device: record.device,
+      inode: record.inode,
+      birthtimeNs: record.birthtimeNs,
+    },
+    { allowZeroBirthtime: true },
+  );
+  if (!physical || physical.birthtimeNs !== "0" || physical.inode === "0") return null;
   const marker = record.generationMarker as Record<string, unknown>;
   if (
     Object.keys(marker).sort().join(",") !== "ctimeNs,device,inode,token" ||

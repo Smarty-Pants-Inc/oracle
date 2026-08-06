@@ -15,6 +15,7 @@ import { assertLoopbackRemoteBind } from "../../remote/remoteServiceConfig.js";
 import { serveRemote } from "../../remote/server.js";
 import {
   BRIDGE_HOST_READINESS_TIMEOUT_MS,
+  WINDOWS_BRIDGE_CHILD_READINESS_STDOUT,
   publishReadyBridgeConnection,
   readBridgeHostCredentialPayload,
   spawnReadyBridgeHostChildAndPublish,
@@ -55,6 +56,7 @@ export interface BridgeHostDeps {
   env?: NodeJS.ProcessEnv;
   generateReadinessNonce?: () => string;
   readinessTimeoutMs?: number;
+  backgroundPlatform?: NodeJS.Platform;
   tunnelPlatform?: NodeJS.Platform;
   tunnelSpawn?: BridgeHostSpawn;
 }
@@ -63,6 +65,7 @@ export async function runBridgeHost(
   options: BridgeHostCliOptions,
   deps: BridgeHostDeps = {},
 ): Promise<void> {
+  const runtimeEnv = deps.env ?? process.env;
   const bindRaw = options.bind?.trim() || "127.0.0.1:9473";
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
   assertLoopbackRemoteBind(bindHost);
@@ -146,9 +149,10 @@ export async function runBridgeHost(
       },
       {
         spawnChild,
-        parentEnv: deps.env ?? process.env,
+        parentEnv: runtimeEnv,
         readinessNonce: (deps.generateReadinessNonce ?? randomUUID)(),
         readinessTimeoutMs: deps.readinessTimeoutMs ?? BRIDGE_HOST_READINESS_TIMEOUT_MS,
+        platform: deps.backgroundPlatform,
       },
     );
     console.log(chalk.green(`Bridge host running in background (pid ${result.pid})`));
@@ -160,8 +164,12 @@ export async function runBridgeHost(
 
   const startTunnel = deps.startReverseTunnel ?? startReverseTunnel;
   const runRemoteService = deps.serveRemote ?? serveRemote;
+  const readinessUsesStdout =
+    options.backgroundChild && runtimeEnv[WINDOWS_BRIDGE_CHILD_READINESS_STDOUT] === "1";
+  const bridgeLog = readinessUsesStdout ? console.error : console.log;
   const readinessOutput = options.backgroundChild
-    ? (deps.readinessOutput ?? createWriteStream("", { fd: 3, autoClose: true }))
+    ? (deps.readinessOutput ??
+      (readinessUsesStdout ? process.stdout : createWriteStream("", { fd: 3, autoClose: true })))
     : undefined;
   const tunnelHandle: { current: ReverseTunnelHandle | null } = { current: null };
   let ready = false;
@@ -172,7 +180,7 @@ export async function runBridgeHost(
         port: bindPort,
         token: credentials.token,
         legacyToken: credentials.legacyToken,
-        logger: console.log,
+        logger: bridgeLog,
       },
       {
         onReady: async (server) => {
@@ -189,7 +197,7 @@ export async function runBridgeHost(
               token: credentials.token,
               identity: options.sshIdentity?.trim() || undefined,
               extraArgs: options.sshExtraArgs?.trim() || undefined,
-              log: (message) => console.log(chalk.dim(message)),
+              log: (message) => bridgeLog(chalk.dim(message)),
               platform: deps.tunnelPlatform,
               spawnSsh: deps.tunnelSpawn,
             });

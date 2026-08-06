@@ -49,6 +49,7 @@ import {
   assertProtectedIntegrityKeyFile,
   loadRemoteTransactionIntegrityKey,
   publishSerializedRecord,
+  repairStaleCreatePublicationAliases,
   QuarantinableRemoteTransactionRecordIntegrityError,
   readErrorCode,
   readStableRemoteTransactionRecordBytes,
@@ -71,6 +72,97 @@ import {
 
 const MAX_REMOTE_TRANSACTION_LEASE_MS = 24 * 60 * 60 * 1000;
 type RemoteArtifactNamespaceCleanup = (record: RemoteTransactionRecord) => Promise<boolean>;
+interface RemoteTransactionStoreRootOptions {
+  directory: string;
+  integrityKeyPath: string;
+  platform?: NodeJS.Platform;
+  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+}
+
+export interface RemoteTransactionStoreRootAuthority {
+  directory: string;
+  storeRootIdentity: PhysicalDirectoryIdentity;
+  integrityKeyDirectory: string;
+  integrityKeyDirectoryIdentity: PhysicalDirectoryIdentity;
+}
+
+export async function prepareRemoteTransactionStoreRoot(
+  options: RemoteTransactionStoreRootOptions,
+): Promise<RemoteTransactionStoreRootAuthority> {
+  const platform = options.platform ?? process.platform;
+  const directory = path.resolve(options.directory);
+  const integrityKeyPath = path.resolve(options.integrityKeyPath);
+  const integrityKeyDirectory = path.dirname(integrityKeyPath);
+  const windowsPrivateTreeAuthority =
+    platform === "win32"
+      ? (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)
+      : undefined;
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await mkdir(integrityKeyDirectory, { recursive: true, mode: 0o700 });
+  const storeRootBeforeProtection = await capturePhysicalDirectoryIdentity(directory);
+  const integrityKeyDirectoryBeforeProtection =
+    await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
+  if (platform === "win32") {
+    await windowsPrivateTreeAuthority?.({
+      storeDirectory: directory,
+      integrityKeyDirectory,
+      integrityKeyPath,
+    });
+  } else {
+    await chmod(directory, 0o700);
+    if (integrityKeyDirectory !== directory) await chmod(integrityKeyDirectory, 0o700);
+  }
+  await syncDirectory(directory);
+  if (integrityKeyDirectory !== directory) await syncDirectory(integrityKeyDirectory);
+  const storeRootIdentity = await capturePhysicalDirectoryIdentity(directory);
+  if (!samePhysicalDirectoryIdentity(storeRootBeforeProtection, storeRootIdentity)) {
+    throw new Error(
+      platform === "win32"
+        ? "Remote transaction store root generation changed during Windows private ACL protection"
+        : "Remote transaction store root generation changed during private-root protection",
+    );
+  }
+  const integrityKeyDirectoryIdentity =
+    await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
+  if (
+    !samePhysicalDirectoryIdentity(
+      integrityKeyDirectoryBeforeProtection,
+      integrityKeyDirectoryIdentity,
+    )
+  ) {
+    throw new Error(
+      platform === "win32"
+        ? "Remote transaction integrity key directory generation changed during Windows private ACL protection"
+        : "Remote transaction integrity key directory generation changed during private-root protection",
+    );
+  }
+  return {
+    directory,
+    storeRootIdentity,
+    integrityKeyDirectory,
+    integrityKeyDirectoryIdentity,
+  };
+}
+
+export async function assertRemoteTransactionStoreRootAuthority(
+  authority: RemoteTransactionStoreRootAuthority,
+): Promise<void> {
+  const currentStoreRoot = await capturePhysicalDirectoryIdentity(authority.directory);
+  if (!samePhysicalDirectoryIdentity(currentStoreRoot, authority.storeRootIdentity)) {
+    throw new Error("Remote transaction store root generation changed");
+  }
+  const currentIntegrityKeyDirectory = await capturePhysicalDirectoryIdentity(
+    authority.integrityKeyDirectory,
+  );
+  if (
+    !samePhysicalDirectoryIdentity(
+      currentIntegrityKeyDirectory,
+      authority.integrityKeyDirectoryIdentity,
+    )
+  ) {
+    throw new Error("Remote transaction integrity key directory generation changed");
+  }
+}
 
 export interface RemoteTransactionStoreOptions {
   directory: string;
@@ -87,6 +179,7 @@ export interface RemoteTransactionStoreOptions {
   beforeQuarantineUnlink?: () => Promise<void>;
   platform?: NodeJS.Platform;
   windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+  rootAuthority?: RemoteTransactionStoreRootAuthority;
   afterRecordPublication?: (
     operation: RemoteTransactionPublicationOperation,
     checkpoint: RemoteTransactionPublicationCheckpoint,
@@ -191,45 +284,27 @@ export class RemoteTransactionStore {
       integrityKeyDirectory,
       integrityKeyPath,
     };
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await mkdir(integrityKeyDirectory, { recursive: true, mode: 0o700 });
-    const storeRootBeforeWindowsAuthority =
-      platform === "win32" ? await capturePhysicalDirectoryIdentity(directory) : undefined;
-    const integrityKeyDirectoryBeforeWindowsAuthority =
-      platform === "win32"
-        ? await capturePhysicalDirectoryIdentity(integrityKeyDirectory)
-        : undefined;
-    if (platform === "win32") {
-      await windowsPrivateTreeAuthority?.(windowsPrivateTreeScope);
+    let rootAuthority: RemoteTransactionStoreRootAuthority;
+    if (options.rootAuthority) {
+      if (
+        options.rootAuthority.directory !== directory ||
+        options.rootAuthority.integrityKeyDirectory !== integrityKeyDirectory
+      ) {
+        throw new Error("Remote transaction root authority does not match configured paths");
+      }
+      await assertRemoteTransactionStoreRootAuthority(options.rootAuthority);
+      rootAuthority = options.rootAuthority;
     } else {
-      await chmod(directory, 0o700);
-    }
-    await syncDirectory(directory);
-    const storeRootIdentity = await capturePhysicalDirectoryIdentity(directory);
-    if (
-      storeRootBeforeWindowsAuthority &&
-      !samePhysicalDirectoryIdentity(storeRootBeforeWindowsAuthority, storeRootIdentity)
-    ) {
-      throw new Error(
-        "Remote transaction store root generation changed during Windows private ACL protection",
-      );
-    }
-    const integrityKeyDirectoryIdentity =
-      await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
-    if (
-      integrityKeyDirectoryBeforeWindowsAuthority &&
-      !samePhysicalDirectoryIdentity(
-        integrityKeyDirectoryBeforeWindowsAuthority,
-        integrityKeyDirectoryIdentity,
-      )
-    ) {
-      throw new Error(
-        "Remote transaction integrity key directory generation changed during Windows private ACL protection",
-      );
+      rootAuthority = await prepareRemoteTransactionStoreRoot({
+        directory,
+        integrityKeyPath,
+        platform,
+        windowsPrivateTreeAuthority,
+      });
     }
     const names = await readdir(directory);
     const storeRootAfterInventory = await capturePhysicalDirectoryIdentity(directory);
-    if (!samePhysicalDirectoryIdentity(storeRootIdentity, storeRootAfterInventory)) {
+    if (!samePhysicalDirectoryIdentity(rootAuthority.storeRootIdentity, storeRootAfterInventory)) {
       throw new Error("Remote transaction store root generation changed during inventory");
     }
     const hasPersistedRecords = names.some(isPersistedRemoteTransactionStoreEntry);
@@ -240,16 +315,37 @@ export class RemoteTransactionStore {
         platform,
         windowsPrivateTreeAuthority,
         windowsPrivateTreeScope,
-        expectedDirectoryIdentity: platform === "win32" ? integrityKeyDirectoryIdentity : undefined,
+        expectedDirectoryIdentity: rootAuthority.integrityKeyDirectoryIdentity,
       },
     );
+    await assertRemoteTransactionStoreRootAuthority(rootAuthority);
+    if (
+      !samePhysicalDirectoryIdentity(
+        integrityKey.directoryIdentity,
+        rootAuthority.integrityKeyDirectoryIdentity,
+      )
+    ) {
+      throw new Error(
+        "Remote transaction integrity key directory generation changed during key use",
+      );
+    }
     const store = new RemoteTransactionStore(
       { ...options, directory, integrityKeyPath: integrityKey.path, platform },
-      storeRootIdentity,
+      rootAuthority.storeRootIdentity,
       integrityKey,
       windowsPrivateTreeAuthority,
     );
-    await store.#maintenance.run();
+    await store.withWindowsPrivateTreeAuthority(async () => {
+      await repairStaleCreatePublicationAliases({
+        directory,
+        platform,
+        assertIntegrityAuthority: () => store.assertIntegrityAuthority(),
+        authenticateTarget: async (targetPath, transactionToken) => {
+          await store.readAuthenticatedRecord(targetPath, transactionToken);
+        },
+      });
+      await store.#maintenance.run();
+    });
     return store;
   }
 
@@ -816,7 +912,9 @@ export class RemoteTransactionStore {
     if (!this.#windowsPrivateTreeAuthority || this.#windowsAuthorityContext.getStore()) {
       return await operation();
     }
+    await this.assertIntegrityAuthority();
     await this.#windowsPrivateTreeAuthority(this.#windowsPrivateTreeScope);
+    await this.assertIntegrityAuthority();
     return await this.#windowsAuthorityContext.run(true, operation);
   }
 

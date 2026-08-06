@@ -32,7 +32,11 @@ import {
   recoveryCleanupGroupKey,
 } from "./reattachCleanup.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
-import { findRemoteRecoveryAuthority } from "./reattachability.js";
+import {
+  findRemoteRecoveryAuthority,
+  resolveCommittedGeminiPromptEpochLocator,
+  type CommittedPromptEpochLocator,
+} from "./reattachability.js";
 export type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
 import {
   assertSameCommittedPromptEpoch,
@@ -173,6 +177,22 @@ export async function resumeBrowserSession(
   const explicitTabRef = config?.browserTabRef?.trim() || undefined;
   const geminiDeepThinkRecovery =
     resolveGeminiWebModel(config?.desiredModel) === "gemini-3-pro-deep-think";
+  const requireRecoveryPromptLocator = (
+    candidate: BrowserRuntimeMetadata,
+  ): CommittedPromptEpochLocator => {
+    if (!geminiDeepThinkRecovery) return requireCommittedPromptEpochLocator(candidate);
+    const locator = resolveCommittedGeminiPromptEpochLocator(candidate, config);
+    if (locator) return locator;
+    throw new BrowserAutomationError(
+      "Gemini reattach requires immutable committed-prompt identity and an exact retained target binding.",
+      {
+        stage: "gemini-response-capture",
+        code: "gemini-reattach-authority-unavailable",
+        reattachable: false,
+        runtime: candidate,
+      },
+    );
+  };
   const initialRemoteRecovery = findRemoteRecoveryAuthority(runtime);
   if (initialRemoteRecovery && explicitTabRef) {
     throw explicitTargetAuthorityError(
@@ -182,9 +202,7 @@ export async function resumeBrowserSession(
     );
   }
   const promptLocator =
-    initialRemoteRecovery && !runtime.promptEpoch
-      ? null
-      : requireCommittedPromptEpochLocator(runtime);
+    initialRemoteRecovery && !runtime.promptEpoch ? null : requireRecoveryPromptLocator(runtime);
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const acquireRecoveryLock = deps.acquireRecoveryLock ?? acquireReattachRecoveryLock;
   let recoveryLock: ReattachRecoveryLock | null = await acquireRecoveryLock(lockPath);
@@ -216,10 +234,18 @@ export async function resumeBrowserSession(
     capture: ReattachCapture,
     authoritativeRuntime: BrowserRuntimeMetadata = runtime,
   ): ReattachResult =>
-    createReattachSettlement(capture, authoritativeRuntime, promptLocator, logger, deps, {
-      ensure: ensureRecoveryLock,
-      release: releaseRecoveryLock,
-    });
+    createReattachSettlement(
+      capture,
+      authoritativeRuntime,
+      promptLocator,
+      logger,
+      deps,
+      {
+        ensure: ensureRecoveryLock,
+        release: releaseRecoveryLock,
+      },
+      requireRecoveryPromptLocator,
+    );
 
   const recover = async (
     classification: ReattachRecoveryClassification,
@@ -314,7 +340,7 @@ export async function resumeBrowserSession(
         }
         liveRuntime = refreshedRuntime;
       }
-      const livePromptLocator = requireCommittedPromptEpochLocator(liveRuntime);
+      const livePromptLocator = requireRecoveryPromptLocator(liveRuntime);
       assertSameCommittedPromptEpoch(promptLocator, livePromptLocator);
       const host = liveRuntime.chromeHost ?? "127.0.0.1";
       const port =

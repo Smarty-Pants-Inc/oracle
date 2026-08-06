@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
@@ -602,6 +602,37 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const restarted = await createRemoteServer(options, { transactionStoreDir });
       await restarted.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "refuses a controller lock when the prepared transaction-store generation is replaced",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-root-race-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const displacedStoreDir = path.join(tmpDir, "transactions-displaced");
+      const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
+      let racedStartup: Promise<RemoteServerInstance> | undefined;
+      let replacement: RemoteServerInstance | undefined;
+      try {
+        racedStartup = createRemoteServer(options, {
+          transactionStoreDir,
+          controllerLockDeps: {
+            beforeLockPublication: async () => {
+              await rename(transactionStoreDir, displacedStoreDir);
+              await mkdir(transactionStoreDir, { mode: 0o700 });
+            },
+          },
+        });
+        await expect(racedStartup).rejects.toThrow("Filesystem lock parent generation changed");
+        expect(await readdir(transactionStoreDir)).toEqual([]);
+        expect(await readdir(displacedStoreDir)).not.toContain(".controller.lock");
+        replacement = await createRemoteServer(options, { transactionStoreDir });
+      } finally {
+        const raced = racedStartup ? await racedStartup.catch(() => undefined) : undefined;
+        await raced?.close();
+        await replacement?.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     },
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
