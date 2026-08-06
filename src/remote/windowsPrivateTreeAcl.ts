@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import { resolveWindowsPowerShellExecutable } from "../windowsSystemExecutable.js";
 
-export const WINDOWS_POWERSHELL_EXECUTABLE = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
 const WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS = 12_000;
 const WINDOWS_PRIVATE_TREE_ACL_MARKER = "oracle.remote-transaction.private-tree.v1";
 const WINDOWS_PRIVATE_TREE_MAX_ENTRIES = 4_096;
@@ -28,11 +28,6 @@ export type WindowsPrivateTreeAuthority = (scope: WindowsPrivateTreeScope) => Pr
 const WINDOWS_PRIVATE_TREE_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
-if ($Scope.Count -ne 3) { throw 'Expected store directory, integrity-key directory, and integrity-key path.' }
-
-$StorePath = [System.IO.Path]::GetFullPath([string]$Scope[0])
-$KeyDirectoryPath = [System.IO.Path]::GetFullPath([string]$Scope[1])
-$KeyPath = [System.IO.Path]::GetFullPath([string]$Scope[2])
 $Comparer = [System.StringComparer]::OrdinalIgnoreCase
 if (-not $Comparer.Equals([System.IO.Path]::GetDirectoryName($KeyPath), $KeyDirectoryPath)) {
   throw 'Integrity-key path is outside its declared directory.'
@@ -155,13 +150,15 @@ if ([System.IO.File]::Exists($KeyPath)) { Protect-File $KeyPath }
 `;
 
 function encodeWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope): string {
-  const encodedScope = Buffer.from(
-    JSON.stringify([scope.storeDirectory, scope.integrityKeyDirectory, scope.integrityKeyPath]),
-    "utf8",
-  ).toString("base64");
+  const encodedPaths = [
+    scope.storeDirectory,
+    scope.integrityKeyDirectory,
+    scope.integrityKeyPath,
+  ].map((protectedPath) => Buffer.from(protectedPath, "utf8").toString("base64"));
   const command = String.raw`
-$ScopeJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedScope}'))
-$Scope = @($ScopeJson | ConvertFrom-Json)
+$StorePath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[0]}')))
+$KeyDirectoryPath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[1]}')))
+$KeyPath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[2]}')))
 ${WINDOWS_PRIVATE_TREE_ACL_SCRIPT}`;
   return Buffer.from(command, "utf16le").toString("base64");
 }
@@ -178,7 +175,10 @@ const executeWindowsAclCommand: WindowsAclCommandExecutor = async (file, args, o
   return { stdout: String(stdout ?? "") };
 };
 
-export function buildWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope): {
+export function buildWindowsPrivateTreeAclCommand(
+  scope: WindowsPrivateTreeScope,
+  systemRoot?: string,
+): {
   readonly file: string;
   readonly args: string[];
   readonly options: WindowsAclCommandOptions;
@@ -193,7 +193,7 @@ export function buildWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope
     }
   }
   return {
-    file: WINDOWS_POWERSHELL_EXECUTABLE,
+    file: resolveWindowsPowerShellExecutable(systemRoot),
     args: [
       "-NoLogo",
       "-NoProfile",
@@ -208,8 +208,9 @@ export function buildWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope
 export async function protectWindowsPrivateTreeAcl(
   scope: WindowsPrivateTreeScope,
   execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
+  systemRoot?: string,
 ): Promise<void> {
-  const command = buildWindowsPrivateTreeAclCommand(scope);
+  const command = buildWindowsPrivateTreeAclCommand(scope, systemRoot);
   let stdout: string;
   try {
     ({ stdout } = await execute(command.file, command.args, command.options));

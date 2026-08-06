@@ -13,6 +13,8 @@ import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLi
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
+import { finalizeRecoveredRuntime } from "../../src/browser/reattachCleanup.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 const {
   launchChrome,
@@ -30,6 +32,7 @@ const {
   settleManualChromeOwner,
   releaseManualChromeOwnerEndpointAuthority,
   acquireBrowserTabLease,
+  releaseBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   teardownSettle,
   teardownState,
@@ -66,6 +69,7 @@ const {
   settleManualChromeOwner: vi.fn(),
   releaseManualChromeOwnerEndpointAuthority: vi.fn(),
   acquireBrowserTabLease: vi.fn(),
+  releaseBrowserTabLease: vi.fn(),
   retainBrowserTabLeaseTeardownAuthority: vi.fn(),
   teardownSettle: vi.fn(),
   teardownState: { leaseReleased: false },
@@ -124,6 +128,8 @@ vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
 }));
 vi.mock("../../src/browser/profileState.js", () => ({
+  parseProfileDirectoryIdentity: (identity: unknown) => identity,
+  verifyProfileDirectoryIdentity: vi.fn(async () => true),
   captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
   createChromeProcessLaunchClaim: (generationId: string) => ({
@@ -149,6 +155,7 @@ vi.mock("../../src/browser/tabLeaseRegistry.js", () => ({
     return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : 3;
   },
   acquireBrowserTabLease,
+  releaseBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
 }));
 vi.mock("../../src/browser/utils.js", () => ({
@@ -224,6 +231,17 @@ describe("gemini-web executor", () => {
       },
     );
     acquireBrowserTabLease.mockReset();
+    releaseBrowserTabLease.mockReset();
+    releaseBrowserTabLease.mockImplementation(
+      async (
+        _profileDir: string,
+        _lease: { sessionId: string },
+        _logger: unknown,
+        options?: { onRelease?: (input: { isLastLease: boolean }) => Promise<void> },
+      ) => {
+        await options?.onRelease?.({ isLastLease: true });
+      },
+    );
     retainBrowserTabLeaseTeardownAuthority.mockReset();
     teardownState.leaseReleased = false;
     teardownSettle.mockReset();
@@ -553,6 +571,7 @@ describe("gemini-web executor", () => {
     const result = await createGeminiWebExecutor({})({
       prompt: "hello",
       attachments: [],
+      sessionId: "gemini-cookie-owner",
       config: { desiredModel: "Gemini 3 Pro", manualLogin: true, keepBrowser: true },
       log: () => {},
       runtimeHintCb: async (runtime) => {
@@ -574,6 +593,10 @@ describe("gemini-web executor", () => {
         .map((runtime) => runtime.recoveryCleanupResources?.[0]?.acquisition?.pendingResource)
         .filter(Boolean),
     ).toEqual(["tab-lease", "chrome-process", "chrome-target"]);
+    expect(acquireBrowserTabLease).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ sessionId: "gemini-cookie-owner" }),
+    );
     expect(
       acquisitionSnapshots.some(
         (runtime) =>
@@ -667,6 +690,7 @@ describe("gemini-web executor", () => {
     const result = await exec({
       prompt: "hello",
       attachments: [],
+      sessionId: "gemini-persisted-capture-owner",
       config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
       runtimeHintCb,
       log: () => {},
@@ -746,7 +770,7 @@ describe("gemini-web executor", () => {
     },
   ])(
     "publishes committed recovery authority after a $phase capture failure",
-    async ({ expressionMarker, failureMessage }) => {
+    async ({ phase, expressionMarker, failureMessage }) => {
       const persisted: BrowserRuntimeMetadata[] = [];
       const events: string[] = [];
       const evaluateNormally = runtimeEvaluate.getMockImplementation();
@@ -763,6 +787,7 @@ describe("gemini-web executor", () => {
         exec({
           prompt: "hello",
           attachments: [],
+          sessionId: `gemini-recoverable-${phase}`,
           config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
           runtimeHintCb: async (runtime) => {
             persisted.push(runtime);
@@ -824,6 +849,107 @@ describe("gemini-web executor", () => {
       expect(killChrome).not.toHaveBeenCalled();
     },
   );
+
+  it("keeps recoverable Deep Think cleanup bound to the original session owner", async () => {
+    const sessionId = "gemini-recovery-owner";
+    const evaluateNormally = runtimeEvaluate.getMockImplementation();
+    if (!evaluateNormally) throw new Error("missing Gemini Runtime.evaluate fixture");
+    runtimeEvaluate.mockImplementation(async (input: { expression?: string }) => {
+      if (String(input.expression ?? "").includes("const ordered =")) {
+        throw new Error("injected recoverable capture failure");
+      }
+      return evaluateNormally(input);
+    });
+
+    const error = await createGeminiWebExecutor({})({
+      prompt: "hello",
+      attachments: [],
+      sessionId,
+      config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      log: () => {},
+    }).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toMatchObject({
+      name: "BrowserAutomationError",
+      details: { code: "gemini-response-capture-recoverable" },
+    });
+    if (!(error instanceof BrowserAutomationError)) {
+      throw new Error("expected a recoverable Gemini browser error");
+    }
+    const runtimeValue = error.details?.runtime;
+    if (!runtimeValue || typeof runtimeValue !== "object") {
+      throw new Error("recoverable Gemini browser error is missing runtime authority");
+    }
+    const runtime = runtimeValue as BrowserRuntimeMetadata;
+    expect(acquireBrowserTabLease).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ sessionId }),
+    );
+
+    const releaseLease = vi.fn(
+      async (
+        _profileDir: string,
+        lease: { sessionId: string },
+        _logger: unknown,
+        options?: { onRelease?: (input: { isLastLease: boolean }) => Promise<void> },
+      ) => {
+        if (lease.sessionId !== sessionId) {
+          throw new Error("Browser tab lease owner or acquisition generation does not match.");
+        }
+        await options?.onRelease?.({ isLastLease: true });
+      },
+    );
+    const cleanupDeps = {
+      verifyProfileDirectoryIdentity: vi.fn(async () => true),
+      terminateExactChromeForProfile: vi.fn(
+        async (_profileDir: string, identity: { pid: number }) => ({
+          status: "stopped" as const,
+          pid: identity.pid,
+          signal: "SIGTERM" as const,
+        }),
+      ),
+      cleanupStaleProfileState: vi.fn(async () => true),
+      releaseBrowserTabLease: releaseLease,
+    };
+
+    const rejected = await finalizeRecoveredRuntime(
+      runtime,
+      vi.fn<(message: string) => void>(),
+      { ...cleanupDeps, ownerId: "different-session-owner" },
+      "finalize",
+    );
+    expect(rejected).toMatchObject({
+      status: "pending",
+      runtime: {
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            chromeTargetId: "target-1",
+            targetCloseCapability: expect.any(Object),
+            tabLease: expect.any(Object),
+          }),
+        ],
+      },
+    });
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+
+    const finalized = await finalizeRecoveredRuntime(
+      rejected.runtime,
+      vi.fn<(message: string) => void>(),
+      { ...cleanupDeps, ownerId: sessionId },
+      "finalize",
+    );
+    if (finalized.status === "pending") throw new Error(finalized.error);
+    expect(finalized).toMatchObject({ status: "completed" });
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
+    expect(releaseLease).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.objectContaining({ sessionId }),
+      expect.any(Function),
+      expect.any(Object),
+    );
+  });
 
   it("preserves an accepted provider-id-less Gemini turn without advertising exact reattach", async () => {
     const evaluateNormally = runtimeEvaluate.getMockImplementation();

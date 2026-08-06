@@ -1,0 +1,774 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
+import { lstat, open, readFile, rm } from "node:fs/promises";
+import path from "node:path";
+import { syncDirectory } from "../fsDurability.js";
+import type { BrowserRuntimeMetadata } from "../sessionManager.js";
+import { resolveUserDataBaseDir } from "./localExecutionContext.js";
+import {
+  captureProfileDirectoryIdentity,
+  parseChromeProcessIdentity,
+  parseChromeProcessLaunchClaim,
+  parseProfileDirectoryIdentity,
+  readOracleChromeOwner,
+  sameChromeProcessIdentity,
+  sameChromeProcessLaunchClaim,
+  sameProfileDirectoryIdentity,
+  type OracleChromeOwnerRecord,
+  type ProfileDirectoryIdentity,
+} from "./profileState.js";
+import { hasExactBrowserTabLease, type BrowserTabLeaseIdentity } from "./tabLeaseRegistry.js";
+
+const PROJECT_SOURCES_PROFILE_MARKER = ".oracle-project-sources-authority.json";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+export interface ProjectSourcesMarkerFileIdentity {
+  readonly device: string;
+  readonly inode: string;
+  readonly birthtimeNs: string;
+  readonly ctimeNs: string;
+  readonly mode: string;
+  readonly size: string;
+}
+
+interface ProjectSourcesTemporaryMarkerProof {
+  readonly path: string;
+  readonly token: string;
+  readonly identity: ProjectSourcesMarkerFileIdentity;
+}
+
+export interface ProjectSourcesCleanupStorage {
+  readonly requestedRoot: string;
+  readonly root: ProfileDirectoryIdentity;
+  readonly journalPath: string;
+  readonly lockPath: string;
+}
+
+export interface ProjectSourcesTemporaryCleanupProof {
+  readonly version: 1;
+  readonly kind: "temporary";
+  readonly storageOwnerId: string;
+  readonly generationId: string;
+  readonly userDataDir: string;
+  readonly approvedBase: ProfileDirectoryIdentity;
+  readonly profileDirectory: ProfileDirectoryIdentity;
+  readonly marker: ProjectSourcesTemporaryMarkerProof;
+}
+
+export interface ProjectSourcesManualCleanupProof {
+  readonly version: 1;
+  readonly kind: "manual-login";
+  readonly storageOwnerId: string;
+  readonly generationId: string;
+  readonly userDataDir: string;
+  readonly profileDirectory: ProfileDirectoryIdentity;
+  readonly lease: {
+    readonly id: string;
+    readonly generationId: string;
+    readonly state: "pending" | "active" | "released";
+  };
+  readonly admission: {
+    readonly path: string;
+    readonly token: string;
+    readonly identity?: ProjectSourcesMarkerFileIdentity;
+  };
+  readonly owner?: OracleChromeOwnerRecord;
+  readonly authenticated?: true;
+}
+
+export type ProjectSourcesCleanupProof =
+  | ProjectSourcesTemporaryCleanupProof
+  | ProjectSourcesManualCleanupProof;
+
+export interface ProjectSourcesProfileCreateIntent {
+  readonly generationId: string;
+  readonly storageOwnerId: string;
+  readonly markerToken: string;
+  readonly parent: ProfileDirectoryIdentity;
+  readonly userDataDir: string;
+  readonly proof?: ProjectSourcesTemporaryCleanupProof;
+}
+
+export interface ProjectSourcesAuthorityDeps {
+  hasExactBrowserTabLease?: typeof hasExactBrowserTabLease;
+  readOracleChromeOwner?: typeof readOracleChromeOwner;
+}
+
+export function projectSourcesCleanupOwnerId(storage: ProjectSourcesCleanupStorage): string {
+  const root = storage.root;
+  const marker = root.generationMarker;
+  const storageAuthority = JSON.stringify([
+    root.version,
+    root.platform,
+    root.canonicalPath,
+    root.device,
+    root.inode,
+    root.birthtimeNs,
+    marker?.device ?? null,
+    marker?.inode ?? null,
+    marker?.ctimeNs ?? null,
+    marker?.token ?? null,
+  ]);
+  return `project-sources:${createHash("sha256").update(storageAuthority).digest("hex")}`;
+}
+
+export function createProjectSourcesProfileCreateIntent(
+  storage: ProjectSourcesCleanupStorage,
+  parent: ProfileDirectoryIdentity,
+  generationId: string,
+): ProjectSourcesProfileCreateIntent {
+  if (!UUID_PATTERN.test(generationId)) {
+    throw new Error("Project Sources profile creation requires a UUID generation.");
+  }
+  return {
+    generationId,
+    storageOwnerId: projectSourcesCleanupOwnerId(storage),
+    markerToken: randomUUID(),
+    parent,
+    userDataDir: path.join(parent.canonicalPath, `oracle-browser-${generationId}`),
+  };
+}
+
+export function createProjectSourcesManualCleanupProof(
+  storage: ProjectSourcesCleanupStorage,
+  generationId: string,
+  userDataDir: string,
+  profileDirectory: ProfileDirectoryIdentity,
+  leaseId: string,
+): ProjectSourcesManualCleanupProof {
+  return {
+    version: 1,
+    kind: "manual-login",
+    storageOwnerId: projectSourcesCleanupOwnerId(storage),
+    generationId,
+    userDataDir: path.resolve(userDataDir),
+    profileDirectory,
+    lease: { id: leaseId, generationId, state: "pending" },
+    admission: {
+      path: path.join(storage.root.canonicalPath, `project-sources-admission-${generationId}.json`),
+      token: randomUUID(),
+    },
+  };
+}
+
+function markerPath(userDataDir: string): string {
+  return path.join(userDataDir, PROJECT_SOURCES_PROFILE_MARKER);
+}
+
+function markerContent(intent: ProjectSourcesProfileCreateIntent): string {
+  return `${JSON.stringify({
+    version: 1,
+    purpose: "project-sources-cleanup",
+    storageOwnerId: intent.storageOwnerId,
+    generationId: intent.generationId,
+    userDataDir: intent.userDataDir,
+    token: intent.markerToken,
+  })}\n`;
+}
+
+function captureMarkerFileIdentity(stats: BigIntStats): ProjectSourcesMarkerFileIdentity {
+  if (!stats.isFile()) throw new Error("Project Sources profile authority marker is not a file.");
+  return {
+    device: String(stats.dev),
+    inode: String(stats.ino),
+    birthtimeNs: String(stats.birthtimeNs),
+    ctimeNs: String(stats.ctimeNs),
+    mode: String(stats.mode),
+    size: String(stats.size),
+  };
+}
+
+function sameMarkerFileIdentity(
+  left: ProjectSourcesMarkerFileIdentity,
+  right: ProjectSourcesMarkerFileIdentity,
+): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.mode === right.mode &&
+    left.size === right.size
+  );
+}
+
+function markerContentMatches(value: unknown, intent: ProjectSourcesProfileCreateIntent): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.version === 1 &&
+    candidate.purpose === "project-sources-cleanup" &&
+    candidate.storageOwnerId === intent.storageOwnerId &&
+    candidate.generationId === intent.generationId &&
+    candidate.userDataDir === intent.userDataDir &&
+    candidate.token === intent.markerToken
+  );
+}
+
+export async function authenticateProjectSourcesTemporaryMarker(
+  intent: ProjectSourcesProfileCreateIntent,
+): Promise<ProjectSourcesTemporaryCleanupProof> {
+  const authorityPath = markerPath(intent.userDataDir);
+  const before = captureMarkerFileIdentity(await lstat(authorityPath, { bigint: true }));
+  const parsed: unknown = JSON.parse(await readFile(authorityPath, "utf8"));
+  const after = captureMarkerFileIdentity(await lstat(authorityPath, { bigint: true }));
+  if (!sameMarkerFileIdentity(before, after) || !markerContentMatches(parsed, intent)) {
+    throw new Error("Project Sources temporary profile authority marker changed or mismatched.");
+  }
+  return {
+    version: 1,
+    kind: "temporary",
+    storageOwnerId: intent.storageOwnerId,
+    generationId: intent.generationId,
+    userDataDir: intent.userDataDir,
+    approvedBase: intent.parent,
+    profileDirectory: await captureProfileDirectoryIdentity(intent.userDataDir),
+    marker: { path: authorityPath, token: intent.markerToken, identity: before },
+  };
+}
+
+export async function createProjectSourcesTemporaryCleanupProof(
+  intent: ProjectSourcesProfileCreateIntent,
+  storage: ProjectSourcesCleanupStorage,
+): Promise<ProjectSourcesTemporaryCleanupProof> {
+  await assertProjectSourcesProfileParent(intent, storage);
+  const handle = await open(markerPath(intent.userDataDir), "wx", 0o600);
+  try {
+    await handle.writeFile(markerContent(intent), "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(intent.userDataDir);
+  return await authenticateProjectSourcesTemporaryMarker(intent);
+}
+
+function parseMarkerFileIdentity(value: unknown): ProjectSourcesMarkerFileIdentity | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  return ["device", "inode", "birthtimeNs", "ctimeNs", "mode", "size"].every(
+    (key) => typeof candidate[key] === "string" && candidate[key] !== "",
+  )
+    ? (candidate as unknown as ProjectSourcesMarkerFileIdentity)
+    : null;
+}
+
+function parseManualOwner(value: unknown): OracleChromeOwnerRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const processIdentity = parseChromeProcessIdentity(candidate.processIdentity, process.platform);
+  const disposition = candidate.disposition;
+  const preservationPolicy = candidate.preservationPolicy;
+  if (
+    !Number.isInteger(candidate.port) ||
+    Number(candidate.port) <= 0 ||
+    !processIdentity ||
+    (disposition !== "preserve" && disposition !== "close-on-last-lease") ||
+    (preservationPolicy !== undefined && preservationPolicy !== "service-persistent")
+  ) {
+    return null;
+  }
+  return {
+    port: Number(candidate.port),
+    processIdentity,
+    disposition,
+    ...(preservationPolicy ? { preservationPolicy } : {}),
+  };
+}
+
+function parseTemporaryProof(value: unknown): ProjectSourcesTemporaryCleanupProof | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const approvedBase = parseProfileDirectoryIdentity(candidate.approvedBase, process.platform);
+  const profileDirectory = parseProfileDirectoryIdentity(
+    candidate.profileDirectory,
+    process.platform,
+  );
+  const marker = candidate.marker as Record<string, unknown> | undefined;
+  const markerIdentity = parseMarkerFileIdentity(marker?.identity);
+  if (
+    candidate.version !== 1 ||
+    candidate.kind !== "temporary" ||
+    typeof candidate.storageOwnerId !== "string" ||
+    !UUID_PATTERN.test(String(candidate.generationId)) ||
+    typeof candidate.userDataDir !== "string" ||
+    !approvedBase ||
+    !profileDirectory ||
+    path.resolve(candidate.userDataDir) !== candidate.userDataDir ||
+    candidate.userDataDir !==
+      path.join(approvedBase.canonicalPath, `oracle-browser-${candidate.generationId}`) ||
+    profileDirectory.canonicalPath !== candidate.userDataDir ||
+    !marker ||
+    marker.path !== markerPath(candidate.userDataDir) ||
+    typeof marker.token !== "string" ||
+    !UUID_PATTERN.test(marker.token) ||
+    !markerIdentity
+  ) {
+    return null;
+  }
+  return candidate as unknown as ProjectSourcesTemporaryCleanupProof;
+}
+
+function parseManualProof(value: unknown): ProjectSourcesManualCleanupProof | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const profileDirectory = parseProfileDirectoryIdentity(
+    candidate.profileDirectory,
+    process.platform,
+  );
+  const lease = candidate.lease as Record<string, unknown> | undefined;
+  const admission = candidate.admission as Record<string, unknown> | undefined;
+  const admissionIdentity = parseMarkerFileIdentity(admission?.identity);
+  const owner = candidate.owner === undefined ? undefined : parseManualOwner(candidate.owner);
+  if (
+    candidate.version !== 1 ||
+    candidate.kind !== "manual-login" ||
+    typeof candidate.storageOwnerId !== "string" ||
+    !UUID_PATTERN.test(String(candidate.generationId)) ||
+    typeof candidate.userDataDir !== "string" ||
+    path.resolve(candidate.userDataDir) !== candidate.userDataDir ||
+    !profileDirectory ||
+    profileDirectory.canonicalPath !== candidate.userDataDir ||
+    !lease ||
+    typeof lease.id !== "string" ||
+    lease.id === "" ||
+    lease.generationId !== candidate.generationId ||
+    !["pending", "active", "released"].includes(String(lease.state)) ||
+    !admission ||
+    typeof admission.path !== "string" ||
+    path.isAbsolute(admission.path) === false ||
+    path.basename(admission.path) !== `project-sources-admission-${candidate.generationId}.json` ||
+    typeof admission.token !== "string" ||
+    !UUID_PATTERN.test(admission.token) ||
+    (admission.identity !== undefined && !admissionIdentity) ||
+    (candidate.owner !== undefined && !owner) ||
+    (candidate.authenticated === true && (!owner || !admissionIdentity)) ||
+    (candidate.authenticated !== undefined && candidate.authenticated !== true) ||
+    (admissionIdentity && (!owner || candidate.authenticated !== true))
+  ) {
+    return null;
+  }
+  return candidate as unknown as ProjectSourcesManualCleanupProof;
+}
+
+export function parseProjectSourcesCleanupProof(value: unknown): ProjectSourcesCleanupProof | null {
+  return parseTemporaryProof(value) ?? parseManualProof(value);
+}
+
+export function isProjectSourcesProfileCreateIntent(
+  value: unknown,
+): value is ProjectSourcesProfileCreateIntent {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const parent = parseProfileDirectoryIdentity(candidate.parent, process.platform);
+  const proof = candidate.proof === undefined ? undefined : parseTemporaryProof(candidate.proof);
+  return Boolean(
+    parent &&
+    UUID_PATTERN.test(String(candidate.generationId)) &&
+    typeof candidate.storageOwnerId === "string" &&
+    UUID_PATTERN.test(String(candidate.markerToken)) &&
+    typeof candidate.userDataDir === "string" &&
+    path.resolve(candidate.userDataDir) ===
+      path.join(parent.canonicalPath, `oracle-browser-${candidate.generationId}`) &&
+    (!proof ||
+      (proof.generationId === candidate.generationId &&
+        proof.storageOwnerId === candidate.storageOwnerId &&
+        proof.marker.token === candidate.markerToken &&
+        sameProfileDirectoryIdentity(proof.approvedBase, parent))),
+  );
+}
+
+export function hasProjectSourcesCleanupAuthority(runtime: BrowserRuntimeMetadata): boolean {
+  return Boolean(runtime.recoveryCleanupResources?.length && runtime.recoveryCleanupResult);
+}
+
+export function hasOwnedProjectSourcesProvenance(
+  runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesCleanupProof,
+): boolean {
+  const resources = runtime.recoveryCleanupResources;
+  if (!resources || resources.length !== 1) return false;
+  if (runtime.userDataDir && path.resolve(runtime.userDataDir) !== proof.userDataDir) return false;
+  return resources.every((resource) => {
+    const acquisition = resource.acquisition;
+    const launchClaim = parseChromeProcessLaunchClaim(acquisition?.processLaunchClaim);
+    const profile = parseProfileDirectoryIdentity(
+      resource.profileDirectoryIdentity,
+      process.platform,
+    );
+    const disposition = acquisition?.processOwnerDisposition;
+    if (
+      !acquisition ||
+      acquisition.generationId !== proof.generationId ||
+      !launchClaim ||
+      launchClaim.generationId !== proof.generationId ||
+      !disposition ||
+      !profile ||
+      !sameProfileDirectoryIdentity(profile, proof.profileDirectory) ||
+      resource.userDataDir !== proof.userDataDir ||
+      resource.chromeProfileRoot !== proof.userDataDir ||
+      acquisition.targetMarkerUrl !== `about:blank#oracle-project-sources=${proof.generationId}` ||
+      (disposition === "preserve" && !resource.recoveryCleanup.keepBrowser) ||
+      (proof.kind === "temporary" &&
+        (resource.recoveryCleanup.profileKind !== "temporary" ||
+          acquisition.processOwnerProvenance !== "temporary-launch")) ||
+      (proof.kind === "manual-login" &&
+        (resource.recoveryCleanup.profileKind !== "manual-login" ||
+          acquisition.processOwnerProvenance !== "manual-canonical-owner"))
+    ) {
+      return false;
+    }
+    if (
+      resource.chromeProcessIdentity &&
+      (!sameProfileDirectoryIdentity(resource.chromeProcessIdentity.profileDirectory, profile) ||
+        (proof.kind === "temporary" &&
+          !sameChromeProcessLaunchClaim(resource.chromeProcessIdentity.launchClaim, launchClaim)))
+    ) {
+      return false;
+    }
+    if (proof.kind === "manual-login") {
+      const lease = resource.tabLease;
+      if (proof.lease.state === "released") {
+        if (lease) return false;
+      } else if (
+        !lease ||
+        lease.id !== proof.lease.id ||
+        lease.generationId !== proof.generationId ||
+        !sameProfileDirectoryIdentity(lease.profileDirectory, proof.profileDirectory)
+      ) {
+        return false;
+      }
+      if (proof.lease.state === "pending" && acquisition.pendingResource !== "tab-lease")
+        return false;
+      if (
+        resource.chromeProcessIdentity &&
+        (!proof.authenticated ||
+          !proof.owner ||
+          !proof.admission.identity ||
+          !sameChromeProcessIdentity(resource.chromeProcessIdentity, proof.owner.processIdentity) ||
+          disposition !== proof.owner.disposition)
+      ) {
+        return false;
+      }
+    }
+    if (acquisition.pendingResource || !resource.recoveryCleanup.ownsTarget) return true;
+    return Boolean(
+      typeof resource.recoveryCleanup.closeOwnedTargetOnComplete === "boolean" &&
+      resource.chromeTargetId &&
+      resource.targetCloseCapability?.generationId === proof.generationId &&
+      resource.targetCloseCapability.capabilityId,
+    );
+  });
+}
+
+async function assertApprovedTemporaryBase(expected: ProfileDirectoryIdentity): Promise<void> {
+  const approved = await captureProfileDirectoryIdentity(await resolveUserDataBaseDir(), {
+    create: true,
+  });
+  if (!sameProfileDirectoryIdentity(approved, expected)) {
+    throw new Error("Project Sources temporary profile parent is not the approved user-data base.");
+  }
+}
+
+export async function assertProjectSourcesProfileParent(
+  intent: ProjectSourcesProfileCreateIntent,
+  storage: ProjectSourcesCleanupStorage,
+): Promise<void> {
+  if (intent.storageOwnerId !== projectSourcesCleanupOwnerId(storage)) {
+    throw new Error("Project Sources profile creation intent has different cleanup storage.");
+  }
+  await assertApprovedTemporaryBase(intent.parent);
+  const current = await captureProfileDirectoryIdentity(intent.parent.canonicalPath);
+  if (!sameProfileDirectoryIdentity(current, intent.parent)) {
+    throw new Error("Project Sources temporary profile parent authority changed before recovery.");
+  }
+}
+
+export async function assertProjectSourcesTemporaryProof(
+  proof: ProjectSourcesTemporaryCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+): Promise<void> {
+  if (proof.storageOwnerId !== projectSourcesCleanupOwnerId(storage)) {
+    throw new Error("Project Sources temporary proof has different cleanup storage.");
+  }
+  await assertApprovedTemporaryBase(proof.approvedBase);
+  const currentProfile = await captureProfileDirectoryIdentity(proof.userDataDir);
+  if (!sameProfileDirectoryIdentity(currentProfile, proof.profileDirectory)) {
+    throw new Error("Project Sources temporary profile physical authority changed.");
+  }
+  const currentMarker = await authenticateProjectSourcesTemporaryMarker({
+    generationId: proof.generationId,
+    storageOwnerId: proof.storageOwnerId,
+    markerToken: proof.marker.token,
+    parent: proof.approvedBase,
+    userDataDir: proof.userDataDir,
+  });
+  if (
+    !sameProfileDirectoryIdentity(currentMarker.profileDirectory, proof.profileDirectory) ||
+    !sameMarkerFileIdentity(currentMarker.marker.identity, proof.marker.identity)
+  ) {
+    throw new Error("Project Sources temporary profile marker physical authority changed.");
+  }
+}
+
+export function projectSourcesManualLeaseIdentity(
+  proof: ProjectSourcesManualCleanupProof,
+): BrowserTabLeaseIdentity {
+  return {
+    id: proof.lease.id,
+    sessionId: proof.storageOwnerId,
+    generationId: proof.generationId,
+    profileDirectory: proof.profileDirectory,
+  };
+}
+
+export function sameProjectSourcesManualOwner(
+  left: OracleChromeOwnerRecord,
+  right: OracleChromeOwnerRecord,
+): boolean {
+  return (
+    left.port === right.port &&
+    left.disposition === right.disposition &&
+    left.preservationPolicy === right.preservationPolicy &&
+    sameChromeProcessIdentity(left.processIdentity, right.processIdentity)
+  );
+}
+
+function manualAdmissionContentMatches(
+  value: unknown,
+  proof: ProjectSourcesManualCleanupProof,
+  owner: OracleChromeOwnerRecord,
+): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const lease = candidate.lease as Record<string, unknown> | undefined;
+  const admittedOwner = parseManualOwner(candidate.owner);
+  const profileDirectory = parseProfileDirectoryIdentity(
+    candidate.profileDirectory,
+    process.platform,
+  );
+  return Boolean(
+    candidate.version === 1 &&
+    candidate.purpose === "project-sources-manual-cleanup-admission" &&
+    candidate.storageOwnerId === proof.storageOwnerId &&
+    candidate.generationId === proof.generationId &&
+    candidate.userDataDir === proof.userDataDir &&
+    candidate.token === proof.admission.token &&
+    lease?.id === proof.lease.id &&
+    lease?.generationId === proof.generationId &&
+    profileDirectory &&
+    sameProfileDirectoryIdentity(profileDirectory, proof.profileDirectory) &&
+    admittedOwner &&
+    sameProjectSourcesManualOwner(admittedOwner, owner),
+  );
+}
+
+function manualAdmissionContent(
+  proof: ProjectSourcesManualCleanupProof,
+  owner: OracleChromeOwnerRecord,
+): string {
+  return `${JSON.stringify({
+    version: 1,
+    purpose: "project-sources-manual-cleanup-admission",
+    storageOwnerId: proof.storageOwnerId,
+    generationId: proof.generationId,
+    userDataDir: proof.userDataDir,
+    profileDirectory: proof.profileDirectory,
+    lease: { id: proof.lease.id, generationId: proof.generationId },
+    owner,
+    token: proof.admission.token,
+  })}\n`;
+}
+
+export async function authenticateProjectSourcesManualAdmission(
+  proof: ProjectSourcesManualCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  owner: OracleChromeOwnerRecord,
+  options: { create?: boolean } = {},
+): Promise<ProjectSourcesManualCleanupProof> {
+  if (proof.storageOwnerId !== projectSourcesCleanupOwnerId(storage)) {
+    throw new Error("Project Sources manual admission has different cleanup storage.");
+  }
+  const expectedPath = path.join(
+    storage.root.canonicalPath,
+    `project-sources-admission-${proof.generationId}.json`,
+  );
+  if (proof.admission.path !== expectedPath) {
+    throw new Error("Project Sources manual admission is outside its exact cleanup storage.");
+  }
+  if (
+    !sameProfileDirectoryIdentity(owner.processIdentity.profileDirectory, proof.profileDirectory)
+  ) {
+    throw new Error("Project Sources manual admission owner has a different physical profile.");
+  }
+  if (options.create) {
+    try {
+      const handle = await open(expectedPath, "wx", 0o600);
+      try {
+        await handle.writeFile(manualAdmissionContent(proof, owner), "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await syncDirectory(storage.root.canonicalPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  const before = captureMarkerFileIdentity(await lstat(expectedPath, { bigint: true }));
+  const parsed: unknown = JSON.parse(await readFile(expectedPath, "utf8"));
+  const after = captureMarkerFileIdentity(await lstat(expectedPath, { bigint: true }));
+  if (
+    !sameMarkerFileIdentity(before, after) ||
+    (proof.admission.identity && !sameMarkerFileIdentity(before, proof.admission.identity)) ||
+    !manualAdmissionContentMatches(parsed, proof, owner)
+  ) {
+    throw new Error("Project Sources manual admission receipt changed or mismatched.");
+  }
+  return {
+    ...proof,
+    admission: { ...proof.admission, identity: before },
+    owner,
+    authenticated: true,
+  };
+}
+
+export async function removeProjectSourcesCleanupProofArtifacts(
+  proof: ProjectSourcesCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+): Promise<void> {
+  if (
+    proof.kind !== "manual-login" ||
+    !proof.owner ||
+    !proof.authenticated ||
+    !proof.admission.identity
+  )
+    return;
+  await authenticateProjectSourcesManualAdmission(proof, storage, proof.owner);
+  await rm(proof.admission.path);
+  await syncDirectory(storage.root.canonicalPath);
+}
+
+async function assertManualProof(
+  runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesManualCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  deps: ProjectSourcesAuthorityDeps,
+): Promise<void> {
+  if (proof.storageOwnerId !== projectSourcesCleanupOwnerId(storage)) {
+    throw new Error("Project Sources manual proof has different cleanup storage.");
+  }
+  const currentProfile = await captureProfileDirectoryIdentity(proof.userDataDir);
+  if (!sameProfileDirectoryIdentity(currentProfile, proof.profileDirectory)) {
+    throw new Error("Project Sources manual profile physical authority changed.");
+  }
+  const requiresOwnedEffects = (runtime.recoveryCleanupResources ?? []).some(
+    (resource) =>
+      Boolean(resource.chromeProcessIdentity) ||
+      resource.recoveryCleanup.ownsTarget ||
+      resource.acquisition?.pendingResource === "chrome-target",
+  );
+  if (requiresOwnedEffects && (!proof.authenticated || !proof.owner || !proof.admission.identity)) {
+    throw new Error(
+      "Project Sources manual cleanup has no authenticated lease/owner admission receipt.",
+    );
+  }
+  if (proof.authenticated && proof.owner && proof.admission.identity) {
+    await authenticateProjectSourcesManualAdmission(proof, storage, proof.owner);
+  }
+  if (proof.lease.state === "pending") {
+    throw new Error("Project Sources manual lease acquisition is still unresolved.");
+  }
+  if (proof.lease.state === "active") {
+    const hasLease = await (deps.hasExactBrowserTabLease ?? hasExactBrowserTabLease)(
+      proof.userDataDir,
+      projectSourcesManualLeaseIdentity(proof),
+    );
+    if (!hasLease)
+      throw new Error("Project Sources manual cleanup exact lease evidence is unavailable.");
+    if (proof.owner) {
+      const owner = await (deps.readOracleChromeOwner ?? readOracleChromeOwner)(proof.userDataDir);
+      if (!owner || !sameProjectSourcesManualOwner(owner, proof.owner)) {
+        throw new Error("Project Sources manual cleanup owner-registry evidence changed.");
+      }
+    }
+  }
+}
+
+export async function assertProjectSourcesCleanupProof(
+  runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  deps: ProjectSourcesAuthorityDeps = {},
+): Promise<void> {
+  if (!hasOwnedProjectSourcesProvenance(runtime, proof)) {
+    throw new Error("Project Sources cleanup runtime does not match its exact durable proof.");
+  }
+  if (proof.kind === "temporary") await assertProjectSourcesTemporaryProof(proof, storage);
+  else await assertManualProof(runtime, proof, storage, deps);
+}
+
+export async function updateProjectSourcesCleanupProofForPersistence(
+  runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  deps: ProjectSourcesAuthorityDeps = {},
+): Promise<ProjectSourcesCleanupProof> {
+  if (!hasProjectSourcesCleanupAuthority(runtime)) return proof;
+  if (proof.kind === "temporary") {
+    await assertProjectSourcesTemporaryProof(proof, storage);
+    return proof;
+  }
+  const resource = runtime.recoveryCleanupResources?.[0];
+  if (!resource) return proof;
+  let next = proof;
+  if (
+    next.lease.state === "pending" &&
+    resource.tabLease &&
+    resource.acquisition?.pendingResource !== "tab-lease"
+  ) {
+    const active = await (deps.hasExactBrowserTabLease ?? hasExactBrowserTabLease)(
+      next.userDataDir,
+      projectSourcesManualLeaseIdentity(next),
+    );
+    if (!active) throw new Error("Project Sources manual lease acquisition was not recorded.");
+    next = { ...next, lease: { ...next.lease, state: "active" } };
+  }
+  if (resource.chromeProcessIdentity) {
+    const owner =
+      next.owner ?? (await (deps.readOracleChromeOwner ?? readOracleChromeOwner)(next.userDataDir));
+    if (
+      !owner ||
+      !sameChromeProcessIdentity(owner.processIdentity, resource.chromeProcessIdentity) ||
+      !sameProfileDirectoryIdentity(
+        owner.processIdentity.profileDirectory,
+        next.profileDirectory,
+      ) ||
+      owner.disposition !== resource.acquisition?.processOwnerDisposition
+    ) {
+      throw new Error("Project Sources manual owner-registry evidence does not match acquisition.");
+    }
+    if (!next.authenticated) {
+      if (next.lease.state !== "active") {
+        throw new Error("Project Sources manual owner appeared without an active exact lease.");
+      }
+      const active = await (deps.hasExactBrowserTabLease ?? hasExactBrowserTabLease)(
+        next.userDataDir,
+        projectSourcesManualLeaseIdentity(next),
+      );
+      if (!active) throw new Error("Project Sources manual admission has no active exact lease.");
+      next = await authenticateProjectSourcesManualAdmission({ ...next, owner }, storage, owner, {
+        create: true,
+      });
+    } else {
+      next = await authenticateProjectSourcesManualAdmission(next, storage, owner);
+    }
+  }
+  if (next.lease.state === "active" && !resource.tabLease) {
+    next = { ...next, lease: { ...next.lease, state: "released" } };
+  }
+  if (!hasOwnedProjectSourcesProvenance(runtime, next)) {
+    throw new Error("Project Sources cleanup persistence would break its exact proof binding.");
+  }
+  return next;
+}

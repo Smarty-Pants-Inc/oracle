@@ -185,6 +185,7 @@ describe("openGeminiBrowserSession", () => {
       settle: teardownSettle,
     }));
     cleanupStaleProfileState.mockClear();
+    captureProfileDirectoryIdentity.mockClear();
     createChromeProcessLaunchClaim.mockClear();
     cleanupStaleProfileState.mockResolvedValue(true);
 
@@ -278,6 +279,47 @@ describe("openGeminiBrowserSession", () => {
       { retries: 6 },
     );
   });
+
+  it("uses the trusted session owner for live Gemini resources", async () => {
+    const session = await openGeminiBrowserSession({
+      browserConfig: { manualLoginProfileDir: path.join(tempRoot, "trusted-owner-profile") },
+      keepBrowserDefault: false,
+      purpose: "Gemini trusted owner",
+      sessionId: "  gemini-session-owner  ",
+    });
+
+    expect(acquireBrowserTabLease).toHaveBeenCalledWith(
+      session.profileDir,
+      expect.objectContaining({ sessionId: "gemini-session-owner" }),
+    );
+    await session.close();
+  });
+
+  it.each([undefined, "   "])(
+    "rejects persisted Gemini resources without a canonical session owner (%s)",
+    async (sessionId) => {
+      const persistRuntime = vi.fn(async () => undefined);
+
+      await expect(
+        openGeminiBrowserSession({
+          browserConfig: {
+            manualLoginProfileDir: path.join(tempRoot, "missing-persisted-owner-profile"),
+          },
+          keepBrowserDefault: false,
+          purpose: "Gemini persisted owner validation",
+          ...(sessionId !== undefined ? { sessionId } : {}),
+          persistRuntime,
+        }),
+      ).rejects.toThrow("Persisted Gemini browser sessions require a trusted session owner");
+
+      expect(persistRuntime).not.toHaveBeenCalled();
+      expect(captureProfileDirectoryIdentity).not.toHaveBeenCalled();
+      expect(acquireBrowserTabLease).not.toHaveBeenCalled();
+      expect(acquireManualChromeOwner).not.toHaveBeenCalled();
+      expect(connectWithNewTabWithExactAuthority).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not acquire a Gemini target from generation B after same-port rebinding", async () => {
     const generationBCreateTarget = vi.fn();
     const generationBAttachTarget = vi.fn();
@@ -365,6 +407,7 @@ describe("openGeminiBrowserSession", () => {
       browserConfig: { manualLoginProfileDir: path.join(tempRoot, "ordered-profile") },
       keepBrowserDefault: false,
       purpose: "Gemini ordered acquisition",
+      sessionId: "gemini-ordered-owner",
       persistRuntime: async (runtime) => {
         const resource = runtime.recoveryCleanupResources?.[0];
         const pending = resource?.acquisition?.pendingResource;
@@ -428,6 +471,7 @@ describe("openGeminiBrowserSession", () => {
         },
         keepBrowserDefault: false,
         purpose: "Gemini target disposition",
+        sessionId: `gemini-target-disposition-${mode}-${keepBrowser}`,
         persistRuntime: async () => undefined,
       });
 
@@ -451,6 +495,7 @@ describe("openGeminiBrowserSession", () => {
         },
         keepBrowserDefault: false,
         purpose: "Gemini missing target disposition",
+        sessionId: `gemini-missing-disposition-${mode}`,
         persistRuntime: async () => undefined,
       });
       const currentRuntime = session.runtime();

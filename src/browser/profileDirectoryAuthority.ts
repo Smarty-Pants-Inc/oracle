@@ -28,6 +28,7 @@ const hasDirectoryCapabilityFlags =
 const directoryOpenFlags = hasDirectoryCapabilityFlags
   ? constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
   : 0;
+const inFlightLinuxProfileGenerationMarkerCreations = new Map<string, Promise<void>>();
 
 export interface ProfileDirectoryGenerationMarker {
   readonly device: string;
@@ -51,6 +52,8 @@ interface AuthenticatedProfileDirectory {
 }
 interface AuthenticatedProfileDirectoryOptions {
   readonly forceLinuxGenerationMarker?: boolean;
+  readonly beforeGenerationMarkerWrite?: () => void | Promise<void>;
+  readonly onGenerationMarkerCreationWait?: () => void;
   readonly beforeFinalEntry?: () => void | Promise<void>;
 }
 export async function captureProfileDirectoryIdentity(
@@ -92,13 +95,19 @@ export async function captureProfileDirectoryIdentity(
 }
 export async function captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(
   userDataDir: string,
-  options: { beforeFinalEntry?: () => void | Promise<void> } = {},
+  options: {
+    beforeGenerationMarkerWrite?: () => void | Promise<void>;
+    onGenerationMarkerCreationWait?: () => void;
+    beforeFinalEntry?: () => void | Promise<void>;
+  } = {},
 ): Promise<ProfileDirectoryIdentity> {
   const resolvedPath = path.resolve(userDataDir);
   await rejectProfileSymlinkTraversal(resolvedPath);
   const canonicalPath = await realpath(resolvedPath);
   const authenticated = await captureAuthenticatedProfileDirectory(canonicalPath, {
     forceLinuxGenerationMarker: true,
+    beforeGenerationMarkerWrite: options.beforeGenerationMarkerWrite,
+    onGenerationMarkerCreationWait: options.onGenerationMarkerCreationWait,
     beforeFinalEntry: options.beforeFinalEntry,
   });
   const physicalIdentity = physicalDirectoryIdentityFromStats(authenticated.stats);
@@ -171,7 +180,7 @@ async function captureAuthenticatedProfileDirectory(
     }
     const generationMarker =
       authenticated.birthtimeNs === 0n || options.forceLinuxGenerationMarker
-        ? await captureLinuxProfileGenerationMarker(handle, authenticated, canonicalPath)
+        ? await captureLinuxProfileGenerationMarker(handle, authenticated, canonicalPath, options)
         : undefined;
     await options.beforeFinalEntry?.();
     const finalEntry = await lstat(canonicalPath, { bigint: true });
@@ -197,6 +206,7 @@ async function captureLinuxProfileGenerationMarker(
   directoryHandle: FileHandle,
   directoryStats: BigIntStats,
   canonicalPath: string,
+  options: AuthenticatedProfileDirectoryOptions,
 ): Promise<ProfileDirectoryGenerationMarker> {
   if (process.platform !== "linux" || !hasDirectoryCapabilityFlags) {
     throw profileGenerationPrerequisiteError(canonicalPath);
@@ -206,33 +216,93 @@ async function captureLinuxProfileGenerationMarker(
     directoryHandle.fd.toString(),
     PROFILE_GENERATION_MARKER_FILENAME,
   );
+  const creationKey = `${directoryStats.dev}:${directoryStats.ino}`;
   try {
+    const creationBeforeRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
+    if (creationBeforeRead) {
+      return await readLinuxProfileGenerationMarkerAfterCreation(
+        markerPath,
+        directoryStats,
+        creationBeforeRead,
+        options,
+      );
+    }
+
     try {
-      return await readLinuxProfileGenerationMarker(markerPath, directoryStats);
+      const marker = await readLinuxProfileGenerationMarker(markerPath, directoryStats);
+      const creationAfterRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
+      return creationAfterRead
+        ? await readLinuxProfileGenerationMarkerAfterCreation(
+            markerPath,
+            directoryStats,
+            creationAfterRead,
+            options,
+          )
+        : marker;
     } catch (error) {
+      const creationAfterRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
+      if (creationAfterRead) {
+        return await readLinuxProfileGenerationMarkerAfterCreation(
+          markerPath,
+          directoryStats,
+          creationAfterRead,
+          options,
+        );
+      }
       if (readErrorCode(error) !== "ENOENT") throw error;
     }
 
-    const token = randomBytes(32).toString("hex");
-    let markerHandle: FileHandle | undefined;
-    try {
-      markerHandle = await open(
+    const existingCreation = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
+    if (existingCreation) {
+      return await readLinuxProfileGenerationMarkerAfterCreation(
         markerPath,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-        0o600,
+        directoryStats,
+        existingCreation,
+        options,
       );
-      await markerHandle.writeFile(`${PROFILE_GENERATION_MARKER_PREFIX}${token}\n`, "utf8");
-      await markerHandle.sync();
-    } catch (error) {
-      if (readErrorCode(error) !== "EEXIST") throw error;
-    } finally {
-      await markerHandle?.close();
     }
-    await directoryHandle.sync();
+
+    const creation = Promise.withResolvers<void>();
+    inFlightLinuxProfileGenerationMarkerCreations.set(creationKey, creation.promise);
+    try {
+      const token = randomBytes(32).toString("hex");
+      let markerHandle: FileHandle | undefined;
+      try {
+        markerHandle = await open(
+          markerPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        );
+        await options.beforeGenerationMarkerWrite?.();
+        await markerHandle.writeFile(`${PROFILE_GENERATION_MARKER_PREFIX}${token}\n`, "utf8");
+        await markerHandle.sync();
+      } catch (error) {
+        if (readErrorCode(error) !== "EEXIST") throw error;
+      } finally {
+        await markerHandle?.close();
+      }
+      await directoryHandle.sync();
+    } finally {
+      if (inFlightLinuxProfileGenerationMarkerCreations.get(creationKey) === creation.promise) {
+        inFlightLinuxProfileGenerationMarkerCreations.delete(creationKey);
+      }
+      creation.resolve();
+    }
     return await readLinuxProfileGenerationMarker(markerPath, directoryStats);
   } catch (error) {
     throw profileGenerationPrerequisiteError(canonicalPath, error);
   }
+}
+
+async function readLinuxProfileGenerationMarkerAfterCreation(
+  markerPath: string,
+  directoryStats: BigIntStats,
+  creation: Promise<void>,
+  options: AuthenticatedProfileDirectoryOptions,
+): Promise<ProfileDirectoryGenerationMarker> {
+  options.onGenerationMarkerCreationWait?.();
+  await creation;
+  return await readLinuxProfileGenerationMarker(markerPath, directoryStats);
 }
 
 async function readLinuxProfileGenerationMarker(

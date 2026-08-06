@@ -44,6 +44,7 @@ export interface OpenGeminiBrowserSessionInput {
   browserConfig: BrowserRunOptions["config"];
   keepBrowserDefault: boolean;
   purpose: string;
+  sessionId?: string;
   log?: BrowserLogger;
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
 }
@@ -52,6 +53,10 @@ export async function openGeminiBrowserSession(
   input: OpenGeminiBrowserSessionInput,
 ): Promise<GeminiBrowserSession> {
   const { browserConfig, keepBrowserDefault, purpose, log, persistRuntime } = input;
+  const sessionOwnerId = input.sessionId?.trim();
+  if (persistRuntime && !sessionOwnerId) {
+    throw new Error("Persisted Gemini browser sessions require a trusted session owner.");
+  }
   const logger = log ?? (() => {});
   const resolvedConfig = resolveBrowserConfig({
     ...browserConfig,
@@ -61,7 +66,7 @@ export async function openGeminiBrowserSession(
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   const generationId = randomUUID();
-  const resourceOwnerId = randomUUID();
+  const resourceOwnerId = sessionOwnerId || randomUUID();
   const launchClaim = createChromeProcessLaunchClaim(generationId);
   const ownerDisposition = resolvedConfig.keepBrowser ? "preserve" : "close-on-last-lease";
   const leaseId = randomUUID();

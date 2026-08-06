@@ -709,14 +709,14 @@ async function rethrowAfterRestoring(
   throw error;
 }
 
-interface WindowsReverseTunnelProbeState {
+interface ReverseTunnelProbeState {
   child: ChildProcess | null;
   server: NetServer | null;
   socket: NetSocket | null;
 }
 
-async function closeWindowsReverseTunnelProbe(
-  state: WindowsReverseTunnelProbeState,
+async function closeReverseTunnelProbe(
+  state: ReverseTunnelProbeState,
   expectedServer?: NetServer,
 ): Promise<void> {
   if (expectedServer && state.server !== expectedServer) return;
@@ -757,7 +757,7 @@ function assertWindowsSshExtraArgs(args: readonly string[]): void {
   }
 }
 
-async function probeWindowsReverseTunnelHealth({
+async function probeReverseTunnelHealth({
   sshTarget,
   remotePort,
   token,
@@ -774,7 +774,7 @@ async function probeWindowsReverseTunnelHealth({
   extraArgs: readonly string[];
   timeoutMs: number;
   spawnSsh: BridgeHostSpawn;
-  state: WindowsReverseTunnelProbeState;
+  state: ReverseTunnelProbeState;
 }): Promise<RemoteHealthResult> {
   const server = net.createServer();
   state.server = server;
@@ -803,7 +803,7 @@ async function probeWindowsReverseTunnelHealth({
     }
     state.child = child;
     if (!child.stdin || !child.stdout) {
-      socket.destroy(new Error("Windows SSH bridge health probe started without stdio pipes."));
+      socket.destroy(new Error("SSH bridge health probe started without stdio pipes."));
       return;
     }
     child.stdin.on("error", () => socket.destroy());
@@ -825,7 +825,7 @@ async function probeWindowsReverseTunnelHealth({
     });
     const address = server.address();
     if (!address || typeof address === "string") {
-      throw new Error("Windows SSH bridge health probe did not acquire a loopback port.");
+      throw new Error("SSH bridge health probe did not acquire a loopback port.");
     }
     return await checkRemoteHealth({
       host: `127.0.0.1:${address.port}`,
@@ -834,7 +834,7 @@ async function probeWindowsReverseTunnelHealth({
       idleTimeoutMs: timeoutMs,
     });
   } finally {
-    await closeWindowsReverseTunnelProbe(state, server);
+    await closeReverseTunnelProbe(state, server);
   }
 }
 
@@ -862,7 +862,7 @@ function startReverseTunnel({
   const initialReady = Promise.withResolvers<void>();
   const parsedExtraArgs = extraArgs ? splitArgs(extraArgs) : [];
   if (platform === "win32") assertWindowsSshExtraArgs(parsedExtraArgs);
-  const windowsProbeState: WindowsReverseTunnelProbeState = {
+  const probeState: ReverseTunnelProbeState = {
     child: null,
     server: null,
     socket: null,
@@ -925,6 +925,43 @@ function startReverseTunnel({
     child.once("exit", (code) => settle(code ?? 255));
     return result.promise;
   };
+  const waitForAuthenticatedHealth = async (
+    currentMaster: ChildProcess,
+    masterClosed: Promise<void>,
+    deadline: number,
+  ): Promise<void> => {
+    while (!stopped && Date.now() < deadline) {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const result = await Promise.race([
+        probeReverseTunnelHealth({
+          sshTarget,
+          remotePort,
+          token,
+          identity,
+          extraArgs: parsedExtraArgs,
+          timeoutMs: Math.min(5_000, remainingMs),
+          spawnSsh,
+          state: probeState,
+        }).then((health) => ({ type: "health" as const, health })),
+        masterClosed.then(() => ({ type: "master-closed" as const })),
+      ]);
+      if (result.type === "master-closed") {
+        throw new Error("Reverse SSH tunnel exited before remote health readiness.");
+      }
+      if (
+        result.health.ok &&
+        result.health.protocol === "transaction-v3" &&
+        result.health.serverGeneration &&
+        !stopped &&
+        currentMaster.exitCode === null &&
+        currentMaster.signalCode === null
+      ) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("Reverse SSH tunnel remote authenticated health did not become ready.");
+  };
 
   const runWindowsTunnel = async (): Promise<void> => {
     const masterArgs = [
@@ -947,41 +984,7 @@ function startReverseTunnel({
     currentMaster.once("exit", () => masterClosed.resolve());
 
     const deadline = Date.now() + BRIDGE_HOST_READINESS_TIMEOUT_MS;
-    let authenticatedReady = false;
-    while (!stopped && Date.now() < deadline) {
-      const remainingMs = Math.max(1, deadline - Date.now());
-      const result = await Promise.race([
-        probeWindowsReverseTunnelHealth({
-          sshTarget,
-          remotePort,
-          token,
-          identity,
-          extraArgs: parsedExtraArgs,
-          timeoutMs: Math.min(5_000, remainingMs),
-          spawnSsh,
-          state: windowsProbeState,
-        }).then((health) => ({ type: "health" as const, health })),
-        masterClosed.promise.then(() => ({ type: "master-closed" as const })),
-      ]);
-      if (result.type === "master-closed") {
-        throw new Error("Reverse SSH tunnel exited before remote health readiness.");
-      }
-      if (
-        result.health.ok &&
-        result.health.protocol === "transaction-v3" &&
-        result.health.serverGeneration &&
-        !stopped &&
-        currentMaster.exitCode === null &&
-        currentMaster.signalCode === null
-      ) {
-        authenticatedReady = true;
-        break;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    }
-    if (!authenticatedReady || stopped) {
-      throw new Error("Reverse SSH tunnel remote authenticated health did not become ready.");
-    }
+    await waitForAuthenticatedHealth(currentMaster, masterClosed.promise, deadline);
     markReady(currentMaster);
     await masterClosed.promise;
     if (master === currentMaster) master = null;
@@ -1067,6 +1070,7 @@ function startReverseTunnel({
       throw new Error("Reverse SSH tunnel forwarding request failed.");
     }
 
+    await waitForAuthenticatedHealth(currentMaster, masterClosed.promise, deadline);
     markReady(currentMaster);
     await masterClosed.promise;
     if (master === currentMaster) master = null;
@@ -1084,7 +1088,7 @@ function startReverseTunnel({
       scheduleRestart();
     } catch {
       stopProcesses();
-      await Promise.all([closeWindowsReverseTunnelProbe(windowsProbeState), cleanupControlDir()]);
+      await Promise.all([closeReverseTunnelProbe(probeState), cleanupControlDir()]);
       if (!becameReady) {
         initialReady.reject(
           new Error("Reverse SSH tunnel failed before the remote forward was ready."),
@@ -1108,7 +1112,7 @@ function startReverseTunnel({
         initialReady.reject(new Error("Reverse SSH tunnel stopped before readiness."));
       }
       stopProcesses();
-      await Promise.all([closeWindowsReverseTunnelProbe(windowsProbeState), cleanupControlDir()]);
+      await Promise.all([closeReverseTunnelProbe(probeState), cleanupControlDir()]);
     },
   };
 }

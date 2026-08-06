@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFile as readFileFromDisk } from "node:fs/promises";
 import { promisify } from "node:util";
+import { resolveWindowsPowerShellExecutable } from "../windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_GENERATION_COMMAND_TIMEOUT_MS = 12_000;
@@ -32,16 +33,22 @@ export type TrustedProcessProbe = (
 export function createTrustedProcessProbe(
   platform: NodeJS.Platform,
   execute: ProcessGenerationCommandExecutor,
+  windowsSystemRoot?: string,
 ): TrustedProcessProbe | null {
-  const executable =
-    platform === "darwin"
-      ? "/bin/ps"
-      : platform === "linux"
-        ? "/usr/bin/ps"
-        : platform === "win32"
-          ? String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`
-          : null;
-  if (!executable) return null;
+  let executable: string;
+  if (platform === "darwin") {
+    executable = "/bin/ps";
+  } else if (platform === "linux") {
+    executable = "/usr/bin/ps";
+  } else if (platform === "win32") {
+    try {
+      executable = resolveWindowsPowerShellExecutable(windowsSystemRoot);
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
   return (args, options) =>
     options === undefined ? execute(executable, args) : execute(executable, args, options);
 }
@@ -57,6 +64,7 @@ export interface PlatformProcessGenerationProviderDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessGenerationCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
+  windowsSystemRoot?: string;
   readFile?: ProcessGenerationFileReader;
 }
 
@@ -121,7 +129,7 @@ export function createPlatformProcessGenerationProvider(
   const readFile = deps.readFile ?? readFileFromDisk;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute)
+      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
       : deps.trustedProcessProbe;
   return {
     platform,

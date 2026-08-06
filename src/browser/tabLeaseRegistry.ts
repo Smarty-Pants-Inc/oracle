@@ -436,6 +436,25 @@ export function retainBrowserTabLeaseTeardownAuthority(
   };
 }
 
+export async function hasExactBrowserTabLease(
+  profileDir: string,
+  lease: BrowserTabLeaseIdentity,
+): Promise<boolean> {
+  const leaseIdentity = snapshotBrowserTabLeaseIdentity(lease);
+  const authority = await captureTabLeaseAuthority(profileDir, {
+    expectedProfileIdentity: leaseIdentity.profileDirectory,
+  });
+  return withRegistryLock(authority, async () => {
+    const { registry } = await readRegistryStrict(authority);
+    const activeLease = registry.leases.find((entry) => entry.id === leaseIdentity.id);
+    if (!activeLease) return false;
+    if (!matchesBrowserTabLeaseIdentity(activeLease, leaseIdentity)) {
+      throw new Error("Browser tab lease owner or acquisition generation does not match.");
+    }
+    return true;
+  });
+}
+
 export async function updateBrowserTabLease(
   profileDir: string,
   lease: BrowserTabLeaseIdentity,

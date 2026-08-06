@@ -1,5 +1,4 @@
-import type { BigIntStats } from "node:fs";
-import { lstat, readFile, rename, rm } from "node:fs/promises";
+import { lstat, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -9,12 +8,31 @@ import {
   type BrowserRuntimeMetadata,
   writeFileAtomicDurable,
 } from "../sessionManager.js";
-import type { BrowserLogger } from "./types.js";
+import {
+  assertProjectSourcesCleanupProof,
+  assertProjectSourcesProfileParent,
+  assertProjectSourcesTemporaryProof,
+  authenticateProjectSourcesTemporaryMarker,
+  hasOwnedProjectSourcesProvenance,
+  hasProjectSourcesCleanupAuthority,
+  isProjectSourcesProfileCreateIntent,
+  parseProjectSourcesCleanupProof,
+  projectSourcesCleanupOwnerId,
+  removeProjectSourcesCleanupProofArtifacts,
+  updateProjectSourcesCleanupProofForPersistence,
+  type ProjectSourcesCleanupProof,
+  type ProjectSourcesCleanupStorage,
+  type ProjectSourcesProfileCreateIntent,
+} from "./projectSourcesCleanupAuthority.js";
+import {
+  reconcilePendingProjectSourcesManualAcquisition,
+  reconcilePendingProjectSourcesTarget,
+  type ProjectSourcesPendingTargetDeps,
+} from "./projectSourcesPendingTarget.js";
 import {
   captureProfileDirectoryIdentity,
-  parseChromeProcessLaunchClaim,
   parseProfileDirectoryIdentity,
-  sameChromeProcessLaunchClaim,
+  removeProfileDirectoryIfIdentityMatches,
   sameProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
@@ -24,27 +42,38 @@ import {
   isBrowserRecoveryTargetCloseCapability,
   type RetainedTargetCloseCapabilityResult,
 } from "./targetCloseAuthority.js";
+import type { BrowserLogger } from "./types.js";
+
+export {
+  assertProjectSourcesCleanupProof,
+  assertProjectSourcesProfileParent,
+  createProjectSourcesManualCleanupProof,
+  createProjectSourcesProfileCreateIntent,
+  createProjectSourcesTemporaryCleanupProof,
+  projectSourcesCleanupOwnerId,
+  removeProjectSourcesCleanupProofArtifacts,
+  updateProjectSourcesCleanupProofForPersistence,
+  type ProjectSourcesCleanupProof,
+  type ProjectSourcesCleanupStorage,
+  type ProjectSourcesManualCleanupProof,
+  type ProjectSourcesProfileCreateIntent,
+  type ProjectSourcesTemporaryCleanupProof,
+} from "./projectSourcesCleanupAuthority.js";
+export { reconcilePendingProjectSourcesTarget } from "./projectSourcesPendingTarget.js";
 
 const PROJECT_SOURCES_CLEANUP_JOURNAL = "project-sources-cleanup.json";
 
-export interface ProjectSourcesCleanupStorage {
-  readonly requestedRoot: string;
-  readonly root: ProfileDirectoryIdentity;
-  readonly journalPath: string;
-  readonly lockPath: string;
-}
-
-export interface ProjectSourcesProfileCreateIntent {
-  readonly generationId: string;
-  readonly parent: ProfileDirectoryIdentity;
-  readonly userDataDir: string;
-}
-
 export interface ProjectSourcesCleanupJournal {
-  version: 1;
+  version: 2;
   oracleHome: ProfileDirectoryIdentity;
   runtime?: BrowserRuntimeMetadata;
+  proof?: ProjectSourcesCleanupProof;
   profileCreate?: ProjectSourcesProfileCreateIntent;
+}
+
+export interface ProjectSourcesRecoveryDeps extends ProjectSourcesPendingTargetDeps {
+  retryCleanup?: typeof retryBrowserRecoveryCleanup;
+  removeProfileDirectoryIfIdentityMatches?: typeof removeProfileDirectoryIfIdentityMatches;
 }
 
 export async function establishProjectSourcesCleanupStorage(): Promise<ProjectSourcesCleanupStorage> {
@@ -70,130 +99,22 @@ export function projectSourcesCleanupJournalPath(): string {
   return path.join(getOracleHomeDir(), PROJECT_SOURCES_CLEANUP_JOURNAL);
 }
 
-function hasProjectSourcesCleanupAuthority(runtime: BrowserRuntimeMetadata): boolean {
-  return Boolean(runtime.recoveryCleanupResources?.length && runtime.recoveryCleanupResult);
-}
-
-function isProjectSourcesProfileCreateIntent(
-  value: unknown,
-): value is ProjectSourcesProfileCreateIntent {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  const parent = parseProfileDirectoryIdentity(candidate.parent, process.platform);
-  return Boolean(
-    parent &&
-    typeof candidate.generationId === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-      candidate.generationId,
-    ) &&
-    typeof candidate.userDataDir === "string" &&
-    path.resolve(candidate.userDataDir) ===
-      path.join(parent.canonicalPath, `oracle-browser-${candidate.generationId}`),
-  );
-}
-
-export function projectSourcesProfileQuarantinePath(
-  intent: ProjectSourcesProfileCreateIntent,
-): string {
-  return path.join(
-    intent.parent.canonicalPath,
-    `.oracle-browser-${intent.generationId}.identity-unknown`,
-  );
-}
-
-export async function assertProjectSourcesProfileParent(
-  intent: ProjectSourcesProfileCreateIntent,
-): Promise<void> {
-  const current = await captureProfileDirectoryIdentity(intent.parent.canonicalPath);
-  if (!sameProfileDirectoryIdentity(current, intent.parent)) {
-    throw new Error("Project Sources temporary profile parent authority changed before recovery.");
-  }
-}
-
-async function lstatProjectSourcesEntry(candidate: string) {
-  try {
-    return await lstat(candidate, { bigint: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-function sameProjectSourcesEntryIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.mode === right.mode
-  );
-}
-
-function hasOwnedProjectSourcesProvenance(runtime: BrowserRuntimeMetadata): boolean {
-  return Boolean(
-    runtime.recoveryCleanupResources?.every((resource) => {
-      const acquisition = resource.acquisition;
-      const launchClaim = parseChromeProcessLaunchClaim(acquisition?.processLaunchClaim);
-      const profile = parseProfileDirectoryIdentity(
-        resource.profileDirectoryIdentity,
-        process.platform,
-      );
-      if (
-        !acquisition?.generationId ||
-        !launchClaim ||
-        launchClaim.generationId !== acquisition.generationId ||
-        !acquisition.processOwnerDisposition ||
-        !profile ||
-        (resource.recoveryCleanup.profileKind === "temporary" &&
-          acquisition.processOwnerProvenance !== "temporary-launch") ||
-        (resource.recoveryCleanup.profileKind === "manual-login" &&
-          acquisition.processOwnerProvenance !== "manual-canonical-owner") ||
-        !["temporary", "manual-login"].includes(resource.recoveryCleanup.profileKind)
-      ) {
-        return false;
-      }
-      if (
-        resource.chromeProcessIdentity &&
-        (!sameProfileDirectoryIdentity(resource.chromeProcessIdentity.profileDirectory, profile) ||
-          (resource.recoveryCleanup.profileKind === "temporary" &&
-            !sameChromeProcessLaunchClaim(resource.chromeProcessIdentity.launchClaim, launchClaim)))
-      ) {
-        return false;
-      }
-      if (
-        resource.tabLease &&
-        !sameProfileDirectoryIdentity(resource.tabLease.profileDirectory, profile)
-      ) {
-        return false;
-      }
-      if (acquisition.pendingResource) return true;
-      if (resource.recoveryCleanup.ownsTarget) {
-        return Boolean(
-          resource.chromeTargetId &&
-          resource.targetCloseCapability?.generationId === acquisition.generationId &&
-          resource.targetCloseCapability.capabilityId &&
-          resource.acquisition?.targetMarkerUrl ===
-            `about:blank#oracle-project-sources=${acquisition.generationId}`,
-        );
-      }
-      return true;
-    }),
-  );
-}
-
 function isProjectSourcesCleanupJournal(value: unknown): value is ProjectSourcesCleanupJournal {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   const root = parseProfileDirectoryIdentity(candidate.oracleHome, process.platform);
   const runtime = candidate.runtime as BrowserRuntimeMetadata | undefined;
+  const proof = parseProjectSourcesCleanupProof(candidate.proof);
   const profileCreate = candidate.profileCreate;
-  return (
-    candidate.version === 1 &&
-    Boolean(root) &&
-    ((Boolean(runtime) &&
-      hasProjectSourcesCleanupAuthority(runtime as BrowserRuntimeMetadata) &&
-      hasOwnedProjectSourcesProvenance(runtime as BrowserRuntimeMetadata) &&
+  return Boolean(
+    candidate.version === 2 &&
+    root &&
+    ((runtime &&
+      proof &&
+      hasProjectSourcesCleanupAuthority(runtime) &&
+      hasOwnedProjectSourcesProvenance(runtime, proof) &&
       !profileCreate) ||
-      (!runtime && isProjectSourcesProfileCreateIntent(profileCreate)))
+      (!runtime && !proof && isProjectSourcesProfileCreateIntent(profileCreate))),
   );
 }
 
@@ -210,6 +131,15 @@ export async function readProjectSourcesCleanupJournal(
     if (!sameProfileDirectoryIdentity(parsed.oracleHome, resolvedStorage.root)) {
       throw new Error("Project Sources cleanup journal Oracle-home authority does not match.");
     }
+    const ownerId = projectSourcesCleanupOwnerId(resolvedStorage);
+    if (parsed.proof && parsed.proof.storageOwnerId !== ownerId) {
+      throw new Error("Project Sources cleanup proof is bound to different cleanup storage.");
+    }
+    if (parsed.profileCreate && parsed.profileCreate.storageOwnerId !== ownerId) {
+      throw new Error(
+        "Project Sources profile creation intent is bound to different cleanup storage.",
+      );
+    }
     return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -220,19 +150,35 @@ export async function readProjectSourcesCleanupJournal(
 export async function persistProjectSourcesCleanupRuntime(
   runtime: BrowserRuntimeMetadata,
   storage?: ProjectSourcesCleanupStorage,
-  profileCreate?: ProjectSourcesProfileCreateIntent,
+  authority: {
+    proof?: ProjectSourcesCleanupProof;
+    profileCreate?: ProjectSourcesProfileCreateIntent;
+  } = {},
 ): Promise<void> {
   const resolvedStorage = storage ?? (await establishProjectSourcesCleanupStorage());
   await assertProjectSourcesCleanupStorage(resolvedStorage);
-  if (hasProjectSourcesCleanupAuthority(runtime) || profileCreate) {
+  if (hasProjectSourcesCleanupAuthority(runtime)) {
+    if (!authority.proof || !hasOwnedProjectSourcesProvenance(runtime, authority.proof)) {
+      throw new Error("Project Sources cleanup runtime has no exact Project Sources proof.");
+    }
     await writeFileAtomicDurable(
       resolvedStorage.journalPath,
       `${JSON.stringify(
-        {
-          version: 1,
-          oracleHome: resolvedStorage.root,
-          ...(profileCreate ? { profileCreate } : { runtime }),
-        } satisfies ProjectSourcesCleanupJournal,
+        { version: 2, oracleHome: resolvedStorage.root, runtime, proof: authority.proof },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+  if (authority.profileCreate) {
+    if (!isProjectSourcesProfileCreateIntent(authority.profileCreate)) {
+      throw new Error("Project Sources profile creation intent is invalid.");
+    }
+    await writeFileAtomicDurable(
+      resolvedStorage.journalPath,
+      `${JSON.stringify(
+        { version: 2, oracleHome: resolvedStorage.root, profileCreate: authority.profileCreate },
         null,
         2,
       )}\n`,
@@ -245,6 +191,7 @@ export async function persistProjectSourcesCleanupRuntime(
 
 function ownedProjectSourcesTarget(
   runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesCleanupProof,
   capability: BrowserRecoveryTargetCloseCapabilityMetadata,
   targetId: string,
 ) {
@@ -252,10 +199,11 @@ function ownedProjectSourcesTarget(
     (resource) =>
       resource.recoveryCleanup.ownsTarget === true &&
       resource.chromeTargetId === targetId &&
-      resource.acquisition?.generationId === capability.generationId &&
+      resource.acquisition?.generationId === proof.generationId &&
+      capability.generationId === proof.generationId &&
       resource.acquisition.targetMarkerUrl ===
-        `about:blank#oracle-project-sources=${capability.generationId}` &&
-      resource.targetCloseCapability?.generationId === capability.generationId &&
+        `about:blank#oracle-project-sources=${proof.generationId}` &&
+      resource.targetCloseCapability?.generationId === proof.generationId &&
       resource.targetCloseCapability.capabilityId === capability.capabilityId,
   );
 }
@@ -263,77 +211,92 @@ function ownedProjectSourcesTarget(
 export async function closeProjectSourcesTargetFromJournal(options: {
   ownerId: string;
   runtime: BrowserRuntimeMetadata;
+  proof: ProjectSourcesCleanupProof;
+  storage: ProjectSourcesCleanupStorage;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
   logger: BrowserLogger;
+  deps?: ProjectSourcesRecoveryDeps;
 }): Promise<RetainedTargetCloseCapabilityResult> {
-  const { ownerId, runtime, capability, targetId, logger } = options;
+  const { ownerId, runtime, proof, storage, capability, targetId, logger, deps = {} } = options;
+  if (ownerId !== proof.storageOwnerId) {
+    return {
+      status: "unavailable",
+      reason: "Project Sources target cleanup does not match this storage owner",
+    };
+  }
   if (!isBrowserRecoveryTargetCloseCapability(capability)) {
     return {
       status: "unavailable",
       reason: "Project Sources target cleanup capability is malformed",
     };
   }
-  if (!ownedProjectSourcesTarget(runtime, capability, targetId)) {
+  if (!ownedProjectSourcesTarget(runtime, proof, capability, targetId)) {
     return {
       status: "unavailable",
       reason: "Project Sources cleanup target does not match its durable generation authority",
     };
   }
+  try {
+    await assertProjectSourcesCleanupProof(runtime, proof, storage, deps);
+  } catch (error) {
+    return {
+      status: "unavailable",
+      reason: `Project Sources target cleanup proof is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
   return await closeChromeTargetWithRetainedCapability({ ownerId, capability, targetId, logger });
+}
+
+async function projectSourcesEntryExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate, { bigint: true });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function recoverPendingProjectSourcesProfileCreate(
   journal: ProjectSourcesCleanupJournal,
   storage: ProjectSourcesCleanupStorage,
   logger: BrowserLogger,
+  deps: ProjectSourcesRecoveryDeps = {},
 ): Promise<boolean> {
   const intent = journal.profileCreate;
   if (!intent) return false;
-  await assertProjectSourcesProfileParent(intent);
-
-  const quarantinePath = projectSourcesProfileQuarantinePath(intent);
-  const occupant = await lstatProjectSourcesEntry(intent.userDataDir);
-  if (!occupant) {
-    const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
-    await assertProjectSourcesProfileParent(intent);
-    if (quarantinedOccupant) {
-      logger(
-        `[browser] Project Sources preserved an identity-less temporary profile at ${quarantinePath} for manual inspection.`,
-      );
-    }
+  await assertProjectSourcesProfileParent(intent, storage);
+  if (!(await projectSourcesEntryExists(intent.userDataDir))) {
     await persistProjectSourcesCleanupRuntime({}, storage);
     return true;
   }
-
-  if (await lstatProjectSourcesEntry(quarantinePath)) {
-    throw new Error(
-      `Project Sources temporary profile and its quarantine path are both occupied; preserving both for manual recovery: ${intent.userDataDir}, ${quarantinePath}`,
-    );
-  }
-  await assertProjectSourcesProfileParent(intent);
-  try {
-    await rename(intent.userDataDir, quarantinePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
-    await assertProjectSourcesProfileParent(intent);
-    if (!quarantinedOccupant) {
-      await persistProjectSourcesCleanupRuntime({}, storage);
-      return true;
+  let proof = intent.proof;
+  if (proof) {
+    await assertProjectSourcesTemporaryProof(proof, storage);
+  } else {
+    try {
+      proof = await authenticateProjectSourcesTemporaryMarker(intent);
+    } catch (error) {
+      throw new Error(
+        `Project Sources preserved an unproven temporary-profile occupant for manual recovery: ${intent.userDataDir}`,
+        { cause: error },
+      );
     }
+    await persistProjectSourcesCleanupRuntime({}, storage, {
+      profileCreate: { ...intent, proof },
+    });
+  }
+  const removed = await (
+    deps.removeProfileDirectoryIfIdentityMatches ?? removeProfileDirectoryIfIdentityMatches
+  )(intent.userDataDir, proof.profileDirectory);
+  if (!removed) {
+    throw new Error(
+      `Project Sources proven temporary profile removal was not confirmed: ${intent.userDataDir}`,
+    );
   }
   await syncDirectory(intent.parent.canonicalPath);
-  const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
-  await assertProjectSourcesProfileParent(intent);
-  if (!quarantinedOccupant || !sameProjectSourcesEntryIdentity(occupant, quarantinedOccupant)) {
-    throw new Error(
-      `Project Sources temporary profile quarantine identity changed; preserving the journal and occupant for manual recovery: ${quarantinePath}`,
-    );
-  }
-  logger(
-    `[browser] Project Sources preserved an identity-less temporary profile at ${quarantinePath} for manual inspection.`,
-  );
+  logger(`[browser] Removed interrupted Project Sources temporary profile ${intent.userDataDir}.`);
   await persistProjectSourcesCleanupRuntime({}, storage);
   return true;
 }
@@ -345,43 +308,60 @@ function bindProjectSourcesAbortRecovery(runtime: BrowserRuntimeMetadata): Brows
   };
 }
 
-export async function reconcilePendingProjectSourcesTarget(
-  runtime: BrowserRuntimeMetadata,
-  _logger: BrowserLogger,
-): Promise<BrowserRuntimeMetadata> {
-  const pendingResources = runtime.recoveryCleanupResources?.filter(
-    (candidate) => candidate.acquisition?.pendingResource === "chrome-target",
-  );
-  if (!pendingResources?.length) return runtime;
-  if (pendingResources.length !== 1) {
-    throw new Error(
-      "Project Sources interrupted target acquisition names multiple pending resources.",
-    );
-  }
-  return runtime;
-}
-
 export async function retryPendingProjectSourcesCleanup(
   logger: BrowserLogger,
-  storage: ProjectSourcesCleanupStorage | undefined,
-  ownerId: string,
+  storage?: ProjectSourcesCleanupStorage,
+  deps: ProjectSourcesRecoveryDeps = {},
 ): Promise<void> {
   const resolvedStorage = storage ?? (await establishProjectSourcesCleanupStorage());
+  const ownerId = projectSourcesCleanupOwnerId(resolvedStorage);
   const journal = await readProjectSourcesCleanupJournal(resolvedStorage);
   if (
     !journal ||
-    (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage, logger))
-  )
+    (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage, logger, deps))
+  ) {
     return;
-  if (!journal.runtime)
-    throw new Error("Project Sources cleanup journal has no runtime authority.");
-  const abortRuntime = bindProjectSourcesAbortRecovery(journal.runtime);
-  await persistProjectSourcesCleanupRuntime(abortRuntime, resolvedStorage);
-  const runtime = await reconcilePendingProjectSourcesTarget(abortRuntime, logger);
-  if (runtime !== abortRuntime) {
-    await persistProjectSourcesCleanupRuntime(runtime, resolvedStorage);
   }
-  const finalization = await retryBrowserRecoveryCleanup(
+  if (!journal.runtime || !journal.proof) {
+    throw new Error("Project Sources cleanup journal has no exact runtime proof.");
+  }
+  let runtime = bindProjectSourcesAbortRecovery(journal.runtime);
+  let proof = journal.proof;
+  await persistProjectSourcesCleanupRuntime(runtime, resolvedStorage, { proof });
+
+  const acquisition = await reconcilePendingProjectSourcesManualAcquisition(runtime, proof, deps);
+  if (!acquisition) {
+    await removeProjectSourcesCleanupProofArtifacts(proof, resolvedStorage);
+    await persistProjectSourcesCleanupRuntime({}, resolvedStorage);
+    return;
+  }
+  if (acquisition.runtime !== runtime || acquisition.proof !== proof) {
+    runtime = acquisition.runtime;
+    proof = await updateProjectSourcesCleanupProofForPersistence(
+      runtime,
+      acquisition.proof,
+      resolvedStorage,
+      deps,
+    );
+    await persistProjectSourcesCleanupRuntime(runtime, resolvedStorage, { proof });
+  }
+
+  const reconciledTarget = await reconcilePendingProjectSourcesTarget(
+    runtime,
+    proof,
+    resolvedStorage,
+    logger,
+    deps,
+  );
+  if (reconciledTarget !== runtime) {
+    runtime = reconciledTarget;
+    await persistProjectSourcesCleanupRuntime(runtime, resolvedStorage, { proof });
+  }
+  await assertProjectSourcesCleanupProof(runtime, proof, resolvedStorage, deps);
+
+  const runtimeAuthority = runtime;
+  let durableProof = proof;
+  const finalization = await (deps.retryCleanup ?? retryBrowserRecoveryCleanup)(
     runtime,
     logger,
     {
@@ -390,14 +370,30 @@ export async function retryPendingProjectSourcesCleanup(
         closeChromeTargetWithRetainedCapability: ({ capability, targetId, logger: closeLogger }) =>
           closeProjectSourcesTargetFromJournal({
             ownerId,
-            runtime,
+            runtime: runtimeAuthority,
+            proof: durableProof,
+            storage: resolvedStorage,
             capability,
             targetId,
             logger: closeLogger,
+            deps,
           }),
       },
       persistFinalizationResult: async (result) => {
-        await persistProjectSourcesCleanupRuntime(result.runtime, resolvedStorage);
+        if (hasProjectSourcesCleanupAuthority(result.runtime)) {
+          durableProof = await updateProjectSourcesCleanupProofForPersistence(
+            result.runtime,
+            durableProof,
+            resolvedStorage,
+            deps,
+          );
+          await persistProjectSourcesCleanupRuntime(result.runtime, resolvedStorage, {
+            proof: durableProof,
+          });
+        } else {
+          await removeProjectSourcesCleanupProofArtifacts(durableProof, resolvedStorage);
+          await persistProjectSourcesCleanupRuntime({}, resolvedStorage);
+        }
         return result;
       },
     },

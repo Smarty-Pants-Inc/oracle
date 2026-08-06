@@ -26,6 +26,7 @@ export interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
+  windowsSystemRoot?: string;
   readOwner?: (userDataDir: string) => Promise<{ processIdentity: ChromeProcessIdentity } | null>;
   launchClaim?: ChromeProcessLaunchClaim;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
@@ -157,7 +158,7 @@ async function captureChromeProcessIdentityWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute)
+      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
       : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(pid)
@@ -226,7 +227,7 @@ export async function inspectChromeProcessIdentityWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute)
+      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
       : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(identity.pid)
@@ -372,6 +373,7 @@ interface ChromeProfileDirectoryUseDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
+  windowsSystemRoot?: string;
   listProcesses?: () => Promise<readonly RunningChromeProcessCommand[]>;
   readProcessGeneration?: (pid: number) => Promise<string | null>;
   captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
@@ -402,12 +404,13 @@ async function inspectChromeProfileDirectoryUseWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute)
+      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
       : deps.trustedProcessProbe;
   const processGenerationProvider = createPlatformProcessGenerationProvider({
     platform,
     execute,
     trustedProcessProbe,
+    windowsSystemRoot: deps.windowsSystemRoot,
   });
   const readProcessGeneration =
     deps.readProcessGeneration ?? processGenerationProvider.readProcessGeneration;
@@ -1077,7 +1080,7 @@ function readDarwinChromeUserDataDirArgument(command: string): string | null | u
   if (!remainder) return null;
   const nextFlagOffset = remainder.search(/\s--[a-z0-9][a-z0-9-]*(?=$|=|\s)/iu);
   const value = (nextFlagOffset < 0 ? remainder : remainder.slice(0, nextFlagOffset)).trim();
-  if (!value || (nextFlagOffset < 0 && /\s/u.test(value))) return null;
+  if (!value) return null;
   return normalizeProfileArgument(value, "darwin");
 }
 function isChromeCommandTokensForUserDataDir(
@@ -1085,7 +1088,7 @@ function isChromeCommandTokensForUserDataDir(
   userDataDir: string,
   platform: NodeJS.Platform,
 ): boolean {
-  if (!isChromeExecutablePrefix(tokens, platform)) return false;
+  if (!isChromeExecutablePath(tokens[0] ?? "", platform)) return false;
   const expected = normalizeProfileArgument(userDataDir, platform);
   const actual = readChromeUserDataDirArgument(tokens, platform);
   return (
@@ -1135,7 +1138,9 @@ function isChromeSnapshotForLaunchClaim(
   const tokens = snapshot.commandTokens ?? tokenizeCommandLine(snapshot.commandLine);
   return Boolean(
     tokens &&
-    isChromeExecutablePrefix(tokens, platform) &&
+    (snapshot.commandTokens
+      ? isChromeExecutablePath(tokens[0] ?? "", platform)
+      : isChromeExecutablePrefix(tokens, platform)) &&
     sameChromeProcessLaunchClaim(readChromeProcessLaunchClaimArgument(tokens), claim),
   );
 }

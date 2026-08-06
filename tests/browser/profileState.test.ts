@@ -18,6 +18,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 import type {
   ChromeProcessIdentity,
   OracleChromeOwnerRecord,
@@ -789,6 +790,7 @@ describe("profileState", () => {
     });
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const identity = syntheticWindowsChromeIdentity(profileDir);
+    const windowsSystemRoot = String.raw`D:\Windows`;
     let cleanupDir: string | undefined;
 
     try {
@@ -800,6 +802,7 @@ describe("profileState", () => {
       await expect(
         timedProfileState.inspectChromeProcessIdentityForTest(profileDir, identity, {
           platform: "win32",
+          windowsSystemRoot,
           verifyProfileIdentity: async () => true,
           isProcessAlive: () => true,
         }),
@@ -812,11 +815,11 @@ describe("profileState", () => {
 
       expect(execFileAsync.mock.calls).toHaveLength(2);
       expect(execFileAsync.mock.calls[0]?.[0]).toBe(
-        String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+        resolveWindowsPowerShellExecutable(windowsSystemRoot),
       );
       expect(execFileAsync.mock.calls[1]?.[0]).toBe(
         process.platform === "win32"
-          ? String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`
+          ? resolveWindowsPowerShellExecutable()
           : process.platform === "darwin"
             ? "/bin/ps"
             : "/usr/bin/ps",

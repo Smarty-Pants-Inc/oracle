@@ -128,88 +128,45 @@ test("persists and resolves Project Sources cleanup while discarding successful 
   try {
     const profileState = await import("../../src/browser/profileState.js");
     const temporaryParent = await profileState.captureProfileDirectoryIdentity(temporaryBase);
-    const profileGeneration = randomUUID();
-    const interruptedProfile = path.join(
-      temporaryParent.canonicalPath,
-      `oracle-browser-${profileGeneration}`,
+    const cleanupStorage = await projectSourcesRecovery.establishProjectSourcesCleanupStorage();
+    const profileCreateIntent = projectSourcesRecovery.createProjectSourcesProfileCreateIntent(
+      cleanupStorage,
+      temporaryParent,
+      randomUUID(),
     );
-    const profileCreateIntent = {
-      generationId: profileGeneration,
-      parent: temporaryParent,
-      userDataDir: interruptedProfile,
-    };
 
-    // Crash before mkdir: the durable intent is enough to clear the absent exact generation.
-    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime(
-      {},
-      undefined,
-      profileCreateIntent,
-    );
+    // Crash before mkdir: the exact absent path clears without blocking the next run.
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
+      profileCreate: profileCreateIntent,
+    });
     await expect(
       readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).resolves.toContain('"profileCreate"');
     await projectSourcesRecovery.retryPendingProjectSourcesCleanup(
       vi.fn<(message: string) => void>(),
-      undefined,
-      "test-owner",
+      cleanupStorage,
     );
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await expect(
       readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
 
-    // Crash after mkdir before identity persistence: atomically quarantine the unknown occupant.
-    const quarantinePath =
-      projectSourcesRecovery.projectSourcesProfileQuarantinePath(profileCreateIntent);
-    const recoveryLog = vi.fn<(message: string) => void>();
-    await mkdir(interruptedProfile);
-    await writeFile(path.join(interruptedProfile, "unknown-owner.txt"), "preserve me");
-    mocks.removeProfile.mockClear();
-    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime(
-      {},
-      undefined,
-      profileCreateIntent,
-    );
-    await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
-        recoveryLog,
-        undefined,
-        "test-owner",
-      ),
-    ).resolves.toBeUndefined();
-    expect(mocks.removeProfile).not.toHaveBeenCalled();
-    await expect(readFile(path.join(quarantinePath, "unknown-owner.txt"), "utf8")).resolves.toBe(
-      "preserve me",
-    );
-    await expect(
-      readFile(path.join(interruptedProfile, "unknown-owner.txt"), "utf8"),
-    ).rejects.toMatchObject({ code: "ENOENT" });
-    expect(recoveryLog).toHaveBeenCalledWith(expect.stringContaining(quarantinePath));
-    await expect(
-      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
-    ).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
-        recoveryLog,
-        undefined,
-        "test-owner",
-      ),
-    ).resolves.toBeUndefined();
-
-    // A changed physical parent fails closed before the child is inspected or removed.
-    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({}, undefined, {
-      ...profileCreateIntent,
-      parent: { ...temporaryParent, inode: "999999" },
+    // Crash after mkdir but before marker creation: leave the unproven occupant in place.
+    await mkdir(profileCreateIntent.userDataDir);
+    const unknownOwner = path.join(profileCreateIntent.userDataDir, "unknown-owner.txt");
+    await writeFile(unknownOwner, "preserve me");
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
+      profileCreate: profileCreateIntent,
     });
     await expect(
       projectSourcesRecovery.retryPendingProjectSourcesCleanup(
         vi.fn<(message: string) => void>(),
-        undefined,
-        "test-owner",
+        cleanupStorage,
       ),
-    ).rejects.toThrow(/parent authority changed/i);
-    expect(mocks.removeProfile).not.toHaveBeenCalled();
-    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({});
+    ).rejects.toThrow(/preserved an unproven temporary-profile occupant/i);
+    await expect(readFile(unknownOwner, "utf8")).resolves.toBe("preserve me");
+    await rm(profileCreateIntent.userDataDir, { recursive: true, force: true });
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({}, cleanupStorage);
     mocks.resolveBrowserConfig.mockReturnValue({
       remoteChrome: null,
       manualLogin: false,
@@ -343,6 +300,8 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     const reconciledTargetAcquisition =
       await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
         pendingTargetAcquisition,
+        pendingJournal.proof,
+        cleanupStorage,
         vi.fn<(message: string) => void>(),
       );
     expect(reconciledTargetAcquisition).toBe(pendingTargetAcquisition);
@@ -361,8 +320,10 @@ test("persists and resolves Project Sources cleanup while discarding successful 
 
     await expect(
       projectSourcesRecovery.closeProjectSourcesTargetFromJournal({
-        ownerId: "test-owner",
+        ownerId: pendingJournal.proof.storageOwnerId,
         runtime: pendingJournal.runtime,
+        proof: pendingJournal.proof,
+        storage: cleanupStorage,
         capability: pendingJournal.runtime.recoveryCleanupResources[0].targetCloseCapability,
         targetId: "project-sources-target",
         logger: vi.fn<(message: string) => void>(),

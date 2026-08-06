@@ -13,6 +13,7 @@ import {
   revalidateChromeProfileDirectoryUseForTest,
   type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
+import { inspectChromeProcessesForLaunchClaimFromProcessListForTest } from "../../src/browser/chromeProcessIdentity.js";
 
 describe("stable Chrome process authority", () => {
   test("carries retained endpoint release authority into a current standard launch", async () => {
@@ -416,6 +417,31 @@ describe("stable Chrome process authority", () => {
   });
 });
 
+describe("Darwin Chrome process command parsing", () => {
+  test("accepts an unquoted final spaced profile from its claimed launch without honoring a quoted decoy", () => {
+    const executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    const userDataDir = "/private/var/folders/oracle/profile with spaces";
+    const claim = {
+      version: 1 as const,
+      generationId: "00000000-0000-4000-8000-000000000001",
+      nonce: "00000000-0000-4000-8000-000000000002",
+    };
+
+    expect(
+      inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+        `4321 ${executable} --remote-debugging-port=9222 "quoted --user-data-dir=/private/decoy" --oracle-launch-claim=${claim.generationId}:${claim.nonce} --user-data-dir=${userDataDir}\n`,
+        userDataDir,
+        claim,
+        null,
+        "darwin",
+      ),
+    ).toEqual({
+      exactMatches: [{ pid: 4321, port: 9222 }],
+      conflictingProfilePids: [],
+    });
+  });
+});
+
 describe("physical Chrome profile use authority", () => {
   test.each([
     ["Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
@@ -531,7 +557,7 @@ describe("physical Chrome profile use authority", () => {
     expect(execute).toHaveBeenCalledWith("/bin/ps", ["-axww", "-o", "pid=", "-o", "command="]);
   });
 
-  test("uses only the fixed System32 probe for Windows Chrome enumeration", async () => {
+  test("uses only the injected System32 probe for Windows Chrome enumeration", async () => {
     const expected = Object.freeze({
       version: 2 as const,
       platform: "win32" as const,
@@ -541,7 +567,8 @@ describe("physical Chrome profile use authority", () => {
       birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const attackerPowerShell = vi.fn(async () => ({ stdout: "999:\n" }));
-    const trustedPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const windowsSystemRoot = String.raw`D:\Windows`;
+    const trustedPowerShell = String.raw`${windowsSystemRoot}\System32\WindowsPowerShell\v1.0\powershell.exe`;
     const execute = vi.fn(async (file: string, _args: string[]) => {
       if (file === "powershell.exe") return attackerPowerShell();
       if (file !== trustedPowerShell) throw new Error(`Unexpected process probe: ${file}`);
@@ -549,7 +576,11 @@ describe("physical Chrome profile use authority", () => {
     });
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, { platform: "win32", execute }),
+      inspectChromeProfileDirectoryUseForTest(expected, {
+        platform: "win32",
+        execute,
+        windowsSystemRoot,
+      }),
     ).resolves.toEqual({ status: "unused", candidates: [] });
     expect(attackerPowerShell).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledOnce();
@@ -581,7 +612,8 @@ describe("physical Chrome profile use authority", () => {
       birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const commandLine = `"${executablePath}" --user-data-dir="${expected.canonicalPath}"`;
-    const trustedPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const windowsSystemRoot = String.raw`D:\Windows`;
+    const trustedPowerShell = String.raw`${windowsSystemRoot}\System32\WindowsPowerShell\v1.0\powershell.exe`;
     const execute = vi.fn(async (file: string, args: string[]) => {
       expect(file).toBe(trustedPowerShell);
       expect(args[3]).toContain(
@@ -598,6 +630,7 @@ describe("physical Chrome profile use authority", () => {
       inspectChromeProfileDirectoryUseForTest(expected, {
         platform: "win32",
         execute,
+        windowsSystemRoot,
         readProcessGeneration: async () => "win32:2026-08-06T12:00:00.0000000Z",
         captureProfileIdentity,
       }),

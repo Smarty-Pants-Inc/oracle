@@ -67,6 +67,7 @@ interface InFlightIsolatedDirectoryRemoval {
 const inFlightIsolatedDirectoryRemovals = new Map<string, InFlightIsolatedDirectoryRemoval>();
 // Replay must not finalize a journaled empty root while its generation move is still in flight.
 const inFlightIsolatedDirectoryPreparations = new Map<string, Promise<void>>();
+let beforePreparationWaitForTest: ((rootPath: string) => void) | undefined;
 
 // The journal is durable before the candidate rename. A crash can therefore leave either an
 // empty prepared root or the exact moved generation, and restart can distinguish both without
@@ -206,6 +207,7 @@ export function removeIsolatedDirectoryGeneration(
   const canonicalRootPath = path.resolve(rootPath);
   const preparation = inFlightIsolatedDirectoryPreparations.get(canonicalRootPath);
   if (preparation !== undefined) {
+    beforePreparationWaitForTest?.(canonicalRootPath);
     return preparation.then(() => removeIsolatedDirectoryGeneration(canonicalRootPath, deps));
   }
   return removeIsolatedDirectoryGenerationNow(canonicalRootPath, deps);
@@ -820,3 +822,10 @@ function isolatedDirectoryCleanupCompletionPath(rootPath: string): string {
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suites
+export const __test__ = {
+  setBeforePreparationWait(callback: ((rootPath: string) => void) | undefined): void {
+    beforePreparationWaitForTest = callback;
+  },
+};

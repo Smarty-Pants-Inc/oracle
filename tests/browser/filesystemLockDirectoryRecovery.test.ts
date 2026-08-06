@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -8,18 +8,22 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
+import type * as NodeFsPromisesModule from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
   isolateDirectoryGenerationForRemoval,
   removeIsolatedDirectoryGeneration,
 } from "../../src/browser/filesystemLock.js";
+import type { BrowserTabLease } from "../../src/browser/tabLeaseRegistry.js";
+import type * as FilesystemLockIoModule from "../../src/browser/filesystemLockIo.js";
 import { retryPendingFilesystemLockReleases } from "../../src/browser/filesystemLockReleaseJournal.js";
 import { agePath, createProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
@@ -225,6 +229,156 @@ describe("crash-recoverable filesystem lock", () => {
       await expect(stat(isolation.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(stat(candidatePath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(
+    process.platform === "linux" || process.platform === "darwin" || process.platform === "win32",
+  )("waits for journaled generation preparation during tab-lease reacquisition", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-filesystem-preparation-race-"));
+    const lockPath = path.join(root, "oracle-tab-leases.lock");
+    const generationRenameStarted = Promise.withResolvers<void>();
+    const allowGenerationRename = Promise.withResolvers<void>();
+    const preparationWaitObserved = Promise.withResolvers<string>();
+    const prematureRootRemoval = Promise.withResolvers<string>();
+    const actualFs = await vi.importActual<typeof NodeFsPromisesModule>("node:fs/promises");
+    const actualIo = await vi.importActual<typeof FilesystemLockIoModule>(
+      "../../src/browser/filesystemLockIo.js",
+    );
+    let firstRelease: Promise<void> | undefined;
+    let secondAcquisition: Promise<BrowserTabLease> | undefined;
+    let secondLease: BrowserTabLease | undefined;
+    let generationRenameCount = 0;
+    let pausedRootPath: string | undefined;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({
+      ...actualFs,
+      rmdir: async (...args: unknown[]) => {
+        const rootPath = path.resolve(String(args[0]));
+        if (rootPath === pausedRootPath) prematureRootRemoval.resolve(rootPath);
+        return Reflect.apply(actualFs.rmdir, actualFs, args);
+      },
+    }));
+    vi.doMock("../../src/browser/filesystemLockIo.js", () => ({
+      ...actualIo,
+      renameLockPath: async (sourcePath: string, destinationPath: string) => {
+        if (
+          path.basename(destinationPath) === "generation" &&
+          path.basename(sourcePath).includes(".released-")
+        ) {
+          generationRenameCount += 1;
+          if (generationRenameCount === 2) {
+            generationRenameStarted.resolve();
+            await allowGenerationRename.promise;
+          }
+        }
+        await actualIo.renameLockPath(sourcePath, destinationPath);
+      },
+    }));
+    // Reloading is intentional: the mocked ESM binding must be captured by this isolated graph.
+    const { acquireBrowserTabLease: acquireIsolatedBrowserTabLease } =
+      await import("../../src/browser/tabLeaseRegistry.js");
+    const { __test__: directoryRemovalTest } =
+      await import("../../src/browser/filesystemLockDirectoryRemoval.js");
+
+    try {
+      const firstLease = await acquireIsolatedBrowserTabLease(
+        root,
+        {
+          maxConcurrentTabs: 1,
+          timeoutMs: 1_000,
+          sessionId: "first-tab-lease-owner",
+          generationId: "first-tab-lease-generation",
+          leaseId: "first-tab-lease",
+        },
+        { readProcessStartIdentity: async () => "first-tab-lease-start" },
+      );
+      firstRelease = firstLease.release();
+      await generationRenameStarted.promise;
+
+      const journalName = (await readdir(root)).find((entry) =>
+        entry.endsWith(".cleanup-journal.json"),
+      );
+      expect(journalName).toBeDefined();
+      const journalPath = path.join(root, journalName!);
+      const journal = JSON.parse(await readFile(journalPath, "utf8")) as { rootPath: string };
+      expect(await readdir(journal.rootPath)).toEqual([]);
+      await expect(stat(path.join(journal.rootPath, "generation"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      pausedRootPath = journal.rootPath;
+      expect((await readdir(root)).some((entry) => entry.includes(".released-"))).toBe(true);
+
+      directoryRemovalTest.setBeforePreparationWait((rootPath) => {
+        preparationWaitObserved.resolve(rootPath);
+      });
+      secondAcquisition = acquireIsolatedBrowserTabLease(
+        root,
+        {
+          maxConcurrentTabs: 1,
+          timeoutMs: 1_000,
+          pollMs: 50,
+          sessionId: "second-tab-lease-owner",
+          generationId: "second-tab-lease-generation",
+          leaseId: "second-tab-lease",
+        },
+        { readProcessStartIdentity: async () => "second-tab-lease-start" },
+      ).then((lease) => {
+        secondLease = lease;
+        return lease;
+      });
+      await expect(
+        Promise.race([
+          preparationWaitObserved.promise.then((rootPath) => ({ status: "waiting", rootPath })),
+          prematureRootRemoval.promise.then((rootPath) => ({ status: "removed", rootPath })),
+          secondAcquisition.then(
+            () => ({ status: "settled" }),
+            () => ({ status: "failed" }),
+          ),
+        ]),
+      ).resolves.toEqual({ status: "waiting", rootPath: journal.rootPath });
+
+      allowGenerationRename.resolve();
+      await expect(firstRelease).resolves.toBeUndefined();
+      secondLease = await secondAcquisition;
+      const registry = JSON.parse(
+        await readFile(path.join(root, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ id: string; sessionId: string; generationId: string }> };
+      expect(registry.leases).toEqual([
+        expect.objectContaining({
+          id: "second-tab-lease",
+          sessionId: "second-tab-lease-owner",
+          generationId: "second-tab-lease-generation",
+        }),
+      ]);
+      expect((await readdir(root)).filter((entry) => entry.includes(".released-"))).toEqual([]);
+      expect(
+        (await readdir(root)).filter(
+          (entry) =>
+            entry.startsWith(".oracle-remove-") ||
+            entry.endsWith(".cleanup-journal.json") ||
+            entry.endsWith(".contents-deleted.json"),
+        ),
+      ).toEqual([]);
+      await expect(stat(journal.rootPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(journalPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      await secondLease.release();
+      secondLease = undefined;
+      await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      directoryRemovalTest.setBeforePreparationWait(undefined);
+      allowGenerationRename.resolve();
+      await Promise.allSettled([
+        firstRelease ?? Promise.resolve(),
+        secondAcquisition ?? Promise.resolve(),
+      ]);
+      await secondLease?.release().catch(() => undefined);
+      vi.doUnmock("node:fs/promises");
+      vi.doUnmock("../../src/browser/filesystemLockIo.js");
+      vi.resetModules();
       await rm(root, { recursive: true, force: true });
     }
   });

@@ -38,13 +38,20 @@ import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
 import {
+  assertProjectSourcesCleanupProof,
   assertProjectSourcesCleanupStorage,
   assertProjectSourcesProfileParent,
+  createProjectSourcesManualCleanupProof,
+  createProjectSourcesProfileCreateIntent,
+  createProjectSourcesTemporaryCleanupProof,
   establishProjectSourcesCleanupStorage,
   persistProjectSourcesCleanupRuntime,
+  projectSourcesCleanupOwnerId,
+  removeProjectSourcesCleanupProofArtifacts,
   retryPendingProjectSourcesCleanup,
+  updateProjectSourcesCleanupProofForPersistence,
+  type ProjectSourcesCleanupProof,
   type ProjectSourcesCleanupStorage,
-  type ProjectSourcesProfileCreateIntent,
 } from "./projectSourcesRecovery.js";
 import { acquireReattachRecoveryLock } from "./reattachLock.js";
 import { resolveUserDataBaseDir, waitForLogin } from "./localExecutionContext.js";
@@ -104,8 +111,8 @@ async function runBrowserProjectSourcesUnlocked(
     };
   }
   const cleanupStorage = storage ?? (await establishProjectSourcesCleanupStorage());
-  const resourceOwnerId = randomUUID();
-  await retryPendingProjectSourcesCleanup(logger, cleanupStorage, resourceOwnerId);
+  const resourceOwnerId = projectSourcesCleanupOwnerId(cleanupStorage);
+  await retryPendingProjectSourcesCleanup(logger, cleanupStorage);
 
   let config = resolveBrowserConfig({
     ...request.config,
@@ -126,9 +133,10 @@ async function runBrowserProjectSourcesUnlocked(
   const manualProfileDir = config.manualLoginProfileDir
     ? path.resolve(config.manualLoginProfileDir)
     : defaultManualLoginProfileDir();
-  let profileCreateIntent: ProjectSourcesProfileCreateIntent | undefined;
+  const leaseId = manualLogin ? randomUUID() : undefined;
   let userDataDir = manualLogin ? manualProfileDir : "";
   let profileDirectoryIdentity: ProfileDirectoryIdentity;
+  let cleanupProof: ProjectSourcesCleanupProof;
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
     logger(`Manual login mode enabled; reusing persistent profile at ${userDataDir}`);
@@ -137,33 +145,55 @@ async function runBrowserProjectSourcesUnlocked(
       keepBrowser: effectiveKeepBrowser,
     });
     profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
+    cleanupProof = createProjectSourcesManualCleanupProof(
+      cleanupStorage,
+      targetGenerationId,
+      userDataDir,
+      profileDirectoryIdentity,
+      leaseId as string,
+    );
   } else {
     const parent = await captureProfileDirectoryIdentity(await resolveUserDataBaseDir(), {
       create: true,
     });
-    const temporaryProfileDir = path.join(
-      parent.canonicalPath,
-      `oracle-browser-${targetGenerationId}`,
-    );
-    profileCreateIntent = {
-      generationId: targetGenerationId,
+    const profileCreateIntent = createProjectSourcesProfileCreateIntent(
+      cleanupStorage,
       parent,
-      userDataDir: temporaryProfileDir,
-    };
-    await persistProjectSourcesCleanupRuntime({}, cleanupStorage, profileCreateIntent);
-    await assertProjectSourcesProfileParent(profileCreateIntent);
-    await mkdir(temporaryProfileDir);
-    userDataDir = temporaryProfileDir;
+      targetGenerationId,
+    );
+    await persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
+      profileCreate: profileCreateIntent,
+    });
+    await assertProjectSourcesProfileParent(profileCreateIntent, cleanupStorage);
+    await mkdir(profileCreateIntent.userDataDir);
+    userDataDir = profileCreateIntent.userDataDir;
     logger(`Created temporary Chrome profile at ${userDataDir}`);
-    profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
-    await assertProjectSourcesProfileParent(profileCreateIntent);
+    cleanupProof = await createProjectSourcesTemporaryCleanupProof(
+      profileCreateIntent,
+      cleanupStorage,
+    );
+    profileDirectoryIdentity = cleanupProof.profileDirectory;
+    await persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
+      profileCreate: { ...profileCreateIntent, proof: cleanupProof },
+    });
   }
 
-  const leaseId = manualLogin ? randomUUID() : undefined;
   const persistOwnedResources = async (
     runtimeToPersist: BrowserRuntimeMetadata,
   ): Promise<BrowserRuntimeMetadata> => {
-    await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage);
+    if (runtimeToPersist.recoveryCleanupResources?.length) {
+      cleanupProof = await updateProjectSourcesCleanupProofForPersistence(
+        runtimeToPersist,
+        cleanupProof,
+        cleanupStorage,
+      );
+      await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage, {
+        proof: cleanupProof,
+      });
+    } else {
+      await removeProjectSourcesCleanupProofArtifacts(cleanupProof, cleanupStorage);
+      await persistProjectSourcesCleanupRuntime({}, cleanupStorage);
+    }
     return runtimeToPersist;
   };
   const resources = new LocalOwnedBrowserResourceAuthority({
@@ -387,7 +417,35 @@ async function runBrowserProjectSourcesUnlocked(
 
   removeDialogHandler?.();
   removeTerminationHooks?.();
-  const finalization = await resources.settle(completed ? "finalize" : "abort");
+  let finalization;
+  try {
+    const runtimeBeforeSettlement = resources.runtime();
+    if (runtimeBeforeSettlement.recoveryCleanupResources?.length) {
+      cleanupProof = await updateProjectSourcesCleanupProofForPersistence(
+        runtimeBeforeSettlement,
+        cleanupProof,
+        cleanupStorage,
+      );
+      await persistProjectSourcesCleanupRuntime(runtimeBeforeSettlement, cleanupStorage, {
+        proof: cleanupProof,
+      });
+      await assertProjectSourcesCleanupProof(runtimeBeforeSettlement, cleanupProof, cleanupStorage);
+    }
+    finalization = await resources.settle(completed ? "finalize" : "abort");
+  } catch (error) {
+    const cleanupError = new BrowserAutomationError(
+      `Project Sources browser cleanup proof is unavailable; exact resources remain durably journaled: ${error instanceof Error ? error.message : String(error)}`,
+      { stage: "project-sources-cleanup", runtime: resources.runtime() },
+      error,
+    );
+    if (primaryError !== undefined) {
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        "Project Sources operation failed and browser cleanup remains retryable.",
+      );
+    }
+    throw cleanupError;
+  }
   if (finalization.status === "pending") {
     const cleanupError = new BrowserAutomationError(
       `Project Sources browser cleanup remains retryable and is durably journaled for the next Project Sources run: ${finalization.error}`,

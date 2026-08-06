@@ -9,11 +9,33 @@ import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import {
   buildWindowsPrivateTreeAclCommand,
   protectWindowsPrivateTreeAcl,
-  WINDOWS_POWERSHELL_EXECUTABLE,
 } from "../../src/remote/windowsPrivateTreeAcl.js";
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
 const WINDOWS_PRIVATE_TREE_ACL_MARKER = "oracle.remote-transaction.private-tree.v1";
+const TEST_WINDOWS_SYSTEM_ROOT = String.raw`D:\Windows`;
+
+function buildWindowsTestPathCommandArgs(script: string, itemPaths: string[]): string[] {
+  const pathExpressions = itemPaths
+    .map((itemPath) => {
+      const encodedPath = Buffer.from(itemPath, "utf8").toString("base64");
+      return `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}'))`;
+    })
+    .join(",\n  ");
+  const command = String.raw`
+$ItemPaths = @(
+  ${pathExpressions}
+)
+${script}`;
+  return [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    Buffer.from(command, "utf16le").toString("base64"),
+  ];
+}
 
 const commandScope = {
   storeDirectory: String.raw`C:\Users\Oracle\.oracle\remote-transactions`,
@@ -22,16 +44,15 @@ const commandScope = {
 };
 
 describe("Windows remote transaction private ACL authority", () => {
-  test("uses one bounded fixed-path native command without PATH or shell resolution", async () => {
+  test("uses one bounded native command resolved from an injected non-C SystemRoot", async () => {
     const execute = vi.fn(async () => ({ stdout: WINDOWS_PRIVATE_TREE_ACL_MARKER }));
 
-    await protectWindowsPrivateTreeAcl(commandScope, execute);
+    await protectWindowsPrivateTreeAcl(commandScope, execute, TEST_WINDOWS_SYSTEM_ROOT);
 
-    const command = buildWindowsPrivateTreeAclCommand(commandScope);
+    const command = buildWindowsPrivateTreeAclCommand(commandScope, TEST_WINDOWS_SYSTEM_ROOT);
     expect(command.file).toBe(
-      String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+      String.raw`D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
     );
-    expect(command.file).toBe(WINDOWS_POWERSHELL_EXECUTABLE);
     expect(command.args.slice(0, 4)).toEqual([
       "-NoLogo",
       "-NoProfile",
@@ -44,38 +65,86 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
   });
 
-  test("encodes configured paths instead of appending them as PowerShell source", () => {
+  test("encodes each configured path independently instead of appending hostile paths as PowerShell source", () => {
     const hostileScope = {
-      ...commandScope,
-      storeDirectory: String.raw`C:\Users\Oracle\$(throw 'path injection')`,
+      storeDirectory: String.raw`C:\Users\Oracle\$(throw 'store path injection')`,
+      integrityKeyDirectory: String.raw`C:\Users\Oracle\$(throw 'key directory injection')`,
+      integrityKeyPath: String.raw`C:\Users\Oracle\$(throw 'key directory injection')\$(throw 'key path injection').key`,
     };
-    const command = buildWindowsPrivateTreeAclCommand(hostileScope);
+    const protectedPaths = [
+      hostileScope.storeDirectory,
+      hostileScope.integrityKeyDirectory,
+      hostileScope.integrityKeyPath,
+    ];
+    const command = buildWindowsPrivateTreeAclCommand(hostileScope, TEST_WINDOWS_SYSTEM_ROOT);
     const encodedCommand = command.args.at(-1);
     expect(encodedCommand).toBeDefined();
     const decodedCommand = Buffer.from(encodedCommand ?? "", "base64").toString("utf16le");
-    const encodedScope = Buffer.from(
-      JSON.stringify([
-        hostileScope.storeDirectory,
-        hostileScope.integrityKeyDirectory,
-        hostileScope.integrityKeyPath,
-      ]),
-      "utf8",
-    ).toString("base64");
+    const encodedPaths = [
+      ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
+    ].map((match) => match[1] ?? "");
 
-    expect(command.args).not.toContain(hostileScope.storeDirectory);
-    expect(decodedCommand).not.toContain(hostileScope.storeDirectory);
-    expect(decodedCommand).toContain(`FromBase64String('${encodedScope}')`);
-    expect(decodedCommand).toContain("$Scope = @($ScopeJson | ConvertFrom-Json)");
+    expect(encodedPaths).toHaveLength(3);
+    expect(
+      encodedPaths.map((encodedPath) => Buffer.from(encodedPath, "base64").toString("utf8")),
+    ).toEqual(protectedPaths);
+    for (const protectedPath of protectedPaths) {
+      expect(command.args.join("\0")).not.toContain(protectedPath);
+      expect(decodedCommand).not.toContain(protectedPath);
+    }
+    expect(decodedCommand).not.toContain("ConvertFrom-Json");
+    expect(decodedCommand).not.toContain("$Scope");
+    expect(decodedCommand).toContain("$StorePath = [System.IO.Path]::GetFullPath(");
+    expect(decodedCommand).toContain("$KeyDirectoryPath = [System.IO.Path]::GetFullPath(");
+    expect(decodedCommand).toContain("$KeyPath = [System.IO.Path]::GetFullPath(");
+  });
+
+  test("encodes every native integration helper path instead of using trailing PowerShell arguments", () => {
+    const hostilePaths = [
+      String.raw`C:\$(throw 'first path injection')`,
+      String.raw`C:\$(throw 'second path injection')`,
+      String.raw`C:\$(throw 'third path injection')`,
+      String.raw`C:\$(throw 'fourth path injection')`,
+    ];
+    const args = buildWindowsTestPathCommandArgs(
+      "foreach ($ItemPath in $ItemPaths) { [Console]::Out.Write($ItemPath) }",
+      hostilePaths,
+    );
+    const decodedCommand = Buffer.from(args.at(-1) ?? "", "base64").toString("utf16le");
+    const decodedPaths = [
+      ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
+    ].map((match) => Buffer.from(match[1] ?? "", "base64").toString("utf8"));
+
+    expect(args.slice(0, 4)).toEqual([
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+    ]);
+    expect(args).not.toContain("-Command");
+    expect(decodedPaths).toEqual(hostilePaths);
+    for (const hostilePath of hostilePaths) {
+      expect(args.join("\0")).not.toContain(hostilePath);
+      expect(decodedCommand).not.toContain(hostilePath);
+    }
   });
 
   test("fails closed when the native ACL probe does not complete exactly", async () => {
     await expect(
-      protectWindowsPrivateTreeAcl(commandScope, async () => ({ stdout: "partial" })),
+      protectWindowsPrivateTreeAcl(
+        commandScope,
+        async () => ({ stdout: "partial" }),
+        TEST_WINDOWS_SYSTEM_ROOT,
+      ),
     ).rejects.toThrow("private ACL verification did not complete");
     await expect(
-      protectWindowsPrivateTreeAcl(commandScope, async () => {
-        throw new Error("probe unavailable");
-      }),
+      protectWindowsPrivateTreeAcl(
+        commandScope,
+        async () => {
+          throw new Error("probe unavailable");
+        },
+        TEST_WINDOWS_SYSTEM_ROOT,
+      ),
     ).rejects.toThrow("private ACL protection failed");
   });
 
@@ -86,6 +155,7 @@ describe("Windows remote transaction private ACL authority", () => {
       const directory = path.join(root, "remote-transactions");
       const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
       const transactionToken = "a".repeat(64);
+      const powershellExecutable = resolveWindowsPowerShellExecutable();
       try {
         const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
         await store.begin({
@@ -114,22 +184,15 @@ $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
   [System.Security.AccessControl.AccessControlType]::Allow
 )
-foreach ($ItemPath in $args) {
+foreach ($ItemPath in $ItemPaths) {
   $Item = Get-Item -LiteralPath $ItemPath -Force
   $Acl = $Item.GetAccessControl()
   [void]$Acl.AddAccessRule($Rule)
   $Item.SetAccessControl($Acl)
 }`;
         await execFileAsync(
-          WINDOWS_POWERSHELL_EXECUTABLE,
-          [
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            broadenScript,
-            ...protectedPaths,
-          ],
+          powershellExecutable,
+          buildWindowsTestPathCommandArgs(broadenScript, protectedPaths),
           { timeout: 12_000, windowsHide: true },
         );
 
@@ -139,7 +202,7 @@ foreach ($ItemPath in $args) {
         const verifyScript = String.raw`
 $ErrorActionPreference = 'Stop'
 $Everyone = 'S-1-1-0'
-foreach ($ItemPath in $args) {
+foreach ($ItemPath in $ItemPaths) {
   $Item = Get-Item -LiteralPath $ItemPath -Force
   $Acl = $Item.GetAccessControl()
   if (-not $Acl.AreAccessRulesProtected) { exit 20 }
@@ -148,8 +211,8 @@ foreach ($ItemPath in $args) {
 }
 [Console]::Out.Write('private')`;
         const { stdout } = await execFileAsync(
-          WINDOWS_POWERSHELL_EXECUTABLE,
-          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", verifyScript, ...protectedPaths],
+          powershellExecutable,
+          buildWindowsTestPathCommandArgs(verifyScript, protectedPaths),
           { encoding: "utf8", timeout: 12_000, windowsHide: true },
         );
         expect(stdout).toBe("private");

@@ -133,6 +133,43 @@ function createFakeSshChild(io?: net.Socket, pid = 5000): FakeSshChild {
   };
 }
 
+function createFakeSshTunnelHarness(platform: NodeJS.Platform, healthPort: number) {
+  const sshArgs: Array<readonly string[]> = [];
+  const sshChildren: FakeSshChild[] = [];
+  const mainChildren: FakeSshChild[] = [];
+  const controlChildren: FakeSshChild[] = [];
+  const probeChildren: FakeSshChild[] = [];
+  const tunnelSpawn = vi.fn(
+    (_command: string, args: readonly string[], _options: SpawnOptions): ChildProcess => {
+      sshArgs.push([...args]);
+      const isProbe = args[0] === "-W";
+      const isControl = platform !== "win32" && args.includes("-O");
+      const child = createFakeSshChild(
+        isProbe ? net.createConnection({ host: "127.0.0.1", port: healthPort }) : undefined,
+        5000 + sshChildren.length,
+      );
+      sshChildren.push(child);
+      if (isProbe) {
+        probeChildren.push(child);
+      } else if (isControl) {
+        controlChildren.push(child);
+        queueMicrotask(() => child.exit(0));
+      } else {
+        mainChildren.push(child);
+      }
+      return child.child;
+    },
+  );
+  return {
+    tunnelSpawn,
+    sshArgs,
+    sshChildren,
+    mainChildren,
+    controlChildren,
+    probeChildren,
+  };
+}
+
 async function listenLoopback(server: http.Server): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -163,7 +200,7 @@ function writeHealthResponse(
   res.end(
     JSON.stringify({
       ok: true,
-      version: "windows-contract",
+      version: "ssh-contract",
       uptimeSeconds: 1,
       capabilities: {
         artifactTransfer: true,
@@ -181,7 +218,7 @@ function writeHealthResponse(
       },
       authentication: createRemoteHealthAuthenticationProof({
         rootKey,
-        serverGeneration: "windows-contract-generation",
+        serverGeneration: "ssh-contract-generation",
         clientNonce,
       }),
     }),
@@ -208,6 +245,42 @@ function expectNativeWindowsSshArgs(calls: Array<readonly string[]>): void {
     expect(args).not.toContain("-O");
     expect(args.some((arg) => /^Control(?:Master|Path|Persist)/iu.test(arg))).toBe(false);
   }
+}
+
+function expectPosixSshArgs(calls: Array<readonly string[]>): void {
+  const controlPath = calls[0]?.[2];
+  expect(typeof controlPath).toBe("string");
+  expect(path.basename(controlPath!)).toBe("ctl");
+  expect(calls[0]).toEqual([
+    "-M",
+    "-S",
+    controlPath,
+    "-N",
+    "-o",
+    "ControlMaster=yes",
+    "-o",
+    "ControlPersist=no",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+    "synthetic-host",
+  ]);
+  expect(calls[1]).toEqual(["-S", controlPath, "-O", "check", "synthetic-host"]);
+  expect(calls[2]).toEqual([
+    "-S",
+    controlPath,
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-O",
+    "forward",
+    "-R",
+    "9473:127.0.0.1:9473",
+    "synthetic-host",
+  ]);
+  expect(calls.some((args) => args[0] === "-W" && args[1] === "127.0.0.1:9473")).toBe(true);
 }
 
 afterEach(() => {
@@ -598,14 +671,25 @@ describe("bridge host detached child transport", () => {
   });
 });
 
-describe("native Windows OpenSSH bridge tunnel contract", () => {
+describe.each([
+  {
+    name: "native Windows OpenSSH",
+    platform: "win32" as const,
+    expectSshArgs: expectNativeWindowsSshArgs,
+  },
+  {
+    name: "POSIX OpenSSH control socket",
+    platform: "linux" as const,
+    expectSshArgs: expectPosixSshArgs,
+  },
+])("$name bridge tunnel contract", ({ name, platform, expectSshArgs }) => {
   it.each([
     { name: "foreground", backgroundChild: false },
     { name: "background child", backgroundChild: true },
   ])("gates $name readiness on authenticated remote-side health", async ({ backgroundChild }) => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-bridge-ready-"));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-ssh-bridge-ready-"));
     const artifactPath = path.join(tempDir, "connection.json");
-    const oldArtifact = '{"old":"windows"}\n';
+    const oldArtifact = '{"old":"ssh"}\n';
     await fs.writeFile(artifactPath, oldArtifact);
     setOracleHomeDirOverrideForTest(tempDir);
     const healthRequested = Promise.withResolvers<void>();
@@ -615,22 +699,7 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
       void releaseHealth.promise.then(() => writeHealthResponse(req, res, MODERN_TOKEN));
     });
     const healthPort = await listenLoopback(healthServer);
-    const sshArgs: Array<readonly string[]> = [];
-    const sshChildren: FakeSshChild[] = [];
-    const tunnelSpawn = vi.fn(
-      (_command: string, args: readonly string[], _options: SpawnOptions): ChildProcess => {
-        sshArgs.push([...args]);
-        const child =
-          args[0] === "-W"
-            ? createFakeSshChild(
-                net.createConnection({ host: "127.0.0.1", port: healthPort }),
-                5001,
-              )
-            : createFakeSshChild(undefined, 5000);
-        sshChildren.push(child);
-        return child.child;
-      },
-    );
+    const harness = createFakeSshTunnelHarness(platform, healthPort);
     const readinessWrites: Buffer[] = [];
     const readinessOutput = new Writable({
       write(chunk, _encoding, callback) {
@@ -654,8 +723,8 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
               stdin: Readable.from([credentialPayload()]),
               readinessOutput,
               serveRemote,
-              tunnelPlatform: "win32",
-              tunnelSpawn,
+              tunnelPlatform: platform,
+              tunnelSpawn: harness.tunnelSpawn,
             },
           )
         : runBridgeHost(
@@ -665,10 +734,20 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
               ssh: "synthetic-host",
               writeConnection: artifactPath,
             },
-            { serveRemote, tunnelPlatform: "win32", tunnelSpawn },
+            { serveRemote, tunnelPlatform: platform, tunnelSpawn: harness.tunnelSpawn },
           );
 
-      await healthRequested.promise;
+      await Promise.race([
+        healthRequested.promise,
+        run.then(
+          () => {
+            throw new Error(`${name} tunnel published readiness without remote health`);
+          },
+          (error: unknown) => {
+            throw error;
+          },
+        ),
+      ]);
       if (backgroundChild) {
         expect(readinessWrites).toHaveLength(0);
       } else {
@@ -677,10 +756,15 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
 
       releaseHealth.resolve();
       await run;
-      expectNativeWindowsSshArgs(sshArgs);
-      expect(tunnelSpawn).toHaveBeenCalledTimes(2);
-      expect(sshChildren).toHaveLength(2);
-      for (const child of sshChildren) expect(child.kill).toHaveBeenCalledOnce();
+      expectSshArgs(harness.sshArgs);
+      expect(harness.mainChildren).toHaveLength(1);
+      expect(harness.controlChildren).toHaveLength(platform === "win32" ? 0 : 2);
+      expect(harness.probeChildren).toHaveLength(1);
+      expect(harness.sshChildren).toHaveLength(platform === "win32" ? 2 : 4);
+      for (const child of [...harness.mainChildren, ...harness.probeChildren]) {
+        expect(child.kill).toHaveBeenCalledOnce();
+      }
+      for (const child of harness.controlChildren) expect(child.kill).not.toHaveBeenCalled();
       if (backgroundChild) {
         expect(Buffer.concat(readinessWrites).toString("utf8")).toBe(
           readinessPayload(READINESS_NONCE),
@@ -693,6 +777,7 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
       expect(log.mock.calls.flat().join("\n")).not.toContain(MODERN_TOKEN);
     } finally {
       releaseHealth.resolve();
+      harness.mainChildren[0]?.exit(1);
       await closeServer(healthServer);
       await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -704,9 +789,9 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
   ])(
     "fails $name readiness when remote-side health is not authenticated",
     async ({ backgroundChild }) => {
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-bridge-fail-"));
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-ssh-bridge-fail-"));
       const artifactPath = path.join(tempDir, "connection.json");
-      const oldArtifact = '{"old":"windows"}\n';
+      const oldArtifact = '{"old":"ssh"}\n';
       await fs.writeFile(artifactPath, oldArtifact);
       setOracleHomeDirOverrideForTest(tempDir);
       const secondHealthRequest = Promise.withResolvers<void>();
@@ -717,24 +802,7 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
         if (healthRequestCount === 2) secondHealthRequest.resolve();
       });
       const healthPort = await listenLoopback(healthServer);
-      const sshArgs: Array<readonly string[]> = [];
-      const sshChildren: FakeSshChild[] = [];
-      let mainChild: FakeSshChild | undefined;
-      const tunnelSpawn = vi.fn(
-        (_command: string, args: readonly string[], _options: SpawnOptions): ChildProcess => {
-          sshArgs.push([...args]);
-          const child =
-            args[0] === "-W"
-              ? createFakeSshChild(
-                  net.createConnection({ host: "127.0.0.1", port: healthPort }),
-                  5100 + sshChildren.length,
-                )
-              : createFakeSshChild(undefined, 5099);
-          if (args[0] !== "-W") mainChild = child;
-          sshChildren.push(child);
-          return child.child;
-        },
-      );
+      const harness = createFakeSshTunnelHarness(platform, healthPort);
       const readinessWrites: Buffer[] = [];
       const readinessOutput = new Writable({
         write(chunk, _encoding, callback) {
@@ -758,8 +826,8 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
                 stdin: Readable.from([credentialPayload()]),
                 readinessOutput,
                 serveRemote,
-                tunnelPlatform: "win32",
-                tunnelSpawn,
+                tunnelPlatform: platform,
+                tunnelSpawn: harness.tunnelSpawn,
               },
             )
           : runBridgeHost(
@@ -769,24 +837,36 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
                 ssh: "synthetic-host",
                 writeConnection: artifactPath,
               },
-              { serveRemote, tunnelPlatform: "win32", tunnelSpawn },
+              { serveRemote, tunnelPlatform: platform, tunnelSpawn: harness.tunnelSpawn },
             );
         const failure = run.then(
-          () => new Error("Windows tunnel unexpectedly became ready"),
+          () => new Error(`${name} tunnel unexpectedly became ready`),
           (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
         );
 
-        await secondHealthRequest.promise;
-        expectNativeWindowsSshArgs(sshArgs);
+        await Promise.race([
+          secondHealthRequest.promise,
+          failure.then((error) => {
+            throw error;
+          }),
+        ]);
+        expectSshArgs(harness.sshArgs);
         if (backgroundChild) {
           expect(readinessWrites).toHaveLength(0);
         } else {
           expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
         }
-        mainChild?.exit(1);
+        harness.mainChildren[0]?.exit(1);
 
         expect((await failure).message).toMatch(/failed before the remote forward was ready/i);
-        for (const child of sshChildren) expect(child.kill).toHaveBeenCalledOnce();
+        expect(harness.mainChildren).toHaveLength(1);
+        expect(harness.controlChildren).toHaveLength(platform === "win32" ? 0 : 2);
+        expect(harness.probeChildren).toHaveLength(2);
+        expect(harness.sshChildren).toHaveLength(platform === "win32" ? 3 : 5);
+        for (const child of [...harness.mainChildren, ...harness.probeChildren]) {
+          expect(child.kill).toHaveBeenCalledOnce();
+        }
+        for (const child of harness.controlChildren) expect(child.kill).not.toHaveBeenCalled();
         if (backgroundChild) {
           expect(Buffer.concat(readinessWrites).toString("utf8")).toBe(
             readinessPayload(READINESS_NONCE, "failed"),
@@ -795,13 +875,15 @@ describe("native Windows OpenSSH bridge tunnel contract", () => {
           expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
         }
       } finally {
-        mainChild?.exit(1);
+        harness.mainChildren[0]?.exit(1);
         await closeServer(healthServer);
         await fs.rm(tempDir, { recursive: true, force: true });
       }
     },
   );
+});
 
+describe("native Windows OpenSSH bridge tunnel contract", () => {
   it("rejects Windows control-socket options before spawning SSH", async () => {
     const tunnelSpawn = vi.fn();
     await expect(

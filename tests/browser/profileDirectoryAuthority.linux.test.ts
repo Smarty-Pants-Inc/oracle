@@ -41,6 +41,42 @@ describe("Linux zero-birthtime profile generation marker", () => {
     }
   });
 
+  linuxTest("waits for the exact same-process first-use marker creation", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-profile-race-"));
+    const markerCreated = Promise.withResolvers<void>();
+    const finishMarker = Promise.withResolvers<void>();
+    const concurrentWait = Promise.withResolvers<void>();
+    const creator = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
+      beforeGenerationMarkerWrite: async () => {
+        markerCreated.resolve();
+        await finishMarker.promise;
+      },
+    });
+    let concurrent = creator;
+    try {
+      await markerCreated.promise;
+      await expect(
+        stat(path.join(profileDir, MARKER_FILENAME), { bigint: true }),
+      ).resolves.toMatchObject({ size: 0n });
+
+      concurrent = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
+        onGenerationMarkerCreationWait: concurrentWait.resolve,
+      });
+      await concurrentWait.promise;
+      finishMarker.resolve();
+
+      const [created, reused] = await Promise.all([creator, concurrent]);
+      expect(reused).toEqual(created);
+      await expect(readFile(path.join(profileDir, MARKER_FILENAME), "utf8")).resolves.toMatch(
+        /^oracle-profile-generation-v1:[0-9a-f]{64}\n$/u,
+      );
+    } finally {
+      finishMarker.resolve();
+      await Promise.allSettled([creator, concurrent]);
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
   linuxTest("rejects a symlinked generation marker", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-profile-marker-symlink-"));
     const profileDir = path.join(root, "profile");
@@ -73,6 +109,11 @@ describe("Linux zero-birthtime profile generation marker", () => {
       await chmod(markerPath, 0o600);
       const validContent = await readFile(markerPath, "utf8");
       await writeFile(markerPath, validContent.replace(/^oracle/u, "forged"), { mode: 0o600 });
+      await expect(
+        captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir),
+      ).rejects.toThrow(/generation marker/i);
+
+      await writeFile(markerPath, "short\n", { mode: 0o600 });
       await expect(
         captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir),
       ).rejects.toThrow(/generation marker/i);

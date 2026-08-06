@@ -257,6 +257,7 @@ const GEMINI_CDP_COOKIE_URLS = [
 
 async function loadGeminiCookiesFromCDP(
   browserConfig: BrowserRunOptions["config"],
+  sessionId: string | undefined,
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
   log?: BrowserLogger,
 ): Promise<GeminiCookieLoadResult> {
@@ -265,6 +266,7 @@ async function loadGeminiCookiesFromCDP(
     keepBrowserDefault: false,
     purpose: "Gemini manual-login cookie extraction (no keychain)",
     log,
+    ...(sessionId !== undefined ? { sessionId } : {}),
     persistRuntime,
   });
   let cookieMap: Record<string, string> = {};
@@ -325,6 +327,7 @@ async function runGeminiDeepThinkViaBrowser(
   browserConfig: BrowserRunOptions["config"],
   options: {
     showThoughts: boolean;
+    sessionId?: string;
     startedAt: number;
     persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
   },
@@ -334,6 +337,7 @@ async function runGeminiDeepThinkViaBrowser(
     browserConfig,
     keepBrowserDefault: true,
     purpose: "Gemini Deep Think",
+    ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
     log,
     ...(options.persistRuntime ? { persistRuntime: options.persistRuntime } : {}),
   });
@@ -533,6 +537,7 @@ async function loadGeminiCookies(
   log?: BrowserLogger,
   options?: {
     preferManualNoKeychain?: boolean;
+    sessionId?: string;
     persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
   },
 ): Promise<GeminiCookieLoadResult> {
@@ -546,7 +551,12 @@ async function loadGeminiCookies(
     Boolean(browserConfig?.manualLogin) || Boolean(options?.preferManualNoKeychain);
   if (manualNoKeychain) {
     log?.("[gemini-web] Using manual-login cookie extraction path (no keychain cookie read).");
-    const cdpResult = await loadGeminiCookiesFromCDP(browserConfig, options?.persistRuntime, log);
+    const cdpResult = await loadGeminiCookiesFromCDP(
+      browserConfig,
+      options?.sessionId,
+      options?.persistRuntime,
+      log,
+    );
     return {
       cookieMap: { ...cdpResult.cookieMap, ...inlineResult.cookieMap },
       warnings: [...inlineResult.warnings, ...cdpResult.warnings],
@@ -607,6 +617,7 @@ export function createGeminiWebExecutor(
           runOptions.config,
           {
             showThoughts: Boolean(geminiOptions.showThoughts),
+            ...(runOptions.sessionId !== undefined ? { sessionId: runOptions.sessionId } : {}),
             startedAt: startTime,
             persistRuntime: runOptions.runtimeHintCb,
           },
@@ -621,6 +632,7 @@ export function createGeminiWebExecutor(
         const useNoKeychainPath = Boolean(runOptions.config?.manualLogin);
         const cookieResult = await loadGeminiCookies(runOptions.config, log, {
           preferManualNoKeychain: useNoKeychainPath,
+          ...(runOptions.sessionId !== undefined ? { sessionId: runOptions.sessionId } : {}),
           ...(runOptions.runtimeHintCb ? { persistRuntime: runOptions.runtimeHintCb } : {}),
         });
         if (!hasRequiredGeminiCookies(cookieResult.cookieMap)) {
