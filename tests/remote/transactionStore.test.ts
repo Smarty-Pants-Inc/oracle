@@ -4,6 +4,7 @@ import path from "node:path";
 import * as fs from "node:fs/promises";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
+import * as directoryIdentity from "../../src/browser/filesystemLockDirectoryIdentity.js";
 import {
   REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -1938,13 +1939,14 @@ describe("RemoteTransactionStore", () => {
       const displacedPath = `${replacedPath}.displaced`;
       let replace = true;
       const windowsPrivateTreeAuthority = vi.fn(async () => {
-        if (!replace) return;
+        if (!replace) return { integrityKeyAclRepaired: false };
         replace = false;
         await fs.rename(replacedPath, displacedPath);
         await fs.mkdir(replacedPath, { recursive: true });
         if (replacedRoot === "integrity-key-directory") {
           await fs.writeFile(integrityKeyPath, Buffer.alloc(32, 0x41));
         }
+        return { integrityKeyAclRepaired: false };
       });
       try {
         await fs.mkdir(directory, { recursive: true });
@@ -1978,7 +1980,7 @@ describe("RemoteTransactionStore", () => {
 
   test("protects and verifies a Windows transaction tree once for a bounded list operation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-acl-bounded-"));
-    const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+    const windowsPrivateTreeAuthority = vi.fn(async () => ({ integrityKeyAclRepaired: false }));
     try {
       const store = await openTransactionStore({
         directory: root,
@@ -1996,6 +1998,125 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("retains Windows authority exclusion through admitted record reads and publications", async () => {
+    const directoryIdentityModule = "../../src/browser/filesystemLockDirectoryIdentity.js";
+    let observeAuthorityPrepass = false;
+    let authorityPrepassStarts = 0;
+    vi.resetModules();
+    vi.doMock(directoryIdentityModule, () => ({
+      ...directoryIdentity,
+      capturePhysicalDirectoryIdentity: async (
+        ...args: Parameters<typeof directoryIdentity.capturePhysicalDirectoryIdentity>
+      ) => {
+        if (observeAuthorityPrepass) authorityPrepassStarts += 1;
+        return await directoryIdentity.capturePhysicalDirectoryIdentity(...args);
+      },
+    }));
+    // The mocked local ESM export requires a test-isolated module reload.
+    const {
+      RemoteTransactionRecordIntegrityError: IsolatedRemoteTransactionRecordIntegrityError,
+      RemoteTransactionStore: IsolatedRemoteTransactionStore,
+    } = await import("../../src/remote/transactionStore.js");
+    try {
+      for (const activeOperation of ["read", "publication"] as const) {
+        const root = await mkdtemp(
+          path.join(os.tmpdir(), `oracle-remote-windows-authority-${activeOperation}-`),
+        );
+        const activeToken = activeOperation === "read" ? "a".repeat(64) : "b".repeat(64);
+        const competingToken = activeOperation === "read" ? "c".repeat(64) : "d".repeat(64);
+        const activeEntered = Promise.withResolvers<void>();
+        const releaseActive = Promise.withResolvers<void>();
+        let blockRead = false;
+        let blockPublication = false;
+        let active: Promise<unknown> | undefined;
+        let competingRead: Promise<unknown> | undefined;
+        const windowsPrivateTreeAuthority = vi.fn(async () => ({
+          integrityKeyAclRepaired: false,
+        }));
+        try {
+          observeAuthorityPrepass = false;
+          const store = await IsolatedRemoteTransactionStore.open({
+            directory: root,
+            integrityKeyPath: path.join(root, ".test-integrity", "record.key"),
+            platform: "win32",
+            windowsPrivateTreeAuthority,
+            beforeQuarantineUnlink: async () => {
+              if (!blockRead) return;
+              activeEntered.resolve();
+              await releaseActive.promise;
+            },
+            afterRecordPublication: async (operation, checkpoint) => {
+              if (
+                !blockPublication ||
+                operation !== "mutation" ||
+                checkpoint !== "namespace-publication"
+              ) {
+                return;
+              }
+              activeEntered.resolve();
+              await releaseActive.promise;
+            },
+          });
+          for (const [transactionToken, runId] of [
+            [activeToken, `${activeOperation}-active`],
+            [competingToken, `${activeOperation}-competing`],
+          ] as const) {
+            await store.begin({
+              protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+              transactionToken,
+              runId,
+              createdAt: new Date().toISOString(),
+              ...authority,
+            });
+          }
+          windowsPrivateTreeAuthority.mockClear();
+
+          if (activeOperation === "read") {
+            await fs.writeFile(store.recordPath(activeToken), "corrupt active record\n");
+            blockRead = true;
+            active = store.read(activeToken);
+          } else {
+            blockPublication = true;
+            active = store.journalRuntime(activeToken, runtime);
+          }
+          await activeEntered.promise;
+
+          observeAuthorityPrepass = true;
+          authorityPrepassStarts = 0;
+          competingRead = store.read(competingToken);
+          // Record-first locking reaches this mocked prepass in two microtasks; authority-first
+          // locking remains blocked on the admitted operation's exclusion gate.
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(authorityPrepassStarts).toBe(0);
+          expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+
+          releaseActive.resolve();
+          if (activeOperation === "read") {
+            await expect(active).rejects.toBeInstanceOf(
+              IsolatedRemoteTransactionRecordIntegrityError,
+            );
+          } else {
+            await expect(active).resolves.toMatchObject({ runtime });
+          }
+          await expect(competingRead).resolves.toMatchObject({ transactionToken: competingToken });
+          expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(2);
+        } finally {
+          releaseActive.resolve();
+          await Promise.allSettled(
+            [active, competingRead].filter(
+              (operation): operation is Promise<unknown> => operation !== undefined,
+            ),
+          );
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      vi.doUnmock(directoryIdentityModule);
+      vi.resetModules();
+    }
+  });
+
   test("rejects live integrity-key file replacement before read or durable mutation", async () => {
     for (const operation of ["read", "mutation"] as const) {
       const root = await mkdtemp(
@@ -2010,6 +2131,7 @@ describe("RemoteTransactionStore", () => {
         const replacement = replaceKey;
         replaceKey = undefined;
         await replacement?.();
+        return { integrityKeyAclRepaired: false };
       });
       try {
         const store = await openTestRemoteTransactionStore({
@@ -2055,6 +2177,7 @@ describe("RemoteTransactionStore", () => {
       const replacement = replaceDirectory;
       replaceDirectory = undefined;
       await replacement?.();
+      return { integrityKeyAclRepaired: false };
     });
     try {
       const store = await openTestRemoteTransactionStore({
@@ -2090,7 +2213,7 @@ describe("RemoteTransactionStore", () => {
     const directory = path.join(root, "transactions");
     const transactionToken = "6".repeat(64);
     const mutationToken = "7".repeat(64);
-    const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+    const windowsPrivateTreeAuthority = vi.fn(async () => ({ integrityKeyAclRepaired: false }));
     try {
       const store = await openTransactionStore({
         directory,

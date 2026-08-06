@@ -13,7 +13,10 @@ import {
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
-const WINDOWS_PRIVATE_TREE_ACL_MARKER = "oracle.remote-transaction.private-tree.v1";
+const WINDOWS_PRIVATE_TREE_ACL_NOT_REPAIRED_MARKER =
+  "oracle.remote-transaction.private-tree.v1:integrity-key-acl-repaired=false";
+const WINDOWS_PRIVATE_TREE_ACL_REPAIRED_MARKER =
+  "oracle.remote-transaction.private-tree.v1:integrity-key-acl-repaired=true";
 
 function buildWindowsTestPathCommandArgs(script: string, itemPaths: string[]): string[] {
   const pathExpressions = itemPaths
@@ -42,11 +45,32 @@ const commandScope = {
   integrityKeyPath: String.raw`C:\Users\Oracle\.oracle\.remote-transaction-integrity.key`,
 };
 
+function beginAclTestRecord(
+  store: RemoteTransactionStore,
+  transactionToken: string,
+  runId: string,
+): Promise<void> {
+  return store.begin({
+    protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+    transactionToken,
+    runId,
+    createdAt: new Date().toISOString(),
+    requestIdentity: {
+      acceptedPromptSha256: ["b".repeat(64)],
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+    },
+    browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+  });
+}
+
 describe("Windows remote transaction private ACL authority", () => {
   test("uses one bounded native command resolved from the OS-rooted namespace", async () => {
-    const execute = vi.fn(async () => ({ stdout: WINDOWS_PRIVATE_TREE_ACL_MARKER }));
+    const execute = vi.fn(async () => ({ stdout: WINDOWS_PRIVATE_TREE_ACL_NOT_REPAIRED_MARKER }));
 
-    await protectWindowsPrivateTreeAcl(commandScope, execute);
+    await expect(protectWindowsPrivateTreeAcl(commandScope, execute)).resolves.toEqual({
+      integrityKeyAclRepaired: false,
+    });
 
     const command = buildWindowsPrivateTreeAclCommand(commandScope);
     expect(command.file).toBe(resolveWindowsPowerShellExecutable());
@@ -60,6 +84,14 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(command.options).toEqual({ timeoutMs: 12_000 });
     expect(execute).toHaveBeenCalledOnce();
     expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
+  });
+
+  test("returns the exact integrity-key ACL repair attestation", async () => {
+    await expect(
+      protectWindowsPrivateTreeAcl(commandScope, async () => ({
+        stdout: WINDOWS_PRIVATE_TREE_ACL_REPAIRED_MARKER,
+      })),
+    ).resolves.toEqual({ integrityKeyAclRepaired: true });
   });
 
   test("encodes each configured path independently instead of appending hostile paths as PowerShell source", () => {
@@ -137,6 +169,190 @@ describe("Windows remote transaction private ACL authority", () => {
     ).rejects.toThrow("private ACL protection failed");
   });
 
+  test("rejects pre-existing key ctime drift when Windows ACL authority reports no repair", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-key-ctime-noop-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const transactionToken = "c".repeat(64);
+    const windowsPrivateTreeAuthority = vi.fn(async () => ({
+      integrityKeyAclRepaired: false,
+    }));
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await beginAclTestRecord(store, transactionToken, "windows-ctime-noop-run");
+      const keyContents = await fs.readFile(integrityKeyPath);
+      const originalRecord = await fs.readFile(store.recordPath(transactionToken));
+      const keyBeforeDrift = await fs.lstat(integrityKeyPath, { bigint: true });
+      await fs.writeFile(integrityKeyPath, keyContents);
+      const keyAfterDrift = await fs.lstat(integrityKeyPath, { bigint: true });
+      expect(keyAfterDrift.ctimeNs).not.toBe(keyBeforeDrift.ctimeNs);
+
+      windowsPrivateTreeAuthority.mockClear();
+      await expect(store.read(transactionToken)).rejects.toThrow(
+        "Remote transaction integrity key generation changed",
+      );
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
+        originalRecord,
+      );
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refreshes only key ctime after an attested Windows ACL repair", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-key-ctime-repair-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const transactionToken = "f".repeat(64);
+    let repairKey: (() => Promise<void>) | undefined;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      const repair = repairKey;
+      repairKey = undefined;
+      await repair?.();
+      return { integrityKeyAclRepaired: repair !== undefined };
+    });
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await beginAclTestRecord(store, transactionToken, "windows-ctime-repair-run");
+      const keyContents = await fs.readFile(integrityKeyPath);
+      const keyBeforeDrift = await fs.lstat(integrityKeyPath, { bigint: true });
+      await fs.writeFile(integrityKeyPath, keyContents);
+      const keyAfterDrift = await fs.lstat(integrityKeyPath, { bigint: true });
+      expect(keyAfterDrift.ctimeNs).not.toBe(keyBeforeDrift.ctimeNs);
+      repairKey = () => fs.writeFile(integrityKeyPath, keyContents);
+
+      windowsPrivateTreeAuthority.mockClear();
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      const keyAfterRepair = await fs.lstat(integrityKeyPath, { bigint: true });
+      expect(keyAfterRepair.ctimeNs).not.toBe(keyAfterDrift.ctimeNs);
+      expect([
+        keyAfterRepair.dev,
+        keyAfterRepair.ino,
+        keyAfterRepair.birthtimeNs,
+        keyAfterRepair.size,
+        keyAfterRepair.mode,
+        keyAfterRepair.nlink,
+      ]).toEqual([
+        keyBeforeDrift.dev,
+        keyBeforeDrift.ino,
+        keyBeforeDrift.birthtimeNs,
+        keyBeforeDrift.size,
+        keyBeforeDrift.mode,
+        keyBeforeDrift.nlink,
+      ]);
+      await expect(fs.readFile(integrityKeyPath)).resolves.toEqual(keyContents);
+
+      windowsPrivateTreeAuthority.mockClear();
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      const keyAfterNoopPass = await fs.lstat(integrityKeyPath, { bigint: true });
+      expect(keyAfterNoopPass.ctimeNs).toBe(keyAfterRepair.ctimeNs);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects same-size key-content replacement during Windows ACL repair", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-key-content-swap-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const transactionToken = "d".repeat(64);
+    let replaceKey: (() => Promise<void>) | undefined;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      const replacement = replaceKey;
+      replaceKey = undefined;
+      await replacement?.();
+      return { integrityKeyAclRepaired: false };
+    });
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await beginAclTestRecord(store, transactionToken, "windows-key-content-swap-run");
+      const originalKey = await fs.readFile(integrityKeyPath);
+      const originalRecord = await fs.readFile(store.recordPath(transactionToken));
+      const replacementKey = Buffer.from(originalKey);
+      replacementKey[0] = (replacementKey[0] ?? 0) ^ 0xff;
+      replaceKey = () => fs.writeFile(integrityKeyPath, replacementKey);
+
+      windowsPrivateTreeAuthority.mockClear();
+      await expect(store.read(transactionToken)).rejects.toThrow(
+        "integrity key contents changed during Windows private ACL protection",
+      );
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
+        originalRecord,
+      );
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects key-generation substitution during Windows ACL repair", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-key-generation-swap-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const displacedKeyPath = `${integrityKeyPath}.displaced`;
+    const transactionToken = "e".repeat(64);
+    let replaceKey: (() => Promise<void>) | undefined;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      const replacement = replaceKey;
+      replaceKey = undefined;
+      await replacement?.();
+      return { integrityKeyAclRepaired: false };
+    });
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await beginAclTestRecord(store, transactionToken, "windows-key-generation-swap-run");
+      const originalKey = await fs.readFile(integrityKeyPath);
+      const originalRecord = await fs.readFile(store.recordPath(transactionToken));
+      replaceKey = async () => {
+        await fs.rename(integrityKeyPath, displacedKeyPath);
+        await fs.writeFile(integrityKeyPath, originalKey);
+      };
+
+      windowsPrivateTreeAuthority.mockClear();
+      await expect(store.read(transactionToken)).rejects.toThrow(
+        "integrity key generation changed during Windows private ACL protection",
+      );
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
+        originalRecord,
+      );
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.runIf(process.platform === "win32")(
     "repairs an ACL broadened after open on the next same-instance read without mutating the key identity",
     async () => {
@@ -147,18 +363,7 @@ describe("Windows remote transaction private ACL authority", () => {
       const powershellExecutable = resolveWindowsPowerShellExecutable();
       try {
         const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
-        await store.begin({
-          protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-          transactionToken,
-          runId: "windows-acl-run",
-          createdAt: new Date().toISOString(),
-          requestIdentity: {
-            acceptedPromptSha256: ["b".repeat(64)],
-            followUpOrdinal: 0,
-            remainingFollowUps: 0,
-          },
-          browserConfig: { chatgptUrl: "https://chatgpt.com/" },
-        });
+        await beginAclTestRecord(store, transactionToken, "windows-acl-run");
         const protectedPaths = [
           root,
           directory,

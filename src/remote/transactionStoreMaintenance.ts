@@ -460,26 +460,30 @@ export class RemoteTransactionStoreMaintenance {
   }
 
   private async withMaintenanceLock<T>(operation: () => Promise<T>): Promise<T> {
-    const prior = this.#maintenanceLock;
-    const gate = Promise.withResolvers<void>();
-    this.#maintenanceLock = prior.then(() => gate.promise);
-    await prior;
-    try {
-      return await this.#options.withWindowsPrivateTreeAuthority(operation);
-    } finally {
-      gate.resolve();
-    }
+    return await this.#options.withWindowsPrivateTreeAuthority(async () => {
+      const prior = this.#maintenanceLock;
+      const gate = Promise.withResolvers<void>();
+      this.#maintenanceLock = prior.then(() => gate.promise);
+      await prior;
+      try {
+        return await operation();
+      } finally {
+        gate.resolve();
+      }
+    });
   }
 
   private async withQuarantineMaintenanceLock<T>(operation: () => Promise<T>): Promise<T> {
-    const prior = this.#quarantineMaintenanceLock;
-    const gate = Promise.withResolvers<void>();
-    this.#quarantineMaintenanceLock = prior.then(() => gate.promise);
-    await prior;
-    try {
-      return await this.#options.withWindowsPrivateTreeAuthority(operation);
-    } finally {
-      gate.resolve();
-    }
+    return await this.#options.withWindowsPrivateTreeAuthority(async () => {
+      const prior = this.#quarantineMaintenanceLock;
+      const gate = Promise.withResolvers<void>();
+      this.#quarantineMaintenanceLock = prior.then(() => gate.promise);
+      await prior;
+      try {
+        return await operation();
+      } finally {
+        gate.resolve();
+      }
+    });
   }
 }

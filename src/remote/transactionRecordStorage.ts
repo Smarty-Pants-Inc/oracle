@@ -103,7 +103,7 @@ export async function loadRemoteTransactionIntegrityKey(
     throw new Error("Remote transaction integrity key directory generation changed before key use");
   }
   try {
-    return await readRemoteTransactionIntegrityKey(
+    return await readStableRemoteTransactionIntegrityKey(
       integrityKeyPath,
       directory,
       directoryIdentity,
@@ -130,7 +130,7 @@ export async function loadRemoteTransactionIntegrityKey(
     handle = await open(integrityKeyPath, "wx", 0o600);
   } catch (error) {
     if (readErrorCode(error) !== "EEXIST") throw error;
-    return await readRemoteTransactionIntegrityKey(
+    return await readStableRemoteTransactionIntegrityKey(
       integrityKeyPath,
       directory,
       directoryIdentity,
@@ -154,7 +154,7 @@ export async function loadRemoteTransactionIntegrityKey(
     );
   }
   await syncDirectory(directory);
-  return await readRemoteTransactionIntegrityKey(
+  return await readStableRemoteTransactionIntegrityKey(
     integrityKeyPath,
     directory,
     directoryIdentity,
@@ -474,7 +474,7 @@ export function readErrorCode(error: unknown): string | undefined {
   return typeof error.code === "string" ? error.code : undefined;
 }
 
-async function readRemoteTransactionIntegrityKey(
+export async function readStableRemoteTransactionIntegrityKey(
   integrityKeyPath: string,
   directory: string,
   directoryIdentity: PhysicalDirectoryIdentity,
