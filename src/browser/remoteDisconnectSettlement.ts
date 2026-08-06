@@ -28,6 +28,7 @@ import {
   appendPostCaptureWarning,
   projectRuntimeAfterChromeTargetLoss,
 } from "./publicationSettlementCoordinator.js";
+import { capturedResultRunStatus } from "./capturedResultPublicationCoordinator.js";
 import { closeRemoteConnectionAfterRun } from "./promptSubmissionCoordinator.js";
 import type { BrowserCaptureFinalizationResult, BrowserRunTransaction } from "./types.js";
 import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
@@ -334,7 +335,7 @@ export async function finalizeRemoteBrowserRun(
         connectionClosedUnexpectedly: context.connectionClosedUnexpectedly,
         connection: context.connection,
         client: context.client,
-        runStatus: context.runStatus,
+        runStatus: capturedResultRunStatus(context),
       });
     }
   } catch {

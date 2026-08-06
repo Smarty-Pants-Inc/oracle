@@ -22,6 +22,7 @@ import {
   type RecoveredConversationCleanup,
 } from "../browser/recoverConversation.js";
 import {
+  findRemoteRecoveryAuthority,
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
 } from "../browser/reattachability.js";
@@ -247,6 +248,22 @@ function requireHarvestPromptEpoch(meta: SessionMetadata): CommittedPromptEpochL
   return locator;
 }
 
+function rejectRemoteTransactionBrowserProbe(meta: SessionMetadata, sessionId: string): void {
+  const runtime = meta.browser?.runtime;
+  const authority = runtime && findRemoteRecoveryAuthority(runtime);
+  if (!authority) return;
+  const safeCommand = `oracle session ${JSON.stringify(sessionId)} --remote-host ${JSON.stringify(authority.host)} --remote-token <64-lowercase-hex>`;
+  throw new BrowserAutomationError(
+    `This session has persisted remote transaction authority; --live/--harvest cannot safely probe local Chrome. Resume and publish it with: ${safeCommand}`,
+    {
+      stage: "remote-session-recovery",
+      code: "remote-browser-tab-probe-rejected",
+      recoverableDisconnect: true,
+      runtime: meta.browser?.runtime,
+    },
+  );
+}
+
 function assertHarvestMatchesPromptEpoch(
   harvested: ChatGptTabSummary,
   locator: CommittedPromptEpochLocator,
@@ -404,6 +421,7 @@ export async function harvestSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
+  rejectRemoteTransactionBrowserProbe(meta, sessionId);
   const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   const remoteRecoveryEndpoint = meta.browser?.config?.remoteChrome ? recordedEndpoint : null;
@@ -482,6 +500,7 @@ export async function liveTailSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
+  rejectRemoteTransactionBrowserProbe(meta, sessionId);
   const promptLocator = requireHarvestPromptEpoch(meta);
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   const remoteRecoveryEndpoint = meta.browser?.config?.remoteChrome ? recordedEndpoint : null;

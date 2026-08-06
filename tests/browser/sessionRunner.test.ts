@@ -105,6 +105,67 @@ describe("runBrowserSessionExecution", () => {
     expect(log).toHaveBeenCalled();
   });
 
+  test("awaits local pre-archive durability before returning the browser transaction", async () => {
+    const durableWrite = Promise.withResolvers<void>();
+    const callbackStarted = Promise.withResolvers<void>();
+    let browserExecutionReturned = false;
+    const executeBrowser = vi.fn(async (options) => {
+      const transaction = browserTransaction(
+        {
+          answerText: "exact local answer",
+          answerMarkdown: "exact local answer",
+          tookMs: 500,
+          answerTokens: 4,
+          answerChars: 18,
+        },
+        { conversationId: "conversation-1" },
+      );
+      await options.preArchiveCaptureCb?.(transaction, transaction.runtime);
+      browserExecutionReturned = true;
+      return transaction;
+    });
+    const run = runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+        persistPreArchiveCapture: async ({ result, runtime, usage }) => {
+          expect(result.answerMarkdown).toBe("exact local answer");
+          expect(runtime).toEqual({ conversationId: "conversation-1" });
+          expect(usage).toEqual({
+            inputTokens: 42,
+            outputTokens: 4,
+            reasoningTokens: 0,
+            totalTokens: 46,
+          });
+          callbackStarted.resolve();
+          await durableWrite.promise;
+        },
+      },
+    );
+
+    await callbackStarted.promise;
+    expect(browserExecutionReturned).toBe(false);
+    durableWrite.resolve();
+    await expect(run).resolves.toMatchObject({ answerText: "exact local answer" });
+    expect(browserExecutionReturned).toBe(true);
+  });
+
   test("passes browser resume conversation URL to executeBrowser", async () => {
     const executeBrowser = vi.fn(async () =>
       browserTransaction({

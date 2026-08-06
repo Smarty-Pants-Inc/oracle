@@ -79,6 +79,7 @@ import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/br
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
 import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
 import { getCliVersion } from "../../src/version.ts";
+import { createRemoteRecoveryConfigResolver } from "../../src/remote/remoteServiceConfig.ts";
 
 const log = vi.fn();
 const write = vi.fn(() => true);
@@ -291,6 +292,101 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("retains one-off remote credentials across automatic transaction recovery", async () => {
+    const remoteToken = "d".repeat(64);
+    const remoteRecovery = {
+      protocolVersion: 3 as const,
+      host: "127.0.0.1:9443",
+      transactionToken: "e".repeat(64),
+      state: "pre-receipt" as const,
+      requestIdentity: {
+        acceptedPromptSha256: [committedDemoAuthority.promptEpoch.promptSha256],
+        followUpOrdinal: 0,
+        remainingFollowUps: 0 as const,
+      },
+    };
+    const disconnectedRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          remoteRecovery,
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+        },
+      ],
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Remote browser response disconnected before publication.", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        disconnectCause: "remote-transport-disconnect",
+        runtime: disconnectedRuntime,
+      }),
+    );
+    const recoveredRuntime = {
+      ...committedDemoAuthority,
+      recoveryCleanupResources: [
+        {
+          conversationId: committedDemoAuthority.conversationId,
+          promptEpoch: committedDemoAuthority.promptEpoch,
+          remoteRecovery: { ...remoteRecovery, state: "pending" as const },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none" as const, keepBrowser: false },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" as const },
+    } satisfies BrowserRuntimeMetadata;
+    const reattach = createReattachResult(
+      "recovered remote answer",
+      "recovered **remote** answer",
+      recoveredRuntime,
+    );
+    const resolveCredentials = vi.fn(async () => ({
+      host: remoteRecovery.host,
+      token: remoteToken,
+    }));
+    const resolveRemoteRecoveryConfig = createRemoteRecoveryConfigResolver(resolveCredentials);
+    vi.mocked(resumeBrowserSession).mockImplementationOnce(
+      async (_runtime, _config, _logger, deps) => {
+        if (deps === undefined || deps.recoveryCleanup === undefined) {
+          throw new Error("Reattach recovery must provide cleanup dependencies.");
+        }
+        const { resolveRemoteRecoveryConfig } = deps.recoveryCleanup;
+        if (resolveRemoteRecoveryConfig === undefined) {
+          throw new Error("Reattach recovery must provide a remote recovery config resolver.");
+        }
+        await expect(resolveRemoteRecoveryConfig()).resolves.toEqual({
+          host: remoteRecovery.host,
+          token: remoteToken,
+        });
+        await expect(resolveRemoteRecoveryConfig()).resolves.toEqual({
+          host: remoteRecovery.host,
+          token: remoteToken,
+        });
+        return reattach.value;
+      },
+    );
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      browserDeps: { resolveRemoteRecoveryConfig },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(resolveCredentials).toHaveBeenCalledOnce();
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledOnce();
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(
+        ([, updates]) => updates.status === "completed",
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(sessionStoreMock.updateSession.mock.calls)).not.toContain(remoteToken);
+    expect(log.mock.calls.flat().join("\n")).not.toContain(remoteToken);
+  });
+
   test("auto-reattaches after connection loss and marks session completed", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",
@@ -397,7 +493,13 @@ describe("performSessionRun", () => {
 
     expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]).toEqual(
-      expect.objectContaining({ sessionId: baseSessionMeta.id }),
+      expect.objectContaining({
+        sessionId: baseSessionMeta.id,
+        pendingPromptCandidates: [
+          baseRunOptions.prompt,
+          ...(baseRunOptions.browserFollowUps ?? []),
+        ],
+      }),
     );
     expect(vi.mocked(ensureSessionArtifacts)).toHaveBeenCalledWith(
       expect.objectContaining({

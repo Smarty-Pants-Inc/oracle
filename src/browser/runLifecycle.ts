@@ -213,11 +213,7 @@ export class BrowserRunLifecycleController {
   }
 
   async resetPrompt(): Promise<void> {
-    if (
-      this.state.kind !== "ready" &&
-      this.state.kind !== "dispatching" &&
-      this.state.kind !== "capturing"
-    ) {
+    if (this.state.kind !== "ready" && this.state.kind !== "capturing") {
       throw this.illegalTransition("reset prompt authority");
     }
     const previousState = this.state;
@@ -244,6 +240,50 @@ export class BrowserRunLifecycleController {
       }
       throw persistenceFailure;
     }
+  }
+
+  restorePendingPromptDispatch(
+    prompt: string,
+    base = this.adapters.getRuntime(),
+  ): PromptEpochIdentity {
+    if (this.state.kind !== "acquiring") {
+      throw this.illegalTransition("restore pending prompt dispatch");
+    }
+    const epoch = base.promptEpoch;
+    if (
+      epoch?.status !== "pending" ||
+      typeof epoch.epochId !== "string" ||
+      !epoch.epochId.trim() ||
+      !/^[a-f0-9]{64}$/.test(epoch.promptSha256) ||
+      promptIdentitySha256(prompt) !== epoch.promptSha256 ||
+      !Number.isInteger(epoch.baselineTurns) ||
+      epoch.baselineTurns < 0 ||
+      !Number.isInteger(epoch.followUpOrdinal) ||
+      epoch.followUpOrdinal < 0 ||
+      !Number.isInteger(epoch.remainingFollowUps) ||
+      epoch.remainingFollowUps < 0
+    ) {
+      throw new BrowserAutomationError(
+        "Persisted pending prompt authority does not match the recovered session prompt.",
+        {
+          stage: "prompt-epoch",
+          code: "pending-prompt-authority-mismatch",
+          runtime: base,
+        },
+      );
+    }
+    this.state = {
+      kind: "dispatching",
+      dispatch: {
+        epochId: epoch.epochId,
+        prompt,
+        promptSha256: epoch.promptSha256,
+        baselineTurns: epoch.baselineTurns,
+        followUpOrdinal: epoch.followUpOrdinal,
+        remainingFollowUps: epoch.remainingFollowUps,
+      },
+    };
+    return { epochId: epoch.epochId, promptSha256: epoch.promptSha256 };
   }
 
   async beginPromptDispatch(
@@ -378,6 +418,14 @@ export class BrowserRunLifecycleController {
 
   async settleIfUnpublished(): Promise<BrowserCaptureFinalizationResult | null> {
     if (this.state.kind === "published") return null;
+    if (this.state.kind === "dispatching") {
+      return {
+        status: "pending",
+        runtime: this.runtime(this.adapters.getRuntime()),
+        error:
+          "Pending prompt dispatch must be reconciled before browser resources can be aborted.",
+      };
+    }
     const settlement = new OwnedBrowserResourceTransaction(
       this.adapters,
       this.runtime(this.adapters.getRuntime()),

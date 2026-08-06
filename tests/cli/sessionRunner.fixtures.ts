@@ -12,6 +12,7 @@ export const baseSessionMeta: SessionMetadata = {
 export const baseRunOptions = {
   prompt: "Hello",
   model: "gpt-5.2-pro" as const,
+  browserFollowUps: [],
 };
 
 export const committedDemoAuthority = {

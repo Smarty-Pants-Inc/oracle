@@ -40,6 +40,7 @@ import {
 } from "./browserRuntimeAuthority.js";
 import { formatError } from "./errorUtils.js";
 import { persistBrowserSessionOutcome } from "./browserSessionOutcome.js";
+import type { RemoteRecoveryConfigResolver } from "../remote/remoteServiceConfig.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? chalk.dim(text) : text);
@@ -50,6 +51,10 @@ const DEEP_RESEARCH_TOOL_CALL_MARKERS = [
   "użyto narzędzia",
   "narzędzie wywołane",
 ];
+
+export interface BrowserAttachAuthorityOptions {
+  resolveRemoteRecoveryConfig?: RemoteRecoveryConfigResolver;
+}
 
 export function isDeepResearchPlaceholderCapture(
   metadata: SessionMetadata,
@@ -70,6 +75,7 @@ export function isDeepResearchPlaceholderCapture(
 export async function orchestrateBrowserAttachAuthority(
   sessionId: string,
   initialMetadata: SessionMetadata,
+  options: BrowserAttachAuthorityOptions = {},
 ): Promise<SessionMetadata> {
   let metadata = initialMetadata;
   const publication = await BrowserPublicationTransaction.open(sessionId);
@@ -135,6 +141,7 @@ export async function orchestrateBrowserAttachAuthority(
           metadata,
           publication,
           durableAnswer.answer,
+          options,
         );
       } catch (error) {
         console.log(
@@ -271,7 +278,10 @@ export async function orchestrateBrowserAttachAuthority(
         {
           ownerId: sessionId,
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
-          recoveryCleanup: { retainChromeEndpointAuthority },
+          recoveryCleanup: {
+            retainChromeEndpointAuthority,
+            resolveRemoteRecoveryConfig: options.resolveRemoteRecoveryConfig,
+          },
           isRemotePublicationAcknowledged: () =>
             completedCleanupAcknowledged && cleanupRetryMode === "finalize",
           loadRuntimeUnderLock: async () => {
@@ -403,6 +413,8 @@ export async function orchestrateBrowserAttachAuthority(
         recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
         acquireRecoveryLock: publication.acquireRecoveryLock,
         isRemotePublicationAcknowledged: publication.isRemotePublicationAcknowledged,
+        recoveryCleanup: { resolveRemoteRecoveryConfig: options.resolveRemoteRecoveryConfig },
+        pendingPromptCandidates: await readStoredPromptCandidates(sessionId),
         runtimeHintCb: async (latestRuntime) => {
           authoritativeRuntime = runtimeAuthority.observeHint(latestRuntime);
           if (!publication.hasJournal) {
@@ -574,6 +586,7 @@ async function recoverDurableBrowserPublication(
   metadata: SessionMetadata,
   publication: BrowserPublicationTransaction,
   answer: string,
+  options: BrowserAttachAuthorityOptions,
 ): Promise<SessionMetadata> {
   console.log(chalk.yellow("Recovering a durable browser answer publication..."));
   const journal = publication.journal;
@@ -581,7 +594,26 @@ async function recoverDurableBrowserPublication(
   const browser = metadata.browser ?? journal.browserAudit;
   const transaction = publication.createPersistedRecoveryTransaction(browser, browserLogger(), {
     acquireRecoveryLock: acquireReattachRecoveryLock,
-    settleRecoveryCleanup: settleBrowserRecoveryCleanup,
+    settleRecoveryCleanup: (runtime, logger, deps, mode) => {
+      if (deps === undefined) {
+        throw new Error("Persisted browser recovery requires settlement dependencies.");
+      }
+      if (deps.recoveryCleanup === undefined) {
+        throw new Error("Persisted browser recovery requires cleanup dependencies.");
+      }
+      return settleBrowserRecoveryCleanup(
+        runtime,
+        logger,
+        {
+          ...deps,
+          recoveryCleanup: {
+            ...deps.recoveryCleanup,
+            resolveRemoteRecoveryConfig: options.resolveRemoteRecoveryConfig,
+          },
+        },
+        mode,
+      );
+    },
   });
   const outputTokens = estimateTokenCount(answer);
   const publishedCapture = await publishCompletedBrowserCapture({
@@ -752,6 +784,14 @@ function readBooleanErrorDetail(metadata: SessionMetadata, key: string): boolean
   const details = metadata.error?.details;
   if (!details || typeof details !== "object" || !(key in details)) return undefined;
   return typeof details[key] === "boolean" ? details[key] : undefined;
+}
+
+async function readStoredPromptCandidates(sessionId: string): Promise<string[]> {
+  const request = await sessionStore.readRequest(sessionId);
+  const options = request ?? (await sessionStore.readSession(sessionId))?.options;
+  return [options?.prompt, ...(options?.browserFollowUps ?? [])].filter(
+    (prompt): prompt is string => typeof prompt === "string" && prompt.trim().length > 0,
+  );
 }
 
 async function readStoredPrompt(sessionId: string): Promise<string | null> {

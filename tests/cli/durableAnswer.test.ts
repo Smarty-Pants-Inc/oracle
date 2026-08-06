@@ -92,6 +92,37 @@ describe("persistDurableBrowserAnswer", () => {
     );
   });
 
+  test("journals and fsyncs the exact answer before pre-archive preparation resolves", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-prearchive-answer-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    vi.spyOn(sessionStore, "readSession").mockResolvedValue(null);
+    const publication = new BrowserPublicationTransaction();
+    const answer = "exact local pre-archive answer";
+
+    const receipt = await publication.prepareDurableCapture({
+      answer: { sessionId: "session-1", answer },
+      runtime: { conversationId: "conversation-1" },
+      browser: { config: {}, runtime: { conversationId: "conversation-1" } },
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      response: { status: "completed" },
+      elapsedMs: 250,
+    });
+
+    expect(await readDurableBrowserAnswer(receipt)).toBe(answer);
+    expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
+      phase: "preparing",
+      receipt,
+      runtime: { conversationId: "conversation-1" },
+    });
+    expect(publication.isRemotePublicationAcknowledged()).toBe(true);
+  });
+
   test("fsyncs an existing matching answer and its parent before returning its receipt", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-durable-answer-"));
     tempDirectories.push(directory);

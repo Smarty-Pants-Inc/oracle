@@ -11,11 +11,14 @@ export async function persistPreArchiveCapture(
   try {
     await callback(structuredClone(result), runtime);
   } catch (cause) {
+    const durableFailure = cause instanceof BrowserAutomationError ? cause.details : undefined;
     throw new BrowserAutomationError(
       "The exact captured answer could not be persisted before conversation archive.",
       {
         stage: "pre-archive-capture-persistence",
         code: "pre-archive-capture-persistence-failed",
+        ...(durableFailure?.runtime ? { runtime: durableFailure.runtime } : {}),
+        ...(durableFailure?.answerReceipt ? { answerReceipt: durableFailure.answerReceipt } : {}),
       },
       cause,
     );

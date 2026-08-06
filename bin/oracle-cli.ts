@@ -69,7 +69,10 @@ import { warnIfOversizeBundle } from "../src/cli/bundleWarnings.js";
 import { formatRenderedMarkdown } from "../src/cli/renderOutput.js";
 import { resolveRenderFlag, resolveRenderPlain } from "../src/cli/renderFlags.js";
 import { resolveGeminiModelId } from "../src/oracle/geminiModels.js";
-import type { StatusOptions } from "../src/cli/sessionCommand.js";
+import {
+  createSessionRemoteRecoveryResolver,
+  type StatusOptions,
+} from "../src/cli/sessionCommand.js";
 import { isErrorLogged } from "../src/cli/errorUtils.js";
 import { resolveOutputPath } from "../src/cli/writeOutputPath.js";
 import { getCliVersion } from "../src/version.js";
@@ -82,6 +85,7 @@ import { loadUserConfig, type UserConfig } from "../src/config.js";
 import { shouldBlockDuplicatePrompt } from "../src/cli/duplicatePromptGuard.js";
 import {
   assertLoopbackRemoteBind,
+  createRemoteRecoveryConfigResolver,
   resolveRemoteServiceConfig,
   validateResolvedRemoteServiceConfig,
 } from "../src/remote/remoteServiceConfig.js";
@@ -1349,6 +1353,11 @@ program
     "--no-recover",
     "Do not relaunch Chrome to reopen the saved conversation URL when --harvest/--live finds no live tab.",
   )
+  .option(
+    "--remote-host <host:port>",
+    "Remote browser service that owns the persisted transaction.",
+  )
+  .option("--remote-token <token>", "Use-scoped v3 HMAC root key for remote recovery.")
   .addOption(new Option("--clean", "Deprecated alias for --clear.").default(false).hideHelp())
   .action(async (sessionId, _options: StatusOptions, cmd: Command) => {
     const { handleSessionCommand } = await import("../src/cli/sessionCommand.js");
@@ -1368,6 +1377,11 @@ program
   .option("--render-markdown", "Alias for --render.", false)
   .option("--model <name>", "Filter sessions/output for a specific model.", "")
   .option("--hide-prompt", "Hide stored prompt when displaying a session.", false)
+  .option(
+    "--remote-host <host:port>",
+    "Remote browser service that owns the persisted transaction.",
+  )
+  .option("--remote-token <token>", "Use-scoped v3 HMAC root key for remote recovery.")
   .option(
     "--browser-tabs",
     "List live ChatGPT browser tabs and known Oracle session linkage.",
@@ -1422,7 +1436,11 @@ program
         statusOptions.render || statusOptions.renderMarkdown || autoRender,
       );
       const { attachSession } = await import("../src/cli/sessionDisplay.js");
-      await attachSession(sessionId, { renderMarkdown, renderPrompt: !statusOptions.hidePrompt });
+      await attachSession(sessionId, {
+        renderMarkdown,
+        renderPrompt: !statusOptions.hidePrompt,
+        resolveRemoteRecoveryConfig: createSessionRemoteRecoveryResolver(statusOptions),
+      });
       return;
     }
     const showExamples = usesDefaultStatusFilters(command);
@@ -1859,6 +1877,15 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     return;
   }
   const userConfig = (await loadUserConfig()).config;
+  const resolveRemoteRecoveryConfig = createRemoteRecoveryConfigResolver(() => {
+    const resolved = resolveRemoteServiceConfig({
+      cliHost: options.remoteHost,
+      cliToken: options.remoteToken,
+      userConfig,
+      env: process.env,
+    });
+    return { host: resolved.host, token: resolved.token };
+  });
   const helpRequested = rawCliArgs.some((arg: string) => arg === "--help" || arg === "-h");
   const multiModelProvided = Array.isArray(options.models) && options.models.length > 0;
   const optionUsesDefault = (name: string): boolean => {
@@ -1941,7 +1968,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   if (options.status) {
     const { attachSession, showStatus } = await import("../src/cli/sessionDisplay.js");
     if (options.session) {
-      await attachSession(options.session);
+      await attachSession(options.session, { resolveRemoteRecoveryConfig });
     } else {
       await showStatus({ hours: 24, includeAll: false, limit: 100, showExamples: true });
     }
@@ -1950,7 +1977,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
 
   if (options.session) {
     const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(options.session);
+    await attachSession(options.session, { resolveRemoteRecoveryConfig });
     return;
   }
   if (!multiModelProvided && optionUsesDefault("model") && userConfig.model) {
@@ -2419,6 +2446,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
     validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
+      resolveRemoteRecoveryConfig,
       executeBrowser: createRemoteBrowserExecutor({
         host: remoteHost,
         token: remoteToken,
@@ -2811,6 +2839,10 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   const remoteLegacyToken = engine === "browser" ? remoteConfig.legacyToken : undefined;
   const allowLegacyTextProtocol =
     engine === "browser" ? remoteConfig.allowLegacyTextProtocol : false;
+  const resolveRemoteRecoveryConfig = createRemoteRecoveryConfigResolver(() => ({
+    host: remoteHost,
+    token: remoteToken,
+  }));
   if (options.remoteHost?.trim() && engine !== "browser") {
     throw new Error("--remote-host requires a browser session.");
   }
@@ -2827,6 +2859,7 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
     validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
+      resolveRemoteRecoveryConfig,
       executeBrowser: createRemoteBrowserExecutor({
         host: remoteHost,
         token: remoteToken,

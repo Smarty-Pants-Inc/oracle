@@ -1,9 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   accessSync,
   constants,
   mkdirSync,
   mkdtempSync,
+  lstatSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -11,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { createInterface } from "node:readline";
 const repoRoot = process.cwd();
 const tmpRoot = mkdtempSync(join(tmpdir(), "oracle-packed-cli-"));
 const npmUserConfigPath = join(tmpRoot, "user-npmrc");
@@ -175,6 +177,140 @@ async function smokeMcp(command, args, label, cwd) {
   }
 }
 
+function assertWorkerMessage(message, type, token) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    throw new Error(`packed removal worker emitted a non-object ${type} message`);
+  }
+  if (message.type !== type || message.token !== token) {
+    throw new Error(`packed removal worker emitted an invalid ${type} message`);
+  }
+  const expectedKeys =
+    type === "attested" ? "generationIdentity,rootIdentity,token,type" : "token,type";
+  if (Object.keys(message).sort().join(",") !== expectedKeys) {
+    throw new Error(`packed removal worker emitted an invalid ${type} message`);
+  }
+  if (type === "attested") {
+    for (const identity of [message.rootIdentity, message.generationIdentity]) {
+      if (
+        !identity ||
+        typeof identity !== "object" ||
+        Array.isArray(identity) ||
+        Object.keys(identity).sort().join(",") !== "birthtimeNs,device,inode" ||
+        !Object.values(identity).every((value) => typeof value === "string" && value.length > 0)
+      ) {
+        throw new Error("packed removal worker emitted an invalid root attestation");
+      }
+    }
+  }
+}
+
+function physicalDirectoryIdentity(directoryPath) {
+  const stats = lstatSync(directoryPath, { bigint: true });
+  return {
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    birthtimeNs: stats.birthtimeNs.toString(),
+  };
+}
+
+function samePhysicalDirectoryIdentity(left, right) {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.birthtimeNs === right.birthtimeNs
+  );
+}
+
+async function readWorkerMessage(iterator, label) {
+  let timeout;
+  try {
+    const next = await Promise.race([
+      iterator.next(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out`)), 5_000);
+      }),
+    ]);
+    if (next.done || typeof next.value !== "string") {
+      throw new Error(`${label} closed stdout before completing its protocol`);
+    }
+    try {
+      return JSON.parse(next.value);
+    } catch {
+      throw new Error(`${label} emitted malformed protocol JSON`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function smokePackedRemovalWorker(packageDir) {
+  const workerPath = join(
+    packageDir,
+    "dist",
+    "src",
+    "browser",
+    "filesystemLockDirectoryRemovalWorker.js",
+  );
+  accessSync(workerPath, constants.R_OK);
+
+  const rootPath = mkdtempSync(join(tmpRoot, "removal-worker-"));
+  mkdirSync(join(rootPath, "generation"));
+  writeFileSync(join(rootPath, "generation", "payload"), "remove me");
+  const rootIdentity = physicalDirectoryIdentity(rootPath);
+  const generationIdentity = physicalDirectoryIdentity(join(rootPath, "generation"));
+  const token = randomUUID();
+  const worker = spawn(process.execPath, [workerPath, token], {
+    cwd: rootPath,
+    env: {
+      ...npmEnvironment,
+      ELECTRON_RUN_AS_NODE: "1",
+      NODE_OPTIONS: "",
+      NODE_PATH: "",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  if (!worker.stdin || !worker.stdout || !worker.stderr) {
+    throw new Error("packed removal worker has unavailable stdio");
+  }
+  worker.stdin.on("error", () => undefined);
+  let stderr = "";
+  worker.stderr.setEncoding("utf8");
+  worker.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const lines = createInterface({ input: worker.stdout, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  const exited = waitForExit(worker, "packed removal worker");
+
+  try {
+    const attestation = await readWorkerMessage(iterator, "packed removal worker attestation");
+    assertWorkerMessage(attestation, "attested", token);
+    if (
+      !samePhysicalDirectoryIdentity(attestation.rootIdentity, rootIdentity) ||
+      !samePhysicalDirectoryIdentity(attestation.generationIdentity, generationIdentity)
+    ) {
+      throw new Error("packed removal worker attested a different filesystem generation");
+    }
+    worker.stdin.end(`${JSON.stringify({ type: "go", token })}\n`);
+    const completion = await readWorkerMessage(iterator, "packed removal worker completion");
+    assertWorkerMessage(completion, "completed", token);
+    const { code, signal } = await exited;
+    if (code !== 0 || signal) {
+      throw new Error(
+        `packed removal worker did not terminate cleanly (${code ?? signal})${stderr ? `:\n${stderr}` : ""}`,
+      );
+    }
+    if (readdirSync(rootPath).length !== 0) {
+      throw new Error("packed removal worker completed without removing its bound generation");
+    }
+  } finally {
+    lines.close();
+    if (worker.exitCode === null && worker.signalCode === null) worker.kill();
+    await exited.catch(() => undefined);
+  }
+}
+
 try {
   run("pnpm", ["--config.ignore-scripts=true", "pack", "--pack-destination", tmpRoot]);
   const tarball = readdirSync(tmpRoot).find((entry) => entry.endsWith(".tgz"));
@@ -214,8 +350,9 @@ try {
     }
   }
   await smokeMcp(oracleMcpBin, [], "packed oracle-mcp bin shim", installDir);
+  await smokePackedRemovalWorker(packageDir);
   await smokeMcp(oracleBin, ["oracle-mcp"], "packed oracle default-bin alias", installDir);
-  console.log("Packed CLI help and MCP dispatch smoke: ok");
+  console.log("Packed CLI, MCP dispatch, and removal-worker protocol smoke: ok");
 } finally {
   rmSync(tmpRoot, { recursive: true, force: true });
 }

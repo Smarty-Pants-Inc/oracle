@@ -28,6 +28,12 @@ function createCommandWithOptions(options: StatusOptions): Command {
   if (options.browserTab !== undefined) {
     command.setOptionValueWithSource("browserTab", options.browserTab, "cli");
   }
+  if (options.remoteHost !== undefined) {
+    command.setOptionValueWithSource("remoteHost", options.remoteHost, "cli");
+  }
+  if (options.remoteToken !== undefined) {
+    command.setOptionValueWithSource("remoteToken", options.remoteToken, "cli");
+  }
   return command;
 }
 
@@ -40,6 +46,9 @@ function createDeps() {
     usesDefaultStatusFilters: vi.fn(),
     deleteSessionsOlderThan: vi.fn(),
     getSessionPaths: vi.fn(),
+    resolveRemoteRecoveryConfig: vi.fn(
+      async (overrides: { host?: string; token?: string }) => overrides,
+    ),
   };
 }
 
@@ -70,6 +79,33 @@ describe("handleSessionCommand", () => {
       "abc",
       expect.objectContaining({ renderMarkdown: false }),
     );
+  });
+
+  test("retains one-off remote recovery credentials in a memoized attach resolver", async () => {
+    const remoteToken = "a".repeat(64);
+    const command = createCommandWithOptions({
+      hours: 24,
+      limit: 10,
+      all: false,
+      remoteHost: "127.0.0.1:9443",
+      remoteToken,
+    });
+    const deps = createDeps();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await handleSessionCommand("abc", command, deps);
+
+    const attachOptions = deps.attachSession.mock.calls[0]?.[1];
+    await expect(attachOptions?.resolveRemoteRecoveryConfig?.()).resolves.toEqual({
+      host: "127.0.0.1:9443",
+      token: remoteToken,
+    });
+    await expect(attachOptions?.resolveRemoteRecoveryConfig?.()).resolves.toEqual({
+      host: "127.0.0.1:9443",
+      token: remoteToken,
+    });
+    expect(deps.resolveRemoteRecoveryConfig).toHaveBeenCalledOnce();
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain(remoteToken);
   });
 
   test("ignores unrelated root-only flags and logs a note when attaching by id", async () => {

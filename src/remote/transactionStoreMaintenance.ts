@@ -49,6 +49,7 @@ type RemoteTransactionStoreMaintenanceOptions = {
     targetPath: string,
     transactionToken: string,
   ) => Promise<AuthenticatedRemoteTransactionRecord>;
+  retireAuthenticatedRecord: (transactionToken: string) => Promise<void>;
   recordPath: (transactionToken: string) => string;
 };
 
@@ -400,6 +401,7 @@ export class RemoteTransactionStoreMaintenance {
         }
         if (!cleaned) continue;
       }
+      await this.#options.retireAuthenticatedRecord(match[1]);
       await this.#options.assertIntegrityAuthority();
       await rm(targetPath, { force: true });
       removed = true;

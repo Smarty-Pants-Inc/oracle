@@ -6,10 +6,15 @@ import { resolveRemoteServiceConfig } from "../remote/remoteServiceConfig.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
+  clearPromptComposer,
   waitForResumedConversationHydration,
   verifyCommittedPromptTurn,
 } from "./pageActions.js";
-import { recoverCommittedGeminiDeepThinkResponse } from "./providers/geminiDeepThinkDomProvider.js";
+import {
+  geminiDeepThinkDomProvider,
+  recoverCommittedGeminiDeepThinkResponse,
+} from "./providers/geminiDeepThinkDomProvider.js";
+import { chatgptDomProvider } from "./providers/chatgptDomProvider.js";
 import type { BrowserLogger } from "./types.js";
 import {
   adaptDirectTargetChromeClient,
@@ -29,6 +34,9 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { delay } from "./utils.js";
+import { BrowserRunLifecycleController } from "./runLifecycle.js";
+import { promptIdentitySha256 } from "./actions/committedPrompt.js";
+import { runProviderSubmissionFlow } from "./providerDomFlow.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import {
   defaultRecoveryLockPath,
@@ -38,8 +46,11 @@ import {
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
 import {
   findRemoteRecoveryAuthority,
+  hasPendingPromptEpoch,
   resolveCommittedGeminiPromptEpochLocator,
+  resolvePendingPromptEpochAuthority,
   type CommittedPromptEpochLocator,
+  type PendingPromptEpochAuthority,
 } from "./reattachability.js";
 export type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
 import {
@@ -53,6 +64,7 @@ import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachCo
 export type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
 import {
   extractRecoverableConversationId,
+  selectPendingPromptTarget,
   selectTarget,
   type ExplicitTargetSelectionFailure,
   type TargetSelection,
@@ -172,6 +184,50 @@ function selectGeminiRecoveryTarget(
   return { status: "selected", target, targetId };
 }
 
+function pendingPromptRecoveryError(
+  runtime: BrowserRuntimeMetadata,
+  reason: string,
+): BrowserAutomationError {
+  return new BrowserAutomationError(`Pending prompt epoch recovery remains ambiguous: ${reason}`, {
+    stage: "prompt-epoch-reconciliation",
+    code: "pending-prompt-epoch-ambiguous",
+    reattachable: true,
+    recoverableDisconnect: true,
+    runtime,
+  });
+}
+
+function assertSamePendingPromptAuthority(
+  expected: PendingPromptEpochAuthority,
+  actual: PendingPromptEpochAuthority | null,
+  runtime: BrowserRuntimeMetadata,
+): asserts actual is PendingPromptEpochAuthority {
+  if (
+    !actual ||
+    actual.targetId !== expected.targetId ||
+    actual.epoch.epochId !== expected.epoch.epochId ||
+    actual.epoch.promptSha256 !== expected.epoch.promptSha256 ||
+    actual.epoch.baselineTurns !== expected.epoch.baselineTurns ||
+    actual.epoch.followUpOrdinal !== expected.epoch.followUpOrdinal ||
+    actual.epoch.remainingFollowUps !== expected.epoch.remainingFollowUps ||
+    actual.conversationId !== expected.conversationId ||
+    actual.resourceKey !== expected.resourceKey
+  ) {
+    throw pendingPromptRecoveryError(runtime, "persisted target or prompt authority changed");
+  }
+}
+
+function pendingReplayPrompt(
+  authority: PendingPromptEpochAuthority,
+  candidates: readonly string[] | undefined,
+): string | null {
+  return (
+    candidates?.find(
+      (candidate) => promptIdentitySha256(candidate) === authority.epoch.promptSha256,
+    ) ?? null
+  );
+}
+
 export async function resumeBrowserSession(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
@@ -205,8 +261,18 @@ export async function resumeBrowserSession(
       `Explicit browser tab ${explicitTabRef} cannot be combined with remote transaction recovery because the remote protocol cannot carry exact tab authority.`,
     );
   }
-  const promptLocator =
-    initialRemoteRecovery && !runtime.promptEpoch ? null : requireRecoveryPromptLocator(runtime);
+  if (!initialRemoteRecovery && hasPendingPromptEpoch(runtime) && !deps.sessionId?.trim()) {
+    throw pendingPromptRecoveryError(runtime, "the exact recovering session owner is unavailable");
+  }
+  let pendingPromptAuthority = initialRemoteRecovery
+    ? null
+    : resolvePendingPromptEpochAuthority(runtime, deps.sessionId?.trim());
+  let promptLocator =
+    initialRemoteRecovery && !runtime.promptEpoch
+      ? null
+      : runtime.promptEpoch?.status === "committed"
+        ? requireRecoveryPromptLocator(runtime)
+        : null;
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   const acquireRecoveryLock = deps.acquireRecoveryLock ?? acquireReattachRecoveryLock;
   let recoveryLock: ReattachRecoveryLock | null = await acquireRecoveryLock(lockPath);
@@ -256,6 +322,12 @@ export async function resumeBrowserSession(
     reason: string,
     authoritativeRuntime: BrowserRuntimeMetadata = runtime,
   ): Promise<ReattachResult> => {
+    if (pendingPromptAuthority) {
+      throw pendingPromptRecoveryError(
+        authoritativeRuntime,
+        `the exact retained target cannot be replaced after ${classification}: ${reason}`,
+      );
+    }
     if (geminiDeepThinkRecovery) {
       throw new BrowserAutomationError(
         `Exact Gemini reattach cannot reopen or resubmit the accepted prompt after ${classification}: ${reason}`,
@@ -308,14 +380,20 @@ export async function resumeBrowserSession(
         transaction.runtime,
       );
     }
-    if (!promptLocator) {
+    if (!promptLocator && !pendingPromptAuthority) {
+      if (hasPendingPromptEpoch(runtime)) {
+        throw pendingPromptRecoveryError(
+          runtime,
+          "the persisted pending epoch lacks exact retained target authority",
+        );
+      }
       throw new BrowserAutomationError(
         "Local browser reattach requires a committed prompt epoch.",
         { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
       );
     }
-    const promptEpoch = promptLocator.epoch;
-    const minAssistantTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
+    let promptEpoch = promptLocator?.epoch;
+    let minAssistantTurnIndex = promptLocator ? promptLocator.verifiedUserTurnIndex + 1 : undefined;
     if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
       const reason = "No running Chrome endpoint is recorded.";
       if (explicitTabRef) {
@@ -344,8 +422,16 @@ export async function resumeBrowserSession(
         }
         liveRuntime = refreshedRuntime;
       }
-      const livePromptLocator = requireRecoveryPromptLocator(liveRuntime);
-      assertSameCommittedPromptEpoch(promptLocator, livePromptLocator);
+      if (pendingPromptAuthority) {
+        assertSamePendingPromptAuthority(
+          pendingPromptAuthority,
+          resolvePendingPromptEpochAuthority(liveRuntime, deps.sessionId?.trim()),
+          liveRuntime,
+        );
+      } else if (promptLocator) {
+        const livePromptLocator = requireRecoveryPromptLocator(liveRuntime);
+        assertSameCommittedPromptEpoch(promptLocator, livePromptLocator);
+      }
       const host = liveRuntime.chromeHost ?? "127.0.0.1";
       const port =
         liveRuntime.chromePort ??
@@ -364,9 +450,22 @@ export async function resumeBrowserSession(
         "Unable to list targets from the recorded Chrome endpoint.",
         listTargets,
       );
-      const selection = geminiDeepThinkRecovery
-        ? selectGeminiRecoveryTarget(targetList, liveRuntime, explicitTabRef)
-        : selectTarget(targetList, liveRuntime, explicitTabRef);
+      const selection = pendingPromptAuthority
+        ? selectPendingPromptTarget(targetList, pendingPromptAuthority.targetId, explicitTabRef)
+        : geminiDeepThinkRecovery
+          ? selectGeminiRecoveryTarget(targetList, liveRuntime, explicitTabRef)
+          : selectTarget(targetList, liveRuntime, explicitTabRef);
+      if (
+        selection.status === "selected" &&
+        pendingPromptAuthority &&
+        geminiDeepThinkRecovery &&
+        !isGeminiAppUrl(selection.target.url)
+      ) {
+        throw pendingPromptRecoveryError(
+          liveRuntime,
+          "the exact retained Gemini target no longer exposes the Gemini application",
+        );
+      }
       if (selection.status !== "selected") {
         if (explicitTabRef) {
           const descriptions: Record<ExplicitTargetSelectionFailure, string> = {
@@ -379,6 +478,12 @@ export async function resumeBrowserSession(
             explicitTabRef,
             selection.status,
             `Explicit browser tab ${explicitTabRef} ${descriptions[selection.status]}.`,
+          );
+        }
+        if (pendingPromptAuthority) {
+          throw pendingPromptRecoveryError(
+            liveRuntime,
+            `the exact retained target is ${selection.status}`,
           );
         }
         if (geminiDeepThinkRecovery) {
@@ -424,7 +529,7 @@ export async function resumeBrowserSession(
       closeAttachedConnection = () => connection.close();
 
       const client: SessionBoundChromeClient = connection.client;
-      const { Runtime, DOM, Page } = client;
+      const { Runtime, DOM, Page, Input } = client;
       await classifyReattachFailure(
         "recoverable-transport",
         `Chrome target ${targetId} disconnected while enabling DevTools domains.`,
@@ -434,6 +539,157 @@ export async function resumeBrowserSession(
           if (Page && typeof Page.enable === "function") await Page.enable();
         },
       );
+      let promptCommitPersistencePending = false;
+      if (pendingPromptAuthority) {
+        const replayPrompt = pendingReplayPrompt(
+          pendingPromptAuthority,
+          deps.pendingPromptCandidates,
+        );
+        const hashAuthorized =
+          replayPrompt !== null ||
+          deps.pendingPromptSha256Authorities?.includes(
+            pendingPromptAuthority.epoch.promptSha256,
+          ) === true;
+        if (!hashAuthorized) {
+          throw pendingPromptRecoveryError(
+            liveRuntime,
+            "the persisted prompt hash is not authorized by the recovering session request",
+          );
+        }
+        if (!deps.runtimeHintCb) {
+          throw pendingPromptRecoveryError(
+            liveRuntime,
+            "no durable runtime writer is available for committed authority promotion",
+          );
+        }
+        const provider =
+          deps.pendingPromptProvider ??
+          (geminiDeepThinkRecovery ? geminiDeepThinkDomProvider : chatgptDomProvider);
+        if (!provider.reconcilePendingPrompt) {
+          throw pendingPromptRecoveryError(
+            liveRuntime,
+            `${provider.providerName} does not expose pending prompt reconciliation`,
+          );
+        }
+        const providerState: Record<string, unknown> = geminiDeepThinkRecovery
+          ? {
+              inputTimeoutMs: config?.inputTimeoutMs,
+              timeoutMs: config?.timeoutMs,
+              geminiConversationId: targetId,
+            }
+          : {
+              runtime: Runtime,
+              input: Input,
+              logger,
+              timeoutMs: config?.timeoutMs ?? 120_000,
+              inputTimeoutMs: config?.inputTimeoutMs,
+              attachmentTimeoutMs: config?.attachmentTimeoutMs,
+              baselineTurns: pendingPromptAuthority.epoch.baselineTurns,
+            };
+        const evaluate = async <T>(expression: string): Promise<T | undefined> => {
+          const evaluation = await Runtime.evaluate({
+            expression,
+            returnByValue: true,
+            awaitPromise: true,
+          });
+          if (evaluation.exceptionDetails) {
+            const detail =
+              evaluation.exceptionDetails.exception?.description ??
+              evaluation.exceptionDetails.text ??
+              "unknown exception";
+            throw new Error(`Pending prompt DOM evaluation failed: ${detail}`);
+          }
+          return evaluation.result?.value as T | undefined;
+        };
+        const reconciliation = await provider.reconcilePendingPrompt(
+          { evaluate, delay, log: logger, state: providerState },
+          {
+            promptSha256: pendingPromptAuthority.epoch.promptSha256,
+            baselineTurns: pendingPromptAuthority.epoch.baselineTurns,
+            ...(geminiDeepThinkRecovery
+              ? { conversationId: targetId }
+              : pendingPromptAuthority.conversationId
+                ? { conversationId: pendingPromptAuthority.conversationId }
+                : {}),
+          },
+        );
+        if (reconciliation.status === "ambiguous") {
+          throw pendingPromptRecoveryError(liveRuntime, reconciliation.reason);
+        }
+        const recoveredPrompt =
+          reconciliation.status === "committed" ? reconciliation.prompt : replayPrompt;
+        if (!recoveredPrompt) {
+          throw pendingPromptRecoveryError(
+            liveRuntime,
+            "non-commit was proven but the exact session prompt is unavailable for replay",
+          );
+        }
+        const lifecycle = new BrowserRunLifecycleController({
+          ownerId: deps.sessionId,
+          getRuntime: () => liveRuntime,
+          persistRuntime: async (nextRuntime) => {
+            liveRuntime = nextRuntime;
+            await deps.runtimeHintCb?.(nextRuntime);
+          },
+          settleResources: (mode, pendingRuntime) =>
+            finalizeRecoveredRuntime(
+              pendingRuntime,
+              logger,
+              { ...deps.recoveryCleanup, ownerId: deps.sessionId },
+              mode,
+            ),
+        });
+        const epochIdentity = lifecycle.restorePendingPromptDispatch(recoveredPrompt, liveRuntime);
+        if (reconciliation.status === "committed") {
+          await lifecycle.recordPromptCommitVerification(
+            reconciliation.verification,
+            epochIdentity,
+          );
+        } else {
+          logger("Pending prompt epoch was definitively not submitted; replaying it once.");
+          if (provider === chatgptDomProvider) {
+            await clearPromptComposer(Runtime, logger);
+          }
+          const evidence = await runProviderSubmissionFlow(provider, {
+            prompt: recoveredPrompt,
+            evaluate,
+            delay,
+            log: logger,
+            state: providerState,
+          });
+          await lifecycle.recordPromptCommitEvidence(evidence, epochIdentity);
+          if (!lifecycle.isPromptCommitted()) {
+            throw pendingPromptRecoveryError(
+              lifecycle.runtime(liveRuntime),
+              "the provider replay did not produce exact committed prompt evidence",
+            );
+          }
+        }
+        promptCommitPersistencePending = lifecycle.hasPendingPromptAuthorityJournal();
+        liveRuntime = lifecycle.runtime(liveRuntime);
+        pendingPromptAuthority = null;
+        promptLocator = requireRecoveryPromptLocator(liveRuntime);
+        promptEpoch = promptLocator.epoch;
+        minAssistantTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
+      }
+      if (!promptLocator || !promptEpoch || minAssistantTurnIndex === undefined) {
+        throw pendingPromptRecoveryError(
+          liveRuntime,
+          "reconciliation did not produce committed prompt authority",
+        );
+      }
+      const committedPromptLocator = promptLocator;
+      const committedPromptEpoch = promptEpoch;
+      const recoveryWarnings = promptCommitPersistencePending
+        ? [
+            {
+              code: "prompt-commit-journal-pending",
+              severity: "warning" as const,
+              message:
+                "The recovered prompt commit could not yet be durably journaled; exact in-memory authority was used to capture the original answer.",
+            },
+          ]
+        : undefined;
       if (geminiDeepThinkRecovery) {
         const timeoutMs = config?.timeoutMs ?? 120_000;
         const pingTimeoutMs = Math.min(5_000, Math.max(1_500, Math.floor(timeoutMs * 0.05)));
@@ -469,7 +725,7 @@ export async function resumeBrowserSession(
               delay,
               log: logger,
             },
-            promptLocator,
+            committedPromptLocator,
             timeoutMs,
           );
         } catch (error) {
@@ -497,6 +753,7 @@ export async function resumeBrowserSession(
             answerText: answer.text,
             answerMarkdown: answer.text,
             runtime: liveRuntime,
+            ...(recoveryWarnings ? { warnings: recoveryWarnings } : {}),
           },
           liveRuntime,
         );
@@ -508,11 +765,11 @@ export async function resumeBrowserSession(
           returnByValue: true,
         });
         const href = typeof result?.value === "string" ? result.value : "";
-        if (extractRecoverableConversationId(href) === promptEpoch.conversationId) return;
+        if (extractRecoverableConversationId(href) === committedPromptEpoch.conversationId) return;
         const opened = await openConversationFromSidebarWithRetry(
           Runtime,
           {
-            conversationId: promptEpoch.conversationId,
+            conversationId: committedPromptEpoch.conversationId,
             preferProjects: true,
           },
           15_000,
@@ -545,7 +802,7 @@ export async function resumeBrowserSession(
       const expectedConversationUrl = buildCommittedConversationUrl(
         runtime,
         resolveBrowserConfig(config ?? {}).url,
-        promptEpoch.conversationId,
+        committedPromptEpoch.conversationId,
       );
       await classifyReattachFailure(
         "stale-runtime",
@@ -558,7 +815,7 @@ export async function resumeBrowserSession(
           }),
       );
       const verifyPromptTurn = deps.verifyCommittedPromptTurn ?? verifyCommittedPromptTurn;
-      await verifyPromptTurn(Runtime, promptLocator);
+      await verifyPromptTurn(Runtime, committedPromptLocator);
       const minTurnIndex = minAssistantTurnIndex;
       if (config?.researchMode === "deep") {
         const waitForDeepResearch =
@@ -566,8 +823,8 @@ export async function resumeBrowserSession(
         const researchResult = await withTimeout(
           waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex, Page, client, {
             requireScopedTargetOwner: true,
-            expectedConversationId: promptLocator.conversationId,
-            expectedPromptTurn: promptLocator,
+            expectedConversationId: committedPromptLocator.conversationId,
+            expectedPromptTurn: committedPromptLocator,
           }),
           timeoutMs + 5_000,
           "Reattach Deep Research response timed out",
@@ -577,6 +834,7 @@ export async function resumeBrowserSession(
           answerText: researchResult.text,
           answerMarkdown: researchResult.text,
           runtime: liveRuntime,
+          ...(recoveryWarnings ? { warnings: recoveryWarnings } : {}),
         });
       }
       const answer = await withTimeout(
@@ -585,8 +843,8 @@ export async function resumeBrowserSession(
           timeoutMs,
           logger,
           minTurnIndex,
-          promptLocator.conversationId,
-          promptLocator,
+          committedPromptLocator.conversationId,
+          committedPromptLocator,
         ),
         timeoutMs + 5_000,
         "Reattach response timed out",
@@ -597,8 +855,8 @@ export async function resumeBrowserSession(
             Runtime,
             answer.meta,
             logger,
-            promptLocator.conversationId,
-            promptLocator,
+            committedPromptLocator.conversationId,
+            committedPromptLocator,
           ),
           15_000,
           "Reattach markdown capture timed out",
@@ -608,6 +866,7 @@ export async function resumeBrowserSession(
         answerText: answer.text,
         answerMarkdown: markdown,
         runtime: liveRuntime,
+        ...(recoveryWarnings ? { warnings: recoveryWarnings } : {}),
       });
     } catch (error) {
       await closeAttached();

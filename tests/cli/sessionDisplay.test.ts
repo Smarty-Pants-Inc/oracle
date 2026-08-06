@@ -43,6 +43,7 @@ import {
   closeChromeTargetWithRetainedCapability,
   retainChromeTargetCloseCapability,
 } from "../../src/browser/targetCloseAuthority.ts";
+import { createRemoteRecoveryConfigResolver } from "../../src/remote/remoteServiceConfig.ts";
 
 const waitMock = vi.hoisted(() => vi.fn());
 const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
@@ -1660,6 +1661,11 @@ describe("attachSession rendering", () => {
       transactionToken: "b".repeat(64),
       state: "pending" as const,
     };
+    const remoteToken = "d".repeat(64);
+    const resolveRemoteRecoveryConfig = vi.fn(async () => ({
+      host: remoteRecovery.host,
+      token: remoteToken,
+    }));
     const pendingRuntime: BrowserRuntimeMetadata = {
       recoveryCleanupResources: [
         {
@@ -1688,12 +1694,13 @@ describe("attachSession rendering", () => {
       .mockResolvedValueOnce(errorMeta)
       .mockResolvedValue({ ...errorMeta, browser: { runtime: {} } });
     readSessionLogMock.mockResolvedValue("");
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await attachSession("sess", {
       suppressMetadata: true,
       renderPrompt: false,
       renderMarkdown: false,
+      resolveRemoteRecoveryConfig,
     });
 
     expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
@@ -1701,6 +1708,7 @@ describe("attachSession rendering", () => {
       expect.any(Function),
       expect.objectContaining({
         recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryCleanup: expect.objectContaining({ resolveRemoteRecoveryConfig }),
       }),
       "abort",
     );
@@ -1708,6 +1716,8 @@ describe("attachSession rendering", () => {
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
     ).toBe(false);
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(JSON.stringify(sessionStoreMock.updateSession.mock.calls)).not.toContain(remoteToken);
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain(remoteToken);
   });
 
   test("reattaches executor-style committed Gemini authority from an acquisition marker", async () => {
@@ -2093,6 +2103,12 @@ describe("attachSession rendering", () => {
       state: "pre-receipt" as const,
       requestIdentity,
     };
+    const remoteToken = "9".repeat(64);
+    const resolveCredentials = vi.fn(async () => ({
+      host: remoteRecovery.host,
+      token: remoteToken,
+    }));
+    const resolveRemoteRecoveryConfig = createRemoteRecoveryConfigResolver(resolveCredentials);
     const remoteOnlyRuntime: BrowserRuntimeMetadata = {
       recoveryCleanupResources: [
         {
@@ -2148,6 +2164,7 @@ describe("attachSession rendering", () => {
       suppressMetadata: true,
       renderPrompt: false,
       renderMarkdown: false,
+      resolveRemoteRecoveryConfig,
     });
 
     expect(logSpy).toHaveBeenCalledWith(
@@ -2157,8 +2174,24 @@ describe("attachSession rendering", () => {
       remoteOnlyRuntime,
       {},
       expect.any(Function),
-      expect.objectContaining({ runtimeHintCb: expect.any(Function) }),
+      expect.objectContaining({
+        runtimeHintCb: expect.any(Function),
+        recoveryCleanup: expect.objectContaining({ resolveRemoteRecoveryConfig }),
+      }),
     );
+    const recoveryResolver =
+      resumeBrowserSessionMock.mock.calls[0]?.[3]?.recoveryCleanup?.resolveRemoteRecoveryConfig;
+    await expect(recoveryResolver?.()).resolves.toEqual({
+      host: remoteRecovery.host,
+      token: remoteToken,
+    });
+    await expect(recoveryResolver?.()).resolves.toEqual({
+      host: remoteRecovery.host,
+      token: remoteToken,
+    });
+    expect(resolveCredentials).toHaveBeenCalledOnce();
+    expect(JSON.stringify(sessionStoreMock.updateSession.mock.calls)).not.toContain(remoteToken);
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain(remoteToken);
     expect(finalize).toHaveBeenCalledOnce();
   });
 

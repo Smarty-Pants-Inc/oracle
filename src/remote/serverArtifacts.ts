@@ -72,10 +72,8 @@ export async function serveRemoteArtifact(params: {
       "X-Oracle-Artifact-Sha256": descriptor.sha256,
     });
     await pipeline(handle.createReadStream({ start: 0, autoClose: false }), params.res).catch(
-      (error) => {
-        params.logger(
-          `[serve] Artifact transfer failed for ${descriptor.artifactId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      () => {
+        params.logger(`[serve] Artifact transfer failed for ${descriptor.artifactId}.`);
       },
     );
   } finally {

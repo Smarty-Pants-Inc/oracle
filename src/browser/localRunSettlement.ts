@@ -1,4 +1,5 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import { capturedResultRunStatus } from "./capturedResultPublicationCoordinator.js";
 import { closeBlankChromeTabsWithExactAuthority } from "./chromeLifecycle.js";
 import { BrowserRunLifecycleController } from "./runLifecycle.js";
 import type { BrowserCaptureSettlementMode } from "./ownedBrowserResources.js";
@@ -71,7 +72,7 @@ export function createLocalRunSettlementCoordinator({
       {
         keepBrowser,
         closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
-          runStatus: state.runStatus,
+          runStatus: capturedResultRunStatus(state),
           ownsTarget: state.ownsTarget,
           keepBrowser: manualLogin ? effectiveKeepBrowser : keepBrowser,
           closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
@@ -104,7 +105,7 @@ export function createLocalRunSettlementCoordinator({
     return resourceAuthority.projectRuntime(runtime, {
       keepBrowser,
       closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
-        runStatus: state.runStatus,
+        runStatus: capturedResultRunStatus(state),
         ownsTarget: state.ownsTarget,
         keepBrowser: manualLogin ? effectiveKeepBrowser : effectiveKeepBrowser || keepBrowser,
         closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
@@ -118,7 +119,7 @@ export function createLocalRunSettlementCoordinator({
     beforeProcessSettlement: async () => {
       if (
         !shouldCleanupBlankTabsAfterLastLease({
-          runStatus: state.runStatus,
+          runStatus: capturedResultRunStatus(state),
           ownsTarget: state.ownsTarget,
           connectionClosedUnexpectedly: state.connectionClosedUnexpectedly,
           manualLogin,
@@ -157,7 +158,7 @@ export function createLocalRunSettlementCoordinator({
     state.tabLease = resourceAuthority.acquiredLease();
     if (result.status === "completed" && !keepBrowserOpen && !state.connectionClosedUnexpectedly) {
       const totalSeconds = (Date.now() - timing.startedAt) / 1000;
-      logger(`Cleanup ${state.runStatus} • ${totalSeconds.toFixed(1)}s total`);
+      logger(`Cleanup ${capturedResultRunStatus(state)} • ${totalSeconds.toFixed(1)}s total`);
     }
     return result;
   };

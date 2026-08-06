@@ -1219,7 +1219,7 @@ describe("recoverable disconnect lifecycle", () => {
     });
   }, 30_000);
 
-  test("cleans a temporary profile when the fresh semantic probe cannot confirm dispatch", async () => {
+  test("preserves a pending epoch when the fresh semantic probe cannot confirm dispatch", async () => {
     await withDisconnectFixture({ semanticProbeSucceeds: false }, async (fixture) => {
       expect(fixture.providerObservedDispatchStart).toBe(true);
       expect(fixture.probeChromeTargetLiveness).toHaveBeenCalledTimes(1);
@@ -1227,9 +1227,10 @@ describe("recoverable disconnect lifecycle", () => {
       expect(fixture.verifyPromptCommitted).toHaveBeenCalledTimes(1);
       expect(fixture.error).toMatchObject({
         details: {
-          stage: "connection-lost",
-          recoverableDisconnect: false,
-          disconnectCause: "prompt-commit-unverified",
+          stage: "prompt-epoch-reconciliation",
+          code: "pending-prompt-epoch-ambiguous",
+          reattachable: true,
+          recoverableDisconnect: true,
           runtime: {
             promptEpoch: {
               status: "pending",
@@ -1242,15 +1243,9 @@ describe("recoverable disconnect lifecycle", () => {
           },
         },
       });
-      expect(fixture.closeChromeTarget).toHaveBeenCalledWith(
-        expect.objectContaining({
-          port: 9230,
-          targetId,
-          host: "127.0.0.1",
-        }),
-      );
-      expect(fixture.kill).toHaveBeenCalledTimes(1);
-      await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
+      expect(fixture.kill).not.toHaveBeenCalled();
+      await expect(access(fixture.profileDir)).resolves.toBeUndefined();
     });
   }, 30_000);
 

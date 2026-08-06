@@ -12,10 +12,12 @@ import type {
 import { runBrowserModeTransaction } from "./browserCoordinator.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import type { RemoteRecoveryConfigResolver } from "../remote/remoteServiceConfig.js";
 import type {
   BrowserArchiveResult,
   BrowserCaptureFinalizationResult,
   BrowserLogger,
+  BrowserRunResult,
   BrowserRunTransaction,
 } from "./types.js";
 import {
@@ -56,6 +58,12 @@ interface RunBrowserSessionArgs {
   log: (message?: string) => void;
 }
 
+export interface BrowserPreArchiveCapture {
+  result: BrowserRunResult;
+  runtime: BrowserRuntimeMetadata;
+  usage: BrowserExecutionResult["usage"];
+}
+
 export interface BrowserSessionRunnerDeps {
   assemblePrompt?: typeof assembleBrowserPrompt;
   executeBrowser?: (
@@ -65,6 +73,8 @@ export interface BrowserSessionRunnerDeps {
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
   ) => Promise<void> | void;
+  resolveRemoteRecoveryConfig?: RemoteRecoveryConfigResolver;
+  persistPreArchiveCapture?: (capture: BrowserPreArchiveCapture) => Promise<void> | void;
 }
 
 function assertBrowserRunTransaction(result: unknown): asserts result is BrowserRunTransaction {
@@ -262,6 +272,20 @@ export async function runBrowserSessionExecution(
           await persistRuntimeHint(runtimeWithController);
         }
       },
+      preArchiveCaptureCb: deps.persistPreArchiveCapture
+        ? async (result, runtime) => {
+            await deps.persistPreArchiveCapture?.({
+              result,
+              runtime,
+              usage: {
+                inputTokens: promptArtifacts.estimatedInputTokens,
+                outputTokens: result.answerTokens,
+                reasoningTokens: 0,
+                totalTokens: promptArtifacts.estimatedInputTokens + result.answerTokens,
+              },
+            });
+          }
+        : undefined,
     });
     assertBrowserRunTransaction(browserResult);
   } catch (error) {

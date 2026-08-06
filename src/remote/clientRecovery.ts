@@ -60,7 +60,9 @@ export async function settleRemoteBrowserRecovery(
     throw settlementModeConflict(mode, persistedMode, params.runtime);
   }
   if (!params.authToken?.trim()) {
-    return pending("Remote cleanup authentication is unavailable; configure ORACLE_REMOTE_TOKEN.");
+    return pending(
+      "Remote cleanup authentication is unavailable; provide --remote-token or configure ORACLE_REMOTE_TOKEN.",
+    );
   }
   if (authority.host !== params.configuredHost) {
     return pending(

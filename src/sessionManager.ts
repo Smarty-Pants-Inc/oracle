@@ -138,6 +138,8 @@ export interface BrowserRecoveryTargetCloseCapabilityMetadata {
   generationId: string;
   /** Opaque in-process lookup id used while the originating controller remains live. */
   capabilityId: string;
+  /** SHA-256 binding to the trusted session/transaction owner; never stores the owner token. */
+  ownerIdSha256?: string;
   /** Exact target identity. Absent only on legacy lookup-only records. */
   targetId?: string;
   /** Exact browser endpoint generation. Absent only on legacy lookup-only records. */

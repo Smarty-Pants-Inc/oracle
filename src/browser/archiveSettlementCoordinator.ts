@@ -206,6 +206,19 @@ export function unpublishedCleanupPendingError(
   finalization: Extract<BrowserCaptureFinalizationResult, { status: "pending" }>,
   cause?: unknown,
 ): BrowserAutomationError {
+  if (finalization.runtime.promptEpoch?.status === "pending") {
+    return new BrowserAutomationError(
+      `Pending prompt epoch recovery remains ambiguous: ${finalization.error}`,
+      {
+        stage: "prompt-epoch-reconciliation",
+        code: "pending-prompt-epoch-ambiguous",
+        reattachable: true,
+        recoverableDisconnect: true,
+        runtime: finalization.runtime,
+      },
+      cause,
+    );
+  }
   return new BrowserAutomationError(
     `Browser cleanup remains pending: ${finalization.error}`,
     {

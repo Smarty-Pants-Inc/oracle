@@ -187,35 +187,54 @@ describe("performSessionRun", () => {
       runtime: finalizedRuntime,
     }));
     const abort = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
-    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
-      usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 },
+    const usage = { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 };
+    const executionResult = {
+      usage,
       elapsedMs: 2000,
       runtime: pendingRuntime,
       modelSelection: {
         requestedModel: "GPT-5.5 Pro",
         resolvedLabel: "Pro",
-        strategy: "select",
-        status: "already-selected",
+        strategy: "select" as const,
+        status: "already-selected" as const,
         verified: true,
-        source: "chatgpt-model-picker",
+        source: "chatgpt-model-picker" as const,
         capturedAt: "2026-05-13T00:00:00.000Z",
       },
       warnings: [
         {
           code: "browser-pro-fast-large-run",
-          severity: "warning",
+          severity: "warning" as const,
           message: "Large browser Pro run completed quickly.",
         },
       ],
       answerText: "Answer",
       promptText: "Normalized submitted prompt",
-      artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
+      artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
       bindSettlement: vi.fn(async () => ({
         ...pendingRuntime,
         recoveryCleanupResult: { status: "pending" as const, settlementMode: "finalize" as const },
       })),
       finalize,
       abort,
+    };
+    const browserExecutionReturned = vi.fn();
+    vi.mocked(runBrowserSessionExecution).mockImplementation(async (_args, deps) => {
+      await deps?.persistPreArchiveCapture?.({
+        result: {
+          answerText: "Answer",
+          answerMarkdown: "Answer",
+          artifacts: executionResult.artifacts,
+          modelSelection: executionResult.modelSelection,
+          tookMs: executionResult.elapsedMs,
+          answerTokens: usage.outputTokens,
+          answerChars: "Answer".length,
+        },
+        runtime: pendingRuntime,
+        usage,
+      });
+      browserExecutionReturned();
+      return executionResult;
     });
 
     await performSessionRun({
@@ -297,6 +316,10 @@ describe("performSessionRun", () => {
     );
     expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
+    );
+    expect(browserExecutionReturned).toHaveBeenCalledOnce();
+    expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
+      browserExecutionReturned.mock.invocationCallOrder[0] ?? 0,
     );
     expect(finalize.mock.invocationCallOrder[0]).toBeGreaterThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,

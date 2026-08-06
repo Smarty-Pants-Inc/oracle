@@ -43,6 +43,19 @@ export interface PublishCompletedBrowserCaptureOptions {
   persistAnswer?: typeof persistDurableBrowserAnswer;
 }
 
+export interface PrepareDurableBrowserCaptureOptions {
+  answer: PersistDurableBrowserAnswerOptions;
+  runtime: BrowserRuntimeMetadata;
+  browser: NonNullable<SessionMetadata["browser"]>;
+  existingArtifacts?: SessionArtifact[];
+  usage?: SessionMetadata["usage"];
+  elapsedMs?: number;
+  response?: SessionMetadata["response"];
+  model?: string;
+  projectRuntime?: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata;
+  persistAnswer?: typeof persistDurableBrowserAnswer;
+}
+
 export type BrowserPublicationRecoveryAnswer =
   | { status: "none" }
   | { status: "pending" }

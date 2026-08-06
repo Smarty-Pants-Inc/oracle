@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -13,8 +13,11 @@ import type {
   WindowsPrivateTreeScope,
 } from "./windowsPrivateTreeAcl.js";
 import {
+  authenticateRemoteTransactionHeadAuthority,
   remoteTransactionIntegrityKeyId,
+  serializeRemoteTransactionHeadAuthority,
   type RemoteTransactionExpectedHead,
+  type RemoteTransactionHeadAuthority,
   type SerializedRemoteTransactionRecord,
 } from "./transactionRecordEnvelope.js";
 import { MAX_REMOTE_TRANSACTION_STORE_BYTES } from "./types.js";
@@ -22,11 +25,18 @@ import { MAX_REMOTE_TRANSACTION_STORE_BYTES } from "./types.js";
 const REMOTE_TRANSACTION_INTEGRITY_KEY_BYTES = 32;
 const REMOTE_TRANSACTION_CREATE_TEMP_PATTERN =
   /^\.([a-f0-9]{64})\.[1-9][0-9]*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
+const REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES = 4_096;
 
 export type RemoteTransactionPublicationCheckpoint =
+  | "head-pending-namespace-publication"
+  | "head-pending-directory-sync"
+  | "head-pending-temp-cleanup"
   | "namespace-publication"
   | "directory-sync"
-  | "temp-cleanup";
+  | "temp-cleanup"
+  | "head-current-namespace-publication"
+  | "head-current-directory-sync"
+  | "head-current-temp-cleanup";
 
 export type RemoteTransactionPublicationOperation = "begin" | "mutation";
 
@@ -54,6 +64,8 @@ export class RemoteTransactionRecordIntegrityError extends Error {
     this.name = "RemoteTransactionRecordIntegrityError";
   }
 }
+
+export class RemoteTransactionRecordHeadMismatchError extends RemoteTransactionRecordIntegrityError {}
 
 export class QuarantinableRemoteTransactionRecordIntegrityError extends RemoteTransactionRecordIntegrityError {
   readonly #contents: Buffer | undefined;
@@ -232,12 +244,14 @@ export async function readStableRemoteTransactionRecordBytes(options: {
 export async function publishSerializedRecord(options: {
   mode: "create" | "replace";
   directory: string;
+  headDirectory: string;
   targetPath: string;
   transactionToken: string;
+  previousHead: RemoteTransactionExpectedHead | null;
   serialized: SerializedRemoteTransactionRecord;
+  integrityKey: Buffer;
+  integrityKeyId: string;
   platform: NodeJS.Platform;
-  maximumEncodedBytes: number;
-  expectedHeads: Map<string, RemoteTransactionExpectedHead>;
   assertIntegrityAuthority: () => Promise<void>;
   underMaintenance: (publish: () => Promise<void>) => Promise<void>;
   afterRecordPublication?: (
@@ -246,16 +260,41 @@ export async function publishSerializedRecord(options: {
   ) => Promise<void>;
 }): Promise<void> {
   const operation = options.mode === "create" ? "begin" : "mutation";
+  if (options.serialized.head.revision !== (options.previousHead?.revision ?? 0) + 1) {
+    throw new Error("Remote transaction publication does not advance the durable maximum head");
+  }
+  const durable = await reconcileRemoteTransactionHeadAuthority({
+    ...options,
+    recordHead: options.previousHead,
+  });
+  if (
+    (options.mode === "create" && durable !== null) ||
+    (options.mode === "replace" &&
+      (!durable ||
+        durable.retired ||
+        durable.pending ||
+        !sameRemoteTransactionHead(durable.current, options.previousHead)))
+  ) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+
   const tempPath = path.join(
     options.directory,
     `.${options.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
   );
-  let published = false;
-  if (options.mode === "create") {
-    options.expectedHeads.set(options.transactionToken, { revision: 0, digest: "" });
-  }
+  let recordPublished = false;
   try {
     await options.underMaintenance(async () => {
+      await publishRemoteTransactionHeadAuthority({
+        ...options,
+        authority: {
+          current: options.previousHead,
+          pending: options.serialized.head,
+          retired: false,
+        },
+        checkpointPrefix: "head-pending",
+        operation,
+      });
       try {
         await options.assertIntegrityAuthority();
         const handle = await open(tempPath, "wx", 0o600);
@@ -272,8 +311,7 @@ export async function publishSerializedRecord(options: {
         } else {
           await rename(tempPath, options.targetPath);
         }
-        published = true;
-        options.expectedHeads.set(options.transactionToken, options.serialized.head);
+        recordPublished = true;
         await options.afterRecordPublication?.(operation, "namespace-publication");
         await options.assertIntegrityAuthority();
         await options.afterRecordPublication?.(operation, "directory-sync");
@@ -289,16 +327,22 @@ export async function publishSerializedRecord(options: {
           await rm(tempPath, { force: true }).catch(() => undefined);
         }
       }
+      await publishRemoteTransactionHeadAuthority({
+        ...options,
+        authority: { current: options.serialized.head, pending: null, retired: false },
+        checkpointPrefix: "head-current",
+        operation,
+      });
     });
   } catch (error) {
-    if (published) {
-      if (options.mode === "create") {
-        await rm(tempPath, { force: true }).catch(() => undefined);
-      }
-      await reconcilePublishedHead(options);
-    } else if (options.mode === "create") {
-      options.expectedHeads.delete(options.transactionToken);
+    if (recordPublished && options.mode === "create") {
+      await rm(tempPath, { force: true }).catch(() => undefined);
+      await syncDirectory(options.directory).catch(() => undefined);
     }
+    await reconcileRemoteTransactionHeadAuthority({
+      ...options,
+      recordHead: recordPublished ? options.serialized.head : options.previousHead,
+    }).catch(() => undefined);
     throw error;
   }
 }
@@ -528,31 +572,182 @@ export async function readStableRemoteTransactionIntegrityKey(
   };
 }
 
-async function reconcilePublishedHead(options: {
-  targetPath: string;
+type RemoteTransactionHeadStorageOptions = {
+  headDirectory: string;
   transactionToken: string;
-  serialized: SerializedRemoteTransactionRecord;
+  integrityKey: Buffer;
+  integrityKeyId: string;
   platform: NodeJS.Platform;
-  maximumEncodedBytes: number;
-  expectedHeads: Map<string, RemoteTransactionExpectedHead>;
   assertIntegrityAuthority: () => Promise<void>;
-}): Promise<void> {
+};
+
+export async function reconcileRemoteTransactionHeadAuthority(
+  options: RemoteTransactionHeadStorageOptions & {
+    recordHead: RemoteTransactionExpectedHead | null;
+  },
+): Promise<RemoteTransactionHeadAuthority | null> {
+  const authority = await readRemoteTransactionHeadAuthority(options);
+  if (!authority) {
+    if (!options.recordHead) return null;
+    const bootstrapped = { current: options.recordHead, pending: null, retired: false };
+    await publishRemoteTransactionHeadAuthority({ ...options, authority: bootstrapped });
+    return bootstrapped;
+  }
+  if (authority.pending) {
+    if (sameRemoteTransactionHead(authority.pending, options.recordHead)) {
+      const committed = { current: authority.pending, pending: null, retired: false };
+      await publishRemoteTransactionHeadAuthority({ ...options, authority: committed });
+      return committed;
+    }
+    if (!authority.current && !options.recordHead) {
+      await options.assertIntegrityAuthority();
+      await rm(remoteTransactionHeadPath(options.headDirectory, options.transactionToken), {
+        force: true,
+      });
+      await options.assertIntegrityAuthority();
+      await syncDirectory(options.headDirectory);
+      return null;
+    }
+    if (sameRemoteTransactionHead(authority.current, options.recordHead)) {
+      const rolledBack = { current: authority.current, pending: null, retired: false };
+      await publishRemoteTransactionHeadAuthority({ ...options, authority: rolledBack });
+      return rolledBack;
+    }
+    throw new RemoteTransactionRecordHeadMismatchError();
+  }
+  if (sameRemoteTransactionHead(authority.current, options.recordHead)) return authority;
+  if (authority.retired && !options.recordHead) return authority;
+  throw new RemoteTransactionRecordHeadMismatchError();
+}
+
+export async function retireRemoteTransactionHeadAuthority(
+  options: RemoteTransactionHeadStorageOptions & { expectedHead: RemoteTransactionExpectedHead },
+): Promise<void> {
+  const authority = await reconcileRemoteTransactionHeadAuthority({
+    ...options,
+    recordHead: options.expectedHead,
+  });
+  if (
+    !authority ||
+    authority.pending ||
+    !sameRemoteTransactionHead(authority.current, options.expectedHead)
+  ) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+  if (authority.retired) return;
+  await publishRemoteTransactionHeadAuthority({
+    ...options,
+    authority: { current: options.expectedHead, pending: null, retired: true },
+  });
+}
+
+export function remoteTransactionHeadPath(headDirectory: string, transactionToken: string): string {
+  return path.join(headDirectory, `${transactionToken}.head`);
+}
+
+async function readRemoteTransactionHeadAuthority(
+  options: RemoteTransactionHeadStorageOptions,
+): Promise<RemoteTransactionHeadAuthority | null> {
+  let authenticated: { contents: Buffer };
   try {
-    const authenticated = await readStableRemoteTransactionRecordBytes({
-      targetPath: options.targetPath,
+    authenticated = await readStableRemoteTransactionRecordBytes({
+      targetPath: remoteTransactionHeadPath(options.headDirectory, options.transactionToken),
       platform: options.platform,
-      maximumEncodedBytes: options.maximumEncodedBytes,
+      maximumEncodedBytes: REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES,
       assertIntegrityAuthority: options.assertIntegrityAuthority,
     });
-    const digest = createHash("sha256").update(authenticated.contents).digest("hex");
-    if (
-      digest === options.serialized.head.digest &&
-      authenticated.contents.equals(options.serialized.contents)
-    ) {
-      options.expectedHeads.set(options.transactionToken, options.serialized.head);
-    }
-  } catch {
-    // Preserve the publication error. The committed head remains fail-closed until a later read
-    // can re-authenticate the exact named bytes or reject a changed generation.
+  } catch (error) {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw new RemoteTransactionRecordIntegrityError();
   }
+  try {
+    return authenticateRemoteTransactionHeadAuthority({
+      contents: authenticated.contents,
+      transactionToken: options.transactionToken,
+      integrityKey: options.integrityKey,
+      integrityKeyId: options.integrityKeyId,
+      headDirectory: options.headDirectory,
+    });
+  } catch {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+}
+
+async function publishRemoteTransactionHeadAuthority(
+  options: RemoteTransactionHeadStorageOptions & {
+    authority: RemoteTransactionHeadAuthority;
+    operation?: RemoteTransactionPublicationOperation;
+    checkpointPrefix?: "head-pending" | "head-current";
+    afterRecordPublication?: (
+      operation: RemoteTransactionPublicationOperation,
+      checkpoint: RemoteTransactionPublicationCheckpoint,
+    ) => Promise<void>;
+  },
+): Promise<void> {
+  const contents = serializeRemoteTransactionHeadAuthority({
+    authority: options.authority,
+    transactionToken: options.transactionToken,
+    integrityKey: options.integrityKey,
+    integrityKeyId: options.integrityKeyId,
+    headDirectory: options.headDirectory,
+  });
+  if (contents.byteLength > REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+  const tempPath = path.join(
+    options.headDirectory,
+    `.head-${options.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await options.assertIntegrityAuthority();
+    const handle = await open(tempPath, "wx", 0o600);
+    try {
+      await handle.writeFile(contents);
+      if (options.platform !== "win32") await handle.chmod(0o600);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await options.assertIntegrityAuthority();
+    await rename(
+      tempPath,
+      remoteTransactionHeadPath(options.headDirectory, options.transactionToken),
+    );
+    if (options.operation && options.checkpointPrefix) {
+      await options.afterRecordPublication?.(
+        options.operation,
+        `${options.checkpointPrefix}-namespace-publication`,
+      );
+    }
+    await options.assertIntegrityAuthority();
+    if (options.operation && options.checkpointPrefix) {
+      await options.afterRecordPublication?.(
+        options.operation,
+        `${options.checkpointPrefix}-directory-sync`,
+      );
+    }
+    await syncDirectory(options.headDirectory);
+  } finally {
+    await options.assertIntegrityAuthority();
+    if (options.operation && options.checkpointPrefix) {
+      await options.afterRecordPublication?.(
+        options.operation,
+        `${options.checkpointPrefix}-temp-cleanup`,
+      );
+    }
+    await rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
+function sameRemoteTransactionHead(
+  left: RemoteTransactionExpectedHead | null,
+  right: RemoteTransactionExpectedHead | null,
+): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.revision === right.revision &&
+      left.digest === right.digest)
+  );
 }

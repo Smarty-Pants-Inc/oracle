@@ -11,6 +11,7 @@ import type { EngineMode } from "../../cli/engine.js";
 import type { BrowserSessionConfig, SessionArtifact, SessionModelRun } from "../../sessionStore.js";
 import { sessionStore } from "../../sessionStore.js";
 import {
+  createRemoteRecoveryConfigResolver,
   resolveRemoteServiceConfig,
   validateResolvedRemoteServiceConfig,
 } from "../../remote/remoteServiceConfig.js";
@@ -708,6 +709,10 @@ export async function runConsultTool(
       };
     }
     browserDeps = {
+      resolveRemoteRecoveryConfig: createRemoteRecoveryConfigResolver(() => ({
+        host: resolvedRemote.host,
+        token: resolvedRemote.token,
+      })),
       executeBrowser: createRemoteBrowserExecutor({
         host: resolvedRemote.host,
         token: resolvedRemote.token,

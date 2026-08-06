@@ -11,12 +11,14 @@ import type {
   BrowserPublicationPersistence,
   BrowserPublicationRecoveryAnswer,
   PersistBrowserCaptureFinalizationOptions,
+  PrepareDurableBrowserCaptureOptions,
   PublishedBrowserCapture,
   PublishCompletedBrowserCaptureOptions,
 } from "./durableAnswerContracts.js";
+import type { DurableBrowserAnswerReceipt } from "./durableBrowserAnswerFile.js";
 import { persistBrowserCaptureFinalization } from "./durableAnswerFinalization.js";
 import { DurableAnswerJournalAuthority } from "./durableAnswerJournal.js";
-import { publishBrowserCapture } from "./durableAnswerPublication.js";
+import { prepareDurableBrowserCapture, publishBrowserCapture } from "./durableAnswerPublication.js";
 
 export class BrowserPublicationTransaction {
   private readonly authority = new DurableAnswerJournalAuthority();
@@ -84,6 +86,13 @@ export class BrowserPublicationTransaction {
 
   async loadCurrentRuntime(fallback: BrowserRuntimeMetadata): Promise<BrowserRuntimeMetadata> {
     return this.authority.loadCurrentRuntime(fallback);
+  }
+
+  async prepareDurableCapture(
+    options: PrepareDurableBrowserCaptureOptions,
+  ): Promise<DurableBrowserAnswerReceipt> {
+    await this.bind(options.answer.sessionId);
+    return prepareDurableBrowserCapture(this.authority, options);
   }
 
   async persistFinalization(

@@ -25,6 +25,8 @@ import { releaseBrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   canExactOwnedProcessTeardownSubsumeTargetClose,
   closeChromeTargetWithRetainedCapability,
+  hasRestartReconstructibleChromeTargetCloseAuthority,
+  hasRetainedChromeTargetCloseCapability,
 } from "./targetCloseAuthority.js";
 import type { BrowserLogger } from "./types.js";
 
@@ -117,17 +119,39 @@ export async function finalizeLocalRecoveryCleanupGroup(
     const connectionResource = connectionEntry?.resource;
     endpointPendingEntry = connectionEntry ?? teardownEntry;
     let recordedProcessExited = false;
+    const ownerId = deps.ownerId;
 
     const exactTeardownBindingRequired =
       teardownEntries.length > 0 &&
       !preserveProcess &&
       Boolean(teardownEntry?.resource.chromeProcessIdentity) &&
       !deps.terminateExactChromeForProfile;
+    let restartTargetBindingRequired = false;
+    if (ownerId?.trim()) {
+      restartTargetBindingRequired = [...targets.values()].flat().some(({ resource }) => {
+        const capability = resource.targetCloseCapability;
+        const targetId = resource.chromeTargetId;
+        return Boolean(
+          capability &&
+          targetId &&
+          hasRestartReconstructibleChromeTargetCloseAuthority(resource, ownerId) &&
+          !hasRetainedChromeTargetCloseCapability({
+            ownerId,
+            capability,
+            targetId,
+          }),
+        );
+      });
+    }
 
-    if (exactTeardownBindingRequired) {
+    if (exactTeardownBindingRequired || restartTargetBindingRequired) {
       if (!connectionResource) {
-        if (teardownEntry) {
-          addPending(teardownEntry, "Local Chrome cleanup endpoint metadata is missing");
+        const message = "Local Chrome cleanup endpoint metadata is missing";
+        if (exactTeardownBindingRequired && teardownEntry) addPending(teardownEntry, message);
+        if (restartTargetBindingRequired) {
+          for (const targetEntries of targets.values()) {
+            for (const entry of targetEntries) addPending(entry, message);
+          }
         }
         return { pending, errors };
       }
@@ -141,6 +165,11 @@ export async function finalizeLocalRecoveryCleanupGroup(
       } catch (error) {
         const message = `Exact Chrome endpoint authentication failed: ${error instanceof Error ? error.message : String(error)}`;
         if (exactTeardownBindingRequired && teardownEntry) addPending(teardownEntry, message);
+        if (restartTargetBindingRequired) {
+          for (const targetEntries of targets.values()) {
+            for (const entry of targetEntries) addPending(entry, message);
+          }
+        }
         return { pending, errors };
       }
     }
@@ -201,7 +230,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
           }
           continue;
         }
-        if (!deps.ownerId?.trim()) {
+        if (!ownerId?.trim()) {
           for (const entry of targetEntries) {
             addPending(
               entry,
@@ -213,7 +242,16 @@ export async function finalizeLocalRecoveryCleanupGroup(
         try {
           const closed = await (
             deps.closeChromeTargetWithRetainedCapability ?? closeChromeTargetWithRetainedCapability
-          )({ ownerId: deps.ownerId, capability, targetId, logger });
+          )({
+            ownerId,
+            capability,
+            targetId,
+            logger,
+            ...(endpointAuthority ? { reconstructedAuthority: endpointAuthority } : {}),
+            ...(deps.closeChromeTargetWithExactAuthority
+              ? { closeWithExactAuthority: deps.closeChromeTargetWithExactAuthority }
+              : {}),
+          });
           if (closed.status === "completed" || closed.status === "gone") {
             settledTargetCapabilities.add(capability.capabilityId);
           }
@@ -267,7 +305,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
         addPending(teardownOnlyEntry(entry), "Browser tab lease profile path is missing");
         continue;
       }
-      if (!deps.ownerId?.trim() || !lease.generationId) {
+      if (!ownerId?.trim() || !lease.generationId) {
         addPending(
           teardownOnlyEntry(entry),
           "Trusted browser tab lease owner or acquisition generation is unavailable",
@@ -302,7 +340,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
           profileDir,
           {
             id: lease.id,
-            sessionId: deps.ownerId,
+            sessionId: ownerId,
             generationId: lease.generationId,
             profileDirectory: lease.profileDirectory,
           },

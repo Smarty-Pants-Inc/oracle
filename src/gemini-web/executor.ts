@@ -440,6 +440,19 @@ async function runGeminiDeepThinkViaBrowser(
     const finalization = await lifecycle.settleIfUnpublished();
     if (finalization?.status === "pending") {
       const message = error instanceof Error ? error.message : String(error);
+      if (finalization.runtime.promptEpoch?.status === "pending") {
+        throw new BrowserAutomationError(
+          `${message}; pending prompt epoch recovery remains ambiguous: ${finalization.error}`,
+          {
+            stage: "prompt-epoch-reconciliation",
+            code: "pending-prompt-epoch-ambiguous",
+            reattachable: true,
+            recoverableDisconnect: true,
+            runtime: finalization.runtime,
+          },
+          error,
+        );
+      }
       throw new BrowserAutomationError(
         `${message}; Gemini browser cleanup remains retryable: ${finalization.error}`,
         { stage: "gemini-browser-cleanup", runtime: finalization.runtime },

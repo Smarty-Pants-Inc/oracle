@@ -154,7 +154,7 @@ async function settleLocalOwnedTarget(options: {
   state.isolatedTargetId = targetId;
   state.lastTargetId = targetId;
   state.targetCloseCapability = targetCloseCapability;
-  state.runStatus = "complete";
+  state.publicationPhase = "safe";
   state.preserveBrowserOnError = options.preserveBrowserOnError ?? false;
   const config = resolveBrowserConfig({ keepBrowser: options.keepBrowser, headless: false });
   let latestRuntime: BrowserRuntimeMetadata | null = null;
@@ -440,7 +440,7 @@ describe("local manual Chrome owner settlement", () => {
     });
     const state = createLocalBrowserRunState(lease);
     state.ownsTarget = false;
-    state.runStatus = "complete";
+    state.publicationPhase = "safe";
     const config = resolveBrowserConfig({
       manualLogin: true,
       manualLoginProfileDir: profileDirectory.canonicalPath,

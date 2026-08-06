@@ -299,7 +299,7 @@ describe("browser coordinator public settlement", () => {
     expect(finalize).not.toHaveBeenCalled();
   });
 
-  test("retains a non-durable same-process retry when public cleanup remains pending", async () => {
+  test("returns only the public warning when direct cleanup remains pending", async () => {
     const runtime: BrowserRunTransaction["runtime"] = {
       chromeHost: "remote.example",
       chromePort: 9333,
@@ -362,20 +362,11 @@ describe("browser coordinator public settlement", () => {
     });
     expect(result).not.toHaveProperty("runtime");
     expect(result).not.toHaveProperty("recoveryCleanupResources");
-    expect(result.retryCleanup).toEqual(expect.any(Function));
-    expect(acknowledgeSettledTargetCloseCapabilities).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty("retryCleanup");
     expect(Object.keys(result)).not.toContain("retryCleanup");
     expect(JSON.stringify(result)).not.toContain("retryCleanup");
-    await expect(result.retryCleanup!()).resolves.toBe("pending");
+    expect(finalize).toHaveBeenCalledOnce();
     expect(acknowledgeSettledTargetCloseCapabilities).not.toHaveBeenCalled();
-    await expect(result.retryCleanup!()).resolves.toBe("completed");
-    expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledOnce();
-    expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledWith(
-      runtime,
-      {},
-      "test-owner",
-    );
-    expect(finalize).toHaveBeenCalledTimes(3);
     expect(abort).not.toHaveBeenCalled();
   });
 });

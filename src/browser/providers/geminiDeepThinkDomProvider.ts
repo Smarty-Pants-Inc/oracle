@@ -7,11 +7,15 @@ import type { PromptCommitVerification } from "../actions/promptCommitVerificati
 import type { CommittedPromptEpochLocator } from "../reattachability.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import type {
+  PendingPromptEpochAuthority,
+  PendingPromptEpochReconciliation,
+  PendingPromptObservation,
+  PendingPromptReconciliationContext,
   PromptCommitEvidence,
   ProviderDomAdapter,
   ProviderDomFlowContext,
 } from "../providerDomFlow.js";
-import { joinSelectors } from "../providerDomFlow.js";
+import { joinSelectors, reconcilePendingPromptObservations } from "../providerDomFlow.js";
 
 const UI_TIMEOUT_MS = 60_000;
 const RESPONSE_TIMEOUT_MS = 10 * 60_000;
@@ -250,6 +254,122 @@ function parseResponseProbe(payload: string | undefined): GeminiRawTurnDescripto
   } catch {
     return null;
   }
+}
+
+function parsePendingPromptObservation(value: unknown): PendingPromptObservation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.ready !== "boolean" ||
+    typeof candidate.conversationId !== "string" ||
+    typeof candidate.composerText !== "string" ||
+    typeof candidate.canSubmit !== "boolean" ||
+    typeof candidate.active !== "boolean" ||
+    !Array.isArray(candidate.turns)
+  ) {
+    return null;
+  }
+  const turns = candidate.turns.map((turn) => {
+    if (!turn || typeof turn !== "object" || Array.isArray(turn)) return null;
+    const entry = turn as Record<string, unknown>;
+    if (
+      (entry.role !== "user" && entry.role !== "assistant") ||
+      typeof entry.text !== "string" ||
+      (entry.turnId !== null && typeof entry.turnId !== "string") ||
+      (entry.messageId !== null && typeof entry.messageId !== "string")
+    ) {
+      return null;
+    }
+    return {
+      role: entry.role,
+      text: entry.text,
+      turnId: entry.turnId,
+      messageId: entry.messageId,
+    };
+  });
+  if (turns.some((turn) => turn === null)) return null;
+  return {
+    ready: candidate.ready,
+    conversationId: candidate.conversationId,
+    composerText: candidate.composerText,
+    canSubmit: candidate.canSubmit,
+    active: candidate.active,
+    turns: turns as PendingPromptObservation["turns"],
+  };
+}
+
+async function readPendingPromptObservation(
+  ctx: PendingPromptReconciliationContext,
+): Promise<PendingPromptObservation | null> {
+  const conversationId = (ctx.state as GeminiDomProviderState | undefined)?.geminiConversationId;
+  if (!conversationId?.trim()) return null;
+  const inputSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.input);
+  const sendButtonSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.sendButton);
+  const userQuerySelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
+  const userQueryTextSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQueryText);
+  const responseTurnSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseTurn);
+  const responseTextSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.responseText);
+  const spinnerSelector = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.spinner);
+  const value = await ctx.evaluate<unknown>(`(() => {
+    /* oracle-pending-prompt-reconciliation */
+    ${GEMINI_STABLE_ID_READER}
+    const isVisible = (node) => {
+      if (!node || node.hidden || node.getAttribute?.('aria-hidden') === 'true') return false;
+      const rect = node.getBoundingClientRect?.();
+      return !rect || (rect.width > 0 && rect.height > 0);
+    };
+    const editor = Array.from(document.querySelectorAll(${inputSelector})).find(isVisible) ?? null;
+    const userTurns = Array.from(document.querySelectorAll(${userQuerySelector}));
+    const responseTurns = Array.from(document.querySelectorAll(${responseTurnSelector}));
+    const ordered = [
+      ...userTurns.map((node) => ({
+        node,
+        role: 'user',
+        text: node.querySelector(${userQueryTextSelector})?.textContent ?? node.textContent ?? '',
+        turnId: readStableId(node),
+      })),
+      ...responseTurns.map((node) => ({
+        node,
+        role: 'assistant',
+        text: node.querySelector(${responseTextSelector})?.textContent ?? node.textContent ?? '',
+        turnId: readStableId(node),
+      })),
+    ].sort((left, right) => {
+      if (left.node === right.node) return 0;
+      return left.node.compareDocumentPosition(right.node) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+    const send = Array.from(document.querySelectorAll(${sendButtonSelector})).find(isVisible);
+    return {
+      ready: document.readyState !== 'loading' && Boolean(editor),
+      conversationId: ${JSON.stringify(conversationId.trim())},
+      composerText: editor?.innerText ?? editor?.textContent ?? '',
+      canSubmit: Boolean(send && !send.disabled && send.getAttribute?.('aria-disabled') !== 'true'),
+      active: Array.from(document.querySelectorAll(${spinnerSelector})).some(isVisible),
+      turns: ordered.map(({ node: _node, role, text, turnId }) => ({
+        role,
+        text,
+        turnId,
+        messageId: turnId,
+      })),
+    };
+  })()`);
+  return parsePendingPromptObservation(value);
+}
+
+async function reconcilePendingPrompt(
+  ctx: PendingPromptReconciliationContext,
+  authority: PendingPromptEpochAuthority,
+): Promise<PendingPromptEpochReconciliation> {
+  const first = await readPendingPromptObservation(ctx);
+  await ctx.delay(750);
+  const second = await readPendingPromptObservation(ctx);
+  if (!first || !second) {
+    return {
+      status: "ambiguous",
+      reason: "Gemini prompt reconciliation returned invalid DOM state.",
+    };
+  }
+  return reconcilePendingPromptObservations(first, second, authority);
 }
 
 function isCompletedGeminiResponse(
@@ -894,6 +1014,7 @@ export const geminiDeepThinkDomProvider: ProviderDomAdapter = {
   selectMode,
   typePrompt,
   submitPrompt,
+  reconcilePendingPrompt,
   waitForResponse,
   extractThoughts,
 };

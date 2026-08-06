@@ -16,11 +16,112 @@ import {
   sameChromeProcessLaunchClaim,
 } from "./chromeProcessLaunchClaim.js";
 import { parseProfileDirectoryIdentity, sameProfileDirectoryIdentity } from "./profileState.js";
+import {
+  hasRestartReconstructibleChromeTargetCloseAuthority,
+  isBrowserRecoveryTargetCloseCapability,
+} from "./targetCloseAuthority.js";
+import { recoveryCleanupResourceKey } from "./recoveryCleanupIdentity.js";
 
 export type CommittedBrowserPromptEpoch = Extract<
   NonNullable<BrowserRuntimeMetadata["promptEpoch"]>,
   { status: "committed" }
 >;
+
+export type PendingBrowserPromptEpoch = Extract<
+  NonNullable<BrowserRuntimeMetadata["promptEpoch"]>,
+  { status: "pending" }
+>;
+
+export interface PendingPromptEpochAuthority {
+  epoch: PendingBrowserPromptEpoch;
+  targetId: string;
+  conversationId?: string;
+  resourceKey: string;
+}
+
+function samePendingPromptEpoch(
+  expected: PendingBrowserPromptEpoch,
+  candidate: BrowserRuntimeMetadata["promptEpoch"],
+): boolean {
+  return (
+    candidate?.status === "pending" &&
+    candidate.epochId === expected.epochId &&
+    candidate.promptSha256 === expected.promptSha256 &&
+    candidate.baselineTurns === expected.baselineTurns &&
+    candidate.followUpOrdinal === expected.followUpOrdinal &&
+    candidate.remainingFollowUps === expected.remainingFollowUps
+  );
+}
+
+export function hasPendingPromptEpoch(runtime: BrowserRuntimeMetadata | null | undefined): boolean {
+  return runtime?.promptEpoch?.status === "pending";
+}
+
+export function resolvePendingPromptEpochAuthority(
+  runtime: BrowserRuntimeMetadata | null | undefined,
+  ownerId?: string,
+): PendingPromptEpochAuthority | null {
+  const epoch = runtime?.promptEpoch;
+  const targetId = runtime?.chromeTargetId?.trim();
+  if (
+    !runtime ||
+    epoch?.status !== "pending" ||
+    !epoch.epochId.trim() ||
+    !/^[a-f0-9]{64}$/.test(epoch.promptSha256) ||
+    !Number.isInteger(epoch.baselineTurns) ||
+    epoch.baselineTurns < 0 ||
+    !Number.isInteger(epoch.followUpOrdinal) ||
+    epoch.followUpOrdinal < 0 ||
+    !Number.isInteger(epoch.remainingFollowUps) ||
+    epoch.remainingFollowUps < 0 ||
+    !targetId
+  ) {
+    return null;
+  }
+  const conversationId =
+    runtime.conversationId?.trim() || extractStableConversationIdFromUrl(runtime.tabUrl ?? "");
+  if (runtime.conversationId !== undefined && !conversationId) return null;
+
+  let exactOwnedTarget = 0;
+  let exactOwnedResourceKey: string | null = null;
+  for (const resource of runtime.recoveryCleanupResources ?? []) {
+    if (resource.promptEpoch && !samePendingPromptEpoch(epoch, resource.promptEpoch)) return null;
+    if (resource.conversationId && conversationId && resource.conversationId !== conversationId) {
+      return null;
+    }
+    if (!resource.recoveryCleanup.ownsTarget) continue;
+    if (resource.chromeTargetId?.trim() !== targetId) return null;
+    const generationId = resource.acquisition?.generationId?.trim();
+    const capability = resource.targetCloseCapability;
+    if (
+      !generationId ||
+      !isBrowserRecoveryTargetCloseCapability(capability) ||
+      capability.generationId !== generationId ||
+      capability.targetId !== targetId
+    ) {
+      return null;
+    }
+    if (
+      ownerId !== undefined &&
+      !hasRestartReconstructibleChromeTargetCloseAuthority(resource, ownerId)
+    ) {
+      return null;
+    }
+    const lease = resource.tabLease;
+    if (
+      resource.recoveryCleanup.profileKind === "manual-login" &&
+      (!lease?.id.trim() || lease.generationId !== generationId)
+    ) {
+      return null;
+    }
+    if (lease && (!lease.id.trim() || lease.generationId !== generationId)) return null;
+    exactOwnedTarget += 1;
+    exactOwnedResourceKey = recoveryCleanupResourceKey(resource);
+  }
+  return exactOwnedTarget === 1 && exactOwnedResourceKey
+    ? { epoch, targetId, conversationId, resourceKey: exactOwnedResourceKey }
+    : null;
+}
 
 export function isRemoteRecoveryAuthority(value: unknown): value is BrowserRemoteRecoveryMetadata {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;

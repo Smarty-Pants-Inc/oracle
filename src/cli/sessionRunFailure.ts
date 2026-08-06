@@ -191,6 +191,7 @@ export async function handleSessionRunFailure(
       log,
       writeAssistantOutput,
       maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
+      resolveRemoteRecoveryConfig: context.browserDeps?.resolveRemoteRecoveryConfig,
     });
     if (reattach.outcome === "exhausted") {
       const exhaustedRuntime = reattach.runtime ?? recoveryRuntime;
@@ -240,6 +241,7 @@ export async function handleSessionRunFailure(
         notificationSettings,
         log,
         writeAssistantOutput,
+        resolveRemoteRecoveryConfig: context.browserDeps?.resolveRemoteRecoveryConfig,
       });
       if (reattach.outcome !== "exhausted") {
         return;

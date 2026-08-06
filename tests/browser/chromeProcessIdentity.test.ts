@@ -259,7 +259,7 @@ describe("stable Chrome process authority", () => {
     expect(exactControlKill).toHaveBeenCalledTimes(2);
     expect(child.kill).not.toHaveBeenCalled();
   });
-  test("re-inspects after unsafe teardown and succeeds only after exact exit is proven", async () => {
+  test("re-inspects after unsafe endpoint teardown and succeeds only after exact exit is proven", async () => {
     const { createLaunchedChromeControlKillForTest } =
       await import("../../src/browser/chromeLifecycle.js");
     const identity = processIdentity(
@@ -277,7 +277,12 @@ describe("stable Chrome process authority", () => {
       pid: identity.pid,
       reason: "Browser.close completed but exact exit is not visible yet",
     }));
-    const retainControlChannel = vi.fn(async () => retainedControlKill);
+    const retainEndpointAuthority = vi.fn(async () => ({
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/exact-generation",
+      kill: retainedControlKill,
+      runExactOperation: vi.fn(),
+      release: vi.fn(async () => undefined),
+    }));
     const kill = await createLaunchedChromeControlKillForTest(
       {
         host: "127.0.0.1",
@@ -285,7 +290,7 @@ describe("stable Chrome process authority", () => {
         userDataDir: identity.profileDirectory.canonicalPath,
         processIdentity: identity,
       },
-      { inspectProcessIdentity, retainControlChannel },
+      { inspectProcessIdentity, retainEndpointAuthority },
     );
 
     await expect(kill()).resolves.toMatchObject({ status: "unsafe" });
@@ -294,7 +299,7 @@ describe("stable Chrome process authority", () => {
     expect(stopped).toEqual({ status: "already-stopped", pid: identity.pid });
     expect(cached).toBe(stopped);
     expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
-    expect(retainControlChannel).toHaveBeenCalledOnce();
+    expect(retainEndpointAuthority).toHaveBeenCalledOnce();
     expect(retainedControlKill).toHaveBeenCalledOnce();
   });
 

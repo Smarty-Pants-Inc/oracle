@@ -405,7 +405,7 @@ export async function resumeRemoteBrowserTransaction(params: {
   assertRemoteTransactionToken(authority.transactionToken);
   if (!params.authToken) {
     throw new BrowserAutomationError(
-      "Remote transaction authentication is unavailable; configure ORACLE_REMOTE_TOKEN.",
+      "Remote transaction authentication is unavailable; provide --remote-token or configure ORACLE_REMOTE_TOKEN.",
       { stage: "remote-resume", recoverableDisconnect: true, runtime: params.runtime },
     );
   }
@@ -669,14 +669,11 @@ async function buildRemoteBrowserTransaction(params: {
       error,
     );
   }
-  const artifactSessionId = params.options.sessionId?.trim();
+  const artifactSessionId = params.options.sessionId?.trim() || params.receipt.transactionToken;
   const transferredFiles: SavedBrowserFile[] = [];
   const transferFailures: string[] = [];
   for (const descriptor of params.receipt.artifacts) {
     try {
-      if (!artifactSessionId) {
-        throw new Error("the recovering local session identity is unavailable");
-      }
       const transferred = await transferRemoteArtifact({
         hostname: params.hostname,
         port: params.port,

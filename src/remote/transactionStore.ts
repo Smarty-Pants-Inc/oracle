@@ -17,6 +17,7 @@ import {
 import {
   assertRemoteTransactionStoreRootAuthority,
   prepareRemoteTransactionStoreRoot,
+  remoteTransactionHeadDirectory,
   type RemoteTransactionStoreRootAuthority,
 } from "./transactionStoreRoot.js";
 import {
@@ -47,17 +48,21 @@ import {
 import {
   authenticateRemoteTransactionRecordEnvelope,
   serializeRemoteTransactionRecord,
+  type AuthenticatedRemoteTransactionRecordEnvelope,
   type RemoteTransactionExpectedHead,
 } from "./transactionRecordEnvelope.js";
 import {
   assertProtectedIntegrityKeyFile,
   loadRemoteTransactionIntegrityKey,
   publishSerializedRecord,
+  reconcileRemoteTransactionHeadAuthority,
   repairStaleCreatePublicationAliases,
   QuarantinableRemoteTransactionRecordIntegrityError,
   readErrorCode,
   readStableRemoteTransactionIntegrityKey,
   readStableRemoteTransactionRecordBytes,
+  RemoteTransactionRecordHeadMismatchError,
+  retireRemoteTransactionHeadAuthority,
   sameFileGeneration,
   samePhysicalFile,
   type RemoteTransactionIntegrityKey,
@@ -116,12 +121,14 @@ export class RemoteTransactionStore {
   readonly #afterRecordPublication?: RemoteTransactionStoreOptions["afterRecordPublication"];
   readonly #integrityKey: RemoteTransactionIntegrityKey;
   readonly #storeRootIdentity: PhysicalDirectoryIdentity;
+  readonly #headDirectory: string;
+  readonly #headDirectoryIdentity: PhysicalDirectoryIdentity;
   readonly #expectedHeads = new Map<string, RemoteTransactionExpectedHead>();
   readonly #maintenance: RemoteTransactionStoreMaintenance;
 
   private constructor(
     options: RemoteTransactionStoreOptions,
-    storeRootIdentity: PhysicalDirectoryIdentity,
+    rootAuthority: RemoteTransactionStoreRootAuthority,
     integrityKey: RemoteTransactionIntegrityKey,
     windowsPrivateTreeAuthority: WindowsPrivateTreeAuthority | undefined,
   ) {
@@ -147,7 +154,9 @@ export class RemoteTransactionStore {
     };
     this.#afterRecordPublication = options.afterRecordPublication;
     this.#integrityKey = integrityKey;
-    this.#storeRootIdentity = storeRootIdentity;
+    this.#storeRootIdentity = rootAuthority.storeRootIdentity;
+    this.#headDirectory = rootAuthority.headDirectory;
+    this.#headDirectoryIdentity = rootAuthority.headDirectoryIdentity;
     if (
       !Number.isSafeInteger(terminalRetentionMs) ||
       terminalRetentionMs < 0 ||
@@ -182,6 +191,7 @@ export class RemoteTransactionStore {
         this.withWindowsPrivateTreeAuthority(operation),
       readAuthenticatedRecord: (targetPath, transactionToken) =>
         this.readAuthenticatedRecord(targetPath, transactionToken),
+      retireAuthenticatedRecord: (transactionToken) => this.retireRecordHead(transactionToken),
       recordPath: (transactionToken) => this.recordPath(transactionToken),
     });
   }
@@ -204,6 +214,7 @@ export class RemoteTransactionStore {
     if (options.rootAuthority) {
       if (
         options.rootAuthority.directory !== directory ||
+        options.rootAuthority.headDirectory !== remoteTransactionHeadDirectory(directory) ||
         options.rootAuthority.integrityKeyDirectory !== integrityKeyDirectory
       ) {
         throw new Error("Remote transaction root authority does not match configured paths");
@@ -218,12 +229,13 @@ export class RemoteTransactionStore {
         windowsPrivateTreeAuthority,
       });
     }
-    const names = await readdir(directory);
-    const storeRootAfterInventory = await capturePhysicalDirectoryIdentity(directory);
-    if (!samePhysicalDirectoryIdentity(rootAuthority.storeRootIdentity, storeRootAfterInventory)) {
-      throw new Error("Remote transaction store root generation changed during inventory");
-    }
-    const hasPersistedRecords = names.some(isPersistedRemoteTransactionStoreEntry);
+    const [names, headNames] = await Promise.all([
+      readdir(directory),
+      readdir(rootAuthority.headDirectory),
+    ]);
+    await assertRemoteTransactionStoreRootAuthority(rootAuthority);
+    const hasPersistedRecords =
+      names.some(isPersistedRemoteTransactionStoreEntry) || headNames.length > 0;
     const integrityKey = await loadRemoteTransactionIntegrityKey(
       integrityKeyPath,
       hasPersistedRecords,
@@ -247,7 +259,7 @@ export class RemoteTransactionStore {
     }
     const store = new RemoteTransactionStore(
       { ...options, directory, integrityKeyPath: integrityKey.path, platform },
-      rootAuthority.storeRootIdentity,
+      rootAuthority,
       integrityKey,
       windowsPrivateTreeAuthority,
     );
@@ -283,6 +295,14 @@ export class RemoteTransactionStore {
       if (this.#expectedHeads.has(persisted.transactionToken)) {
         throw Object.assign(new Error("Remote transaction already exists"), { code: "EEXIST" });
       }
+      const targetPath = this.recordPath(persisted.transactionToken);
+      try {
+        await lstat(targetPath);
+        throw Object.assign(new Error("Remote transaction already exists"), { code: "EEXIST" });
+      } catch (error) {
+        if (readErrorCode(error) !== "ENOENT") throw error;
+      }
+      await this.reconcileHead(persisted.transactionToken, null);
       await this.assertIntegrityAuthority();
       const serialized = serializeRemoteTransactionRecord({
         record: persisted,
@@ -291,16 +311,17 @@ export class RemoteTransactionStore {
         integrityKeyId: this.#integrityKey.keyId,
         directory: this.directory,
       });
-      const targetPath = this.recordPath(persisted.transactionToken);
       await publishSerializedRecord({
         mode: "create",
         directory: this.directory,
+        headDirectory: this.#headDirectory,
         targetPath,
         transactionToken: persisted.transactionToken,
+        previousHead: null,
         serialized,
+        integrityKey: this.#integrityKey.bytes,
+        integrityKeyId: this.#integrityKey.keyId,
         platform: this.#platform,
-        maximumEncodedBytes: this.#maximumBytes,
-        expectedHeads: this.#expectedHeads,
         assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
         underMaintenance: (publish) =>
           this.#maintenance.publishWithCapacity(
@@ -311,6 +332,7 @@ export class RemoteTransactionStore {
           ),
         afterRecordPublication: this.#afterRecordPublication,
       });
+      this.#expectedHeads.set(persisted.transactionToken, serialized.head);
     });
   }
 
@@ -323,7 +345,11 @@ export class RemoteTransactionStore {
     try {
       return (await this.readAuthenticatedRecord(targetPath, transactionToken)).record;
     } catch (error) {
-      if (readErrorCode(error) === "ENOENT") return null;
+      if (readErrorCode(error) === "ENOENT") {
+        const authority = await this.reconcileHead(transactionToken, null);
+        if (authority?.current) this.#expectedHeads.set(transactionToken, authority.current);
+        return null;
+      }
       if (error instanceof QuarantinableRemoteTransactionRecordIntegrityError) {
         await this.#maintenance.quarantineInvalidRecord(targetPath, transactionToken, error);
       }
@@ -754,12 +780,14 @@ export class RemoteTransactionStore {
     await publishSerializedRecord({
       mode: "replace",
       directory: this.directory,
+      headDirectory: this.#headDirectory,
       targetPath,
       transactionToken: record.transactionToken,
+      previousHead,
       serialized,
+      integrityKey: this.#integrityKey.bytes,
+      integrityKeyId: this.#integrityKey.keyId,
       platform: this.#platform,
-      maximumEncodedBytes: this.#maximumBytes,
-      expectedHeads: this.#expectedHeads,
       assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
       underMaintenance: (publish) =>
         this.#maintenance.publishWithCapacity(
@@ -770,6 +798,7 @@ export class RemoteTransactionStore {
         ),
       afterRecordPublication: this.#afterRecordPublication,
     });
+    this.#expectedHeads.set(record.transactionToken, serialized.head);
   }
 
   private async readAuthenticatedRecord(
@@ -785,9 +814,9 @@ export class RemoteTransactionStore {
       expectedLinkCount,
     });
     const { contents } = authenticated;
+    let parsed: AuthenticatedRemoteTransactionRecordEnvelope;
     try {
-      const expectedHead = this.#expectedHeads.get(transactionToken);
-      const { record, head } = authenticateRemoteTransactionRecordEnvelope({
+      parsed = authenticateRemoteTransactionRecordEnvelope({
         contents,
         transactionToken,
         integrityKey: this.#integrityKey.bytes,
@@ -795,27 +824,69 @@ export class RemoteTransactionStore {
         directory: this.directory,
         maximumDecodedRecordBytes: this.#maximumDecodedRecordBytes,
         maximumLeaseDurationMs: this.#leaseDurationMs,
-        expectedHead,
       });
-      if (!expectedHead) this.#expectedHeads.set(transactionToken, head);
-      return {
-        record,
-        byteLength: contents.byteLength,
-        contents,
-        fileIdentity: authenticated.fileIdentity,
-      };
     } catch {
       throw new QuarantinableRemoteTransactionRecordIntegrityError(
         contents,
         authenticated.fileIdentity,
       );
     }
+    try {
+      const authority = await this.reconcileHead(transactionToken, parsed.head);
+      if (!authority?.current) throw new RemoteTransactionRecordHeadMismatchError();
+      this.#expectedHeads.set(transactionToken, authority.current);
+    } catch (error) {
+      if (!(error instanceof RemoteTransactionRecordHeadMismatchError)) throw error;
+      throw new QuarantinableRemoteTransactionRecordIntegrityError(
+        contents,
+        authenticated.fileIdentity,
+      );
+    }
+    return {
+      record: parsed.record,
+      byteLength: contents.byteLength,
+      contents,
+      fileIdentity: authenticated.fileIdentity,
+    };
+  }
+
+  private async reconcileHead(
+    transactionToken: string,
+    recordHead: RemoteTransactionExpectedHead | null,
+  ) {
+    return await reconcileRemoteTransactionHeadAuthority({
+      headDirectory: this.#headDirectory,
+      transactionToken,
+      recordHead,
+      integrityKey: this.#integrityKey.bytes,
+      integrityKeyId: this.#integrityKey.keyId,
+      platform: this.#platform,
+      assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+    });
+  }
+
+  private async retireRecordHead(transactionToken: string): Promise<void> {
+    const expectedHead = this.#expectedHeads.get(transactionToken);
+    if (!expectedHead) throw new Error("Remote transaction controller head is unavailable");
+    await retireRemoteTransactionHeadAuthority({
+      headDirectory: this.#headDirectory,
+      transactionToken,
+      expectedHead,
+      integrityKey: this.#integrityKey.bytes,
+      integrityKeyId: this.#integrityKey.keyId,
+      platform: this.#platform,
+      assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+    });
   }
 
   private async assertIntegrityDirectoryAuthority(): Promise<void> {
     const currentRoot = await capturePhysicalDirectoryIdentity(this.directory);
     if (!samePhysicalDirectoryIdentity(currentRoot, this.#storeRootIdentity)) {
       throw new Error("Remote transaction store root generation changed");
+    }
+    const currentHeadDirectory = await capturePhysicalDirectoryIdentity(this.#headDirectory);
+    if (!samePhysicalDirectoryIdentity(currentHeadDirectory, this.#headDirectoryIdentity)) {
+      throw new Error("Remote transaction head directory generation changed");
     }
     const currentKeyDirectory = await capturePhysicalDirectoryIdentity(
       this.#integrityKey.directory,

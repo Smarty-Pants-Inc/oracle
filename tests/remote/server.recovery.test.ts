@@ -359,6 +359,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             remoteChrome: null,
             attachRunning: false,
           });
+          expect(deps.pendingPromptSha256Authorities).toEqual([promptIdentitySha256(prompt)]);
           const transaction = lifecycleBrowserTransaction(
             prompt,
             {

@@ -4,6 +4,7 @@ import {
   hasPendingChromeAcquisitionIntent,
   hasRecoverableChatGptConversation,
   hasRecoverableGeminiConversation,
+  resolvePendingPromptEpochAuthority,
 } from "../browser/reattachability.js";
 
 type BrowserPromptEpoch = NonNullable<BrowserRuntimeMetadata["promptEpoch"]>;
@@ -124,6 +125,7 @@ export function hasBrowserRecoveryAuthority(
 ): boolean {
   return (
     hasRemoteRecoveryAuthority(runtime) ||
+    resolvePendingPromptEpochAuthority(runtime) !== null ||
     hasRecoverableChatGptConversation(runtime) ||
     hasRecoverableGeminiConversation(runtime, config)
   );
@@ -135,6 +137,7 @@ export function hasResumableBrowserAuthority(
 ): boolean {
   return (
     (hasRemoteRecoveryAuthority(runtime) && !runtime?.recoveryCleanupResult?.settlementMode) ||
+    resolvePendingPromptEpochAuthority(runtime) !== null ||
     hasRecoverableChatGptConversation(runtime) ||
     hasRecoverableGeminiConversation(runtime, config)
   );

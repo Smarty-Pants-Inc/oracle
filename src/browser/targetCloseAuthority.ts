@@ -1,11 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   BrowserRecoveryCleanupResourceMetadata,
   BrowserRecoveryProfileKind,
   BrowserRecoveryTargetCloseCapabilityMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
-import type { ExactChromeTargetCleanupResult } from "./chromeTargetConnection.js";
+import {
+  closeChromeTargetWithExactAuthority,
+  type ExactChromeTargetCleanupResult,
+} from "./chromeTargetConnection.js";
+import type { ExactChromeTargetOperationAuthority } from "./chromeTargetLifecycle.js";
+import { parseChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import type { BrowserLogger } from "./types.js";
 
 export type RetainedTargetCloseCapabilityResult =
@@ -27,6 +32,13 @@ export function canExactOwnedProcessTeardownSubsumeTargetClose(options: {
     options.profileKind !== "none"
   );
 }
+const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
+
+function hashTargetCloseOwnerId(ownerId: string): string | null {
+  const normalized = ownerId.trim();
+  return normalized ? createHash("sha256").update(normalized).digest("hex") : null;
+}
+
 function normalizeExactBrowserWSEndpoint(value: string | undefined): string | null {
   if (!value?.trim()) return null;
   try {
@@ -52,8 +64,53 @@ function normalizeExactBrowserWSEndpoint(value: string | undefined): string | nu
   }
 }
 
+export function hasRestartReconstructibleChromeTargetCloseAuthority(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+  ownerId: string | undefined,
+): boolean {
+  const cleanup = resource.recoveryCleanup;
+  const capability = resource.targetCloseCapability;
+  const targetId = resource.chromeTargetId?.trim();
+  const generationId = resource.acquisition?.generationId?.trim();
+  const resourceEndpoint = normalizeExactBrowserWSEndpoint(resource.chromeBrowserWSEndpoint);
+  const capabilityEndpoint = normalizeExactBrowserWSEndpoint(capability?.browserWSEndpoint);
+  const processIdentity = parseChromeProcessIdentity(
+    resource.chromeProcessIdentity,
+    process.platform,
+  );
+  if (
+    cleanup.ownsTarget !== true ||
+    cleanup.closeOwnedTargetOnComplete !== true ||
+    !processIdentity ||
+    !targetId ||
+    !generationId ||
+    !capability ||
+    !isBrowserRecoveryTargetCloseCapability(capability) ||
+    !capability.ownerIdSha256 ||
+    !SHA256_HEX_PATTERN.test(capability.ownerIdSha256) ||
+    capability.ownerIdSha256 !== hashTargetCloseOwnerId(ownerId ?? "") ||
+    capability.generationId !== generationId ||
+    capability.targetId !== targetId ||
+    !resourceEndpoint ||
+    capabilityEndpoint !== resourceEndpoint
+  ) {
+    return false;
+  }
+  const endpoint = new URL(resourceEndpoint);
+  const endpointHost = endpoint.hostname.toLowerCase().replace(/^\[|\]$/gu, "");
+  const resourceHost = resource.chromeHost
+    ?.trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/gu, "");
+  return (
+    (!resourceHost || endpointHost === resourceHost) &&
+    (!resource.chromePort || Number.parseInt(endpoint.port, 10) === resource.chromePort)
+  );
+}
+
 function hasRestartDurableTargetResourceAuthority(
   resource: BrowserRecoveryCleanupResourceMetadata,
+  ownerId: string | undefined,
 ): boolean {
   const cleanup = resource.recoveryCleanup;
   if (
@@ -66,6 +123,7 @@ function hasRestartDurableTargetResourceAuthority(
   }
   if (!cleanup.ownsTarget || cleanup.closeOwnedTargetOnComplete === false) return true;
   if (cleanup.closeOwnedTargetOnComplete !== true) return false;
+  if (hasRestartReconstructibleChromeTargetCloseAuthority(resource, ownerId)) return true;
   return canExactOwnedProcessTeardownSubsumeTargetClose({
     profileKind: cleanup.profileKind,
     keepBrowserOpen: cleanup.keepBrowser,
@@ -75,9 +133,13 @@ function hasRestartDurableTargetResourceAuthority(
 
 export function hasRestartDurableChromeTargetCleanupAuthority(
   runtime: BrowserRuntimeMetadata,
+  ownerId?: string,
 ): boolean {
   const resources = runtime.recoveryCleanupResources ?? [];
-  if (resources.length > 0) return resources.every(hasRestartDurableTargetResourceAuthority);
+  if (resources.length > 0)
+    return resources.every((resource) =>
+      hasRestartDurableTargetResourceAuthority(resource, ownerId),
+    );
   return !(
     runtime.chromeTargetId ||
     runtime.chromeProcessIdentity ||
@@ -159,6 +221,7 @@ export function retainChromeTargetCloseCapability(options: {
     version: 1,
     generationId,
     capabilityId,
+    ownerIdSha256: hashTargetCloseOwnerId(ownerId)!,
     targetId,
     ...(browserWSEndpoint ? { browserWSEndpoint } : {}),
   });
@@ -175,6 +238,9 @@ export function isBrowserRecoveryTargetCloseCapability(
     candidate.generationId.trim().length > 0 &&
     typeof candidate.capabilityId === "string" &&
     candidate.capabilityId.trim().length > 0 &&
+    (candidate.ownerIdSha256 === undefined ||
+      (typeof candidate.ownerIdSha256 === "string" &&
+        SHA256_HEX_PATTERN.test(candidate.ownerIdSha256))) &&
     (candidate.targetId === undefined ||
       (typeof candidate.targetId === "string" && candidate.targetId.trim().length > 0)) &&
     (candidate.browserWSEndpoint === undefined ||
@@ -183,31 +249,80 @@ export function isBrowserRecoveryTargetCloseCapability(
           candidate.browserWSEndpoint))
   );
 }
+export function hasRetainedChromeTargetCloseCapability(options: {
+  ownerId: string;
+  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
+  targetId: string;
+}): boolean {
+  const ownerId = options.ownerId.trim();
+  const ownerIdSha256 = hashTargetCloseOwnerId(ownerId);
+  const authority = isBrowserRecoveryTargetCloseCapability(options.capability)
+    ? retainedTargetCloseAuthorities.get(options.capability.capabilityId)
+    : undefined;
+  return Boolean(
+    authority &&
+    ownerId &&
+    (!options.capability.ownerIdSha256 || options.capability.ownerIdSha256 === ownerIdSha256) &&
+    authority.ownerId === ownerId &&
+    authority.generationId === options.capability.generationId &&
+    authority.targetId === options.targetId &&
+    (!options.capability.targetId || options.capability.targetId === options.targetId),
+  );
+}
 
 export async function closeChromeTargetWithRetainedCapability(options: {
   ownerId: string;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
   logger: BrowserLogger;
+  reconstructedAuthority?: ExactChromeTargetOperationAuthority & {
+    readonly browserWSEndpoint: string;
+  };
+  closeWithExactAuthority?: typeof closeChromeTargetWithExactAuthority;
 }): Promise<RetainedTargetCloseCapabilityResult> {
   const { capability, targetId, logger } = options;
   const ownerId = options.ownerId.trim();
+  const ownerIdSha256 = hashTargetCloseOwnerId(ownerId);
   if (!isBrowserRecoveryTargetCloseCapability(capability)) {
     return {
       status: "unavailable",
       reason: "Persisted Chrome target close capability is malformed; the target was preserved",
     };
   }
-  const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
-  if (!authority) {
+  if (!ownerId || (capability.ownerIdSha256 && capability.ownerIdSha256 !== ownerIdSha256)) {
     return {
       status: "unavailable",
       reason:
-        "Retained exact Chrome target close capability is no longer live (for example after a controller restart); the target was preserved",
+        "Persisted Chrome target close capability does not match this authenticated owner; the target was preserved",
     };
   }
+  const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
+  if (!authority) {
+    const expectedEndpoint = normalizeExactBrowserWSEndpoint(capability.browserWSEndpoint);
+    const reconstructedEndpoint = normalizeExactBrowserWSEndpoint(
+      options.reconstructedAuthority?.browserWSEndpoint,
+    );
+    if (
+      !capability.ownerIdSha256 ||
+      capability.ownerIdSha256 !== ownerIdSha256 ||
+      capability.targetId !== targetId ||
+      !expectedEndpoint ||
+      reconstructedEndpoint !== expectedEndpoint ||
+      !options.reconstructedAuthority
+    ) {
+      return {
+        status: "unavailable",
+        reason:
+          "Persisted Chrome target close authority could not be reconstructed for the exact owner, browser generation, and target; the target was preserved",
+      };
+    }
+    return await (options.closeWithExactAuthority ?? closeChromeTargetWithExactAuthority)({
+      authority: options.reconstructedAuthority,
+      targetId,
+      logger,
+    });
+  }
   if (
-    !ownerId ||
     authority.ownerId !== ownerId ||
     authority.generationId !== capability.generationId ||
     authority.targetId !== targetId ||
@@ -273,10 +388,12 @@ export async function discardChromeTargetCloseCapability(options: {
 }): Promise<void> {
   const { capability, targetId } = options;
   const ownerId = options.ownerId.trim();
+  const ownerIdSha256 = hashTargetCloseOwnerId(ownerId);
   if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
   if (
     !ownerId ||
+    (capability.ownerIdSha256 !== undefined && capability.ownerIdSha256 !== ownerIdSha256) ||
     !authority ||
     authority.ownerId !== ownerId ||
     authority.generationId !== capability.generationId ||
@@ -298,11 +415,13 @@ export function acknowledgeChromeTargetCloseCapability(options: {
 }): void {
   const { capability, targetId } = options;
   const ownerId = options.ownerId.trim();
+  const ownerIdSha256 = hashTargetCloseOwnerId(ownerId);
   if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
   if (
     !ownerId ||
     !authority?.terminalStatus ||
+    (capability.ownerIdSha256 !== undefined && capability.ownerIdSha256 !== ownerIdSha256) ||
     authority.terminalAcknowledged ||
     authority.close ||
     authority.release ||

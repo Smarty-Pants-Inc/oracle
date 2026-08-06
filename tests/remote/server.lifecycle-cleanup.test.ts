@@ -28,6 +28,7 @@ import {
   closeChromeTargetWithRetainedCapability,
   retainChromeTargetCloseCapability,
 } from "../../src/browser/targetCloseAuthority.js";
+import { retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,
@@ -598,7 +599,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "keeps live manual kept target-close authority until graceful shutdown can settle it",
+    "preserves restart-durable manual kept target authority across graceful shutdown",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-live-close-drain-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -615,7 +616,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       const targetCloseCapability = retainChromeTargetCloseCapability({
-        ownerId: "test-owner",
+        ownerId: transactionToken,
         generationId: "manual-kept-generation",
         targetId,
         browserWSEndpoint,
@@ -654,7 +655,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const finalize = vi.fn(async () => {
         const closeResult = await closeChromeTargetWithRetainedCapability({
-          ownerId: "test-owner",
+          ownerId: transactionToken,
           capability: targetCloseCapability,
           targetId,
           logger: () => {},
@@ -714,14 +715,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         );
         shutdownRequested.resolve();
-        await vi.waitFor(() => {
-          expect(shutdownErrors.some((message) => message.includes("non-restart-durable"))).toBe(
-            true,
-          );
-        });
+        await drain;
 
-        expect(drainSettled).toBe(false);
-        expect(existsSync(controllerLockPath)).toBe(true);
+        expect(drainSettled).toBe(true);
+        expect(shutdownErrors).toEqual([]);
+        expect(existsSync(controllerLockPath)).toBe(false);
         expect(closeTarget).not.toHaveBeenCalled();
         expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
         const pendingRecord = await readAuthenticatedTransactionRecord(
@@ -735,65 +733,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             recoveryCleanupResources: [{ targetCloseCapability }],
           },
         });
-
-        await vi.waitFor(async () => {
-          await expect(
-            httpPostJson({
-              hostname: "127.0.0.1",
-              port: server!.port,
-              path: `/transactions/${transactionToken}/retry`,
-              token: "a".repeat(64),
-              body: {},
-            }),
-          ).resolves.toMatchObject({
-            statusCode: 200,
-            json: { status: "transaction", transaction: { state: "pending" } },
-          });
-        });
-        await vi.waitFor(async () => {
-          await expect(
-            httpPostJson({
-              hostname: "127.0.0.1",
-              port: server!.port,
-              path: `/transactions/${transactionToken}/finalize`,
-              token: "a".repeat(64),
-              body: { durablePublication: true },
-            }),
-          ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
-        });
-
-        expect(finalize).toHaveBeenCalledOnce();
-        expect(closeTarget).toHaveBeenCalledOnce();
-        const liveFinalization = await finalize.mock.results[0]?.value;
-        if (!liveFinalization) throw new Error("Missing live target finalization result");
-        expect(liveFinalization.runtime).not.toHaveProperty("chromeTargetId");
-        expect(liveFinalization.runtime).not.toHaveProperty("recoveryCleanupResources");
-        await drain;
-        expect(existsSync(controllerLockPath)).toBe(false);
-        const finalizedRecord = await readAuthenticatedTransactionRecord(
-          transactionStoreDir,
-          transactionToken,
-        );
-        expect(finalizedRecord).toMatchObject({
-          state: "finalized",
-          finalization: { status: "completed" },
-        });
-        expect(finalizedRecord).not.toHaveProperty("runtime");
-        expect(finalizedRecord?.finalization?.runtime).not.toHaveProperty("chromeTargetId");
-        expect(finalizedRecord?.finalization?.runtime).not.toHaveProperty(
-          "recoveryCleanupResources",
-        );
       } finally {
         shutdownRequested.resolve();
         if (server) {
-          await httpPostJson({
-            hostname: "127.0.0.1",
-            port: server.port,
-            path: `/transactions/${transactionToken}/finalize`,
-            token: "a".repeat(64),
-            body: { durablePublication: true },
-          }).catch(() => undefined);
-          await drain?.catch(() => undefined);
           await server.close().catch(() => undefined);
         }
         targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
@@ -804,7 +746,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "settles store-only recoverable manual kept target authority before graceful shutdown",
+    "reconstructs store-only manual target authority after server restart",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recoverable-close-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -823,7 +765,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       const targetCloseCapability = retainChromeTargetCloseCapability({
-        ownerId: "test-owner",
+        ownerId: transactionToken,
         generationId: "recoverable-manual-kept-generation",
         targetId,
         browserWSEndpoint,
@@ -892,37 +834,62 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           recoverableDisconnect: true,
         },
       });
-      const retryCleanup = vi.fn(
-        async (
-          cleanupRuntime: BrowserRunTransaction["runtime"],
-          _logger: unknown,
-          _deps: unknown,
-          mode?: "finalize" | "abort",
-        ) => {
+      const retainChromeEndpointAuthority = vi.fn(async () => ({
+        browserWSEndpoint,
+        kill: vi.fn(async () => ({
+          status: "unsafe" as const,
+          pid: chromeProcessIdentity.pid,
+          reason: "Manual kept Chrome must remain running",
+        })),
+        runExactOperation: vi.fn(),
+        release: vi.fn(async () => undefined),
+      }));
+      const retryCleanup = vi.fn<typeof retryBrowserRecoveryCleanup>(
+        async (cleanupRuntime, logger, deps = {}, mode) => {
           expect(mode).toBe("abort");
-          const closeResult = await closeChromeTargetWithRetainedCapability({
-            ownerId: "test-owner",
-            capability: targetCloseCapability,
-            targetId,
-            logger: () => {},
-          });
-          if (closeResult.status !== "completed" && closeResult.status !== "gone") {
-            return pendingBrowserCaptureCleanup(cleanupRuntime, closeResult.reason, "abort");
-          }
-          const settledRuntime = { ...cleanupRuntime };
-          delete settledRuntime.chromeTargetId;
-          return completedBrowserCaptureCleanup(settledRuntime);
+          return await retryBrowserRecoveryCleanup(
+            cleanupRuntime,
+            logger,
+            {
+              ownerId: deps.ownerId,
+              acquireRecoveryLock: vi.fn(async () => ({
+                release: async (complete?: () => Promise<void>) => await complete?.(),
+              })),
+              recoveryCleanup: {
+                verifyProfileDirectoryIdentity: vi.fn(async () => true),
+                inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
+                retainChromeEndpointAuthority,
+                closeChromeTargetWithExactAuthority: closeTarget,
+              },
+            },
+            mode,
+          );
         },
       );
+      targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       let server: RemoteServerInstance | undefined;
 
       try {
         server = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
-          { transactionStoreDir, controllerGeneration, retryCleanup },
+          {
+            transactionStoreDir,
+            controllerGeneration: "controller-after-restart",
+            retryCleanup,
+          },
         );
         expect(existsSync(controllerLockPath)).toBe(true);
-        expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
+        expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(0);
+
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/abort`,
+            token: "a".repeat(64),
+            body: {},
+          }),
+        ).resolves.toMatchObject({ statusCode: 200, json: { state: "aborted" } });
 
         await drainRemoteServerShutdown(server, Promise.resolve(), {
           logger: () => {},
@@ -930,6 +897,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
 
         expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retainChromeEndpointAuthority).toHaveBeenCalledOnce();
         expect(closeTarget).toHaveBeenCalledOnce();
         expect(existsSync(controllerLockPath)).toBe(false);
         const terminalRecord = await readAuthenticatedTransactionRecord(
@@ -1114,13 +1082,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
         ).resolves.toEqual(pendingBeforeClose);
 
-        const retryCleanup = vi.fn(
-          async (
-            settlementRuntime: BrowserRunTransaction["runtime"],
-            _logger: unknown,
-            _deps: unknown,
-            mode?: "finalize" | "abort",
-          ) => {
+        const retryCleanup = vi.fn<typeof retryBrowserRecoveryCleanup>(
+          async (settlementRuntime, _logger, _deps = {}, mode) => {
             expect(mode).toBe("finalize");
             return { status: "completed" as const, runtime: settlementRuntime };
           },

@@ -144,34 +144,20 @@ function finalizationRetiresTargetCloseAuthority(
   );
 }
 
-export async function runBrowserMode(options: BrowserRunOptions): Promise<
-  BrowserRunResult & {
-    readonly retryCleanup?: () => Promise<BrowserCaptureFinalizationResult["status"]>;
-  }
-> {
+export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
   const ownerId = options.sessionId?.trim() || randomUUID();
   const transaction = await runBrowserModeTransaction({ ...options, sessionId: ownerId });
-  const finalize = async (): Promise<BrowserCaptureFinalizationResult> => {
-    const runtimeBeforeFinalization = transaction.runtime;
-    const finalization = await transaction.finalize();
-    if (finalizationRetiresTargetCloseAuthority(runtimeBeforeFinalization, finalization)) {
-      await acknowledgeSettledTargetCloseCapabilities(
-        runtimeBeforeFinalization,
-        finalization.runtime,
-        ownerId,
-      );
-    }
-    return finalization;
-  };
-  const finalization = await finalize();
+  const runtimeBeforeFinalization = transaction.runtime;
+  const finalization = await transaction.finalize();
+  if (finalizationRetiresTargetCloseAuthority(runtimeBeforeFinalization, finalization)) {
+    await acknowledgeSettledTargetCloseCapabilities(
+      runtimeBeforeFinalization,
+      finalization.runtime,
+      ownerId,
+    );
+  }
   const result = projectPublicBrowserRunResult(transaction);
   if (finalization.status === "pending") {
-    Object.defineProperty(result, "retryCleanup", {
-      configurable: false,
-      enumerable: false,
-      value: async () => (await finalize()).status,
-      writable: false,
-    });
     result.warnings = [
       ...(result.warnings ?? []),
       {

@@ -277,7 +277,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
         }),
       ).resolves.toMatchObject({
         status: "unavailable",
-        reason: expect.stringMatching(/no longer live/i),
+        reason: expect.stringContaining("could not be reconstructed"),
       });
       expect(mocks.retainEndpoint).not.toHaveBeenCalled();
       expect(mocks.listTargets).not.toHaveBeenCalled();
@@ -341,7 +341,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       }),
     ).resolves.toMatchObject({
       status: "unavailable",
-      reason: expect.stringMatching(/no longer live/i),
+      reason: expect.stringContaining("could not be reconstructed"),
     });
     expect(mocks.retainEndpoint).not.toHaveBeenCalled();
     expect(mocks.listTargets).not.toHaveBeenCalled();

@@ -62,3 +62,20 @@ export function selectTarget(
     ? selected(exactTarget)
     : { status: "missing" };
 }
+
+export function selectPendingPromptTarget(
+  targets: TargetInfoLite[],
+  targetId: string,
+  browserTabRef?: string,
+): TargetSelection {
+  if (!Array.isArray(targets) || !targetId.trim()) return { status: "missing" };
+  const matches = targets.filter((target) => (target.targetId ?? target.id) === targetId);
+  if (matches.length > 1) return { status: "ambiguous" };
+  const target = matches[0];
+  if (!target) return { status: "missing" };
+  if (browserTabRef) {
+    if (browserTabRef.toLowerCase() === "current") return { status: "unsupported" };
+    if (browserTabRef !== targetId && browserTabRef !== target.url) return { status: "mismatched" };
+  }
+  return { status: "selected", target, targetId };
+}

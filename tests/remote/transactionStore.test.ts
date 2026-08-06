@@ -20,6 +20,7 @@ import {
   RemoteTransactionStore,
   type RemoteTransactionPublicationCheckpoint,
 } from "../../src/remote/transactionStore.js";
+import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 import {
   openTestRemoteTransactionStore,
@@ -1429,6 +1430,82 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("rejects an older authenticated envelope after controller restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-durable-head-replay-"));
+    const transactionToken = "a".repeat(64);
+    try {
+      const first = await openTransactionStore({ directory: root });
+      await begin(first, transactionToken, "durable-head-replay-run");
+      const olderBytes = await readFile(first.recordPath(transactionToken));
+      await first.journalRuntime(transactionToken, runtime);
+      const currentBytes = await readFile(first.recordPath(transactionToken));
+
+      await fs.writeFile(first.recordPath(transactionToken), olderBytes, { mode: 0o600 });
+      const restarted = await openTransactionStore({ directory: root });
+
+      await expect(restarted.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      const quarantinedBytes = await Promise.all(
+        (await fs.readdir(root))
+          .filter((name) => name.includes(transactionToken) && name.endsWith(".quarantine"))
+          .map((name) => fs.readFile(path.join(root, name))),
+      );
+      expect(quarantinedBytes).toContainEqual(olderBytes);
+
+      await fs.writeFile(restarted.recordPath(transactionToken), currentBytes, { mode: 0o600 });
+      await expect(restarted.read(transactionToken)).resolves.toMatchObject({ runtime });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not accept an older record while a newer authenticated head is pending", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-pending-head-replay-"));
+    const transactionToken = "b".repeat(64);
+    const headPath = path.join(remoteTransactionHeadDirectory(root), `${transactionToken}.head`);
+    let injectInterruption = false;
+    let pendingHeadBytes: Buffer | undefined;
+    const afterRecordPublication = async (
+      operation: "begin" | "mutation",
+      checkpoint: RemoteTransactionPublicationCheckpoint,
+    ) => {
+      if (!injectInterruption || operation !== "mutation") return;
+      if (checkpoint === "head-pending-namespace-publication") {
+        pendingHeadBytes = await fs.readFile(headPath);
+      }
+      if (checkpoint === "head-pending-directory-sync") {
+        injectInterruption = false;
+        throw Object.assign(new Error("injected pending-head interruption"), { code: "EIO" });
+      }
+    };
+    try {
+      const first = await openTransactionStore({ directory: root, afterRecordPublication });
+      await begin(first, transactionToken, "pending-head-replay-run");
+      const olderBytes = await readFile(first.recordPath(transactionToken));
+      await first.journalRuntime(transactionToken, runtime);
+      const currentBytes = await readFile(first.recordPath(transactionToken));
+
+      injectInterruption = true;
+      await expect(
+        first.journalRuntime(transactionToken, runtime, modelSelection),
+      ).rejects.toMatchObject({ code: "EIO" });
+      if (!pendingHeadBytes) throw new Error("pending head checkpoint was not captured");
+
+      await fs.writeFile(headPath, pendingHeadBytes, { mode: 0o600 });
+      await fs.writeFile(first.recordPath(transactionToken), olderBytes, { mode: 0o600 });
+      const restarted = await openTransactionStore({ directory: root });
+
+      await expect(restarted.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      await fs.writeFile(restarted.recordPath(transactionToken), currentBytes, { mode: 0o600 });
+      await expect(restarted.read(transactionToken)).resolves.toMatchObject({ runtime });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects legacy authenticated envelopes and noncanonical or unauthenticated revisions", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-forgery-"));
     const directory = path.join(root, "transactions");
@@ -1928,14 +2005,19 @@ describe("RemoteTransactionStore", () => {
   });
 
   test("rejects Windows ACL-time root replacement before key or record use", async () => {
-    for (const replacedRoot of ["store", "integrity-key-directory"] as const) {
+    for (const replacedRoot of ["store", "head-directory", "integrity-key-directory"] as const) {
       const root = await mkdtemp(
         path.join(os.tmpdir(), `oracle-remote-windows-acl-${replacedRoot}-swap-`),
       );
       const directory = path.join(root, "transactions");
       const integrityKeyDirectory = path.join(root, "protected");
       const integrityKeyPath = path.join(integrityKeyDirectory, "record-integrity.key");
-      const replacedPath = replacedRoot === "store" ? directory : integrityKeyDirectory;
+      const replacedPath =
+        replacedRoot === "store"
+          ? directory
+          : replacedRoot === "head-directory"
+            ? remoteTransactionHeadDirectory(directory)
+            : integrityKeyDirectory;
       const displacedPath = `${replacedPath}.displaced`;
       let replace = true;
       const windowsPrivateTreeAuthority = vi.fn(async () => {
@@ -1962,7 +2044,9 @@ describe("RemoteTransactionStore", () => {
         ).rejects.toThrow(
           replacedRoot === "store"
             ? "store root generation changed during Windows private ACL protection"
-            : "integrity key directory generation changed during Windows private ACL protection",
+            : replacedRoot === "head-directory"
+              ? "head directory generation changed during Windows private ACL protection"
+              : "integrity key directory generation changed during Windows private ACL protection",
         );
 
         expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
@@ -2405,7 +2489,8 @@ describe("RemoteTransactionStore", () => {
       await expect(fs.access(store.recordPath(interruptedToken))).rejects.toMatchObject({
         code: "ENOENT",
       });
-      expect(await fs.readdir(atomicRoot)).toEqual([".test-integrity"]);
+      expect(await fs.readdir(atomicRoot)).toEqual([".authenticated-heads", ".test-integrity"]);
+      await expect(fs.readdir(path.join(atomicRoot, ".authenticated-heads"))).resolves.toEqual([]);
 
       await store.begin({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -2436,10 +2521,14 @@ describe("RemoteTransactionStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-head-advance-"));
     const transactionToken = "1".repeat(64);
     const actualFs = await vi.importActual<typeof fs>("node:fs/promises");
-    const rename = vi.fn(actualFs.rename);
-    rename.mockRejectedValueOnce(
-      Object.assign(new Error("mutation publication interrupted"), { code: "EINTR" }),
-    );
+    let interruptRecordRename = true;
+    const rename = vi.fn(async (...args: Parameters<typeof actualFs.rename>) => {
+      if (interruptRecordRename && String(args[1]).endsWith(`${transactionToken}.json`)) {
+        interruptRecordRename = false;
+        throw Object.assign(new Error("mutation publication interrupted"), { code: "EINTR" });
+      }
+      return await actualFs.rename(...args);
+    });
     vi.resetModules();
     vi.doMock("node:fs/promises", () => ({ ...actualFs, rename }));
     // Reload the mocked built-in export; a static import cannot observe this isolated fs failure seam.
@@ -2485,11 +2574,17 @@ describe("RemoteTransactionStore", () => {
     }
   }, 15_000);
 
-  test("commits exact begin and mutation heads at namespace publication before later failures", async () => {
+  test("preserves the exact current state across every head and record publication checkpoint", async () => {
     const checkpoints: RemoteTransactionPublicationCheckpoint[] = [
+      "head-pending-namespace-publication",
+      "head-pending-directory-sync",
+      "head-pending-temp-cleanup",
       "namespace-publication",
       "directory-sync",
       "temp-cleanup",
+      "head-current-namespace-publication",
+      "head-current-directory-sync",
+      "head-current-temp-cleanup",
     ];
     for (const checkpoint of checkpoints) {
       for (const operation of ["begin", "mutation"] as const) {
@@ -2497,6 +2592,7 @@ describe("RemoteTransactionStore", () => {
           path.join(os.tmpdir(), `oracle-remote-${operation}-${checkpoint}-`),
         );
         const transactionToken = operation === "begin" ? "8".repeat(64) : "9".repeat(64);
+        const controllerGeneration = `checkpoint-${operation}-${checkpoint}`;
         let injectedFailure:
           | { operation: "begin" | "mutation"; checkpoint: RemoteTransactionPublicationCheckpoint }
           | undefined;
@@ -2519,30 +2615,46 @@ describe("RemoteTransactionStore", () => {
         try {
           const store = await openTransactionStore({
             directory: root,
+            controllerGeneration,
             afterRecordPublication,
           });
+          if (operation === "mutation") {
+            await begin(store, transactionToken, "published-mutation");
+          }
+          injectedFailure = { operation, checkpoint };
           if (operation === "begin") {
-            injectedFailure = { operation, checkpoint };
             await expect(begin(store, transactionToken, "published-begin")).rejects.toMatchObject({
               code: "EIO",
             });
-            await expect(store.read(transactionToken)).resolves.toMatchObject({
-              transactionToken,
-              runId: "published-begin",
-            });
-            await expect(begin(store, transactionToken, "duplicate-begin")).rejects.toMatchObject({
-              code: "EEXIST",
-            });
           } else {
-            await begin(store, transactionToken, "published-mutation");
-            injectedFailure = { operation, checkpoint };
             await expect(store.journalRuntime(transactionToken, runtime)).rejects.toMatchObject({
               code: "EIO",
             });
-            await expect(store.read(transactionToken)).resolves.toMatchObject({ runtime });
-            await expect(store.journalRuntime(transactionToken, runtime)).resolves.toMatchObject({
-              runtime,
-            });
+          }
+
+          const restarted = await openTransactionStore({ directory: root, controllerGeneration });
+          const failedBeforeRecordPublication = checkpoint.startsWith("head-pending-");
+          if (operation === "begin") {
+            if (failedBeforeRecordPublication) {
+              await expect(restarted.read(transactionToken)).resolves.toBeNull();
+              await begin(restarted, transactionToken, "published-begin");
+            } else {
+              await expect(restarted.read(transactionToken)).resolves.toMatchObject({
+                transactionToken,
+                runId: "published-begin",
+              });
+            }
+            await expect(
+              begin(restarted, transactionToken, "duplicate-begin"),
+            ).rejects.toMatchObject({ code: "EEXIST" });
+          } else {
+            if (failedBeforeRecordPublication) {
+              await expect(restarted.read(transactionToken)).resolves.not.toHaveProperty("runtime");
+              await restarted.journalRuntime(transactionToken, runtime);
+            } else {
+              await expect(restarted.read(transactionToken)).resolves.toMatchObject({ runtime });
+            }
+            await expect(restarted.read(transactionToken)).resolves.toMatchObject({ runtime });
           }
           expect((await fs.readdir(root)).some((name) => name.endsWith(".quarantine"))).toBe(false);
         } finally {
@@ -2550,7 +2662,7 @@ describe("RemoteTransactionStore", () => {
         }
       }
     }
-  });
+  }, 30_000);
 
   test("redacts terminal authority and prunes it after retention", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-terminal-store-"));

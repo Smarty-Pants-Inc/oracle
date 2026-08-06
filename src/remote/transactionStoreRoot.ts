@@ -11,6 +11,12 @@ import {
   type WindowsPrivateTreeAuthority,
 } from "./windowsPrivateTreeAcl.js";
 
+const REMOTE_TRANSACTION_HEAD_DIRECTORY_NAME = ".authenticated-heads";
+
+export function remoteTransactionHeadDirectory(directory: string): string {
+  return path.join(path.resolve(directory), REMOTE_TRANSACTION_HEAD_DIRECTORY_NAME);
+}
+
 export interface RemoteTransactionStoreRootOptions {
   directory: string;
   integrityKeyPath: string;
@@ -21,6 +27,8 @@ export interface RemoteTransactionStoreRootOptions {
 export interface RemoteTransactionStoreRootAuthority {
   directory: string;
   storeRootIdentity: PhysicalDirectoryIdentity;
+  headDirectory: string;
+  headDirectoryIdentity: PhysicalDirectoryIdentity;
   integrityKeyDirectory: string;
   integrityKeyDirectoryIdentity: PhysicalDirectoryIdentity;
 }
@@ -29,12 +37,16 @@ export async function initializeRemoteTransactionStoreRoot(
   options: RemoteTransactionStoreRootOptions,
 ): Promise<RemoteTransactionStoreRootAuthority> {
   const directory = path.resolve(options.directory);
+  const headDirectory = remoteTransactionHeadDirectory(directory);
   const integrityKeyDirectory = path.dirname(path.resolve(options.integrityKeyPath));
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  await mkdir(headDirectory, { recursive: true, mode: 0o700 });
   await mkdir(integrityKeyDirectory, { recursive: true, mode: 0o700 });
   return {
     directory,
     storeRootIdentity: await capturePhysicalDirectoryIdentity(directory),
+    headDirectory,
+    headDirectoryIdentity: await capturePhysicalDirectoryIdentity(headDirectory),
     integrityKeyDirectory,
     integrityKeyDirectoryIdentity: await capturePhysicalDirectoryIdentity(integrityKeyDirectory),
   };
@@ -46,10 +58,12 @@ export async function protectRemoteTransactionStoreRoot(
 ): Promise<void> {
   const platform = options.platform ?? process.platform;
   const directory = path.resolve(options.directory);
+  const headDirectory = remoteTransactionHeadDirectory(directory);
   const integrityKeyPath = path.resolve(options.integrityKeyPath);
   const integrityKeyDirectory = path.dirname(integrityKeyPath);
   if (
     authority.directory !== directory ||
+    authority.headDirectory !== headDirectory ||
     authority.integrityKeyDirectory !== integrityKeyDirectory
   ) {
     throw new Error("Remote transaction root authority does not match configured paths");
@@ -63,16 +77,23 @@ export async function protectRemoteTransactionStoreRoot(
     });
   } else {
     await chmod(directory, 0o700);
+    await chmod(headDirectory, 0o700);
     if (integrityKeyDirectory !== directory) await chmod(integrityKeyDirectory, 0o700);
   }
-  await syncDirectory(directory);
-  if (integrityKeyDirectory !== directory) await syncDirectory(integrityKeyDirectory);
   const storeRootIdentity = await capturePhysicalDirectoryIdentity(directory);
   if (!samePhysicalDirectoryIdentity(authority.storeRootIdentity, storeRootIdentity)) {
     throw new Error(
       platform === "win32"
         ? "Remote transaction store root generation changed during Windows private ACL protection"
         : "Remote transaction store root generation changed during private-root protection",
+    );
+  }
+  const currentHeadDirectory = await capturePhysicalDirectoryIdentity(headDirectory);
+  if (!samePhysicalDirectoryIdentity(authority.headDirectoryIdentity, currentHeadDirectory)) {
+    throw new Error(
+      platform === "win32"
+        ? "Remote transaction head directory generation changed during Windows private ACL protection"
+        : "Remote transaction head directory generation changed during private-root protection",
     );
   }
   const integrityKeyDirectoryIdentity =
@@ -89,6 +110,9 @@ export async function protectRemoteTransactionStoreRoot(
         : "Remote transaction integrity key directory generation changed during private-root protection",
     );
   }
+  await syncDirectory(directory);
+  await syncDirectory(headDirectory);
+  if (integrityKeyDirectory !== directory) await syncDirectory(integrityKeyDirectory);
 }
 
 export async function prepareRemoteTransactionStoreRoot(
@@ -105,6 +129,10 @@ export async function assertRemoteTransactionStoreRootAuthority(
   const currentStoreRoot = await capturePhysicalDirectoryIdentity(authority.directory);
   if (!samePhysicalDirectoryIdentity(currentStoreRoot, authority.storeRootIdentity)) {
     throw new Error("Remote transaction store root generation changed");
+  }
+  const currentHeadDirectory = await capturePhysicalDirectoryIdentity(authority.headDirectory);
+  if (!samePhysicalDirectoryIdentity(currentHeadDirectory, authority.headDirectoryIdentity)) {
+    throw new Error("Remote transaction head directory generation changed");
   }
   const currentIntegrityKeyDirectory = await capturePhysicalDirectoryIdentity(
     authority.integrityKeyDirectory,

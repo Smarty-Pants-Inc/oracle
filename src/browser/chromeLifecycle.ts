@@ -84,12 +84,6 @@ export interface ChromeLaunchDeps {
   inspectProcessIdentity?: typeof inspectChromeProcessIdentity;
   captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
   writeOwner?: typeof writeOracleChromeOwner;
-  retainControlChannel?: (options: {
-    host: string;
-    port: number;
-    userDataDir: string;
-    processIdentity: ChromeProcessIdentity;
-  }) => Promise<ChromeStableKill>;
   retainEndpointAuthority?: (options: {
     host: string;
     port: number;
@@ -225,13 +219,12 @@ export async function launchChrome(
         processIdentity,
       },
       {
-        retainControlChannel: deps.retainControlChannel,
         retainEndpointAuthority: deps.retainEndpointAuthority,
         inspectProcessIdentity: deps.inspectProcessIdentity,
       },
     );
     const initialEndpointAuthority = control.readEndpointAuthority();
-    if (!deps.retainControlChannel && !initialEndpointAuthority) {
+    if (!initialEndpointAuthority) {
       const authorityError = new Error(
         `Launched Chrome for ${launchUserDataDir} did not retain exact endpoint release authority.`,
       );
@@ -384,7 +377,7 @@ export function registerTerminationHooks(
   keepBrowser: boolean,
   logger: BrowserLogger,
   opts?: {
-    /** Return true when the run is still in-flight (assistant response pending). */
+    /** Return true until the captured answer has completed its publication safety checks. */
     isInFlight?: () => boolean;
     /** Persist runtime hints so reattach can find the live Chrome. */
     emitRuntimeHint?: () => Promise<void>;
@@ -409,7 +402,7 @@ export function registerTerminationHooks(
     const leaveRunning = (keepBrowser || inFlight) && !forceCleanup;
     if (leaveRunning) {
       logger(
-        `Received ${signal}; leaving Chrome running${inFlight ? " (assistant response pending)" : ""}`,
+        `Received ${signal}; leaving Chrome running${inFlight ? " (answer publication pending)" : ""}`,
       );
     } else if (forceCleanup && (keepBrowser || inFlight)) {
       logger(

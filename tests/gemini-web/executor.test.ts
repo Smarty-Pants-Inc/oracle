@@ -15,6 +15,7 @@ import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 import { finalizeRecoveredRuntime } from "../../src/browser/reattachCleanup.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import type * as ChromeProcessLaunchClaimModule from "../../src/browser/chromeProcessLaunchClaim.js";
 
 const {
   launchChrome,
@@ -127,7 +128,8 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => ({
 vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
 }));
-vi.mock("../../src/browser/chromeProcessLaunchClaim.js", () => ({
+vi.mock("../../src/browser/chromeProcessLaunchClaim.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof ChromeProcessLaunchClaimModule>()),
   createChromeProcessLaunchClaim: (generationId: string) => ({
     version: 1 as const,
     generationId,
@@ -1025,7 +1027,7 @@ describe("gemini-web executor", () => {
     expect(killChrome).not.toHaveBeenCalled();
   });
 
-  it("rejects Chrome evaluation exceptions and cleans up the unpublished session", async () => {
+  it("preserves a pending epoch when Chrome evaluation fails after write-ahead", async () => {
     runtimeEvaluate.mockResolvedValueOnce({
       result: { type: "object", subtype: "error" },
       exceptionDetails: {
@@ -1042,11 +1044,21 @@ describe("gemini-web executor", () => {
         config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
         log: () => {},
       }),
-    ).rejects.toThrow(
-      "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
-    );
-    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
-    expect(killChrome).toHaveBeenCalledTimes(1);
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      message: expect.stringContaining(
+        "Gemini Deep Think DOM evaluation failed: ReferenceError: visibleSpinners is not defined",
+      ),
+      details: {
+        stage: "prompt-epoch-reconciliation",
+        code: "pending-prompt-epoch-ambiguous",
+        reattachable: true,
+        recoverableDisconnect: true,
+        runtime: { promptEpoch: { status: "pending" } },
+      },
+    });
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+    expect(killChrome).not.toHaveBeenCalled();
   });
   it.each([
     { first: "finalize" as const, second: "finalize" as const },

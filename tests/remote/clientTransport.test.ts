@@ -1177,119 +1177,125 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("stores resumed artifacts under the recovering local session before receipting", async () => {
-    const tmpHome = await fsPromises.mkdtemp(
-      path.join(os.tmpdir(), "oracle-remote-resume-artifact-"),
-    );
-    setOracleHomeDirOverrideForTest(tmpHome);
-    const transactionToken = "f".repeat(64);
-    const prompt = "resume artifact into local session";
-    const payload = Buffer.from("recovered artifact");
-    const descriptor = {
-      artifactId: "artifact-1",
-      runId: "run-1",
-      kind: "file" as const,
-      filename: "result.bin",
-      mimeType: "application/octet-stream",
-      byteSize: payload.length,
-      sha256: createHash("sha256").update(payload).digest("hex"),
-      validation: { type: "generic" as const, ok: true },
-      sourceUrlKind: "browser-download" as const,
-      transferStatus: "ready" as const,
-      required: true,
-    };
-    let receipted = false;
-    const server = createAuthenticatedServer(async (req, res) => {
-      if (req.url === `/transactions/${transactionToken}/retry`) {
-        await readJson(req);
-        res.setHeader("content-type", "application/json");
-        res.end(
-          JSON.stringify({
-            status: "transaction",
-            transaction: transactionEvent(transactionToken, prompt, [descriptor]).transaction,
-          }),
-        );
-        return;
-      }
-      if (
-        req.method === "GET" &&
-        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
-      ) {
-        res.setHeader("content-length", String(payload.length));
-        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
-        res.end(payload);
-        return;
-      }
-      if (
-        req.method === "POST" &&
-        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
-      ) {
-        await readJson(req);
-        const localArtifact = path.join(
-          tmpHome,
-          "sessions",
-          "recovering-local-session",
-          "artifacts",
-          "artifact-artifact-1.bin",
-        );
-        await expect(fsPromises.readFile(localArtifact)).resolves.toEqual(payload);
-        receipted = true;
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ ok: true }));
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
-    });
-    const port = await listen(server);
-    const host = `127.0.0.1:${port}`;
-    const runtime: BrowserRuntimeMetadata = {
-      recoveryCleanupResources: [
-        {
-          remoteRecovery: {
-            protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
-            host,
-            transactionToken,
-            state: "pre-receipt",
-            requestIdentity: {
-              acceptedPromptSha256: [promptIdentitySha256(prompt)],
-              followUpOrdinal: 0,
-              remainingFollowUps: 0,
-            },
-          },
-          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
-        },
-      ],
-    };
-
-    try {
-      const transaction = await resumeRemoteBrowserTransaction({
-        runtime,
-        configuredHost: host,
-        authToken: "a".repeat(64),
-        sessionId: "recovering-local-session",
-      });
-      expect(receipted).toBe(true);
-      expect(transaction.savedFiles?.[0]?.path).toBe(
-        path.join(
-          tmpHome,
-          "sessions",
-          "recovering-local-session",
-          "artifacts",
-          "artifact-artifact-1.bin",
-        ),
+  it.each([
+    ["explicit local session", "recovering-local-session", "recovering-local-session"],
+    ["opaque transaction fallback", undefined, "f".repeat(64)],
+  ] as const)(
+    "stores resumed artifacts before receipting with %s",
+    async (_case, sessionId, artifactSessionId) => {
+      const tmpHome = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-resume-artifact-"),
       );
-      await expect(
-        fsPromises.stat(
-          path.join(tmpHome, "sessions", descriptor.runId, "artifacts", "artifact-artifact-1.bin"),
-        ),
-      ).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-      await close(server);
-      setOracleHomeDirOverrideForTest(null);
-      await fsPromises.rm(tmpHome, { recursive: true, force: true });
-    }
-  });
+      setOracleHomeDirOverrideForTest(tmpHome);
+      const transactionToken = "f".repeat(64);
+      const prompt = "resume artifact into local session";
+      const payload = Buffer.from("recovered artifact");
+      const descriptor = {
+        artifactId: "artifact-1",
+        runId: "run-1",
+        kind: "file" as const,
+        filename: "result.bin",
+        mimeType: "application/octet-stream",
+        byteSize: payload.length,
+        sha256: createHash("sha256").update(payload).digest("hex"),
+        validation: { type: "generic" as const, ok: true },
+        sourceUrlKind: "browser-download" as const,
+        transferStatus: "ready" as const,
+        required: true,
+      };
+      let receipted = false;
+      const server = createAuthenticatedServer(async (req, res) => {
+        if (req.url === `/transactions/${transactionToken}/retry`) {
+          await readJson(req);
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              status: "transaction",
+              transaction: transactionEvent(transactionToken, prompt, [descriptor]).transaction,
+            }),
+          );
+          return;
+        }
+        if (
+          req.method === "GET" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
+        ) {
+          res.setHeader("content-length", String(payload.length));
+          res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+          res.end(payload);
+          return;
+        }
+        if (
+          req.method === "POST" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
+        ) {
+          await readJson(req);
+          const localArtifact = path.join(
+            tmpHome,
+            "sessions",
+            artifactSessionId,
+            "artifacts",
+            "artifact-artifact-1.bin",
+          );
+          await expect(fsPromises.readFile(localArtifact)).resolves.toEqual(payload);
+          receipted = true;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      const port = await listen(server);
+      const host = `127.0.0.1:${port}`;
+      const runtime: BrowserRuntimeMetadata = {
+        recoveryCleanupResources: [
+          {
+            remoteRecovery: {
+              protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+              host,
+              transactionToken,
+              state: "pre-receipt",
+              requestIdentity: {
+                acceptedPromptSha256: [promptIdentitySha256(prompt)],
+                followUpOrdinal: 0,
+                remainingFollowUps: 0,
+              },
+            },
+            recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+          },
+        ],
+      };
+
+      try {
+        const transaction = await resumeRemoteBrowserTransaction({
+          runtime,
+          configuredHost: host,
+          authToken: "a".repeat(64),
+          ...(sessionId ? { sessionId } : {}),
+        });
+        expect(receipted).toBe(true);
+        expect(transaction.savedFiles?.[0]?.path).toBe(
+          path.join(tmpHome, "sessions", artifactSessionId, "artifacts", "artifact-artifact-1.bin"),
+        );
+        await expect(
+          fsPromises.stat(
+            path.join(
+              tmpHome,
+              "sessions",
+              descriptor.runId,
+              "artifacts",
+              "artifact-artifact-1.bin",
+            ),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await close(server);
+        setOracleHomeDirOverrideForTest(null);
+        await fsPromises.rm(tmpHome, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("rejects a resumed committed epoch that mismatches persisted request identity", async () => {
     const transactionToken = "d".repeat(64);

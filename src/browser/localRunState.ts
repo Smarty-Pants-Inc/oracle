@@ -9,6 +9,7 @@ import type {
   SessionBoundChromeClient,
 } from "./chromeSessionTransport.js";
 import type { PostCapturePendingWork } from "./publicationSettlementCoordinator.js";
+import type { CapturedResultPublicationPhase } from "./capturedResultPublicationCoordinator.js";
 
 export interface LocalBrowserRunState {
   lastTargetId: string | undefined;
@@ -22,7 +23,7 @@ export interface LocalBrowserRunState {
   modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   tabLease: BrowserTabLease | null;
   conversationUrlMonitor: ConversationUrlMonitor | null;
-  runStatus: "attempted" | "complete";
+  publicationPhase: CapturedResultPublicationPhase;
   connectionClosedUnexpectedly: boolean;
   preserveBrowserOnError: boolean;
   disconnectAssessmentFailure: BrowserAutomationError | null;
@@ -45,7 +46,7 @@ export function createLocalBrowserRunState(tabLease: BrowserTabLease | null): Lo
     modelSelectionEvidence: undefined,
     tabLease,
     conversationUrlMonitor: null,
-    runStatus: "attempted",
+    publicationPhase: "capture-preparation",
     connectionClosedUnexpectedly: false,
     preserveBrowserOnError: false,
     disconnectAssessmentFailure: null,

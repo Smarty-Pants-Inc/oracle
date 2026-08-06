@@ -18,6 +18,16 @@ export interface ResolvedRemoteServiceConfig {
   };
 }
 
+export type RemoteRecoveryConfig = Pick<ResolvedRemoteServiceConfig, "host" | "token">;
+export type RemoteRecoveryConfigResolver = () => Promise<RemoteRecoveryConfig>;
+
+export function createRemoteRecoveryConfigResolver(
+  resolve: () => RemoteRecoveryConfig | Promise<RemoteRecoveryConfig>,
+): RemoteRecoveryConfigResolver {
+  let resolved: Promise<RemoteRecoveryConfig> | undefined;
+  return () => (resolved ??= Promise.resolve().then(resolve));
+}
+
 export const REMOTE_PLAINTEXT_TRANSPORT_GUIDANCE =
   "Plaintext Oracle remote transport is loopback-only. Bind oracle serve to 127.0.0.1 or ::1 and connect through an SSH tunnel that exposes a loopback endpoint. Direct non-loopback transport requires verified TLS, which this client does not currently implement.";
 

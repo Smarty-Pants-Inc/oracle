@@ -1,6 +1,7 @@
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { settleRemoteBrowserRecovery } from "../remote/client.js";
+import type { RemoteRecoveryConfigResolver } from "../remote/remoteServiceConfig.js";
 import type {
   closeChromeTargetWithExactAuthority,
   listChromeTargetsWithExactAuthority,
@@ -57,7 +58,7 @@ export interface ReattachCleanupDeps {
   ) => Promise<boolean>;
   releaseBrowserTabLease?: typeof releaseBrowserTabLease;
   settleRemoteBrowserRecovery?: typeof settleRemoteBrowserRecovery;
-  resolveRemoteRecoveryConfig?: () => Promise<{ host?: string; token?: string }>;
+  resolveRemoteRecoveryConfig?: RemoteRecoveryConfigResolver;
   isRemotePublicationAcknowledged?: () => boolean;
 }
 

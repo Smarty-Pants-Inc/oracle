@@ -30,6 +30,7 @@ import { commitBrowserSessionOutcomeProjection } from "./browserSessionOutcome.j
 import type {
   BrowserPublicationJournalRetirement,
   BrowserPublicationPersistence,
+  PrepareDurableBrowserCaptureOptions,
   PublishedBrowserCapture,
   PublishCompletedBrowserCaptureOptions,
 } from "./durableAnswerContracts.js";
@@ -44,6 +45,38 @@ import {
   persistBrowserCaptureFinalization,
 } from "./durableAnswerFinalization.js";
 import type { DurableAnswerJournalAuthority } from "./durableAnswerJournal.js";
+
+export async function prepareDurableBrowserCapture(
+  authority: DurableAnswerJournalAuthority,
+  options: PrepareDurableBrowserCaptureOptions,
+): Promise<DurableBrowserAnswerReceipt> {
+  const projectRuntime = options.projectRuntime ?? ((runtime) => runtime);
+  const journalStore = authority.requireJournalStore();
+  let journal = authority.journal;
+  if (journal) {
+    assertJournalMatchesCapture(journal, options.runtime);
+  } else {
+    journal = authority.observe(
+      await prepareBrowserCapturePublication(options, projectRuntime, journalStore),
+    );
+  }
+
+  const preparedAnswer = await prepareDurableBrowserAnswer(options.answer);
+  assertDurableBrowserAnswerReceipt(preparedAnswer.receipt, journal.receipt);
+  const persistAnswer = options.persistAnswer ?? persistDurableBrowserAnswer;
+  try {
+    await persistAnswer(options.answer, journal.receipt);
+  } catch (persistError) {
+    const recoveredAnswer = await recoverDurableAnswerAfterPersistenceFailure(
+      journal,
+      options.answer.answer,
+      persistError,
+    );
+    if (recoveredAnswer === null) throw persistError;
+  }
+  authority.acknowledgeDurableAnswer();
+  return journal.receipt;
+}
 
 /**
  * Publishes a completed browser capture through a crash-recoverable transaction:
@@ -65,7 +98,11 @@ export async function publishBrowserCapture(
   } else {
     try {
       journal = authority.observe(
-        await prepareBrowserCapturePublication(options, projectRuntime, journalStore),
+        await prepareBrowserCapturePublication(
+          { ...options, runtime: options.transaction.runtime },
+          projectRuntime,
+          journalStore,
+        ),
       );
     } catch (stageError) {
       if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
@@ -187,12 +224,12 @@ export async function publishBrowserCapture(
 }
 
 async function prepareBrowserCapturePublication(
-  options: PublishCompletedBrowserCaptureOptions,
+  options: PrepareDurableBrowserCaptureOptions,
   projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
   journalStore: BrowserPublicationJournalStore,
 ): Promise<BrowserCapturePublicationJournal> {
   const { receipt } = await prepareDurableBrowserAnswer(options.answer);
-  const runtime = projectRuntime(options.transaction.runtime);
+  const runtime = projectRuntime(options.runtime);
   const event = {
     type: "prepare",
     journal: {

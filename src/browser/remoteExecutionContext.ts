@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
+import {
+  capturedResultRunStatus,
+  type CapturedResultPublicationPhase,
+} from "./capturedResultPublicationCoordinator.js";
 import type {
   BrowserRecoveryCleanupMetadata,
   BrowserRecoveryTargetCloseCapabilityMetadata,
@@ -74,7 +78,7 @@ export interface RemoteBrowserExecutionContext {
   postCapturePendingWork: PostCapturePendingWork | null;
   retainRemoteConnectionForSettlement: boolean;
   connectionClosedUnexpectedly: boolean;
-  runStatus: "attempted" | "complete";
+  publicationPhase: CapturedResultPublicationPhase;
   preserveBrowserOnError: boolean;
   stopThinkingMonitor: (() => void) | null;
   removeDialogHandler: (() => void) | null;
@@ -177,7 +181,7 @@ export function createRemoteBrowserExecutionContext(
     postCapturePendingWork: null,
     retainRemoteConnectionForSettlement: false,
     connectionClosedUnexpectedly: false,
-    runStatus: "attempted",
+    publicationPhase: "capture-preparation",
     preserveBrowserOnError: false,
     stopThinkingMonitor: null,
     removeDialogHandler: null,
@@ -216,7 +220,7 @@ export function createRemoteBrowserExecutionContext(
         pendingResource === "chrome-target"
           ? true
           : shouldCloseOwnedRunTargetAfterRun({
-              runStatus: context.runStatus,
+              runStatus: capturedResultRunStatus(context),
               ownsTarget: authorityOwnsTarget,
               keepBrowser: Boolean(config.keepBrowser),
               closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,

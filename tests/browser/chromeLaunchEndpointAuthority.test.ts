@@ -1,11 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import {
-  inspectChromeProcessIdentityForTest,
-  type ChromeProcessIdentity,
-  type ChromeProcessIdentityInspection,
-} from "../../src/browser/chromeProcessIdentity.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
 import {
   chromeLaunchResult,
   processIdentity,
@@ -226,229 +222,230 @@ describe("hidden macOS Chrome launch", () => {
     expect(inspectProcessIdentity).toHaveBeenCalledTimes(3);
   });
 
-  test("accepts a hidden Chrome endpoint only when macOS reports the exact listener pid", async () => {
-    const { verifyListeningPortOwnedByProcessForTest } =
-      await import("../../src/browser/chromeLifecycle.js");
-    const exactOwner = vi.fn(async () => ({ stdout: "p4321\n" }));
-    const differentOwner = vi.fn(async () => ({ stdout: "p9999\n" }));
-
-    await expect(verifyListeningPortOwnedByProcessForTest(4321, 64305, exactOwner)).resolves.toBe(
-      true,
-    );
-    await expect(
-      verifyListeningPortOwnedByProcessForTest(4321, 64305, differentOwner),
-    ).resolves.toBe(false);
-  });
-
-  test("blocks endpoint automation and close for a claimless possible Darwin PID recycle", async () => {
+  test("accepts matching and rejects mismatched or unresolved listener ownership on every platform", async () => {
     // Dynamic import keeps this endpoint assertion bound to Vitest's hoisted CDP mock.
     const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
-    const userDataDir = "/tmp/oracle-claimless-recycled-profile";
-    const executablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    const identity: ChromeProcessIdentity = {
-      pid: 4321,
-      processStartTime: "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
-      executablePath,
-      normalizedUserDataDir: userDataDir,
-      launchNonce: "00000000-0000-4000-8000-000000007004",
-      profileDirectory: {
-        version: 2,
-        platform: "darwin",
-        canonicalPath: userDataDir,
-        device: "1",
-        inode: "2",
-        birthtimeNs: "3",
+    const cases: ReadonlyArray<{ platform: NodeJS.Platform; processStartTime: string }> = [
+      { platform: "darwin", processStartTime: "darwin-audit-pidversion:7001" },
+      {
+        platform: "linux",
+        processStartTime: "linux:11111111-1111-4111-8111-111111111111:987654",
       },
-    };
-    const commandTokens = [
-      executablePath,
-      `--user-data-dir=${userDataDir}`,
-      "--remote-debugging-port=64305",
+      { platform: "win32", processStartTime: "win32:2026-08-06T12:34:56.1234567Z" },
     ];
-    let observedStartTime = identity.processStartTime;
-    const inspectProcessIdentity = vi.fn(
-      async (profileDir: string, durableIdentity: ChromeProcessIdentity) =>
-        inspectChromeProcessIdentityForTest(profileDir, durableIdentity, {
-          platform: "darwin",
-          verifyProfileIdentity: async () => true,
-          isProcessAlive: () => true,
-          readProcessSnapshot: async () => ({
-            pid: identity.pid,
-            processStartTime: observedStartTime,
-            executablePath,
-            commandLine: commandTokens.join(" "),
-            commandTokens,
-          }),
-        }),
+
+    for (const { platform, processStartTime } of cases) {
+      const baseIdentity = processIdentity(
+        path.join(os.tmpdir(), `oracle-${platform}-listener-profile`),
+        4321,
+        "11111111-1111-4111-8111-111111111113",
+      );
+      const identity: ChromeProcessIdentity = {
+        ...baseIdentity,
+        processStartTime,
+        profileDirectory: { ...baseIdentity.profileDirectory, platform },
+      };
+      const browserWSEndpoint = `ws://127.0.0.1:64305/devtools/browser/${platform}-generation`;
+      const discoverEndpoint = vi.fn(async () => ({ port: 64305, browserWSEndpoint }));
+      const exactClientClose = vi.fn(async () => undefined);
+      const exactClient = {
+        Browser: { getVersion: vi.fn(async () => ({})), close: vi.fn(async () => undefined) },
+        close: exactClientClose,
+      };
+      const exactOwner =
+        platform === "darwin"
+          ? { pid: identity.pid }
+          : { pid: identity.pid, processGeneration: identity.processStartTime };
+      const authority = await retainChromeEndpointAuthority(
+        {
+          host: "127.0.0.1",
+          port: 64305,
+          browserWSEndpoint,
+          userDataDir: identity.profileDirectory.canonicalPath,
+          processIdentity: identity,
+        },
+        {
+          discoverEndpoint,
+          connectBrowser: vi.fn(async () => exactClient as never),
+          inspectProcessIdentity: vi.fn(async () => "current" as const),
+          resolveListeningOwner: vi.fn(async () => exactOwner),
+        },
+      );
+      expect(authority.browserWSEndpoint).toBe(browserWSEndpoint);
+      await authority.release();
+      expect(exactClientClose).toHaveBeenCalledOnce();
+
+      const mismatchedConnect = vi.fn();
+      await expect(
+        retainChromeEndpointAuthority(
+          {
+            host: "127.0.0.1",
+            port: 64305,
+            browserWSEndpoint,
+            userDataDir: identity.profileDirectory.canonicalPath,
+            processIdentity: identity,
+          },
+          {
+            discoverEndpoint,
+            connectBrowser: mismatchedConnect,
+            inspectProcessIdentity: vi.fn(async () => "current" as const),
+            resolveListeningOwner: vi.fn(async () => ({
+              pid: 9999,
+              processGeneration: identity.processStartTime,
+            })),
+          },
+        ),
+      ).rejects.toThrow(/listener no longer belongs to the exact Chrome process/i);
+      expect(mismatchedConnect).not.toHaveBeenCalled();
+
+      const unresolvedConnect = vi.fn();
+      await expect(
+        retainChromeEndpointAuthority(
+          {
+            host: "127.0.0.1",
+            port: 64305,
+            browserWSEndpoint,
+            userDataDir: identity.profileDirectory.canonicalPath,
+            processIdentity: identity,
+          },
+          {
+            discoverEndpoint,
+            connectBrowser: unresolvedConnect,
+            inspectProcessIdentity: vi.fn(async () => "current" as const),
+            resolveListeningOwner: vi.fn(async () => null),
+          },
+        ),
+      ).rejects.toThrow(/listener ownership could not be resolved/i);
+      expect(unresolvedConnect).not.toHaveBeenCalled();
+    }
+  });
+
+  test("blocks operations and kill after same-pid listener generation reuse", async () => {
+    // Dynamic import keeps this endpoint assertion bound to Vitest's hoisted CDP mock.
+    const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
+    const baseIdentity = processIdentity(
+      path.join(os.tmpdir(), "oracle-linux-reused-profile"),
+      4321,
+      "11111111-1111-4111-8111-111111111114",
     );
+    const identity: ChromeProcessIdentity = {
+      ...baseIdentity,
+      processStartTime: "linux:11111111-1111-4111-8111-111111111111:987654",
+      profileDirectory: { ...baseIdentity.profileDirectory, platform: "linux" },
+    };
+    const browserWSEndpoint = "ws://127.0.0.1:64305/devtools/browser/exact-generation";
+    const discoverEndpoint = vi.fn(async () => ({ port: 64305, browserWSEndpoint }));
+    let listenerGeneration = identity.processStartTime;
     const browserClose = vi.fn(async () => undefined);
     const endpointClose = vi.fn(async () => undefined);
-    const getProcessInfo = vi.fn(async () => ({
-      processInfo: [{ id: identity.pid, type: "browser" }],
-    }));
     const client = {
       Browser: { getVersion: vi.fn(async () => ({})), close: browserClose },
-      SystemInfo: { getProcessInfo },
       close: endpointClose,
     };
     const authority = await retainChromeEndpointAuthority(
       {
         host: "127.0.0.1",
         port: 64305,
-        browserWSEndpoint: "ws://127.0.0.1:64305/devtools/browser/claimless-recycled",
-        userDataDir,
-        processIdentity: identity,
-      },
-      {
-        connectBrowser: vi.fn(async () => client as never),
-        inspectProcessIdentity,
-        resolveListeningPid: vi.fn(async () => identity.pid),
-      },
-    );
-
-    observedStartTime = "darwin-audit-pidversion:7001";
-    const operation = vi.fn(async () => "must-not-run");
-    await expect(authority.runExactOperation?.(operation)).resolves.toMatchObject({
-      status: "unsafe",
-      reason: expect.stringMatching(/could not be reverified/i),
-    });
-    await expect(authority.kill()).resolves.toMatchObject({
-      status: "unsafe",
-      pid: identity.pid,
-      reason: expect.stringMatching(/could not be reverified/i),
-    });
-    expect(operation).not.toHaveBeenCalled();
-    expect(browserClose).not.toHaveBeenCalled();
-    expect(getProcessInfo).toHaveBeenCalledOnce();
-    await authority.release();
-    expect(endpointClose).toHaveBeenCalledOnce();
-  });
-
-  test("binds a reusable endpoint to the exact browser process generation", async () => {
-    // Dynamic import is required so Vitest's hoisted CDP mock initializes before module evaluation.
-    const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
-    const identity = processIdentity(
-      path.join(os.tmpdir(), "oracle-reused-profile"),
-      4321,
-      "11111111-1111-4111-8111-111111111113",
-    );
-    const browserWSEndpoint = "ws://127.0.0.1:64305/devtools/browser/exact-generation";
-    const discoverEndpoint = vi.fn(async () => ({ port: 64305, browserWSEndpoint }));
-    const inspectProcessIdentity = vi.fn(
-      async (): Promise<ChromeProcessIdentityInspection> => "current",
-    );
-    const resolveListeningPid = vi.fn(async () => identity.pid);
-    const mismatchedClientClose = vi.fn(async () => undefined);
-    const mismatchedClient = {
-      Browser: { getVersion: vi.fn(async () => ({})) },
-      SystemInfo: {
-        getProcessInfo: vi.fn(async () => ({
-          processInfo: [{ id: 9999, type: "browser" }],
-        })),
-      },
-      close: mismatchedClientClose,
-    };
-
-    await expect(
-      retainChromeEndpointAuthority(
-        {
-          host: "127.0.0.1",
-          port: 64305,
-          userDataDir: identity.profileDirectory.canonicalPath,
-          processIdentity: identity,
-        },
-        {
-          discoverEndpoint,
-          connectBrowser: vi.fn(async () => mismatchedClient as never),
-          inspectProcessIdentity,
-          resolveListeningPid,
-        },
-      ),
-    ).rejects.toThrow(/not bound to the captured browser process generation/i);
-    expect(mismatchedClientClose).toHaveBeenCalledOnce();
-    const failedValidationClose = vi.fn(async () => {
-      throw new Error("validation client close failed");
-    });
-    await expect(
-      retainChromeEndpointAuthority(
-        {
-          host: "127.0.0.1",
-          port: 64305,
-          userDataDir: identity.profileDirectory.canonicalPath,
-          processIdentity: identity,
-        },
-        {
-          discoverEndpoint,
-          connectBrowser: vi.fn(
-            async () => ({ ...mismatchedClient, close: failedValidationClose }) as never,
-          ),
-          inspectProcessIdentity,
-          resolveListeningPid,
-        },
-      ),
-    ).rejects.toThrow(/could not be validated or released safely/i);
-    expect(failedValidationClose).toHaveBeenCalledOnce();
-
-    const exactClientClose = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("transient endpoint release failure"))
-      .mockResolvedValueOnce(undefined);
-    const exactClient = {
-      Browser: {
-        getVersion: vi.fn(async () => ({})),
-        close: vi.fn(async () => undefined),
-      },
-      SystemInfo: {
-        getProcessInfo: vi.fn(async () => ({
-          processInfo: [{ id: identity.pid, type: "browser" }],
-        })),
-      },
-      close: exactClientClose,
-    };
-    const authority = await retainChromeEndpointAuthority(
-      {
-        host: "127.0.0.1",
-        port: 64305,
+        browserWSEndpoint,
         userDataDir: identity.profileDirectory.canonicalPath,
         processIdentity: identity,
       },
       {
         discoverEndpoint,
-        connectBrowser: vi.fn(async () => exactClient as never),
-        inspectProcessIdentity,
-        resolveListeningPid,
+        connectBrowser: vi.fn(async () => client as never),
+        inspectProcessIdentity: vi.fn(async () => "current" as const),
+        resolveListeningOwner: vi.fn(async () => ({
+          pid: identity.pid,
+          processGeneration: listenerGeneration,
+        })),
       },
     );
 
-    expect(authority.browserWSEndpoint).toBe(browserWSEndpoint);
-    expect(inspectProcessIdentity).toHaveBeenCalledWith(
-      identity.profileDirectory.canonicalPath,
-      identity,
-    );
-    if (process.platform === "darwin") {
-      expect(resolveListeningPid).toHaveBeenCalledWith(64305);
-    }
-    const exactOperation = vi.fn(async () => "performed");
-    await expect(authority.runExactOperation?.(exactOperation)).resolves.toEqual({
+    const firstOperation = vi.fn(async () => "performed");
+    await expect(authority.runExactOperation?.(firstOperation)).resolves.toEqual({
       status: "completed",
       value: "performed",
     });
-    expect(exactOperation).toHaveBeenCalledWith(exactClient);
-    inspectProcessIdentity.mockResolvedValueOnce("exited");
-    const replacementMutation = vi.fn(async () => "must-not-run");
-    await expect(authority.runExactOperation?.(replacementMutation)).resolves.toEqual({
-      status: "gone",
+    listenerGeneration = "linux:11111111-1111-4111-8111-111111111111:987655";
+    const replacementOperation = vi.fn(async () => "must-not-run");
+    await expect(authority.runExactOperation?.(replacementOperation)).resolves.toMatchObject({
+      status: "unsafe",
+      reason: expect.stringMatching(/exact Chrome process generation/i),
     });
-    expect(replacementMutation).not.toHaveBeenCalled();
-    await expect(authority.release()).rejects.toThrow(/transient endpoint release failure/i);
-    await expect(authority.release()).resolves.toBeUndefined();
-    await expect(authority.release()).resolves.toBeUndefined();
-    expect(exactClientClose).toHaveBeenCalledTimes(2);
     await expect(authority.kill()).resolves.toMatchObject({
       status: "unsafe",
       pid: identity.pid,
-      reason: expect.stringMatching(/already released/i),
+      reason: expect.stringMatching(/exact Chrome process generation/i),
     });
-    expect(exactClient.Browser.close).not.toHaveBeenCalled();
+    expect(replacementOperation).not.toHaveBeenCalled();
+    expect(browserClose).not.toHaveBeenCalled();
+    await authority.release();
+    expect(endpointClose).toHaveBeenCalledOnce();
+  });
+
+  test("blocks operations and kill after the DevTools endpoint rebinds on the same port", async () => {
+    // Dynamic import keeps this endpoint assertion bound to Vitest's hoisted CDP mock.
+    const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
+    const baseIdentity = processIdentity(
+      path.join(os.tmpdir(), "oracle-linux-endpoint-rebind-profile"),
+      4321,
+      "11111111-1111-4111-8111-111111111115",
+    );
+    const identity: ChromeProcessIdentity = {
+      ...baseIdentity,
+      processStartTime: "linux:11111111-1111-4111-8111-111111111111:987654",
+      profileDirectory: { ...baseIdentity.profileDirectory, platform: "linux" },
+    };
+    const expectedEndpoint = "ws://127.0.0.1:64305/devtools/browser/exact-generation";
+    let currentEndpoint = expectedEndpoint;
+    const discoverEndpoint = vi.fn(async () => ({
+      port: 64305,
+      browserWSEndpoint: currentEndpoint,
+    }));
+    const browserClose = vi.fn(async () => undefined);
+    const endpointClose = vi.fn(async () => undefined);
+    const client = {
+      Browser: { getVersion: vi.fn(async () => ({})), close: browserClose },
+      close: endpointClose,
+    };
+    const authority = await retainChromeEndpointAuthority(
+      {
+        host: "127.0.0.1",
+        port: 64305,
+        browserWSEndpoint: expectedEndpoint,
+        userDataDir: identity.profileDirectory.canonicalPath,
+        processIdentity: identity,
+      },
+      {
+        discoverEndpoint,
+        connectBrowser: vi.fn(async () => client as never),
+        inspectProcessIdentity: vi.fn(async () => "current" as const),
+        resolveListeningOwner: vi.fn(async () => ({
+          pid: identity.pid,
+          processGeneration: identity.processStartTime,
+        })),
+      },
+    );
+
+    const firstOperation = vi.fn(async () => "performed");
+    await expect(authority.runExactOperation?.(firstOperation)).resolves.toEqual({
+      status: "completed",
+      value: "performed",
+    });
+    currentEndpoint = "ws://127.0.0.1:64305/devtools/browser/replacement-generation";
+    const replacementOperation = vi.fn(async () => "must-not-run");
+    await expect(authority.runExactOperation?.(replacementOperation)).resolves.toMatchObject({
+      status: "unsafe",
+      reason: expect.stringMatching(/endpoint identity changed/i),
+    });
+    await expect(authority.kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: identity.pid,
+      reason: expect.stringMatching(/endpoint identity changed/i),
+    });
+    expect(replacementOperation).not.toHaveBeenCalled();
+    expect(browserClose).not.toHaveBeenCalled();
+    await authority.release();
+    expect(endpointClose).toHaveBeenCalledOnce();
   });
 });

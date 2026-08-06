@@ -14,6 +14,13 @@ import {
   type BrowserLiveTailOptions,
 } from "./browserTabs.js";
 import { sessionStore } from "../sessionStore.js";
+import { loadUserConfig } from "../config.js";
+import {
+  createRemoteRecoveryConfigResolver,
+  resolveRemoteServiceConfig,
+  type RemoteRecoveryConfig,
+  type RemoteRecoveryConfigResolver,
+} from "../remote/remoteServiceConfig.js";
 
 export interface StatusOptions extends OptionValues {
   hours: number;
@@ -34,6 +41,8 @@ export interface StatusOptions extends OptionValues {
   browserTab?: string;
   browserTabRef?: string;
   browserTabs?: boolean;
+  remoteHost?: string;
+  remoteToken?: string;
 }
 
 interface SessionCommandDependencies {
@@ -55,6 +64,10 @@ interface SessionCommandDependencies {
   getSessionPaths: (
     sessionId: string,
   ) => Promise<{ dir: string; metadata: string; log: string; request: string }>;
+  resolveRemoteRecoveryConfig: (overrides: {
+    host?: string;
+    token?: string;
+  }) => Promise<RemoteRecoveryConfig>;
 }
 
 const defaultDependencies: SessionCommandDependencies = {
@@ -65,6 +78,16 @@ const defaultDependencies: SessionCommandDependencies = {
   usesDefaultStatusFilters,
   deleteSessionsOlderThan: (options) => sessionStore.deleteOlderThan(options),
   getSessionPaths: (sessionId) => sessionStore.getPaths(sessionId),
+  resolveRemoteRecoveryConfig: async ({ host, token }) => {
+    const { config: userConfig } = await loadUserConfig({ includeProject: false });
+    const resolved = resolveRemoteServiceConfig({
+      cliHost: host,
+      cliToken: token,
+      userConfig,
+      env: process.env,
+    });
+    return { host: resolved.host, token: resolved.token };
+  },
 };
 
 const SESSION_OPTION_KEYS = new Set([
@@ -81,8 +104,9 @@ const SESSION_OPTION_KEYS = new Set([
   "live",
   "writeOutput",
   "browserTab",
+  "remoteHost",
+  "remoteToken",
 ]);
-
 export async function handleSessionCommand(
   sessionId: string | undefined,
   command: Command,
@@ -104,6 +128,13 @@ export async function handleSessionCommand(
     allOptions.browserTabRef ??
     command.getOptionValue?.("browserTab") ??
     command.getOptionValue?.("browserTabRef");
+  const remoteHost =
+    sessionOptions.remoteHost ?? allOptions.remoteHost ?? command.getOptionValue?.("remoteHost");
+  const remoteToken =
+    sessionOptions.remoteToken ?? allOptions.remoteToken ?? command.getOptionValue?.("remoteToken");
+  const resolveRemoteRecoveryConfig = createRemoteRecoveryConfigResolver(() =>
+    deps.resolveRemoteRecoveryConfig({ host: remoteHost, token: remoteToken }),
+  );
   if (sessionOptions.verboseRender) {
     process.env.ORACLE_VERBOSE_RENDER = "1";
   }
@@ -214,7 +245,19 @@ export async function handleSessionCommand(
     renderMarkdown,
     renderPrompt: !sessionOptions.hidePrompt,
     model: sessionOptions.model,
+    resolveRemoteRecoveryConfig,
   });
+}
+
+export function createSessionRemoteRecoveryResolver(
+  options: Pick<StatusOptions, "remoteHost" | "remoteToken">,
+): RemoteRecoveryConfigResolver {
+  return createRemoteRecoveryConfigResolver(() =>
+    defaultDependencies.resolveRemoteRecoveryConfig({
+      host: options.remoteHost,
+      token: options.remoteToken,
+    }),
+  );
 }
 
 export function formatSessionCleanupMessage(

@@ -7,6 +7,7 @@ import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.j
 import { appendArtifacts } from "../browser/artifacts.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
+import type { RemoteRecoveryConfigResolver } from "../remote/remoteServiceConfig.js";
 import type {
   BrowserRuntimeMetadata,
   BrowserSessionConfig,
@@ -54,6 +55,7 @@ export interface AutoReattachControllerOptions {
     log: (message: string) => void,
   ) => Promise<unknown>;
   maxAttempts?: number;
+  resolveRemoteRecoveryConfig?: RemoteRecoveryConfigResolver;
 }
 
 export async function autoReattachUntilComplete({
@@ -67,6 +69,7 @@ export async function autoReattachUntilComplete({
   log,
   writeAssistantOutput,
   maxAttempts,
+  resolveRemoteRecoveryConfig,
 }: AutoReattachControllerOptions): Promise<AutoReattachOutcome> {
   if (!runtime || !browserConfig) {
     log(dim("Auto-reattach disabled: missing runtime or browser config."));
@@ -144,6 +147,8 @@ export async function autoReattachUntilComplete({
           recoveryLockPath,
           acquireRecoveryLock: publication.acquireRecoveryLock,
           isRemotePublicationAcknowledged: publication.isRemotePublicationAcknowledged,
+          recoveryCleanup: { resolveRemoteRecoveryConfig },
+          pendingPromptCandidates: [runOptions.prompt, ...(runOptions.browserFollowUps ?? [])],
           runtimeHintCb: async (latestRuntime) => {
             const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
             authoritativeRuntime = persistedRuntime;

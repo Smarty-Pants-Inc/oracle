@@ -22,6 +22,7 @@ import {
 } from "../../src/remote/auth.js";
 import * as fsDurability from "../../src/fsDurability.js";
 import * as sessionManager from "../../src/sessionManager.js";
+import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
 
 import {
   resolveWindowsOpenSshExecutable,
@@ -500,6 +501,137 @@ describe("bridge host detached child transport", () => {
     }
   });
 
+  it("protects the Windows connection generation before publishing its credential", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-acl-order-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    const visibilityAtAcl: boolean[] = [];
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      visibilityAtAcl.push(
+        await fs.access(artifactPath).then(
+          () => true,
+          () => false,
+        ),
+      );
+      expect(scope.storeDirectory).toBe(tempDir);
+      expect(scope.integrityKeyDirectory).toBe(tempDir);
+      expect(scope.integrityKeyPath).toBe(artifactPath);
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await runBridgeHost(
+        { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+        {
+          spawn: () => harness.child,
+          backgroundPlatform: "win32",
+          windowsPrivateTreeAuthority,
+          generateReadinessNonce: () => READINESS_NONCE,
+        },
+      );
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(2);
+      expect(
+        windowsPrivateTreeAuthority.mock.calls.map(([scope]) => scope.initializeIntegrityKey),
+      ).toEqual([false, true]);
+      expect(visibilityAtAcl).toEqual([false, true]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes an unpublished Windows credential when final ACL verification fails", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-acl-failure-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    let calls = 0;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) throw new Error("injected ACL failure");
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            backgroundPlatform: "win32",
+            windowsPrivateTreeAuthority,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toThrow("injected ACL failure");
+      await expect(fs.access(artifactPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(harness.kill).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a replaced Windows connection generation during ACL-failure cleanup", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-acl-replaced-"));
+    const retiredDir = `${tempDir}-retired`;
+    const artifactPath = path.join(tempDir, "connection.json");
+    const replacement = '{"replacement":true}\n';
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    let calls = 0;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      calls += 1;
+      if (calls !== 2) return;
+      await fs.rename(tempDir, retiredDir);
+      await fs.mkdir(tempDir);
+      await fs.writeFile(artifactPath, replacement);
+      throw new Error("injected ACL replacement failure");
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            backgroundPlatform: "win32",
+            windowsPrivateTreeAuthority,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toThrow("injected ACL replacement failure");
+      await expect(fs.readFile(artifactPath, "utf8")).resolves.toBe(replacement);
+      await expect(
+        fs.readFile(path.join(retiredDir, "connection.json"), "utf8"),
+      ).resolves.toContain(MODERN_TOKEN);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(retiredDir, { recursive: true, force: true });
+    }
+  });
+
   it.runIf(process.platform === "win32")(
     "kills and waits for the raw child when Job assignment throws after start",
     async () => {
@@ -807,10 +939,10 @@ describe("bridge host detached child transport", () => {
     );
     const durableWrite = sessionManager.writeFileAtomicDurable;
     let jobDrained = false;
-    let rollbackObserved = false;
+    let unexpectedArtifactRestore = false;
     vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
       async (targetPath, data, mode) => {
-        if (targetPath === artifactPath && jobDrained) rollbackObserved = true;
+        if (targetPath === artifactPath && jobDrained) unexpectedArtifactRestore = true;
         await durableWrite(targetPath, data, mode);
         if (targetPath === pidPath && !jobDrained) {
           jobDrained = true;
@@ -833,7 +965,7 @@ describe("bridge host detached child transport", () => {
         ),
       ).rejects.toThrow(/exited during state publication/i);
       expect(jobDrained).toBe(true);
-      expect(rollbackObserved).toBe(true);
+      expect(unexpectedArtifactRestore).toBe(false);
       expect(harness.kill).not.toHaveBeenCalled();
       expect(spawnChild).toHaveBeenCalledOnce();
       expect(spawnChild.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());

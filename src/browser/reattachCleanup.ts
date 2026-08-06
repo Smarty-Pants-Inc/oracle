@@ -19,6 +19,7 @@ import {
   projectBrowserCaptureCleanupRuntime,
   projectBrowserCaptureFinalization,
 } from "./ownedBrowserResources.js";
+import { hasPendingPromptEpoch } from "./reattachability.js";
 import type { BrowserLogger } from "./types.js";
 
 export {
@@ -46,6 +47,12 @@ export async function finalizeRecoveredRuntime(
   deps: ReattachCleanupDeps = {},
   mode: ReattachSettlementMode = "finalize",
 ): Promise<ReattachFinalizationResult> {
+  if (hasPendingPromptEpoch(runtime)) {
+    return pendingFinalization(
+      runtime,
+      "Pending prompt dispatch must be reconciled before browser recovery cleanup.",
+    );
+  }
   if (
     mode === "finalize" &&
     !runtime.recoveryCleanupResult?.settlementMode &&

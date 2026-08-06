@@ -228,6 +228,7 @@ async function recoverTransaction(
   try {
     recovered = await params.resumeBrowser(recoveryRuntime, record.browserConfig, params.logger, {
       sessionId: record.transactionToken,
+      pendingPromptSha256Authorities: record.requestIdentity.acceptedPromptSha256,
       runtimeHintCb: async (runtime) => {
         if (runtime.recoveryCleanupResult?.settlementMode) {
           await params.transactionStore.persistSettlementRuntime(record.transactionToken, runtime);

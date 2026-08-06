@@ -61,9 +61,29 @@ export interface CapturedResultPublicationAdapters {
   assertFinalLiveness: () => void;
 }
 
+export type CapturedResultPublicationPhase =
+  | "capture-preparation"
+  | "durable-persistence"
+  | "archive"
+  | "final-prompt-identity"
+  | "final-target-liveness"
+  | "safe";
+
 export interface CapturedResultPublicationState {
-  runStatus: "attempted" | "complete";
+  publicationPhase: CapturedResultPublicationPhase;
   publishableCapture: BrowserRunResult | null;
+}
+
+export function isCapturedResultPublicationInFlight(
+  state: CapturedResultPublicationState,
+): boolean {
+  return state.publicationPhase !== "safe";
+}
+
+export function capturedResultRunStatus(
+  state: CapturedResultPublicationState,
+): "attempted" | "complete" {
+  return isCapturedResultPublicationInFlight(state) ? "attempted" : "complete";
 }
 
 export interface CapturedBrowserResultPublicationContext {
@@ -252,13 +272,14 @@ export async function publishCapturedBrowserResult(
       code: "prompt-epoch-evidence-missing",
     });
   }
+  context.state.publicationPhase = "capture-preparation";
   const prepared =
     context.captured.kind === "deep-research"
       ? await prepareDeepResearchCapture(context, promptLocator)
       : await prepareConversationCapture(context, promptLocator);
 
-  context.state.runStatus = "complete";
   context.state.publishableCapture = prepared.capture;
+  context.state.publicationPhase = "durable-persistence";
   await persistPreArchiveCapture(
     context.options.preArchiveCaptureCb,
     prepared.capture,
@@ -268,6 +289,7 @@ export async function publishCapturedBrowserResult(
     code: "browser-archive-pending",
     context: "ChatGPT conversation archive",
   });
+  context.state.publicationPhase = "archive";
   const archive = await maybeArchiveCompletedConversation({
     Runtime: context.Runtime,
     logger: context.logger,
@@ -287,11 +309,19 @@ export async function publishCapturedBrowserResult(
     code: "browser-final-identity-verification-pending",
     context: "final committed-turn identity verification",
   });
+  context.state.publicationPhase = "final-prompt-identity";
   await assertPostArchivePromptEpochCurrent(context.Runtime, promptLocator, archive);
   context.adapters.setPendingWork({
     code: "browser-final-target-liveness-pending",
     context: "final Chrome target liveness confirmation",
   });
+  context.state.publicationPhase = "final-target-liveness";
   context.adapters.assertFinalLiveness();
-  return context.lifecycle.issueCapture(capture);
+  context.state.publicationPhase = "safe";
+  try {
+    return context.lifecycle.issueCapture(capture);
+  } catch (error) {
+    context.state.publicationPhase = "final-target-liveness";
+    throw error;
+  }
 }

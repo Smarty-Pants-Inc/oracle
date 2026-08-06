@@ -223,7 +223,7 @@ describe("retained Chrome target close capabilities", () => {
     ).toBe(false);
   });
 
-  test("does not promote persisted live-only target capabilities to restart authority", async () => {
+  test("promotes authenticated process-bound target capabilities to restart authority", async () => {
     const browserWSEndpoint = "ws://service.example:9222/devtools/browser/live-generation";
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
@@ -257,6 +257,7 @@ describe("retained Chrome target close capabilities", () => {
     expect(capability).toMatchObject({
       targetId: "owned-target",
       browserWSEndpoint,
+      ownerIdSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
     expect(
       [
@@ -278,11 +279,18 @@ describe("retained Chrome target close capabilities", () => {
           },
         },
       ].map((candidate) =>
-        hasRestartDurableChromeTargetCleanupAuthority({
-          recoveryCleanupResources: [candidate],
-        }),
+        hasRestartDurableChromeTargetCleanupAuthority(
+          { recoveryCleanupResources: [candidate] },
+          "test-owner",
+        ),
       ),
-    ).toEqual([false, false, false]);
+    ).toEqual([true, true, false]);
+    expect(
+      hasRestartDurableChromeTargetCleanupAuthority(
+        { recoveryCleanupResources: [resource] },
+        "different-owner",
+      ),
+    ).toBe(false);
     await expect(
       closeChromeTargetWithRetainedCapability({
         ownerId: "test-owner",

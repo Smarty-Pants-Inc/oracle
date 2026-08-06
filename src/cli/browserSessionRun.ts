@@ -8,13 +8,21 @@ import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
 } from "../browser/reattachability.js";
-import { ensureSessionArtifacts, runBrowserSessionExecution } from "../browser/sessionRunner.js";
+import {
+  ensureSessionArtifacts,
+  runBrowserSessionExecution,
+  type BrowserPreArchiveCapture,
+} from "../browser/sessionRunner.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../browser/types.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import { hasBrowserRecoveryAuthority } from "./browserRuntimeAuthority.js";
-import { persistDurableBrowserAnswer, publishCompletedBrowserCapture } from "./durableAnswer.js";
+import {
+  BrowserPublicationTransaction,
+  persistDurableBrowserAnswer,
+  publishCompletedBrowserCapture,
+} from "./durableAnswer.js";
 import { formatError } from "./errorUtils.js";
 import { sendSessionNotification } from "./notifier.js";
 import { createBrowserLogger, dim, writeAssistantOutput } from "./sessionRunSupport.js";
@@ -37,6 +45,7 @@ export async function runBrowserSession(
       startedAt: new Date().toISOString(),
     });
   }
+  const publicationTransaction = new BrowserPublicationTransaction();
   const runnerDeps = {
     ...browserDeps,
     persistRuntimeHint: async (
@@ -54,6 +63,31 @@ export async function runBrowserSession(
         browser,
       });
       state.currentBrowser = browser;
+    },
+    persistPreArchiveCapture: async ({ result, runtime, usage }: BrowserPreArchiveCapture) => {
+      const authoritativeRuntime = state.runtimeAuthority.observeHint(runtime);
+      const browser = {
+        config: browserConfig,
+        runtime: authoritativeRuntime,
+        ...(result.modelSelection ? { modelSelection: result.modelSelection } : {}),
+      };
+      const receipt = await publicationTransaction.prepareDurableCapture({
+        answer: {
+          sessionId: sessionMeta.id,
+          answer: result.answerMarkdown || result.answerText,
+        },
+        runtime: authoritativeRuntime,
+        browser,
+        existingArtifacts: appendArtifacts(sessionMeta.artifacts, result.artifacts ?? []),
+        usage,
+        elapsedMs: result.tookMs,
+        response: { status: "completed" },
+        model: modelForStatus,
+        persistAnswer: persistDurableBrowserAnswer,
+        projectRuntime: (candidate) => state.runtimeAuthority.observeHint(candidate),
+      });
+      state.currentBrowser = browser;
+      state.durableAnswerReceipt = receipt;
     },
   };
   const result = await runBrowserSessionExecution(
@@ -110,6 +144,7 @@ export async function runBrowserSession(
       };
       return authoritativeRuntime;
     },
+    publication: publicationTransaction,
   });
 
   state.durableAnswerReceipt = publication.receipt;
@@ -212,7 +247,10 @@ async function settleCleanupOnlyRestart(
     {
       ownerId: sessionMeta.id,
       recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
-      recoveryCleanup: { retainChromeEndpointAuthority },
+      recoveryCleanup: {
+        retainChromeEndpointAuthority,
+        resolveRemoteRecoveryConfig: context.browserDeps?.resolveRemoteRecoveryConfig,
+      },
       isRemotePublicationAcknowledged: () => false,
       loadRuntimeUnderLock: async () =>
         (await sessionStore.readSession(sessionMeta.id))?.browser?.runtime ?? restartRuntime,

@@ -3,8 +3,10 @@ import type { CommittedPromptEpochLocator } from "../../src/browser/reattachabil
 import type { BrowserRunLifecycleController } from "../../src/browser/runLifecycle.js";
 import type { BrowserLogger, BrowserRunResult } from "../../src/browser/types.js";
 import {
+  isCapturedResultPublicationInFlight,
   publishCapturedBrowserResult,
   type CapturedBrowserResult,
+  type CapturedResultPublicationState,
 } from "../../src/browser/capturedResultPublicationCoordinator.js";
 
 const mocks = vi.hoisted(() => ({ events: [] as string[] }));
@@ -93,28 +95,41 @@ const promptLocator: CommittedPromptEpochLocator = {
   conversationUrls: ["https://chatgpt.com/c/conversation-1"],
 };
 
-async function publish(captured: CapturedBrowserResult): Promise<BrowserRunResult> {
+async function publish(
+  captured: CapturedBrowserResult,
+  overrides: {
+    state?: CapturedResultPublicationState;
+    preArchiveCaptureCb?: (capture: BrowserRunResult) => Promise<void> | void;
+  } = {},
+): Promise<BrowserRunResult> {
   const runtime = { browserTransport: "cdp" as const };
+  const state = overrides.state ?? {
+    publicationPhase: "capture-preparation" as const,
+    publishableCapture: null,
+  };
   const lifecycle = {
     runtime: () => runtime,
     issueCapture: (capture: BrowserRunResult) => {
       mocks.events.push("issue-capture");
+      expect(state.publicationPhase).toBe("safe");
       return { ...capture, runtime };
     },
   } as unknown as BrowserRunLifecycleController;
   const logger = (() => undefined) as BrowserLogger;
   return publishCapturedBrowserResult({
     captured,
-    state: { runStatus: "attempted", publishableCapture: null },
+    state,
     lifecycle,
     Network: {} as never,
     Runtime: {} as never,
     options: {
       prompt: "prompt",
       sessionId: "session",
-      preArchiveCaptureCb: async () => {
-        mocks.events.push("pre-archive-capture");
-      },
+      preArchiveCaptureCb:
+        overrides.preArchiveCaptureCb ??
+        (async () => {
+          mocks.events.push("pre-archive-capture");
+        }),
     },
     config: {} as never,
     promptText: "prompt",
@@ -140,6 +155,73 @@ async function publish(captured: CapturedBrowserResult): Promise<BrowserRunResul
 describe("captured browser result publication", () => {
   beforeEach(() => {
     mocks.events.length = 0;
+  });
+
+  test("keeps termination in flight until the exact pre-archive answer is durable", async () => {
+    const state: CapturedResultPublicationState = {
+      publicationPhase: "capture-preparation",
+      publishableCapture: null,
+    };
+    const durableWrite = Promise.withResolvers<void>();
+    let durableAnswer: string | undefined;
+    const publication = publish(
+      {
+        kind: "conversation",
+        promptLocator,
+        answerText: "exact local answer",
+        answerMarkdown: "exact local answer",
+        answerHtml: "<p>exact local answer</p>",
+        followUpCount: 0,
+      },
+      {
+        state,
+        preArchiveCaptureCb: async (capture) => {
+          await durableWrite.promise;
+          durableAnswer = capture.answerMarkdown;
+        },
+      },
+    );
+
+    await vi.waitFor(() => expect(state.publicationPhase).toBe("durable-persistence"));
+    expect(state.publishableCapture?.answerMarkdown).toBe("exact local answer\n\nimage saved");
+    expect(isCapturedResultPublicationInFlight(state)).toBe(true);
+
+    durableWrite.resolve();
+    await expect(publication).resolves.toMatchObject({
+      answerMarkdown: "exact local answer\n\nimage saved",
+    });
+    expect(durableAnswer).toBe("exact local answer\n\nimage saved");
+    expect(state.publicationPhase).toBe("safe");
+    expect(isCapturedResultPublicationInFlight(state)).toBe(false);
+  });
+
+  test("keeps a rejected pre-archive callback in flight with the exact capture recoverable", async () => {
+    const state: CapturedResultPublicationState = {
+      publicationPhase: "capture-preparation",
+      publishableCapture: null,
+    };
+    await expect(
+      publish(
+        {
+          kind: "deep-research",
+          promptLocator,
+          answerText: "remote exact answer",
+          answerMarkdown: "remote exact answer",
+        },
+        {
+          state,
+          preArchiveCaptureCb: async () => {
+            throw new Error("remote durable callback rejected");
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "pre-archive-capture-persistence-failed" },
+    });
+    expect(state.publicationPhase).toBe("durable-persistence");
+    expect(isCapturedResultPublicationInFlight(state)).toBe(true);
+    expect(state.publishableCapture).toMatchObject({ answerMarkdown: "remote exact answer" });
+    expect(mocks.events).not.toContain("issue-capture");
   });
 
   test("publishes conversation artifacts only after every prompt-authority check", async () => {

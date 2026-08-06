@@ -7,6 +7,7 @@ import type {
   SessionUserErrorMetadata,
 } from "../sessionStore.js";
 import type { OracleResponseMetadata } from "../oracle.js";
+import type { RemoteRecoveryConfigResolver } from "../remote/remoteServiceConfig.js";
 import {
   formatBrowserModelSelectionEvidence,
   formatSessionBrowserModelWithRequestedKey,
@@ -132,6 +133,7 @@ export interface AttachSessionOptions {
   model?: string;
   /** Propagate a terminal worker failure through the attached CLI process. */
   propagateFailure?: boolean;
+  resolveRemoteRecoveryConfig?: RemoteRecoveryConfigResolver;
 }
 
 type LiveRenderState = {
@@ -176,7 +178,9 @@ export async function attachSession(
   const initialStatus = metadata.status;
   const wantsRender = Boolean(options?.renderMarkdown);
   const isVerbose = Boolean(process.env.ORACLE_VERBOSE_RENDER);
-  metadata = await orchestrateBrowserAttachAuthority(sessionId, metadata);
+  metadata = await orchestrateBrowserAttachAuthority(sessionId, metadata, {
+    resolveRemoteRecoveryConfig: options?.resolveRemoteRecoveryConfig,
+  });
   if (!options?.suppressMetadata) {
     const reattachLine = buildReattachLine(metadata);
     if (reattachLine) {

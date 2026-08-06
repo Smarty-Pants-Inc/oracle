@@ -1,7 +1,19 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
+import {
+  lstat,
+  link,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+  readFile,
+  stat,
+} from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
 import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
@@ -18,6 +30,7 @@ import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
 } from "../../src/remote/types.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import { __test__ as serverExecutionTest } from "../../src/remote/serverExecution.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import {
   CAN_LISTEN_LOCALHOST,
@@ -88,7 +101,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             }
             const fallbackStored = await readFile(fallbackAttachment.path, "utf8");
             expect(fallbackStored).toBe("fallback world");
-            options.log?.("uploading attachment");
+            options.log?.(`uploading attachment ${attachment.path}`);
             const result: BrowserRunResult = {
               answerText: "hi",
               answerMarkdown: "hi",
@@ -125,6 +138,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       });
 
       expect(clientLogs.some((entry) => entry.includes("uploading attachment"))).toBe(true);
+      expect(clientLogs.join("\n")).not.toContain("oracle-serve-");
+      expect(clientLogs.join("\n")).toContain("[host-path]");
       expect(result.answerText).toBe("hi");
       expect(runLog).toEqual(["remote"]);
       expect(finalize).not.toHaveBeenCalled();
@@ -529,4 +544,136 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       }
     },
   );
+  test("rejects precreated scratch symlinks and directories", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-entry-"));
+    const target = path.join(directory, "target.txt");
+    const attachment = {
+      fileName: "note.txt",
+      displayPath: "note.txt",
+      sizeBytes: 5,
+      contentBase64: Buffer.from("hello").toString("base64"),
+    };
+    try {
+      await writeFile(target, "target");
+      await symlink(target, path.join(directory, "1-note.txt"));
+      await expect(
+        serverExecutionTest.materializeRemoteAttachments([attachment], directory, "attachment"),
+      ).rejects.toThrow("Remote attachment scratch materialization failed");
+      await rm(path.join(directory, "1-note.txt"));
+      await mkdir(path.join(directory, "1-note.txt"));
+      await expect(
+        serverExecutionTest.materializeRemoteAttachments([attachment], directory, "attachment"),
+      ).rejects.toThrow("Remote attachment scratch materialization failed");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects replaced remote scratch attachments", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-file-"));
+    const generation = await serverExecutionTest.createRemoteScratchGeneration(
+      root,
+      "attachments-",
+    );
+    const attachment = {
+      fileName: "note.txt",
+      displayPath: "note.txt",
+      sizeBytes: 5,
+      contentBase64: Buffer.from("hello").toString("base64"),
+    };
+    try {
+      const materialized = await serverExecutionTest.materializeRemoteAttachments(
+        [attachment],
+        generation.path,
+        "attachment",
+      );
+      const file = materialized.files[0];
+      if (!file) throw new Error("missing scratch file");
+      await rm(file.path);
+      await writeFile(file.path, "other", { mode: 0o600 });
+      await expect(
+        serverExecutionTest.assertRemoteScratchFiles(materialized.files),
+      ).rejects.toThrow("Remote attachment scratch file changed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "rejects hard-linked remote scratch attachments",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-link-"));
+      const generation = await serverExecutionTest.createRemoteScratchGeneration(
+        root,
+        "attachments-",
+      );
+      const attachment = {
+        fileName: "note.txt",
+        displayPath: "note.txt",
+        sizeBytes: 5,
+        contentBase64: Buffer.from("hello").toString("base64"),
+      };
+      try {
+        const materialized = await serverExecutionTest.materializeRemoteAttachments(
+          [attachment],
+          generation.path,
+          "attachment",
+        );
+        const file = materialized.files[0];
+        if (!file) throw new Error("missing scratch file");
+        await link(file.path, path.join(generation.path, "alias.txt"));
+        await expect(
+          serverExecutionTest.assertRemoteScratchFiles(materialized.files),
+        ).rejects.toThrow("Remote attachment scratch file changed");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("rejects and retains a substituted scratch generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-cleanup-"));
+    const run = await serverExecutionTest.createRemoteScratchGeneration(root, "run-");
+    const generation = await serverExecutionTest.createRemoteScratchGeneration(
+      run.path,
+      "attachments-",
+    );
+    const attachment = {
+      fileName: "note.txt",
+      displayPath: "note.txt",
+      sizeBytes: 5,
+      contentBase64: Buffer.from("hello").toString("base64"),
+    };
+    try {
+      const materialized = await serverExecutionTest.materializeRemoteAttachments(
+        [attachment],
+        generation.path,
+        "attachment",
+      );
+      const moved = `${generation.path}-moved`;
+      await rename(generation.path, moved);
+      await mkdir(generation.path, { mode: 0o700 });
+      await expect(serverExecutionTest.assertRemoteScratchGeneration(generation)).rejects.toThrow(
+        "Remote attachment scratch generation changed",
+      );
+      await serverExecutionTest.releaseRemoteScratchRun(run, [
+        { generation, files: materialized.files },
+      ]);
+      expect((await lstat(generation.path)).isDirectory()).toBe(true);
+      expect((await lstat(moved)).isDirectory()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("projects host artifact paths out of remote messages", () => {
+    const scratchPath = "/private/var/folders/test/oracle-serve-run/attachments-123/1-note.txt";
+    const artifactPath = "C:\\Users\\oracle\\artifacts\\remote-token\\result.zip";
+    const projected = serverExecutionTest.projectRemoteHostText(
+      `attachment ${scratchPath} failed; artifact ${artifactPath} failed`,
+    );
+    expect(projected).not.toContain(scratchPath);
+    expect(projected).not.toContain(artifactPath);
+    expect(projected).toContain("[host-path]");
+  });
 });

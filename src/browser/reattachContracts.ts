@@ -16,6 +16,7 @@ import type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattach
 import type { ReattachSettlementMode } from "./reattachCleanupTypes.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
 import type { ChromeClient } from "./types.js";
+import type { ProviderDomAdapter } from "./providerDomFlow.js";
 
 export interface ReattachCapture extends Partial<
   Omit<BrowserRunResult, "answerText" | "answerMarkdown">
@@ -50,6 +51,9 @@ export interface ReattachDeps {
   isRemotePublicationAcknowledged?: () => boolean;
   resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
   runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+  pendingPromptCandidates?: readonly string[];
+  pendingPromptSha256Authorities?: readonly string[];
+  pendingPromptProvider?: ProviderDomAdapter;
   loadRuntimeUnderLock?: () => Promise<BrowserRuntimeMetadata>;
   persistFinalizationResult?: (
     result: ReattachFinalizationResult,

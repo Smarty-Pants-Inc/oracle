@@ -22,6 +22,7 @@ import {
   writeBridgeHostReadinessPayload,
 } from "./childProtocol.js";
 import type { BridgeHostCredentials, BridgeHostSpawn } from "./childProtocol.js";
+import type { WindowsPrivateTreeAuthority } from "../../remote/windowsPrivateTreeAcl.js";
 import { startReverseTunnel } from "./reverseTunnel.js";
 import type { ReverseTunnelHandle, StartReverseTunnel } from "./reverseTunnel.js";
 
@@ -59,6 +60,7 @@ export interface BridgeHostDeps {
   backgroundPlatform?: NodeJS.Platform;
   tunnelPlatform?: NodeJS.Platform;
   tunnelSpawn?: BridgeHostSpawn;
+  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
 }
 
 export async function runBridgeHost(
@@ -153,6 +155,7 @@ export async function runBridgeHost(
         readinessNonce: (deps.generateReadinessNonce ?? randomUUID)(),
         readinessTimeoutMs: deps.readinessTimeoutMs ?? BRIDGE_HOST_READINESS_TIMEOUT_MS,
         platform: deps.backgroundPlatform,
+        windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
       },
     );
     console.log(chalk.green(`Bridge host running in background (pid ${result.pid})`));
@@ -210,18 +213,25 @@ export async function runBridgeHost(
               status: "ready",
             });
           } else {
-            await publishReadyBridgeConnection(writeConnectionPath, connectionInput, (artifact) =>
-              printForegroundReady({
-                options,
-                artifact,
-                writeConnectionPath,
-                bindHost,
-                bindPort,
-                sshTarget,
-                sshRemotePort,
-                legacyToken: credentials.legacyToken,
-                token: credentials.token,
-              }),
+            await publishReadyBridgeConnection(
+              writeConnectionPath,
+              connectionInput,
+              (artifact) =>
+                printForegroundReady({
+                  options,
+                  artifact,
+                  writeConnectionPath,
+                  bindHost,
+                  bindPort,
+                  sshTarget,
+                  sshRemotePort,
+                  legacyToken: credentials.legacyToken,
+                  token: credentials.token,
+                }),
+              {
+                platform: deps.backgroundPlatform,
+                windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
+              },
             );
           }
           ready = true;

@@ -119,6 +119,79 @@ describe("browser recovery cleanup", () => {
     vi.resetModules();
   });
 
+  test.each(["harvest", "live"] as const)(
+    "rejects %s before probing local Chrome for a persisted remote transaction",
+    async (mode) => {
+      const collectChatGptTabs = vi.fn();
+      const harvestChatGptTab = vi.fn();
+      const recoverConversationTab = vi.fn();
+      vi.doMock("../../src/browser/liveTabs.js", () => ({
+        collectChatGptTabs,
+        DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
+        DEFAULT_REMOTE_CHROME_PORT: 9222,
+        extractConversationIdFromUrl: vi.fn(),
+        formatBrowserTabState: vi.fn(),
+        harvestChatGptTab,
+        sessionMatchesTab: vi.fn(),
+      }));
+      vi.doMock("../../src/browser/recoverConversation.js", () => ({
+        isRecoveredConversationHarvestReady: vi.fn(),
+        recoveredConversationHarvestMatchesPromptEpoch: vi.fn(),
+        recoverConversationTab,
+      }));
+      const remoteMeta = {
+        ...baseMeta,
+        status: "error",
+        browser: {
+          config: {},
+          runtime: {
+            recoveryCleanupResources: [
+              {
+                remoteRecovery: {
+                  protocolVersion: 3,
+                  host: "127.0.0.1:9443",
+                  transactionToken: "b".repeat(64),
+                  state: "pre-receipt",
+                  requestIdentity: {
+                    acceptedPromptSha256: ["c".repeat(64)],
+                    followUpOrdinal: 0,
+                    remainingFollowUps: 0,
+                  },
+                },
+                recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+              },
+            ],
+          },
+        },
+      } as unknown as SessionMetadata;
+      vi.doMock("../../src/sessionStore.js", () => ({
+        sessionStore: {
+          readSession: vi.fn(async () => remoteMeta),
+        },
+      }));
+
+      const browserTabs = await import("../../src/cli/browserTabs.js");
+      const operation =
+        mode === "harvest"
+          ? browserTabs.harvestSessionBrowserOutput("sess-recover", { quietOutput: true })
+          : browserTabs.liveTailSessionBrowserOutput("sess-recover", { stallThresholdMs: 0 });
+
+      await expect(operation).rejects.toMatchObject({
+        message: expect.stringContaining(
+          'oracle session "sess-recover" --remote-host "127.0.0.1:9443" --remote-token <64-lowercase-hex>',
+        ),
+        details: {
+          stage: "remote-session-recovery",
+          code: "remote-browser-tab-probe-rejected",
+          recoverableDisconnect: true,
+        },
+      });
+      expect(collectChatGptTabs).not.toHaveBeenCalled();
+      expect(harvestChatGptTab).not.toHaveBeenCalled();
+      expect(recoverConversationTab).not.toHaveBeenCalled();
+    },
+  );
+
   test("awaits recovered-tab cleanup after normal harvest completion", async () => {
     const cleanup = vi.fn(async (_mode: string, pendingRuntime: BrowserRuntimeMetadata) => ({
       status: "completed" as const,

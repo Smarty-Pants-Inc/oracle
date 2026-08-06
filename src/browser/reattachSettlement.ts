@@ -18,6 +18,7 @@ import {
 } from "./reattachAcquisition.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 import type { CommittedPromptEpochLocator } from "./reattachability.js";
+import { hasPendingPromptEpoch } from "./reattachability.js";
 import { recoveryCleanupResourceKey } from "./recoveryCleanupIdentity.js";
 import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
 
@@ -266,6 +267,14 @@ export async function settleBrowserRecoveryCleanup(
     return {
       finalization,
       persistence: { status: "pending", error: message, runtime: finalization.runtime },
+    };
+  }
+  if (hasPendingPromptEpoch(currentRuntime)) {
+    await recoveryLock.release().catch(() => undefined);
+    const error = "Pending prompt dispatch must be reconciled before browser recovery settlement.";
+    return {
+      finalization: { status: "pending", runtime: currentRuntime, error },
+      persistence: { status: "persisted" },
     };
   }
 

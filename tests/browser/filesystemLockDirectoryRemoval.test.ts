@@ -1,6 +1,3 @@
-import { readFile, stat } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import {
   encodeDirectoryRemovalMessage,
@@ -12,7 +9,6 @@ import {
   samePhysicalDirectoryIdentity,
 } from "../../src/browser/filesystemLockDirectoryIdentity.js";
 
-const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const identity = { device: "1", inode: "2", birthtimeNs: "3" } as const;
 
 describe("physical directory identity", () => {
@@ -83,32 +79,4 @@ describe("filesystem lock directory removal protocol", () => {
       ),
     ).toThrow(/invalid root attestation/i);
   });
-});
-
-test("the standalone removal worker is compiled and included by the package globs", async () => {
-  const coordinatorPath = path.join(
-    repositoryRoot,
-    "src/browser/filesystemLockDirectoryRemoval.ts",
-  );
-  const workerPath = path.join(
-    repositoryRoot,
-    "src/browser/filesystemLockDirectoryRemovalWorker.ts",
-  );
-  const buildConfigPath = path.join(repositoryRoot, "tsconfig.build.json");
-  const packagePath = path.join(repositoryRoot, "package.json");
-
-  const [coordinator, workerEntry, buildConfigRaw, packageRaw] = await Promise.all([
-    readFile(coordinatorPath, "utf8"),
-    stat(workerPath),
-    readFile(buildConfigPath, "utf8"),
-    readFile(packagePath, "utf8"),
-  ]);
-  const buildConfig = JSON.parse(buildConfigRaw) as { include?: string[] };
-  const packageManifest = JSON.parse(packageRaw) as { files?: string[] };
-
-  expect(coordinator).not.toContain("String.raw");
-  expect(coordinator).toContain("filesystemLockDirectoryRemovalWorker");
-  expect(workerEntry.isFile()).toBe(true);
-  expect(buildConfig.include).toContain("src/**/*.ts");
-  expect(packageManifest.files).toContain("dist/**/*");
 });

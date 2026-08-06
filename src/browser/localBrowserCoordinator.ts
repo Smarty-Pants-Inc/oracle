@@ -48,6 +48,7 @@ import {
 import { executeLocalPrompt } from "./localPromptExecution.js";
 import { captureLocalBrowserResponse } from "./localResponseExecution.js";
 import { publishLocalBrowserResult } from "./localResultPublication.js";
+import { isCapturedResultPublicationInFlight } from "./capturedResultPublicationCoordinator.js";
 
 export interface LocalBrowserRunContext {
   options: BrowserRunOptions;
@@ -98,7 +99,7 @@ export async function runLocalBrowserMode({
         (acquisition.manualLogin && acquisition.chromeOwnerDisposition === "preserve"),
       logger,
       {
-        isInFlight: () => state.runStatus !== "complete",
+        isInFlight: () => isCapturedResultPublicationInFlight(state),
         emitRuntimeHint,
         preserveUserDataDir: acquisition.manualLogin,
         // copy-profile is a throwaway copy of a signed-in profile; never leave it on disk.

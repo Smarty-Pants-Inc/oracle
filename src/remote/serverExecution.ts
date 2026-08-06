@@ -1,6 +1,9 @@
 import type http from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import type { BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type {
@@ -64,6 +67,144 @@ import {
   persistRemoteBrowserRuntime,
 } from "./serverTransactionRuntime.js";
 import type { RemoteServerOptions } from "./serverTypes.js";
+import {
+  capturePhysicalDirectoryIdentity,
+  samePhysicalDirectoryIdentity,
+  type PhysicalDirectoryIdentity,
+} from "../browser/filesystemLockDirectoryIdentity.js";
+import { samePhysicalFile } from "./transactionRecordStorage.js";
+
+interface RemoteScratchGeneration {
+  readonly path: string;
+  readonly identity: PhysicalDirectoryIdentity;
+}
+
+interface RemoteScratchFile {
+  readonly path: string;
+  readonly identity: BigIntStats;
+}
+
+interface MaterializedRemoteAttachments {
+  readonly attachments: BrowserAttachment[];
+  readonly files: readonly RemoteScratchFile[];
+}
+
+const remoteAttachmentOpenFlags =
+  constants.O_WRONLY |
+  constants.O_CREAT |
+  constants.O_EXCL |
+  (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
+
+function projectRemoteHostText(message: string): string {
+  return message
+    .replace(/(^|[\s("'])\/(?:[^\s/"']+\/)+[^\s"']*/gu, "$1[host-path]")
+    .replace(/(^|[\s("'])[A-Za-z]:\\(?:[^\s"']+\\)+[^\s"']*/gu, "$1[host-path]");
+}
+
+async function createRemoteScratchGeneration(
+  parent: string,
+  prefix: string,
+): Promise<RemoteScratchGeneration> {
+  const scratchPath = await mkdtemp(path.join(parent, prefix));
+  try {
+    await chmod(scratchPath, 0o700);
+    return { path: scratchPath, identity: await capturePhysicalDirectoryIdentity(scratchPath) };
+  } catch {
+    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
+    throw new Error("Remote attachment scratch generation could not be initialized");
+  }
+}
+
+async function assertRemoteScratchGeneration(generation: RemoteScratchGeneration): Promise<void> {
+  let current: PhysicalDirectoryIdentity;
+  try {
+    current = await capturePhysicalDirectoryIdentity(generation.path);
+  } catch {
+    throw new Error("Remote attachment scratch generation changed");
+  }
+  if (!samePhysicalDirectoryIdentity(current, generation.identity)) {
+    throw new Error("Remote attachment scratch generation changed");
+  }
+}
+
+function assertRemoteScratchFile(entry: BigIntStats, expected?: BigIntStats): void {
+  if (
+    !entry.isFile() ||
+    entry.isSymbolicLink() ||
+    entry.nlink !== 1n ||
+    (expected !== undefined && !samePhysicalFile(entry, expected))
+  ) {
+    throw new Error("Remote attachment scratch file changed");
+  }
+}
+
+async function writeRemoteScratchFile(
+  filePath: string,
+  payload: Buffer,
+): Promise<RemoteScratchFile> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(filePath, remoteAttachmentOpenFlags, 0o600);
+    await handle.writeFile(payload);
+    await handle.sync();
+    const identity = await handle.stat({ bigint: true });
+    assertRemoteScratchFile(identity);
+    if (identity.size !== BigInt(payload.byteLength)) {
+      throw new Error("Remote attachment scratch write did not preserve exact bytes");
+    }
+    const pathEntry = await lstat(filePath, { bigint: true });
+    assertRemoteScratchFile(pathEntry, identity);
+    return { path: filePath, identity };
+  } catch {
+    throw new Error("Remote attachment scratch materialization failed");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function assertRemoteScratchFiles(files: readonly RemoteScratchFile[]): Promise<void> {
+  for (const file of files) {
+    let entry: BigIntStats;
+    try {
+      entry = await lstat(file.path, { bigint: true });
+    } catch {
+      throw new Error("Remote attachment scratch file changed");
+    }
+    assertRemoteScratchFile(entry, file.identity);
+  }
+}
+
+async function removeRemoteScratchGeneration(
+  generation: RemoteScratchGeneration,
+  files: readonly RemoteScratchFile[],
+): Promise<boolean> {
+  try {
+    await assertRemoteScratchGeneration(generation);
+    await assertRemoteScratchFiles(files);
+    await rm(generation.path, { recursive: true, force: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseRemoteScratchRun(
+  run: RemoteScratchGeneration,
+  attachments: readonly {
+    generation: RemoteScratchGeneration;
+    files: readonly RemoteScratchFile[];
+  }[],
+): Promise<void> {
+  for (const attachment of attachments) {
+    await removeRemoteScratchGeneration(attachment.generation, attachment.files);
+  }
+  try {
+    await assertRemoteScratchGeneration(run);
+    await rmdir(run.path);
+  } catch {
+    // A changed or nonempty generation is deliberately retained rather than deleting a replacement.
+  }
+}
 
 export async function handleRemoteRunRequest(params: {
   req: http.IncomingMessage;
@@ -146,7 +287,9 @@ export async function handleRemoteRunRequest(params: {
   } catch (error) {
     const failed = await params.transactionStore.read(params.transactionToken);
     params.logger(
-      `[serve] Run ${runId} failed artifact namespace initialization before browser work: ${error instanceof Error ? error.message : String(error)}`,
+      projectRemoteHostText(
+        `[serve] Run ${runId} failed artifact namespace initialization before browser work: ${error instanceof Error ? error.message : String(error)}`,
+      ),
     );
     sendJson(params.res, 500, {
       error: "remote_artifact_namespace_initialization_failed",
@@ -156,17 +299,24 @@ export async function handleRemoteRunRequest(params: {
     return;
   }
 
-  params.logger(
+  const log = (message: string): void => params.logger(projectRemoteHostText(message));
+  log(
     `[serve] Accepted run ${runId} from ${formatSocket(params.req)} (prompt ${payload.prompt.length} chars)`,
   );
   const runStartedAt = Date.now();
-  let runDir: string | null = null;
+  let scratchRun: RemoteScratchGeneration | null = null;
+  const scratchAttachments: {
+    generation: RemoteScratchGeneration;
+    files: readonly RemoteScratchFile[];
+  }[] = [];
   let legacyResponseHeartbeat: NodeJS.Timeout | undefined;
   params.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
   const sendEvent = (event: RemoteRunEvent | RemoteLegacyRunEvent): boolean => {
     if (params.res.destroyed || params.res.writableEnded) return false;
-    return params.res.write(`${JSON.stringify(event)}\n`);
+    const projected =
+      event.type === "log" ? { ...event, message: projectRemoteHostText(event.message) } : event;
+    return params.res.write(`${JSON.stringify(projected)}\n`);
   };
   if (params.protocol === "legacy-text-v1" && payload.options.heartbeatIntervalMs) {
     const intervalMs = Math.max(25, payload.options.heartbeatIntervalMs);
@@ -269,7 +419,7 @@ export async function handleRemoteRunRequest(params: {
           message:
             "[browser] Answer captured; generated files require manual copy from the remote host.",
         });
-        params.logger(
+        log(
           `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
         );
       }
@@ -297,7 +447,7 @@ export async function handleRemoteRunRequest(params: {
           modelSelection: result.modelSelection,
           artifacts: registrations,
         });
-        params.logger(
+        log(
           `[serve] Run ${runId} published its captured text without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
         );
       }
@@ -308,14 +458,21 @@ export async function handleRemoteRunRequest(params: {
   let capture: BrowserRunTransaction | null = null;
   let durableCapture = false;
   try {
-    runDir = await mkdtemp(path.join(tmpdir(), `oracle-serve-${runId}-`));
-    const attachmentDir = path.join(runDir, "attachments");
-    await mkdir(attachmentDir, { recursive: true });
-    const attachments = await materializeRemoteAttachments(
+    scratchRun = await createRemoteScratchGeneration(tmpdir(), `oracle-serve-${runId}-`);
+    const attachmentGeneration = await createRemoteScratchGeneration(
+      scratchRun.path,
+      "attachments-",
+    );
+    const materializedAttachments = await materializeRemoteAttachments(
       payload.attachments,
-      attachmentDir,
+      attachmentGeneration.path,
       "attachment",
     );
+    scratchAttachments.push({
+      generation: attachmentGeneration,
+      files: materializedAttachments.files,
+    });
+    const attachments = materializedAttachments.attachments;
     let fallbackSubmission:
       | {
           prompt: string;
@@ -323,22 +480,32 @@ export async function handleRemoteRunRequest(params: {
         }
       | undefined;
     if (payload.fallbackSubmission) {
-      const fallbackDir = path.join(runDir, "fallback-attachments");
-      await mkdir(fallbackDir, { recursive: true });
+      const fallbackGeneration = await createRemoteScratchGeneration(
+        scratchRun.path,
+        "fallback-attachments-",
+      );
+      const materializedFallback = await materializeRemoteAttachments(
+        payload.fallbackSubmission.attachments,
+        fallbackGeneration.path,
+        "fallback-attachment",
+      );
+      scratchAttachments.push({
+        generation: fallbackGeneration,
+        files: materializedFallback.files,
+      });
       fallbackSubmission = {
         prompt: payload.fallbackSubmission.prompt,
-        attachments: await materializeRemoteAttachments(
-          payload.fallbackSubmission.attachments,
-          fallbackDir,
-          "fallback-attachment",
-        ),
+        attachments: materializedFallback.attachments,
       };
+    }
+    await assertRemoteScratchGeneration(scratchRun);
+    for (const attachment of scratchAttachments) {
+      await assertRemoteScratchGeneration(attachment.generation);
+      await assertRemoteScratchFiles(attachment.files);
     }
 
     if (params.verbose && params.options.manualLoginDefault) {
-      params.logger(
-        `[serve] Enforcing manual-login profile at ${params.options.manualLoginProfileDir ?? "default"} for remote run ${runId}`,
-      );
+      log(`[serve] Enforcing configured manual-login profile for remote run ${runId}`);
     }
 
     capture = await params.runBrowser({
@@ -415,7 +582,7 @@ export async function handleRemoteRunRequest(params: {
           },
         });
       }
-      params.logger(
+      log(
         `[serve] Run ${runId} recovered publication from its durable pre-archive capture: ${publicationError instanceof Error ? publicationError.message : String(publicationError)}`,
       );
     }
@@ -448,9 +615,7 @@ export async function handleRemoteRunRequest(params: {
         type: "result",
         result: projectLegacyTextResult(record.result),
       });
-      params.logger(
-        `[serve] Legacy text run ${runId} finalized durably in ${Date.now() - runStartedAt}ms`,
-      );
+      log(`[serve] Legacy text run ${runId} finalized durably in ${Date.now() - runStartedAt}ms`);
       return;
     }
     if (registrations.length > 0) {
@@ -460,12 +625,12 @@ export async function handleRemoteRunRequest(params: {
       });
     }
     sendEvent({ type: "transaction", transaction: remoteTransactionPayload(record) });
-    params.logger(
+    log(
       `[serve] Run ${runId} captured durably in ${Date.now() - runStartedAt}ms; awaiting client publication acknowledgement`,
     );
   } catch (rawError) {
     if (durableCapture) {
-      params.logger(
+      log(
         `[serve] Run ${runId} remains durably pending after response publication failed: ${rawError instanceof Error ? rawError.message : String(rawError)}`,
       );
       return;
@@ -499,7 +664,7 @@ export async function handleRemoteRunRequest(params: {
         Boolean(recoverableRuntime) &&
         isTerminalRemoteBrowserAutomationError(error));
     const durableError = serializeDurableBrowserAutomationError(
-      error,
+      new BrowserAutomationError(projectRemoteHostText(error.message), error.details, rawError),
       Boolean(recoverableRuntime) && !terminalFailure,
     );
     let record = abortWorthyMismatch
@@ -517,7 +682,7 @@ export async function handleRemoteRunRequest(params: {
         });
     const stagedCaptureRetained = Boolean(record.stagedCapture);
     if (failedCapture || stagedCaptureRetained) {
-      params.logger(
+      log(
         `[serve] Run ${runId} retained its exact staged answer after durable publication failed.`,
       );
     }
@@ -544,12 +709,10 @@ export async function handleRemoteRunRequest(params: {
             : remoteBrowserAutomationError(record),
       });
     }
-    params.logger(
-      `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
-    );
+    log(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`);
   } finally {
-    if (legacyResponseHeartbeat) clearInterval(legacyResponseHeartbeat);
-    if (runDir) await rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+    clearInterval(legacyResponseHeartbeat);
+    if (scratchRun) await releaseRemoteScratchRun(scratchRun, scratchAttachments);
     if (!params.res.destroyed && !params.res.writableEnded) params.res.end();
   }
 }
@@ -664,18 +827,29 @@ async function materializeRemoteAttachments(
   attachments: RemoteRunPayload["attachments"],
   directory: string,
   fallbackName: string,
-): Promise<BrowserAttachment[]> {
+): Promise<MaterializedRemoteAttachments> {
   const materialized: BrowserAttachment[] = [];
+  const files: RemoteScratchFile[] = [];
   for (const [index, attachment] of attachments.entries()) {
     const safeName = sanitizeArtifactFilename(attachment.fileName, `${fallbackName}-${index + 1}`);
     const filePath = path.join(directory, `${index + 1}-${safeName}`);
     const payload = Buffer.from(attachment.contentBase64, "base64");
-    await writeFile(filePath, payload, { mode: 0o600 });
+    files.push(await writeRemoteScratchFile(filePath, payload));
     materialized.push({
       path: filePath,
       displayPath: attachment.displayPath,
       sizeBytes: payload.byteLength,
     });
   }
-  return materialized;
+  return { attachments: materialized, files };
 }
+
+export const __test__ = {
+  assertRemoteScratchFiles,
+  assertRemoteScratchGeneration,
+  createRemoteScratchGeneration,
+  materializeRemoteAttachments,
+  projectRemoteHostText,
+  releaseRemoteScratchRun,
+  removeRemoteScratchGeneration,
+};
