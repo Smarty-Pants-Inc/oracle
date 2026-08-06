@@ -32,6 +32,7 @@ function browserTransaction(
 describe("runBrowserSessionExecution", () => {
   test("returns transaction runtime without materializing absent optional metadata", async () => {
     const log = vi.fn();
+    const completedAnswer = "private completed browser answer";
     const persistRuntimeHint = vi.fn();
     const executeBrowser = vi.fn(async (options) => {
       await options.runtimeHintCb?.(
@@ -54,8 +55,8 @@ describe("runBrowserSessionExecution", () => {
       );
       return browserTransaction(
         {
-          answerText: "ok",
-          answerMarkdown: "ok",
+          answerText: completedAnswer,
+          answerMarkdown: completedAnswer,
           artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
           tookMs: 1000,
           answerTokens: 12,
@@ -98,6 +99,8 @@ describe("runBrowserSessionExecution", () => {
     expect(result.runtime).not.toHaveProperty("chromePid");
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
     expect(result.promptText).toBe("prompt");
+    expect(result.answerText).toBe(completedAnswer);
+    expect(log.mock.calls.flat().join("\n")).not.toContain(completedAnswer);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),

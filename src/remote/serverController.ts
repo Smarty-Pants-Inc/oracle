@@ -45,6 +45,7 @@ import {
   assertRemoteTransactionStoreRootAuthority,
   initializeRemoteTransactionStoreRoot,
   protectRemoteTransactionStoreRoot,
+  remoteTransactionHeadDirectory,
 } from "./transactionStoreRoot.js";
 import type { WindowsPrivateTreeAuthority } from "./windowsPrivateTreeAcl.js";
 import {
@@ -60,6 +61,7 @@ interface RemoteServerDeps {
   resumeBrowser?: typeof resumeBrowserSession;
   transactionStoreDir?: string;
   transactionIntegrityKeyPath?: string;
+  transactionAuthorityDir?: string;
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
   exactChromeCleanup?: (
     runtime: BrowserRuntimeMetadata,
@@ -118,6 +120,10 @@ export async function createRemoteServer(
   const transactionIntegrityKeyPath =
     deps.transactionIntegrityKeyPath ??
     path.join(path.dirname(transactionStoreDir), ".remote-transaction-integrity.key");
+  const transactionAuthorityDir = remoteTransactionHeadDirectory(
+    transactionIntegrityKeyPath,
+    deps.transactionAuthorityDir,
+  );
   const controllerGeneration = deps.controllerGeneration ?? randomUUID();
   const requestAuthenticator = new RemoteRequestAuthenticator({
     rootKey: authToken,
@@ -126,6 +132,7 @@ export async function createRemoteServer(
   const transactionStoreRootOptions = {
     directory: transactionStoreDir,
     integrityKeyPath: transactionIntegrityKeyPath,
+    authorityDirectory: transactionAuthorityDir,
     platform: deps.transactionStorePlatform,
     windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
   };
@@ -154,6 +161,7 @@ export async function createRemoteServer(
     transactionStore = await RemoteTransactionStore.open({
       directory: transactionStoreDir,
       integrityKeyPath: transactionIntegrityKeyPath,
+      authorityDirectory: transactionAuthorityDir,
       leaseDurationMs: deps.transactionLeaseDurationMs,
       now: deps.transactionStoreNow,
       controllerGeneration,

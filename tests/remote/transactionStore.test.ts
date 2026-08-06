@@ -21,11 +21,13 @@ import {
   type RemoteTransactionPublicationCheckpoint,
 } from "../../src/remote/transactionStore.js";
 import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
+import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 import {
   openTestRemoteTransactionStore,
   testWindowsPrivateTreeAuthority,
 } from "./testTransactionStore.js";
+
 function openTransactionStore(
   options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
 ) {
@@ -1430,6 +1432,36 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("rejects a same-process rollback of both record and external head", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-in-memory-head-rollback-"));
+    const transactionToken = "7".repeat(64);
+    const headPath = path.join(
+      remoteTransactionHeadDirectory(path.join(root, ".test-integrity", "record.key")),
+      `${transactionToken}.head`,
+    );
+    try {
+      const store = await openTransactionStore({ directory: root });
+      await begin(store, transactionToken, "in-memory-head-rollback");
+      const olderRecord = await fs.readFile(store.recordPath(transactionToken));
+      const olderHead = await fs.readFile(headPath);
+      await store.journalRuntime(transactionToken, runtime);
+      const currentRecord = await fs.readFile(store.recordPath(transactionToken));
+      const currentHead = await fs.readFile(headPath);
+
+      await fs.writeFile(store.recordPath(transactionToken), olderRecord, { mode: 0o600 });
+      await fs.writeFile(headPath, olderHead, { mode: 0o600 });
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      await fs.writeFile(store.recordPath(transactionToken), currentRecord, { mode: 0o600 });
+      await fs.writeFile(headPath, currentHead, { mode: 0o600 });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ runtime });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects an older authenticated envelope after controller restart", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-durable-head-replay-"));
     const transactionToken = "a".repeat(64);
@@ -1443,9 +1475,7 @@ describe("RemoteTransactionStore", () => {
       await fs.writeFile(first.recordPath(transactionToken), olderBytes, { mode: 0o600 });
       const restarted = await openTransactionStore({ directory: root });
 
-      await expect(restarted.read(transactionToken)).rejects.toBeInstanceOf(
-        RemoteTransactionRecordIntegrityError,
-      );
+      await expect(restarted.read(transactionToken)).resolves.toBeNull();
       const quarantinedBytes = await Promise.all(
         (await fs.readdir(root))
           .filter((name) => name.includes(transactionToken) && name.endsWith(".quarantine"))
@@ -1460,10 +1490,88 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("keeps used-token authority outside a rolled-back transaction store", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-external-head-rollback-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const authorityDirectory = remoteTransactionHeadDirectory(integrityKeyPath);
+    const usedToken = "c".repeat(64);
+    const unseenToken = "d".repeat(64);
+    try {
+      const first = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+      });
+      await begin(first, usedToken, "used-before-store-rollback");
+      await first.journalRuntime(usedToken, runtime);
+      const externalHeadPath = path.join(authorityDirectory, `${usedToken}.head`);
+      await expect(fs.readFile(externalHeadPath)).resolves.not.toHaveLength(0);
+
+      const legacyHeadDirectory = path.join(directory, ".authenticated-heads");
+      await fs.mkdir(legacyHeadDirectory, { mode: 0o700 });
+      await fs.writeFile(path.join(legacyHeadDirectory, `${usedToken}.head`), "legacy\n", {
+        mode: 0o600,
+      });
+      await fs.rm(directory, { recursive: true, force: true });
+      await expect(fs.readFile(externalHeadPath)).resolves.not.toHaveLength(0);
+
+      const restarted = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+      });
+      await expect(
+        begin(restarted, usedToken, "replayed-after-store-rollback"),
+      ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
+      await expect(restarted.read(usedToken)).resolves.toBeNull();
+      await expect(begin(restarted, usedToken, "replayed-after-observation")).rejects.toMatchObject(
+        {
+          code: "EEXIST",
+        },
+      );
+
+      await begin(restarted, unseenToken, "clean-first-use");
+      await expect(restarted.read(unseenToken)).resolves.toMatchObject({
+        transactionToken: unseenToken,
+        runId: "clean-first-use",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when external head authentication is tampered", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-external-head-tamper-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const authorityDirectory = path.join(root, ".remote-transaction-authority");
+    const transactionToken = "e".repeat(64);
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        authorityDirectory,
+      });
+      await begin(store, transactionToken, "external-head-tamper-run");
+      const headPath = path.join(authorityDirectory, `${transactionToken}.head`);
+      const envelope = JSON.parse(await fs.readFile(headPath, "utf8")) as { mac: string };
+      envelope.mac = "0".repeat(64);
+      await fs.writeFile(headPath, `${JSON.stringify(envelope, null, 2)}\n`, { mode: 0o600 });
+
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not accept an older record while a newer authenticated head is pending", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-pending-head-replay-"));
     const transactionToken = "b".repeat(64);
-    const headPath = path.join(remoteTransactionHeadDirectory(root), `${transactionToken}.head`);
+    const headPath = path.join(
+      remoteTransactionHeadDirectory(path.join(root, ".test-integrity", "record.key")),
+      `${transactionToken}.head`,
+    );
     let injectInterruption = false;
     let pendingHeadBytes: Buffer | undefined;
     const afterRecordPublication = async (
@@ -2016,19 +2124,19 @@ describe("RemoteTransactionStore", () => {
         replacedRoot === "store"
           ? directory
           : replacedRoot === "head-directory"
-            ? remoteTransactionHeadDirectory(directory)
+            ? remoteTransactionHeadDirectory(integrityKeyPath)
             : integrityKeyDirectory;
       const displacedPath = `${replacedPath}.displaced`;
       let replace = true;
-      const windowsPrivateTreeAuthority = vi.fn(async () => {
-        if (!replace) return;
+      const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+        await testWindowsPrivateTreeAuthority(scope);
+        if (scope.initializeRoots || !replace) return;
         replace = false;
         await fs.rename(replacedPath, displacedPath);
         await fs.mkdir(replacedPath, { recursive: true });
         if (replacedRoot === "integrity-key-directory") {
           await fs.writeFile(integrityKeyPath, Buffer.alloc(32, 0x41));
         }
-        return;
       });
       try {
         await fs.mkdir(directory, { recursive: true });
@@ -2049,7 +2157,7 @@ describe("RemoteTransactionStore", () => {
               : "integrity key directory generation changed during Windows private ACL protection",
         );
 
-        expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+        expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(2);
         expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
           false,
         );
@@ -2062,9 +2170,89 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("provisions each new Windows authority file before its first bytes", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-prepublication-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const initializedFiles: string[] = [];
+    let initializedKey = false;
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      const initializedPath = scope.initializeIntegrityKey
+        ? scope.integrityKeyPath
+        : scope.initializeFilePath;
+      if (initializedPath) {
+        await expect(fs.stat(initializedPath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      await testWindowsPrivateTreeAuthority(scope);
+      if (initializedPath) {
+        await expect(fs.stat(initializedPath)).resolves.toMatchObject({ size: 0 });
+      }
+      if (scope.initializeIntegrityKey) initializedKey = true;
+      if (scope.initializeFilePath) initializedFiles.push(scope.initializeFilePath);
+    });
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      const transactionToken = "0".repeat(64);
+      await begin(store, transactionToken, "prepublication-run");
+
+      expect(initializedKey).toBe(true);
+      expect(initializedFiles).toHaveLength(3);
+      expect(initializedFiles.map((filePath) => path.dirname(filePath))).toEqual([
+        remoteTransactionHeadDirectory(integrityKeyPath),
+        directory,
+        remoteTransactionHeadDirectory(integrityKeyPath),
+      ]);
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        runId: "prepublication-run",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not delete or reuse a rejected pre-existing Windows publication candidate", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-candidate-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const retainedBytes = Buffer.from("pre-existing rejected candidate", "utf8");
+    let injectCandidate = false;
+    let rejectedCandidatePath: string | undefined;
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      if (scope.initializeFilePath && injectCandidate) {
+        injectCandidate = false;
+        rejectedCandidatePath = scope.initializeFilePath;
+        await fs.writeFile(rejectedCandidatePath, retainedBytes);
+        return;
+      }
+      await testWindowsPrivateTreeAuthority(scope);
+    });
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      injectCandidate = true;
+      await expect(begin(store, "9".repeat(64), "rejected-candidate-run")).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      expect(rejectedCandidatePath).toBeDefined();
+      await expect(fs.readFile(rejectedCandidatePath ?? "missing")).resolves.toEqual(retainedBytes);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("protects and verifies a Windows transaction tree once for a bounded list operation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-acl-bounded-"));
-    const windowsPrivateTreeAuthority = vi.fn(async () => {});
+    const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
     try {
       const store = await openTransactionStore({
         directory: root,
@@ -2114,7 +2302,7 @@ describe("RemoteTransactionStore", () => {
         let blockPublication = false;
         let active: Promise<unknown> | undefined;
         let competingRead: Promise<unknown> | undefined;
-        const windowsPrivateTreeAuthority = vi.fn(async () => {});
+        const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
         try {
           observeAuthorityPrepass = false;
           const store = await IsolatedRemoteTransactionStore.open({
@@ -2171,7 +2359,9 @@ describe("RemoteTransactionStore", () => {
           await Promise.resolve();
           await Promise.resolve();
           expect(authorityPrepassStarts).toBe(0);
-          expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+          expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(
+            activeOperation === "read" ? 1 : 3,
+          );
 
           releaseActive.resolve();
           if (activeOperation === "read") {
@@ -2182,7 +2372,9 @@ describe("RemoteTransactionStore", () => {
             await expect(active).resolves.toMatchObject({ runtime });
           }
           await expect(competingRead).resolves.toMatchObject({ transactionToken: competingToken });
-          expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(2);
+          expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(
+            activeOperation === "read" ? 2 : 5,
+          );
         } finally {
           releaseActive.resolve();
           await Promise.allSettled(
@@ -2209,11 +2401,11 @@ describe("RemoteTransactionStore", () => {
       const displacedKeyPath = `${integrityKeyPath}.displaced`;
       const transactionToken = operation === "read" ? "3".repeat(64) : "4".repeat(64);
       let replaceKey: (() => Promise<void>) | undefined;
-      const windowsPrivateTreeAuthority = vi.fn(async () => {
+      const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+        await testWindowsPrivateTreeAuthority(scope);
         const replacement = replaceKey;
         replaceKey = undefined;
         await replacement?.();
-        return;
       });
       try {
         const store = await openTestRemoteTransactionStore({
@@ -2255,11 +2447,11 @@ describe("RemoteTransactionStore", () => {
     const integrityKeyPath = path.join(integrityKeyDirectory, "record-integrity.key");
     const transactionToken = "5".repeat(64);
     let replaceDirectory: (() => Promise<void>) | undefined;
-    const windowsPrivateTreeAuthority = vi.fn(async () => {
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      await testWindowsPrivateTreeAuthority(scope);
       const replacement = replaceDirectory;
       replaceDirectory = undefined;
       await replacement?.();
-      return;
     });
     try {
       const store = await openTestRemoteTransactionStore({
@@ -2295,7 +2487,7 @@ describe("RemoteTransactionStore", () => {
     const directory = path.join(root, "transactions");
     const transactionToken = "6".repeat(64);
     const mutationToken = "7".repeat(64);
-    const windowsPrivateTreeAuthority = vi.fn(async () => {});
+    const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
     try {
       const store = await openTransactionStore({
         directory,
@@ -2458,6 +2650,61 @@ describe("RemoteTransactionStore", () => {
       await rm(byteRoot, { recursive: true, force: true });
     }
 
+    const authorityRoot = await mkdtemp(
+      path.join(os.tmpdir(), "oracle-remote-authority-capacity-"),
+    );
+    let authorityNow = Date.parse("2026-01-01T00:00:00.000Z");
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory: path.join(authorityRoot, "remote-transactions"),
+        integrityKeyPath: path.join(authorityRoot, ".remote-transaction-integrity.key"),
+        authorityDirectory: path.join(authorityRoot, ".remote-transaction-authority"),
+        maximumAuthorityRecords: 1,
+        terminalRetentionMs: 0,
+        now: () => authorityNow,
+      });
+      const retainedToken = "a".repeat(64);
+      await begin(store, retainedToken);
+      await publish(store, retainedToken);
+      await store.bindSettlement({
+        transactionToken: retainedToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await store.beginSettlementExecution({ transactionToken: retainedToken, mode: "finalize" });
+      await store.completeSettlement({
+        transactionToken: retainedToken,
+        mode: "finalize",
+        finalization: { status: "completed", runtime },
+      });
+      authorityNow += 1;
+      await expect(store.list()).resolves.toEqual([]);
+      await expect(begin(store, "b".repeat(64), "authority-count-overflow")).rejects.toBeInstanceOf(
+        RemoteTransactionCapacityError,
+      );
+    } finally {
+      await rm(authorityRoot, { recursive: true, force: true });
+    }
+
+    const authorityByteRoot = await mkdtemp(
+      path.join(os.tmpdir(), "oracle-remote-authority-byte-capacity-"),
+    );
+    try {
+      const authorityDirectory = path.join(authorityByteRoot, ".remote-transaction-authority");
+      const store = await openTestRemoteTransactionStore({
+        directory: path.join(authorityByteRoot, "remote-transactions"),
+        integrityKeyPath: path.join(authorityByteRoot, ".remote-transaction-integrity.key"),
+        authorityDirectory,
+        maximumAuthorityBytes: 1,
+      });
+      await expect(begin(store, "c".repeat(64), "authority-byte-overflow")).rejects.toBeInstanceOf(
+        RemoteTransactionCapacityError,
+      );
+      await expect(fs.readdir(authorityDirectory)).resolves.toEqual([]);
+    } finally {
+      await rm(authorityByteRoot, { recursive: true, force: true });
+    }
+
     const atomicRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-atomic-store-"));
     const interruptedToken = "8".repeat(64);
     const duplicateToken = "9".repeat(64);
@@ -2489,8 +2736,12 @@ describe("RemoteTransactionStore", () => {
       await expect(fs.access(store.recordPath(interruptedToken))).rejects.toMatchObject({
         code: "ENOENT",
       });
-      expect(await fs.readdir(atomicRoot)).toEqual([".authenticated-heads", ".test-integrity"]);
-      await expect(fs.readdir(path.join(atomicRoot, ".authenticated-heads"))).resolves.toEqual([]);
+      expect(await fs.readdir(atomicRoot)).toEqual([".test-integrity"]);
+      await expect(
+        fs.readdir(
+          remoteTransactionHeadDirectory(path.join(atomicRoot, ".test-integrity", "record.key")),
+        ),
+      ).resolves.toEqual([]);
 
       await store.begin({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,

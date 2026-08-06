@@ -3,6 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { capturePhysicalDirectoryIdentity } from "../../src/browser/filesystemLockDirectoryIdentity.js";
+import {
+  authenticateRemoteTransactionHeadAuthority,
+  remoteTransactionIntegrityKeyId,
+  serializeRemoteTransactionHeadAuthority,
+} from "../../src/remote/transactionRecordEnvelope.js";
 
 describe("remote transaction integrity-key storage", () => {
   test.skipIf(process.platform === "win32")(
@@ -68,4 +73,46 @@ describe("remote transaction integrity-key storage", () => {
       }
     },
   );
+
+  test("binds authenticated heads to the exact configured transaction store", () => {
+    const integrityKey = Buffer.alloc(32, 0x5a);
+    const integrityKeyId = remoteTransactionIntegrityKeyId(integrityKey);
+    const transactionToken = "a".repeat(64);
+    const headDirectory = path.resolve("/authority/heads");
+    const storeDirectory = path.resolve("/stores/primary");
+    const authority = {
+      current: { revision: 3, digest: "b".repeat(64) },
+      pending: null,
+      retired: true,
+    };
+    const contents = serializeRemoteTransactionHeadAuthority({
+      authority,
+      transactionToken,
+      integrityKey,
+      integrityKeyId,
+      headDirectory,
+      storeDirectory,
+    });
+
+    expect(
+      authenticateRemoteTransactionHeadAuthority({
+        contents,
+        transactionToken,
+        integrityKey,
+        integrityKeyId,
+        headDirectory,
+        storeDirectory,
+      }),
+    ).toEqual(authority);
+    expect(() =>
+      authenticateRemoteTransactionHeadAuthority({
+        contents,
+        transactionToken,
+        integrityKey,
+        integrityKeyId,
+        headDirectory,
+        storeDirectory: path.resolve("/stores/substitute"),
+      }),
+    ).toThrow("invalid transaction head authentication");
+  });
 });

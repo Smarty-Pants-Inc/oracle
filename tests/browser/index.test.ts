@@ -14,8 +14,6 @@ import {
   classifyPreservedBrowserErrorForTest,
   formatBrowserTurnTranscript,
   isLocalChromeHostForTest,
-  maybeArchiveCompletedConversationForTest,
-  maybeArchiveInterruptedConversationForTest,
   redactBrowserConfigForDebugLogForTest,
   resolveRemoteTabLeaseProfileDirForTest,
   runBrowserMode,
@@ -23,6 +21,10 @@ import {
   shouldPreferSystemTmpDirForTest,
   shouldPreserveBrowserOnErrorForTest,
 } from "../../src/browser/index.js";
+import {
+  maybeArchiveCompletedConversation,
+  maybeArchiveInterruptedConversation,
+} from "../../src/browser/archiveSettlementCoordinator.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
@@ -1276,7 +1278,7 @@ describe("browser conversation archiving", () => {
     const log = vi.fn();
 
     await expect(
-      maybeArchiveInterruptedConversationForTest({
+      maybeArchiveInterruptedConversation({
         Runtime: runtime as never,
         logger: log as never,
         config: resolveBrowserConfig({
@@ -1303,7 +1305,7 @@ describe("browser conversation archiving", () => {
     };
 
     await expect(
-      maybeArchiveInterruptedConversationForTest({
+      maybeArchiveInterruptedConversation({
         Runtime: runtime as never,
         logger: vi.fn() as never,
         config: resolveBrowserConfig({ archiveConversations: "always" }),
@@ -1327,7 +1329,7 @@ describe("browser conversation archiving", () => {
     };
 
     await expect(
-      maybeArchiveInterruptedConversationForTest({
+      maybeArchiveInterruptedConversation({
         Runtime: runtime as never,
         logger: vi.fn() as never,
         config: resolveBrowserConfig({
@@ -1368,7 +1370,7 @@ describe("browser conversation archiving", () => {
     };
 
     await expect(
-      maybeArchiveCompletedConversationForTest({
+      maybeArchiveCompletedConversation({
         Runtime: runtime as never,
         logger: log as never,
         config: resolveBrowserConfig({ archiveConversations: "always" }),

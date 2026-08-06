@@ -24,7 +24,7 @@ import { createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCommittedPromptEpochLocator } from "../dist/browser/reattachability.js";
+import { resolveCommittedPromptEpochLocator } from "../dist/src/browser/reattachability.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");

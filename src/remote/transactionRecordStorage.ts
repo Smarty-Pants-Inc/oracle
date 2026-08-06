@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { chmod, link, lstat, mkdir, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -7,7 +8,8 @@ import {
   samePhysicalDirectoryIdentity,
   type PhysicalDirectoryIdentity,
 } from "../browser/filesystemLockDirectoryIdentity.js";
-import { syncDirectory } from "../fsDurability.js";
+import { readErrorCode, syncDirectory } from "../fsDurability.js";
+export { readErrorCode };
 import type {
   WindowsPrivateTreeAuthority,
   WindowsPrivateTreeScope,
@@ -25,7 +27,7 @@ import { MAX_REMOTE_TRANSACTION_STORE_BYTES } from "./types.js";
 const REMOTE_TRANSACTION_INTEGRITY_KEY_BYTES = 32;
 const REMOTE_TRANSACTION_CREATE_TEMP_PATTERN =
   /^\.([a-f0-9]{64})\.[1-9][0-9]*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
-const REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES = 4_096;
+export const REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES = 4_096;
 
 export type RemoteTransactionPublicationCheckpoint =
   | "head-pending-namespace-publication"
@@ -137,30 +139,40 @@ export async function loadRemoteTransactionIntegrityKey(
       "Remote transaction integrity key directory generation changed before creation",
     );
   }
-  let handle;
-  try {
+  let handle: FileHandle;
+  let emptyWindowsKeyIdentity: BigIntStats | undefined;
+  if (options.platform === "win32") {
+    if (!options.windowsPrivateTreeAuthority) {
+      throw new Error("Windows remote transaction private ACL authority is unavailable");
+    }
+    await options.windowsPrivateTreeAuthority({
+      ...options.windowsPrivateTreeScope,
+      initializeIntegrityKey: true,
+    });
+    emptyWindowsKeyIdentity = await lstat(integrityKeyPath, { bigint: true });
+    assertProtectedIntegrityKeyFile(emptyWindowsKeyIdentity, options.platform);
+    if (emptyWindowsKeyIdentity.size !== 0n) {
+      throw new Error("New Windows remote transaction integrity key is not empty");
+    }
+    handle = await open(integrityKeyPath, "r+");
+  } else {
     handle = await open(integrityKeyPath, "wx", 0o600);
-  } catch (error) {
-    if (readErrorCode(error) !== "EEXIST") throw error;
-    return await readStableRemoteTransactionIntegrityKey(
-      integrityKeyPath,
-      directory,
-      directoryIdentity,
-      options.platform,
-    );
   }
   try {
+    if (emptyWindowsKeyIdentity) {
+      const openedIdentity = await handle.stat({ bigint: true });
+      if (
+        openedIdentity.size !== 0n ||
+        !samePhysicalFile(emptyWindowsKeyIdentity, openedIdentity)
+      ) {
+        throw new Error("New Windows remote transaction integrity key generation changed");
+      }
+    }
     await handle.writeFile(key);
     if (options.platform !== "win32") await handle.chmod(0o600);
     await handle.sync();
   } finally {
     await handle.close();
-  }
-  if (options.platform === "win32") {
-    await options.windowsPrivateTreeAuthority?.({
-      ...options.windowsPrivateTreeScope,
-      initializeIntegrityKey: true,
-    });
   }
   const directoryAfterWrite = await capturePhysicalDirectoryIdentity(directory);
   if (!samePhysicalDirectoryIdentity(directoryAfterWrite, directoryIdentity)) {
@@ -241,10 +253,38 @@ export async function readStableRemoteTransactionRecordBytes(options: {
   return { contents, fileIdentity: namedAfterRead };
 }
 
+async function openFreshPrivateTransactionFile(
+  filePath: string,
+  platform: NodeJS.Platform,
+  initializeWindowsPrivateFile: ((filePath: string) => Promise<void>) | undefined,
+): Promise<FileHandle> {
+  if (platform !== "win32") return await open(filePath, "wx", 0o600);
+  if (!initializeWindowsPrivateFile) {
+    throw new Error("Windows private transaction file authority is unavailable");
+  }
+  await initializeWindowsPrivateFile(filePath);
+  const namedIdentity = await lstat(filePath, { bigint: true });
+  assertProtectedTransactionRecordFile(namedIdentity, platform, 1n);
+  if (namedIdentity.size !== 0n) throw new RemoteTransactionRecordIntegrityError();
+  const handle = await open(filePath, "r+");
+  try {
+    const openedIdentity = await handle.stat({ bigint: true });
+    assertProtectedTransactionRecordFile(openedIdentity, platform, 1n);
+    if (openedIdentity.size !== 0n || !samePhysicalFile(namedIdentity, openedIdentity)) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+  return handle;
+}
+
 export async function publishSerializedRecord(options: {
   mode: "create" | "replace";
   directory: string;
   headDirectory: string;
+  storeDirectory: string;
   targetPath: string;
   transactionToken: string;
   previousHead: RemoteTransactionExpectedHead | null;
@@ -253,7 +293,12 @@ export async function publishSerializedRecord(options: {
   integrityKeyId: string;
   platform: NodeJS.Platform;
   assertIntegrityAuthority: () => Promise<void>;
-  underMaintenance: (publish: () => Promise<void>) => Promise<void>;
+  initializeWindowsPrivateFile?: (filePath: string) => Promise<void>;
+  underMaintenance: (
+    authorityPath: string,
+    authorityContentsBytes: number,
+    publish: () => Promise<void>,
+  ) => Promise<void>;
   afterRecordPublication?: (
     operation: RemoteTransactionPublicationOperation,
     checkpoint: RemoteTransactionPublicationCheckpoint,
@@ -277,27 +322,44 @@ export async function publishSerializedRecord(options: {
   ) {
     throw new RemoteTransactionRecordIntegrityError();
   }
+  const pendingAuthority = {
+    current: options.previousHead,
+    pending: options.serialized.head,
+    retired: false,
+  };
+  const currentAuthority = {
+    current: options.serialized.head,
+    pending: null,
+    retired: false,
+  };
+  const authorityContentsBytes = Math.max(
+    serializeRemoteTransactionHeadAuthority({ ...options, authority: pendingAuthority }).byteLength,
+    serializeRemoteTransactionHeadAuthority({ ...options, authority: currentAuthority }).byteLength,
+  );
+  const authorityPath = remoteTransactionHeadPath(options.headDirectory, options.transactionToken);
 
   const tempPath = path.join(
     options.directory,
     `.${options.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
   );
   let recordPublished = false;
+  let tempCreated = false;
   try {
-    await options.underMaintenance(async () => {
+    await options.underMaintenance(authorityPath, authorityContentsBytes, async () => {
       await publishRemoteTransactionHeadAuthority({
         ...options,
-        authority: {
-          current: options.previousHead,
-          pending: options.serialized.head,
-          retired: false,
-        },
+        authority: pendingAuthority,
         checkpointPrefix: "head-pending",
         operation,
       });
       try {
         await options.assertIntegrityAuthority();
-        const handle = await open(tempPath, "wx", 0o600);
+        const handle = await openFreshPrivateTransactionFile(
+          tempPath,
+          options.platform,
+          options.initializeWindowsPrivateFile,
+        );
+        tempCreated = true;
         try {
           await handle.writeFile(options.serialized.contents);
           if (options.platform !== "win32") await handle.chmod(0o600);
@@ -319,17 +381,19 @@ export async function publishSerializedRecord(options: {
       } finally {
         await options.assertIntegrityAuthority();
         await options.afterRecordPublication?.(operation, "temp-cleanup");
-        if (options.mode === "create") {
-          await rm(tempPath, { force: true });
-          await options.assertIntegrityAuthority();
-          await syncDirectory(options.directory);
-        } else {
-          await rm(tempPath, { force: true }).catch(() => undefined);
+        if (tempCreated) {
+          if (options.mode === "create") {
+            await rm(tempPath, { force: true });
+            await options.assertIntegrityAuthority();
+            await syncDirectory(options.directory);
+          } else {
+            await rm(tempPath, { force: true }).catch(() => undefined);
+          }
         }
       }
       await publishRemoteTransactionHeadAuthority({
         ...options,
-        authority: { current: options.serialized.head, pending: null, retired: false },
+        authority: currentAuthority,
         checkpointPrefix: "head-current",
         operation,
       });
@@ -516,11 +580,6 @@ export function samePhysicalFile(left: BigIntStats, right: BigIntStats): boolean
   );
 }
 
-export function readErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return typeof error.code === "string" ? error.code : undefined;
-}
-
 export async function readStableRemoteTransactionIntegrityKey(
   integrityKeyPath: string,
   directory: string,
@@ -574,11 +633,13 @@ export async function readStableRemoteTransactionIntegrityKey(
 
 type RemoteTransactionHeadStorageOptions = {
   headDirectory: string;
+  storeDirectory: string;
   transactionToken: string;
   integrityKey: Buffer;
   integrityKeyId: string;
   platform: NodeJS.Platform;
   assertIntegrityAuthority: () => Promise<void>;
+  initializeWindowsPrivateFile?: (filePath: string) => Promise<void>;
 };
 
 export async function reconcileRemoteTransactionHeadAuthority(
@@ -589,9 +650,7 @@ export async function reconcileRemoteTransactionHeadAuthority(
   const authority = await readRemoteTransactionHeadAuthority(options);
   if (!authority) {
     if (!options.recordHead) return null;
-    const bootstrapped = { current: options.recordHead, pending: null, retired: false };
-    await publishRemoteTransactionHeadAuthority({ ...options, authority: bootstrapped });
-    return bootstrapped;
+    throw new RemoteTransactionRecordHeadMismatchError();
   }
   if (authority.pending) {
     if (sameRemoteTransactionHead(authority.pending, options.recordHead)) {
@@ -616,7 +675,7 @@ export async function reconcileRemoteTransactionHeadAuthority(
     throw new RemoteTransactionRecordHeadMismatchError();
   }
   if (sameRemoteTransactionHead(authority.current, options.recordHead)) return authority;
-  if (authority.retired && !options.recordHead) return authority;
+  if (authority.current && !options.recordHead) return authority;
   throw new RemoteTransactionRecordHeadMismatchError();
 }
 
@@ -667,6 +726,7 @@ async function readRemoteTransactionHeadAuthority(
       integrityKey: options.integrityKey,
       integrityKeyId: options.integrityKeyId,
       headDirectory: options.headDirectory,
+      storeDirectory: options.storeDirectory,
     });
   } catch {
     throw new RemoteTransactionRecordIntegrityError();
@@ -690,6 +750,7 @@ async function publishRemoteTransactionHeadAuthority(
     integrityKey: options.integrityKey,
     integrityKeyId: options.integrityKeyId,
     headDirectory: options.headDirectory,
+    storeDirectory: options.storeDirectory,
   });
   if (contents.byteLength > REMOTE_TRANSACTION_HEAD_MAXIMUM_BYTES) {
     throw new RemoteTransactionRecordIntegrityError();
@@ -698,9 +759,15 @@ async function publishRemoteTransactionHeadAuthority(
     options.headDirectory,
     `.head-${options.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
   );
+  let tempCreated = false;
   try {
     await options.assertIntegrityAuthority();
-    const handle = await open(tempPath, "wx", 0o600);
+    const handle = await openFreshPrivateTransactionFile(
+      tempPath,
+      options.platform,
+      options.initializeWindowsPrivateFile,
+    );
+    tempCreated = true;
     try {
       await handle.writeFile(contents);
       if (options.platform !== "win32") await handle.chmod(0o600);
@@ -735,7 +802,7 @@ async function publishRemoteTransactionHeadAuthority(
         `${options.checkpointPrefix}-temp-cleanup`,
       );
     }
-    await rm(tempPath, { force: true }).catch(() => undefined);
+    if (tempCreated) await rm(tempPath, { force: true }).catch(() => undefined);
   }
 }
 

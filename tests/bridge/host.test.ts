@@ -22,7 +22,7 @@ import {
 } from "../../src/remote/auth.js";
 import * as fsDurability from "../../src/fsDurability.js";
 import * as sessionManager from "../../src/sessionManager.js";
-import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
+import type { WindowsPrivateFileAclRequest } from "../../src/windowsPrivateFileAcl.js";
 
 import {
   resolveWindowsOpenSshExecutable,
@@ -514,16 +514,18 @@ describe("bridge host detached child transport", () => {
       true,
     );
     const visibilityAtAcl: boolean[] = [];
-    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+    const requests: WindowsPrivateFileAclRequest[] = [];
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
+      requests.push(request);
       visibilityAtAcl.push(
         await fs.access(artifactPath).then(
           () => true,
           () => false,
         ),
       );
-      expect(scope.storeDirectory).toBe(tempDir);
-      expect(scope.integrityKeyDirectory).toBe(tempDir);
-      expect(scope.integrityKeyPath).toBe(artifactPath);
+      const contents = await fs.readFile(request.filePath, "utf8");
+      if (request.repair) expect(contents).toBe("");
+      else expect(contents).toContain(MODERN_TOKEN);
     });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -533,14 +535,15 @@ describe("bridge host detached child transport", () => {
         {
           spawn: () => harness.child,
           backgroundPlatform: "win32",
-          windowsPrivateTreeAuthority,
+          windowsPrivateFileAuthority,
           generateReadinessNonce: () => READINESS_NONCE,
         },
       );
-      expect(windowsPrivateTreeAuthority).toHaveBeenCalledTimes(2);
-      expect(
-        windowsPrivateTreeAuthority.mock.calls.map(([scope]) => scope.initializeIntegrityKey),
-      ).toEqual([false, true]);
+      expect(windowsPrivateFileAuthority).toHaveBeenCalledTimes(2);
+      expect(requests.map(({ repair }) => repair)).toEqual([true, false]);
+      expect(requests[0]?.filePath).not.toBe(artifactPath);
+      expect(path.dirname(requests[0]!.filePath)).toBe(tempDir);
+      expect(requests[1]?.filePath).toBe(artifactPath);
       expect(visibilityAtAcl).toEqual([false, true]);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -560,7 +563,7 @@ describe("bridge host detached child transport", () => {
       true,
     );
     let calls = 0;
-    const windowsPrivateTreeAuthority = vi.fn(async () => {
+    const windowsPrivateFileAuthority = vi.fn(async () => {
       calls += 1;
       if (calls === 2) throw new Error("injected ACL failure");
     });
@@ -573,7 +576,7 @@ describe("bridge host detached child transport", () => {
           {
             spawn: () => harness.child,
             backgroundPlatform: "win32",
-            windowsPrivateTreeAuthority,
+            windowsPrivateFileAuthority,
             generateReadinessNonce: () => READINESS_NONCE,
           },
         ),
@@ -600,7 +603,7 @@ describe("bridge host detached child transport", () => {
       true,
     );
     let calls = 0;
-    const windowsPrivateTreeAuthority = vi.fn(async () => {
+    const windowsPrivateFileAuthority = vi.fn(async () => {
       calls += 1;
       if (calls !== 2) return;
       await fs.rename(tempDir, retiredDir);
@@ -617,7 +620,7 @@ describe("bridge host detached child transport", () => {
           {
             spawn: () => harness.child,
             backgroundPlatform: "win32",
-            windowsPrivateTreeAuthority,
+            windowsPrivateFileAuthority,
             generateReadinessNonce: () => READINESS_NONCE,
           },
         ),
@@ -869,19 +872,15 @@ describe("bridge host detached child transport", () => {
     const spawnChild = vi.fn(
       (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
     );
-    const durableWrite = sessionManager.writeFileAtomicDurable;
-    let failPublishedArtifact = true;
+    let finalVerificationFailed = false;
     let rollbackStarted = false;
-    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
-      async (targetPath, data, mode) => {
-        if (targetPath === artifactPath && !failPublishedArtifact) rollbackStarted = true;
-        await durableWrite(targetPath, data, mode);
-        if (targetPath === artifactPath && failPublishedArtifact) {
-          failPublishedArtifact = false;
-          throw new Error("injected directory sync failure after artifact publication");
-        }
-      },
-    );
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
+      if (request.filePath === artifactPath && !request.repair && !finalVerificationFailed) {
+        finalVerificationFailed = true;
+        throw new Error("injected final ACL verification failure");
+      }
+      if (request.repair && finalVerificationFailed) rollbackStarted = true;
+    });
     const syncDirectory = vi.spyOn(fsDurability, "syncDirectory");
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -892,6 +891,7 @@ describe("bridge host detached child transport", () => {
           spawn: spawnChild,
           backgroundPlatform: "win32",
           generateReadinessNonce: () => READINESS_NONCE,
+          windowsPrivateFileAuthority,
         },
       );
       await shutdownRequested.promise;
@@ -902,7 +902,7 @@ describe("bridge host detached child transport", () => {
 
       tunnelLive = false;
       harness.exit();
-      await expect(publication).rejects.toThrow(/injected directory sync failure/i);
+      await expect(publication).rejects.toThrow(/injected final ACL verification failure/i);
       expect(tunnelLive).toBe(false);
       expect(harness.kill).toHaveBeenCalledOnce();
       expect(spawnChild).toHaveBeenCalledOnce();

@@ -1,4 +1,5 @@
 import path from "node:path";
+import chalk from "chalk";
 
 import { appendArtifacts } from "../browser/artifacts.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
@@ -160,7 +161,9 @@ export async function runBrowserSession(
         `Browser answer is durable; terminal session/model projection remains pending for retry: ${publication.projection.error}`,
       ),
     );
-  } else if (publication.finalization.status === "pending") {
+    return;
+  }
+  if (publication.finalization.status === "pending") {
     log(dim("Browser cleanup remains pending; saved the answer and cleanup authority for retry."));
   } else if (publication.finalizationPersistence.status === "pending") {
     log(
@@ -168,6 +171,11 @@ export async function runBrowserSession(
         `Browser answer is published; cleanup authority projection remains pending for retry: ${publication.finalizationPersistence.error}`,
       ),
     );
+  }
+  if (!runOptions.silent) {
+    log(chalk.bold("Answer:"));
+    log(result.answerText || chalk.dim("(no text output)"));
+    log("");
   }
   await writeAssistantOutput(runOptions.writeOutputPath, result.answerText, log);
   await sendSessionNotification(

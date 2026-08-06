@@ -561,36 +561,6 @@ describe("browser publication phase model", () => {
       "cleanup-pending requires an error message",
     );
   });
-
-  test("restart upgrades legacy publication proofs before validation", async () => {
-    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-legacy-"));
-    tempDirectories.push(directory);
-    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
-      dir: directory,
-      metadata: path.join(directory, "metadata.json"),
-      log: path.join(directory, "session.log"),
-      request: path.join(directory, "request.json"),
-    });
-    const published = reduceBrowserPublicationEvent(finalizeBound, {
-      type: "completed-session-persisted",
-      receipt: { artifact },
-      completedSessionPersisted: true,
-    });
-    const legacy: Record<string, unknown> = { ...published, version: 1 };
-    delete legacy.finalizeSettlementMode;
-    delete legacy.completedSessionPersisted;
-    await writeFile(
-      path.join(directory, "browser-capture-publication.json"),
-      JSON.stringify(legacy),
-    );
-
-    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toMatchObject({
-      version: 2,
-      phase: "published",
-      finalizeSettlementMode: "finalize",
-      completedSessionPersisted: true,
-    });
-  });
 });
 
 describe("publishCompletedBrowserCapture", () => {

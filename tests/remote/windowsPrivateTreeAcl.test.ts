@@ -1,17 +1,22 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test, vi } from "vitest";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
 import {
+  buildWindowsPrivateDirectoryCommand,
   buildWindowsPrivateTreeAclCommand,
+  establishWindowsPrivateDirectory,
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeScope,
 } from "../../src/remote/windowsPrivateTreeAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
+import { testWindowsPrivateTreeAuthority } from "./testTransactionStore.js";
 
 const execFileAsync = promisify(execFile);
 const WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER =
@@ -40,6 +45,7 @@ ${script}`;
 
 const commandScope = {
   storeDirectory: String.raw`C:\Users\Oracle\.oracle\remote-transactions`,
+  authorityDirectory: String.raw`C:\Users\Oracle\.oracle\.remote-transaction-authority`,
   integrityKeyDirectory: String.raw`C:\Users\Oracle\.oracle`,
   integrityKeyPath: String.raw`C:\Users\Oracle\.oracle\.remote-transaction-integrity.key`,
 };
@@ -83,14 +89,54 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
   });
 
+  test("creates or verifies one private directory without in-place ACL repair", async () => {
+    const directoryPath = String.raw`C:\Users\Oracle\.oracle\private-temp`;
+    const execute = vi.fn(async () => ({
+      stdout: "oracle.windows-private-directory.v1:complete",
+    }));
+
+    await expect(establishWindowsPrivateDirectory(directoryPath, execute)).resolves.toBeUndefined();
+
+    const command = buildWindowsPrivateDirectoryCommand(directoryPath);
+    const decodedCommand = Buffer.from(command.args.at(-1) ?? "", "base64").toString("utf16le");
+    expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
+    expect(decodedCommand).toContain("[System.IO.Directory]::CreateDirectory(");
+    expect(decodedCommand).toContain("Assert-PrivateAcl");
+    expect(decodedCommand).toContain("Refusing to promote an existing file");
+    expect(decodedCommand).not.toContain(".SetAccessControl(");
+    expect(command.args.join("\0")).not.toContain(directoryPath);
+  });
+
+  test("precreates fresh transaction files with exact ACLs and only verifies existing tree entries", () => {
+    const initializeFilePath = String.raw`C:\Users\Oracle\.oracle\remote-transactions\.record.tmp`;
+    const command = buildWindowsPrivateTreeAclCommand({
+      ...commandScope,
+      initializeRoots: true,
+      initializeIntegrityKey: true,
+      initializeFilePath,
+    });
+    const decodedCommand = Buffer.from(command.args.at(-1) ?? "", "base64").toString("utf16le");
+
+    expect(decodedCommand).toContain("$InitializeRoots = $true");
+    expect(decodedCommand).toContain("$InitializeIntegrityKey = $true");
+    expect(decodedCommand).toContain("[System.IO.FileStream]::new(");
+    expect(decodedCommand).toContain("Refusing to promote an existing integrity key");
+    expect(decodedCommand).not.toContain(".SetAccessControl(");
+    expect([
+      ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
+    ]).toHaveLength(5);
+  });
+
   test("encodes each configured path independently instead of appending hostile paths as PowerShell source", () => {
     const hostileScope = {
       storeDirectory: String.raw`C:\Users\Oracle\$(throw 'store path injection')`,
       integrityKeyDirectory: String.raw`C:\Users\Oracle\$(throw 'key directory injection')`,
+      authorityDirectory: String.raw`C:\Users\Oracle\$(throw 'authority path injection')`,
       integrityKeyPath: String.raw`C:\Users\Oracle\$(throw 'key directory injection')\$(throw 'key path injection').key`,
     };
     const protectedPaths = [
       hostileScope.storeDirectory,
+      hostileScope.authorityDirectory,
       hostileScope.integrityKeyDirectory,
       hostileScope.integrityKeyPath,
     ];
@@ -102,7 +148,7 @@ describe("Windows remote transaction private ACL authority", () => {
       ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
     ].map((match) => match[1] ?? "");
 
-    expect(encodedPaths).toHaveLength(3);
+    expect(encodedPaths).toHaveLength(4);
     expect(
       encodedPaths.map((encodedPath) => Buffer.from(encodedPath, "base64").toString("utf8")),
     ).toEqual(protectedPaths);
@@ -113,6 +159,7 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(decodedCommand).not.toContain("ConvertFrom-Json");
     expect(decodedCommand).not.toContain("$Scope");
     expect(decodedCommand).toContain("$StorePath = [System.IO.Path]::GetFullPath(");
+    expect(decodedCommand).toContain("$AuthorityPath = [System.IO.Path]::GetFullPath(");
     expect(decodedCommand).toContain("$KeyDirectoryPath = [System.IO.Path]::GetFullPath(");
     expect(decodedCommand).toContain("$KeyPath = [System.IO.Path]::GetFullPath(");
   });
@@ -162,8 +209,8 @@ describe("Windows remote transaction private ACL authority", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-key-initializer-"));
     const directory = path.join(root, "remote-transactions");
     const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
-    const freshAuthority = vi.fn(async (_scope: WindowsPrivateTreeScope) => {});
-    const existingAuthority = vi.fn(async (_scope: WindowsPrivateTreeScope) => {});
+    const freshAuthority = vi.fn(testWindowsPrivateTreeAuthority);
+    const existingAuthority = vi.fn(testWindowsPrivateTreeAuthority);
     try {
       await RemoteTransactionStore.open({
         directory,
@@ -194,7 +241,7 @@ describe("Windows remote transaction private ACL authority", () => {
     const directory = path.join(root, "remote-transactions");
     const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
     const transactionToken = "c".repeat(64);
-    const windowsPrivateTreeAuthority = vi.fn(async () => {});
+    const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
     try {
       const store = await RemoteTransactionStore.open({
         directory,
@@ -230,7 +277,7 @@ describe("Windows remote transaction private ACL authority", () => {
     const directory = path.join(root, "remote-transactions");
     const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
     const transactionToken = "1".repeat(64);
-    const windowsPrivateTreeAuthority = vi.fn(async () => {});
+    const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
     try {
       const store = await RemoteTransactionStore.open({
         directory,
@@ -267,7 +314,8 @@ describe("Windows remote transaction private ACL authority", () => {
     const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
     const transactionToken = "d".repeat(64);
     let replaceKey: (() => Promise<void>) | undefined;
-    const windowsPrivateTreeAuthority = vi.fn(async () => {
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      await testWindowsPrivateTreeAuthority(scope);
       const replacement = replaceKey;
       replaceKey = undefined;
       await replacement?.();
@@ -309,7 +357,8 @@ describe("Windows remote transaction private ACL authority", () => {
     const displacedKeyPath = `${integrityKeyPath}.displaced`;
     const transactionToken = "e".repeat(64);
     let replaceKey: (() => Promise<void>) | undefined;
-    const windowsPrivateTreeAuthority = vi.fn(async () => {
+    const windowsPrivateTreeAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+      await testWindowsPrivateTreeAuthority(scope);
       const replacement = replaceKey;
       replaceKey = undefined;
       await replacement?.();
@@ -346,39 +395,27 @@ describe("Windows remote transaction private ACL authority", () => {
   });
 
   test.runIf(process.platform === "win32")(
-    "repairs broadened ordinary tree ACLs without mutating the integrity key",
+    "creates fresh roots and publication entries with exact protected ACLs",
     async () => {
-      const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-private-acl-"));
-      const directory = path.join(root, "remote-transactions");
-      const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+      const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-fresh-private-acl-"));
+      const privateRoot = path.join(sandbox, "generation");
+      const directory = path.join(privateRoot, "remote-transactions");
+      const integrityKeyPath = path.join(privateRoot, ".remote-transaction-integrity.key");
       const transactionToken = "a".repeat(64);
       const powershellExecutable = resolveWindowsPowerShellExecutable();
       try {
+        await establishWindowsPrivateDirectory(privateRoot);
         const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
-        await beginAclTestRecord(store, transactionToken, "windows-acl-run");
-        const protectedPaths = [root, directory, store.recordPath(transactionToken)];
-        const broadenScript = String.raw`
-$ErrorActionPreference = 'Stop'
-$Everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-$Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-  $Everyone,
-  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
-  [System.Security.AccessControl.AccessControlType]::Allow
-)
-foreach ($ItemPath in $ItemPaths) {
-  $Item = Get-Item -LiteralPath $ItemPath -Force
-  $Acl = $Item.GetAccessControl()
-  [void]$Acl.AddAccessRule($Rule)
-  $Item.SetAccessControl($Acl)
-}`;
-        await execFileAsync(
-          powershellExecutable,
-          buildWindowsTestPathCommandArgs(broadenScript, protectedPaths),
-          { timeout: 12_000, windowsHide: true },
-        );
-
-        await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
-
+        await beginAclTestRecord(store, transactionToken, "windows-fresh-acl-run");
+        const headDirectory = remoteTransactionHeadDirectory(integrityKeyPath);
+        const protectedPaths = [
+          privateRoot,
+          directory,
+          headDirectory,
+          integrityKeyPath,
+          store.recordPath(transactionToken),
+          path.join(headDirectory, `${transactionToken}.head`),
+        ];
         const verifyScript = String.raw`
 $ErrorActionPreference = 'Stop'
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -396,16 +433,15 @@ foreach ($ItemPath in $ItemPaths) {
   $Item = Get-Item -LiteralPath $ItemPath -Force
   $Acl = $Item.GetAccessControl()
   $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-  $DescribeRules = @($Rules | ForEach-Object { "$($_.IdentityReference.Value)|$([int64]$_.FileSystemRights)|$([int]$_.AccessControlType)|$([int]$_.InheritanceFlags)|$([int]$_.PropagationFlags)|$($_.IsInherited)" } | Sort-Object) -join ', '
-  if ($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value) { throw "Unexpected private ACL owner for $ItemPath; actual=$($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value); expected=$($CurrentSid.Value)" }
-  if (-not $Acl.AreAccessRulesProtected) { throw "Inherited private ACL for $ItemPath; actual=[$DescribeRules]" }
-  if ($Rules.Count -ne $AllowedSids.Count) { throw "Unexpected private ACL rule count for $ItemPath; actual=[$DescribeRules]" }
+  if ($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value) { throw "Unexpected private ACL owner for $ItemPath" }
+  if (-not $Acl.AreAccessRulesProtected) { throw "Inherited private ACL for $ItemPath" }
+  if ($Rules.Count -ne $AllowedSids.Count) { throw "Unexpected private ACL rule count for $ItemPath" }
   $ExpectedInheritance = if ($Item.PSIsContainer) { $DirectoryInheritance } else { $NoInheritance }
   foreach ($Sid in $AllowedSids) {
     $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid.Value })
-    if ($Matches.Count -ne 1) { throw "Unexpected private ACL principal rules for $ItemPath; actual=[$DescribeRules]" }
+    if ($Matches.Count -ne 1) { throw "Unexpected private ACL principal rules for $ItemPath" }
     $Rule = $Matches[0]
-    if ($Rule.IsInherited -or $Rule.AccessControlType -ne $Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl -or $Rule.InheritanceFlags -ne $ExpectedInheritance -or $Rule.PropagationFlags -ne $NoPropagation) { throw "Unexpected private ACL rule for $ItemPath; actual=[$DescribeRules]" }
+    if ($Rule.IsInherited -or $Rule.AccessControlType -ne $Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl -or $Rule.InheritanceFlags -ne $ExpectedInheritance -or $Rule.PropagationFlags -ne $NoPropagation) { throw "Unexpected private ACL rule for $ItemPath" }
   }
 }
 [Console]::Out.Write('private')`;
@@ -415,36 +451,93 @@ foreach ($ItemPath in $ItemPaths) {
           { encoding: "utf8", timeout: 12_000, windowsHide: true },
         );
         expect(stdout).toBe("private");
-
-        const keyAfterRepair = await fs.lstat(integrityKeyPath, { bigint: true });
-
-        const secondAuthorityPass = await RemoteTransactionStore.open({
-          directory,
-          integrityKeyPath,
-        });
-        await expect(secondAuthorityPass.read(transactionToken)).resolves.toMatchObject({
-          transactionToken,
-        });
-        const keyAfterSecondAuthorityPass = await fs.lstat(integrityKeyPath, { bigint: true });
-        expect([
-          keyAfterSecondAuthorityPass.dev,
-          keyAfterSecondAuthorityPass.ino,
-          keyAfterSecondAuthorityPass.birthtimeNs,
-          keyAfterSecondAuthorityPass.ctimeNs,
-          keyAfterSecondAuthorityPass.size,
-          keyAfterSecondAuthorityPass.mode,
-          keyAfterSecondAuthorityPass.nlink,
-        ]).toEqual([
-          keyAfterRepair.dev,
-          keyAfterRepair.ino,
-          keyAfterRepair.birthtimeNs,
-          keyAfterRepair.ctimeNs,
-          keyAfterRepair.size,
-          keyAfterRepair.mode,
-          keyAfterRepair.nlink,
-        ]);
+        await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
       } finally {
-        await fs.rm(root, { recursive: true, force: true });
+        await fs.rm(sandbox, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.runIf(process.platform === "win32")(
+    "rejects broadened existing entries so a retained old handle cannot alter accepted authority",
+    async () => {
+      const sandbox = await fs.mkdtemp(
+        path.join(os.tmpdir(), "oracle-windows-rejected-generation-"),
+      );
+      const rejectedRoot = path.join(sandbox, "rejected-generation");
+      const acceptedRoot = path.join(sandbox, "accepted-generation");
+      const transactionToken = "f".repeat(64);
+      const powershellExecutable = resolveWindowsPowerShellExecutable();
+      let retainedHandle: FileHandle | undefined;
+      try {
+        await establishWindowsPrivateDirectory(rejectedRoot);
+        const rejectedDirectory = path.join(rejectedRoot, "remote-transactions");
+        const rejectedKeyPath = path.join(rejectedRoot, ".remote-transaction-integrity.key");
+        const rejectedStore = await RemoteTransactionStore.open({
+          directory: rejectedDirectory,
+          integrityKeyPath: rejectedKeyPath,
+        });
+        await beginAclTestRecord(rejectedStore, transactionToken, "rejected-generation-run");
+        const rejectedRecordPath = rejectedStore.recordPath(transactionToken);
+        const rejectedHeadPath = path.join(
+          remoteTransactionHeadDirectory(rejectedKeyPath),
+          `${transactionToken}.head`,
+        );
+        retainedHandle = await fs.open(rejectedRecordPath, "r+");
+        const broadenScript = String.raw`
+$Everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$Rule = [System.Security.AccessControl.FileSystemAccessRule]::new($Everyone, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, [System.Security.AccessControl.AccessControlType]::Allow)
+foreach ($ItemPath in $ItemPaths) {
+  $Item = Get-Item -LiteralPath $ItemPath -Force
+  $Acl = $Item.GetAccessControl()
+  [void]$Acl.AddAccessRule($Rule)
+  $Item.SetAccessControl($Acl)
+}`;
+        await execFileAsync(
+          powershellExecutable,
+          buildWindowsTestPathCommandArgs(broadenScript, [rejectedRecordPath, rejectedHeadPath]),
+          { timeout: 12_000, windowsHide: true },
+        );
+
+        await expect(rejectedStore.read(transactionToken)).rejects.toThrow(
+          "Windows remote transaction private ACL protection failed",
+        );
+        await expect(
+          RemoteTransactionStore.open({
+            directory: rejectedDirectory,
+            integrityKeyPath: rejectedKeyPath,
+          }),
+        ).rejects.toThrow("Windows remote transaction private ACL protection failed");
+        const { stdout: rejectedAclCount } = await execFileAsync(
+          powershellExecutable,
+          buildWindowsTestPathCommandArgs(
+            "[Console]::Out.Write(@($ItemPaths | Where-Object { @((Get-Item -LiteralPath $_ -Force).GetAccessControl().GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count -eq 1 }).Count)",
+            [rejectedRecordPath, rejectedHeadPath],
+          ),
+          { encoding: "utf8", timeout: 12_000, windowsHide: true },
+        );
+        expect(rejectedAclCount).toBe("2");
+
+        await establishWindowsPrivateDirectory(acceptedRoot);
+        const acceptedStore = await RemoteTransactionStore.open({
+          directory: path.join(acceptedRoot, "remote-transactions"),
+          integrityKeyPath: path.join(acceptedRoot, ".remote-transaction-integrity.key"),
+        });
+        await beginAclTestRecord(acceptedStore, transactionToken, "accepted-generation-run");
+        const acceptedBytes = await fs.readFile(acceptedStore.recordPath(transactionToken));
+
+        await retainedHandle.writeFile(Buffer.from("stale rejected generation write", "utf8"));
+        await retainedHandle.sync();
+        await expect(acceptedStore.read(transactionToken)).resolves.toMatchObject({
+          runId: "accepted-generation-run",
+        });
+        await expect(fs.readFile(acceptedStore.recordPath(transactionToken))).resolves.toEqual(
+          acceptedBytes,
+        );
+      } finally {
+        await retainedHandle?.close();
+        await fs.rm(sandbox, { recursive: true, force: true });
       }
     },
     30_000,
@@ -463,25 +556,13 @@ foreach ($ItemPath in $ItemPaths) {
       const powershellExecutable = resolveWindowsPowerShellExecutable();
       const scope = { storeDirectory, integrityKeyDirectory, integrityKeyPath };
       try {
-        await fs.mkdir(integrityKeyDirectory, { recursive: true });
+        await establishWindowsPrivateDirectory(storeDirectory);
+        await establishWindowsPrivateDirectory(path.join(storeDirectory, "keys"));
+        await establishWindowsPrivateDirectory(integrityKeyDirectory);
+        await protectWindowsPrivateTreeAcl({ ...scope, initializeIntegrityKey: true });
         await fs.writeFile(integrityKeyPath, Buffer.alloc(32));
+        await protectWindowsPrivateTreeAcl({ ...scope, initializeFilePath: ordinaryFilePath });
         await fs.writeFile(ordinaryFilePath, "record");
-        await execFileAsync(
-          powershellExecutable,
-          buildWindowsTestPathCommandArgs(
-            String.raw`
-$CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$Acl = [System.Security.AccessControl.FileSecurity]::new()
-$Acl.SetOwner($CurrentSid)
-$Acl.SetAccessRuleProtection($true, $false)
-foreach ($Sid in @($CurrentSid, [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
-  $Acl.SetAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($Sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow))
-}
-(Get-Item -LiteralPath $ItemPaths[0] -Force).SetAccessControl($Acl)`,
-            [integrityKeyPath],
-          ),
-          { timeout: 12_000, windowsHide: true },
-        );
         await expect(protectWindowsPrivateTreeAcl(scope)).resolves.toBeUndefined();
 
         await execFileAsync(

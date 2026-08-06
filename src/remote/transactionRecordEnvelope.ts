@@ -9,8 +9,8 @@ const REMOTE_TRANSACTION_KEY_ID_DOMAIN =
 const REMOTE_TRANSACTION_RECORD_MAC_DOMAIN = "oracle.remote-controller.transaction-store.record.v1";
 const REMOTE_TRANSACTION_RECORD_MAC_PATTERN = /^[a-f0-9]{64}$/u;
 const REMOTE_TRANSACTION_RECORD_KEY_ID_PATTERN = /^[a-f0-9]{64}$/u;
-const REMOTE_TRANSACTION_HEAD_ENVELOPE_VERSION = 1;
-const REMOTE_TRANSACTION_HEAD_MAC_DOMAIN = "oracle.remote-controller.transaction-store.head.v1";
+const REMOTE_TRANSACTION_HEAD_ENVELOPE_VERSION = 2;
+const REMOTE_TRANSACTION_HEAD_MAC_DOMAIN = "oracle.remote-controller.transaction-store.head.v2";
 const REMOTE_TRANSACTION_HEAD_DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 
 type RemoteTransactionRecordEnvelope = {
@@ -183,6 +183,7 @@ export function serializeRemoteTransactionHeadAuthority(options: {
   integrityKey: Buffer;
   integrityKeyId: string;
   headDirectory: string;
+  storeDirectory: string;
 }): Buffer {
   assertRemoteTransactionHeadAuthority(options.authority);
   const envelope: RemoteTransactionHeadEnvelope = {
@@ -206,6 +207,7 @@ export function authenticateRemoteTransactionHeadAuthority(options: {
   integrityKey: Buffer;
   integrityKeyId: string;
   headDirectory: string;
+  storeDirectory: string;
 }): RemoteTransactionHeadAuthority {
   const candidate = JSON.parse(options.contents.toString("utf8")) as unknown;
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
@@ -242,6 +244,7 @@ export function authenticateRemoteTransactionHeadAuthority(options: {
     integrityKey: options.integrityKey,
     integrityKeyId: options.integrityKeyId,
     headDirectory: options.headDirectory,
+    storeDirectory: options.storeDirectory,
     version: envelope.version,
   });
   const actualMac = Buffer.from(envelope.mac, "hex");
@@ -292,6 +295,7 @@ function headMac(options: {
   integrityKey: Buffer;
   integrityKeyId: string;
   headDirectory: string;
+  storeDirectory: string;
   version: number;
 }): Buffer {
   return createHmac("sha256", options.integrityKey)
@@ -303,6 +307,7 @@ function headMac(options: {
           REMOTE_TRANSACTION_RECORD_ALGORITHM,
           options.integrityKeyId,
           options.headDirectory,
+          options.storeDirectory,
           options.transactionToken,
           options.authority.current,
           options.authority.pending,

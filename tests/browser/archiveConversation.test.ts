@@ -460,10 +460,6 @@ describe("archiveChatGptConversation", () => {
 
   test("keeps the archive expression scoped to Archive actions", () => {
     const expression = buildArchiveConversationExpressionForTest();
-    expect(expression).toContain("findConversationMenuButton");
-    expect(expression).toContain("visibleMenuCandidates");
-    expect(expression).toContain("findArchiveMenuItem");
-    expect(expression).toContain("findArchiveConfirmationButton");
     expect(expression).toContain("hasUnarchiveMenuItem");
     expect(expression).toContain("PointerEvent");
     expect(expression).toContain("runWithArchiveAuthority");

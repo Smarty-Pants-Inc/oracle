@@ -10,7 +10,7 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
-import { syncDirectory } from "../fsDurability.js";
+import { readErrorCode, syncDirectory } from "../fsDurability.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   RemoteArtifactDeliveryReceiptRequestSchema,
@@ -346,12 +346,6 @@ async function quarantineStaleArtifactFile(
   }
   await unlink(quarantinePath);
   await syncDirectory(path.dirname(artifactPath));
-}
-
-function readErrorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : undefined;
 }
 
 export function mergeTransferredArtifacts(

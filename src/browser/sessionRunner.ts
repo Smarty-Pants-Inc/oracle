@@ -313,11 +313,6 @@ export async function runBrowserSessionExecution(
   for (const warning of warnings) {
     log(chalk.yellow(`[browser] ${warning.message}`));
   }
-  if (!runOptions.silent) {
-    log(chalk.bold("Answer:"));
-    log(browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"));
-    log("");
-  }
   const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
   const savedArtifacts = browserResult.artifacts;
   const usage = {

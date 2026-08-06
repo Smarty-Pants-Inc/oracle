@@ -50,7 +50,7 @@ for _ in {1..40}; do
 
     const [root, metaPath] = process.argv.slice(1);
     const { resolveCommittedPromptEpochLocator } = await import(
-      pathToFileURL(path.join(root, "dist", "browser", "reattachability.js")).href,
+      pathToFileURL(path.join(root, "dist", "src", "browser", "reattachability.js")).href,
     );
     const runtime = JSON.parse(readFileSync(metaPath, "utf8")).browser?.runtime;
     process.exit(runtime?.chromePort && resolveCommittedPromptEpochLocator(runtime) ? 0 : 1);

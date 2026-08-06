@@ -1,6 +1,9 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import type { BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import type { BrowserRunOptions } from "../browserMode.js";
 import type {
   BrowserAttachment,
@@ -325,6 +328,31 @@ function projectRemoteBrowserRunConfig(options: BrowserRunOptions): RemoteBrowse
   };
 }
 
+const remoteAttachmentOpenFlags =
+  constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
+
+function isSerializableAttachment(entry: BigIntStats): boolean {
+  return (
+    entry.isFile() &&
+    !entry.isSymbolicLink() &&
+    entry.nlink === 1n &&
+    entry.size > 0n &&
+    entry.size <= BigInt(MAX_REMOTE_ATTACHMENT_BYTES)
+  );
+}
+
+function sameSerializableAttachment(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.size === right.size &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink
+  );
+}
+
 async function serializeAttachments(
   attachments: BrowserAttachment[],
   budget: RemoteAttachmentBudget,
@@ -339,44 +367,81 @@ async function serializeAttachments(
   }
   const serialized: RemoteAttachmentPayload[] = [];
   for (const attachment of attachments) {
-    const fileStat = await stat(attachment.path).catch((error) => {
-      throw new BrowserAutomationError(
-        `Unable to inspect remote browser attachment ${attachment.displayPath}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-        { stage: "remote-request", attachment: attachment.displayPath },
-        error,
-      );
-    });
-    if (!fileStat.isFile() || fileStat.size <= 0 || fileStat.size > MAX_REMOTE_ATTACHMENT_BYTES) {
-      throw new BrowserAutomationError(
-        `Remote browser attachment exceeds the ${MAX_REMOTE_ATTACHMENT_BYTES}-byte per-file limit: ${attachment.displayPath}`,
-        { stage: "remote-request", attachment: attachment.displayPath },
-      );
-    }
-    if (budget.bytes + fileStat.size > MAX_REMOTE_TOTAL_ATTACHMENT_BYTES) {
-      throw new BrowserAutomationError(
-        "Remote browser attachments exceed the aggregate protocol size limit.",
-        { stage: "remote-request" },
-      );
+    let handle: FileHandle | undefined;
+    let namedBeforeRead: BigIntStats;
+    let fileStat: BigIntStats;
+    let content: Buffer;
+    try {
+      try {
+        namedBeforeRead = await lstat(attachment.path, { bigint: true });
+        handle = await open(attachment.path, remoteAttachmentOpenFlags);
+        fileStat = await handle.stat({ bigint: true });
+      } catch (error) {
+        throw new BrowserAutomationError(
+          `Unable to inspect remote browser attachment ${attachment.displayPath}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+          error,
+        );
+      }
+      if (!isSerializableAttachment(namedBeforeRead) || !isSerializableAttachment(fileStat)) {
+        throw new BrowserAutomationError(
+          `Remote browser attachment exceeds the ${MAX_REMOTE_ATTACHMENT_BYTES}-byte per-file limit: ${attachment.displayPath}`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+        );
+      }
+      if (!sameSerializableAttachment(namedBeforeRead, fileStat)) {
+        throw new BrowserAutomationError(
+          `Remote browser attachment changed while it was being read: ${attachment.displayPath}`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+        );
+      }
+      if (budget.bytes + Number(fileStat.size) > MAX_REMOTE_TOTAL_ATTACHMENT_BYTES) {
+        throw new BrowserAutomationError(
+          "Remote browser attachments exceed the aggregate protocol size limit.",
+          { stage: "remote-request" },
+        );
+      }
+      try {
+        content = await handle.readFile();
+      } catch (error) {
+        throw new BrowserAutomationError(
+          `Unable to read remote browser attachment ${attachment.displayPath}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+          error,
+        );
+      }
+      let afterRead: BigIntStats;
+      let namedAfterRead: BigIntStats;
+      try {
+        afterRead = await handle.stat({ bigint: true });
+        namedAfterRead = await lstat(attachment.path, { bigint: true });
+      } catch {
+        throw new BrowserAutomationError(
+          `Remote browser attachment changed while it was being read: ${attachment.displayPath}`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+        );
+      }
+      if (
+        content.byteLength !== Number(fileStat.size) ||
+        !isSerializableAttachment(afterRead) ||
+        !sameSerializableAttachment(fileStat, afterRead) ||
+        !isSerializableAttachment(namedAfterRead) ||
+        !sameSerializableAttachment(afterRead, namedAfterRead)
+      ) {
+        throw new BrowserAutomationError(
+          `Remote browser attachment changed while it was being read: ${attachment.displayPath}`,
+          { stage: "remote-request", attachment: attachment.displayPath },
+        );
+      }
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
     budget.count += 1;
-    budget.bytes += fileStat.size;
-    const content = await readFile(attachment.path).catch((error) => {
-      throw new BrowserAutomationError(
-        `Unable to read remote browser attachment ${attachment.displayPath}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-        { stage: "remote-request", attachment: attachment.displayPath },
-        error,
-      );
-    });
-    if (content.byteLength !== fileStat.size) {
-      throw new BrowserAutomationError(
-        `Remote browser attachment changed while it was being read: ${attachment.displayPath}`,
-        { stage: "remote-request", attachment: attachment.displayPath },
-      );
-    }
+    budget.bytes += content.byteLength;
     serialized.push({
       fileName: path.basename(attachment.path),
       displayPath: attachment.displayPath,

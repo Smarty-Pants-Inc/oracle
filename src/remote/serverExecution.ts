@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { chmod, lstat, mkdtemp, open, rm, rmdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, open, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import type {
   BrowserAttachment,
@@ -67,17 +66,16 @@ import {
   persistRemoteBrowserRuntime,
 } from "./serverTransactionRuntime.js";
 import type { RemoteServerOptions } from "./serverTypes.js";
-import {
-  capturePhysicalDirectoryIdentity,
-  samePhysicalDirectoryIdentity,
-  type PhysicalDirectoryIdentity,
-} from "../browser/filesystemLockDirectoryIdentity.js";
 import { samePhysicalFile } from "./transactionRecordStorage.js";
+import {
+  assertPrivateDirectoryAuthority,
+  createPrivateTempChildGeneration,
+  createPrivateTempGeneration,
+  type PrivateTempGeneration,
+  type PrivateTempRootOptions,
+} from "../privateTempRoot.js";
 
-interface RemoteScratchGeneration {
-  readonly path: string;
-  readonly identity: PhysicalDirectoryIdentity;
-}
+type RemoteScratchGeneration = PrivateTempGeneration;
 
 interface RemoteScratchFile {
   readonly path: string;
@@ -102,27 +100,24 @@ function projectRemoteHostText(message: string): string {
 }
 
 async function createRemoteScratchGeneration(
-  parent: string,
+  parent: RemoteScratchGeneration,
   prefix: string,
+  options: PrivateTempRootOptions = {},
 ): Promise<RemoteScratchGeneration> {
-  const scratchPath = await mkdtemp(path.join(parent, prefix));
   try {
-    await chmod(scratchPath, 0o700);
-    return { path: scratchPath, identity: await capturePhysicalDirectoryIdentity(scratchPath) };
-  } catch {
-    await rm(scratchPath, { recursive: true, force: true }).catch(() => undefined);
-    throw new Error("Remote attachment scratch generation could not be initialized");
+    return await createPrivateTempChildGeneration(parent, prefix, options);
+  } catch (error) {
+    throw new Error("Remote attachment scratch generation could not be initialized", {
+      cause: error,
+    });
   }
 }
 
 async function assertRemoteScratchGeneration(generation: RemoteScratchGeneration): Promise<void> {
-  let current: PhysicalDirectoryIdentity;
   try {
-    current = await capturePhysicalDirectoryIdentity(generation.path);
+    await assertPrivateDirectoryAuthority(generation.parent);
+    await assertPrivateDirectoryAuthority(generation);
   } catch {
-    throw new Error("Remote attachment scratch generation changed");
-  }
-  if (!samePhysicalDirectoryIdentity(current, generation.identity)) {
     throw new Error("Remote attachment scratch generation changed");
   }
 }
@@ -181,7 +176,8 @@ async function removeRemoteScratchGeneration(
   try {
     await assertRemoteScratchGeneration(generation);
     await assertRemoteScratchFiles(files);
-    await rm(generation.path, { recursive: true, force: false });
+    for (const file of files) await unlink(file.path);
+    await rmdir(generation.path);
     return true;
   } catch {
     return false;
@@ -195,9 +191,13 @@ async function releaseRemoteScratchRun(
     files: readonly RemoteScratchFile[];
   }[],
 ): Promise<void> {
+  let retainedAttachment = false;
   for (const attachment of attachments) {
-    await removeRemoteScratchGeneration(attachment.generation, attachment.files);
+    if (!(await removeRemoteScratchGeneration(attachment.generation, attachment.files))) {
+      retainedAttachment = true;
+    }
   }
+  if (retainedAttachment) return;
   try {
     await assertRemoteScratchGeneration(run);
     await rmdir(run.path);
@@ -275,6 +275,13 @@ export async function handleRemoteRunRequest(params: {
       });
       return;
     }
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+      sendJson(params.res, 409, {
+        error: "transaction_exists",
+        transactionToken: params.transactionToken,
+      });
+      return;
+    }
     throw error;
   }
   params.releaseTransactionAdmission?.();
@@ -304,7 +311,7 @@ export async function handleRemoteRunRequest(params: {
     `[serve] Accepted run ${runId} from ${formatSocket(params.req)} (prompt ${payload.prompt.length} chars)`,
   );
   const runStartedAt = Date.now();
-  let scratchRun: RemoteScratchGeneration | null = null;
+  let scratchRun: PrivateTempGeneration | null = null;
   const scratchAttachments: {
     generation: RemoteScratchGeneration;
     files: readonly RemoteScratchFile[];
@@ -458,11 +465,8 @@ export async function handleRemoteRunRequest(params: {
   let capture: BrowserRunTransaction | null = null;
   let durableCapture = false;
   try {
-    scratchRun = await createRemoteScratchGeneration(tmpdir(), `oracle-serve-${runId}-`);
-    const attachmentGeneration = await createRemoteScratchGeneration(
-      scratchRun.path,
-      "attachments-",
-    );
+    scratchRun = await createPrivateTempGeneration(`oracle-serve-${runId}-`);
+    const attachmentGeneration = await createRemoteScratchGeneration(scratchRun, "attachments-");
     const materializedAttachments = await materializeRemoteAttachments(
       payload.attachments,
       attachmentGeneration.path,
@@ -481,7 +485,7 @@ export async function handleRemoteRunRequest(params: {
       | undefined;
     if (payload.fallbackSubmission) {
       const fallbackGeneration = await createRemoteScratchGeneration(
-        scratchRun.path,
+        scratchRun,
         "fallback-attachments-",
       );
       const materializedFallback = await materializeRemoteAttachments(
@@ -847,6 +851,7 @@ async function materializeRemoteAttachments(
 export const __test__ = {
   assertRemoteScratchFiles,
   assertRemoteScratchGeneration,
+  createRemoteScratchRun: createPrivateTempGeneration,
   createRemoteScratchGeneration,
   materializeRemoteAttachments,
   projectRemoteHostText,

@@ -257,18 +257,6 @@ export async function persistCompletedUnpublishedFinalization(
   }
 }
 
-export function maybeArchiveCompletedConversationForTest(
-  args: Parameters<typeof maybeArchiveCompletedConversation>[0],
-): Promise<BrowserArchiveResult> {
-  return maybeArchiveCompletedConversation(args);
-}
-
-export function maybeArchiveInterruptedConversationForTest(
-  args: Parameters<typeof maybeArchiveInterruptedConversation>[0],
-): Promise<BrowserArchiveResult | null> {
-  return maybeArchiveInterruptedConversation(args);
-}
-
 export type BrowserSubmissionResult = {
   baselineTurns: number | null;
   promptLocator: CommittedPromptEpochLocator;

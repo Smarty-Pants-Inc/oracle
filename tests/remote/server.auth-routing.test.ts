@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
+import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
   CAN_LISTEN_LOCALHOST,
@@ -15,7 +16,10 @@ import {
   openSeedTransactionStore,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
-import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
+import {
+  openTestRemoteTransactionStore,
+  testWindowsPrivateTreeAuthority,
+} from "./testTransactionStore.js";
 import {
   REMOTE_BODY_SHA256_HEADER,
   REMOTE_REQUEST_MAC_HEADER,
@@ -616,7 +620,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const integrityKeyPath = path.join(tmpDir, ".remote-transaction-integrity.key");
-      const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+      const windowsPrivateTreeAuthority = vi.fn(testWindowsPrivateTreeAuthority);
       const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
       const first = await createTestRemoteServer(options, {
         transactionStoreDir,
@@ -640,7 +644,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           }),
         ).rejects.toThrow(/lock|owner|active/i);
 
-        expect(windowsPrivateTreeAuthority).not.toHaveBeenCalled();
+        expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+        expect(windowsPrivateTreeAuthority).toHaveBeenCalledWith(
+          expect.objectContaining({ initializeRoots: true }),
+        );
         await expect(readFile(integrityKeyPath)).resolves.toEqual(keyBefore);
         expect(
           (await readdir(transactionStoreDir)).filter((name) => name.endsWith(".json")),
@@ -656,8 +663,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-windows-acl-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
-      const failingAuthority = vi.fn(async () => {
-        throw new Error("simulated Windows tree authority failure");
+      const failingAuthority = vi.fn(async (scope: WindowsPrivateTreeScope) => {
+        await testWindowsPrivateTreeAuthority(scope);
+        if (!scope.initializeRoots) throw new Error("simulated Windows tree authority failure");
       });
       const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
       let recovered: RemoteServerInstance | undefined;
@@ -669,7 +677,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             windowsPrivateTreeAuthority: failingAuthority,
           }),
         ).rejects.toThrow("simulated Windows tree authority failure");
-        expect(failingAuthority).toHaveBeenCalledOnce();
+        expect(failingAuthority).toHaveBeenCalledTimes(2);
         expect(await readdir(transactionStoreDir)).not.toContain(".controller.lock");
 
         recovered = await createTestRemoteServer(options, {

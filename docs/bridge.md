@@ -39,9 +39,11 @@ What it does:
 - Generates a 32-byte CSPRNG access key encoded as exactly 64 lowercase hexadecimal characters (stored to disk; not printed unless you ask).
 - Starts an SSH reverse tunnel so the Linux host can reach the Windows service at `127.0.0.1:9473`. Native Windows OpenSSH runs one tracked `ssh -N -R ... -o ExitOnForwardFailure=yes` tunnel child; it does not use `ControlMaster`, `ControlPath`, or `ssh -O`. POSIX hosts retain the control-socket flow.
 - Writes `~/.oracle/bridge-connection.json` (contains host + token) only after the local controller is ready and a bounded, short-lived `ssh -W` stdio probe reaches the forwarded Linux loopback port and verifies its transaction-v3 health proof with the generated key. Probe processes are closed after each attempt. A live reverse-tunnel process by itself is never readiness.
+- Publishes only the connection file: Oracle creates a private temporary file in the requested destination parent, writes and durably syncs it, atomically replaces the destination, and verifies the final physical artifact. Existing parent permissions, unrelated siblings, large sibling sets, and sibling symlinks/reparse points are not scanned or changed.
 
 Useful flags:
 
+- Write a different connection artifact without changing its parent or siblings: `--write-connection <path>`
 - Bind a different local port: `--bind 127.0.0.1:9474`
 - Use a specific key: `--token <64-lowercase-hex-characters>`
 - Allow predecessor text-only clients with a separate bearer: `--legacy-token <distinct-64-lowercase-hex-characters>`
@@ -78,7 +80,7 @@ The immediately preceding base release generated 16-byte bridge credentials enco
 
 Use this rotate/clear/re-import sequence:
 
-1. On the browser host, stop the predecessor bridge, upgrade Oracle, and rotate the credential by starting the current host with `oracle bridge host --token auto` (plus the same `--ssh` options you normally use). This writes a new 64-character credential to `~/.oracle/bridge-connection.json`.
+1. On the browser host, stop the predecessor bridge, upgrade Oracle, and start the current host with `oracle bridge host --token auto` (plus the same `--ssh` options you normally use). Oracle treats an existing predecessor connection file, including one with an inherited Windows DACL, only as replacement input: it never reuses its credential and atomically publishes a fresh private artifact containing a new 64-character credential. Do not manually delete the artifact or change its parent directory permissions.
 2. On the client, remove `browser.remoteHost` and `browser.remoteToken` from `~/.oracle/config.json`, then clear any shell overrides:
 
    ```bash
@@ -200,7 +202,7 @@ Transaction-v3 request signatures are accepted only when their issued-at timesta
 
 - Tokens are not printed by default.
 - Detached background child process arguments and environment do not contain either bridge credential; credentials cross only the inherited one-shot pipe and are never copied to the log.
-- The connection artifact and config file contain secrets; keep them private (Oracle writes them with restrictive permissions on Unix).
+- The connection artifact and config file contain secrets; keep them private. Oracle publishes the connection artifact itself as POSIX mode `0600` or an exact protected Windows owner DACL, and verifies that exact final file before printing connection details. It never chmods, re-ACLs, recursively enumerates, or rejects the artifact’s unrelated parent or sibling entries.
 - A legacy bearer must be distinct from the modern v3 HMAC root key; the modern key is never sent or accepted as bearer authentication.
 - Durable remote-transaction records use a separate OS-account-scoped integrity key (by default `~/.oracle/.remote-transaction-integrity.key`), not the mutable bridge connection credential. Oracle requires mode `0600` and owner-private directories on Unix. On Windows it invokes the fixed native Windows PowerShell executable directly, never through `PATH` or an intermediate command shell; the UTF-16LE encoded command carries configured paths in a separate base64 payload so path text is never appended as PowerShell source. The command removes inherited access and establishes an exact protected DACL for the controller user plus `SYSTEM` and built-in Administrators on the key directory/file and the bounded transaction-store tree before key or record use, while the controller pins the protected root generations across ACL application and store inventory; the closed tree is revalidated once per bounded store operation. Rotating the connection credential does not re-key persisted records or invalidate pending cleanup or recovery authority.
 - Each transaction envelope authenticates its format version, monotonic revision, key identifier, resolved store directory, trusted filename token, exact payload length, and exact payload bytes before Oracle parses or uses the record. Within one controller lifetime, Oracle remembers the exact authenticated head for each transaction and rejects an older signed revision or any different digest before it can authorize recovery, target closure, artifact cleanup, or retention deletion. Unsigned, modified, wrong-key, renamed, copied, or controller-head-stale records are preserved in hidden `.quarantine` files when safe containment is possible.

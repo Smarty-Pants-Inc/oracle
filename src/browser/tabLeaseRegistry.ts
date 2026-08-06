@@ -1,7 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { open, readFile, rename, rm } from "node:fs/promises";
-import { syncDirectory } from "../fsDurability.js";
+import { readErrorCode, syncDirectory } from "../fsDurability.js";
 import type { BrowserLogger } from "./types.js";
 import { delay } from "./utils.js";
 import {
@@ -854,9 +854,4 @@ async function replaceRegistryFile(sourcePath: string, destinationPath: string):
     }
     await delay(Math.min(WINDOWS_REGISTRY_MUTATION_RETRY_MS, Math.max(1, deadline - Date.now())));
   }
-}
-
-function readErrorCode(error: unknown): unknown {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return error.code;
 }

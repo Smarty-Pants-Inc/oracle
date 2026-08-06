@@ -3,7 +3,7 @@ import { readFile, rm } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import type { BrowserRuntimeMetadata, SessionArtifact, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import { syncDirectory } from "../fsDurability.js";
+import { readErrorCode, syncDirectory } from "../fsDurability.js";
 import { writeFileAtomicDurable } from "../sessionManager.js";
 import {
   assertDurableBrowserAnswerReceipt,
@@ -279,9 +279,8 @@ export class BrowserPublicationJournalStore {
     const journalPath = await resolveJournalPath(this.sessionId);
     try {
       const parsed: unknown = JSON.parse(await readFile(journalPath, "utf8"));
-      const journal = upgradeLegacyBrowserCapturePublicationJournal(parsed);
-      assertBrowserCapturePublicationJournal(journal, this.sessionId);
-      return journal;
+      assertBrowserCapturePublicationJournal(parsed, this.sessionId);
+      return parsed;
     } catch (error) {
       if (readErrorCode(error) === "ENOENT") return null;
       throw error;
@@ -454,31 +453,6 @@ async function resolveJournalPath(sessionId: string): Promise<string> {
   return path.join((await sessionStore.getPaths(sessionId)).dir, JOURNAL_FILENAME);
 }
 
-function upgradeLegacyBrowserCapturePublicationJournal(value: unknown): unknown {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    !("version" in value) ||
-    value.version !== 1 ||
-    !("phase" in value) ||
-    typeof value.phase !== "string" ||
-    !Object.hasOwn(BROWSER_PUBLICATION_PHASES, value.phase)
-  ) {
-    return value;
-  }
-  const phase = value.phase as BrowserPublicationPhase;
-  return {
-    ...value,
-    version: 2,
-    ...(phase === "finalize-bound" || phase === "published" || phase === "cleanup-pending"
-      ? { finalizeSettlementMode: "finalize" }
-      : {}),
-    ...(phase === "published" || phase === "cleanup-pending"
-      ? { completedSessionPersisted: true }
-      : {}),
-  };
-}
-
 function assertBrowserCapturePublicationJournal(
   value: unknown,
   sessionId: string,
@@ -625,9 +599,4 @@ function isReceipt(value: unknown): value is DurableBrowserAnswerReceipt {
     Number.isSafeInteger(artifact.sizeBytes) &&
     artifact.sizeBytes >= 0,
   );
-}
-
-function readErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return typeof error.code === "string" ? error.code : undefined;
 }

@@ -4,6 +4,7 @@ import { lstat, readFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { promisify } from "node:util";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
+import { readErrorCode } from "../fsDurability.js";
 import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
 import type { BrowserLevelChromeClient } from "./chromeSessionTransport.js";
 import {
@@ -648,11 +649,6 @@ async function waitForVerifiedDevToolsActivePort(
     await delay(100);
   }
   throw new Error(`Timed out waiting for verified hidden Chrome DevToolsActivePort metadata.`);
-}
-
-function readErrorCode(error: unknown): unknown {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return error.code;
 }
 
 function buildChromeFlags(

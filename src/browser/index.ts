@@ -31,10 +31,6 @@ export {
   type BrowserConversationTurn,
 } from "./responseCaptureCoordinator.js";
 export {
-  maybeArchiveCompletedConversationForTest,
-  maybeArchiveInterruptedConversationForTest,
-} from "./archiveSettlementCoordinator.js";
-export {
   isLocalChromeHostForTest,
   resolveRemoteTabLeaseProfileDirForTest,
   runSubmissionWithRecoveryForTest,

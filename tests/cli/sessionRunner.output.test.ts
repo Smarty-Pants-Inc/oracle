@@ -80,6 +80,7 @@ import { getCliVersion } from "../../src/version.ts";
 import { deriveModelOutputPath } from "../../src/cli/multiModelSessionRun.ts";
 import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
+import { sendSessionNotification } from "../../src/cli/notifier.ts";
 
 const log = vi.fn();
 const write = vi.fn(() => true);
@@ -194,6 +195,154 @@ describe("performSessionRun", () => {
       expect.stringContaining("browser answer\n"),
       "utf8",
     ]);
+  });
+
+  test.each([
+    {
+      provider: "ChatGPT",
+      desiredModel: "GPT-5.5 Pro",
+      tabUrl: "https://chatgpt.com/c/output-ordering",
+      retryProjection: false,
+    },
+    {
+      provider: "Gemini HTTP",
+      desiredModel: "gemini-3.1-pro",
+      tabUrl: undefined,
+      retryProjection: true,
+    },
+    {
+      provider: "Gemini DOM",
+      desiredModel: "gemini-3-pro-deep-think",
+      tabUrl: "https://gemini.google.com/app/output-ordering",
+      retryProjection: false,
+    },
+  ])("emits $provider output exactly once after durable publication", async (providerCase) => {
+    const answerText = `${providerCase.provider} exact completed answer`;
+    const runtime: BrowserRuntimeMetadata = providerCase.tabUrl
+      ? { tabUrl: providerCase.tabUrl }
+      : {};
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText,
+      bindSettlement: vi.fn(async () => runtime),
+      finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
+      abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
+    });
+    if (providerCase.retryProjection) {
+      commitSessionModelProjectionMock.mockRejectedValueOnce(
+        new Error("transient terminal projection failure"),
+      );
+    }
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null, desiredModel: providerCase.desiredModel },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const messages = log.mock.calls.map(([message]) => String(message));
+    const answerIndexes = messages.flatMap((message, index) =>
+      message === answerText ? [index] : [],
+    );
+    expect(answerIndexes).toHaveLength(1);
+    expect(messages.filter((message) => message.includes("Answer:"))).toHaveLength(1);
+    const answerOrder = log.mock.invocationCallOrder[answerIndexes[0] ?? -1] ?? 0;
+    expect(answerOrder).toBeGreaterThan(
+      vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder.at(-1) ?? 0,
+    );
+    expect(answerOrder).toBeGreaterThan(
+      commitSessionModelProjectionMock.mock.invocationCallOrder.at(-1) ?? 0,
+    );
+    expect(vi.mocked(sendSessionNotification)).toHaveBeenCalledOnce();
+  });
+
+  test("keeps a Gemini answer private while terminal publication remains retryable", async () => {
+    const answerText = "Gemini answer without terminal publication";
+    const runtime: BrowserRuntimeMetadata = {};
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText,
+      bindSettlement: vi.fn(async () => runtime),
+      finalize,
+      abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
+    });
+    commitSessionModelProjectionMock.mockRejectedValue(new Error("terminal projection failed"));
+    const outputPath = path.resolve("/tmp/gemini-unpublished.md");
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: { ...baseRunOptions, writeOutputPath: outputPath },
+        mode: "browser",
+        browserConfig: { chromePath: null, desiredModel: "gemini-3.1-pro" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).resolves.toBeUndefined();
+
+    const messages = log.mock.calls.map(([message]) => String(message));
+    expect(messages.join("\n")).toContain("terminal session/model projection remains pending");
+    expect(messages.join("\n")).not.toContain(answerText);
+    expect(messages.some((message) => message.includes("Answer:"))).toBe(false);
+    expect(
+      vi.mocked(fsPromises.writeFile).mock.calls.some(([target]) => target === outputPath),
+    ).toBe(false);
+    expect(finalize).not.toHaveBeenCalled();
+    expect(vi.mocked(sendSessionNotification)).not.toHaveBeenCalled();
+  });
+
+  test("does not emit Gemini output when durable publication fails", async () => {
+    const answerText = "Gemini answer from failed durable publication";
+    const runtime: BrowserRuntimeMetadata = {};
+    const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
+    const abort = vi.fn(async () => ({ status: "completed" as const, runtime }));
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText,
+      bindSettlement: vi.fn(async () => runtime),
+      finalize,
+      abort,
+    });
+    vi.mocked(persistDurableBrowserAnswer).mockRejectedValueOnce(
+      new Error("Gemini durable publication failed"),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, desiredModel: "gemini-3.1-pro" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Gemini durable publication failed");
+
+    const messages = log.mock.calls.map(([message]) => String(message));
+    expect(messages.join("\n")).not.toContain(answerText);
+    expect(messages.some((message) => message.includes("Answer:"))).toBe(false);
+    expect(finalize).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledOnce();
+    expect(vi.mocked(sendSessionNotification)).not.toHaveBeenCalled();
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, update]) => update.status === "error"),
+    ).toBe(true);
   });
 
   test("write-output failures warn but keep session successful", async () => {

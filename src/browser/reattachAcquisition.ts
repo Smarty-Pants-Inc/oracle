@@ -1,10 +1,11 @@
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import { assertPrivateTempGeneration, createPrivateTempGeneration } from "../privateTempRoot.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -211,9 +212,12 @@ export async function resumeBrowserSessionViaNewChrome(
   const promptEpoch = promptLocator.epoch;
   const minTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
   const manualLogin = Boolean(resolved.manualLogin);
-  const userDataDir = manualLogin
-    ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
-    : await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
+  const temporaryProfileGeneration = manualLogin
+    ? null
+    : await (deps.createPrivateTempGeneration ?? createPrivateTempGeneration)("oracle-reattach-");
+  const userDataDir = temporaryProfileGeneration
+    ? temporaryProfileGeneration.path
+    : (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"));
   if (manualLogin) await mkdir(userDataDir, { recursive: true });
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
@@ -269,6 +273,10 @@ export async function resumeBrowserSessionViaNewChrome(
           );
           return { kind: "manual" as const, owner };
         }
+        if (!temporaryProfileGeneration) {
+          throw new Error("Temporary recovery profile authority is unavailable.");
+        }
+        await assertPrivateTempGeneration(temporaryProfileGeneration);
         const chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger, {
           launchClaim: acquisitionLaunchClaim,
         });

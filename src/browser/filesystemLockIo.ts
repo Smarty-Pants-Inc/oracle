@@ -1,13 +1,14 @@
 import path from "node:path";
 import { lstat, readdir, rename, rmdir, stat, unlink } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
+import { readErrorCode } from "../fsDurability.js";
 import {
   physicalDirectoryIdentityFromStats,
   samePhysicalDirectoryIdentity,
 } from "./filesystemLockDirectoryIdentity.js";
 import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 import { delay } from "./utils.js";
-export { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
+export { readErrorCode, syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
 
 export { capturePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 export type { PhysicalDirectoryIdentity };
@@ -106,10 +107,4 @@ export async function lockPathExists(lockPath: string): Promise<boolean> {
     if (readErrorCode(error) === "ENOENT") return false;
     throw error;
   }
-}
-
-export function readErrorCode(error: unknown): unknown {
-  return error && typeof error === "object" && "code" in error
-    ? (error as { code?: unknown }).code
-    : undefined;
 }

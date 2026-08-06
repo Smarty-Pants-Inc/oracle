@@ -1177,7 +1177,7 @@ bridgeCommand
   )
   .option(
     "--write-connection <path>",
-    "Write a connection artifact JSON (default ~/.oracle/bridge-connection.json).",
+    "Atomically write only this private connection artifact (default ~/.oracle/bridge-connection.json).",
   )
   .option("--ssh <user@host>", "Maintain an SSH reverse tunnel to the Linux host (ssh -N -R ...).")
   .option(

@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 const repoRoot = process.cwd();
 const tmpRoot = mkdtempSync(join(tmpdir(), "oracle-packed-cli-"));
@@ -58,6 +59,48 @@ function assertPackedBin(packageDir, shimPath, name) {
   }
   if (!readFileSync(targetPath, "utf8").startsWith("#!")) {
     throw new Error(`packed ${name} bin target is missing a shebang`);
+  }
+}
+
+const criticalLazyRuntimeModules = [
+  ["dist/src/browser/reattachability.js", "resolveCommittedPromptEpochLocator"],
+  ["dist/src/browser/browserCoordinator.js", "runBrowserModeTransaction"],
+  ["dist/src/cli/browserConfig.js", "buildBrowserConfig"],
+  ["dist/src/cli/sessionRunner.js", "performSessionRun"],
+  ["dist/src/remote/client.js", "createRemoteBrowserExecutor"],
+  ["dist/src/remote/server.js", "serveRemote"],
+  ["dist/src/cli/bridge/host.js", "runBridgeHost"],
+];
+
+async function smokePackedLazyRuntimeModules(packageDir) {
+  let timeout;
+  try {
+    await Promise.race([
+      Promise.all(
+        criticalLazyRuntimeModules.map(async ([relativePath, exportName]) => {
+          const modulePath = join(packageDir, ...relativePath.split("/"));
+          accessSync(modulePath, constants.R_OK);
+          const loaded = await import(pathToFileURL(modulePath).href);
+          if (typeof loaded[exportName] !== "function") {
+            throw new Error(`packed lazy runtime module ${relativePath} lacks ${exportName}`);
+          }
+          if (
+            relativePath === "dist/src/browser/reattachability.js" &&
+            loaded.resolveCommittedPromptEpochLocator(null) !== null
+          ) {
+            throw new Error("packed reattachability helper accepted an absent prompt epoch");
+          }
+        }),
+      ),
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("packed lazy runtime modules did not load within 5 seconds")),
+          5_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -350,9 +393,12 @@ try {
     }
   }
   await smokeMcp(oracleMcpBin, [], "packed oracle-mcp bin shim", installDir);
+  await smokePackedLazyRuntimeModules(packageDir);
   await smokePackedRemovalWorker(packageDir);
   await smokeMcp(oracleBin, ["oracle-mcp"], "packed oracle default-bin alias", installDir);
-  console.log("Packed CLI, MCP dispatch, and removal-worker protocol smoke: ok");
+  console.log(
+    "Packed CLI, MCP dispatch, lazy-runtime import, and removal-worker protocol smoke: ok",
+  );
 } finally {
   rmSync(tmpRoot, { recursive: true, force: true });
 }

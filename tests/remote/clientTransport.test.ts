@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import * as fsPromises from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
+import type { FileHandle } from "node:fs/promises";
 import {
   createRemoteBrowserExecutor,
   resumeRemoteBrowserTransaction,
@@ -272,6 +273,122 @@ describe("remote client transport deadlines", () => {
         allowLegacyTextProtocol: true,
       }),
     ).toThrow(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i);
+  });
+
+  it("serializes ordinary attachments from their opened file handle", async () => {
+    const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-attachment-"));
+    const attachmentPath = path.join(directory, "attachment.txt");
+    const contents = Buffer.from("trusted attachment");
+    await fsPromises.writeFile(attachmentPath, contents);
+    let receivedAttachments: unknown;
+    const server = createAuthenticatedServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (!transactionToken) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      receivedAttachments = (await readJson(req)).attachments;
+      res.setHeader("content-type", "application/x-ndjson");
+      res.end(`${JSON.stringify(transactionEvent(transactionToken, "attachment"))}\n`);
+    });
+    const port = await listen(server);
+    try {
+      await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "a".repeat(64),
+        deadlines,
+      })({
+        prompt: "attachment",
+        attachments: [{ path: attachmentPath, displayPath: "attachment.txt" }],
+        config: {},
+      });
+      expect(receivedAttachments).toEqual([
+        {
+          fileName: "attachment.txt",
+          displayPath: "attachment.txt",
+          sizeBytes: contents.byteLength,
+          contentBase64: contents.toString("base64"),
+        },
+      ]);
+    } finally {
+      await close(server);
+      await fsPromises.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "mutates the opened file",
+      change: async (attachmentPath: string) => {
+        await fsPromises.writeFile(
+          attachmentPath,
+          Buffer.alloc(Buffer.byteLength("trusted attachment"), 0x78),
+        );
+      },
+    },
+    {
+      name: "swaps the named path",
+      change: async (attachmentPath: string, directory: string) => {
+        const replacementPath = path.join(directory, "replacement.txt");
+        await fsPromises.writeFile(
+          replacementPath,
+          Buffer.alloc(Buffer.byteLength("trusted attachment"), 0x78),
+        );
+        await fsPromises.rename(replacementPath, attachmentPath);
+      },
+    },
+    {
+      name: "adds a hardlink",
+      change: async (attachmentPath: string, directory: string) => {
+        await fsPromises.link(attachmentPath, path.join(directory, "attachment-link.txt"));
+      },
+    },
+  ])("does not send replacement attachment bytes when it $name", async ({ change }) => {
+    const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-attachment-"));
+    const attachmentPath = path.join(directory, "attachment.txt");
+    await fsPromises.writeFile(attachmentPath, "trusted attachment");
+    let runRequests = 0;
+    const server = createAuthenticatedServer(async (req, res) => {
+      if (runTransactionToken(req)) runRequests += 1;
+      res.statusCode = 500;
+      res.end();
+    });
+    const port = await listen(server);
+    const probe = await fsPromises.open(attachmentPath, "r");
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as FileHandle;
+    await probe.close();
+    const originalReadFile = fileHandlePrototype.readFile;
+    let changed = false;
+    const readFile = vi.spyOn(fileHandlePrototype, "readFile").mockImplementation(async function (
+      this: FileHandle,
+      ...args: Parameters<FileHandle["readFile"]>
+    ) {
+      if (!changed) {
+        changed = true;
+        await change(attachmentPath, directory);
+      }
+      return await originalReadFile.apply(this, args);
+    });
+    try {
+      await expect(
+        createRemoteBrowserExecutor({
+          host: `127.0.0.1:${port}`,
+          token: "a".repeat(64),
+          deadlines,
+        })({
+          prompt: "attachment",
+          attachments: [{ path: attachmentPath, displayPath: "attachment.txt" }],
+          config: {},
+        }),
+      ).rejects.toThrow(/attachment changed while it was being read/i);
+      expect(changed).toBe(true);
+      expect(runRequests).toBe(0);
+    } finally {
+      readFile.mockRestore();
+      await close(server);
+      await fsPromises.rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("times out held run and retry requests while preserving opaque retry authority", async () => {

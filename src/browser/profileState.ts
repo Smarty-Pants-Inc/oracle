@@ -1,6 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { readErrorCode } from "../fsDurability.js";
 import {
   acquireCrashRecoverableFilesystemLock,
   type CrashRecoverableFilesystemLock,
@@ -182,7 +183,7 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
   try {
     await rename(expected.canonicalPath, quarantinePath);
   } catch (error) {
-    if (["ENOENT", "EEXIST", "ENOTEMPTY"].includes(String(readErrorCode(error)))) return false;
+    if (["ENOENT", "EEXIST", "ENOTEMPTY"].includes(readErrorCode(error) ?? "")) return false;
     throw error;
   }
 
@@ -480,11 +481,6 @@ async function syncProfileDirectory(userDataDir: string): Promise<void> {
   } finally {
     await handle.close();
   }
-}
-
-function readErrorCode(error: unknown): unknown {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return error.code;
 }
 
 export type RecordedChromeTerminationOutcome =

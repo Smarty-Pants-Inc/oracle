@@ -35,9 +35,12 @@ type AuthenticatedRemoteTransactionRecord = {
 
 type RemoteTransactionStoreMaintenanceOptions = {
   directory: string;
+  headDirectory: string;
   platform: NodeJS.Platform;
   terminalRetentionMs: number;
   maximumRecords: number;
+  maximumAuthorityRecords: number;
+  maximumAuthorityBytes: number;
   maximumBytes: number;
   maximumQuarantineRecords: number;
   maximumQuarantineBytes: number;
@@ -103,11 +106,19 @@ export class RemoteTransactionStoreMaintenance {
     contentsBytes: number,
     replacedPath: string | undefined,
     reservationBytes: number | undefined,
+    authorityPath: string,
+    authorityContentsBytes: number,
     publish: () => Promise<void>,
   ): Promise<void> {
     await this.withMaintenanceLock(async () => {
       await this.pruneExpiredTerminalRecords();
-      await this.assertCapacity(contentsBytes, replacedPath, reservationBytes);
+      await this.assertCapacity(
+        contentsBytes,
+        replacedPath,
+        reservationBytes ?? 0,
+        authorityPath,
+        authorityContentsBytes,
+      );
       await publish();
     });
   }
@@ -411,8 +422,10 @@ export class RemoteTransactionStoreMaintenance {
 
   private async assertCapacity(
     contentsBytes: number,
-    replacedPath?: string,
-    reservationBytes = 0,
+    replacedPath: string | undefined,
+    reservationBytes: number,
+    authorityPath: string,
+    authorityContentsBytes: number,
   ): Promise<void> {
     await this.#options.assertIntegrityAuthority();
     const names = await readdir(this.#options.directory);
@@ -442,6 +455,25 @@ export class RemoteTransactionStoreMaintenance {
       storedBytes += chargedBytes;
       if (replacedPath === candidatePath) replacedBytes = chargedBytes;
     }
+    let authorityRecords = 0;
+    let authorityBytes = 0n;
+    let replacedAuthorityBytes = 0n;
+    for (const name of await readdir(this.#options.headDirectory)) {
+      const candidatePath = path.join(this.#options.headDirectory, name);
+      let identity: BigIntStats;
+      try {
+        identity = await lstat(candidatePath, { bigint: true });
+      } catch (error) {
+        if (readErrorCode(error) === "ENOENT") continue;
+        throw error;
+      }
+      if (!isPhysicalTransactionRecordFile(identity, this.#options.platform)) {
+        throw new RemoteTransactionRecordIntegrityError();
+      }
+      authorityRecords += 1;
+      authorityBytes += identity.size;
+      if (candidatePath === authorityPath) replacedAuthorityBytes = identity.size;
+    }
     const nextRecords = replacedPath ? records : records + 1;
     const requestedBytes = Math.max(contentsBytes, reservationBytes);
     const nextBytes = storedBytes - replacedBytes + requestedBytes;
@@ -452,6 +484,22 @@ export class RemoteTransactionStoreMaintenance {
         currentRecords: records,
         currentBytes: storedBytes,
         requestedBytes,
+      });
+    }
+    const nextAuthorityRecords =
+      replacedAuthorityBytes === 0n ? authorityRecords + 1 : authorityRecords;
+    const nextAuthorityBytes =
+      authorityBytes - replacedAuthorityBytes + BigInt(authorityContentsBytes);
+    if (
+      nextAuthorityRecords > this.#options.maximumAuthorityRecords ||
+      nextAuthorityBytes > BigInt(this.#options.maximumAuthorityBytes)
+    ) {
+      throw new RemoteTransactionCapacityError({
+        maximumRecords: this.#options.maximumAuthorityRecords,
+        maximumBytes: this.#options.maximumAuthorityBytes,
+        currentRecords: authorityRecords,
+        currentBytes: boundedNumber(authorityBytes),
+        requestedBytes: authorityContentsBytes,
       });
     }
   }
@@ -488,4 +536,8 @@ export class RemoteTransactionStoreMaintenance {
       }
     });
   }
+}
+
+function boundedNumber(value: bigint): number {
+  return Number(value > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : value);
 }

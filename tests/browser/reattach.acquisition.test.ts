@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import {
   resumeBrowserSession,
   retryBrowserRecoveryCleanup,
@@ -18,6 +18,7 @@ import {
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import { createPrivateTempGeneration } from "../../src/privateTempRoot.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
@@ -231,6 +232,82 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     expect(result.answerMarkdown).toBe("fallback-md");
     expect(recoverSession).toHaveBeenCalled();
     await result.abort();
+  });
+  test("fails closed before Chrome launch when private profile authority is unavailable", async () => {
+    const runtime = withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/private-root" });
+    const launchChrome = vi.fn();
+    const establishProfile = vi.fn(async () => {
+      throw new Error("simulated private profile authority failure");
+    });
+
+    await expect(
+      resumeBrowserSession(runtime, {}, createBrowserLogger(), {
+        createPrivateTempGeneration: establishProfile,
+        launchChrome,
+      }),
+    ).rejects.toThrow("simulated private profile authority failure");
+
+    expect(establishProfile).toHaveBeenCalledWith("oracle-reattach-");
+    expect(launchChrome).not.toHaveBeenCalled();
+  });
+
+  test("proves the temporary recovery profile before Chrome can create endpoint state", async () => {
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-private-temp-"));
+    const runtime = withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/private-profile" });
+    const acquisitionError = new Error("stop after private profile proof");
+    const establishProfile = vi.fn((prefix: string) =>
+      createPrivateTempGeneration(prefix, { tempDirectory: ambient }),
+    );
+    const kill = vi.fn(async () => ({
+      status: "stopped" as const,
+      pid: 4321,
+      signal: "SIGTERM" as const,
+    }));
+    const launchChrome = vi.fn(async (_config, userDataDir: string) => {
+      expect((await stat(path.dirname(userDataDir))).mode & 0o777).toBe(0o700);
+      expect((await stat(userDataDir)).mode & 0o777).toBe(0o700);
+      expect(await readdir(userDataDir)).toEqual([]);
+      const processIdentity = await physicalChromeProcessIdentity(userDataDir, 4321);
+      return {
+        pid: 4321,
+        port: 9222,
+        host: "127.0.0.1",
+        remoteDebuggingPipes: undefined,
+        processIdentity,
+        endpointAuthority: {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/private-profile",
+          kill,
+          runExactOperation: vi.fn(),
+          release: vi.fn(async () => undefined),
+        },
+        kill,
+      };
+    });
+    const removeProfile = vi.fn(async (profilePath: string) => {
+      await rm(profilePath, { recursive: true, force: true });
+      return true;
+    });
+    try {
+      await expect(
+        resumeBrowserSession(runtime, {}, createBrowserLogger(), {
+          createPrivateTempGeneration: establishProfile,
+          launchChrome: launchChrome as never,
+          connectRecoveryTargetWithExactAuthority: vi.fn(async () => {
+            throw acquisitionError;
+          }),
+          acquireRecoveryLock: vi.fn(async () => ({
+            release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
+          })),
+          recoveryCleanup: { removeProfile },
+        }),
+      ).rejects.toBe(acquisitionError);
+      expect(establishProfile).toHaveBeenCalledWith("oracle-reattach-");
+      expect(launchChrome).toHaveBeenCalledOnce();
+      expect(kill).toHaveBeenCalledOnce();
+      expect(removeProfile).toHaveBeenCalledOnce();
+    } finally {
+      await rm(ambient, { recursive: true, force: true });
+    }
   });
 
   test("journals fallback acquisition intent and exact identities before later side effects", async () => {

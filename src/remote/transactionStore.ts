@@ -2,11 +2,7 @@ import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat, readdir } from "node:fs/promises";
 import path from "node:path";
-import {
-  capturePhysicalDirectoryIdentity,
-  samePhysicalDirectoryIdentity,
-  type PhysicalDirectoryIdentity,
-} from "../browser/filesystemLockDirectoryIdentity.js";
+import { samePhysicalDirectoryIdentity } from "../browser/filesystemLockDirectoryIdentity.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
@@ -87,10 +83,13 @@ type RemoteArtifactNamespaceCleanup = (record: RemoteTransactionRecord) => Promi
 export interface RemoteTransactionStoreOptions {
   directory: string;
   integrityKeyPath: string;
+  authorityDirectory?: string;
   controllerGeneration?: string;
   terminalRetentionMs?: number;
   maximumRecords?: number;
   maximumBytes?: number;
+  maximumAuthorityRecords?: number;
+  maximumAuthorityBytes?: number;
   maximumDecodedRecordBytes?: number;
   maximumQuarantineRecords?: number;
   maximumQuarantineBytes?: number;
@@ -120,9 +119,8 @@ export class RemoteTransactionStore {
   #windowsAuthorityLock: Promise<void> = Promise.resolve();
   readonly #afterRecordPublication?: RemoteTransactionStoreOptions["afterRecordPublication"];
   readonly #integrityKey: RemoteTransactionIntegrityKey;
-  readonly #storeRootIdentity: PhysicalDirectoryIdentity;
+  readonly #rootAuthority: RemoteTransactionStoreRootAuthority;
   readonly #headDirectory: string;
-  readonly #headDirectoryIdentity: PhysicalDirectoryIdentity;
   readonly #expectedHeads = new Map<string, RemoteTransactionExpectedHead>();
   readonly #maintenance: RemoteTransactionStoreMaintenance;
 
@@ -137,6 +135,10 @@ export class RemoteTransactionStore {
     const terminalRetentionMs = options.terminalRetentionMs ?? REMOTE_TERMINAL_RETENTION_MS;
     this.#leaseDurationMs = options.leaseDurationMs ?? MAX_REMOTE_TRANSACTION_LEASE_MS;
     const maximumRecords = options.maximumRecords ?? MAX_REMOTE_TRANSACTION_RECORDS;
+    const maximumAuthorityRecords =
+      options.maximumAuthorityRecords ?? MAX_REMOTE_TRANSACTION_RECORDS;
+    const maximumAuthorityBytes =
+      options.maximumAuthorityBytes ?? MAX_REMOTE_TRANSACTION_STORE_BYTES;
     this.#maximumBytes = options.maximumBytes ?? MAX_REMOTE_TRANSACTION_STORE_BYTES;
     this.#maximumDecodedRecordBytes =
       options.maximumDecodedRecordBytes ?? MAX_REMOTE_TRANSACTION_STORE_BYTES;
@@ -148,15 +150,15 @@ export class RemoteTransactionStore {
     this.#platform = options.platform ?? process.platform;
     this.#windowsPrivateTreeAuthority = windowsPrivateTreeAuthority;
     this.#windowsPrivateTreeScope = {
+      authorityDirectory: rootAuthority.headDirectory,
       storeDirectory: this.directory,
       integrityKeyDirectory: integrityKey.directory,
       integrityKeyPath: integrityKey.path,
     };
     this.#afterRecordPublication = options.afterRecordPublication;
     this.#integrityKey = integrityKey;
-    this.#storeRootIdentity = rootAuthority.storeRootIdentity;
+    this.#rootAuthority = rootAuthority;
     this.#headDirectory = rootAuthority.headDirectory;
-    this.#headDirectoryIdentity = rootAuthority.headDirectoryIdentity;
     if (
       !Number.isSafeInteger(terminalRetentionMs) ||
       terminalRetentionMs < 0 ||
@@ -165,6 +167,10 @@ export class RemoteTransactionStore {
       this.#leaseDurationMs > MAX_REMOTE_TRANSACTION_LEASE_MS ||
       !Number.isSafeInteger(maximumRecords) ||
       maximumRecords <= 0 ||
+      !Number.isSafeInteger(maximumAuthorityRecords) ||
+      maximumAuthorityRecords <= 0 ||
+      !Number.isSafeInteger(maximumAuthorityBytes) ||
+      maximumAuthorityBytes <= 0 ||
       !Number.isSafeInteger(this.#maximumBytes) ||
       this.#maximumBytes <= 0 ||
       !Number.isSafeInteger(this.#maximumDecodedRecordBytes) ||
@@ -177,10 +183,13 @@ export class RemoteTransactionStore {
       throw new Error("Invalid remote transaction retention, lease, or capacity policy");
     }
     this.#maintenance = new RemoteTransactionStoreMaintenance({
+      headDirectory: this.#headDirectory,
       directory: this.directory,
       platform: this.#platform,
       terminalRetentionMs,
       maximumRecords,
+      maximumAuthorityRecords,
+      maximumAuthorityBytes,
       maximumBytes: this.#maximumBytes,
       maximumQuarantineRecords,
       maximumQuarantineBytes,
@@ -201,12 +210,17 @@ export class RemoteTransactionStore {
     const directory = path.resolve(options.directory);
     const integrityKeyPath = path.resolve(options.integrityKeyPath);
     const integrityKeyDirectory = path.dirname(integrityKeyPath);
+    const headDirectory = remoteTransactionHeadDirectory(
+      integrityKeyPath,
+      options.authorityDirectory,
+    );
     const windowsPrivateTreeAuthority =
       platform === "win32"
         ? (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)
         : undefined;
     const windowsPrivateTreeScope = {
       storeDirectory: directory,
+      authorityDirectory: headDirectory,
       integrityKeyDirectory,
       integrityKeyPath,
     };
@@ -214,8 +228,9 @@ export class RemoteTransactionStore {
     if (options.rootAuthority) {
       if (
         options.rootAuthority.directory !== directory ||
-        options.rootAuthority.headDirectory !== remoteTransactionHeadDirectory(directory) ||
-        options.rootAuthority.integrityKeyDirectory !== integrityKeyDirectory
+        options.rootAuthority.headDirectory !== headDirectory ||
+        options.rootAuthority.integrityKeyDirectory !== integrityKeyDirectory ||
+        options.rootAuthority.platform !== platform
       ) {
         throw new Error("Remote transaction root authority does not match configured paths");
       }
@@ -225,6 +240,7 @@ export class RemoteTransactionStore {
       rootAuthority = await prepareRemoteTransactionStoreRoot({
         directory,
         integrityKeyPath,
+        authorityDirectory: headDirectory,
         platform,
         windowsPrivateTreeAuthority,
       });
@@ -314,6 +330,7 @@ export class RemoteTransactionStore {
       await publishSerializedRecord({
         mode: "create",
         directory: this.directory,
+        storeDirectory: this.directory,
         headDirectory: this.#headDirectory,
         targetPath,
         transactionToken: persisted.transactionToken,
@@ -323,11 +340,14 @@ export class RemoteTransactionStore {
         integrityKeyId: this.#integrityKey.keyId,
         platform: this.#platform,
         assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
-        underMaintenance: (publish) =>
+        initializeWindowsPrivateFile: (filePath) => this.initializeWindowsPrivateFile(filePath),
+        underMaintenance: (authorityPath, authorityContentsBytes, publish) =>
           this.#maintenance.publishWithCapacity(
             serialized.contents.byteLength,
             undefined,
             persisted.capacityReservationBytes,
+            authorityPath,
+            authorityContentsBytes,
             publish,
           ),
         afterRecordPublication: this.#afterRecordPublication,
@@ -781,6 +801,7 @@ export class RemoteTransactionStore {
       mode: "replace",
       directory: this.directory,
       headDirectory: this.#headDirectory,
+      storeDirectory: this.directory,
       targetPath,
       transactionToken: record.transactionToken,
       previousHead,
@@ -789,11 +810,14 @@ export class RemoteTransactionStore {
       integrityKeyId: this.#integrityKey.keyId,
       platform: this.#platform,
       assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
-      underMaintenance: (publish) =>
+      initializeWindowsPrivateFile: (filePath) => this.initializeWindowsPrivateFile(filePath),
+      underMaintenance: (authorityPath, authorityContentsBytes, publish) =>
         this.#maintenance.publishWithCapacity(
           serialized.contents.byteLength,
           targetPath,
           record.capacityReservationBytes,
+          authorityPath,
+          authorityContentsBytes,
           publish,
         ),
       afterRecordPublication: this.#afterRecordPublication,
@@ -854,15 +878,28 @@ export class RemoteTransactionStore {
     transactionToken: string,
     recordHead: RemoteTransactionExpectedHead | null,
   ) {
-    return await reconcileRemoteTransactionHeadAuthority({
+    const authority = await reconcileRemoteTransactionHeadAuthority({
       headDirectory: this.#headDirectory,
+      storeDirectory: this.directory,
       transactionToken,
       recordHead,
       integrityKey: this.#integrityKey.bytes,
       integrityKeyId: this.#integrityKey.keyId,
       platform: this.#platform,
       assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+      initializeWindowsPrivateFile: (filePath) => this.initializeWindowsPrivateFile(filePath),
     });
+    const remembered = this.#expectedHeads.get(transactionToken);
+    const current = authority?.current ?? null;
+    if (
+      remembered &&
+      (!current ||
+        current.revision < remembered.revision ||
+        (current.revision === remembered.revision && current.digest !== remembered.digest))
+    ) {
+      throw new RemoteTransactionRecordHeadMismatchError();
+    }
+    return authority;
   }
 
   private async retireRecordHead(transactionToken: string): Promise<void> {
@@ -870,30 +907,19 @@ export class RemoteTransactionStore {
     if (!expectedHead) throw new Error("Remote transaction controller head is unavailable");
     await retireRemoteTransactionHeadAuthority({
       headDirectory: this.#headDirectory,
+      storeDirectory: this.directory,
       transactionToken,
       expectedHead,
       integrityKey: this.#integrityKey.bytes,
       integrityKeyId: this.#integrityKey.keyId,
       platform: this.#platform,
       assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+      initializeWindowsPrivateFile: (filePath) => this.initializeWindowsPrivateFile(filePath),
     });
   }
 
   private async assertIntegrityDirectoryAuthority(): Promise<void> {
-    const currentRoot = await capturePhysicalDirectoryIdentity(this.directory);
-    if (!samePhysicalDirectoryIdentity(currentRoot, this.#storeRootIdentity)) {
-      throw new Error("Remote transaction store root generation changed");
-    }
-    const currentHeadDirectory = await capturePhysicalDirectoryIdentity(this.#headDirectory);
-    if (!samePhysicalDirectoryIdentity(currentHeadDirectory, this.#headDirectoryIdentity)) {
-      throw new Error("Remote transaction head directory generation changed");
-    }
-    const currentKeyDirectory = await capturePhysicalDirectoryIdentity(
-      this.#integrityKey.directory,
-    );
-    if (!samePhysicalDirectoryIdentity(currentKeyDirectory, this.#integrityKey.directoryIdentity)) {
-      throw new Error("Remote transaction integrity key directory generation changed");
-    }
+    await assertRemoteTransactionStoreRootAuthority(this.#rootAuthority);
   }
 
   private async assertIntegrityAuthority(): Promise<void> {
@@ -903,6 +929,14 @@ export class RemoteTransactionStore {
     if (!samePhysicalFile(currentKey, this.#integrityKey.fileIdentity)) {
       throw new Error("Remote transaction integrity key generation changed");
     }
+  }
+
+  private async initializeWindowsPrivateFile(filePath: string): Promise<void> {
+    const authority = this.#windowsPrivateTreeAuthority;
+    if (!authority) {
+      throw new Error("Windows private transaction file authority is unavailable");
+    }
+    await authority({ ...this.#windowsPrivateTreeScope, initializeFilePath: filePath });
   }
 
   // Windows ACL protection must not mutate the integrity key's identity, metadata, or bytes.

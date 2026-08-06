@@ -568,13 +568,32 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  test("fails before scratch descendants when Windows private authority is unavailable", async () => {
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-hostile-temp-"));
+    const establishWindowsPrivateDirectory = vi.fn(async () => {
+      throw new Error("simulated Windows private root failure");
+    });
+    try {
+      await expect(
+        serverExecutionTest.createRemoteScratchRun("run-", {
+          platform: "win32",
+          tempDirectory: ambient,
+          windowsPrivateDirectoryAuthority: establishWindowsPrivateDirectory,
+        }),
+      ).rejects.toThrow("simulated Windows private root failure");
+      expect(establishWindowsPrivateDirectory).toHaveBeenCalledOnce();
+      expect(await readdir(ambient)).toEqual([]);
+    } finally {
+      await rm(ambient, { recursive: true, force: true });
+    }
+  });
 
   test("rejects replaced remote scratch attachments", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-file-"));
-    const generation = await serverExecutionTest.createRemoteScratchGeneration(
-      root,
-      "attachments-",
-    );
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-file-"));
+    const run = await serverExecutionTest.createRemoteScratchRun("run-", {
+      tempDirectory: ambient,
+    });
+    const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
     const attachment = {
       fileName: "note.txt",
       displayPath: "note.txt",
@@ -589,22 +608,31 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
       const file = materialized.files[0];
       if (!file) throw new Error("missing scratch file");
+      if (process.platform !== "win32") {
+        expect((await stat(run.parent.path)).mode & 0o777).toBe(0o700);
+        expect((await stat(run.path)).mode & 0o777).toBe(0o700);
+        expect((await stat(generation.path)).mode & 0o777).toBe(0o700);
+        expect((await stat(file.path)).mode & 0o777).toBe(0o600);
+      }
       await rm(file.path);
       await writeFile(file.path, "other", { mode: 0o600 });
       await expect(
         serverExecutionTest.assertRemoteScratchFiles(materialized.files),
       ).rejects.toThrow("Remote attachment scratch file changed");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(ambient, { recursive: true, force: true });
     }
   });
 
   test.skipIf(process.platform === "win32")(
     "rejects hard-linked remote scratch attachments",
     async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-link-"));
+      const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-link-"));
+      const run = await serverExecutionTest.createRemoteScratchRun("run-", {
+        tempDirectory: ambient,
+      });
       const generation = await serverExecutionTest.createRemoteScratchGeneration(
-        root,
+        run,
         "attachments-",
       );
       const attachment = {
@@ -626,18 +654,17 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           serverExecutionTest.assertRemoteScratchFiles(materialized.files),
         ).rejects.toThrow("Remote attachment scratch file changed");
       } finally {
-        await rm(root, { recursive: true, force: true });
+        await rm(ambient, { recursive: true, force: true });
       }
     },
   );
 
   test("rejects and retains a substituted scratch generation", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-cleanup-"));
-    const run = await serverExecutionTest.createRemoteScratchGeneration(root, "run-");
-    const generation = await serverExecutionTest.createRemoteScratchGeneration(
-      run.path,
-      "attachments-",
-    );
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-cleanup-"));
+    const run = await serverExecutionTest.createRemoteScratchRun("run-", {
+      tempDirectory: ambient,
+    });
+    const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
     const attachment = {
       fileName: "note.txt",
       displayPath: "note.txt",
@@ -662,7 +689,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       expect((await lstat(generation.path)).isDirectory()).toBe(true);
       expect((await lstat(moved)).isDirectory()).toBe(true);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(ambient, { recursive: true, force: true });
     }
   });
 

@@ -18,7 +18,7 @@ export async function syncDirectoryIfPresent(directory: string): Promise<void> {
   }
 }
 
-function readErrorCode(error: unknown): string | undefined {
+export function readErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" ? code : undefined;

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { mkdir, mkdtemp, open, readFile, readdir } from "node:fs/promises";
+import { setTimeout } from "node:timers/promises";
 import { delay } from "./utils.js";
 import {
   isolateDirectoryGenerationForRemoval,
@@ -358,15 +359,8 @@ async function retryRetainedFilesystemLockMutationRequestRemoval(
     } catch (error) {
       if (!isRetryableFilesystemLockMutationCleanupError(error, state)) return;
     }
-    await delayWithoutKeepingProcessAlive(options.pollMs);
+    await setTimeout(Math.max(1, options.pollMs), undefined, { ref: false });
   }
-}
-
-function delayWithoutKeepingProcessAlive(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  const timer = setTimeout(resolve, Math.max(1, ms));
-  timer.unref();
-  return promise;
 }
 
 async function removeFilesystemLockMutationRequest(

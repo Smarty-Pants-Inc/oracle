@@ -16,13 +16,15 @@ import { serveRemote } from "../../remote/server.js";
 import {
   BRIDGE_HOST_READINESS_TIMEOUT_MS,
   WINDOWS_BRIDGE_CHILD_READINESS_STDOUT,
+  preflightBridgeConnectionArtifactPath,
   publishReadyBridgeConnection,
   readBridgeHostCredentialPayload,
+  resolveBridgeConnectionArtifactPath,
   spawnReadyBridgeHostChildAndPublish,
   writeBridgeHostReadinessPayload,
 } from "./childProtocol.js";
 import type { BridgeHostCredentials, BridgeHostSpawn } from "./childProtocol.js";
-import type { WindowsPrivateTreeAuthority } from "../../remote/windowsPrivateTreeAcl.js";
+import type { WindowsPrivateFileAuthority } from "../../windowsPrivateFileAcl.js";
 import { startReverseTunnel } from "./reverseTunnel.js";
 import type { ReverseTunnelHandle, StartReverseTunnel } from "./reverseTunnel.js";
 
@@ -60,7 +62,7 @@ export interface BridgeHostDeps {
   backgroundPlatform?: NodeJS.Platform;
   tunnelPlatform?: NodeJS.Platform;
   tunnelSpawn?: BridgeHostSpawn;
-  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+  windowsPrivateFileAuthority?: WindowsPrivateFileAuthority;
 }
 
 export async function runBridgeHost(
@@ -110,8 +112,31 @@ export async function runBridgeHost(
     );
   }
 
-  const writeConnectionPath =
-    options.writeConnection?.trim() || path.join(getOracleHomeDir(), "bridge-connection.json");
+  const defaultConnectionPath = path.join(getOracleHomeDir(), "bridge-connection.json");
+  const writeConnectionDisplayPath = options.writeConnection ?? defaultConnectionPath;
+  const writeConnectionPath = resolveBridgeConnectionArtifactPath(
+    options.writeConnection,
+    defaultConnectionPath,
+  );
+  if (!options.backgroundChild) {
+    await preflightBridgeConnectionArtifactPath(writeConnectionPath);
+    if (options.background) {
+      const oracleHome = getOracleHomeDir();
+      const backgroundPaths = [
+        path.join(oracleHome, "bridge-host.log"),
+        path.join(oracleHome, "bridge-host.pid"),
+      ];
+      if (
+        backgroundPaths.some(
+          (backgroundPath) => path.resolve(backgroundPath) === writeConnectionPath,
+        )
+      ) {
+        throw new Error(
+          "Bridge host connection artifact path conflicts with a background state file.",
+        );
+      }
+    }
+  }
   const sshTarget = options.ssh?.trim();
   const sshRemotePort =
     typeof options.sshRemotePort === "number" ? options.sshRemotePort : bindPort;
@@ -155,7 +180,7 @@ export async function runBridgeHost(
         readinessNonce: (deps.generateReadinessNonce ?? randomUUID)(),
         readinessTimeoutMs: deps.readinessTimeoutMs ?? BRIDGE_HOST_READINESS_TIMEOUT_MS,
         platform: deps.backgroundPlatform,
-        windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
+        windowsPrivateFileAuthority: deps.windowsPrivateFileAuthority,
       },
     );
     console.log(chalk.green(`Bridge host running in background (pid ${result.pid})`));
@@ -220,7 +245,7 @@ export async function runBridgeHost(
                 printForegroundReady({
                   options,
                   artifact,
-                  writeConnectionPath,
+                  writeConnectionPath: writeConnectionDisplayPath,
                   bindHost,
                   bindPort,
                   sshTarget,
@@ -230,7 +255,7 @@ export async function runBridgeHost(
                 }),
               {
                 platform: deps.backgroundPlatform,
-                windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
+                windowsPrivateFileAuthority: deps.windowsPrivateFileAuthority,
               },
             );
           }

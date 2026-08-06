@@ -4,7 +4,7 @@ import { lstat, mkdir, open } from "node:fs/promises";
 import path from "node:path";
 import type { SessionArtifact } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import { syncDirectory } from "../fsDurability.js";
+import { readErrorCode, syncDirectory } from "../fsDurability.js";
 import { writeFileAtomicDurable } from "../sessionManager.js";
 
 export interface DurableBrowserAnswerReceipt {
@@ -185,9 +185,4 @@ async function appendDurableFile(targetPath: string, payload: Buffer): Promise<v
   } finally {
     await handle.close();
   }
-}
-
-function readErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
-  return typeof error.code === "string" ? error.code : undefined;
 }

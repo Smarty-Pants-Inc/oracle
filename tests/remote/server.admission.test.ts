@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -187,6 +187,86 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
         expect(record).toBeNull();
       } finally {
         begin.mockRestore();
+        await server.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "rejects a used token after only remote-transactions is rolled back",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-store-rollback-"));
+      const transactionStoreDir = path.join(root, "remote-transactions");
+      const transactionAuthorityDir = path.join(root, ".remote-transaction-authority");
+      const transactionIntegrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+      const usedToken = "e".repeat(64);
+      const unseenToken = "f".repeat(64);
+      const runBrowser = vi.fn(async (options) =>
+        browserTransaction(options.prompt, {
+          answerText: "exactly once",
+          answerMarkdown: "exactly once",
+          tookMs: 1,
+          answerTokens: 2,
+          answerChars: 12,
+        }),
+      );
+      const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
+      const deps = {
+        transactionStoreDir,
+        transactionAuthorityDir,
+        transactionIntegrityKeyPath,
+        leaseSweepIntervalMs: 60_000,
+        runBrowser,
+      };
+      let server = await createTestRemoteServer(options, deps);
+      try {
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${usedToken}/run`,
+            token: "a".repeat(64),
+            body: remoteRunPayload(),
+          }),
+        ).resolves.toMatchObject({ statusCode: 200 });
+        expect(runBrowser).toHaveBeenCalledOnce();
+        await server.close();
+
+        await mkdir(path.join(transactionStoreDir, ".authenticated-heads"), { recursive: true });
+        await writeFile(
+          path.join(transactionStoreDir, ".authenticated-heads", `${usedToken}.head`),
+          "legacy head\n",
+        );
+        await rm(transactionStoreDir, { recursive: true, force: true });
+        expect(await readdir(transactionAuthorityDir)).toContain(`${usedToken}.head`);
+
+        server = await createTestRemoteServer(options, deps);
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${usedToken}/run`,
+            token: "a".repeat(64),
+            body: remoteRunPayload(),
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 409,
+          json: { error: "transaction_exists", transactionToken: usedToken },
+        });
+        expect(runBrowser).toHaveBeenCalledOnce();
+
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${unseenToken}/run`,
+            token: "a".repeat(64),
+            body: remoteRunPayload(),
+          }),
+        ).resolves.toMatchObject({ statusCode: 200 });
+        expect(runBrowser).toHaveBeenCalledTimes(2);
+      } finally {
         await server.close();
         await rm(root, { recursive: true, force: true });
       }
