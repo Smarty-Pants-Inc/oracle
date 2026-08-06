@@ -14,6 +14,7 @@ import {
 } from "../../src/cli/durableAnswer.js";
 import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
 import {
+  isBrowserPublicationAcknowledged,
   readBrowserCapturePublicationJournal,
   writeBrowserCapturePublicationJournal,
   type BrowserCapturePublicationJournal,
@@ -154,6 +155,18 @@ describe("persistDurableBrowserAnswer", () => {
     await expect(persistDurableBrowserAnswer({ sessionId: "session-1", answer })).rejects.toThrow(
       "Durable browser answer hash collision",
     );
+  });
+});
+
+describe("browser publication phase model", () => {
+  test.each([
+    ["preparing", false],
+    ["staged", false],
+    ["finalize-bound", false],
+    ["published", true],
+    ["cleanup-pending", true],
+  ] as const)("maps %s acknowledgement in one place", (phase, acknowledged) => {
+    expect(isBrowserPublicationAcknowledged(phase)).toBe(acknowledged);
   });
 });
 

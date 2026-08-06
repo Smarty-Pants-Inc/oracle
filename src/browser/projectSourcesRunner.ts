@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { lstat, mkdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import {
   closeChromeTargetWithExactAuthority,
@@ -166,6 +167,40 @@ function isProjectSourcesProfileCreateIntent(
     typeof candidate.userDataDir === "string" &&
     path.resolve(candidate.userDataDir) ===
       path.join(parent.canonicalPath, `oracle-browser-${candidate.generationId}`),
+  );
+}
+
+function projectSourcesProfileQuarantinePath(intent: ProjectSourcesProfileCreateIntent): string {
+  return path.join(
+    intent.parent.canonicalPath,
+    `.oracle-browser-${intent.generationId}.identity-unknown`,
+  );
+}
+
+async function assertProjectSourcesProfileParent(
+  intent: ProjectSourcesProfileCreateIntent,
+): Promise<void> {
+  const current = await captureProfileDirectoryIdentity(intent.parent.canonicalPath);
+  if (!sameProfileDirectoryIdentity(current, intent.parent)) {
+    throw new Error("Project Sources temporary profile parent authority changed before recovery.");
+  }
+}
+
+async function lstatProjectSourcesEntry(candidate: string) {
+  try {
+    return await lstat(candidate, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function sameProjectSourcesEntryIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.mode === right.mode
   );
 }
 
@@ -423,25 +458,56 @@ async function closeProjectSourcesTargetFromJournal(options: {
 async function recoverPendingProjectSourcesProfileCreate(
   journal: ProjectSourcesCleanupJournal,
   storage: ProjectSourcesCleanupStorage,
+  logger: BrowserLogger,
 ): Promise<boolean> {
   const intent = journal.profileCreate;
   if (!intent) return false;
-  const parent = await captureProfileDirectoryIdentity(intent.parent.canonicalPath);
-  if (!sameProfileDirectoryIdentity(parent, intent.parent)) {
-    throw new Error("Project Sources temporary profile parent authority changed before recovery.");
+  await assertProjectSourcesProfileParent(intent);
+
+  const quarantinePath = projectSourcesProfileQuarantinePath(intent);
+  const occupant = await lstatProjectSourcesEntry(intent.userDataDir);
+  if (!occupant) {
+    const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
+    await assertProjectSourcesProfileParent(intent);
+    if (quarantinedOccupant) {
+      logger(
+        `[browser] Project Sources preserved an identity-less temporary profile at ${quarantinePath} for manual inspection.`,
+      );
+    }
+    await persistProjectSourcesCleanupRuntime({}, storage);
+    return true;
   }
+
+  if (await lstatProjectSourcesEntry(quarantinePath)) {
+    throw new Error(
+      `Project Sources temporary profile and its quarantine path are both occupied; preserving both for manual recovery: ${intent.userDataDir}, ${quarantinePath}`,
+    );
+  }
+  await assertProjectSourcesProfileParent(intent);
   try {
-    await captureProfileDirectoryIdentity(intent.userDataDir);
+    await rename(intent.userDataDir, quarantinePath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
+    await assertProjectSourcesProfileParent(intent);
+    if (!quarantinedOccupant) {
       await persistProjectSourcesCleanupRuntime({}, storage);
       return true;
     }
-    throw error;
   }
-  throw new Error(
-    "Project Sources temporary profile exists without a durably recorded physical identity; preserving it for manual recovery.",
+  await syncDirectoryIfSupported(intent.parent.canonicalPath);
+  const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
+  await assertProjectSourcesProfileParent(intent);
+  if (!quarantinedOccupant || !sameProjectSourcesEntryIdentity(occupant, quarantinedOccupant)) {
+    throw new Error(
+      `Project Sources temporary profile quarantine identity changed; preserving the journal and occupant for manual recovery: ${quarantinePath}`,
+    );
+  }
+  logger(
+    `[browser] Project Sources preserved an identity-less temporary profile at ${quarantinePath} for manual inspection.`,
   );
+  await persistProjectSourcesCleanupRuntime({}, storage);
+  return true;
 }
 
 function bindProjectSourcesAbortRecovery(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
@@ -563,7 +629,10 @@ async function retryPendingProjectSourcesCleanup(
 ): Promise<void> {
   const resolvedStorage = storage ?? (await establishProjectSourcesCleanupStorage());
   const journal = await readProjectSourcesCleanupJournal(resolvedStorage);
-  if (!journal || (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage)))
+  if (
+    !journal ||
+    (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage, logger))
+  )
     return;
   if (!journal.runtime)
     throw new Error("Project Sources cleanup journal has no runtime authority.");
@@ -608,6 +677,7 @@ export const __test__ = {
   retryPendingProjectSourcesCleanup,
   closeProjectSourcesTargetFromJournal,
   recoverPendingProjectSourcesProfileCreate,
+  projectSourcesProfileQuarantinePath,
   reconcilePendingProjectSourcesTarget,
 };
 
@@ -697,10 +767,12 @@ async function runBrowserProjectSourcesUnlocked(
       userDataDir: temporaryProfileDir,
     };
     await persistProjectSourcesCleanupRuntime({}, cleanupStorage, profileCreateIntent);
+    await assertProjectSourcesProfileParent(profileCreateIntent);
     await mkdir(temporaryProfileDir);
     userDataDir = temporaryProfileDir;
     logger(`Created temporary Chrome profile at ${userDataDir}`);
     profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
+    await assertProjectSourcesProfileParent(profileCreateIntent);
   }
 
   let acquisitionPendingResource: "tab-lease" | "chrome-process" | "chrome-target" | undefined =

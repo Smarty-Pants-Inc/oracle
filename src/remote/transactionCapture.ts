@@ -106,6 +106,9 @@ export function browserRuntimeFromError(
   const runtime = candidate as BrowserRuntimeMetadata;
   return runtime;
 }
+export function isRecoverableRemoteBrowserAutomationError(error: BrowserAutomationError): boolean {
+  return error.details?.recoverableDisconnect === true && error.details?.reattachable !== false;
+}
 
 export function hasBrowserCleanupAuthority(
   runtime: BrowserRuntimeMetadata | undefined,

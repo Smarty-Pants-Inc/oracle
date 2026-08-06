@@ -36,7 +36,11 @@ import {
   type RemoteLegacyRunPayload,
 } from "./legacyProtocol.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
-import { remoteBrowserAutomationError, remoteTransactionPayload } from "./transactionProtocol.js";
+import {
+  remoteBrowserAutomationError,
+  remotePendingSettlementError,
+  remoteTransactionPayload,
+} from "./transactionProtocol.js";
 import type {
   DurableRemoteArtifactRegistration,
   RemoteTransactionRecord,
@@ -54,6 +58,7 @@ import {
 import { formatSocket, readRequestBody, RemoteRequestError, sendJson } from "./serverHttp.js";
 import {
   isAbortWorthyRemoteCaptureMismatch,
+  isTerminalRemoteBrowserAutomationError,
   persistRemoteBrowserRuntime,
 } from "./serverTransactionRuntime.js";
 import type { RemoteServerOptions } from "./serverTypes.js";
@@ -151,19 +156,13 @@ export async function handleRemoteRunRequest(params: {
       { ...result, conversationId: runtime.conversationId },
       runtime,
     );
-    let stagedRecord = await params.transactionStore.stageCapture({
-      transactionToken: params.transactionToken,
-      runId,
-      result: projectRemotePublicResult(result),
-      runtime,
-      modelSelection: result.modelSelection,
-    });
     const fileArtifacts: SessionArtifact[] = [
       ...(result.savedFiles ?? []),
       ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
     ];
     let stagedResult = result;
-    let registrations: DurableRemoteArtifactRegistration[] = [];
+    let registrations: DurableRemoteArtifactRegistration[] | undefined =
+      fileArtifacts.length === 0 || params.protocol === "legacy-text-v1" ? [] : undefined;
     if (params.protocol === "legacy-text-v1" && fileArtifacts.length > 0) {
       stagedResult = {
         ...result,
@@ -177,7 +176,16 @@ export async function handleRemoteRunRequest(params: {
           },
         ],
       };
-    } else {
+    }
+    let stagedRecord = await params.transactionStore.stageCapture({
+      transactionToken: params.transactionToken,
+      runId,
+      result: projectRemotePublicResult(stagedResult),
+      runtime,
+      modelSelection: result.modelSelection,
+      artifacts: registrations,
+    });
+    if (params.protocol === "transaction-v3" && fileArtifacts.length > 0) {
       try {
         registrations = await params.artifactStore.prepareRequiredArtifacts({
           transactionToken: params.transactionToken,
@@ -207,20 +215,20 @@ export async function handleRemoteRunRequest(params: {
           `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
         );
       }
-    }
-    try {
-      stagedRecord = await params.transactionStore.stageCapture({
-        transactionToken: params.transactionToken,
-        runId,
-        result: projectRemotePublicResult(stagedResult),
-        runtime,
-        modelSelection: result.modelSelection,
-        artifacts: registrations,
-      });
-    } catch (enrichmentError) {
-      params.logger(
-        `[serve] Run ${runId} retained its exact staged answer without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
-      );
+      try {
+        stagedRecord = await params.transactionStore.stageCapture({
+          transactionToken: params.transactionToken,
+          runId,
+          result: projectRemotePublicResult(stagedResult),
+          runtime,
+          modelSelection: result.modelSelection,
+          artifacts: registrations,
+        });
+      } catch (enrichmentError) {
+        params.logger(
+          `[serve] Run ${runId} retained its exact staged answer without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
+        );
+      }
     }
     return stagedRecord;
   };
@@ -290,14 +298,22 @@ export async function handleRemoteRunRequest(params: {
     const result = browserRunResultFromTransaction(capturedTransaction);
     assertCapturedPromptIdentity(requestIdentity, result, capturedTransaction.runtime);
     let stagedRecord = await params.transactionStore.read(params.transactionToken);
-    if (!stagedRecord?.stagedCapture) {
+    if (!stagedRecord?.stagedCapture || stagedRecord.stagedCapture.artifacts === undefined) {
       stagedRecord = await persistExactStagedCapture(result, capturedTransaction.runtime);
     }
     const stagedCapture = stagedRecord.stagedCapture;
-    if (!stagedCapture) {
-      throw new Error("Remote transaction lost its exact pre-archive staged capture");
+    if (!stagedCapture || stagedCapture.artifacts === undefined) {
+      throw new BrowserAutomationError(
+        "Remote artifact registration remains incomplete for the exact staged capture.",
+        {
+          stage: "remote-artifact-preparation",
+          code: "remote-artifact-manifest-incomplete",
+          recoverableDisconnect: true,
+          runtime: capturedTransaction.runtime,
+        },
+      );
     }
-    const registrations = stagedCapture.artifacts ?? [];
+    const registrations = stagedCapture.artifacts;
     const publicResult = projectRemotePublicResult(result);
     let record: RemoteTransactionRecord;
     try {
@@ -394,17 +410,28 @@ export async function handleRemoteRunRequest(params: {
           ? journaled.runtime
           : undefined;
     const abortWorthyMismatch = isAbortWorthyRemoteCaptureMismatch(rawError);
-    const durableError = serializeDurableBrowserAutomationError(error, Boolean(recoverableRuntime));
+    const terminalFailure =
+      abortWorthyMismatch ||
+      (!journaled?.stagedCapture &&
+        !failedCapture &&
+        Boolean(recoverableRuntime) &&
+        isTerminalRemoteBrowserAutomationError(error));
+    const durableError = serializeDurableBrowserAutomationError(
+      error,
+      Boolean(recoverableRuntime) && !terminalFailure,
+    );
     let record = abortWorthyMismatch
       ? await params.transactionStore.invalidateStagedCapture({
           transactionToken: params.transactionToken,
           runtime: recoverableRuntime,
           error: durableError,
+          settlementMode: terminalFailure && recoverableRuntime ? "abort" : undefined,
         })
       : await params.transactionStore.recordRecoverableFailure({
           transactionToken: params.transactionToken,
           runtime: recoverableRuntime,
           error: durableError,
+          settlementMode: terminalFailure && recoverableRuntime ? "abort" : undefined,
         });
     const stagedCaptureRetained = Boolean(record.stagedCapture);
     if (failedCapture || stagedCaptureRetained) {
@@ -412,13 +439,7 @@ export async function handleRemoteRunRequest(params: {
         `[serve] Run ${runId} retained its exact staged answer after durable publication failed.`,
       );
     }
-    const cleanupRequired =
-      abortWorthyMismatch ||
-      (!stagedCaptureRetained &&
-        !failedCapture &&
-        Boolean(recoverableRuntime) &&
-        error.details?.recoverableDisconnect !== true);
-    if (cleanupRequired && recoverableRuntime) {
+    if (terminalFailure && recoverableRuntime) {
       record = (
         await params.transactionCoordinator.settle({
           transactionToken: params.transactionToken,
@@ -430,7 +451,16 @@ export async function handleRemoteRunRequest(params: {
     if (params.protocol === "legacy-text-v1") {
       sendEvent({ type: "error", message: "Remote browser automation failed." });
     } else {
-      sendEvent({ type: "error", error: remoteBrowserAutomationError(record) });
+      sendEvent({
+        type: "error",
+        error:
+          record.settlementMode &&
+          record.error?.recoverableDisconnect === false &&
+          record.state !== "aborted" &&
+          record.state !== "failed"
+            ? remotePendingSettlementError(record)
+            : remoteBrowserAutomationError(record),
+      });
     }
     params.logger(
       `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,

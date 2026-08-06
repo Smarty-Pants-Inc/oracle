@@ -3,7 +3,7 @@ import { readFile, rm } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, SessionArtifact, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
-import type { DurableBrowserAnswerReceipt } from "./durableAnswer.js";
+import type { DurableBrowserAnswerReceipt } from "./durableBrowserAnswerFile.js";
 
 const JOURNAL_FILENAME = "browser-capture-publication.json";
 const MAX_AUDIT_MESSAGE_CHARS = 240;
@@ -14,6 +14,25 @@ export type BrowserPublicationPhase =
   | "finalize-bound"
   | "published"
   | "cleanup-pending";
+const BROWSER_PUBLICATION_PHASES: Readonly<
+  Record<BrowserPublicationPhase, { acknowledged: boolean }>
+> = {
+  preparing: { acknowledged: false },
+  staged: { acknowledged: false },
+  "finalize-bound": { acknowledged: false },
+  published: { acknowledged: true },
+  "cleanup-pending": { acknowledged: true },
+};
+
+export function isBrowserPublicationPhase(value: unknown): value is BrowserPublicationPhase {
+  return typeof value === "string" && value in BROWSER_PUBLICATION_PHASES;
+}
+
+export function isBrowserPublicationAcknowledged(
+  phase: BrowserPublicationPhase | null | undefined,
+): boolean {
+  return phase ? BROWSER_PUBLICATION_PHASES[phase].acknowledged : false;
+}
 
 export interface BrowserCapturePublicationJournal {
   version: 1;
@@ -173,7 +192,7 @@ function isBrowserCapturePublicationJournal(
   if (!value || typeof value !== "object") return false;
   if (!("version" in value) || value.version !== 1) return false;
   if (!("sessionId" in value) || value.sessionId !== sessionId) return false;
-  if (!("phase" in value) || !isPublicationPhase(value.phase)) return false;
+  if (!("phase" in value) || !isBrowserPublicationPhase(value.phase)) return false;
   if (!("completedAt" in value) || typeof value.completedAt !== "string") return false;
   if (!("runtime" in value) || !value.runtime || typeof value.runtime !== "object") return false;
   if (!("browserAudit" in value) || !value.browserAudit || typeof value.browserAudit !== "object") {
@@ -181,16 +200,6 @@ function isBrowserCapturePublicationJournal(
   }
   if (!("receipt" in value) || !isReceipt(value.receipt)) return false;
   return "artifacts" in value && Array.isArray(value.artifacts);
-}
-
-function isPublicationPhase(value: unknown): value is BrowserPublicationPhase {
-  return (
-    value === "preparing" ||
-    value === "staged" ||
-    value === "finalize-bound" ||
-    value === "published" ||
-    value === "cleanup-pending"
-  );
 }
 
 function isReceipt(value: unknown): value is DurableBrowserAnswerReceipt {

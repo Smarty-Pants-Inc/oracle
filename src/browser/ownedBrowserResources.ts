@@ -417,8 +417,9 @@ export function projectBrowserRetryableCleanupRuntime(
 }
 
 /**
- * Canonical owner of acquisition ordering, runtime authority, settlement binding, and retry state
- * for browser resources. Callers provide resource-specific acquisition and cleanup effects only.
+ * Canonical owner of resource acquisition ordering, settlement binding, and cleanup retry state.
+ * Publication phases, acknowledgement, recovery-lock lifetime, and final session persistence stay
+ * with BrowserPublicationTransaction; callers provide resource effects only.
  */
 export class OwnedBrowserResourceTransaction {
   private state: OwnedBrowserResourceTransactionState;

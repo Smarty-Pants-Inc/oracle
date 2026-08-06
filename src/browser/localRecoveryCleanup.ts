@@ -21,7 +21,10 @@ import type {
 } from "./reattachCleanupTypes.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
 import { releaseBrowserTabLease } from "./tabLeaseRegistry.js";
-import { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
+import {
+  canExactOwnedProcessTeardownSubsumeTargetClose,
+  closeChromeTargetWithRetainedCapability,
+} from "./targetCloseAuthority.js";
 import type { BrowserLogger } from "./types.js";
 
 export async function finalizeLocalRecoveryCleanupGroup(
@@ -141,6 +144,17 @@ export async function finalizeLocalRecoveryCleanupGroup(
       }
     }
 
+    const processTeardownSubsumesTargetClose =
+      teardownEntries.length > 0 &&
+      Boolean(teardownEntry?.resource.chromeProcessIdentity) &&
+      canExactOwnedProcessTeardownSubsumeTargetClose({
+        profileKind: teardownEntry?.resource.recoveryCleanup.profileKind ?? "none",
+        keepBrowserOpen: preserveProcess,
+        hasExactProcessAuthority: Boolean(
+          recordedProcessExited || endpointAuthority || deps.terminateExactChromeForProfile,
+        ),
+      });
+
     if (!recordedProcessExited) {
       targetCleanup: for (const targetEntries of targets.values()) {
         const representative = targetEntries[0];
@@ -151,10 +165,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
         if (
           !targetId &&
           resource.acquisition?.pendingResource === "chrome-target" &&
-          teardownEntry &&
-          teardownEntries.length > 0 &&
-          !preserveProcess &&
-          (endpointAuthority || deps.terminateExactChromeForProfile)
+          processTeardownSubsumesTargetClose
         ) {
           processSubsumedTargets.push(...targetEntries);
           continue;
@@ -201,7 +212,11 @@ export async function finalizeLocalRecoveryCleanupGroup(
             break targetCleanup;
           }
           if (closed.status === "unsafe" || closed.status === "unavailable") {
-            for (const entry of targetEntries) addPending(entry, closed.reason);
+            if (processTeardownSubsumesTargetClose) {
+              processSubsumedTargets.push(...targetEntries);
+            } else {
+              for (const entry of targetEntries) addPending(entry, closed.reason);
+            }
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

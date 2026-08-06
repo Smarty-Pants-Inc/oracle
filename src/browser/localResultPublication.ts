@@ -40,20 +40,58 @@ export interface LocalResultPublicationContext {
   buildRuntimeMetadata: (tabUrl?: string) => BrowserRuntimeMetadata;
 }
 
-export async function publishLocalBrowserResult({
-  acquisition,
-  state,
-  lifecycle,
-  prompt,
-  captured,
-  options,
-  promptText,
-  followUpPrompts,
-  logger,
-  startedAt,
-  buildRuntimeMetadata,
-}: LocalResultPublicationContext): Promise<BrowserRunTransaction> {
-  const { config } = acquisition;
+async function settlePublishedLocalCapture(
+  { acquisition, state, lifecycle, options, logger, startedAt }: LocalResultPublicationContext,
+  Runtime: LocalPromptExecutionResult["Runtime"],
+  promptLocator: NonNullable<LocalCapturedResponse["promptLocator"]>,
+  capture: NonNullable<LocalBrowserRunState["publishableCapture"]>,
+  followUpCount: number,
+  requiredArtifactsSaved: boolean,
+): Promise<BrowserRunTransaction> {
+  await persistPreArchiveCapture(options.preArchiveCaptureCb, capture, lifecycle.runtime());
+  state.postCapturePendingWork = {
+    code: "browser-archive-pending",
+    context: "ChatGPT conversation archive",
+  };
+  capture.archive = await maybeArchiveCompletedConversation({
+    Runtime,
+    logger,
+    config: acquisition.config,
+    conversationUrl: state.lastUrl,
+    promptLocator,
+    followUpCount,
+    requiredArtifactsSaved,
+  });
+  capture.tookMs = Date.now() - startedAt;
+  state.postCapturePendingWork = {
+    code: "browser-final-identity-verification-pending",
+    context: "final committed-turn identity verification",
+  };
+  await assertPostArchivePromptEpochCurrent(Runtime, promptLocator, capture.archive);
+  state.postCapturePendingWork = {
+    code: "browser-final-target-liveness-pending",
+    context: "final Chrome target liveness confirmation",
+  };
+  if (state.connectionClosedUnexpectedly) {
+    throw new Error("Chrome disconnected after complete answer capture");
+  }
+  return lifecycle.issueCapture(capture);
+}
+
+export async function publishLocalBrowserResult(
+  context: LocalResultPublicationContext,
+): Promise<BrowserRunTransaction> {
+  const {
+    state,
+    prompt,
+    captured,
+    options,
+    promptText,
+    followUpPrompts,
+    logger,
+    startedAt,
+    buildRuntimeMetadata,
+  } = context;
   const { client, Network, Page, Runtime } = prompt;
   const artifactPromptLocator = captured.promptLocator;
   if (!artifactPromptLocator) {
@@ -98,42 +136,14 @@ export async function publishLocalBrowserResult({
       answerTokens: estimateTokenCount(captured.answerMarkdown),
       answerChars: captured.answerText.length,
     };
-    await persistPreArchiveCapture(
-      options.preArchiveCaptureCb,
-      state.publishableCapture,
-      lifecycle.runtime(),
-    );
-    state.postCapturePendingWork = {
-      code: "browser-archive-pending",
-      context: "ChatGPT conversation archive",
-    };
-    state.publishableCapture.archive = await maybeArchiveCompletedConversation({
-      Runtime,
-      logger,
-      config,
-      conversationUrl: state.lastUrl,
-      promptLocator: artifactPromptLocator,
-      followUpCount: 0,
-      requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
-    });
-    state.publishableCapture.tookMs = Date.now() - startedAt;
-    state.postCapturePendingWork = {
-      code: "browser-final-identity-verification-pending",
-      context: "final committed-turn identity verification",
-    };
-    await assertPostArchivePromptEpochCurrent(
+    return settlePublishedLocalCapture(
+      context,
       Runtime,
       artifactPromptLocator,
-      state.publishableCapture.archive,
+      state.publishableCapture,
+      0,
+      Boolean(reportArtifact && transcriptArtifact),
     );
-    state.postCapturePendingWork = {
-      code: "browser-final-target-liveness-pending",
-      context: "final Chrome target liveness confirmation",
-    };
-    if (state.connectionClosedUnexpectedly) {
-      throw new Error("Chrome disconnected after complete answer capture");
-    }
-    return lifecycle.issueCapture(state.publishableCapture);
   }
 
   let answerText = captured.answerText;
@@ -213,43 +223,14 @@ export async function publishLocalBrowserResult({
     answerTokens: estimateTokenCount(answerMarkdown),
     answerChars: answerText.length,
   };
-  await persistPreArchiveCapture(
-    options.preArchiveCaptureCb,
-    state.publishableCapture,
-    lifecycle.runtime(),
-  );
-  state.postCapturePendingWork = {
-    code: "browser-archive-pending",
-    context: "ChatGPT conversation archive",
-  };
-  state.publishableCapture.archive = await maybeArchiveCompletedConversation({
-    Runtime,
-    logger,
-    config,
-    conversationUrl: state.lastUrl,
-    promptLocator: artifactPromptLocator,
-    followUpCount: followUpPrompts.length,
-    requiredArtifactsSaved:
-      Boolean(transcriptArtifact) &&
-      imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
-      fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
-  });
-  state.publishableCapture.tookMs = Date.now() - startedAt;
-  state.postCapturePendingWork = {
-    code: "browser-final-identity-verification-pending",
-    context: "final committed-turn identity verification",
-  };
-  await assertPostArchivePromptEpochCurrent(
+  return settlePublishedLocalCapture(
+    context,
     Runtime,
     artifactPromptLocator,
-    state.publishableCapture.archive,
+    state.publishableCapture,
+    followUpPrompts.length,
+    Boolean(transcriptArtifact) &&
+      imageArtifacts.savedImages.length === imageArtifacts.imageCount &&
+      fileArtifacts.savedFiles.length === fileArtifacts.fileCount,
   );
-  state.postCapturePendingWork = {
-    code: "browser-final-target-liveness-pending",
-    context: "final Chrome target liveness confirmation",
-  };
-  if (state.connectionClosedUnexpectedly) {
-    throw new Error("Chrome disconnected after complete answer capture");
-  }
-  return lifecycle.issueCapture(state.publishableCapture);
 }

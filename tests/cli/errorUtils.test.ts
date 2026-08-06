@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { isErrorLogged, markErrorLogged } from "../../src/cli/errorUtils.ts";
+import { formatError, isErrorLogged, markErrorLogged } from "../../src/cli/errorUtils.ts";
 
 describe("errorUtils", () => {
   test("marks errors as logged", () => {
@@ -7,6 +7,11 @@ describe("errorUtils", () => {
     expect(isErrorLogged(err)).toBe(false);
     markErrorLogged(err);
     expect(isErrorLogged(err)).toBe(true);
+  });
+
+  test("renders Error messages and non-Error values", () => {
+    expect(formatError(new Error("boom"))).toBe("boom");
+    expect(formatError({ code: "boom" })).toBe("[object Object]");
   });
 
   test("ignores non-error values", () => {

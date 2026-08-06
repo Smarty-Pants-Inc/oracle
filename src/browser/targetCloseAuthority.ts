@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
+import type {
+  BrowserRecoveryProfileKind,
+  BrowserRecoveryTargetCloseCapabilityMetadata,
+} from "../sessionManager.js";
 import type { ExactChromeTargetCleanupResult } from "./chromeTargetConnection.js";
 import type { BrowserLogger } from "./types.js";
 
@@ -9,6 +12,19 @@ export type RetainedTargetCloseCapabilityResult =
       status: "unavailable";
       reason: string;
     };
+
+export function canExactOwnedProcessTeardownSubsumeTargetClose(options: {
+  profileKind: BrowserRecoveryProfileKind;
+  keepBrowserOpen: boolean;
+  hasExactProcessAuthority: boolean;
+}): boolean {
+  return (
+    options.hasExactProcessAuthority &&
+    !options.keepBrowserOpen &&
+    options.profileKind !== "manual-login" &&
+    options.profileKind !== "none"
+  );
+}
 
 interface RetainedTargetCloseAuthority {
   readonly generationId: string;

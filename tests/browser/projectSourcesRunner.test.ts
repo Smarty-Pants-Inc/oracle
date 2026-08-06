@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { expect, test, vi } from "vitest";
 
 const { generationBAttachTarget, generationBCloseTarget, generationBCreateTarget } = vi.hoisted(
@@ -40,13 +42,13 @@ test("Project Sources does not acquire a target from generation B after same-por
   expect(generationBCloseTarget).not.toHaveBeenCalled();
 });
 test("persists and resolves Project Sources cleanup while discarding successful preserved targets", async () => {
+  const temporaryBase = await mkdtemp(path.join(tmpdir(), "oracle-project-sources-runner-"));
   const mocks = {
     acquireLock: vi.fn(),
     closeTarget: vi.fn(),
     connectTarget: vi.fn(),
     launchChrome: vi.fn(),
     listTargets: vi.fn(),
-    profileExists: true,
     removeProfile: vi.fn(),
     resolveBrowserConfig: vi.fn(),
     retainEndpoint: vi.fn(),
@@ -77,7 +79,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     acquireReattachRecoveryLock: mocks.acquireLock,
   }));
   vi.doMock("../../src/browser/localExecutionContext.js", () => ({
-    resolveUserDataBaseDir: vi.fn(async () => "/tmp"),
+    resolveUserDataBaseDir: vi.fn(async () => temporaryBase),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
     clearStaleChatGptConversationCookies: vi.fn(),
@@ -103,20 +105,13 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       captureProfileDirectoryIdentity: vi.fn(
         async (directory: string, options?: { create?: boolean }) =>
           path.basename(directory).startsWith("oracle-browser-")
-            ? (() => {
-                if (!mocks.profileExists) {
-                  const error = new Error("profile does not exist") as NodeJS.ErrnoException;
-                  error.code = "ENOENT";
-                  throw error;
-                }
-                return {
-                  version: 1 as const,
-                  platform: process.platform,
-                  canonicalPath: path.resolve(directory),
-                  device: "1",
-                  inode: "1",
-                };
-              })()
+            ? {
+                version: 1 as const,
+                platform: process.platform,
+                canonicalPath: path.resolve(directory),
+                device: "1",
+                inode: "1",
+              }
             : actual.captureProfileDirectoryIdentity(directory, options),
       ),
       isSafeChromeTerminationOutcome: vi.fn(() => true),
@@ -130,8 +125,8 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     await import("../../src/browser/targetCloseAuthority.js");
   try {
     const profileState = await import("../../src/browser/profileState.js");
-    const temporaryParent = await profileState.captureProfileDirectoryIdentity("/tmp");
-    const profileGeneration = "11111111-1111-4111-8111-111111111111";
+    const temporaryParent = await profileState.captureProfileDirectoryIdentity(temporaryBase);
+    const profileGeneration = randomUUID();
     const interruptedProfile = path.join(
       temporaryParent.canonicalPath,
       `oracle-browser-${profileGeneration}`,
@@ -143,7 +138,6 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     };
 
     // Crash before mkdir: the durable intent is enough to clear the absent exact generation.
-    mocks.profileExists = false;
     await projectSourcesRunner.persistProjectSourcesCleanupRuntime(
       {},
       undefined,
@@ -160,8 +154,12 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
 
-    // Crash after mkdir before identity persistence: preserve the unknown occupant.
-    mocks.profileExists = true;
+    // Crash after mkdir before identity persistence: atomically quarantine the unknown occupant.
+    const quarantinePath =
+      projectSourcesRunner.projectSourcesProfileQuarantinePath(profileCreateIntent);
+    const recoveryLog = vi.fn<(message: string) => void>();
+    await mkdir(interruptedProfile);
+    await writeFile(path.join(interruptedProfile, "unknown-owner.txt"), "preserve me");
     mocks.removeProfile.mockClear();
     await projectSourcesRunner.persistProjectSourcesCleanupRuntime(
       {},
@@ -169,16 +167,22 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       profileCreateIntent,
     );
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(vi.fn<(message: string) => void>()),
-    ).rejects.toThrow(/without a durably recorded physical identity/i);
+      projectSourcesRunner.retryPendingProjectSourcesCleanup(recoveryLog),
+    ).resolves.toBeUndefined();
     expect(mocks.removeProfile).not.toHaveBeenCalled();
-
-    // An attacker reusing the deterministic name is indistinguishable from the crash window and
-    // is likewise preserved rather than freshly captured as deletion authority.
+    await expect(readFile(path.join(quarantinePath, "unknown-owner.txt"), "utf8")).resolves.toBe(
+      "preserve me",
+    );
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(vi.fn<(message: string) => void>()),
-    ).rejects.toThrow(/preserving it for manual recovery/i);
-    expect(mocks.removeProfile).not.toHaveBeenCalled();
+      readFile(path.join(interruptedProfile, "unknown-owner.txt"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(recoveryLog).toHaveBeenCalledWith(expect.stringContaining(quarantinePath));
+    await expect(
+      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      projectSourcesRunner.retryPendingProjectSourcesCleanup(recoveryLog),
+    ).resolves.toBeUndefined();
 
     // A changed physical parent fails closed before the child is inspected or removed.
     await projectSourcesRunner.persistProjectSourcesCleanupRuntime({}, undefined, {
@@ -461,6 +465,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
   } finally {
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();
     await rm(projectSourcesRunner.projectSourcesCleanupJournalPath(), { force: true });
+    await rm(temporaryBase, { recursive: true, force: true });
     vi.doUnmock("../../src/browser/config.js");
     vi.doUnmock("../../src/browser/chromeLifecycle.js");
     vi.doUnmock("../../src/browser/reattach.js");

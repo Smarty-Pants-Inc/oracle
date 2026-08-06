@@ -24,6 +24,7 @@ import { createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCommittedPromptEpochLocator } from "../dist/browser/reattachability.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -253,14 +254,14 @@ async function main() {
   let forcedDetach = false;
   try {
     const ready = await waitFor(
-      (meta) =>
-        Boolean(
-          meta?.browser?.runtime?.chromePort && meta?.browser?.runtime?.promptSubmitted === true,
-        ),
+      (meta) => {
+        const runtime = meta?.browser?.runtime;
+        return Boolean(runtime?.chromePort && resolveCommittedPromptEpochLocator(runtime));
+      },
       {
         timeoutMs: 240_000,
         intervalMs: 200,
-        label: "promptSubmitted + chromePort",
+        label: "durably committed prompt epoch + chromePort",
         shouldAbort: () => childExit != null && childExit.code !== 0,
       },
     );

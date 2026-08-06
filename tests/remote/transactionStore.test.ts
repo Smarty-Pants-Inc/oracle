@@ -378,6 +378,7 @@ describe("RemoteTransactionStore", () => {
         runId: "run-1",
         result: capturedResult,
         runtime,
+        artifacts: [],
       });
       await expect(
         store.recordRecoverableFailure({
@@ -414,8 +415,49 @@ describe("RemoteTransactionStore", () => {
             },
           ],
         },
+        artifacts: [],
         stagedCapture: undefined,
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("never promotes an artifact-bearing stage before its durable manifest is complete", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-incomplete-manifest-"));
+    const transactionToken = "4".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      await begin(store, transactionToken);
+      await store.stageCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime,
+      });
+      await store.recordRecoverableFailure({
+        transactionToken,
+        runtime,
+        error: failure(true),
+      });
+
+      await expect(store.promoteStagedCapture({ transactionToken })).rejects.toMatchObject({
+        code: "staged_capture_artifact_manifest_incomplete",
+      });
+      await expect(
+        store.stageCapture({
+          transactionToken,
+          runId: "run-1",
+          result: capturedResult,
+          runtime,
+          artifacts: [],
+        }),
+      ).rejects.toMatchObject({ code: "staged_capture_artifact_manifest_incomplete" });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "recoverable-error",
+        stagedCapture: { result: capturedResult },
+      });
+      expect((await store.read(transactionToken))?.stagedCapture).not.toHaveProperty("artifacts");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -439,6 +481,7 @@ describe("RemoteTransactionStore", () => {
         result,
         runtime,
         modelSelection: optionalModelSelection,
+        artifacts: [],
       });
       await expect(
         store.stageCapture({
@@ -447,6 +490,7 @@ describe("RemoteTransactionStore", () => {
           result,
           runtime,
           modelSelection: optionalModelSelection,
+          artifacts: [],
         }),
       ).resolves.toMatchObject({ state: "running", stagedCapture: { result: capturedResult } });
       await expect(

@@ -73,6 +73,7 @@ export interface DurableRemoteStagedCapture {
   result: RemotePublicRunResult;
   runtime: BrowserRuntimeMetadata;
   modelSelection?: BrowserModelSelectionEvidence;
+  /** Undefined means artifact registration is incomplete; an explicit empty array is complete. */
   artifacts?: DurableRemoteArtifactRegistration[];
   stagedAt: string;
 }
@@ -206,7 +207,7 @@ interface RemoteTransactionTransitionDefinitions {
       result: RemotePublicRunResult;
       runtime: BrowserRuntimeMetadata;
       modelSelection?: BrowserModelSelectionEvidence;
-      artifacts: DurableRemoteArtifactRegistration[];
+      artifacts?: DurableRemoteArtifactRegistration[];
     };
     outcome: undefined;
   };
@@ -223,6 +224,7 @@ interface RemoteTransactionTransitionDefinitions {
     params: {
       runtime?: BrowserRuntimeMetadata;
       error: DurableRemoteAutomationError;
+      settlementMode?: "abort";
     };
     outcome: undefined;
   };
@@ -240,6 +242,7 @@ interface RemoteTransactionTransitionDefinitions {
     params: {
       runtime?: BrowserRuntimeMetadata;
       error: DurableRemoteAutomationError;
+      settlementMode?: "abort";
     };
     outcome: undefined;
   };

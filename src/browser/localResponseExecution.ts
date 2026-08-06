@@ -21,9 +21,11 @@ import {
   formatBrowserTurnTranscript,
   isAssistantResponseTimeoutError,
   maybeRecoverLongAssistantResponse,
+  normalizeForComparison,
   validateChatGPTSession,
   waitForAssistantOrGeneratedImageResponse,
   waitForAssistantResponseWithReload,
+  waitForFreshAssistantResponse,
   type AssistantAnswer,
   type BrowserConversationTurn,
 } from "./responseCaptureCoordinator.js";
@@ -129,46 +131,6 @@ export async function captureLocalBrowserResponse({
     };
   }
 
-  const normalizeForComparison = (text: string): string =>
-    text.toLowerCase().replace(/\s+/g, " ").trim();
-  const waitForFreshAssistantResponse = async (
-    baselineNormalized: string,
-    timeoutMs: number,
-    expectedPromptTurn: CommittedPromptEpochLocator,
-  ) => {
-    const baselinePrefix =
-      baselineNormalized.length >= 80
-        ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
-        : "";
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const snapshot = await readAssistantSnapshot(
-        Runtime,
-        expectedPromptTurn.verifiedUserTurnIndex + 1,
-        expectedPromptTurn.conversationId,
-        expectedPromptTurn,
-      ).catch(() => null);
-      const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
-      if (text) {
-        const normalized = normalizeForComparison(text);
-        const isBaseline =
-          normalized === baselineNormalized ||
-          (baselinePrefix.length > 0 && normalized.startsWith(baselinePrefix));
-        if (!isBaseline) {
-          return {
-            text,
-            html: snapshot?.html ?? undefined,
-            meta: {
-              turnId: snapshot?.turnId ?? undefined,
-              messageId: snapshot?.messageId ?? undefined,
-            },
-          };
-        }
-      }
-      await delay(350);
-    }
-    return null;
-  };
   let stopThinkingMonitor: (() => void) | null = null;
   const waitWithThinkingMonitor = async <T>(operation: () => Promise<T>): Promise<T> => {
     stopThinkingMonitor?.();
@@ -333,6 +295,7 @@ export async function captureLocalBrowserResponse({
       if (isBaseline) {
         logger("Detected stale assistant response; waiting for new response...");
         const refreshed = await waitForFreshAssistantResponse(
+          Runtime,
           baselineNormalized,
           15_000,
           expectedPromptTurn,

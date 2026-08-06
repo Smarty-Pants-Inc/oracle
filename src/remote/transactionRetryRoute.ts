@@ -27,6 +27,10 @@ import { settleExpiredRemoteTransaction } from "./transactionServer.js";
 import { sendJson } from "./serverHttp.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
 import { RemoteTransactionStore } from "./transactionStore.js";
+import {
+  isAbortWorthyRemoteCaptureMismatch,
+  isTerminalRemoteBrowserAutomationError,
+} from "./serverTransactionRuntime.js";
 import { RemoteRetryRequestSchema, type RemoteTransactionRetryResponse } from "./types.js";
 
 type RecoverableRemoteTransactionRecord = RemoteTransactionRecord & {
@@ -82,13 +86,20 @@ export async function serveRemoteTransactionRetry(
       return;
     }
     if (record.settlementMode) {
-      const response: RemoteTransactionRetryResponse = {
-        status: "error",
-        error: record.error
-          ? remoteBrowserAutomationError(record)
-          : remotePendingSettlementError(record),
-      };
-      sendJson(params.res, 200, response);
+      const settled =
+        record.settlementMode === "abort" && record.error?.recoverableDisconnect === false
+          ? (
+              await params.runBrowserWork(
+                async () =>
+                  await params.transactionCoordinator.settle({
+                    transactionToken: record.transactionToken,
+                    mode: "abort",
+                    durablePublication: false,
+                  }),
+              )
+            ).record
+          : record;
+      sendJson(params.res, 200, retryFailureResponse(settled));
       return;
     }
     if (requiresCleanupOnlyCommittedPromptRecovery(record.runtime)) {
@@ -121,7 +132,7 @@ export async function serveRemoteTransactionRetry(
       sendJson(params.res, 200, response);
       return;
     }
-    if (record.stagedCapture) {
+    if (record.stagedCapture?.artifacts !== undefined) {
       const targetAuthorityUnavailable =
         Boolean(record.restartRecovery) ||
         record.error?.stage === "connection-lost" ||
@@ -225,15 +236,24 @@ async function recoverTransaction(
             { stage: "remote-answer-recovery" },
             rawError,
           );
+    const terminalFailure = isTerminalRemoteBrowserAutomationError(error);
     const failed = await params.transactionStore.recordRecoverableFailure({
       transactionToken: record.transactionToken,
       runtime: browserRuntimeFromError(error) ?? recoveryRuntime,
-      error: serializeDurableBrowserAutomationError(error, true),
+      error: serializeDurableBrowserAutomationError(error, !terminalFailure),
+      settlementMode: terminalFailure ? "abort" : undefined,
     });
-    return {
-      statusCode: 200,
-      body: { status: "error", error: remoteBrowserAutomationError(failed) },
-    };
+    if (!terminalFailure) {
+      return { statusCode: 200, body: retryFailureResponse(failed) };
+    }
+    const settled = (
+      await params.transactionCoordinator.settle({
+        transactionToken: record.transactionToken,
+        mode: "abort",
+        durablePublication: false,
+      })
+    ).record;
+    return { statusCode: 200, body: retryFailureResponse(settled) };
   }
 
   const capture = browserTransactionFromRecoveredSession(recovered, Date.now() - recoveryStartedAt);
@@ -248,6 +268,14 @@ async function recoverTransaction(
       transactionToken: record.transactionToken,
       runId: record.runId,
       artifacts: fileArtifacts,
+    });
+    await params.transactionStore.stageCapture({
+      transactionToken: record.transactionToken,
+      runId: record.runId,
+      result: projectRemotePublicResult(result),
+      runtime: capture.runtime,
+      modelSelection: result.modelSelection,
+      artifacts: registrations,
     });
     const published = await params.transactionStore.publishCapture({
       transactionToken: record.transactionToken,
@@ -276,27 +304,41 @@ async function recoverTransaction(
             },
             rawError,
           );
-    await params.transactionStore.recordRecoverableFailure({
+    const terminalFailure = isAbortWorthyRemoteCaptureMismatch(rawError);
+    const failed = await params.transactionStore.recordRecoverableFailure({
       transactionToken: record.transactionToken,
       runtime: capture.runtime,
-      error: serializeDurableBrowserAutomationError(error, true),
+      error: serializeDurableBrowserAutomationError(error, !terminalFailure),
+      settlementMode: terminalFailure ? "abort" : undefined,
     });
+    if (!terminalFailure) {
+      return { statusCode: 200, body: retryFailureResponse(failed) };
+    }
     params.transactionCoordinator.registerActive(record.transactionToken, capture);
-    const failed = (
+    const settled = (
       await params.transactionCoordinator.settle({
         transactionToken: record.transactionToken,
         mode: "abort",
         durablePublication: false,
       })
     ).record;
-    if (failed.state === "finalized" || failed.state === "aborted" || failed.state === "failed") {
-      return { statusCode: 200, body: terminalTransactionRetryResponse(failed) };
-    }
-    return {
-      statusCode: 200,
-      body: { status: "error", error: remoteBrowserAutomationError(failed) },
-    };
+    return { statusCode: 200, body: retryFailureResponse(settled) };
   }
+}
+
+function retryFailureResponse(record: RemoteTransactionRecord): RemoteTransactionRetryResponse {
+  if (record.state === "finalized" || record.state === "aborted" || record.state === "failed") {
+    return terminalTransactionRetryResponse(record);
+  }
+  return {
+    status: "error",
+    error:
+      record.settlementMode && record.error?.recoverableDisconnect === false
+        ? remotePendingSettlementError(record)
+        : record.error
+          ? remoteBrowserAutomationError(record)
+          : remotePendingSettlementError(record),
+  };
 }
 
 async function readRetryRequestBody(req: http.IncomingMessage): Promise<string> {

@@ -123,6 +123,7 @@ async function settleLocalOwnedTarget(options: {
   mode: "finalize" | "abort";
   keepBrowser: boolean;
   omitDisposition?: boolean;
+  loseTargetCapabilityBeforeSettlement?: boolean;
 }) {
   const { createLocalRunSettlementCoordinator } =
     await import("../../src/browser/localRunSettlement.js");
@@ -196,8 +197,11 @@ async function settleLocalOwnedTarget(options: {
   const cleanup = transaction.runtime.recoveryCleanupResources?.[0]?.recoveryCleanup;
   const disposition = cleanup?.closeOwnedTargetOnComplete;
   if (options.omitDisposition && cleanup) delete cleanup.closeOwnedTargetOnComplete;
+  if (options.loseTargetCapabilityBeforeSettlement) {
+    localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+  }
   try {
-    return { closeTarget, disposition, result: await transaction[options.mode]() };
+    return { authority, closeTarget, disposition, result: await transaction[options.mode]() };
   } finally {
     localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     await rm(profileDir, { recursive: true, force: true });
@@ -215,6 +219,21 @@ describe("local owned-target disposition", () => {
       const preserved = await settleLocalOwnedTarget({ mode, keepBrowser: true });
       expect(preserved.disposition).toBe(false);
       expect(preserved.closeTarget).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(["finalize", "abort"] as const)(
+    "%s lets exact temporary-process teardown settle a target capability lost on restart",
+    async (mode) => {
+      const settlement = await settleLocalOwnedTarget({
+        mode,
+        keepBrowser: false,
+        loseTargetCapabilityBeforeSettlement: true,
+      });
+
+      expect(settlement.result.status).toBe("completed");
+      expect(settlement.closeTarget).not.toHaveBeenCalled();
+      expect(settlement.authority.kill).toHaveBeenCalledOnce();
     },
   );
 

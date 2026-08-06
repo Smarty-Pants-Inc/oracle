@@ -36,7 +36,10 @@ import type {
   BrowserLogger,
   BrowserRunOptions,
 } from "./types.js";
-import { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
+import {
+  canExactOwnedProcessTeardownSubsumeTargetClose,
+  closeChromeTargetWithRetainedCapability,
+} from "./targetCloseAuthority.js";
 
 export interface LocalRunSettlementContext {
   acquisition: LocalBrowserAcquisition;
@@ -184,7 +187,13 @@ export function createLocalRunSettlementCoordinator({
         if (targetCleanup.status === "completed" || targetCleanup.status === "gone") {
           closedOwnedTargetId = targetId;
           closedOwnedTargetCloseCapability = capability;
-        } else if (manualLogin || keepBrowserOpen) {
+        } else if (
+          !canExactOwnedProcessTeardownSubsumeTargetClose({
+            profileKind: pendingCleanup?.profileKind ?? "none",
+            keepBrowserOpen,
+            hasExactProcessAuthority: Boolean(settlementEndpointAuthority),
+          })
+        ) {
           errors.push(targetCleanup.reason);
         }
       }

@@ -27,7 +27,7 @@ import {
 } from "../browser/sessionRunner.js";
 import { renderMarkdownAnsi } from "./markdownRenderer.js";
 import { formatResponseMetadata, formatTransportMetadata } from "./sessionDisplay.js";
-import { markErrorLogged } from "./errorUtils.js";
+import { formatError, markErrorLogged } from "./errorUtils.js";
 import {
   type NotificationSettings,
   sendSessionNotification,
@@ -1041,10 +1041,6 @@ function mergeArtifacts(
   }
   const values = Array.from(merged.values());
   return values.length > 0 ? values : undefined;
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function providerFailureContextForModel(

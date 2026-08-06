@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { CookieParam } from "../browser/types.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   MAX_REMOTE_ATTACHMENT_BYTES,
@@ -73,6 +74,30 @@ const trustedUrl = z
   .max(2048)
   .refine(isTrustedChatGptUrl, "URL must be an HTTPS ChatGPT origin");
 
+const RemoteLegacyCookieParamSchema: z.ZodType<CookieParam> = z
+  .object({
+    name: z.string(),
+    value: z.string(),
+    url: z.string().optional(),
+    domain: z.string().optional(),
+    path: z.string().optional(),
+    secure: z.boolean().optional(),
+    httpOnly: z.boolean().optional(),
+    sameSite: z.enum(["Strict", "Lax", "None"]).optional(),
+    expires: z.number().optional(),
+    priority: z.enum(["Low", "Medium", "High"]).optional(),
+    sourceScheme: z.enum(["Unset", "NonSecure", "Secure"]).optional(),
+    sourcePort: z.number().int().optional(),
+    partitionKey: z
+      .object({
+        topLevelSite: z.string(),
+        hasCrossSiteAncestor: z.boolean(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 /**
  * Exact predecessor request surface. Authority-bearing fields are accepted only so an explicit
  * compatibility client can be parsed; the adapter never forwards them to browser execution.
@@ -101,7 +126,7 @@ export const RemoteLegacyBrowserRunConfigSchema = z
     cookieSync: z.boolean().optional(),
     cookieNames: z.array(z.string().min(1).max(256)).max(64).nullable().optional(),
     cookieSyncWaitMs: optionalDuration,
-    inlineCookies: z.null().optional(),
+    inlineCookies: z.array(RemoteLegacyCookieParamSchema).nullable().optional(),
     inlineCookiesSource: optionalPath,
     headless: z.boolean().optional(),
     keepBrowser: z.boolean().optional(),

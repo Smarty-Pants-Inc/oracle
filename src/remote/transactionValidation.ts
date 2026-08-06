@@ -332,11 +332,14 @@ export function validateRemoteTransactionRecord(
       if (
         !record.runtime ||
         !record.result ||
+        !Array.isArray(record.artifacts) ||
         record.stagedCapture ||
         record.error ||
         record.restartRecovery
       ) {
-        invalidRecord("Pending remote transaction requires runtime and captured result only");
+        invalidRecord(
+          "Pending remote transaction requires runtime, captured result, and artifact manifest",
+        );
       }
       if (!record.settlementMode) {
         if (record.publicationAcknowledgedAt || record.finalization) {
@@ -367,7 +370,7 @@ export function validateRemoteTransactionRecord(
       if (
         !record.runtime ||
         !record.error ||
-        !record.error.recoverableDisconnect ||
+        (!record.error.recoverableDisconnect && record.settlementMode !== "abort") ||
         record.result ||
         record.artifacts ||
         record.modelSelection ||

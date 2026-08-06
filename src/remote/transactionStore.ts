@@ -241,7 +241,7 @@ export class RemoteTransactionStore {
         result: params.result,
         runtime: params.runtime,
         modelSelection: params.modelSelection,
-        artifacts: params.artifacts ?? [],
+        artifacts: params.artifacts,
       })
     ).record;
   }
@@ -288,12 +288,14 @@ export class RemoteTransactionStore {
     transactionToken: string;
     runtime?: BrowserRuntimeMetadata;
     error: DurableRemoteAutomationError;
+    settlementMode?: "abort";
   }): Promise<RemoteTransactionRecord> {
     return (
       await this.transition(params.transactionToken, {
         type: "invalidate-staged-capture",
         runtime: params.runtime,
         error: params.error,
+        settlementMode: params.settlementMode,
       })
     ).record;
   }
@@ -302,12 +304,14 @@ export class RemoteTransactionStore {
     transactionToken: string;
     runtime?: BrowserRuntimeMetadata;
     error: DurableRemoteAutomationError;
+    settlementMode?: "abort";
   }): Promise<RemoteTransactionRecord> {
     return (
       await this.transition(params.transactionToken, {
         type: "record-failure",
         runtime: params.runtime,
         error: params.error,
+        settlementMode: params.settlementMode,
       })
     ).record;
   }

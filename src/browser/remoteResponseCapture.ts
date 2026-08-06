@@ -19,9 +19,11 @@ import {
   attemptAssistantRecheckOrRethrow,
   isAssistantResponseTimeoutError,
   maybeRecoverLongAssistantResponse,
+  normalizeForComparison,
   validateChatGPTSession,
   waitForAssistantOrGeneratedImageResponse,
   waitForAssistantResponseWithReload,
+  waitForFreshAssistantResponse,
   type AssistantAnswer,
   type BrowserConversationTurn,
 } from "./responseCaptureCoordinator.js";
@@ -31,50 +33,6 @@ import type { RemoteBrowserTarget } from "./remoteTargetAcquisition.js";
 
 export interface RemoteCapturedAssistantTurn extends BrowserConversationTurn {
   answerHtml: string;
-}
-
-function normalizeForComparison(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-async function waitForFreshAssistantResponse(
-  target: RemoteBrowserTarget,
-  baselineNormalized: string,
-  timeoutMs: number,
-  expectedPromptTurn: CommittedPromptEpochLocator,
-): Promise<AssistantAnswer | null> {
-  const baselinePrefix =
-    baselineNormalized.length >= 80
-      ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
-      : "";
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const snapshot = await readAssistantSnapshot(
-      target.Runtime,
-      expectedPromptTurn.verifiedUserTurnIndex + 1,
-      expectedPromptTurn.conversationId,
-      expectedPromptTurn,
-    ).catch(() => null);
-    const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
-    if (text) {
-      const normalized = normalizeForComparison(text);
-      const isBaseline =
-        normalized === baselineNormalized ||
-        (baselinePrefix.length > 0 && normalized.startsWith(baselinePrefix));
-      if (!isBaseline) {
-        return {
-          text,
-          html: snapshot?.html ?? undefined,
-          meta: {
-            turnId: snapshot?.turnId ?? undefined,
-            messageId: snapshot?.messageId ?? undefined,
-          },
-        };
-      }
-    }
-    await delay(350);
-  }
-  return null;
 }
 
 async function waitWithThinkingMonitor<T>(
@@ -243,7 +201,7 @@ export async function captureRemoteAssistantTurn(
     if (isBaseline) {
       logger("Detected stale assistant response; waiting for new response...");
       const refreshed = await waitForFreshAssistantResponse(
-        target,
+        Runtime,
         baselineNormalized,
         15_000,
         expectedPromptTurn,

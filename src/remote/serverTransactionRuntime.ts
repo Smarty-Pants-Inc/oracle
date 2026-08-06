@@ -15,6 +15,7 @@ import {
 } from "./transactionCoordinator.js";
 import { settlementBindingResponse, settlementResponse } from "./transactionProtocol.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
+import { isRecoverableRemoteBrowserAutomationError } from "./transactionCapture.js";
 import type { RemoteTransactionStore } from "./transactionStore.js";
 import {
   RemoteAbortRequestSchema,
@@ -93,6 +94,11 @@ export function isAbortWorthyRemoteCaptureMismatch(error: unknown): boolean {
     code === "committed-prompt-identity-mismatch" ||
     code === "remote-prompt-authority-mismatch" ||
     code === "staged_capture_identity_mismatch"
+  );
+}
+export function isTerminalRemoteBrowserAutomationError(error: BrowserAutomationError): boolean {
+  return (
+    isAbortWorthyRemoteCaptureMismatch(error) || !isRecoverableRemoteBrowserAutomationError(error)
   );
 }
 

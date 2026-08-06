@@ -209,6 +209,71 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "accepts and discards predecessor inline cookies",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-legacy-cookies-"));
+      let receivedBrowserConfig: BrowserSessionConfig | undefined;
+      const server = await createRemoteServer(
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "v3-root-key",
+          legacyToken: "legacy-bearer",
+          logger: () => {},
+        },
+        {
+          transactionStoreDir: path.join(tmpDir, "transactions"),
+          runBrowser: async (options) => {
+            receivedBrowserConfig = options.config;
+            return browserTransaction(options.prompt, {
+              answerText: "answer",
+              answerMarkdown: "answer",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 6,
+            });
+          },
+        },
+      );
+      try {
+        const response = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: "/runs",
+          headers: { authorization: "Bearer legacy-bearer" },
+          body: {
+            prompt: "legacy cookie payload",
+            attachments: [],
+            browserConfig: {
+              inlineCookies: [
+                {
+                  name: "__Secure-next-auth.session-token",
+                  value: "legacy-cookie",
+                  domain: "chatgpt.com",
+                  path: "/",
+                  secure: true,
+                  httpOnly: true,
+                  sameSite: "Lax",
+                },
+              ],
+            },
+            options: {},
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(receivedBrowserConfig).toMatchObject({
+          inlineCookies: null,
+          inlineCookiesSource: null,
+        });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "returns canonical bound and completed authority on opposite-mode conflicts",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-http-conflict-"));
@@ -580,7 +645,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "durably publishes a captured answer before finalizing after required artifact preparation fails",
+    "keeps an artifact-bearing staged capture recoverable when registration fails",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-pending-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -608,15 +673,21 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       setOracleHomeDirOverrideForTest(tmpDir);
       await mkdir(path.dirname(missingArtifactPath), { recursive: true });
       const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
-        async (mode, pendingRuntime) => {
-          expect(mode).toBe("finalize");
-          return completedBrowserCaptureCleanup(pendingRuntime);
-        },
+        async (_mode, pendingRuntime) => completedBrowserCaptureCleanup(pendingRuntime),
       );
+      const resumeBrowser = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => {
+        throw new BrowserAutomationError("Required artifact registration remains unavailable", {
+          stage: "remote-artifact-preparation",
+          code: "remote-artifact-preparation-pending",
+          recoverableDisconnect: true,
+          runtime: recoveryRuntime,
+        });
+      });
       const server = await createRemoteServer(
         { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
         {
           transactionStoreDir,
+          resumeBrowser,
           runBrowser: async (options) =>
             lifecycleBrowserTransaction(
               options.prompt,
@@ -648,93 +719,182 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const caught = await createRemoteBrowserExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "secret",
-        })({ prompt: "preserve answer after artifact failure", config: {} });
-        const publishedResult = {
-          answerText: "captured before artifact failure",
-          answerMarkdown: "captured before artifact failure",
-          warnings: [
-            {
-              code: "remote-artifact-preparation-pending",
-              severity: "warning",
-              message: "Remote browser host reported a warning.",
-            },
-          ],
-          tookMs: 1,
-          answerTokens: 4,
-          answerChars: 32,
-        };
-
-        expect(transaction).toMatchObject(publishedResult);
-        expect(settleResources).not.toHaveBeenCalled();
-
-        const recordName = (await readdir(transactionStoreDir)).find((name) =>
-          name.endsWith(".json"),
+        })({ prompt: "preserve answer after artifact failure", config: {} }).then(
+          () => null,
+          (error: unknown) => error,
         );
-        if (!recordName) throw new Error("missing captured artifact failure transaction");
-        const recordPath = path.join(transactionStoreDir, recordName);
-        const pendingRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        expect(caught).toMatchObject({
+          name: "BrowserAutomationError",
+          details: {
+            code: "remote-artifact-manifest-incomplete",
+            recoverableDisconnect: true,
+          },
+        });
+        const transactionToken = remoteRecoveryTransactionToken(caught);
+        const pendingRecord = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+        }).then((store) => store.read(transactionToken));
         expect(pendingRecord).toMatchObject({
-          state: "pending",
-          requestIdentity: {
-            acceptedPromptSha256: [promptIdentitySha256("preserve answer after artifact failure")],
+          state: "recoverable-error",
+          error: {
+            code: "remote-artifact-manifest-incomplete",
+            recoverableDisconnect: true,
+          },
+          stagedCapture: {
+            result: {
+              answerText: "captured before artifact failure",
+              warnings: [expect.objectContaining({ code: "remote-artifact-preparation-pending" })],
+            },
           },
         });
-        expect(pendingRecord.result).toEqual(publishedResult);
+        expect(pendingRecord).not.toHaveProperty("result");
         expect(pendingRecord).not.toHaveProperty("artifacts");
-
-        const pendingRetry = await httpPostJson({
-          hostname: "127.0.0.1",
-          port: server.port,
-          path: `/transactions/${pendingRecord.transactionToken}/retry`,
-          token: "secret",
-          body: {},
-        });
-        expect(pendingRetry).toMatchObject({
-          statusCode: 200,
-          json: {
-            status: "transaction",
-            transaction: { state: "pending", result: publishedResult },
-          },
-        });
-        expect(JSON.parse(await readFile(recordPath, "utf8")).result).toEqual(publishedResult);
-
-        const firstFinalization = await transaction.finalize();
-        await expect(transaction.finalize()).resolves.toEqual(firstFinalization);
-        expect(firstFinalization).toMatchObject({ status: "completed" });
-        expect(settleResources).toHaveBeenCalledOnce();
-
-        const finalizedRecordText = await readFile(recordPath, "utf8");
-        const finalizedRecord = JSON.parse(finalizedRecordText);
-        expect(finalizedRecord).toMatchObject({
-          state: "finalized",
-          terminalAudit: {
-            settlementMode: "finalize",
-            publicationAcknowledgedAt: expect.any(String),
-          },
-          finalization: { status: "completed" },
-        });
-        expect(finalizedRecord).not.toHaveProperty("result");
+        expect(pendingRecord?.stagedCapture).not.toHaveProperty("artifacts");
+        expect(settleResources).not.toHaveBeenCalled();
 
         const retry = await httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
-          path: `/transactions/${pendingRecord.transactionToken}/retry`,
+          path: `/transactions/${transactionToken}/retry`,
           token: "secret",
           body: {},
         });
         expect(retry).toMatchObject({
           statusCode: 200,
           json: {
-            status: "terminal",
-            transactionToken: pendingRecord.transactionToken,
-            outcome: { state: "finalized", finalization: { status: "completed" } },
+            status: "error",
+            error: {
+              code: "remote-artifact-preparation-pending",
+              recoverableDisconnect: true,
+            },
           },
         });
-        await expect(readFile(recordPath, "utf8")).resolves.toBe(finalizedRecordText);
+        expect(resumeBrowser).toHaveBeenCalledOnce();
+        const afterRetry = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+        }).then((store) => store.read(transactionToken));
+        expect(afterRetry).toMatchObject({ state: "recoverable-error" });
+        expect(afterRetry).not.toHaveProperty("result");
+        expect(afterRetry?.stagedCapture).not.toHaveProperty("artifacts");
       } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "does not promote an artifact-bearing capture when manifest enrichment cannot persist",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-enrichment-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const artifactPath = path.join(
+        tmpDir,
+        "sessions",
+        "artifact-enrichment-session",
+        "artifacts",
+        "result.zip",
+      );
+      const artifactPayload = Buffer.from([
+        0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      ]);
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "artifact-enrichment-target",
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "artifact-enrichment-target",
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      setOracleHomeDirOverrideForTest(tmpDir);
+      await mkdir(path.dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, artifactPayload);
+      const originalStageCapture = RemoteTransactionStore.prototype.stageCapture;
+      const stageCapture = vi
+        .spyOn(RemoteTransactionStore.prototype, "stageCapture")
+        .mockImplementation(function (
+          this: RemoteTransactionStore,
+          params: Parameters<RemoteTransactionStore["stageCapture"]>[0],
+        ) {
+          if (params.artifacts?.length) {
+            return Promise.reject(new Error("simulated artifact manifest persistence failure"));
+          }
+          return originalStageCapture.call(this, params);
+        });
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            const result: BrowserRunResult = {
+              answerText: "artifact enrichment answer",
+              answerMarkdown: "artifact enrichment answer",
+              tookMs: 1,
+              answerTokens: 3,
+              answerChars: 26,
+              savedFiles: [
+                {
+                  kind: "file",
+                  path: artifactPath,
+                  label: "result.zip",
+                  mimeType: "application/zip",
+                  sizeBytes: artifactPayload.length,
+                  sourceUrl: "sandbox:/mnt/data/result.zip",
+                  url: "browser-download",
+                  finalUrl: "browser-download",
+                  filename: "result.zip",
+                },
+              ],
+            };
+            const transaction = browserTransaction(options.prompt, result, runtime);
+            await options.preArchiveCaptureCb?.(result, transaction.runtime);
+            return transaction;
+          },
+        },
+      );
+
+      try {
+        const caught = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        })({ prompt: "artifact enrichment persistence", config: {} }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(caught).toMatchObject({
+          name: "BrowserAutomationError",
+          details: {
+            code: "remote-artifact-manifest-incomplete",
+            recoverableDisconnect: true,
+          },
+        });
+        const transactionToken = remoteRecoveryTransactionToken(caught);
+        const record = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+        }).then((store) => store.read(transactionToken));
+        expect(record).toMatchObject({
+          state: "recoverable-error",
+          stagedCapture: { result: { answerText: "artifact enrichment answer" } },
+        });
+        expect(record).not.toHaveProperty("result");
+        expect(record).not.toHaveProperty("artifacts");
+        expect(record?.stagedCapture).not.toHaveProperty("artifacts");
+        expect(stageCapture.mock.calls.filter(([params]) => params.artifacts?.length)).toHaveLength(
+          2,
+        );
+      } finally {
+        stageCapture.mockRestore();
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
         setOracleHomeDirOverrideForTest(null);
@@ -2102,6 +2262,111 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     15_000,
   );
 
+  test.skipIf(!CAN_LISTEN_LOCALHOST).each([
+    {
+      name: "committed prompt mismatch",
+      code: "committed-prompt-identity-mismatch",
+      reattachable: undefined,
+    },
+    {
+      name: "Gemini non-reattachable authority",
+      code: "gemini-reattach-authority-unavailable",
+      reattachable: false,
+    },
+  ])("durably aborts terminal retry errors: $name", async ({ code, reattachable }) => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-terminal-retry-"));
+    const transactionStoreDir = path.join(tmpDir, "transactions");
+    const transactionToken = "9".repeat(64);
+    const prompt = "terminal retry authority";
+    const runtime: BrowserRunTransaction["runtime"] = {
+      conversationId: "remote-conversation",
+      promptEpoch: committedPromptEpoch(prompt),
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: "terminal-retry-target",
+          conversationId: "remote-conversation",
+          promptEpoch: committedPromptEpoch(prompt),
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "temporary",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+    };
+    const seeded = await RemoteTransactionStore.open({
+      directory: transactionStoreDir,
+      controllerGeneration: "controller-before-terminal-retry",
+    });
+    await seedRemoteTransaction(seeded, transactionToken, {
+      prompt,
+      state: "recoverable-error",
+      runtime,
+    });
+    const retryCleanup = vi.fn<typeof retryBrowserRecoveryCleanup>(async (cleanupRuntime) => ({
+      status: "completed" as const,
+      runtime: cleanupRuntime,
+    }));
+    const resumeBrowser = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => {
+      throw new BrowserAutomationError("Recovery authority is terminal", {
+        stage: "prompt-epoch",
+        code,
+        recoverableDisconnect: true,
+        reattachable,
+        runtime: recoveryRuntime,
+      });
+    });
+    const server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+      {
+        transactionStoreDir,
+        controllerGeneration: "controller-after-terminal-retry",
+        resumeBrowser,
+        retryCleanup,
+      },
+    );
+
+    try {
+      const retry = await httpPostJson({
+        hostname: "127.0.0.1",
+        port: server.port,
+        path: `/transactions/${transactionToken}/retry`,
+        token: "secret",
+        body: {},
+      });
+      expect(retry).toMatchObject({
+        statusCode: 200,
+        json: {
+          status: "terminal",
+          outcome: {
+            state: "aborted",
+            error: { code, recoverableDisconnect: false },
+          },
+        },
+      });
+      expect(resumeBrowser).toHaveBeenCalledOnce();
+      expect(retryCleanup).toHaveBeenCalledOnce();
+      expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
+      const record = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: "terminal-retry-reader",
+      }).then((store) => store.read(transactionToken));
+      expect(record).toMatchObject({
+        state: "aborted",
+        terminalAudit: {
+          settlementMode: "abort",
+          errorCode: code,
+          errorStage: "prompt-epoch",
+        },
+      });
+      expect(record).not.toHaveProperty("error");
+      expect(record).not.toHaveProperty("runtime");
+    } finally {
+      await server.close();
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "captures a recoverable answer after controller restart using journaled host authority",
     async () => {
@@ -2661,8 +2926,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(retry).toMatchObject({
           statusCode: 200,
           json: {
+            status: "error",
             error: {
-              code: "remote-prompt-authority-mismatch",
+              code: "remote-settlement-pending",
               recoverableDisconnect: true,
               settlementMode: "abort",
             },
@@ -2674,6 +2940,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         }).then((store) => store.read(transactionToken));
         expect(record).toMatchObject({
           state: "recoverable-error",
+          error: {
+            code: "remote-prompt-authority-mismatch",
+            recoverableDisconnect: false,
+          },
           settlementMode: "abort",
           finalization: { status: "pending" },
         });
@@ -3558,6 +3828,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           answerChars: 26,
         },
         runtime,
+        artifacts: [],
       });
       const resumeBrowser = vi.fn(async () => {
         throw new Error("retry must not recapture a durable staged answer");
@@ -3614,6 +3885,113 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(JSON.stringify(record?.runtime)).not.toMatch(
           /lost-after-archive|chromeTargetId|chromePort|chromeHost|recoveryCleanupResources/u,
         );
+      } finally {
+        await restarted.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "never promotes a pre-artifact stage from the crash window",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-pre-artifact-crash-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "8".repeat(64);
+      const prompt = "restart before artifact registration";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "pre-artifact-crash-target",
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "pre-artifact-crash-target",
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const beforeCrash = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        controllerGeneration: "controller-before-pre-artifact-crash",
+      });
+      await beforeCrash.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "run-pre-artifact-crash",
+        createdAt: new Date().toISOString(),
+        requestIdentity: {
+          acceptedPromptSha256: [promptIdentitySha256(prompt)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+        browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+      });
+      await beforeCrash.stageCapture({
+        transactionToken,
+        runId: "run-pre-artifact-crash",
+        result: {
+          answerText: "pre-artifact staged answer",
+          answerMarkdown: "pre-artifact staged answer",
+          tookMs: 2,
+          answerTokens: 4,
+          answerChars: 26,
+        },
+        runtime,
+      });
+      const resumeBrowser = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => ({
+        answerText: "pre-artifact staged answer",
+        answerMarkdown: "pre-artifact staged answer",
+        runtime: recoveryRuntime,
+        bindSettlement: async () => recoveryRuntime,
+        finalize: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
+        abort: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
+      }));
+      const restarted = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: "controller-after-pre-artifact-crash",
+          resumeBrowser,
+        },
+      );
+
+      try {
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "error",
+            error: {
+              code: "remote-answer-publication-failed",
+              recoverableDisconnect: true,
+            },
+          },
+        });
+        expect(resumeBrowser).toHaveBeenCalledOnce();
+        const record = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          controllerGeneration: "pre-artifact-crash-reader",
+        }).then((store) => store.read(transactionToken));
+        expect(record).toMatchObject({
+          state: "recoverable-error",
+          stagedCapture: { result: { answerText: "pre-artifact staged answer" } },
+        });
+        expect(record).not.toHaveProperty("result");
+        expect(record).not.toHaveProperty("artifacts");
+        expect(record?.stagedCapture).not.toHaveProperty("artifacts");
       } finally {
         await restarted.close();
         await rm(tmpDir, { recursive: true, force: true });

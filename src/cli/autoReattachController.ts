@@ -16,7 +16,7 @@ import { sessionStore } from "../sessionStore.js";
 import { wait } from "../sessionManager.js";
 import { formatElapsed } from "../oracle/format.js";
 import {
-  createBrowserCapturePublicationAcknowledgement,
+  BrowserPublicationTransaction,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
   runtimeFromBrowserError,
@@ -27,6 +27,7 @@ import {
   MonotonicBrowserRuntimeAuthority,
 } from "./browserRuntimeAuthority.js";
 import { sendSessionNotification, type NotificationSettings } from "./notifier.js";
+import { formatError } from "./errorUtils.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -107,6 +108,7 @@ export async function autoReattachUntilComplete({
   );
   let retryRuntime = runtime;
   const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime);
+  const publication = new BrowserPublicationTransaction();
 
   let attempt = 0;
   for (;;) {
@@ -125,7 +127,6 @@ export async function autoReattachUntilComplete({
     let durablyCompleted = false;
     let authoritativeRuntime = retryRuntime;
     try {
-      const acknowledgement = createBrowserCapturePublicationAcknowledgement();
       const reattachConfig: BrowserSessionConfig = { ...browserConfig, timeoutMs };
       const reattachResult: ReattachResult = await resumeBrowserSession(
         retryRuntime,
@@ -133,7 +134,8 @@ export async function autoReattachUntilComplete({
         logger,
         {
           recoveryLockPath,
-          isRemotePublicationAcknowledged: acknowledgement.isPublished,
+          acquireRecoveryLock: publication.acquireRecoveryLock,
+          isRemotePublicationAcknowledged: publication.isPublished,
           runtimeHintCb: async (latestRuntime) => {
             const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
             authoritativeRuntime = persistedRuntime;
@@ -159,7 +161,7 @@ export async function autoReattachUntilComplete({
         reasoningTokens: 0,
         totalTokens: outputTokens,
       };
-      const publication = await publishCompletedBrowserCapture({
+      const publishedCapture = await publishCompletedBrowserCapture({
         answer: {
           sessionId: sessionMeta.id,
           answer: answerText,
@@ -185,7 +187,7 @@ export async function autoReattachUntilComplete({
         usage,
         response: { status: "completed" },
         model: modelForStatus,
-        acknowledgement,
+        publication,
         projectRuntime: (latestRuntime) => {
           const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
           authoritativeRuntime = persistedRuntime;
@@ -197,12 +199,12 @@ export async function autoReattachUntilComplete({
         persistAnswer: persistDurableBrowserAnswer,
       });
       durablyCompleted = true;
-      authoritativeRuntime = publication.finalization.runtime;
+      authoritativeRuntime = publishedCapture.finalization.runtime;
       retryRuntime = authoritativeRuntime;
-      if (publication.finalization.status === "pending") {
+      if (publishedCapture.finalization.status === "pending") {
         log(
           kleur.yellow(
-            `Auto-reattach completed; browser cleanup remains pending: ${publication.finalization.error}`,
+            `Auto-reattach completed; browser cleanup remains pending: ${publishedCapture.finalization.error}`,
           ),
         );
       } else {
@@ -387,8 +389,4 @@ function mergeArtifacts(
   for (const artifact of existing ?? []) merged.set(`${artifact.kind}:${artifact.path}`, artifact);
   for (const artifact of additions) merged.set(`${artifact.kind}:${artifact.path}`, artifact);
   return Array.from(merged.values());
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

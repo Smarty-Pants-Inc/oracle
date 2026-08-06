@@ -35,7 +35,12 @@ export function projectRemotePublicRuntime(
 export function remoteTransactionPayload(
   record: RemoteTransactionRecord,
 ): RemoteRunTransactionPayload {
-  if (!record.result || !record.runtime || record.state !== "pending") {
+  if (
+    !record.result ||
+    !record.runtime ||
+    !Array.isArray(record.artifacts) ||
+    record.state !== "pending"
+  ) {
     throw new Error("Remote transaction record is not publishable");
   }
   return RemoteRunTransactionPayloadSchema.parse({
@@ -44,7 +49,7 @@ export function remoteTransactionPayload(
     runId: record.runId,
     result: record.result,
     runtime: projectRemotePublicRuntime(record.runtime, "pending", true),
-    artifacts: (record.artifacts ?? []).map((artifact) => artifact.descriptor),
+    artifacts: record.artifacts.map((artifact) => artifact.descriptor),
     state: record.state,
   });
 }

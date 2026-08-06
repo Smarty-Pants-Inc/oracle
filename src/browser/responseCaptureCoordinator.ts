@@ -21,6 +21,50 @@ export type AssistantAnswer = {
   meta: { turnId?: string | null; messageId?: string | null };
 };
 
+export function normalizeForComparison(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+export async function waitForFreshAssistantResponse(
+  Runtime: ChromeClient["Runtime"],
+  baselineNormalized: string,
+  timeoutMs: number,
+  expectedPromptTurn: CommittedPromptEpochLocator,
+): Promise<AssistantAnswer | null> {
+  const baselinePrefix =
+    baselineNormalized.length >= 80
+      ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
+      : "";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      expectedPromptTurn.verifiedUserTurnIndex + 1,
+      expectedPromptTurn.conversationId,
+      expectedPromptTurn,
+    ).catch(() => null);
+    const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
+    if (text) {
+      const normalized = normalizeForComparison(text);
+      const isBaseline =
+        normalized === baselineNormalized ||
+        (baselinePrefix.length > 0 && normalized.startsWith(baselinePrefix));
+      if (!isBaseline) {
+        return {
+          text,
+          html: snapshot?.html ?? undefined,
+          meta: {
+            turnId: snapshot?.turnId ?? undefined,
+            messageId: snapshot?.messageId ?? undefined,
+          },
+        };
+      }
+    }
+    await delay(350);
+  }
+  return null;
+}
+
 export async function waitForAssistantOrGeneratedImageResponse(params: {
   Runtime: ChromeClient["Runtime"];
   waitForText: () => Promise<AssistantAnswer>;

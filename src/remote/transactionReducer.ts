@@ -117,10 +117,13 @@ const reducers: RemoteTransactionReducers = {
     return { persist: true, outcome: undefined };
   },
   "stage-capture": (record, transition, context) => {
-    if (record.state !== "running") {
+    if (
+      record.state !== "running" &&
+      !(record.state === "recoverable-error" && !record.settlementMode)
+    ) {
       throw new Error(`Cannot stage capture from transaction state ${record.state}`);
     }
-    assertCurrentController(record, context, "stage capture");
+    if (record.state === "running") assertCurrentController(record, context, "stage capture");
     if (record.runId !== transition.runId) {
       throw new Error("Remote capture run identity changed before durable staging");
     }
@@ -128,12 +131,18 @@ const reducers: RemoteTransactionReducers = {
       result: transition.result,
       runtime: transition.runtime,
       modelSelection: transition.modelSelection,
-      artifacts: transition.artifacts.length > 0 ? transition.artifacts : undefined,
+      artifacts: transition.artifacts,
       stagedAt: context.nowIso(),
     };
     assertValidRemoteStagedCapture(record, stagedCapture);
     if (record.stagedCapture) {
       const existing = record.stagedCapture;
+      if (existing.artifacts === undefined && stagedCapture.artifacts?.length === 0) {
+        throw new RemoteTransactionTransitionError(
+          "staged_capture_artifact_manifest_incomplete",
+          "An artifact-bearing staged capture cannot be completed with an empty manifest",
+        );
+      }
       assertCapturePromotionMatchesStage(existing, stagedCapture.result, stagedCapture.runtime);
       if (
         !isDeepStrictEqual(
@@ -147,8 +156,8 @@ const reducers: RemoteTransactionReducers = {
         );
       }
       if (
-        existing.artifacts?.length &&
-        stagedCapture.artifacts?.length &&
+        existing.artifacts !== undefined &&
+        stagedCapture.artifacts !== undefined &&
         !isDeepStrictEqual(existing.artifacts, stagedCapture.artifacts)
       ) {
         throw new RemoteTransactionTransitionError(
@@ -191,6 +200,12 @@ const reducers: RemoteTransactionReducers = {
     if (record.state === "running") assertCurrentController(record, context, "promote capture");
     const staged = record.stagedCapture;
     if (!staged) throw new Error("Remote transaction does not contain a staged capture");
+    if (staged.artifacts === undefined) {
+      throw new RemoteTransactionTransitionError(
+        "staged_capture_artifact_manifest_incomplete",
+        "Remote transaction staged capture lacks a complete artifact manifest",
+      );
+    }
     const result = transition.result ?? staged.result;
     const runtime = transition.runtime ?? staged.runtime;
     assertCapturePromotionMatchesStage(staged, result, runtime);
@@ -199,7 +214,7 @@ const reducers: RemoteTransactionReducers = {
       mergeCaptureWarnings(staged.result, result, transition.warning),
       transition.stripTargetAuthority ? projectRuntimeAfterTargetLoss(runtime) : runtime,
       staged.modelSelection,
-      staged.artifacts ?? [],
+      staged.artifacts,
       context,
     );
     return { persist: true, outcome: undefined };
@@ -212,13 +227,23 @@ const reducers: RemoteTransactionReducers = {
     if (record.settlementMode) {
       throw new Error("Cannot invalidate a capture after cleanup settlement is bound");
     }
-    if (Boolean(transition.runtime) !== transition.error.recoverableDisconnect) {
+    const terminalAbort =
+      transition.settlementMode === "abort" &&
+      Boolean(transition.runtime) &&
+      !transition.error.recoverableDisconnect;
+    if (!terminalAbort && Boolean(transition.runtime) !== transition.error.recoverableDisconnect) {
       throw new Error("Capture invalidation recoverability must match runtime authority");
+    }
+    if (transition.settlementMode && !terminalAbort) {
+      throw new Error(
+        "Only terminal runtime failures may durably bind abort while recording failure",
+      );
     }
     record.controllerGeneration = context.controllerGeneration;
     record.runtime = transition.runtime;
     record.runtimeJournaledAt = transition.runtime ? context.nowIso() : undefined;
     projectRunningRecordToFailure(record, transition.error, true);
+    record.settlementMode = transition.settlementMode;
     return { persist: true, outcome: undefined };
   },
   "publish-capture": (record, transition, context) => {
@@ -238,12 +263,18 @@ const reducers: RemoteTransactionReducers = {
     validateRemoteArtifactOwnership(record, transition.artifacts);
     let result = transition.result;
     if (record.stagedCapture) {
+      if (record.stagedCapture.artifacts === undefined) {
+        throw new RemoteTransactionTransitionError(
+          "staged_capture_artifact_manifest_incomplete",
+          "Published capture cannot bypass incomplete staged artifact registration",
+        );
+      }
       assertCapturePromotionMatchesStage(
         record.stagedCapture,
         transition.result,
         transition.runtime,
       );
-      if (!isDeepStrictEqual(record.stagedCapture.artifacts ?? [], transition.artifacts)) {
+      if (!isDeepStrictEqual(record.stagedCapture.artifacts, transition.artifacts)) {
         throw new RemoteTransactionTransitionError(
           "staged_capture_artifact_mismatch",
           "Published capture artifacts do not match the exact staged capture",
@@ -271,13 +302,23 @@ const reducers: RemoteTransactionReducers = {
     if (!transition.runtime && record.runtime) {
       throw new Error("Cannot discard journaled runtime authority while recording failure");
     }
-    if (Boolean(transition.runtime) !== transition.error.recoverableDisconnect) {
+    const terminalAbort =
+      transition.settlementMode === "abort" &&
+      Boolean(transition.runtime) &&
+      !transition.error.recoverableDisconnect;
+    if (!terminalAbort && Boolean(transition.runtime) !== transition.error.recoverableDisconnect) {
       throw new Error("Failure recoverability must match durable runtime authority");
+    }
+    if (transition.settlementMode && !terminalAbort) {
+      throw new Error(
+        "Only terminal runtime failures may durably bind abort while recording failure",
+      );
     }
     record.controllerGeneration = context.controllerGeneration;
     record.runtime = transition.runtime;
     record.runtimeJournaledAt = transition.runtime ? context.nowIso() : undefined;
     projectRunningRecordToFailure(record, transition.error);
+    record.settlementMode = transition.settlementMode;
     return { persist: true, outcome: undefined };
   },
   "record-artifact-delivery": (record, transition, context) => {
@@ -461,7 +502,6 @@ const reducers: RemoteTransactionReducers = {
       if (record.error) record.error = { ...record.error, recoverableDisconnect: false };
     } else {
       record.state = record.error && !record.result ? "recoverable-error" : "pending";
-      if (record.error) record.error = { ...record.error, recoverableDisconnect: true };
     }
     return { persist: true, outcome: undefined };
   },
@@ -790,7 +830,7 @@ function commitCapture(
   record.runtime = runtime;
   record.runtimeJournaledAt = context.nowIso();
   record.modelSelection = modelSelection;
-  record.artifacts = artifacts.length > 0 ? artifacts : undefined;
+  record.artifacts = artifacts;
   record.stagedCapture = undefined;
   record.error = undefined;
   record.settlementMode = undefined;

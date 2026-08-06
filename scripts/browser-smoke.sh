@@ -37,13 +37,24 @@ meta="$HOME/.oracle/sessions/$slug/meta.json"
 logfile="$(mktemp -t oracle-browser-reattach)"
 rm -rf "$HOME/.oracle/sessions/$slug"
 
-# Start a browser run in the background and wait until the prompt is submitted.
+# Start a browser run in the background and wait for durable prompt authority.
 "${CMD[@]}" --model "$PRO_MODEL" --prompt "Return exactly 'reattach-ok'." --slug "$slug" --browser-keep-browser --heartbeat 0 --timeout 900 --force >"$logfile" 2>&1 &
 runner_pid=$!
 
 runtime_ready=0
 for _ in {1..40}; do
-  if [ -f "$meta" ] && node -e "const fs=require('fs');const p=process.argv[1];const j=JSON.parse(fs.readFileSync(p,'utf8'));if(j.browser?.runtime?.chromePort && j.browser?.runtime?.promptSubmitted === true){process.exit(0);}process.exit(1);" "$meta"; then
+  if [ -f "$meta" ] && node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+
+    const [root, metaPath] = process.argv.slice(1);
+    const { resolveCommittedPromptEpochLocator } = await import(
+      pathToFileURL(path.join(root, "dist", "browser", "reattachability.js")).href,
+    );
+    const runtime = JSON.parse(readFileSync(metaPath, "utf8")).browser?.runtime;
+    process.exit(runtime?.chromePort && resolveCommittedPromptEpochLocator(runtime) ? 0 : 1);
+  ' "$ROOT" "$meta"; then
     runtime_ready=1
     break
   fi
@@ -51,7 +62,7 @@ for _ in {1..40}; do
 done
 
 if [ "$runtime_ready" -ne 1 ]; then
-  echo "[browser-smoke] reattach: runtime hint never appeared"
+  echo "[browser-smoke] reattach: committed prompt authority never appeared"
   cat "$logfile"
   kill "$runner_pid" 2>/dev/null || true
   exit 1
