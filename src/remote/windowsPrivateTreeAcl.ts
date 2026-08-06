@@ -111,18 +111,31 @@ function Assert-PrivateAcl([System.IO.FileSystemInfo]$Item, [bool]$Directory) {
   }
 }
 
+function Test-PrivateAcl([System.IO.FileSystemInfo]$Item, [bool]$Directory) {
+  try {
+    Assert-PrivateAcl $Item $Directory
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 function Protect-Directory([string]$DirectoryPath) {
   $Item = Get-PhysicalItem $DirectoryPath $true
-  $Item.SetAccessControl((New-PrivateAcl $true))
-  $Item = Get-PhysicalItem $DirectoryPath $true
-  Assert-PrivateAcl $Item $true
+  if (-not (Test-PrivateAcl $Item $true)) {
+    $Item.SetAccessControl((New-PrivateAcl $true))
+    $Item = Get-PhysicalItem $DirectoryPath $true
+    Assert-PrivateAcl $Item $true
+  }
 }
 
 function Protect-File([string]$FilePath) {
   $Item = Get-PhysicalItem $FilePath $false
-  $Item.SetAccessControl((New-PrivateAcl $false))
-  $Item = Get-PhysicalItem $FilePath $false
-  Assert-PrivateAcl $Item $false
+  if (-not (Test-PrivateAcl $Item $false)) {
+    $Item.SetAccessControl((New-PrivateAcl $false))
+    $Item = Get-PhysicalItem $FilePath $false
+    Assert-PrivateAcl $Item $false
+  }
 }
 
 Protect-Directory $KeyDirectoryPath

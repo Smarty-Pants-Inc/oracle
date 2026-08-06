@@ -17,7 +17,7 @@
 - Browser/Gemini: require immutable provider user-message identity for live and recovered response publication. Provider-id-less accepted turns retain committed audit and cleanup state, but cannot publish or reattach; owned resources can still be cleaned without resubmitting.
 - CLI/Browser follow-up: accept pre-prompt-epoch completed browser follow-ups only with unambiguous GPT/ChatGPT provenance and one exact ChatGPT conversation locator, rejecting Gemini, non-GPT, and conflicting metadata.
 - Browser/Project Sources: bind interrupted temporary-profile cleanup to a create-only authority marker under the exact physical profile, bind manual cleanup to an external Project-Sources admission receipt plus exact lease and owner evidence, and reconcile interrupted target acquisition without closing ambiguous or unrelated tabs.
-- Remote/Windows: resolve native PowerShell only from a validated drive-absolute active `SystemRoot`, rejecting mutable `PATH`, UNC/device paths, traversal, and ambiguous Windows path forms before bridge or private-tree ACL operations.
+- Remote/Windows: resolve native PowerShell only from a validated drive-absolute active `SystemRoot`, rejecting mutable `PATH`, UNC/device paths, traversal, and ambiguous Windows path forms before bridge or private-tree ACL operations; verified private ACLs are left unchanged so repeated authority checks cannot invalidate file-generation evidence.
 
 ## 0.17.0 — 2026-08-02
 

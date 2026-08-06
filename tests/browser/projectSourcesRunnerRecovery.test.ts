@@ -35,10 +35,18 @@ function processIdentity(
 ): ChromeProcessIdentity {
   return {
     pid: process.pid,
-    executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    executablePath:
+      process.platform === "win32"
+        ? String.raw`c:\program files\google\chrome\application\chrome.exe`
+        : process.platform === "darwin"
+          ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          : "/usr/bin/google-chrome",
     processStartTime: "1",
     launchNonce: launchClaim.nonce,
-    normalizedUserDataDir: profileDirectory.canonicalPath,
+    normalizedUserDataDir:
+      process.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath,
     launchClaim,
     profileDirectory,
   };
