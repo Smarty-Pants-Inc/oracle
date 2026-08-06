@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import { bindPersistedLocalEndpoint } from "./pendingProcessAcquisition.js";
 import {
+  browserTabLeaseAuthorityKey,
   recoveryCleanupResourceKey,
   removeReleasedLeaseAuthority,
   requestsProcessTeardown,
@@ -36,7 +37,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
   const pending: RecoveryCleanupEntry[] = [];
   const errors: string[] = [];
   const pendingKeys = new Set<string>();
-  const releasedLeaseIds = new Set<string>();
+  const releasedLeaseAuthorities = new Set<string>();
   const settledTargetCapabilities = new Set<string>();
   const processSubsumedTargets: RecoveryCleanupEntry[] = [];
   let classification: RecoveryCleanupPhaseResult["classification"];
@@ -200,10 +201,19 @@ export async function finalizeLocalRecoveryCleanupGroup(
           }
           continue;
         }
+        if (!deps.ownerId?.trim()) {
+          for (const entry of targetEntries) {
+            addPending(
+              entry,
+              "Trusted target cleanup owner is unavailable; the target was preserved",
+            );
+          }
+          continue;
+        }
         try {
           const closed = await (
             deps.closeChromeTargetWithRetainedCapability ?? closeChromeTargetWithRetainedCapability
-          )({ capability, targetId, logger });
+          )({ ownerId: deps.ownerId, capability, targetId, logger });
           if (closed.status === "completed" || closed.status === "gone") {
             settledTargetCapabilities.add(capability.capabilityId);
           }
@@ -246,44 +256,60 @@ export async function finalizeLocalRecoveryCleanupGroup(
     let teardownViaLeaseError: string | null = null;
     let manualOwnerRetainedByOtherLease = false;
     const releaseLease = deps.releaseBrowserTabLease ?? releaseBrowserTabLease;
-    const seenLeaseIds = new Set<string>();
+    const seenLeaseAuthorities = new Set<string>();
     for (const entry of group.entries) {
       const lease = entry.resource.tabLease;
-      if (!lease || seenLeaseIds.has(lease.id)) continue;
-      seenLeaseIds.add(lease.id);
+      const leaseAuthority = browserTabLeaseAuthorityKey(lease);
+      if (!lease || !leaseAuthority || seenLeaseAuthorities.has(leaseAuthority)) continue;
+      seenLeaseAuthorities.add(leaseAuthority);
       const profileDir = entry.resource.userDataDir;
       if (!profileDir) {
         addPending(teardownOnlyEntry(entry), "Browser tab lease profile path is missing");
         continue;
       }
+      if (!deps.ownerId?.trim() || !lease.generationId) {
+        addPending(
+          teardownOnlyEntry(entry),
+          "Trusted browser tab lease owner or acquisition generation is unavailable",
+        );
+        continue;
+      }
       try {
-        await releaseLease(profileDir, lease.id, logger, {
-          expectedProfileIdentity: lease.profileDirectory,
-          onRelease:
-            teardownEntry &&
-            teardownEntries.length > 0 &&
-            !preserveProcess &&
-            teardownEntry.resource.recoveryCleanup.profileKind === "manual-login"
-              ? async ({ isLastLease }) => {
-                  if (!isLastLease) {
-                    manualOwnerRetainedByOtherLease = true;
-                    return;
-                  }
-                  teardownViaLeaseAttempted = true;
-                  try {
-                    teardownViaLeaseError = await teardownLocalRecoveryGroup(
-                      teardownEntry.resource,
-                      logger,
-                      deps,
-                      { endpointAuthority, recordedProcessExited },
-                    );
-                  } catch (error) {
-                    teardownViaLeaseError = error instanceof Error ? error.message : String(error);
-                  }
+        const onRelease =
+          teardownEntry &&
+          teardownEntries.length > 0 &&
+          !preserveProcess &&
+          teardownEntry.resource.recoveryCleanup.profileKind === "manual-login"
+            ? async ({ isLastLease }: { isLastLease: boolean }) => {
+                if (!isLastLease) {
+                  manualOwnerRetainedByOtherLease = true;
+                  return;
                 }
-              : undefined,
-        });
-        releasedLeaseIds.add(lease.id);
+                teardownViaLeaseAttempted = true;
+                try {
+                  teardownViaLeaseError = await teardownLocalRecoveryGroup(
+                    teardownEntry.resource,
+                    logger,
+                    deps,
+                    { endpointAuthority, recordedProcessExited },
+                  );
+                } catch (error) {
+                  teardownViaLeaseError = error instanceof Error ? error.message : String(error);
+                }
+              }
+            : undefined;
+        await releaseLease(
+          profileDir,
+          {
+            id: lease.id,
+            sessionId: deps.ownerId,
+            generationId: lease.generationId,
+            profileDirectory: lease.profileDirectory,
+          },
+          logger,
+          { onRelease },
+        );
+        releasedLeaseAuthorities.add(leaseAuthority);
       } catch (error) {
         addPending(
           teardownOnlyEntry(entry),
@@ -300,7 +326,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
         !pending.some((entry) => requestsProcessTeardown(entry.resource))
       ) {
         addPending(
-          removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds),
+          removeReleasedLeaseAuthority(teardownEntry, releasedLeaseAuthorities),
           "Process teardown deferred until lease cleanup completes",
         );
       }
@@ -319,7 +345,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
       return { pending, errors };
     }
 
-    const resource = removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds).resource;
+    const resource = removeReleasedLeaseAuthority(teardownEntry, releasedLeaseAuthorities).resource;
     const profileKind = resource.recoveryCleanup.profileKind;
     try {
       let teardownError: string | null = null;
@@ -338,14 +364,17 @@ export async function finalizeLocalRecoveryCleanupGroup(
       }
 
       if (teardownError) {
-        addPending(removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds), teardownError);
+        addPending(
+          removeReleasedLeaseAuthority(teardownEntry, releasedLeaseAuthorities),
+          teardownError,
+        );
         retainProcessSubsumedTargets(
           "Exact process teardown did not complete; unresolved target acquisition authority was preserved",
         );
       }
     } catch (error) {
       addPending(
-        removeReleasedLeaseAuthority(teardownEntry, releasedLeaseIds),
+        removeReleasedLeaseAuthority(teardownEntry, releasedLeaseAuthorities),
         error instanceof Error ? error.message : String(error),
       );
       retainProcessSubsumedTargets(
@@ -365,7 +394,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
         const entry = endpointPendingEntry ?? group.entries[0];
         if (entry) {
           addPending(
-            removeReleasedLeaseAuthority(entry, releasedLeaseIds),
+            removeReleasedLeaseAuthority(entry, releasedLeaseAuthorities),
             `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         }

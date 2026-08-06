@@ -49,10 +49,15 @@ describe("local acquisition durability", () => {
       events.push("release:tab-lease");
     });
     const acquireBrowserTabLease = vi.fn(
-      async (profileDirectory: string, options?: { leaseId?: string }) => {
+      async (
+        profileDirectory: string,
+        options: { leaseId?: string; sessionId: string; generationId: string },
+      ) => {
         events.push("acquire:tab-lease");
         return {
-          id: options?.leaseId ?? "test-lease",
+          id: options.leaseId ?? "test-lease",
+          sessionId: options.sessionId,
+          generationId: options.generationId,
           profileDirectory: await captureProfileDirectoryIdentity(profileDirectory),
           update: vi.fn(async () => undefined),
           release,
@@ -62,7 +67,7 @@ describe("local acquisition durability", () => {
     const releaseBrowserTabLease = vi.fn(
       async (
         _profileDirectory: string,
-        _leaseId: string,
+        _lease: TabLeaseRegistryModule.BrowserTabLeaseIdentity,
         _logger: BrowserLogger,
         options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> },
       ) => {

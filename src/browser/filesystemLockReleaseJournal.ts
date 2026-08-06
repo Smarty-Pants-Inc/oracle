@@ -94,6 +94,9 @@ export function hasRetainedFilesystemLockRelease(lockPath: string): boolean {
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suites
 export const __test__ = {
   clearRetainedFilesystemLockReleases(): void {
+    if ([...retainedReleases.values()].some((entry) => entry.inFlight !== undefined)) {
+      throw new Error("Cannot clear retained filesystem lock release while cleanup is in flight");
+    }
     retainedReleases.clear();
   },
 };

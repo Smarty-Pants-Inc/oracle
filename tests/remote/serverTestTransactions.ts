@@ -1,3 +1,4 @@
+import path from "node:path";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
@@ -14,10 +15,25 @@ export async function openSeedTransactionStore(
 ) {
   return await RemoteTransactionStore.open({
     directory,
+    integrityKeyPath: path.join(path.dirname(directory), ".remote-transaction-integrity.key"),
     controllerGeneration: TEST_CONTROLLER_GENERATION,
     leaseDurationMs,
     now,
   });
+}
+
+export async function readAuthenticatedTransactionRecord(
+  directory: string,
+  transactionToken: string,
+) {
+  const store = await RemoteTransactionStore.open({
+    directory,
+    integrityKeyPath: path.join(path.dirname(directory), ".remote-transaction-integrity.key"),
+    controllerGeneration: "server-test-authenticated-reader",
+  });
+  const record = await store.read(transactionToken);
+  if (!record) throw new Error(`Missing authenticated remote transaction ${transactionToken}`);
+  return record;
 }
 
 export async function seedRemoteTransaction(

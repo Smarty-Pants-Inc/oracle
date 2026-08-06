@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createRemoteServer } from "../../src/remote/server.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
@@ -12,12 +12,17 @@ import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import {
+  __test__ as targetCloseAuthorityTest,
+  retainChromeTargetCloseCapability,
+} from "../../src/browser/targetCloseAuthority.js";
+import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
   committedPromptEpoch,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpPostJson, httpPostNdjson } from "./serverTestHttp.js";
+import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -147,6 +152,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(preArchiveResult).not.toHaveProperty("archive");
         const store = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "archive-result-reader",
         });
         expect(await store.read(transactionToken)).toMatchObject({
@@ -227,6 +236,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         );
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "staged-publication-reader",
         });
         const published = await record.read("1".repeat(64));
@@ -253,24 +266,36 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "promotes the durable pre-archive capture after restart without browser recapture",
+    "promotes the durable pre-archive capture after target liveness loss without erasing cleanup authority",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-restart-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const transactionToken = "2".repeat(64);
       const prompt = "restart after archive";
+      const targetId = "lost-after-archive";
+      const targetGenerationId = "lost-after-archive-generation";
+      const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+      targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+      const targetCloseCapability = retainChromeTargetCloseCapability({
+        ownerId: transactionToken,
+        generationId: targetGenerationId,
+        targetId,
+        close: closeTarget,
+      });
       const runtime: BrowserRunTransaction["runtime"] = {
         browserTransport: "cdp",
         chromeHost: "127.0.0.1",
         chromePort: 9222,
-        chromeTargetId: "lost-after-archive",
+        chromeTargetId: targetId,
         conversationId: "remote-conversation",
         promptEpoch: committedPromptEpoch(prompt),
         recoveryCleanupResources: [
           {
             chromeHost: "127.0.0.1",
             chromePort: 9222,
-            chromeTargetId: "lost-after-archive",
+            chromeTargetId: targetId,
+            targetCloseCapability,
+            acquisition: { generationId: targetGenerationId },
             conversationId: "remote-conversation",
             promptEpoch: committedPromptEpoch(prompt),
             recoveryCleanup: {
@@ -284,6 +309,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const beforeCrash = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: "controller-before-staged-crash",
       });
       await beforeCrash.begin({
@@ -348,26 +377,53 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           json: { transaction: { result: { archive: expect.anything() } } },
         });
         expect(resumeBrowser).not.toHaveBeenCalled();
-        const afterRetry = await RemoteTransactionStore.open({
-          directory: transactionStoreDir,
-          controllerGeneration: "staged-retry-reader",
-        });
-        const record = await afterRetry.read(transactionToken);
+        const record = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
         expect(record).toMatchObject({
           state: "pending",
           result: { answerText: "restart-safe staged answer" },
           runtime: {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
             conversationId: "remote-conversation",
             promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanupResources: [
+              {
+                chromeTargetId: targetId,
+                targetCloseCapability,
+                acquisition: { generationId: targetGenerationId },
+                recoveryCleanup: {
+                  ownsTarget: true,
+                  closeOwnedTargetOnComplete: true,
+                },
+              },
+            ],
           },
         });
-        expect(record?.result).not.toHaveProperty("archive");
-        expect(record).not.toHaveProperty("stagedCapture");
-        expect(JSON.stringify(record?.runtime)).not.toMatch(
-          /lost-after-archive|chromeTargetId|chromePort|chromeHost|recoveryCleanupResources/u,
+        if (!record.runtime) {
+          throw new Error("Authenticated promoted capture is missing durable runtime authority");
+        }
+        expect(record.runtime).not.toHaveProperty("chromeTargetId");
+        expect(record.runtime.recoveryCleanupResources).toStrictEqual(
+          runtime.recoveryCleanupResources,
         );
+        expect(record.result).not.toHaveProperty("archive");
+        expect(record).not.toHaveProperty("stagedCapture");
+
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: restarted.port,
+          path: `/transactions/${transactionToken}/finalize`,
+          token: "a".repeat(64),
+          body: { durablePublication: true },
+        });
+        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        expect(closeTarget).toHaveBeenCalledOnce();
       } finally {
         await restarted.close();
+        targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
         await rm(tmpDir, { recursive: true, force: true });
       }
     },
@@ -390,16 +446,20 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             conversationId: "remote-conversation",
             promptEpoch: committedPromptEpoch(prompt),
             recoveryCleanup: {
-              ownsTarget: true,
-              profileKind: "temporary",
+              ownsTarget: false,
+              profileKind: "none",
               keepBrowser: false,
-              closeOwnedTargetOnComplete: true,
+              closeOwnedTargetOnComplete: false,
             },
           },
         ],
       };
       const beforeCrash = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: "controller-before-pre-artifact-crash",
       });
       await beforeCrash.begin({
@@ -464,6 +524,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(resumeBrowser).toHaveBeenCalledOnce();
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "pre-artifact-crash-reader",
         }).then((store) => store.read(transactionToken));
         expect(record).toMatchObject({
@@ -552,8 +616,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           statusCode: 200,
           json: { status: "terminal", outcome: { state: "aborted" } },
         });
-        const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
-        const record = JSON.parse(await readFile(recordPath, "utf8"));
+        const record = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
         expect(record).toMatchObject({
           state: "aborted",
           terminalAudit: { settlementMode: "abort" },

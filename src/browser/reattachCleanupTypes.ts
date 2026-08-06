@@ -29,6 +29,8 @@ import type {
 import type { BrowserCaptureFinalizationResult } from "./types.js";
 
 export interface ReattachCleanupDeps {
+  /** Trusted session/transaction owner for live target and lease capabilities. */
+  ownerId?: string;
   closeChromeTargetWithExactAuthority?: typeof closeChromeTargetWithExactAuthority;
   listChromeTargetsWithExactAuthority?: typeof listChromeTargetsWithExactAuthority;
   closeChromeTargetWithRetainedCapability?: typeof closeChromeTargetWithRetainedCapability;

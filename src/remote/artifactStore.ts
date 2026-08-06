@@ -18,8 +18,10 @@ import {
 import type { BrowserArtifactWriteAuthority } from "../browser/types.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactDescriptor } from "./types.js";
+import { deriveRemoteArtifactManualCopyWaiverId } from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactManualCopyWaiver,
   DurableRemoteArtifactNamespaceIdentity,
   DurableRemoteArtifactRegistration,
   DurableRemoteFileIdentity,
@@ -103,11 +105,13 @@ export class RemoteArtifactStore {
     } catch (error) {
       if (namespaceCreated) {
         try {
-          const removed = await this.cleanupArtifactNamespace({
-            ...record,
-            artifactNamespaceState: "initializing",
-            artifactNamespaceIdentity: namespaceIdentity,
-          });
+          const removed = namespaceIdentity
+            ? await this.cleanupArtifactNamespace({
+                ...record,
+                artifactNamespaceState: "initializing",
+                artifactNamespaceIdentity: namespaceIdentity,
+              })
+            : await this.removeFreshEmptyArtifactNamespace(namespaceDirectory);
           if (removed) {
             await this.#transactionStore.rollbackArtifactNamespaceInitialization({
               ...params,
@@ -271,6 +275,33 @@ export class RemoteArtifactStore {
     }
   }
 
+  async recordManualCopyWaiver(params: {
+    transactionToken: string;
+    artifactId: string;
+    byteSize: number;
+    sha256: string;
+  }): Promise<DurableRemoteArtifactManualCopyWaiver | null> {
+    const waiver: DurableRemoteArtifactManualCopyWaiver = {
+      waiverId: deriveRemoteArtifactManualCopyWaiverId(params),
+      waivedAt: new Date(this.#now()).toISOString(),
+      disposition: "manual-copy-required",
+      byteSize: params.byteSize,
+      sha256: params.sha256,
+    };
+    try {
+      return await this.#transactionStore.recordArtifactManualCopyWaiver({
+        transactionToken: params.transactionToken,
+        artifactId: params.artifactId,
+        waiver,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("expired transaction lease")) {
+        throw new RemoteArtifactUnavailableError("transaction_lease_expired");
+      }
+      throw error;
+    }
+  }
+
   private namespaceDirectory(artifactNamespace: string): string {
     const sessionsRoot = path.resolve(this.#sessionsRoot);
     const namespaceDirectory = path.resolve(sessionsRoot, artifactNamespace);
@@ -280,20 +311,29 @@ export class RemoteArtifactStore {
     return namespaceDirectory;
   }
 
+  private async removeFreshEmptyArtifactNamespace(namespaceDirectory: string): Promise<boolean> {
+    try {
+      await rmdir(namespaceDirectory);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return true;
+      if (code === "ENOTEMPTY" || code === "EEXIST") return false;
+      throw error;
+    }
+  }
+
   private async cleanupArtifactNamespace(record: RemoteTransactionRecord): Promise<boolean> {
     if (record.artifactNamespaceState === "uninitialized") return true;
     const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
     const identity = record.artifactNamespaceIdentity;
     if (!identity) {
       try {
-        await rmdir(namespaceDirectory);
-        return true;
+        await capturePhysicalDirectoryIdentity(namespaceDirectory);
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT") return true;
-        if (code === "ENOTEMPTY" || code === "EEXIST") return false;
-        throw error;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
       }
+      return false;
     }
 
     const verifyIdentity = async (candidatePath: string): Promise<boolean> => {

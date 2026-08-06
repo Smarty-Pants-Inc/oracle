@@ -33,6 +33,7 @@ import {
   sanitizeBrowserPublicationRuntime,
   type BrowserCapturePublicationJournal,
   type BrowserPublicationEvent,
+  type BrowserPublicationRemovalEvent,
 } from "./browserPublicationJournal.js";
 import {
   assertDurableBrowserAnswerReceipt,
@@ -87,6 +88,11 @@ type BrowserPublicationRecoveryAnswer =
   | { status: "none" }
   | { status: "pending" }
   | { status: "ready"; answer: string };
+
+type BrowserPublicationJournalRetirement = (
+  journal: BrowserCapturePublicationJournal | null,
+  event: BrowserPublicationRemovalEvent,
+) => Promise<void>;
 
 export class BrowserPublicationTransaction {
   private sessionId: string | undefined;
@@ -157,19 +163,17 @@ export class BrowserPublicationTransaction {
   }
 
   async clear(): Promise<void> {
-    if (!this.currentJournal) return;
+    const journal = this.currentJournal;
+    if (!journal) return;
     const metadata = await sessionStore.readSession(this.requireSessionId());
-    if (!isBrowserPublicationAcknowledged(this.currentJournal, metadata)) {
+    if (!isBrowserPublicationAcknowledged(journal, metadata)) {
       throw new Error("Browser publication journal cannot retire before terminal model projection");
     }
-    await this.requireJournalStore().remove(this.currentJournal, {
+    await this.retireJournal(journal, {
       type: "retire-completed-publication",
-      receipt: this.currentJournal.receipt,
+      receipt: journal.receipt,
       completedSessionPersisted: true,
     });
-    this.currentJournal = null;
-    this.durableAnswerAcknowledged = false;
-    this.publicationAcknowledged = false;
   }
 
   async discardAbortedPreparation(runtime: BrowserRuntimeMetadata | undefined): Promise<boolean> {
@@ -178,13 +182,12 @@ export class BrowserPublicationTransaction {
   }
 
   async discardPreparationForAbort(): Promise<boolean> {
-    if (this.currentJournal?.phase !== "preparing") return false;
-    await this.requireJournalStore().remove(this.currentJournal, {
+    const journal = this.currentJournal;
+    if (journal?.phase !== "preparing") return false;
+    await this.retireJournal(journal, {
       type: "abort-preparation",
-      receipt: this.currentJournal.receipt,
+      receipt: journal.receipt,
     });
-    this.currentJournal = null;
-    this.durableAnswerAcknowledged = false;
     return true;
   }
 
@@ -265,6 +268,7 @@ export class BrowserPublicationTransaction {
                 projected,
                 beforeRuntime,
                 this.requireJournalStore(),
+                this.retireJournal,
                 options,
               );
         await this.refresh();
@@ -311,6 +315,7 @@ export class BrowserPublicationTransaction {
     const settleRecoveryCleanup = adapters.settleRecoveryCleanup ?? settleBrowserRecoveryCleanup;
     const settlement = new OwnedBrowserResourceTransaction(
       {
+        ownerId: sessionId,
         persistRuntime: async (proposedRuntime) => {
           const lockPath = path.join(
             (await sessionStore.getPaths(sessionId)).dir,
@@ -340,6 +345,7 @@ export class BrowserPublicationTransaction {
             runtime,
             logger,
             {
+              ownerId: sessionId,
               recoveryLockPath: lockPath,
               recoveryCleanup: { retainChromeEndpointAuthority },
               isRemotePublicationAcknowledged: this.isRemotePublicationAcknowledged,
@@ -395,7 +401,7 @@ export class BrowserPublicationTransaction {
         );
       } catch (stageError) {
         if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
-        return abortPreStageFailure(options, stageError, projectRuntime, journalStore);
+        return abortPreStageFailure(options, stageError, projectRuntime, this.retireJournal);
       }
     }
 
@@ -404,7 +410,7 @@ export class BrowserPublicationTransaction {
         journal = this.observe(await stageBrowserCapture(options, journal, journalStore));
       } catch (stageError) {
         if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
-        return abortPreStageFailure(options, stageError, projectRuntime, journalStore);
+        return abortPreStageFailure(options, stageError, projectRuntime, this.retireJournal);
       }
       this.durableAnswerAcknowledged = true;
     }
@@ -520,6 +526,14 @@ export class BrowserPublicationTransaction {
     });
     return finalization;
   }
+
+  private readonly retireJournal: BrowserPublicationJournalRetirement = async (journal, event) => {
+    await this.requireJournalStore().remove(journal, event);
+    this.currentJournal = null;
+    this.authorityJournal = null;
+    this.durableAnswerAcknowledged = false;
+    this.publicationAcknowledged = false;
+  };
 
   private requireJournal(): BrowserCapturePublicationJournal {
     const journal = this.currentJournal ?? this.authorityJournal;
@@ -1031,6 +1045,7 @@ async function persistBrowserCaptureFinalizationStateOnce(
   finalization: BrowserCaptureFinalizationResult,
   beforeFinalizationRuntime: BrowserRuntimeMetadata,
   journalStore: BrowserPublicationJournalStore,
+  retireJournal: BrowserPublicationJournalRetirement,
   options: PersistBrowserCaptureFinalizationOptions = {},
 ): Promise<PersistedBrowserCaptureFinalizationState> {
   const currentJournal = await readBrowserCapturePublicationJournal(sessionId);
@@ -1048,7 +1063,11 @@ async function persistBrowserCaptureFinalizationStateOnce(
       throw new Error("Browser finalization journal authority changed before persistence");
     }
     if (options.acknowledgeCapabilities !== false) {
-      await acknowledgeSettledTargetCloseCapabilities(beforeFinalizationRuntime, terminalRuntime);
+      await acknowledgeSettledTargetCloseCapabilities(
+        beforeFinalizationRuntime,
+        terminalRuntime,
+        sessionId,
+      );
     }
     return {
       finalization: { status: "completed", runtime: terminalRuntime },
@@ -1102,7 +1121,11 @@ async function persistBrowserCaptureFinalizationStateOnce(
         };
   const persistedJournal = await journalStore.transition(currentJournal, event);
   if (options.acknowledgeCapabilities !== false) {
-    await acknowledgeSettledTargetCloseCapabilities(beforeFinalizationRuntime, persistedRuntime);
+    await acknowledgeSettledTargetCloseCapabilities(
+      beforeFinalizationRuntime,
+      persistedRuntime,
+      sessionId,
+    );
   }
   const projection = await commitBrowserSessionOutcomeProjection(
     sessionId,
@@ -1124,7 +1147,7 @@ async function persistBrowserCaptureFinalizationStateOnce(
   }
   if (!cleanupPending) {
     try {
-      await journalStore.remove(persistedJournal, {
+      await retireJournal(persistedJournal, {
         type: "retire-completed-publication",
         receipt: persistedJournal.receipt,
         completedSessionPersisted: true,
@@ -1148,7 +1171,7 @@ async function abortPreStageFailure(
   options: PublishCompletedBrowserCaptureOptions,
   stageError: unknown,
   projectRuntime: (runtime: BrowserRuntimeMetadata) => BrowserRuntimeMetadata,
-  journalStore: BrowserPublicationJournalStore,
+  retireJournal: BrowserPublicationJournalRetirement,
 ): Promise<never> {
   const errorAnswerReceipt = durableBrowserAnswerReceiptFromError(stageError);
   const answerReceipt = await verifiedDurableBrowserAnswerReceiptFromError(stageError);
@@ -1193,7 +1216,7 @@ async function abortPreStageFailure(
   }
   try {
     const preparation = await readBrowserCapturePublicationJournal(options.answer.sessionId);
-    await journalStore.remove(preparation, {
+    await retireJournal(preparation, {
       type: "abort-preparation",
       receipt: preparation?.receipt ?? errorAnswerReceipt,
     });

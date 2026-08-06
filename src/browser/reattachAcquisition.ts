@@ -113,6 +113,7 @@ export function assertSameCommittedPromptEpoch(
 }
 
 export async function createOwnedRecoveryTargetConnection(
+  ownerId: string,
   endpointAuthority: RetainedChromeEndpointAuthority,
   generationId: string,
   logger: BrowserLogger,
@@ -144,6 +145,7 @@ export async function createOwnedRecoveryTargetConnection(
       throw new Error(`Recovery target ${targetId} was not created by this recovery acquisition.`);
     }
     targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId,
       generationId,
       targetId,
       browserWSEndpoint: endpointAuthority.browserWSEndpoint,
@@ -169,7 +171,7 @@ export async function createOwnedRecoveryTargetConnection(
         ? await (
             deps.recoveryCleanup?.closeChromeTargetWithRetainedCapability ??
             closeChromeTargetWithRetainedCapability
-          )({ capability: targetCloseCapability, targetId, logger })
+          )({ ownerId, capability: targetCloseCapability, targetId, logger })
         : await (
             deps.recoveryCleanup?.closeChromeTargetWithExactAuthority ??
             closeChromeTargetWithExactAuthority
@@ -215,11 +217,13 @@ export async function resumeBrowserSessionViaNewChrome(
   const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
 
   const acquisitionGenerationId = randomUUID();
+  const resourceOwnerId = deps.sessionId?.trim() || randomUUID();
   const acquisitionLaunchClaim = createChromeProcessLaunchClaim(acquisitionGenerationId);
   const acquisitionOwnerDisposition = resolved.keepBrowser ? "preserve" : "close-on-last-lease";
   const fallbackLeaseId = randomUUID();
   const fallbackTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const fallbackAuthority = new ReattachFallbackAuthority({
+    ownerId: resourceOwnerId,
     baseRuntime: runtime,
     userDataDir,
     profileIdentity: fallbackProfileIdentity,
@@ -244,7 +248,8 @@ export async function resumeBrowserSessionViaNewChrome(
             maxConcurrentTabs: resolved.maxConcurrentTabs,
             timeoutMs: resolved.timeoutMs,
             logger,
-            sessionId: `reattach-${process.pid}`,
+            sessionId: resourceOwnerId,
+            generationId: acquisitionGenerationId,
             leaseId: fallbackLeaseId,
           }),
         authority: (lease) => lease,
@@ -258,7 +263,7 @@ export async function resumeBrowserSessionViaNewChrome(
             userDataDir,
             resolved,
             logger,
-            `reattach-${process.pid}`,
+            resourceOwnerId,
             { launchClaim: acquisitionLaunchClaim },
           );
           return { kind: "manual" as const, owner };
@@ -281,6 +286,7 @@ export async function resumeBrowserSessionViaNewChrome(
       resource: "chrome-target",
       acquire: () =>
         createOwnedRecoveryTargetConnection(
+          resourceOwnerId,
           recoveryEndpointAuthority,
           acquisitionGenerationId,
           logger,

@@ -421,7 +421,8 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
       const lease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 1,
         timeoutMs: 500,
-        sessionId: "missing-lease-replay",
+        sessionId: "test-owner",
+        generationId: "missing-lease-replay-generation",
       });
       const staleRuntime = withRecoveryCleanup(
         { chromePort: 9222, userDataDir: profileDir, chromeProcessIdentity: processIdentity },
@@ -435,6 +436,7 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
       if (!staleResource) throw new Error("missing cleanup resource fixture");
       staleResource.tabLease = {
         id: lease.id,
+        generationId: lease.generationId,
         profileDirectory: lease.profileDirectory,
       };
       const kill = vi.fn();

@@ -53,6 +53,7 @@ export async function acquireRemoteBrowserTarget(
     browserWSEndpoint,
     remoteLeaseProfileDir,
     acquisitionLeaseId,
+    resourceOwnerId,
     acquisitionTargetMarkerUrl,
     promptText,
   } = context;
@@ -66,7 +67,8 @@ export async function acquireRemoteBrowserTarget(
       maxConcurrentTabs: config.maxConcurrentTabs,
       timeoutMs: config.timeoutMs,
       logger,
-      sessionId: options.sessionId,
+      sessionId: resourceOwnerId,
+      generationId: context.acquisitionGenerationId,
       chromeHost: host,
       chromePort: port,
       leaseId: acquisitionLeaseId,
@@ -112,6 +114,7 @@ export async function acquireRemoteBrowserTarget(
       }
       const targetId = context.connection.targetId;
       context.targetCloseCapability = retainChromeTargetCloseCapability({
+        ownerId: resourceOwnerId,
         generationId: context.acquisitionGenerationId,
         targetId,
         browserWSEndpoint: context.connection.browserWSEndpoint,

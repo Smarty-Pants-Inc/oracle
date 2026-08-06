@@ -1,13 +1,31 @@
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { access, mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import type { SessionArtifact } from "../../src/sessionManager.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { missingRequiredArtifactDeliveries } from "../../src/remote/transactionValidation.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+function openTransactionStore(
+  options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
+) {
+  return RemoteTransactionStore.open({
+    ...options,
+    integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
+  });
+}
 
 const authority = {
   requestIdentity: {
@@ -93,7 +111,7 @@ describe("RemoteArtifactStore", () => {
     let now = Date.parse("2026-01-01T00:00:00.000Z");
 
     try {
-      const firstTransactionStore = await RemoteTransactionStore.open({
+      const firstTransactionStore = await openTransactionStore({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-1",
         now: () => now,
@@ -144,7 +162,7 @@ describe("RemoteArtifactStore", () => {
       ).toHaveLength(1);
 
       now += 31 * 60 * 1000;
-      const restartedTransactionStore = await RemoteTransactionStore.open({
+      const restartedTransactionStore = await openTransactionStore({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-2",
         now: () => now,
@@ -205,7 +223,7 @@ describe("RemoteArtifactStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-foreign-"));
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const firstToken = "a".repeat(64);
@@ -238,6 +256,98 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
+  test("rejects artifacts outside sessions root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-boundary-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await openTransactionStore({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "1".repeat(64);
+      await begin(store, transactionToken, "run-boundary");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      await artifacts.createArtifactWriteAuthority({ transactionToken, runId: "run-boundary" });
+      const outsideArtifact = await writeArtifact(
+        path.join(root, "outside.txt"),
+        Buffer.from("outside"),
+      );
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-boundary",
+          artifacts: [outsideArtifact],
+        }),
+      ).rejects.toThrow("outside its exact transaction artifact namespace");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects artifacts outside a session artifacts directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-boundary-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await openTransactionStore({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "2".repeat(64);
+      await begin(store, transactionToken, "run-boundary");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const writeAuthority = await artifacts.createArtifactWriteAuthority({
+        transactionToken,
+        runId: "run-boundary",
+      });
+      const outsideArtifact = await writeArtifact(
+        path.join(path.dirname(writeAuthority.artifactsDirectory), "outside.txt"),
+        Buffer.from("outside"),
+      );
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-boundary",
+          artifacts: [outsideArtifact],
+        }),
+      ).rejects.toThrow("outside its exact transaction artifact namespace");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects symlinked artifacts escaping sessions root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-boundary-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await openTransactionStore({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "3".repeat(64);
+      await begin(store, transactionToken, "run-boundary");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const writeAuthority = await artifacts.createArtifactWriteAuthority({
+        transactionToken,
+        runId: "run-boundary",
+      });
+      const outsideArtifact = await writeArtifact(
+        path.join(root, "outside.txt"),
+        Buffer.from("outside"),
+      );
+      const symlinkPath = path.join(writeAuthority.artifactsDirectory, "escaped.txt");
+      await symlink(outsideArtifact.path!, symlinkPath);
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-boundary",
+          artifacts: [{ ...outsideArtifact, path: symlinkPath }],
+        }),
+      ).rejects.toThrow("outside its exact transaction artifact namespace");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test.each([
     {
       name: "size",
@@ -261,7 +371,7 @@ describe("RemoteArtifactStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-evidence-"));
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const transactionToken = "d".repeat(64);
@@ -292,7 +402,7 @@ describe("RemoteArtifactStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-producer-race-"));
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const transactionToken = "e".repeat(64);
@@ -323,7 +433,7 @@ describe("RemoteArtifactStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-delivery-race-"));
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const transactionToken = "f".repeat(64);
@@ -379,7 +489,7 @@ describe("RemoteArtifactStore", () => {
       await import("../../src/remote/artifactStore.js");
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
         terminalRetentionMs: 1_000,
         now: () => now,
@@ -421,7 +531,7 @@ describe("RemoteArtifactStore", () => {
     const transactionToken = "6".repeat(64);
     let now = Date.parse("2026-01-01T00:00:00.000Z");
     const sessionsRoot = path.join(root, "sessions");
-    const store = await RemoteTransactionStore.open({
+    const store = await openTransactionStore({
       directory: path.join(root, "transactions"),
       terminalRetentionMs: 1_000,
       now: () => now,
@@ -487,7 +597,7 @@ describe("RemoteArtifactStore", () => {
       await import("../../src/remote/artifactStore.js");
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const begun = await begin(store, transactionToken, "run-init-failure");
@@ -526,7 +636,7 @@ describe("RemoteArtifactStore", () => {
     const substitutedToken = "4".repeat(64);
     let now = Date.parse("2026-01-01T00:00:00.000Z");
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
         terminalRetentionMs: 1_000,
         now: () => now,
@@ -579,19 +689,89 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
+  test("retains a replaced no-identity namespace across cold restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-cold-restart-"));
+    const sessionsRoot = path.join(root, "sessions");
+    const transactionDirectory = path.join(root, "transactions");
+    const transactionToken = "7".repeat(64);
+    const runId = "run-cold-restart";
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    try {
+      const initial = await openTransactionStore({
+        directory: transactionDirectory,
+        controllerGeneration: "artifact-controller-before-restart",
+        terminalRetentionMs: 1_000,
+        now: () => now,
+      });
+      const begun = await begin(initial, transactionToken, runId);
+      await initial.beginArtifactNamespaceInitialization({ transactionToken, runId });
+      const namespacePath = path.join(sessionsRoot, begun.artifactNamespace);
+      await mkdir(namespacePath, { recursive: true });
+      await rm(namespacePath, { recursive: true });
+      await mkdir(namespacePath);
+      const foreignFile = path.join(namespacePath, "foreign.txt");
+      await writeFile(foreignFile, "foreign generation");
+
+      const restarted = await openTransactionStore({
+        directory: transactionDirectory,
+        controllerGeneration: "artifact-controller-after-restart",
+        terminalRetentionMs: 1_000,
+        now: () => now,
+      });
+      await expect(
+        restarted.reconcileStaleRunningRecords({
+          buildError: (_record, hadRuntimeAuthority) => ({
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "stale artifact namespace controller",
+            recoverableDisconnect: hadRuntimeAuthority,
+          }),
+        }),
+      ).resolves.toEqual([
+        {
+          transactionToken,
+          previousControllerGeneration: "artifact-controller-before-restart",
+          state: "failed",
+          hadRuntimeAuthority: false,
+        },
+      ]);
+      new RemoteArtifactStore({ transactionStore: restarted, sessionsRoot });
+
+      now += 1_001;
+      await expect(restarted.list()).resolves.toEqual([
+        expect.objectContaining({
+          transactionToken,
+          state: "failed",
+          artifactNamespaceState: "initializing",
+          controllerGeneration: "artifact-controller-after-restart",
+        }),
+      ]);
+      const retained = await restarted.read(transactionToken);
+      expect(retained).not.toBeNull();
+      expect(retained).not.toHaveProperty("artifactNamespaceIdentity");
+      await expect(readFile(foreignFile, "utf8")).resolves.toBe("foreign generation");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a symlinked transaction namespace", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-namespace-alias-"));
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
     try {
       const sessionsRoot = path.join(root, "sessions");
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
+        terminalRetentionMs: 1_000,
+        now: () => now,
       });
       const transactionToken = "1".repeat(64);
       const record = await begin(store, transactionToken, "run-alias");
       const foreignDirectory = path.join(root, "foreign");
+      const aliasPath = path.join(sessionsRoot, record.artifactNamespace);
       await mkdir(sessionsRoot, { recursive: true });
       await mkdir(foreignDirectory, { recursive: true });
-      await symlink(foreignDirectory, path.join(sessionsRoot, record.artifactNamespace), "dir");
+      await symlink(foreignDirectory, aliasPath, "dir");
       const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
 
       await expect(
@@ -605,9 +785,29 @@ describe("RemoteArtifactStore", () => {
           errorStage: "remote-artifact-namespace-initialization",
         },
       });
-      await expect(realpath(path.join(sessionsRoot, record.artifactNamespace))).resolves.toBe(
-        await realpath(foreignDirectory),
-      );
+      const canonicalForeignDirectory = await realpath(foreignDirectory);
+      await expect(realpath(aliasPath)).resolves.toBe(canonicalForeignDirectory);
+
+      now += 1_001;
+      await expect(store.list()).resolves.toEqual([
+        expect.objectContaining({ transactionToken, state: "failed" }),
+      ]);
+      await expect(realpath(aliasPath)).resolves.toBe(canonicalForeignDirectory);
+
+      const replacementDirectory = path.join(root, "replacement");
+      await mkdir(replacementDirectory);
+      await rm(aliasPath);
+      await symlink(replacementDirectory, aliasPath, "dir");
+      const canonicalReplacementDirectory = await realpath(replacementDirectory);
+      await expect(store.list()).resolves.toEqual([
+        expect.objectContaining({ transactionToken, state: "failed" }),
+      ]);
+      await expect(realpath(aliasPath)).resolves.toBe(canonicalReplacementDirectory);
+
+      await rm(aliasPath);
+      await expect(store.list()).resolves.toEqual([]);
+      await expect(realpath(foreignDirectory)).resolves.toBe(canonicalForeignDirectory);
+      await expect(realpath(replacementDirectory)).resolves.toBe(canonicalReplacementDirectory);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

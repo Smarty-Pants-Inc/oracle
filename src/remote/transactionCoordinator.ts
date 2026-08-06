@@ -41,6 +41,7 @@ export interface RemoteTransactionCoordinatorOptions {
   retryCleanup: (
     runtime: BrowserRuntimeMetadata,
     mode: "finalize" | "abort",
+    ownerId: string,
   ) => Promise<BrowserCaptureFinalizationResult>;
   activeTransactions?: Map<string, BrowserRunTransaction>;
 }
@@ -50,6 +51,7 @@ export class RemoteTransactionCoordinator {
   readonly #retryCleanup: (
     runtime: BrowserRuntimeMetadata,
     mode: "finalize" | "abort",
+    ownerId: string,
   ) => Promise<BrowserCaptureFinalizationResult>;
   readonly #activeTransactions: Map<string, BrowserRunTransaction>;
 
@@ -144,7 +146,7 @@ export class RemoteTransactionCoordinator {
     const active = this.#activeTransactions.get(params.transactionToken);
     const rawFinalization = active
       ? await active[mode]().catch((error) => retryableCleanupFailure(runtime, mode, error))
-      : await this.#retryCleanup(runtime, mode).catch((error) =>
+      : await this.#retryCleanup(runtime, mode, params.transactionToken).catch((error) =>
           retryableCleanupFailure(runtime, mode, error),
         );
     const resourceFinalization =

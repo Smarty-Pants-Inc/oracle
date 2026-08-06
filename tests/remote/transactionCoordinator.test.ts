@@ -14,6 +14,14 @@ import {
 import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+function openTransactionStore(
+  options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
+) {
+  return RemoteTransactionStore.open({
+    ...options,
+    integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
+  });
+}
 
 const runtime: BrowserRunTransaction["runtime"] = {
   chromeTargetId: "target-1",
@@ -82,7 +90,7 @@ async function createPendingStore(
   transactionToken: string,
   artifacts: DurableRemoteArtifactRegistration[] = [],
 ) {
-  const store = await RemoteTransactionStore.open({
+  const store = await openTransactionStore({
     directory: root,
     controllerGeneration: "controller-generation-1",
   });
@@ -282,7 +290,11 @@ describe("RemoteTransactionCoordinator", () => {
       const store = await createPendingStore(root, abortToken);
       await createPendingStore(root, finalizeToken);
       const retryCleanup = vi.fn(
-        async (_runtime: BrowserRunTransaction["runtime"], _mode: "finalize" | "abort") => ({
+        async (
+          _runtime: BrowserRunTransaction["runtime"],
+          _mode: "finalize" | "abort",
+          _ownerId: string,
+        ) => ({
           status: "completed" as const,
           runtime,
         }),
@@ -314,6 +326,7 @@ describe("RemoteTransactionCoordinator", () => {
           recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
         },
         "abort",
+        abortToken,
       );
       expect(retryCleanup).toHaveBeenNthCalledWith(
         2,
@@ -322,6 +335,7 @@ describe("RemoteTransactionCoordinator", () => {
           recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
         },
         "finalize",
+        finalizeToken,
       );
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -332,7 +346,7 @@ describe("RemoteTransactionCoordinator", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recoverable-abort-"));
     const transactionToken = "3".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: root,
         controllerGeneration: "controller-generation-1",
       });

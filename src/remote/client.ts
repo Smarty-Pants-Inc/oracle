@@ -25,6 +25,7 @@ import {
   buildRemotePromptRequestIdentity,
   RemoteRunPayloadSchema,
   type RemoteAttachmentPayload,
+  type RemoteArtifactDescriptor,
   type RemoteBrowserRunConfig,
   type RemoteRunTransactionPayload,
   type RemoteTransportDeadlines,
@@ -57,7 +58,11 @@ import {
   settleRemoteBrowserTransaction,
   unresolvedRemoteTransactionRuntime,
 } from "./clientRecovery.js";
-import { mergeTransferredArtifacts, transferRemoteArtifact } from "./clientArtifacts.js";
+import {
+  mergeTransferredArtifacts,
+  transferRemoteArtifact,
+  waiveRemoteArtifactDelivery,
+} from "./clientArtifacts.js";
 import { assertRemoteTransactionToken } from "./transactionToken.js";
 
 export { settleRemoteBrowserRecovery } from "./clientRecovery.js";
@@ -471,15 +476,52 @@ async function buildRemoteBrowserTransaction(params: {
   let selectedSettlementMode = params.settlementMode;
   if (selectedSettlementMode) runtime = bindRemoteSettlementMode(runtime, selectedSettlementMode);
   let settlementBindingPersisted = selectedSettlementMode !== undefined;
+  const pendingManualCopyWaivers = new Map<string, RemoteArtifactDescriptor>();
   let transaction!: BrowserRunTransaction;
   let settlementInFlight: {
     mode: "finalize" | "abort";
     promise: Promise<BrowserCaptureFinalizationResult>;
   } | null = null;
   let completedSettlement: BrowserCaptureFinalizationResult | null = null;
+  const persistManualCopyWaiver = async (descriptor: RemoteArtifactDescriptor): Promise<void> => {
+    await waiveRemoteArtifactDelivery({
+      hostname: params.hostname,
+      port: params.port,
+      token: params.token,
+      descriptor,
+      transactionToken: params.receipt.transactionToken,
+      deadlines: params.deadlines,
+    });
+    pendingManualCopyWaivers.delete(descriptor.artifactId);
+  };
+  const persistPendingManualCopyWaivers = async (): Promise<void> => {
+    let lastError: unknown;
+    for (const descriptor of pendingManualCopyWaivers.values()) {
+      try {
+        await persistManualCopyWaiver(descriptor);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (pendingManualCopyWaivers.size === 0) return;
+    throw new BrowserAutomationError(
+      "Remote required-artifact manual-copy waiver remains retryable; captured text and cleanup authority are preserved.",
+      {
+        stage: "remote-artifact-transfer",
+        code: "remote-artifact-manual-copy-waiver-pending",
+        recoverableDisconnect: true,
+        transactionToken: params.receipt.transactionToken,
+        runtime,
+      },
+      lastError,
+    );
+  };
   const persistSettlementBinding = async (
     mode: "finalize" | "abort",
   ): Promise<BrowserRuntimeMetadata> => {
+    if (mode === "finalize" && pendingManualCopyWaivers.size > 0) {
+      await persistPendingManualCopyWaivers();
+    }
     const authoritativeMode =
       runtime.recoveryCleanupResult?.settlementMode ?? selectedSettlementMode;
     if (authoritativeMode && authoritativeMode !== mode) {
@@ -538,7 +580,8 @@ async function buildRemoteBrowserTransaction(params: {
     if (
       error instanceof BrowserAutomationError &&
       (error.details?.code === "settlement-authority-persistence-failed" ||
-        error.details?.code === "remote-settlement-binding-transport-failed")
+        error.details?.code === "remote-settlement-binding-transport-failed" ||
+        error.details?.code === "remote-artifact-manual-copy-waiver-pending")
     ) {
       return pendingBrowserCaptureCleanup(runtime, error.message, mode);
     }
@@ -637,7 +680,18 @@ async function buildRemoteBrowserTransaction(params: {
     } catch (error) {
       const filename = sanitizeArtifactFilename(descriptor.filename, "artifact.bin");
       const reason = (error instanceof Error ? error.message : String(error)).slice(0, 1024);
-      const failure = `${filename}: ${reason}`;
+      let failure = `${filename}: ${reason}`;
+      if (descriptor.required) {
+        pendingManualCopyWaivers.set(descriptor.artifactId, descriptor);
+        try {
+          await persistManualCopyWaiver(descriptor);
+        } catch (waiverError) {
+          const waiverReason = (
+            waiverError instanceof Error ? waiverError.message : String(waiverError)
+          ).slice(0, 1024);
+          failure += ` Manual-copy waiver remains pending: ${waiverReason}`;
+        }
+      }
       params.options.log?.(
         `[browser] Oracle captured the browser text response, but bridge artifact transfer failed for ${failure}`,
       );

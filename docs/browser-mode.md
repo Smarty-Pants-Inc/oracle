@@ -372,7 +372,7 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
      --file docs/incidents/latest.md
    ```
 
-   Store the same loopback host and 64-character lowercase hexadecimal key in `browser.remoteHost` / `browser.remoteToken`, or use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
+   For a one-off run, pass `--remote-host` / `--remote-token`; for process-scoped authority such as MCP, use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`; use `browser.remoteHost` / `browser.remoteToken` only as persistent defaults. Resolution is CLI, then environment, then user config, so mutable config cannot redirect a run that supplies a use-scoped pair. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
 
 4. **Stop the host**
 

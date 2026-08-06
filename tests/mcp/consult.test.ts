@@ -392,9 +392,13 @@ describe("summarizeModelRunsForConsult", () => {
     }
   });
 
-  test("ignores dormant predecessor remote credentials for API consults but rejects remote use", async () => {
+  test("keeps predecessor config dormant until MCP remote transport use", async () => {
     const home = mkdtempSync(path.join(tmpdir(), "oracle-home-"));
     setOracleHomeDirOverrideForTest(home);
+    const prevHost = process.env.ORACLE_REMOTE_HOST;
+    const prevToken = process.env.ORACLE_REMOTE_TOKEN;
+    delete process.env.ORACLE_REMOTE_HOST;
+    delete process.env.ORACLE_REMOTE_TOKEN;
     writeFileSync(
       path.join(home, "config.json"),
       JSON.stringify({
@@ -427,9 +431,20 @@ describe("summarizeModelRunsForConsult", () => {
       };
       expect(apiResult.isError).not.toBe(true);
       expect(apiResult.structuredContent?.status).toBe("dry-run");
+      const browserPreview = (await handler({
+        dryRun: true,
+        engine: "browser",
+        model: "gpt-5.5",
+        prompt: "Browser preview must not construct remote transport",
+        files: [],
+      })) as {
+        isError?: boolean;
+        structuredContent?: { status?: string };
+      };
+      expect(browserPreview.isError).not.toBe(true);
+      expect(browserPreview.structuredContent?.status).toBe("dry-run");
 
       const remoteResult = (await handler({
-        dryRun: true,
         engine: "browser",
         model: "gpt-5.5",
         prompt: "Remote path must rotate predecessor state",
@@ -439,7 +454,26 @@ describe("summarizeModelRunsForConsult", () => {
       expect(remoteResult.content[0]?.text).toMatch(
         /immediately preceding base-generated.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
       );
+
+      process.env.ORACLE_REMOTE_HOST = "127.0.0.1:19473";
+      process.env.ORACLE_REMOTE_TOKEN = "b".repeat(64);
+      const envRemoteResult = (await handler({
+        dryRun: true,
+        engine: "browser",
+        model: "gpt-5.5",
+        prompt: "Use-scoped environment must override dormant predecessor config",
+        files: [],
+      })) as {
+        isError?: boolean;
+        structuredContent?: { status?: string };
+      };
+      expect(envRemoteResult.isError).not.toBe(true);
+      expect(envRemoteResult.structuredContent?.status).toBe("dry-run");
     } finally {
+      if (prevHost === undefined) delete process.env.ORACLE_REMOTE_HOST;
+      else process.env.ORACLE_REMOTE_HOST = prevHost;
+      if (prevToken === undefined) delete process.env.ORACLE_REMOTE_TOKEN;
+      else process.env.ORACLE_REMOTE_TOKEN = prevToken;
       setOracleHomeDirOverrideForTest(null);
       rmSync(home, { recursive: true, force: true });
     }

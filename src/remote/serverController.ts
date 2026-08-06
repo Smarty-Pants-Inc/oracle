@@ -50,6 +50,7 @@ interface RemoteServerDeps {
   ) => Promise<BrowserRunTransaction>;
   resumeBrowser?: typeof resumeBrowserSession;
   transactionStoreDir?: string;
+  transactionIntegrityKeyPath?: string;
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
   exactChromeCleanup?: (
     runtime: BrowserRuntimeMetadata,
@@ -102,6 +103,9 @@ export async function createRemoteServer(
     : (_formatter: (msg: string) => string, msg: string) => msg;
   const transactionStoreDir =
     deps.transactionStoreDir ?? path.join(getOracleHomeDir(), "remote-transactions");
+  const transactionIntegrityKeyPath =
+    deps.transactionIntegrityKeyPath ??
+    path.join(path.dirname(transactionStoreDir), ".remote-transaction-integrity.key");
   const controllerGeneration = deps.controllerGeneration ?? randomUUID();
   const requestAuthenticator = new RemoteRequestAuthenticator({
     rootKey: authToken,
@@ -117,6 +121,7 @@ export async function createRemoteServer(
   try {
     transactionStore = await RemoteTransactionStore.open({
       directory: transactionStoreDir,
+      integrityKeyPath: transactionIntegrityKeyPath,
       leaseDurationMs: deps.transactionLeaseDurationMs,
       now: deps.transactionStoreNow,
       controllerGeneration,
@@ -131,6 +136,7 @@ export async function createRemoteServer(
   });
   const activeTransactions = new Map<string, BrowserRunTransaction>();
   const admittedTransactions = new Map<string, { controllerGeneration: string }>();
+  const remoteTransactionRetryWork = new Map<string, Promise<unknown>>();
   let closing = false;
   let closed = false;
   let closeInFlight: Promise<void> | null = null;
@@ -143,14 +149,15 @@ export async function createRemoteServer(
   const transactionCoordinator = new RemoteTransactionCoordinator({
     transactionStore,
     activeTransactions,
-    retryCleanup: (runtime, mode) => {
+    retryCleanup: (runtime, mode, ownerId) => {
       const cleanup = injectedRetryCleanup ?? retryBrowserRecoveryCleanup;
       return cleanup(
         runtime,
         cleanupLogger,
         injectedRetryCleanup
-          ? {}
+          ? { ownerId }
           : {
+              ownerId,
               recoveryCleanup: {
                 terminateExactChromeForProfile: (profileDir, identity, cleanupLog) =>
                   (deps.exactChromeCleanup ?? terminateRemoteChromeWithExactControl)(
@@ -188,6 +195,22 @@ export async function createRemoteServer(
   };
   const isRemoteTransactionAdmitted = (transactionToken: string): boolean =>
     admittedTransactions.get(transactionToken)?.controllerGeneration === controllerGeneration;
+  const runRemoteTransactionRetryWork = async <T>(
+    transactionToken: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const existing = remoteTransactionRetryWork.get(transactionToken);
+    if (existing) return (await existing) as T;
+    const inFlight = Promise.resolve().then(operation);
+    remoteTransactionRetryWork.set(transactionToken, inFlight);
+    const clear = () => {
+      if (remoteTransactionRetryWork.get(transactionToken) === inFlight) {
+        remoteTransactionRetryWork.delete(transactionToken);
+      }
+    };
+    void inFlight.then(clear, clear);
+    return await inFlight;
+  };
   const admitControllerOperation = (): (() => void) | null => {
     if (closing) return null;
     if (controllerOperationCount === 0) controllerOperationsIdle = Promise.withResolvers<void>();
@@ -334,6 +357,7 @@ export async function createRemoteServer(
     admitControllerOperation,
     admitRemoteTransaction,
     isRemoteTransactionAdmitted,
+    runRemoteTransactionRetryWork,
     isClosing: () => closing,
     isBrowserWorkBusy: () => browserWorkCount > 0,
     isBrowserWorkExclusive: () => browserWorkExclusive,

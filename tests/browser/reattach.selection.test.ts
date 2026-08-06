@@ -458,6 +458,7 @@ describe("resumeBrowserSession selection", { timeout: 15_000 }, () => {
 
     const finalized = await result.finalize();
     expect(closeChromeTargetWithRetainedCapability).toHaveBeenCalledWith({
+      ownerId: "test-owner",
       capability,
       targetId: "owned-t1",
       logger: expect.any(Function),
@@ -501,7 +502,7 @@ describe("resumeBrowserSession selection", { timeout: 15_000 }, () => {
     expect(result.runtime.recoveryCleanupResources?.[0]?.recoveryCleanup.ownsTarget).toBe(true);
     await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
     expect(closeChromeTargetWithRetainedCapability).toHaveBeenCalledWith(
-      expect.objectContaining({ targetId: "owned-t1", capability }),
+      expect.objectContaining({ ownerId: "test-owner", targetId: "owned-t1", capability }),
     );
   });
 

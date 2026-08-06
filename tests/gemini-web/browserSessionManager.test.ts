@@ -201,12 +201,16 @@ describe("openGeminiBrowserSession", () => {
       disposition: "close-on-last-lease",
       endpointAuthority,
     });
-    acquireBrowserTabLease.mockResolvedValue({
-      id: "lease-1",
-      profileDirectory: processIdentity.profileDirectory,
-      update: leaseUpdate,
-      release: leaseRelease,
-    });
+    acquireBrowserTabLease.mockImplementation(
+      async (_profileDir: string, options: { sessionId: string; generationId: string }) => ({
+        id: "lease-1",
+        sessionId: options.sessionId,
+        generationId: options.generationId,
+        profileDirectory: processIdentity.profileDirectory,
+        update: leaseUpdate,
+        release: leaseRelease,
+      }),
+    );
     connectWithNewTabWithExactAuthority.mockResolvedValue({
       targetId: "target-1",
       client: { close: clientClose },
@@ -237,7 +241,10 @@ describe("openGeminiBrowserSession", () => {
     expect(session.processIdentity).toBe(processIdentity);
     expect(acquireBrowserTabLease).toHaveBeenCalledWith(
       explicitDir,
-      expect.objectContaining({ sessionId: "Gemini Deep Think" }),
+      expect.objectContaining({
+        sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        generationId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      }),
     );
     expect(acquireManualChromeOwner).toHaveBeenCalledWith(
       explicitDir,
@@ -320,15 +327,19 @@ describe("openGeminiBrowserSession", () => {
 
   it("journals each acquisition intent before its effect and exact identity immediately after", async () => {
     const events: string[] = [];
-    acquireBrowserTabLease.mockImplementationOnce(async () => {
-      events.push("acquire:tab-lease");
-      return {
-        id: "lease-ordered",
-        profileDirectory: processIdentity.profileDirectory,
-        update: leaseUpdate,
-        release: leaseRelease,
-      };
-    });
+    acquireBrowserTabLease.mockImplementationOnce(
+      async (_profileDir: string, options: { sessionId: string; generationId: string }) => {
+        events.push("acquire:tab-lease");
+        return {
+          id: "lease-ordered",
+          sessionId: options.sessionId,
+          generationId: options.generationId,
+          profileDirectory: processIdentity.profileDirectory,
+          update: leaseUpdate,
+          release: leaseRelease,
+        };
+      },
+    );
     acquireManualChromeOwner.mockImplementationOnce(async () => {
       events.push("acquire:chrome-process");
       return {

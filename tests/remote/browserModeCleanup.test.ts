@@ -20,6 +20,7 @@ describe("remote browser unpublished cleanup", () => {
   test("surfaces abort-bound target and lease cleanup authority and retries it", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-cleanup-retry-"));
     const originalFailure = new Error("remote navigation failed before publication");
+    const ownerId = "remote-cleanup-owner";
     const closeChromeTargetWithExactAuthority = vi
       .fn()
       .mockResolvedValueOnce({
@@ -90,6 +91,7 @@ describe("remote browser unpublished cleanup", () => {
       ]);
       const error = await runBrowserMode({
         prompt: "remote cleanup retry",
+        sessionId: ownerId,
         config: {
           remoteChrome: { host: "remote.example", port: 9333 },
           manualLogin: true,
@@ -132,10 +134,19 @@ describe("remote browser unpublished cleanup", () => {
       expect((error as Error & { cause?: unknown }).cause).toBe(originalFailure);
       expect(
         JSON.parse(await readFile(path.join(profileDir, "oracle-tab-leases.json"), "utf8")),
-      ).toMatchObject({ leases: [expect.objectContaining({ id: expect.any(String) })] });
+      ).toMatchObject({
+        leases: [
+          expect.objectContaining({
+            id: expect.any(String),
+            sessionId: ownerId,
+            generationId: expect.any(String),
+          }),
+        ],
+      });
 
       await expect(
         retryBrowserRecoveryCleanup(runtime, vi.fn() as BrowserLogger, {
+          ownerId,
           acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
         }),
       ).resolves.toMatchObject({ status: "completed" });

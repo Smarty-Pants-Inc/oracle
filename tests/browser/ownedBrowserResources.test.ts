@@ -44,7 +44,7 @@ function acquisitionRuntime(
           pendingResource === "chrome-target"
             ? undefined
             : { version: 1, generationId: "generation-1", capabilityId: "capability-1" },
-        tabLease: { id: "lease-1", profileDirectory },
+        tabLease: { id: "lease-1", generationId: "generation-1", profileDirectory },
         acquisition: {
           generationId: "generation-1",
           processOwnerProvenance: "manual-canonical-owner",
@@ -186,6 +186,7 @@ describe("OwnedBrowserResourceTransaction", () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "generation-1",
       targetId: "target-1",
       close: closeTarget,
@@ -199,10 +200,12 @@ describe("OwnedBrowserResourceTransaction", () => {
       .mockRejectedValueOnce(new Error("completed runtime store unavailable"));
     const transaction = new OwnedBrowserResourceTransaction(
       {
+        ownerId: "test-owner",
         persistRuntime: async () => undefined,
         persistSettlementResult,
         settleResources: async (_mode, pendingRuntime) => {
           await closeChromeTargetWithRetainedCapability({
+            ownerId: "test-owner",
             capability,
             targetId: "target-1",
             logger,
@@ -218,7 +221,12 @@ describe("OwnedBrowserResourceTransaction", () => {
       0,
     );
     await expect(
-      closeChromeTargetWithRetainedCapability({ capability, targetId: "target-1", logger }),
+      closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
+        capability,
+        targetId: "target-1",
+        logger,
+      }),
     ).resolves.toEqual({ status: "completed" });
 
     await expect(transaction.settle("finalize")).resolves.toMatchObject({ status: "completed" });
@@ -232,6 +240,7 @@ describe("OwnedBrowserResourceTransaction", () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "partial-generation",
       targetId: "target-1",
       close: closeTarget,
@@ -243,10 +252,12 @@ describe("OwnedBrowserResourceTransaction", () => {
     const persistSettlementResult = vi.fn(async (_runtime: BrowserRuntimeMetadata) => undefined);
     const transaction = new OwnedBrowserResourceTransaction(
       {
+        ownerId: "test-owner",
         persistRuntime: async () => undefined,
         persistSettlementResult,
         settleResources: async (_mode, pendingRuntime) => {
           await closeChromeTargetWithRetainedCapability({
+            ownerId: "test-owner",
             capability,
             targetId: "target-1",
             logger,
@@ -281,6 +292,7 @@ describe("OwnedBrowserResourceTransaction", () => {
     for (let index = 0; index < 3; index += 1) {
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       const capability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: `preserved-generation-${index}`,
         targetId: "target-1",
         close: closeTarget,
@@ -301,6 +313,7 @@ describe("OwnedBrowserResourceTransaction", () => {
       ];
       const transaction = new OwnedBrowserResourceTransaction(
         {
+          ownerId: "test-owner",
           persistRuntime: async () => undefined,
           persistSettlementResult: async () => undefined,
           settleResources: async (_mode, pendingRuntime) =>
@@ -321,6 +334,7 @@ describe("OwnedBrowserResourceTransaction", () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "generation-1",
       targetId: "target-1",
       close: closeTarget,
@@ -334,6 +348,7 @@ describe("OwnedBrowserResourceTransaction", () => {
         persistRuntime: async () => undefined,
         settleResources: async (_mode, pendingRuntime) => {
           await closeChromeTargetWithRetainedCapability({
+            ownerId: "test-owner",
             capability,
             targetId: "target-1",
             logger,
@@ -350,7 +365,12 @@ describe("OwnedBrowserResourceTransaction", () => {
       0,
     );
     await expect(
-      closeChromeTargetWithRetainedCapability({ capability, targetId: "target-1", logger }),
+      closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
+        capability,
+        targetId: "target-1",
+        logger,
+      }),
     ).resolves.toEqual({ status: "completed" });
     expect(closeTarget).toHaveBeenCalledOnce();
   });
@@ -514,6 +534,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       profileDirectory,
     };
     const authority = new LocalOwnedBrowserResourceAuthority({
+      ownerId: "test-owner",
       purpose: "Shared owner test",
       targetLabel: "Shared owner",
       userDataDir: profileDirectory.canonicalPath,
@@ -541,6 +562,8 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       resource: "tab-lease",
       acquire: async () => ({
         id: "shared-lease",
+        sessionId: "test-owner",
+        generationId: "shared-generation",
         profileDirectory,
         update: vi.fn(async () => undefined),
         release: vi.fn(async () => {
@@ -584,6 +607,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       authority: ({ targetId }) => ({
         targetId,
         capability: retainChromeTargetCloseCapability({
+          ownerId: "test-owner",
           generationId: "shared-generation",
           targetId,
           close: async () => {
@@ -659,6 +683,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
     };
     const authority = new LocalOwnedBrowserResourceAuthority({
+      ownerId: "test-owner",
       purpose: "Active handoff test",
       targetLabel: "Active handoff",
       userDataDir: profileDirectory.canonicalPath,
@@ -687,6 +712,8 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       resource: "tab-lease",
       acquire: async () => ({
         id: "active-handoff-lease",
+        sessionId: "test-owner",
+        generationId: "active-handoff-generation",
         profileDirectory,
         update: vi.fn(async () => undefined),
         release: vi.fn(async () => undefined),
@@ -784,6 +811,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         release: vi.fn(async () => undefined),
       };
       const authority = new LocalOwnedBrowserResourceAuthority({
+        ownerId: "test-owner",
         purpose: "Runtime projection test",
         targetLabel: "Runtime projection",
         ...(baseRuntime ? { baseRuntime } : {}),
@@ -826,6 +854,8 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         resource: "tab-lease",
         acquire: async () => ({
           id: "runtime-projection-lease",
+          sessionId: "test-owner",
+          generationId: "runtime-projection-generation",
           profileDirectory,
           update: vi.fn(async () => undefined),
           release: vi.fn(async () => undefined),
@@ -857,6 +887,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         authority: ({ targetId }) => ({
           targetId,
           capability: retainChromeTargetCloseCapability({
+            ownerId: "test-owner",
             generationId: "runtime-projection-generation",
             targetId,
             close: async () => {

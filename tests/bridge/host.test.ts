@@ -1,0 +1,473 @@
+import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { Readable, Writable } from "node:stream";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
+import {
+  BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES,
+  runBridgeHost,
+} from "../../src/cli/bridge/host.js";
+import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import type { RemoteServerLifecycle, RemoteServerOptions } from "../../src/remote/server.js";
+
+const MODERN_TOKEN = "a".repeat(64);
+const LEGACY_TOKEN = "b".repeat(64);
+const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
+const OTHER_NONCE = "22222222-2222-4222-8222-222222222222";
+
+interface FakeBridgeChild {
+  child: ChildProcess;
+  stdinWrites: Buffer[];
+  stdinUnref: Mock;
+  readinessUnref: Mock;
+  unref: Mock;
+  kill: Mock;
+}
+
+function createFakeBridgeChild(
+  onCredentials: (payload: string, readiness: Readable) => void | Promise<void>,
+): FakeBridgeChild {
+  const stdinWrites: Buffer[] = [];
+  const readiness = new Readable({ read() {} });
+  const readinessUnref = vi.fn();
+  Object.assign(readiness, { unref: readinessUnref });
+  const stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      stdinWrites.push(Buffer.from(chunk as Uint8Array));
+      callback();
+    },
+  });
+  const stdinUnref = vi.fn();
+  Object.assign(stdin, { unref: stdinUnref });
+  stdin.once("finish", () => {
+    void Promise.resolve(
+      onCredentials(Buffer.concat(stdinWrites).toString("utf8"), readiness),
+    ).catch((error: unknown) =>
+      readiness.destroy(error instanceof Error ? error : new Error(String(error))),
+    );
+  });
+
+  const unref = vi.fn();
+  const kill = vi.fn(() => true);
+  const child = Object.assign(new EventEmitter(), {
+    pid: 4242,
+    stdin,
+    stdio: [stdin, null, null, readiness],
+    stdout: null,
+    stderr: null,
+    exitCode: null,
+    signalCode: null,
+    unref,
+    kill,
+  }) as unknown as ChildProcess;
+  return { child, stdinWrites, stdinUnref, readinessUnref, unref, kill };
+}
+
+function credentialPayload(
+  input: {
+    readinessNonce?: string;
+    token?: string;
+    legacyToken?: string;
+  } = {},
+): string {
+  return `${JSON.stringify({
+    version: 1,
+    readinessNonce: input.readinessNonce ?? READINESS_NONCE,
+    token: input.token ?? MODERN_TOKEN,
+    ...(input.legacyToken === undefined ? {} : { legacyToken: input.legacyToken }),
+  })}\n`;
+}
+
+function readinessPayload(readinessNonce: string, status: "ready" | "failed" = "ready"): string {
+  return `${JSON.stringify({ version: 1, readinessNonce, status })}\n`;
+}
+
+afterEach(() => {
+  setOracleHomeDirOverrideForTest(null);
+  vi.restoreAllMocks();
+});
+
+describe("bridge host detached child transport", () => {
+  it("keeps both credentials out of child argv/env and transfers one exact closed payload", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-ipc-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    setOracleHomeDirOverrideForTest(tempDir);
+    let publishedBeforeReady = false;
+    const harness = createFakeBridgeChild(async (payload, readiness) => {
+      publishedBeforeReady = await Promise.all([
+        fs.access(artifactPath).then(
+          () => true,
+          () => false,
+        ),
+        fs.access(pidPath).then(
+          () => true,
+          () => false,
+        ),
+      ]).then((results) => results.some(Boolean));
+      const parsed = JSON.parse(payload) as { readinessNonce: string };
+      readiness.push(readinessPayload(parsed.readinessNonce));
+      readiness.push(null);
+    });
+    const spawnChild = vi.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+    );
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await runBridgeHost(
+        {
+          background: true,
+          bind: "127.0.0.1:9473",
+          token: MODERN_TOKEN,
+          legacyToken: LEGACY_TOKEN,
+          writeConnection: artifactPath,
+        },
+        {
+          spawn: spawnChild,
+          generateReadinessNonce: () => READINESS_NONCE,
+          env: {
+            SAFE_VALUE: "kept",
+            ORACLE_REMOTE_TOKEN: MODERN_TOKEN,
+            ORACLE_REMOTE_LEGACY_TOKEN: LEGACY_TOKEN,
+            oracle_remote_token: "case-insensitive-name",
+            WRAPPED_SECRET: `prefix-${MODERN_TOKEN}-suffix`,
+            [LEGACY_TOKEN]: "secret-in-name",
+          },
+        },
+      );
+
+      expect(spawnChild).toHaveBeenCalledOnce();
+      const [command, args, spawnOptions] = spawnChild.mock.calls[0]!;
+      expect(command).toBe(process.execPath);
+      expect(args).toEqual([
+        process.argv[1],
+        "bridge",
+        "host",
+        "--background-child",
+        "--bind",
+        "127.0.0.1:9473",
+      ]);
+      expect(args).not.toContain("--token");
+      expect(args).not.toContain("--legacy-token");
+      expect(args).not.toContain("--write-connection");
+      expect(args).not.toContain("--foreground");
+      expect(JSON.stringify(args)).not.toContain(MODERN_TOKEN);
+      expect(JSON.stringify(args)).not.toContain(LEGACY_TOKEN);
+      expect(JSON.stringify(args)).not.toContain(READINESS_NONCE);
+      expect(spawnOptions.detached).toBe(true);
+      expect(spawnOptions.stdio).toEqual(["pipe", expect.any(Number), expect.any(Number), "pipe"]);
+      expect(spawnOptions.env).toEqual({ SAFE_VALUE: "kept" });
+
+      expect(publishedBeforeReady).toBe(false);
+      expect(harness.stdinWrites).toHaveLength(1);
+      expect(Buffer.concat(harness.stdinWrites).toString("utf8")).toBe(
+        credentialPayload({ legacyToken: LEGACY_TOKEN }),
+      );
+      expect(harness.child.stdin?.writableEnded).toBe(true);
+      expect(harness.stdinUnref).toHaveBeenCalledOnce();
+      expect(harness.readinessUnref).toHaveBeenCalledOnce();
+      expect(harness.unref).toHaveBeenCalledOnce();
+      expect(harness.kill).not.toHaveBeenCalled();
+      expect(JSON.parse(await fs.readFile(artifactPath, "utf8"))).toMatchObject({
+        remoteToken: MODERN_TOKEN,
+      });
+      expect(await fs.readFile(pidPath, "utf8")).toBe("4242\n");
+      expect(log.mock.calls.flat().join("\n")).toContain("Bridge host running in background");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("requires authenticated readiness before replacing prior artifact or pid state", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-not-ready-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    const oldArtifact = '{"old":true}\n';
+    const oldPid = "31337\n";
+    await fs.writeFile(artifactPath, oldArtifact);
+    await fs.writeFile(pidPath, oldPid);
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild((_payload, readiness) => {
+      readiness.push(readinessPayload(OTHER_NONCE));
+      readiness.push(null);
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          {
+            background: true,
+            token: MODERN_TOKEN,
+            writeConnection: artifactPath,
+          },
+          {
+            spawn: () => harness.child,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toThrow(/did not authenticate readiness/i);
+      expect(harness.kill).toHaveBeenCalledOnce();
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("running in background");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: "early child exit", expected: /exited before readiness/i },
+    { name: "authenticated failed response", expected: /reported that startup failed/i },
+    { name: "readiness timeout", expected: /readiness timed out/i },
+  ])("preserves prior state on $name", async ({ name, expected }) => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-failure-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    const oldArtifact = '{"old":"artifact"}\n';
+    const oldPid = "9191\n";
+    await fs.writeFile(artifactPath, oldArtifact);
+    await fs.writeFile(pidPath, oldPid);
+    setOracleHomeDirOverrideForTest(tempDir);
+    let harness: FakeBridgeChild;
+    harness = createFakeBridgeChild((_payload, readiness) => {
+      if (name === "early child exit") {
+        Object.defineProperty(harness.child, "exitCode", {
+          configurable: true,
+          value: 1,
+          writable: true,
+        });
+        harness.child.emit("exit", 1, null);
+        readiness.push(null);
+        return;
+      }
+      if (name === "authenticated failed response") {
+        readiness.push(readinessPayload(READINESS_NONCE, "failed"));
+        readiness.push(null);
+      }
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            generateReadinessNonce: () => READINESS_NONCE,
+            readinessTimeoutMs: name === "readiness timeout" ? 5 : 1_000,
+          },
+        ),
+      ).rejects.toThrow(expected);
+      expect(harness.kill).toHaveBeenCalledOnce();
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("running in background");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores both files when a ready child exits during publication", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-publish-race-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    const oldArtifact = '{"old":"artifact"}\n';
+    const oldPid = "8181\n";
+    await fs.writeFile(artifactPath, oldArtifact);
+    await fs.writeFile(pidPath, oldPid);
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild((_payload, readiness) => {
+      readiness.push(readinessPayload(READINESS_NONCE));
+      readiness.push(null);
+    });
+    const exitCodes: Array<number | null> = [null, null, null, 1];
+    let exitCodeReads = 0;
+    Object.defineProperty(harness.child, "exitCode", {
+      configurable: true,
+      get: () => exitCodes[Math.min(exitCodeReads++, exitCodes.length - 1)]!,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toThrow(/exited during state publication/i);
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("running in background");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes and validates child stdin before service startup, then returns one ready response", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-child-"));
+    setOracleHomeDirOverrideForTest(tempDir);
+    const input = Readable.from([
+      Buffer.from(credentialPayload({ legacyToken: LEGACY_TOKEN }), "utf8"),
+    ]);
+    const readinessWrites: Buffer[] = [];
+    const readinessOutput = new Writable({
+      write(chunk, _encoding, callback) {
+        readinessWrites.push(Buffer.from(chunk as Uint8Array));
+        callback();
+      },
+    });
+    const serveRemote = vi.fn(
+      async (options: RemoteServerOptions = {}, lifecycle: RemoteServerLifecycle = {}) => {
+        expect(input.readableEnded).toBe(true);
+        expect(options).toMatchObject({ token: MODERN_TOKEN, legacyToken: LEGACY_TOKEN });
+        await lifecycle.onReady?.({ port: 9473, token: MODERN_TOKEN });
+      },
+    );
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await runBridgeHost(
+        { backgroundChild: true, bind: "127.0.0.1:9473" },
+        { stdin: input, readinessOutput, serveRemote },
+      );
+      expect(serveRemote).toHaveBeenCalledOnce();
+      expect(Buffer.concat(readinessWrites).toString("utf8")).toBe(
+        readinessPayload(READINESS_NONCE),
+      );
+      await expect(fs.access(path.join(tempDir, "bridge-connection.json"))).rejects.toThrow();
+      expect(log.mock.calls.flat().join("\n")).not.toContain(MODERN_TOKEN);
+      expect(log.mock.calls.flat().join("\n")).not.toContain(LEGACY_TOKEN);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects missing, oversized, malformed, and extra child bytes without echoing them", async () => {
+    const valid = credentialPayload();
+    const cases: Array<{ name: string; chunks: Buffer[]; expected: RegExp }> = [
+      { name: "missing", chunks: [], expected: /payload is missing/i },
+      {
+        name: "oversized",
+        chunks: [Buffer.alloc(BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES + 1, 0x61)],
+        expected: /exceeds the 512-byte limit/i,
+      },
+      {
+        name: "malformed",
+        chunks: [Buffer.from('{"DO_NOT_ECHO":"credential-marker"}\n', "utf8")],
+        expected: /payload is malformed/i,
+      },
+      {
+        name: "extra",
+        chunks: [Buffer.from(`${valid}extra`, "utf8")],
+        expected: /contains extra bytes/i,
+      },
+    ];
+
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    for (const testCase of cases) {
+      const serveRemote = vi.fn(async () => undefined);
+      const failure = await runBridgeHost(
+        { backgroundChild: true },
+        { stdin: Readable.from(testCase.chunks), serveRemote },
+      ).then(
+        () => new Error(`${testCase.name} unexpectedly succeeded`),
+        (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+      );
+      expect(failure.message).toMatch(testCase.expected);
+      expect(failure.message).not.toContain("DO_NOT_ECHO");
+      expect(failure.message).not.toContain("credential-marker");
+      expect(serveRemote).not.toHaveBeenCalled();
+    }
+    expect(log.mock.calls.flat().join("\n")).not.toContain("credential-marker");
+  });
+
+  it.each([
+    ["occupied listener", new Error("listen EADDRINUSE: address already in use")],
+    ["occupied controller lock", new Error("Remote browser controller lock is already held")],
+  ] as const)("preserves the foreground artifact on %s rejection", async (_name, startupError) => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-occupied-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const oldArtifact = '{"old":"foreground"}\n';
+    await fs.writeFile(artifactPath, oldArtifact);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(
+        runBridgeHost(
+          { token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            serveRemote: async () => {
+              throw startupError;
+            },
+          },
+        ),
+      ).rejects.toThrow(startupError.message);
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("Bridge host started");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the foreground artifact when exact tunnel readiness rejects", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-tunnel-fail-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const oldArtifact = '{"old":"foreground"}\n';
+    await fs.writeFile(artifactPath, oldArtifact);
+    const stop = vi.fn();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(
+        runBridgeHost(
+          {
+            token: MODERN_TOKEN,
+            writeConnection: artifactPath,
+            ssh: "synthetic-host",
+          },
+          {
+            serveRemote: async (options, lifecycle) => {
+              const token = options?.token;
+              if (!token) throw new Error("missing bridge credential");
+              await lifecycle?.onReady?.({ port: 9473, token });
+            },
+            startReverseTunnel: () => ({
+              ready: Promise.reject(new Error("remote forward denied")),
+              stop,
+            }),
+          },
+        ),
+      ).rejects.toThrow(/remote forward denied/i);
+      expect(stop).toHaveBeenCalledOnce();
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("Bridge host started");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a service that resolves before onReady as explicitly not started", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-no-ready-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const oldArtifact = '{"old":true}\n';
+    await fs.writeFile(artifactPath, oldArtifact);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(
+        runBridgeHost(
+          { token: MODERN_TOKEN, writeConnection: artifactPath },
+          { serveRemote: async () => undefined },
+        ),
+      ).rejects.toThrow(/did not start.*before readiness/i);
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("Bridge host started");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});

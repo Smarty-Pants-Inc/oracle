@@ -1,8 +1,12 @@
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { parsePhysicalDirectoryIdentity } from "../browser/filesystemLockDirectoryIdentity.js";
-import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
+import {
+  deriveRemoteArtifactManualCopyWaiverId,
+  deriveRemoteArtifactNamespace,
+} from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactManualCopyWaiver,
   DurableRemoteArtifactRegistration,
   DurableRemoteStagedCapture,
   RemoteTransactionRecord,
@@ -21,6 +25,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 export type RemoteTransactionValidationCode =
   | "artifact_ownership_invalid"
   | "artifact_delivery_receipt_invalid"
+  | "artifact_manual_copy_waiver_invalid"
   | "staged_capture_invalid"
   | "terminal_audit_invalid"
   | "persisted_record_invalid";
@@ -74,7 +79,8 @@ export function missingRequiredArtifactDeliveries(
   record: Pick<RemoteTransactionRecord, "artifacts">,
 ): DurableRemoteArtifactRegistration[] {
   return (record.artifacts ?? []).filter(
-    (artifact) => artifact.descriptor.required && !artifact.deliveryReceipt,
+    (artifact) =>
+      artifact.descriptor.required && !artifact.deliveryReceipt && !artifact.manualCopyWaiver,
   );
 }
 
@@ -96,8 +102,25 @@ export function validateRemoteArtifactOwnership(
       );
     }
     artifactIds.add(artifact.descriptor.artifactId);
+    if (artifact.deliveryReceipt && artifact.manualCopyWaiver) {
+      throw new RemoteTransactionValidationError(
+        "artifact_manual_copy_waiver_invalid",
+        "Remote artifact cannot be both delivered and waived for manual copy",
+      );
+    }
     if (artifact.deliveryReceipt) {
       validateRemoteArtifactDeliveryReceipt(artifact, artifact.deliveryReceipt);
+    }
+    if (artifact.manualCopyWaiver) {
+      validateRemoteArtifactManualCopyWaiver(
+        {
+          transactionToken: artifact.transactionToken,
+          artifactId: artifact.descriptor.artifactId,
+          byteSize: artifact.descriptor.byteSize,
+          sha256: artifact.descriptor.sha256,
+        },
+        artifact.manualCopyWaiver,
+      );
     }
   }
 }
@@ -116,6 +139,29 @@ export function validateRemoteArtifactDeliveryReceipt(
     throw new RemoteTransactionValidationError(
       "artifact_delivery_receipt_invalid",
       "Remote artifact delivery receipt does not match registered content",
+    );
+  }
+}
+
+export function validateRemoteArtifactManualCopyWaiver(
+  identity: {
+    transactionToken: string;
+    artifactId: string;
+    byteSize: number;
+    sha256: string;
+  },
+  waiver: DurableRemoteArtifactManualCopyWaiver,
+): void {
+  if (
+    waiver.disposition !== "manual-copy-required" ||
+    !Number.isFinite(Date.parse(waiver.waivedAt)) ||
+    waiver.byteSize !== identity.byteSize ||
+    waiver.sha256 !== identity.sha256 ||
+    waiver.waiverId !== deriveRemoteArtifactManualCopyWaiverId(identity)
+  ) {
+    throw new RemoteTransactionValidationError(
+      "artifact_manual_copy_waiver_invalid",
+      "Remote artifact manual-copy waiver does not match registered content authority",
     );
   }
 }
@@ -161,6 +207,30 @@ export function validateRemoteTerminalAudit(record: RemoteTransactionRecord): vo
       "terminal_audit_invalid",
       "Terminal remote transaction audit is invalid",
     );
+  }
+  const artifactIds = new Set<string>();
+  for (const artifact of audit.artifacts) {
+    if (
+      artifactIds.has(artifact.artifactId) ||
+      (artifact.deliveryReceipt && artifact.manualCopyWaiver)
+    ) {
+      throw new RemoteTransactionValidationError(
+        "terminal_audit_invalid",
+        "Terminal remote artifact audit contains conflicting disposition authority",
+      );
+    }
+    artifactIds.add(artifact.artifactId);
+    if (artifact.manualCopyWaiver) {
+      validateRemoteArtifactManualCopyWaiver(
+        {
+          transactionToken: record.transactionToken,
+          artifactId: artifact.artifactId,
+          byteSize: artifact.manualCopyWaiver.byteSize,
+          sha256: artifact.manualCopyWaiver.sha256,
+        },
+        artifact.manualCopyWaiver,
+      );
+    }
   }
   if (
     record.capacityReservationBytes !== undefined ||

@@ -12,7 +12,11 @@ import {
 import type { BrowserLogger, CookieParam } from "../browser/types.js";
 import { delay } from "../browser/utils.js";
 import { createRemoteServer } from "./serverController.js";
-import type { RemoteServerInstance, RemoteServerOptions } from "./serverTypes.js";
+import type {
+  RemoteServerInstance,
+  RemoteServerLifecycle,
+  RemoteServerOptions,
+} from "./serverTypes.js";
 
 export async function drainRemoteServerShutdown(
   server: Pick<RemoteServerInstance, "close">,
@@ -68,7 +72,10 @@ export async function bootstrapRemoteManualChromeOwner(
   }
 }
 
-export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
+export async function serveRemote(
+  options: RemoteServerOptions = {},
+  lifecycle: RemoteServerLifecycle = {},
+): Promise<void> {
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(homedir(), ".oracle", "browser-profile");
   const preferManualLogin = options.manualLoginDefault || process.platform === "win32" || isWsl();
@@ -85,7 +92,9 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
     console.log(
       "Alternatively, start Windows Chrome with --remote-debugging-port=9222 and use `--remote-chrome <windows-ip>:9222`.",
     );
-    return;
+    throw new Error(
+      "Remote service not started: WSL hosting requires ORACLE_ALLOW_WSL_SERVE=1 or a native Windows oracle serve process.",
+    );
   }
 
   if (!preferManualLogin) {
@@ -110,7 +119,9 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
       console.log(
         "Opened chatgpt.com for login. Sign in, then restart `oracle serve` to continue.",
       );
-      return;
+      throw new Error(
+        "Remote service not started: ChatGPT login is required. Sign in, then restart oracle serve.",
+      );
     } else {
       console.log(
         "Please open https://chatgpt.com/ in this host's browser and sign in; then rerun.",
@@ -118,7 +129,9 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
       console.log(
         "Tip: install xdg-utils (xdg-open) to enable automatic browser opening on Linux/WSL.",
       );
-      return;
+      throw new Error(
+        "Remote service not started: no ChatGPT login was found and the login page could not be opened.",
+      );
     }
   } else {
     console.log(
@@ -142,7 +155,18 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   try {
+    await lifecycle.onReady?.(server);
     await drainRemoteServerShutdown(server, shutdownRequested.promise);
+  } catch (error) {
+    try {
+      await server.close();
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "Remote service readiness failed and the bound listener could not be closed.",
+      );
+    }
+    throw error;
   } finally {
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);

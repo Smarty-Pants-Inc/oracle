@@ -96,6 +96,7 @@ describe("resumeBrowserSession fallback acquisition", { timeout: 15_000 }, () =>
         { cookieSync: false, headless: true, manualLogin: false, timeoutMs: 1_000 },
         createBrowserLogger(),
         {
+          sessionId: "test-owner",
           launchChrome: acquireTemporaryChromeOwner as never,
           acquireRecoveryLock: vi.fn(async () => ({
             release: vi.fn(async () => undefined),

@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../../src/sessionManager.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
-import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
+import type { ReattachCleanupDeps } from "../../src/browser/reattachCleanupTypes.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
@@ -40,6 +40,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
     );
     const logger = createBrowserLogger();
     const result = await resumeBrowserSession(runtime, {}, logger, {
+      sessionId: "test-owner",
       recoverSession: vi.fn(async () => {
         events.push("fallback-capture");
         return { answerText: "fallback", answerMarkdown: "fallback" };
@@ -228,12 +229,9 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       const releaseBrowserTabLease = vi.fn(
         async (
           _profileDir: string,
-          _leaseId: string,
-          _logger: BrowserLogger | undefined,
-          options?: {
-            onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
-            expectedProfileIdentity?: ChromeProcessIdentity["profileDirectory"];
-          },
+          _lease: Parameters<NonNullable<ReattachCleanupDeps["releaseBrowserTabLease"]>>[1],
+          _logger?: BrowserLogger,
+          options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> },
         ) => {
           events.push("release-current-lease");
           await options?.onRelease?.({ isLastLease: true });
@@ -257,6 +255,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
         chromeTargetId: "current-target",
         tabLease: {
           id: "current-lease",
+          generationId: "test-target-generation:current-target",
           profileDirectory: processIdentity.profileDirectory,
         },
       });

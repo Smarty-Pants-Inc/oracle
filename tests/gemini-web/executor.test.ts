@@ -280,12 +280,16 @@ describe("gemini-web executor", () => {
         };
       },
     );
-    acquireBrowserTabLease.mockImplementation(async (profileDir: string) => ({
-      id: "lease-1",
-      profileDirectory: await captureProfileDirectoryIdentity(profileDir, { create: true }),
-      update: vi.fn(async () => undefined),
-      release: vi.fn(async () => undefined),
-    }));
+    acquireBrowserTabLease.mockImplementation(
+      async (profileDir: string, options: { sessionId: string; generationId: string }) => ({
+        id: "lease-1",
+        sessionId: options.sessionId,
+        generationId: options.generationId,
+        profileDirectory: await captureProfileDirectoryIdentity(profileDir, { create: true }),
+        update: vi.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
+      }),
+    );
     runtimeEvaluate = vi.fn(async ({ expression }: { expression?: string }) => {
       const source = String(expression ?? "");
       if (source.includes("requiresLogin")) {

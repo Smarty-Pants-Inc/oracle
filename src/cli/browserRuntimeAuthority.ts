@@ -98,7 +98,9 @@ export function retryableInitialBrowserRuntime(
   if (hasPendingChromeAcquisitionIntent(runtime)) {
     return hasExactPendingChromeAcquisitionAuthority(runtime) ? runtime : undefined;
   }
-  return hasCoherentBrowserRecoveryAuthority(runtime) ? runtime : undefined;
+  return !hasBrowserRecoveryAuthority(runtime) || hasCoherentBrowserRecoveryAuthority(runtime)
+    ? runtime
+    : undefined;
 }
 
 export function hasRemoteRecoveryAuthority(

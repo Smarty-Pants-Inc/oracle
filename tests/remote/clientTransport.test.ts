@@ -362,6 +362,7 @@ describe("remote client transport deadlines", () => {
       required: true,
     };
     let settlementRequests = 0;
+    let waiverRequests = 0;
     const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
@@ -374,6 +375,20 @@ describe("remote client transport deadlines", () => {
         return;
       }
       if (req.url?.includes("/artifacts/") && req.method === "GET") return;
+      const waiver =
+        /^\/transactions\/([a-f0-9]{64})\/artifacts\/artifact-1\/manual-copy-waiver$/u.exec(
+          req.url ?? "",
+        );
+      if (req.method === "POST" && waiver) {
+        waiverRequests += 1;
+        expect(await readJson(req)).toEqual({
+          sha256: descriptor.sha256,
+          byteSize: descriptor.byteSize,
+        });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true, artifactId: descriptor.artifactId }));
+        return;
+      }
       const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
       if (req.method === "POST" && finalize) {
         settlementRequests += 1;
@@ -412,6 +427,84 @@ describe("remote client transport deadlines", () => {
       expect(transaction).not.toHaveProperty("savedFiles");
       await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
       expect(settlementRequests).toBe(1);
+      expect(waiverRequests).toBe(1);
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await close(server);
+      await fsPromises.rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps finalize pending when a required artifact waiver cannot persist", async () => {
+    const artifact = Buffer.from("artifact");
+    const descriptor = {
+      artifactId: "artifact-waiver-pending",
+      runId: "run-1",
+      kind: "file" as const,
+      filename: "pending.bin",
+      byteSize: artifact.byteLength,
+      sha256: createHash("sha256").update(artifact).digest("hex"),
+      sourceUrlKind: "browser-download" as const,
+      transferStatus: "ready" as const,
+      required: true,
+    };
+    let waiverRequests = 0;
+    let settlementRequests = 0;
+    const server = createAuthenticatedServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (transactionToken) {
+        const request = await readJson(req);
+        res.setHeader("content-type", "application/x-ndjson");
+        res.end(
+          `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
+        );
+        return;
+      }
+      if (req.method === "GET" && req.url?.includes("/artifacts/artifact-waiver-pending")) {
+        res.statusCode = 503;
+        res.end("artifact unavailable");
+        return;
+      }
+      if (req.method === "POST" && req.url?.endsWith("/manual-copy-waiver")) {
+        waiverRequests += 1;
+        await readJson(req);
+        res.statusCode = 503;
+        res.end("waiver store unavailable");
+        return;
+      }
+      if (req.method === "POST" && req.url?.endsWith("/finalize")) settlementRequests += 1;
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    const oracleHome = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-waiver-pending-"));
+    setOracleHomeDirOverrideForTest(oracleHome);
+    try {
+      const transaction = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "a".repeat(64),
+        deadlines,
+      })({ prompt: "waiver pending", config: {}, sessionId: "waiver-pending" });
+      expect(transaction).toMatchObject({
+        answerText: "answer",
+        warnings: [
+          expect.objectContaining({
+            code: "remote-artifact-manual-copy-required",
+            message: expect.stringContaining("Manual-copy waiver remains pending"),
+          }),
+        ],
+      });
+      const finalization = await transaction.finalize();
+      expect(finalization).toMatchObject({
+        status: "pending",
+        error: expect.stringContaining("manual-copy waiver remains retryable"),
+        runtime: {
+          recoveryCleanupResult: { settlementMode: "finalize" },
+          recoveryCleanupResources: [{ remoteRecovery: { state: "pending" } }],
+        },
+      });
+      expect(waiverRequests).toBe(2);
+      expect(settlementRequests).toBe(0);
     } finally {
       setOracleHomeDirOverrideForTest(null);
       await close(server);
@@ -1769,6 +1862,7 @@ describe("remote client transport deadlines", () => {
     await fsPromises.writeFile(finalPath, "corrupt!");
     let artifactGets = 0;
     let settlementRequests = 0;
+    let waiverRequests = 0;
     const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
@@ -1783,6 +1877,20 @@ describe("remote client transport deadlines", () => {
         artifactGets += 1;
         res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
         res.end(payload);
+        return;
+      }
+      const waiver =
+        /^\/transactions\/([a-f0-9]{64})\/artifacts\/artifact-io\/manual-copy-waiver$/u.exec(
+          req.url ?? "",
+        );
+      if (req.method === "POST" && waiver) {
+        waiverRequests += 1;
+        expect(await readJson(req)).toEqual({
+          sha256: descriptor.sha256,
+          byteSize: descriptor.byteSize,
+        });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true, artifactId: descriptor.artifactId }));
         return;
       }
       const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
@@ -1831,6 +1939,7 @@ describe("remote client transport deadlines", () => {
       expect(artifactGets).toBe(0);
       await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
       expect(settlementRequests).toBe(1);
+      expect(waiverRequests).toBe(1);
     } finally {
       syncDirectory.mockRestore();
       setOracleHomeDirOverrideForTest(null);

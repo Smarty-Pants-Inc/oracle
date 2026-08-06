@@ -54,6 +54,7 @@ export interface RemoteTransactionRetryRouteParams {
   isTransactionAdmitted: (transactionToken: string) => boolean;
   resumeBrowser: typeof resumeBrowserSession;
   runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
+  runTransactionRetryWork: <T>(transactionToken: string, operation: () => Promise<T>) => Promise<T>;
   logger: BrowserLogger;
   serverLogger: (message: string) => void;
 }
@@ -139,18 +140,18 @@ export async function serveRemoteTransactionRetry(
       return;
     }
     if (record.stagedCapture?.artifacts !== undefined) {
-      const targetAuthorityUnavailable =
+      const targetLivenessUnavailable =
         Boolean(record.restartRecovery) ||
         record.error?.stage === "connection-lost" ||
         record.error?.code === "browser-final-target-liveness-pending";
       const published = await params.transactionStore.promoteStagedCapture({
         transactionToken: record.transactionToken,
-        stripTargetAuthority: targetAuthorityUnavailable,
-        warning: targetAuthorityUnavailable
+        projectTargetSelectionLoss: targetLivenessUnavailable,
+        warning: targetLivenessUnavailable
           ? {
               code: "remote-post-archive-target-unavailable",
               message:
-                "The exact pre-archive answer was promoted because post-archive identity revalidation became impossible after the Chrome target was lost.",
+                "The exact pre-archive answer was promoted because post-archive identity revalidation became impossible after Chrome target liveness could no longer be established.",
             }
           : {
               code: "remote-publication-retry-recovered",
@@ -174,8 +175,9 @@ export async function serveRemoteTransactionRetry(
       return;
     }
 
-    const outcome = await params.runBrowserWork(
-      async () => await recoverTransaction(params, record),
+    const outcome = await params.runTransactionRetryWork(
+      params.transactionToken,
+      async () => await params.runBrowserWork(async () => await recoverTransaction(params, record)),
     );
     sendJson(params.res, outcome.statusCode, outcome.body);
   } catch (error) {
@@ -225,6 +227,7 @@ async function recoverTransaction(
   let recovered: ReattachResult;
   try {
     recovered = await params.resumeBrowser(recoveryRuntime, record.browserConfig, params.logger, {
+      sessionId: record.transactionToken,
       runtimeHintCb: async (runtime) => {
         if (runtime.recoveryCleanupResult?.settlementMode) {
           await params.transactionStore.persistSettlementRuntime(record.transactionToken, runtime);

@@ -91,6 +91,7 @@ export function hasRestartDurableChromeTargetCleanupAuthority(
 }
 
 interface RetainedTargetCloseAuthority {
+  readonly ownerId: string;
   readonly generationId: string;
   readonly targetId: string;
   readonly close?: (logger: BrowserLogger) => Promise<ExactChromeTargetCleanupResult>;
@@ -111,6 +112,7 @@ function retainTerminalTargetCloseCapability(
   terminalAcknowledged: boolean,
 ): void {
   retainedTargetCloseAuthorities.set(capabilityId, {
+    ownerId: authority.ownerId,
     generationId: authority.generationId,
     targetId: authority.targetId,
     terminalStatus,
@@ -129,22 +131,25 @@ function retainTerminalTargetCloseCapability(
 }
 
 export function retainChromeTargetCloseCapability(options: {
+  ownerId: string;
   generationId: string;
   targetId: string;
   browserWSEndpoint?: string;
   close: (logger: BrowserLogger) => Promise<ExactChromeTargetCleanupResult>;
   release?: () => Promise<void>;
 }): BrowserRecoveryTargetCloseCapabilityMetadata {
+  const ownerId = options.ownerId.trim();
   const generationId = options.generationId.trim();
   const targetId = options.targetId.trim();
   const browserWSEndpoint = normalizeExactBrowserWSEndpoint(options.browserWSEndpoint);
-  if (!generationId || !targetId || (options.browserWSEndpoint && !browserWSEndpoint)) {
+  if (!ownerId || !generationId || !targetId || (options.browserWSEndpoint && !browserWSEndpoint)) {
     throw new Error(
-      "Exact Chrome target close authority requires valid generation, target, and endpoint identity.",
+      "Exact Chrome target close authority requires valid owner, generation, target, and endpoint identity.",
     );
   }
   const capabilityId = randomUUID();
   retainedTargetCloseAuthorities.set(capabilityId, {
+    ownerId,
     generationId,
     targetId,
     close: options.close,
@@ -180,11 +185,13 @@ export function isBrowserRecoveryTargetCloseCapability(
 }
 
 export async function closeChromeTargetWithRetainedCapability(options: {
+  ownerId: string;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
   logger: BrowserLogger;
 }): Promise<RetainedTargetCloseCapabilityResult> {
   const { capability, targetId, logger } = options;
+  const ownerId = options.ownerId.trim();
   if (!isBrowserRecoveryTargetCloseCapability(capability)) {
     return {
       status: "unavailable",
@@ -200,6 +207,8 @@ export async function closeChromeTargetWithRetainedCapability(options: {
     };
   }
   if (
+    !ownerId ||
+    authority.ownerId !== ownerId ||
     authority.generationId !== capability.generationId ||
     authority.targetId !== targetId ||
     (capability.targetId !== undefined && capability.targetId !== targetId)
@@ -207,7 +216,7 @@ export async function closeChromeTargetWithRetainedCapability(options: {
     return {
       status: "unavailable",
       reason:
-        "Persisted Chrome target close capability does not match this target generation; the target was preserved",
+        "Persisted Chrome target close capability does not match this owner or target generation; the target was preserved",
     };
   }
   if (authority.terminalStatus && !authority.release) {
@@ -258,14 +267,18 @@ export async function closeChromeTargetWithRetainedCapability(options: {
 
 /** Drops a live close capability after durable intentional target preservation. */
 export async function discardChromeTargetCloseCapability(options: {
+  ownerId: string;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
 }): Promise<void> {
   const { capability, targetId } = options;
+  const ownerId = options.ownerId.trim();
   if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
   if (
+    !ownerId ||
     !authority ||
+    authority.ownerId !== ownerId ||
     authority.generationId !== capability.generationId ||
     authority.targetId !== targetId
   ) {
@@ -279,17 +292,21 @@ export async function discardChromeTargetCloseCapability(options: {
 
 /** Releases a terminal capability only after its exact target cleanup state is durable. */
 export function acknowledgeChromeTargetCloseCapability(options: {
+  ownerId: string;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
 }): void {
   const { capability, targetId } = options;
+  const ownerId = options.ownerId.trim();
   if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
   if (
+    !ownerId ||
     !authority?.terminalStatus ||
     authority.terminalAcknowledged ||
     authority.close ||
     authority.release ||
+    authority.ownerId !== ownerId ||
     authority.generationId !== capability.generationId ||
     authority.targetId !== targetId
   ) {

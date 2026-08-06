@@ -1,8 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readdir, rm, readFile, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { createRemoteServer } from "../../src/remote/server.js";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
@@ -13,6 +14,7 @@ import {
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
+import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
@@ -116,6 +118,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
         const records = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
         }).then((store) => store.list());
         expect(records).toEqual([
           expect.objectContaining({
@@ -220,6 +226,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
         const records = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
         }).then((store) => store.list());
         expect(records).toEqual([
           expect.objectContaining({
@@ -282,6 +292,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
         const records = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
         }).then((store) => store.list());
         expect(records).toEqual([
           expect.objectContaining({
@@ -439,6 +453,154 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await server.close();
       await rm(tmpDir, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
+    },
+    15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "durably waives a required artifact after post-manifest client publication failure",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-waiver-"));
+      const clientHome = path.join(tmpDir, "oracle-home");
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const clientSessionDirectory = path.join(clientHome, "sessions", "manual-copy-client");
+      await mkdir(clientSessionDirectory, { recursive: true });
+      await writeFile(path.join(clientSessionDirectory, "artifacts"), "block local publication");
+      setOracleHomeDirOverrideForTest(clientHome);
+      const payload = Buffer.from([
+        0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      ]);
+      const answerText = "captured with artifact waiver";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromeTargetId: "artifact-waiver-target",
+        recoveryCleanupResources: [
+          {
+            chromeTargetId: "artifact-waiver-target",
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "temporary",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+        async (_mode, pendingRuntime) => completedBrowserCaptureCleanup(pendingRuntime),
+      );
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            const artifact = await writeBinaryBrowserArtifact({
+              sessionId: options.sessionId,
+              artifactWriteAuthority: options.artifactWriteAuthority,
+              kind: "file",
+              filename: "waived-result.zip",
+              contents: payload,
+              label: "waived-result.zip",
+              mimeType: "application/zip",
+              sourceUrl: "sandbox:/mnt/data/waived-result.zip",
+            });
+            if (!artifact) throw new Error("Expected required waiver artifact fixture");
+            return lifecycleBrowserTransaction(
+              options.prompt,
+              {
+                answerText,
+                answerMarkdown: answerText,
+                tookMs: 1,
+                answerTokens: 4,
+                answerChars: answerText.length,
+                savedFiles: [
+                  {
+                    ...artifact,
+                    kind: "file",
+                    url: "browser-download",
+                    finalUrl: "browser-download",
+                    filename: path.basename(artifact.path),
+                  },
+                ],
+              },
+              runtime,
+              options.runtimeHintCb,
+              settleResources,
+            );
+          },
+        },
+      );
+      const originalRecordManualCopyWaiver = RemoteArtifactStore.prototype.recordManualCopyWaiver;
+      let injectedWaiverResponseFailure = false;
+      const recordManualCopyWaiver = vi
+        .spyOn(RemoteArtifactStore.prototype, "recordManualCopyWaiver")
+        .mockImplementation(async function (
+          this: RemoteArtifactStore,
+          params: Parameters<RemoteArtifactStore["recordManualCopyWaiver"]>[0],
+        ) {
+          const waiver = await originalRecordManualCopyWaiver.call(this, params);
+          if (!injectedWaiverResponseFailure) {
+            injectedWaiverResponseFailure = true;
+            throw new Error("simulated lost manual-copy waiver response");
+          }
+          return waiver;
+        });
+
+      try {
+        const captured = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "a".repeat(64),
+        })({
+          prompt: "waive failed artifact transfer",
+          config: {},
+          sessionId: "manual-copy-client",
+        });
+        expect(captured).toMatchObject({
+          answerText,
+          warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
+        });
+        expect(captured.warnings?.[0]?.message).toContain("Manual-copy waiver remains pending");
+        expect(captured).not.toHaveProperty("artifacts");
+        expect(captured).not.toHaveProperty("savedFiles");
+        await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
+        const records = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
+        }).then((store) => store.list());
+        expect(records).toEqual([
+          expect.objectContaining({
+            state: "finalized",
+            finalization: { status: "completed", runtime: expect.any(Object) },
+            terminalAudit: expect.objectContaining({
+              settlementMode: "finalize",
+              publicationAcknowledgedAt: expect.any(String),
+              artifacts: [
+                expect.objectContaining({
+                  required: true,
+                  manualCopyWaiver: {
+                    waiverId: expect.stringMatching(/^[a-f0-9]{64}$/u),
+                    waivedAt: expect.any(String),
+                    disposition: "manual-copy-required",
+                    byteSize: payload.length,
+                    sha256: createHash("sha256").update(payload).digest("hex"),
+                  },
+                }),
+              ],
+            }),
+          }),
+        ]);
+        expect(records[0]?.terminalAudit?.artifacts[0]).not.toHaveProperty("deliveryReceipt");
+        expect(settleResources).toHaveBeenCalledOnce();
+        expect(recordManualCopyWaiver).toHaveBeenCalledTimes(2);
+      } finally {
+        recordManualCopyWaiver.mockRestore();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
     },
     15_000,
   );
@@ -738,6 +900,24 @@ async function createFakeArtifactBridge({
     const artifactPath = activeTransactionToken
       ? `/transactions/${activeTransactionToken}/artifacts/${encodeURIComponent(descriptor.artifactId)}`
       : null;
+    if (req.method === "POST" && artifactPath && req.url === `${artifactPath}/manual-copy-waiver`) {
+      const body = JSON.parse(await readIncomingBody(req)) as {
+        sha256?: unknown;
+        byteSize?: unknown;
+      };
+      if (body.sha256 !== descriptor.sha256 || body.byteSize !== descriptor.byteSize) {
+        throw new Error("manual-copy waiver did not match the artifact descriptor");
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          artifactId: descriptor.artifactId,
+          disposition: "manual-copy-required",
+        }),
+      );
+      return;
+    }
     if (req.method === "POST" && artifactPath && req.url === `${artifactPath}/receipt`) {
       await readIncomingBody(req);
       res.writeHead(204);

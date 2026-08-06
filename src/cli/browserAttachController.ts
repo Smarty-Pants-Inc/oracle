@@ -270,6 +270,7 @@ export async function orchestrateBrowserAttachAuthority(
         runtime,
         cleanupLogger,
         {
+          ownerId: sessionId,
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
           recoveryCleanup: { retainChromeEndpointAuthority },
           isRemotePublicationAcknowledged: () =>

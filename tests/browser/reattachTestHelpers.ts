@@ -136,6 +136,7 @@ export function authenticatedLocalTargetCleanupDeps(
   } = {},
 ): Pick<
   ReattachCleanupDeps,
+  | "ownerId"
   | "verifyProfileDirectoryIdentity"
   | "inspectChromeProcessIdentity"
   | "retainChromeEndpointAuthority"
@@ -144,6 +145,7 @@ export function authenticatedLocalTargetCleanupDeps(
   | "listChromeTargetsWithExactAuthority"
 > {
   return {
+    ownerId: "test-owner",
     verifyProfileDirectoryIdentity: vi.fn(async () => true),
     inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
     retainChromeEndpointAuthority: vi.fn(
@@ -260,6 +262,7 @@ export async function resumeExplicitTargetFixture(options: {
     { browserTabRef: options.browserTabRef, timeoutMs: 2_000 },
     createBrowserLogger(),
     {
+      sessionId: "test-owner",
       acquireRecoveryLock: vi.fn(async () => ({ release })),
       listTargets: vi.fn(async () => options.targets) as unknown as () => Promise<FakeTarget[]>,
       connect,
@@ -348,7 +351,7 @@ export async function resumeFallbackWithManualOwner(
   const releaseBrowserTabLease = vi.fn(
     async (
       _profileDir: string,
-      _leaseId: string,
+      _lease: Parameters<NonNullable<ReattachCleanupDeps["releaseBrowserTabLease"]>>[1],
       _logger?: BrowserLogger,
       releaseOptions?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> },
     ) => {
@@ -357,10 +360,15 @@ export async function resumeFallbackWithManualOwner(
     },
   );
   const acquireBrowserTabLease = vi.fn(
-    async (_profileDir: string, options?: { leaseId?: string }) => {
+    async (
+      _profileDir: string,
+      options: { leaseId?: string; sessionId: string; generationId: string },
+    ) => {
       acquisitionOrder.push("acquire:tab-lease");
       return {
-        id: options?.leaseId ?? "fallback-lease",
+        id: options.leaseId ?? "fallback-lease",
+        sessionId: options.sessionId,
+        generationId: options.generationId,
         profileDirectory: processIdentity.profileDirectory,
         update: vi.fn(async () => undefined),
         release: vi.fn(async () => undefined),
@@ -462,6 +470,7 @@ export async function resumeFallbackWithManualOwner(
     },
     createBrowserLogger(),
     {
+      sessionId: "test-owner",
       acquireRecoveryLock: vi.fn(async () => ({ release: releaseRecoveryLock })),
       acquireBrowserTabLease: acquireBrowserTabLease as never,
       acquireManualChromeOwner: acquireManualChromeOwner as never,

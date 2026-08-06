@@ -25,6 +25,7 @@ import {
   resolveCommittedPromptEpochLocator,
   type CommittedPromptEpochLocator,
 } from "./reattachability.js";
+import { settleBrowserRecoveryCleanup } from "./reattachSettlement.js";
 import { isImageOnlyUiChromeText } from "./index.js";
 import { harvestChatGptTab } from "./liveTabs.js";
 import { buildConversationUrl } from "./reattachHelpers.js";
@@ -204,20 +205,101 @@ export async function recoverConversationTab(
     readyTimeoutMs?: number;
     waitForReady?: boolean;
     persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+    loadRuntimeUnderLock?: () => Promise<BrowserRuntimeMetadata>;
   } = {},
 ): Promise<RecoveredConversation> {
-  const locator = resolveCommittedPromptEpochLocator(meta.browser?.runtime, [
-    meta.browser?.harvest?.url,
+  const resourceOwnerId = meta.id.trim();
+  if (!resourceOwnerId) {
+    throw new Error("Recovered browser resources require a trusted session owner.");
+  }
+  let inheritedRuntime = meta.browser?.runtime ?? {};
+  const hasInheritedCleanup = Boolean(
+    inheritedRuntime.recoveryCleanupResources?.length || inheritedRuntime.recoveryCleanupResult,
+  );
+  if (hasInheritedCleanup) {
+    const settlementMode = inheritedRuntime.recoveryCleanupResult?.settlementMode;
+    if (!settlementMode) {
+      throw new BrowserAutomationError(
+        "Cannot replace browser resources while inherited cleanup has no bound settlement mode.",
+        {
+          stage: "recovered-conversation-inherited-cleanup",
+          code: "settlement-mode-missing",
+          runtime: inheritedRuntime,
+        },
+      );
+    }
+    if (!options.persistRuntime) {
+      throw new BrowserAutomationError(
+        "Cannot replace browser resources without durable inherited-cleanup persistence.",
+        {
+          stage: "recovered-conversation-inherited-cleanup",
+          code: "cleanup-persistence-missing",
+          runtime: inheritedRuntime,
+        },
+      );
+    }
+    const persistFinalization = async (result: BrowserCaptureFinalizationResult) => {
+      await options.persistRuntime?.(result.runtime);
+      return result;
+    };
+    const inheritedSettlement = await settleBrowserRecoveryCleanup(
+      inheritedRuntime,
+      logger,
+      {
+        ownerId: resourceOwnerId,
+        ...(options.loadRuntimeUnderLock
+          ? { loadRuntimeUnderLock: options.loadRuntimeUnderLock }
+          : {}),
+        persistFinalizationResult: persistFinalization,
+        completeFinalizationAfterLockRelease: persistFinalization,
+      },
+      settlementMode,
+    );
+    if (inheritedSettlement.persistence.status === "pending") {
+      throw new BrowserAutomationError(
+        `Cannot replace browser resources while inherited cleanup persistence remains pending: ${inheritedSettlement.persistence.error}`,
+        {
+          stage: "recovered-conversation-inherited-cleanup",
+          runtime: inheritedSettlement.persistence.runtime,
+        },
+      );
+    }
+    if (inheritedSettlement.finalization.status === "pending") {
+      throw new BrowserAutomationError(
+        `Cannot replace browser resources while inherited cleanup remains pending: ${inheritedSettlement.finalization.error}`,
+        {
+          stage: "recovered-conversation-inherited-cleanup",
+          runtime: inheritedSettlement.finalization.runtime,
+        },
+      );
+    }
+    inheritedRuntime = inheritedSettlement.finalization.runtime;
+    if (
+      inheritedRuntime.recoveryCleanupResources?.length ||
+      inheritedRuntime.recoveryCleanupResult
+    ) {
+      throw new BrowserAutomationError(
+        "Inherited browser cleanup reported completion without retiring its durable authority.",
+        { stage: "recovered-conversation-inherited-cleanup", runtime: inheritedRuntime },
+      );
+    }
+  }
+  const recoveryMeta: SessionMetadata = {
+    ...meta,
+    browser: { ...(meta.browser ?? {}), runtime: inheritedRuntime },
+  };
+  const locator = resolveCommittedPromptEpochLocator(inheritedRuntime, [
+    recoveryMeta.browser?.harvest?.url,
   ]);
-  const url = resolveRecoveryUrl(meta);
+  const url = resolveRecoveryUrl(recoveryMeta);
   if (!locator || !url) {
     throw new Error(
       "Cannot recover conversation: session metadata lacks a valid committed prompt epoch " +
         "bound to an exact ChatGPT conversation URL.",
     );
   }
-  const userDataDir = resolveRecoveryProfileDir(meta);
-  const config = resolveBrowserConfig(meta.browser?.config);
+  const userDataDir = resolveRecoveryProfileDir(recoveryMeta);
+  const config = resolveBrowserConfig(recoveryMeta.browser?.config);
   const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   const waitForReady = options.waitForReady !== false;
   const generationId = randomUUID();
@@ -227,7 +309,7 @@ export async function recoverConversationTab(
   const targetMarkerUrl = `about:blank#oracle-recovery=${generationId}`;
   const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
   const baseRuntime: BrowserRuntimeMetadata = {
-    ...(meta.browser?.runtime ?? {}),
+    ...inheritedRuntime,
     browserTransport: "cdp",
     chromeTargetId: undefined,
     chromeProfileRoot: userDataDir,
@@ -237,9 +319,8 @@ export async function recoverConversationTab(
     promptEpoch: locator.epoch,
     controllerPid: process.pid,
   };
-  delete baseRuntime.recoveryCleanupResources;
-  delete baseRuntime.recoveryCleanupResult;
   const resources = new LocalOwnedBrowserResourceAuthority({
+    ownerId: resourceOwnerId,
     purpose: "Recovered ChatGPT",
     targetLabel: "Recovered",
     baseRuntime,
@@ -318,6 +399,7 @@ export async function recoverConversationTab(
           browserWSEndpoint = connection.browserWSEndpoint;
         }
         const capability = retainChromeTargetCloseCapability({
+          ownerId: resourceOwnerId,
           generationId,
           targetId,
           browserWSEndpoint,
@@ -364,7 +446,8 @@ export async function recoverConversationTab(
           maxConcurrentTabs: config.maxConcurrentTabs,
           timeoutMs: config.timeoutMs,
           logger,
-          sessionId: meta.id,
+          sessionId: resourceOwnerId,
+          generationId,
           leaseId,
         }),
       authority: (acquiredLease) => acquiredLease,

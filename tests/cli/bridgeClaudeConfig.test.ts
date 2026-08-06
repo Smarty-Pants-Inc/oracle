@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -121,16 +121,31 @@ describe("formatClaudeMcpConfig", () => {
       ],
     ]) {
       await expect(
-        execFileAsync(process.execPath, ["--import", "tsx", CLI_ENTRY, ...args]),
+        execFileAsync(process.execPath, [
+          "--import",
+          "tsx",
+          CLI_ENTRY,
+          ...args,
+          "--engine",
+          "browser",
+          "--prompt",
+          "validate selected remote transport",
+        ]),
       ).rejects.toMatchObject({
         stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
       });
     }
   }, 30_000);
 
-  test("prints local-browser CLI config as parseable stdout JSON", async () => {
+  test("prints local-browser CLI config without resolving dormant remote credentials", async () => {
     const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-claude-config-"));
     const browserProfileDir = path.join(oracleHome, "browser-profile");
+    await writeFile(
+      path.join(oracleHome, "config.json"),
+      JSON.stringify({
+        browser: { remoteHost: "127.0.0.1:9473", remoteToken: "a".repeat(32) },
+      }),
+    );
     try {
       const { stdout, stderr } = await execFileAsync(
         process.execPath,
@@ -145,6 +160,10 @@ describe("formatClaudeMcpConfig", () => {
             ORACLE_HOME_DIR: oracleHome,
             // biome-ignore lint/style/useNamingConvention: env var name
             ORACLE_BROWSER_PROFILE_DIR: browserProfileDir,
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_REMOTE_HOST: "127.0.0.1:9473",
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_REMOTE_TOKEN: "a".repeat(32),
           },
         },
       );

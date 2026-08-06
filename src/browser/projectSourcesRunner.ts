@@ -104,7 +104,8 @@ async function runBrowserProjectSourcesUnlocked(
     };
   }
   const cleanupStorage = storage ?? (await establishProjectSourcesCleanupStorage());
-  await retryPendingProjectSourcesCleanup(logger, cleanupStorage);
+  const resourceOwnerId = randomUUID();
+  await retryPendingProjectSourcesCleanup(logger, cleanupStorage, resourceOwnerId);
 
   let config = resolveBrowserConfig({
     ...request.config,
@@ -166,6 +167,7 @@ async function runBrowserProjectSourcesUnlocked(
     return runtimeToPersist;
   };
   const resources = new LocalOwnedBrowserResourceAuthority({
+    ownerId: resourceOwnerId,
     purpose: "Project Sources",
     targetLabel: "Project Sources",
     userDataDir,
@@ -202,7 +204,8 @@ async function runBrowserProjectSourcesUnlocked(
             maxConcurrentTabs: config.maxConcurrentTabs,
             timeoutMs: config.timeoutMs,
             logger,
-            sessionId: "project-sources",
+            sessionId: resourceOwnerId,
+            generationId: targetGenerationId,
             leaseId,
           }),
         authority: (lease) => lease,
@@ -216,7 +219,7 @@ async function runBrowserProjectSourcesUnlocked(
             userDataDir,
             config,
             logger,
-            "project-sources",
+            resourceOwnerId,
             { launchClaim: processLaunchClaim },
           );
           return { kind: "manual" as const, owner };
@@ -277,6 +280,7 @@ async function runBrowserProjectSourcesUnlocked(
         targetId: opened.targetId as string,
         releasesProcessEndpointOnSettle: effectiveKeepBrowser,
         capability: retainChromeTargetCloseCapability({
+          ownerId: resourceOwnerId,
           generationId: targetGenerationId,
           targetId: opened.targetId as string,
           browserWSEndpoint: acquiredEndpointAuthority.browserWSEndpoint,

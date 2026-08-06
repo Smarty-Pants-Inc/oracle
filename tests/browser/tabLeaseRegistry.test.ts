@@ -7,15 +7,21 @@ import {
   FilesystemLockBusyError,
   readProcessStartIdentity,
 } from "../../src/browser/filesystemLock.js";
-import { isSafeChromeTerminationOutcome } from "../../src/browser/profileState.js";
+import {
+  captureProfileDirectoryIdentity,
+  isSafeChromeTerminationOutcome,
+} from "../../src/browser/profileState.js";
 import { createStableChildProcessChromeKill } from "../../src/browser/chromeLifecycle.js";
 import type * as FilesystemLockModule from "../../src/browser/filesystemLock.js";
 import {
-  acquireBrowserTabLease,
+  acquireBrowserTabLease as acquireBrowserTabLeaseExact,
   hasOtherActiveBrowserTabLeases,
   normalizeMaxConcurrentTabs,
+  releaseBrowserTabLease,
   retainBrowserTabLeaseTeardownAuthority,
   teardownBrowserResourcesIfNoActiveLeases,
+  updateBrowserTabLease,
+  type BrowserTabLeaseIdentity,
 } from "../../src/browser/tabLeaseRegistry.js";
 import {
   BrowserRunLifecycleController,
@@ -28,6 +34,40 @@ const CANONICAL_TEMP_ROOT = await realpath(os.tmpdir());
 
 function makeTempDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(CANONICAL_TEMP_ROOT, prefix));
+}
+
+type BrowserTabLeaseAcquireOptions = Parameters<typeof acquireBrowserTabLeaseExact>[1];
+let testLeaseOrdinal = 0;
+
+function acquireBrowserTabLease(
+  profileDir: string,
+  options: Partial<BrowserTabLeaseAcquireOptions> = {},
+  deps: Parameters<typeof acquireBrowserTabLeaseExact>[2] = {},
+) {
+  testLeaseOrdinal += 1;
+  return acquireBrowserTabLeaseExact(
+    profileDir,
+    {
+      sessionId: `test-owner-${testLeaseOrdinal}`,
+      generationId: `test-generation-${testLeaseOrdinal}`,
+      ...options,
+    },
+    deps,
+  );
+}
+
+async function browserTabLeaseIdentity(
+  profileDir: string,
+  id: string,
+  sessionId = "test-owner",
+  generationId = "test-generation",
+): Promise<BrowserTabLeaseIdentity> {
+  return {
+    id,
+    sessionId,
+    generationId,
+    profileDirectory: await captureProfileDirectoryIdentity(profileDir),
+  };
 }
 
 describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
@@ -91,7 +131,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
 
       const lease = await acquireWindowsBrowserTabLease(
         dir,
-        { timeoutMs: 500 },
+        { timeoutMs: 500, sessionId: "windows-owner", generationId: "windows-generation" },
         { platform: "win32" },
       );
       await lease.update({ chromeTargetId: "current-windows-null-generation" });
@@ -204,14 +244,15 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     };
     try {
       await writeFile(registryPath, JSON.stringify({ version: 1, leases: [legacyLease] }), "utf8");
+      const otherLease = await browserTabLeaseIdentity(dir, "other-lease");
 
       await expect(
-        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+        hasOtherActiveBrowserTabLeases(dir, otherLease, {
           readProcessLiveness: () => "dead",
         }),
       ).resolves.toBe(false);
 
-      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 2/);
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 3/);
       await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"leases": \[\]/);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -246,7 +287,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         leases: Array<Record<string, unknown>>;
       };
       expect(migrated).toMatchObject({
-        version: 2,
+        version: 3,
         leases: [expect.objectContaining(legacyLease)],
       });
       expect(migrated.leases[0]).not.toHaveProperty("processStartIdentity");
@@ -273,7 +314,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
 
       await lease.release();
 
-      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 2/);
+      await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"version": 3/);
       await expect(readFile(registryPath, "utf8")).resolves.toMatch(/"leases": \[\]/);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -296,30 +337,31 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         JSON.stringify({ version: 1, leases: [nullGenerationLease] }),
         "utf8",
       );
+      const otherLease = await browserTabLeaseIdentity(dir, "other-lease");
 
       await expect(
-        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+        hasOtherActiveBrowserTabLeases(dir, otherLease, {
           readProcessLiveness: () => "alive",
           readProcessStartIdentity: async () => "replacement-generation",
         }),
       ).resolves.toBe(true);
       expect(JSON.parse(await readFile(registryPath, "utf8"))).toMatchObject({
-        version: 2,
+        version: 3,
         leases: [{ processStartIdentity: null }],
       });
 
       await expect(
-        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+        hasOtherActiveBrowserTabLeases(dir, otherLease, {
           readProcessLiveness: () => "unknown",
           readProcessStartIdentity: async () => "replacement-generation",
         }),
       ).resolves.toBe(true);
       expect(JSON.parse(await readFile(registryPath, "utf8"))).toMatchObject({
-        version: 2,
+        version: 3,
         leases: [{ processStartIdentity: null }],
       });
       await expect(
-        hasOtherActiveBrowserTabLeases(dir, "other-lease", {
+        hasOtherActiveBrowserTabLeases(dir, otherLease, {
           readProcessLiveness: () => "dead",
           readProcessStartIdentity: async () => "replacement-generation",
         }),
@@ -359,15 +401,38 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         logger,
       });
       let resolved = false;
-      const fourthPromise = acquireBrowserTabLease(dir, {
-        maxConcurrentTabs: 3,
-        pollMs: 25,
-        timeoutMs: 1000,
-        logger,
-      }).then((lease) => {
+      let nowMs = 0;
+      let signalQueueAttempt: () => void = () => undefined;
+      const queueAttemptStarted = new Promise<void>((resolve) => {
+        signalQueueAttempt = resolve;
+      });
+      let releaseQueueAttempt: () => void = () => undefined;
+      const queueAttemptMayContinue = new Promise<void>((resolve) => {
+        releaseQueueAttempt = resolve;
+      });
+      const fourthPromise = acquireBrowserTabLease(
+        dir,
+        {
+          maxConcurrentTabs: 3,
+          pollMs: 25,
+          timeoutMs: 1000,
+          logger,
+        },
+        {
+          now: () => nowMs,
+          beforeRegistryLockAcquisition: async () => {
+            signalQueueAttempt();
+            await queueAttemptMayContinue;
+          },
+        },
+      ).then((lease) => {
         resolved = true;
         return lease;
       });
+
+      await queueAttemptStarted;
+      nowMs = 1_000;
+      releaseQueueAttempt();
 
       await Promise.race([
         waitingForSlot,
@@ -445,13 +510,14 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
           readProcessStartIdentity: async () => "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
         },
       );
+      const unrelatedLease = await browserTabLeaseIdentity(dir, "unrelated-lease");
 
       for (const observedIdentity of [
         "darwin-kernel-start:1785945427:287123",
         "darwin-audit-pidversion:7001",
       ]) {
         await expect(
-          hasOtherActiveBrowserTabLeases(dir, "unrelated-lease", {
+          hasOtherActiveBrowserTabLeases(dir, unrelatedLease, {
             readProcessLiveness: () => "alive",
             readProcessStartIdentity: async () => observedIdentity,
           }),
@@ -557,12 +623,54 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         sessionId: "second-session",
       });
 
-      expect(await hasOtherActiveBrowserTabLeases(dir, first.id)).toBe(true);
+      expect(await hasOtherActiveBrowserTabLeases(dir, first)).toBe(true);
 
       await second.release();
-      expect(await hasOtherActiveBrowserTabLeases(dir, first.id)).toBe(false);
+      expect(await hasOtherActiveBrowserTabLeases(dir, first)).toBe(false);
 
       await first.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not update or release another owner's copied lease identity", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    try {
+      const lease = await acquireBrowserTabLease(dir, {
+        sessionId: "owner-a",
+        generationId: "shared-generation",
+        leaseId: "shared-opaque-lease-id",
+        timeoutMs: 500,
+      });
+      expect(Object.isFrozen(lease)).toBe(true);
+      expect(Object.isFrozen(lease.profileDirectory)).toBe(true);
+      const copiedByOwnerB: BrowserTabLeaseIdentity = {
+        id: lease.id,
+        sessionId: "owner-b",
+        generationId: lease.generationId,
+        profileDirectory: lease.profileDirectory,
+      };
+
+      await expect(
+        updateBrowserTabLease(dir, copiedByOwnerB, { chromeTargetId: "owner-b-target" }),
+      ).rejects.toThrow(/owner or acquisition generation does not match/i);
+      await expect(releaseBrowserTabLease(dir, copiedByOwnerB)).rejects.toThrow(
+        /owner or acquisition generation does not match/i,
+      );
+
+      await lease.update({ chromeTargetId: "owner-a-target" });
+      const registry = JSON.parse(
+        await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
+      ) as { leases: Array<{ id: string; sessionId: string; chromeTargetId?: string }> };
+      expect(registry.leases).toEqual([
+        expect.objectContaining({
+          id: lease.id,
+          sessionId: "owner-a",
+          chromeTargetId: "owner-a-target",
+        }),
+      ]);
+      await lease.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -701,7 +809,11 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
             {
               userDataDir: dir,
               profileDirectoryIdentity: lease.profileDirectory,
-              tabLease: { id: lease.id, profileDirectory: lease.profileDirectory },
+              tabLease: {
+                id: lease.id,
+                generationId: lease.generationId,
+                profileDirectory: lease.profileDirectory,
+              },
               recoveryCleanup: {
                 ownsTarget: false,
                 profileKind: "manual-login" as const,
@@ -1078,11 +1190,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
       await expect(lease.release({ onRelease })).rejects.toThrow(
         /physical browser profile changed/i,
       );
-      await expect(
-        hasOtherActiveBrowserTabLeases(profileDir, lease.id, {
-          expectedProfileIdentity: lease.profileDirectory,
-        }),
-      ).rejects.toThrow(/physical browser profile changed/i);
+      await expect(hasOtherActiveBrowserTabLeases(profileDir, lease)).rejects.toThrow(
+        /physical browser profile changed/i,
+      );
       expect(onRelease).not.toHaveBeenCalled();
       await expect(
         readFile(path.join(profileDir, "oracle-tab-leases.json"), "utf8"),

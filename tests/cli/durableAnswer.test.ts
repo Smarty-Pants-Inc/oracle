@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  BrowserPublicationTransaction,
   durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
@@ -36,9 +37,11 @@ import {
 } from "../../src/browser/ownedBrowserResources.js";
 import { createReattachSettlement } from "../../src/browser/reattachSettlement.js";
 import type { ReattachResult } from "../../src/browser/reattachContracts.js";
-import { acquireCrashRecoverableFilesystemLock } from "../../src/browser/filesystemLock.js";
-import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
-import { __test__ as lockReleaseJournalTest } from "../../src/browser/filesystemLockReleaseJournal.js";
+import {
+  hasRetainedFilesystemLockRelease,
+  retainFilesystemLockRelease,
+  __test__ as lockReleaseJournalTest,
+} from "../../src/browser/filesystemLockReleaseJournal.js";
 import {
   __test__ as targetCloseAuthorityTest,
   closeChromeTargetWithRetainedCapability,
@@ -339,6 +342,84 @@ describe("browser publication phase model", () => {
     await store.remove(persisted, { type: "abort-preparation", receipt: persisted.receipt });
     await expect(store.read()).resolves.toBeNull();
   });
+
+  test("retains receipt authority when completed journal retirement durability is unknown", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-retirement-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    const store = new BrowserPublicationJournalStore("session-1");
+    const persistedPreparing = await store.transition(null, {
+      type: "prepare",
+      journal: {
+        sessionId: "session-1",
+        receipt: { artifact },
+        artifacts: [],
+        completedAt: "2026-01-01T00:00:00.000Z",
+        browserAudit: { runtime: {} },
+        runtime: {},
+      },
+    });
+    const staged = await store.transition(persistedPreparing, {
+      type: "answer-staged",
+      receipt: persistedPreparing.receipt,
+      artifacts: [artifact],
+    });
+    const bound = await store.transition(staged, {
+      type: "finalize-bound",
+      receipt: staged.receipt,
+      settlementMode: "finalize",
+      runtime: {},
+      browserAudit: { runtime: {} },
+    });
+    const published = await store.transition(bound, {
+      type: "completed-session-persisted",
+      receipt: bound.receipt,
+      completedSessionPersisted: true,
+    });
+    vi.spyOn(sessionStore, "readSession").mockResolvedValue({
+      id: "session-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      completedAt: published.completedAt,
+      status: "completed",
+      options: {},
+      artifacts: [artifact],
+    });
+    const publication = await BrowserPublicationTransaction.open("session-1");
+    vi.spyOn(fsDurability, "syncDirectory").mockRejectedValueOnce(
+      new Error("journal directory sync outcome unknown"),
+    );
+
+    await expect(publication.clear()).rejects.toThrow("journal directory sync outcome unknown");
+
+    expect(await store.read()).toBeNull();
+    expect(publication.journal).toEqual(published);
+    expect(publication.isRemotePublicationAcknowledged()).toBe(true);
+    const differentArtifact = {
+      ...artifact,
+      path: "/tmp/different-browser-answer.md",
+      sha256: "b".repeat(64),
+    };
+    const differentJournal = store.reduce(null, {
+      type: "prepare",
+      journal: {
+        sessionId: "session-1",
+        receipt: { artifact: differentArtifact },
+        artifacts: [],
+        completedAt: "2026-01-02T00:00:00.000Z",
+        browserAudit: { runtime: {} },
+        runtime: {},
+      },
+    });
+    expect(() => publication.observe(differentJournal)).toThrow(
+      "receipt does not match its publication intent",
+    );
+  });
+
   test("rejects illegal edges and missing phase payloads", () => {
     expect(() =>
       reduceBrowserPublicationEvent(null, {
@@ -1482,6 +1563,7 @@ describe("publishCompletedBrowserCapture", () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "session-1",
       generationId: "b0000000-0000-4000-8000-00000000000b",
       targetId,
       close: closeTarget,
@@ -1504,7 +1586,12 @@ describe("publishCompletedBrowserCapture", () => {
     const transaction = new OwnedBrowserResourceTransaction(
       {
         settleResources: async (_mode, pendingRuntime) => {
-          await closeChromeTargetWithRetainedCapability({ capability, targetId, logger });
+          await closeChromeTargetWithRetainedCapability({
+            ownerId: "session-1",
+            capability,
+            targetId,
+            logger,
+          });
           return completedBrowserCaptureCleanup(pendingRuntime);
         },
       },
@@ -1633,45 +1720,60 @@ describe("publishCompletedBrowserCapture", () => {
       };
       return currentSession;
     });
-    const controllerA = await acquireReattachRecoveryLock(lockPath);
-    const { promise: callbackPaused, resolve: markCallbackPaused } = Promise.withResolvers<void>();
-    const { promise: resumeCallback, resolve: resumeControllerA } = Promise.withResolvers<void>();
+
+    const exactCleanupStarted = Promise.withResolvers<void>();
+    const allowExactCleanupToSettle = Promise.withResolvers<void>();
+    const controllerA = retainFilesystemLockRelease(
+      lockPath,
+      {
+        pid: process.pid,
+        processStartIdentity: "controller-a",
+        ownerNonce: "controller-a-release",
+      },
+      async () => {
+        exactCleanupStarted.resolve();
+        await allowExactCleanupToSettle.promise;
+      },
+    );
     let controllerAFinalization: BrowserCaptureFinalizationResult | undefined;
-    const controllerARelease = controllerA.release(async () => {
-      markCallbackPaused();
-      await resumeCallback;
-      controllerAFinalization = await persistBrowserCaptureFinalizationState(
+    let controllerARelease: Promise<void> | undefined;
+    try {
+      controllerARelease = controllerA.release(async () => {
+        controllerAFinalization = await persistBrowserCaptureFinalizationState(
+          "session-1",
+          browser(pendingRuntime),
+          journal,
+          { status: "completed", runtime: { conversationId: "conversation-cross-process" } },
+          pendingRuntime,
+        );
+      });
+      await exactCleanupStarted.promise;
+
+      await persistBrowserCaptureFinalizationState(
         "session-1",
         browser(pendingRuntime),
         journal,
         { status: "completed", runtime: { conversationId: "conversation-cross-process" } },
         pendingRuntime,
       );
-    });
-    await callbackPaused;
+      await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toBeNull();
+      expect(controllerAFinalization).toBeUndefined();
+      expect(hasRetainedFilesystemLockRelease(lockPath)).toBe(true);
+      expect(() => lockReleaseJournalTest.clearRetainedFilesystemLockReleases()).toThrow(
+        "Cannot clear retained filesystem lock release while cleanup is in flight",
+      );
+      expect(hasRetainedFilesystemLockRelease(lockPath)).toBe(true);
 
-    const controllerB = await acquireCrashRecoverableFilesystemLock(lockPath, {
-      timeoutMs: 5_000,
-      pollMs: 10,
-    });
-    await persistBrowserCaptureFinalizationState(
-      "session-1",
-      browser(pendingRuntime),
-      journal,
-      { status: "completed", runtime: { conversationId: "conversation-cross-process" } },
-      pendingRuntime,
-    );
-    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toBeNull();
-    await controllerB.release();
-
-    resumeControllerA();
-    await controllerARelease;
-    expect(controllerAFinalization).toEqual({
-      status: "completed",
-      runtime: expect.objectContaining({ conversationId: "conversation-cross-process" }),
-    });
-
-    const reacquired = await acquireReattachRecoveryLock(lockPath);
-    await reacquired.release();
+      allowExactCleanupToSettle.resolve();
+      await controllerARelease;
+      expect(controllerAFinalization).toEqual({
+        status: "completed",
+        runtime: expect.objectContaining({ conversationId: "conversation-cross-process" }),
+      });
+      expect(hasRetainedFilesystemLockRelease(lockPath)).toBe(false);
+    } finally {
+      allowExactCleanupToSettle.resolve();
+      await controllerARelease?.catch(() => undefined);
+    }
   });
 });

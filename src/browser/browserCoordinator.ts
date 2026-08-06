@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { resolveAttachRunningConnection } from "./attachRunning.js";
 import { resolveBrowserConfig } from "./config.js";
@@ -148,7 +149,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<
     readonly retryCleanup?: () => Promise<BrowserCaptureFinalizationResult["status"]>;
   }
 > {
-  const transaction = await runBrowserModeTransaction(options);
+  const ownerId = options.sessionId?.trim() || randomUUID();
+  const transaction = await runBrowserModeTransaction({ ...options, sessionId: ownerId });
   const finalize = async (): Promise<BrowserCaptureFinalizationResult> => {
     const runtimeBeforeFinalization = transaction.runtime;
     const finalization = await transaction.finalize();
@@ -156,6 +158,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<
       await acknowledgeSettledTargetCloseCapabilities(
         runtimeBeforeFinalization,
         finalization.runtime,
+        ownerId,
       );
     }
     return finalization;

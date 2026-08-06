@@ -14,6 +14,7 @@ import { syncDirectory } from "../fsDurability.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   RemoteArtifactDeliveryReceiptRequestSchema,
+  RemoteArtifactManualCopyWaiverRequestSchema,
   RemoteArtifactDescriptorSchema,
   type RemoteArtifactDescriptor,
 } from "./types.js";
@@ -152,6 +153,36 @@ export async function transferRemoteArtifact(params: {
     finalUrl: "bridge-artifact",
     filename: publishedFilename,
   };
+}
+
+export async function waiveRemoteArtifactDelivery(params: {
+  hostname: string;
+  port: number;
+  token?: string;
+  descriptor: RemoteArtifactDescriptor;
+  transactionToken: string;
+  deadlines: ResolvedRemoteTransportDeadlines;
+}): Promise<void> {
+  RemoteArtifactDescriptorSchema.parse(params.descriptor);
+  assertRemoteTransactionToken(params.transactionToken);
+  const response = await postRemoteJson({
+    hostname: params.hostname,
+    port: params.port,
+    path: `/transactions/${encodeURIComponent(params.transactionToken)}/artifacts/${encodeURIComponent(
+      params.descriptor.artifactId,
+    )}/manual-copy-waiver`,
+    token: params.token,
+    body: RemoteArtifactManualCopyWaiverRequestSchema.parse({
+      sha256: params.descriptor.sha256,
+      byteSize: params.descriptor.byteSize,
+    }),
+    overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
+    idleTimeoutMs: params.deadlines.socketIdleTimeoutMs,
+    operation: "Remote artifact manual-copy waiver request",
+  });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(response.errorMessage);
+  }
 }
 
 async function downloadArtifactToFile(params: {

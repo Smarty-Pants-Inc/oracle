@@ -98,8 +98,11 @@ describe("bridge connection parsing", () => {
       await runBridgeHost(
         { token: "auto", writeConnection: artifactPath },
         {
-          serveRemote: async (options) => {
-            servedToken = options?.token;
+          serveRemote: async (options, lifecycle) => {
+            const token = options?.token;
+            if (!token) throw new Error("missing generated bridge credential");
+            servedToken = token;
+            await lifecycle?.onReady?.({ port: 9473, token });
           },
         },
       );

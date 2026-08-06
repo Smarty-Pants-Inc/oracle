@@ -18,6 +18,7 @@ import {
 } from "./reattachAcquisition.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 import type { CommittedPromptEpochLocator } from "./reattachability.js";
+import { recoveryCleanupResourceKey } from "./recoveryCleanupIdentity.js";
 import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
 
 export interface ReattachSettlementLockAuthority {
@@ -40,6 +41,7 @@ export interface RetryBrowserRecoveryCleanupDeps extends Pick<
   ReattachDeps,
   "recoveryCleanup" | "recoveryLockPath" | "acquireRecoveryLock" | "isRemotePublicationAcknowledged"
 > {
+  ownerId?: string;
   loadRuntimeUnderLock?: () => Promise<BrowserRuntimeMetadata>;
   persistFinalizationResult?: (
     result: ReattachFinalizationResult,
@@ -125,6 +127,7 @@ export function createReattachSettlement(
   lockAuthority: ReattachSettlementLockAuthority,
 ): ReattachResult {
   const { runtime: captureRuntime, finalizeResources, abortResources, ...capturedResult } = capture;
+  const ownerId = deps.sessionId?.trim();
   const runtimeForCapture = markBrowserCaptureCleanupPending(
     captureRuntime ?? authoritativeRuntime,
   );
@@ -139,6 +142,7 @@ export function createReattachSettlement(
   let captureCleanupRuntime = runtimeForCapture;
   const settlement = new OwnedBrowserResourceTransaction(
     {
+      ownerId,
       persistRuntime: async (pendingRuntime) => {
         await lockAuthority.ensure();
         try {
@@ -164,6 +168,7 @@ export function createReattachSettlement(
           pendingRuntime,
           logger,
           {
+            ownerId,
             recoveryCleanup: deps.recoveryCleanup,
             isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
             acquireRecoveryLock: async () => {
@@ -192,6 +197,7 @@ export function createReattachSettlement(
                 logger,
                 {
                   ...deps.recoveryCleanup,
+                  ownerId,
                   isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
                 },
                 settlementMode,
@@ -227,6 +233,7 @@ export async function settleBrowserRecoveryCleanup(
   deps: BrowserRecoverySettlementDeps = {},
   requestedMode?: BrowserRecoverySettlementMode,
 ): Promise<BrowserRecoverySettlementOutcome> {
+  const ownerId = deps.ownerId?.trim() ?? "";
   const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
   let recoveryLock: ReattachRecoveryLock;
   try {
@@ -298,6 +305,7 @@ export async function settleBrowserRecoveryCleanup(
             logger,
             {
               ...deps.recoveryCleanup,
+              ownerId,
               isRemotePublicationAcknowledged: deps.isRemotePublicationAcknowledged,
             },
             settlementMode,
@@ -330,7 +338,11 @@ export async function settleBrowserRecoveryCleanup(
         currentRuntime,
         settlementMode,
       );
-      await acknowledgeSettledTargetCloseCapabilities(currentRuntime, durableUnderLock.runtime);
+      await acknowledgeSettledTargetCloseCapabilities(
+        currentRuntime,
+        durableUnderLock.runtime,
+        ownerId,
+      );
     } catch (error) {
       const message = `Browser cleanup finished but its durable result remains pending: ${error instanceof Error ? error.message : String(error)}`;
       await recoveryLock.release().catch(() => undefined);
@@ -352,7 +364,11 @@ export async function settleBrowserRecoveryCleanup(
       ? await completeProjection(cleanupResult, currentRuntime, settlementMode)
       : cleanupResult;
     if (completeProjection) {
-      await acknowledgeSettledTargetCloseCapabilities(currentRuntime, releasedFinalization.runtime);
+      await acknowledgeSettledTargetCloseCapabilities(
+        currentRuntime,
+        releasedFinalization.runtime,
+        ownerId,
+      );
     }
   };
   try {
@@ -388,9 +404,15 @@ function recoveryCleanupAuthoritiesMatch(
   capturedRuntime: BrowserRuntimeMetadata,
   currentRuntime: BrowserRuntimeMetadata,
 ): boolean {
+  const capturedResources = capturedRuntime.recoveryCleanupResources ?? [];
+  const currentResources = currentRuntime.recoveryCleanupResources ?? [];
   return (
-    JSON.stringify(capturedRuntime.recoveryCleanupResources ?? []) ===
-    JSON.stringify(currentRuntime.recoveryCleanupResources ?? [])
+    capturedResources.length === currentResources.length &&
+    capturedResources.every(
+      (resource, index) =>
+        recoveryCleanupResourceKey(resource) ===
+        recoveryCleanupResourceKey(currentResources[index]!),
+    )
   );
 }
 

@@ -5,7 +5,9 @@ import { RemoteArtifactStore, RemoteArtifactUnavailableError } from "./artifactS
 import type { RemoteTransactionStore } from "./transactionStore.js";
 import {
   RemoteArtifactDeliveryReceiptRequestSchema,
+  RemoteArtifactManualCopyWaiverRequestSchema,
   type RemoteArtifactDeliveryReceiptRequest,
+  type RemoteArtifactManualCopyWaiverRequest,
 } from "./types.js";
 import { readRequestBody, sendJson } from "./serverHttp.js";
 import { renewAuthenticatedTransactionLease } from "./serverTransactionRuntime.js";
@@ -119,6 +121,58 @@ export async function serveRemoteArtifactReceipt(params: {
     const missing = message.includes("does not exist");
     sendJson(params.res, missing ? 404 : 409, {
       error: missing ? "artifact_not_found" : "artifact_delivery_receipt_conflict",
+      message,
+    });
+  }
+}
+
+export async function serveRemoteArtifactManualCopyWaiver(params: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  artifactStore: RemoteArtifactStore;
+  transactionStore: RemoteTransactionStore;
+  transactionToken: string;
+  artifactId: string;
+}): Promise<void> {
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
+    return;
+  }
+
+  let body: RemoteArtifactManualCopyWaiverRequest;
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    body = RemoteArtifactManualCopyWaiverRequestSchema.parse(raw ? JSON.parse(raw) : {});
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_artifact_manual_copy_waiver" });
+    return;
+  }
+  try {
+    const waiver = await params.artifactStore.recordManualCopyWaiver({
+      transactionToken: params.transactionToken,
+      artifactId: params.artifactId,
+      sha256: body.sha256,
+      byteSize: body.byteSize,
+    });
+    sendJson(params.res, 200, {
+      ok: true,
+      artifactId: params.artifactId,
+      disposition: waiver?.disposition ?? "delivered",
+      ...(waiver ? { waivedAt: waiver.waivedAt } : {}),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const missing = message.includes("does not exist");
+    sendJson(params.res, missing ? 404 : 409, {
+      error: missing ? "artifact_not_found" : "artifact_manual_copy_waiver_conflict",
       message,
     });
   }

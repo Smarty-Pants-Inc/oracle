@@ -110,6 +110,33 @@ export function matchArtifactReceiptRequest(
   }
 }
 
+export function matchArtifactManualCopyWaiverRequest(
+  req: http.IncomingMessage,
+): { transactionToken: string; artifactId: string } | null {
+  if (req.method !== "POST" || !req.url) return null;
+  let pathname: string;
+  try {
+    pathname = new URL(req.url, "http://oracle.local").pathname;
+  } catch {
+    return null;
+  }
+  const match = /^\/transactions\/([^/]+)\/artifacts\/([^/]+)\/manual-copy-waiver$/.exec(pathname);
+  if (!match) return null;
+  try {
+    const transactionToken = decodeURIComponent(match[1] ?? "");
+    const artifactId = decodeURIComponent(match[2] ?? "");
+    if (
+      !REMOTE_TRANSACTION_TOKEN_PATTERN.test(transactionToken) ||
+      !/^[A-Za-z0-9_-]{1,128}$/u.test(artifactId)
+    ) {
+      return null;
+    }
+    return { transactionToken, artifactId };
+  } catch {
+    return null;
+  }
+}
+
 export function matchArtifactRequest(
   req: http.IncomingMessage,
 ): { transactionToken: string; artifactId: string } | null {

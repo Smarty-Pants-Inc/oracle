@@ -25,6 +25,7 @@ import type {
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -140,6 +141,7 @@ async function settleLocalOwnedTarget(options: {
   const targetId = `local-${options.mode}-${options.keepBrowser ? "preserve" : "close"}`;
   const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
   const targetCloseCapability = retainChromeTargetCloseCapability({
+    ownerId: "test-owner",
     generationId,
     targetId,
     close: closeTarget,
@@ -152,6 +154,7 @@ async function settleLocalOwnedTarget(options: {
   state.runStatus = "complete";
   const config = resolveBrowserConfig({ keepBrowser: options.keepBrowser });
   const resourceAuthority = new LocalOwnedBrowserResourceAuthority({
+    ownerId: "test-owner",
     purpose: "Local ChatGPT test",
     targetLabel: "Owned Chrome",
     userDataDir: profileDir,
@@ -327,6 +330,8 @@ describe("local manual Chrome owner settlement", () => {
     const releaseLease = vi.fn(async () => undefined);
     const lease: BrowserTabLease = {
       id: "mixed-owner-lease",
+      sessionId: "test-owner",
+      generationId: "10000000-0000-4000-8000-000000000001",
       profileDirectory,
       release: releaseLease,
       update: vi.fn(async () => undefined),
@@ -343,6 +348,7 @@ describe("local manual Chrome owner settlement", () => {
       ]);
     const generationId = "10000000-0000-4000-8000-000000000001";
     const resourceAuthority = new LocalOwnedBrowserResourceAuthority({
+      ownerId: "test-owner",
       purpose: "Local ChatGPT test",
       targetLabel: "Owned Chrome",
       userDataDir: profileDirectory.canonicalPath,
@@ -422,6 +428,8 @@ describe("local manual Chrome owner settlement", () => {
       const releaseLease = vi.fn(async () => undefined);
       const lease: BrowserTabLease = {
         id: "mixed-owner-lease",
+        sessionId: "mixed-owner",
+        generationId: "mixed-owner-generation",
         profileDirectory,
         release: releaseLease,
         update: vi.fn(async () => undefined),
@@ -482,6 +490,130 @@ describe("local manual Chrome owner settlement", () => {
       expect(ownerMocks.settleManualChromeOwner).not.toHaveBeenCalled();
       expect(authority.release).toHaveBeenCalledOnce();
       expect(authority.kill).not.toHaveBeenCalled();
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves exact lease and process cleanup when endpoint update fails after its effect", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-endpoint-update-acquisition-"));
+    try {
+      vi.resetModules();
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const { owner, authority } = manualOwner(profileDirectory, "close-on-last-lease");
+      const endpointUpdateFailure = new Error("lease endpoint update failed after write");
+      const terminalPersistenceFailure = new Error("terminal cleanup journal unavailable");
+      let endpointUpdateApplied = false;
+      let publishedEndpoint: { chromeHost: string; chromePort: number } | undefined;
+      const releaseLease = vi.fn(async () => undefined);
+      const updateLease = vi.fn(async (endpoint: Parameters<BrowserTabLease["update"]>[0]) => {
+        publishedEndpoint = {
+          chromeHost: endpoint.chromeHost ?? "",
+          chromePort: endpoint.chromePort ?? -1,
+        };
+        endpointUpdateApplied = true;
+        throw endpointUpdateFailure;
+      });
+      const lease: BrowserTabLease = {
+        id: "endpoint-update-lease",
+        sessionId: "endpoint-update-owner",
+        generationId: "endpoint-update-generation",
+        profileDirectory,
+        release: releaseLease,
+        update: updateLease,
+      };
+      const retainTeardownAuthority = vi.fn(() => lastLeaseTeardownAuthority(lease));
+      const ownerMocks = manualOwnerSettlementMocks();
+      const acquireOwner = vi.fn(async () => owner);
+      const runtimeHints: BrowserRuntimeMetadata[] = [];
+
+      vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+        acquireManualChromeOwner: acquireOwner,
+        ...ownerMocks,
+      }));
+      vi.doMock("../../src/browser/manualLoginProfile.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof ManualLoginProfileModule>()),
+        assertManualLoginProfileReadyForRun: vi.fn(async () => undefined),
+      }));
+      vi.doMock("../../src/browser/tabLeaseRegistry.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof TabLeaseRegistryModule>()),
+        acquireBrowserTabLease: vi.fn(async () => lease),
+        retainBrowserTabLeaseTeardownAuthority: retainTeardownAuthority,
+      }));
+      // The subject must load after the acquisition collaborators are mocked.
+      const { acquireLocalBrowserResources } =
+        await import("../../src/browser/localAcquisition.js");
+      const config = resolveBrowserConfig({
+        manualLogin: true,
+        manualLoginProfileDir: profileDir,
+        keepBrowser: false,
+      });
+
+      let error: unknown;
+      try {
+        await acquireLocalBrowserResources({
+          options: {
+            prompt: "test",
+            runtimeHintCb: async (runtime) => {
+              if (endpointUpdateApplied && !runtime.recoveryCleanupResources?.length) {
+                throw terminalPersistenceFailure;
+              }
+              runtimeHints.push(structuredClone(runtime));
+            },
+          },
+          config,
+          logger,
+          usingCopiedProfile: false,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(publishedEndpoint).toEqual({ chromeHost: "127.0.0.1", chromePort: owner.chrome.port });
+      expect(updateLease).toHaveBeenCalledOnce();
+      expect(acquireOwner).toHaveBeenCalledOnce();
+      expect(releaseLease).toHaveBeenCalledOnce();
+      expect(retainTeardownAuthority).toHaveBeenCalledOnce();
+      expect(ownerMocks.settleManualChromeOwner).toHaveBeenCalledOnce();
+      expect(authority.kill).toHaveBeenCalledOnce();
+      expect(error).toMatchObject({
+        details: {
+          code: "local-acquisition-cleanup-pending",
+          runtime: {
+            chromeProcessIdentity: owner.processIdentity,
+            recoveryCleanupResult: {
+              status: "failed",
+              settlementMode: "abort",
+            },
+            recoveryCleanupResources: [
+              expect.objectContaining({
+                chromeProcessIdentity: owner.processIdentity,
+                tabLease: {
+                  id: lease.id,
+                  generationId: lease.generationId,
+                  profileDirectory,
+                },
+                acquisition: expect.not.objectContaining({
+                  pendingResource: expect.anything(),
+                }),
+              }),
+            ],
+          },
+        },
+      });
+      expect(runtimeHints.at(-1)).toMatchObject({
+        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            chromeProcessIdentity: owner.processIdentity,
+            tabLease: {
+              id: lease.id,
+              generationId: lease.generationId,
+              profileDirectory,
+            },
+          }),
+        ],
+      });
     } finally {
       await rm(profileDir, { recursive: true, force: true });
     }

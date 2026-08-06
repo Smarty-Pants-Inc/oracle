@@ -12,13 +12,14 @@ export interface BridgeClaudeConfigCliOptions {
 }
 
 export async function runBridgeClaudeConfig(options: BridgeClaudeConfigCliOptions): Promise<void> {
-  const { config: userConfig } = await loadUserConfig();
-  const resolved = resolveRemoteServiceConfig({
-    cliHost: undefined,
-    cliToken: undefined,
-    userConfig,
-    env: process.env,
-  });
+  const resolved = options.localBrowser
+    ? undefined
+    : resolveRemoteServiceConfig({
+        cliHost: undefined,
+        cliToken: undefined,
+        userConfig: (await loadUserConfig()).config,
+        env: process.env,
+      });
 
   const snippet = formatClaudeMcpConfig({
     oracleHomeDir:
@@ -33,10 +34,10 @@ export async function runBridgeClaudeConfig(options: BridgeClaudeConfigCliOption
         options.localBrowser ? ".oracle" : ".oracle-local",
         "browser-profile",
       ),
-    remoteHost: resolved.host,
-    remoteToken: resolved.token,
-    remoteLegacyToken: resolved.legacyToken,
-    allowLegacyTextProtocol: resolved.allowLegacyTextProtocol,
+    remoteHost: resolved?.host,
+    remoteToken: resolved?.token,
+    remoteLegacyToken: resolved?.legacyToken,
+    allowLegacyTextProtocol: resolved?.allowLegacyTextProtocol,
     includeToken: Boolean(options.printToken),
     localBrowser: Boolean(options.localBrowser),
   });

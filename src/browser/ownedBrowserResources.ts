@@ -36,6 +36,8 @@ import {
 export type BrowserCaptureSettlementMode = "finalize" | "abort";
 
 export interface OwnedBrowserResourceTransactionAdapters {
+  /** Trusted controller/session owner for live capability acknowledgement. */
+  ownerId?: string;
   /** Durable acquisition and bound-pending authority, written before effects. */
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<BrowserRuntimeMetadata | void>;
   /** Project mode-specific cleanup policy before the bound runtime is persisted. */
@@ -250,7 +252,9 @@ function projectPendingBrowserCleanupAuthority(
 export async function acknowledgeSettledTargetCloseCapabilities(
   beforeSettlement: BrowserRuntimeMetadata,
   persistedSettlement: BrowserRuntimeMetadata,
+  ownerId: string,
 ): Promise<void> {
+  const trustedOwnerId = ownerId.trim();
   for (const resource of beforeSettlement.recoveryCleanupResources ?? []) {
     const capability = resource.targetCloseCapability;
     if (
@@ -264,13 +268,16 @@ export async function acknowledgeSettledTargetCloseCapabilities(
     ) {
       continue;
     }
+    if (!trustedOwnerId) throw new Error("Target close capability owner is unavailable.");
     if (resource.recoveryCleanup.closeOwnedTargetOnComplete === false) {
       await discardChromeTargetCloseCapability({
+        ownerId: trustedOwnerId,
         capability,
         targetId: resource.chromeTargetId,
       });
     } else if (resource.recoveryCleanup.closeOwnedTargetOnComplete === true) {
       acknowledgeChromeTargetCloseCapability({
+        ownerId: trustedOwnerId,
         capability,
         targetId: resource.chromeTargetId,
       });
@@ -654,7 +661,13 @@ export class OwnedBrowserResourceTransaction {
         try {
           if (this.adapters.persistSettlementResult) {
             await this.adapters.persistSettlementResult(boundResult.runtime);
-            await acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
+            if (this.adapters.ownerId) {
+              await acknowledgeSettledTargetCloseCapabilities(
+                boundRuntime,
+                boundResult.runtime,
+                this.adapters.ownerId,
+              );
+            }
           }
         } catch (error) {
           const retryRuntime =
@@ -738,6 +751,7 @@ export interface LocalOwnedBrowserSettlementAdapters {
 }
 
 export interface LocalOwnedBrowserResourceAuthorityOptions {
+  ownerId: string;
   purpose: string;
   targetLabel: string;
   baseRuntime?: BrowserRuntimeMetadata;
@@ -777,6 +791,8 @@ export interface LocalOwnedBrowserResourceAuthorityOptions {
  */
 export class LocalOwnedBrowserResourceAuthority {
   private readonly transaction: OwnedBrowserResourceTransaction;
+  private readonly ownerId: string;
+  private readonly options: LocalOwnedBrowserResourceAuthorityOptions;
   private baseRuntime: BrowserRuntimeMetadata;
   private inheritedResources: BrowserRecoveryCleanupResourceMetadata[];
   private pendingResource: LocalOwnedBrowserPendingResource | undefined;
@@ -796,17 +812,31 @@ export class LocalOwnedBrowserResourceAuthority {
   private settlementAdapters: LocalOwnedBrowserSettlementAdapters = {};
   private settlementMode: BrowserCaptureSettlementMode | undefined;
 
-  constructor(private readonly options: LocalOwnedBrowserResourceAuthorityOptions) {
-    this.baseRuntime = options.baseRuntime ?? {};
+  constructor(options: LocalOwnedBrowserResourceAuthorityOptions) {
+    this.ownerId = options.ownerId.trim();
+    const generationId = options.generationId.trim();
+    if (!this.ownerId) throw new Error("Local browser resource authority requires an owner id.");
+    if (!generationId) {
+      throw new Error("Local browser resource authority requires an acquisition generation.");
+    }
+    this.options = Object.freeze({
+      ...options,
+      ownerId: this.ownerId,
+      generationId,
+      profileDirectoryIdentity: Object.freeze({ ...options.profileDirectoryIdentity }),
+      processLaunchClaim: Object.freeze({ ...options.processLaunchClaim }),
+    });
+    this.baseRuntime = this.options.baseRuntime ?? {};
     this.inheritedResources = [...(this.baseRuntime.recoveryCleanupResources ?? [])];
-    this.keepBrowserDisposition = options.keepBrowser;
-    this.closeOwnedTargetOnComplete = options.closeOwnedTargetOnComplete;
-    this.tabUrl = options.tabUrl;
+    this.keepBrowserDisposition = this.options.keepBrowser;
+    this.closeOwnedTargetOnComplete = this.options.closeOwnedTargetOnComplete;
+    this.tabUrl = this.options.tabUrl;
     this.transaction = new OwnedBrowserResourceTransaction(
       {
-        ...(options.persistRuntime ? { persistRuntime: options.persistRuntime } : {}),
-        ...(options.persistSettlementResult
-          ? { persistSettlementResult: options.persistSettlementResult }
+        ownerId: this.ownerId,
+        ...(this.options.persistRuntime ? { persistRuntime: this.options.persistRuntime } : {}),
+        ...(this.options.persistSettlementResult
+          ? { persistSettlementResult: this.options.persistSettlementResult }
           : {}),
         settleResources: (mode, runtime) => this.settleResources(mode, runtime),
       },
@@ -833,6 +863,10 @@ export class LocalOwnedBrowserResourceAuthority {
       return this.process.owner.endpointAuthority ?? this.process.owner.chrome.endpointAuthority;
     }
     return this.process?.chrome.endpointAuthority;
+  }
+
+  ownerIdValue(): string {
+    return this.ownerId;
   }
 
   generationId(): string {
@@ -910,6 +944,7 @@ export class LocalOwnedBrowserResourceAuthority {
     } else {
       try {
         const closed = await closeChromeTargetWithRetainedCapability({
+          ownerId: this.ownerId,
           capability: this.target.capability,
           targetId: this.target.targetId,
           logger: this.options.logger,
@@ -1152,6 +1187,7 @@ export class LocalOwnedBrowserResourceAuthority {
         promptEpoch: next.promptEpoch,
         tabLease: leasePending
           ? {
+              generationId: this.lease?.generationId ?? this.options.generationId,
               id: this.lease?.id ?? this.options.leaseId ?? "",
               profileDirectory:
                 this.lease?.profileDirectory ?? this.options.profileDirectoryIdentity,
@@ -1236,6 +1272,7 @@ export class LocalOwnedBrowserResourceAuthority {
         if (closeTarget && this.target) {
           try {
             const closed = await closeChromeTargetWithRetainedCapability({
+              ownerId: this.ownerId,
               capability: this.target.capability,
               targetId: this.target.targetId,
               logger: this.options.logger,
@@ -1326,9 +1363,13 @@ export class LocalOwnedBrowserResourceAuthority {
           } else if (this.options.leaseId) {
             await releaseBrowserTabLease(
               this.options.userDataDir,
-              this.options.leaseId,
+              {
+                id: this.options.leaseId,
+                sessionId: this.ownerId,
+                generationId: this.options.generationId,
+                profileDirectory: this.options.profileDirectoryIdentity,
+              },
               this.options.logger,
-              { expectedProfileIdentity: this.options.profileDirectoryIdentity },
             );
           } else {
             throw new Error("lease id is missing");
@@ -1542,7 +1583,7 @@ export class LocalOwnedBrowserResourceAuthority {
     try {
       if (!terminalResultWillBePersisted) {
         await this.options.persistRuntime?.(after);
-        await acknowledgeSettledTargetCloseCapabilities(before, after);
+        await acknowledgeSettledTargetCloseCapabilities(before, after, this.ownerId);
       }
     } catch (error) {
       return `Browser authority progress could not be persisted: ${error instanceof Error ? error.message : String(error)}`;

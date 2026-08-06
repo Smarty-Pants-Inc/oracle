@@ -6,6 +6,7 @@ import { createRemoteServer } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
@@ -70,30 +71,36 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(caught).toMatchObject({ details: { recoverableDisconnect: true } });
         transactionToken = remoteRecoveryTransactionToken(caught);
 
-        const retryRequest = () =>
-          httpPostJson({
-            hostname: "127.0.0.1",
-            port: server.port,
-            path: `/transactions/${transactionToken}/retry`,
-            token: "a".repeat(64),
-            body: {},
-          });
-        const firstRetry = retryRequest();
-        await recoveryStarted.promise;
-        const secondRetry = retryRequest();
-        releaseRecovery.resolve();
-        const responses = await Promise.all([firstRetry, secondRetry]);
-        expect(responses).toEqual([
-          expect.objectContaining({
-            statusCode: 200,
-            json: expect.objectContaining({ status: "transaction" }),
-          }),
-          expect.objectContaining({
-            statusCode: 200,
-            json: expect.objectContaining({ status: "transaction" }),
-          }),
-        ]);
-        expect(resumeBrowser).toHaveBeenCalledOnce();
+        const renewLease = vi.spyOn(RemoteTransactionStore.prototype, "renewLease");
+        try {
+          const retryRequest = () =>
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/retry`,
+              token: "a".repeat(64),
+              body: {},
+            });
+          const firstRetry = retryRequest();
+          await recoveryStarted.promise;
+          const secondRetry = retryRequest();
+          await vi.waitFor(() => expect(renewLease).toHaveBeenCalledTimes(2));
+          releaseRecovery.resolve();
+          const responses = await Promise.all([firstRetry, secondRetry]);
+          expect(responses).toEqual([
+            expect.objectContaining({
+              statusCode: 200,
+              json: expect.objectContaining({ status: "transaction" }),
+            }),
+            expect.objectContaining({
+              statusCode: 200,
+              json: expect.objectContaining({ status: "transaction" }),
+            }),
+          ]);
+          expect(resumeBrowser).toHaveBeenCalledOnce();
+        } finally {
+          renewLease.mockRestore();
+        }
       } finally {
         releaseRecovery.resolve();
         await server.close();
@@ -183,6 +190,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(settled).toMatchObject({ statusCode: 200, json: { state: "aborted" } });
         expect(retryCleanup).toHaveBeenCalledOnce();
         expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
+        expect(retryCleanup.mock.calls[0]?.[2]).toMatchObject({ ownerId: settlementToken });
       } finally {
         releaseRun.resolve();
         await server.close();
@@ -352,6 +360,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
               periodicSweepStarted.resolve();
               await releasePeriodicSweep.promise;
             }
+            if (cleanupAttempts >= 4) return { status: "completed" as const, runtime };
             return {
               status: "pending" as const,
               runtime: {

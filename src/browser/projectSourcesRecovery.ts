@@ -261,12 +261,13 @@ function ownedProjectSourcesTarget(
 }
 
 export async function closeProjectSourcesTargetFromJournal(options: {
+  ownerId: string;
   runtime: BrowserRuntimeMetadata;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   targetId: string;
   logger: BrowserLogger;
 }): Promise<RetainedTargetCloseCapabilityResult> {
-  const { runtime, capability, targetId, logger } = options;
+  const { ownerId, runtime, capability, targetId, logger } = options;
   if (!isBrowserRecoveryTargetCloseCapability(capability)) {
     return {
       status: "unavailable",
@@ -279,7 +280,7 @@ export async function closeProjectSourcesTargetFromJournal(options: {
       reason: "Project Sources cleanup target does not match its durable generation authority",
     };
   }
-  return await closeChromeTargetWithRetainedCapability({ capability, targetId, logger });
+  return await closeChromeTargetWithRetainedCapability({ ownerId, capability, targetId, logger });
 }
 
 export async function recoverPendingProjectSourcesProfileCreate(
@@ -362,7 +363,8 @@ export async function reconcilePendingProjectSourcesTarget(
 
 export async function retryPendingProjectSourcesCleanup(
   logger: BrowserLogger,
-  storage?: ProjectSourcesCleanupStorage,
+  storage: ProjectSourcesCleanupStorage | undefined,
+  ownerId: string,
 ): Promise<void> {
   const resolvedStorage = storage ?? (await establishProjectSourcesCleanupStorage());
   const journal = await readProjectSourcesCleanupJournal(resolvedStorage);
@@ -383,9 +385,11 @@ export async function retryPendingProjectSourcesCleanup(
     runtime,
     logger,
     {
+      ownerId,
       recoveryCleanup: {
         closeChromeTargetWithRetainedCapability: ({ capability, targetId, logger: closeLogger }) =>
           closeProjectSourcesTargetFromJournal({
+            ownerId,
             runtime,
             capability,
             targetId,

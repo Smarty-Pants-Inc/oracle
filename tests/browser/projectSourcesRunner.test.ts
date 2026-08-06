@@ -150,6 +150,8 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     ).resolves.toContain('"profileCreate"');
     await projectSourcesRecovery.retryPendingProjectSourcesCleanup(
       vi.fn<(message: string) => void>(),
+      undefined,
+      "test-owner",
     );
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await expect(
@@ -169,7 +171,11 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       profileCreateIntent,
     );
     await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(recoveryLog),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
+        recoveryLog,
+        undefined,
+        "test-owner",
+      ),
     ).resolves.toBeUndefined();
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await expect(readFile(path.join(quarantinePath, "unknown-owner.txt"), "utf8")).resolves.toBe(
@@ -183,7 +189,11 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
     await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(recoveryLog),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
+        recoveryLog,
+        undefined,
+        "test-owner",
+      ),
     ).resolves.toBeUndefined();
 
     // A changed physical parent fails closed before the child is inspected or removed.
@@ -192,7 +202,11 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       parent: { ...temporaryParent, inode: "999999" },
     });
     await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(vi.fn<(message: string) => void>()),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
+        vi.fn<(message: string) => void>(),
+        undefined,
+        "test-owner",
+      ),
     ).rejects.toThrow(/parent authority changed/i);
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({});
@@ -288,6 +302,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       });
       await expect(
         deps.recoveryCleanup.closeChromeTargetWithRetainedCapability({
+          ownerId: deps.ownerId,
           capability: resource.targetCloseCapability,
           targetId: resource.chromeTargetId,
           logger,
@@ -346,6 +361,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
 
     await expect(
       projectSourcesRecovery.closeProjectSourcesTargetFromJournal({
+        ownerId: "test-owner",
         runtime: pendingJournal.runtime,
         capability: pendingJournal.runtime.recoveryCleanupResources[0].targetCloseCapability,
         targetId: "project-sources-target",

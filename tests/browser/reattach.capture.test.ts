@@ -104,6 +104,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     logger.verbose = true;
 
     const result = await resumeBrowserSession(runtime, { timeoutMs: 2000 }, logger, {
+      sessionId: "test-owner",
       listTargets,
       connect,
       waitForAssistantResponse,

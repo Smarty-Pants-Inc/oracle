@@ -300,8 +300,14 @@ function pendingChromeProcessAcquisitionRuntime(): BrowserRuntimeMetadata {
   };
 }
 
-function mockRecoveredCleanupResult(result: BrowserCaptureFinalizationResult): void {
-  retryBrowserRecoveryCleanupMock.mockResolvedValue(result);
+function mockRecoveredCleanupResult(
+  result: BrowserCaptureFinalizationResult,
+  observePublicationAcknowledgement?: (acknowledged: boolean) => void,
+): void {
+  retryBrowserRecoveryCleanupMock.mockImplementation(async (_runtime, _logger, deps) => {
+    observePublicationAcknowledgement?.(Boolean(deps.isRemotePublicationAcknowledged?.()));
+    return result;
+  });
 }
 
 beforeEach(() => {
@@ -994,7 +1000,10 @@ describe("attachSession rendering", () => {
     };
     const recoveredMeta = { ...completedMeta, artifacts: [journal.receipt.artifact] };
     readSessionMetadataMock.mockResolvedValue(recoveredMeta);
-    mockRecoveredCleanupResult({ status: "completed", runtime: {} });
+    let publicationAcknowledgedDuringCleanup = false;
+    mockRecoveredCleanupResult({ status: "completed", runtime: {} }, (acknowledged) => {
+      publicationAcknowledgedDuringCleanup = acknowledged;
+    });
     resumeBrowserSessionMock.mockRejectedValue(new Error("browser authority is unavailable"));
     writeFileAtomicDurableMock.mockImplementation(
       async (targetPath: string, payload: string | Uint8Array) => {
@@ -1022,9 +1031,10 @@ describe("attachSession rendering", () => {
       }),
       "finalize",
     );
+    expect(publicationAcknowledgedDuringCleanup).toBe(true);
     expect(
       settleBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test("retries cleanup-pending publication authority without recapturing the answer", async () => {
@@ -1050,7 +1060,10 @@ describe("attachSession rendering", () => {
       artifacts: [journal.receipt.artifact],
     };
     readSessionMetadataMock.mockResolvedValue(completedMeta);
-    mockRecoveredCleanupResult({ status: "completed", runtime: {} });
+    let publicationAcknowledgedDuringCleanup = false;
+    mockRecoveredCleanupResult({ status: "completed", runtime: {} }, (acknowledged) => {
+      publicationAcknowledgedDuringCleanup = acknowledged;
+    });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await orchestrateBrowserAttachAuthority("sess", completedMeta);
@@ -1067,9 +1080,10 @@ describe("attachSession rendering", () => {
       expect.objectContaining({ isRemotePublicationAcknowledged: expect.any(Function) }),
       "finalize",
     );
+    expect(publicationAcknowledgedDuringCleanup).toBe(true);
     expect(
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test("replays a durably journaled close after final session persistence fails and tombstones churn", async () => {
@@ -1079,6 +1093,7 @@ describe("attachSession rendering", () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>();
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "sess",
       generationId,
       targetId,
       close: closeTarget,
@@ -1132,6 +1147,7 @@ describe("attachSession rendering", () => {
           return completedBrowserCaptureCleanup(pendingRuntime);
         }
         const closeResult = await closeChromeTargetWithRetainedCapability({
+          ownerId: "sess",
           capability: resource.targetCloseCapability,
           targetId: resource.chromeTargetId,
           logger,
@@ -1158,22 +1174,26 @@ describe("attachSession rendering", () => {
     for (let index = 0; index < churnCount; index += 1) {
       const churnTargetId = `churn-target-${index}`;
       const churnCapability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: `churn-generation-${index}`,
         targetId: churnTargetId,
         close: async () => ({ status: "completed" as const }),
       });
       await closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: churnCapability,
         targetId: churnTargetId,
         logger,
       });
       acknowledgeChromeTargetCloseCapability({
+        ownerId: "test-owner",
         capability: churnCapability,
         targetId: churnTargetId,
       });
     }
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "sess",
         capability: targetCloseCapability,
         targetId,
         logger,
@@ -1194,6 +1214,7 @@ describe("attachSession rendering", () => {
     const answer = "published answer whose terminal projection survived restart";
     const targetId = "stale-journal-target";
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "a0000000-0000-4000-8000-00000000000a",
       targetId,
       close: vi.fn(async () => ({ status: "completed" as const })),
@@ -1731,6 +1752,7 @@ describe("attachSession rendering", () => {
     const generationId = "b0000000-0000-4000-8000-00000000000b";
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "sess",
       generationId,
       targetId,
       close: closeTarget,
@@ -1823,6 +1845,7 @@ describe("attachSession rendering", () => {
                 throw new Error("Current cleanup target authority is missing");
               }
               await closeChromeTargetWithRetainedCapability({
+                ownerId: "sess",
                 capability: resource.targetCloseCapability,
                 targetId: resource.chromeTargetId,
                 logger,

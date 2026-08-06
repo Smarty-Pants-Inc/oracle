@@ -352,7 +352,7 @@ export async function handleRemoteRunRequest(params: {
       log: automationLogger,
       heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
       verbose: payload.options.verbose,
-      sessionId: payload.options.sessionId,
+      sessionId: params.transactionToken,
       artifactWriteAuthority,
       followUpPrompts: payload.options.followUpPrompts,
       runtimeHintCb: (runtime, modelSelection) =>

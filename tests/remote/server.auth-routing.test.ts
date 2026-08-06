@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import { CAN_LISTEN_LOCALHOST, browserTransaction } from "./serverTestBuilders.js";
 import {
@@ -297,6 +298,19 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(invalidSettlement.statusCode).toBe(400);
         const settlementLease = (await store.read(transactionToken))?.leaseExpiresAt;
         expect(Date.parse(settlementLease ?? "")).toBeGreaterThan(Date.parse(receiptLease ?? ""));
+        const pending = await store.read(transactionToken);
+        if (!pending?.runtime) throw new Error("missing auth-renewal runtime");
+        await store.bindSettlement({
+          transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        });
+        await store.beginSettlementExecution({ transactionToken, mode: "abort" });
+        await store.completeSettlement({
+          transactionToken,
+          mode: "abort",
+          finalization: { status: "completed", runtime: pending.runtime },
+        });
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -390,6 +404,63 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const restarted = await createRemoteServer(options, { transactionStoreDir });
       await restarted.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "keeps pending transaction authentication valid across connection credential rotation",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-credential-rotation-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const integrityKeyPath = path.join(tmpDir, ".remote-transaction-integrity.key");
+      const transactionToken = "e".repeat(64);
+      const first = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        { transactionStoreDir, controllerGeneration: "controller-before-credential-rotation" },
+      );
+      try {
+        await first.close();
+        const seeded = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          integrityKeyPath,
+          controllerGeneration: "credential-rotation-seeder",
+        });
+        await seedRemoteTransaction(seeded, transactionToken, {
+          prompt: "preserve authenticated transaction across credential rotation",
+        });
+
+        const rotated = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "b".repeat(64), logger: () => {} },
+          { transactionStoreDir, controllerGeneration: "controller-after-credential-rotation" },
+        );
+        try {
+          const reader = await RemoteTransactionStore.open({
+            directory: transactionStoreDir,
+            integrityKeyPath,
+            controllerGeneration: "credential-rotation-reader",
+          });
+          const record = await reader.read(transactionToken);
+          expect(record).toMatchObject({
+            transactionToken,
+            state: "pending",
+          });
+          if (!record?.runtime) throw new Error("missing credential-rotation runtime");
+          await reader.bindSettlement({
+            transactionToken,
+            mode: "abort",
+            durablePublication: false,
+          });
+          await reader.beginSettlementExecution({ transactionToken, mode: "abort" });
+          await reader.completeSettlement({
+            transactionToken,
+            mode: "abort",
+            finalization: { status: "completed", runtime: record.runtime },
+          });
+        } finally {
+          await rotated.close();
+        }
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     },
   );
 });

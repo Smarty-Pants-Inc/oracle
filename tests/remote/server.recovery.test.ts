@@ -32,6 +32,7 @@ import {
 } from "./serverTestBuilders.js";
 import { httpPostJson } from "./serverTestHttp.js";
 import { remoteRecoveryTransactionToken, seedRemoteTransaction } from "./serverTestTransactions.js";
+import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -163,6 +164,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     };
     const seeded = await RemoteTransactionStore.open({
       directory: transactionStoreDir,
+      integrityKeyPath: path.join(
+        path.dirname(transactionStoreDir),
+        ".remote-transaction-integrity.key",
+      ),
       controllerGeneration: "controller-before-terminal-retry",
     });
     await seedRemoteTransaction(seeded, transactionToken, {
@@ -216,6 +221,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
       const record = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: "terminal-retry-reader",
       }).then((store) => store.read(transactionToken));
       expect(record).toMatchObject({
@@ -242,17 +251,55 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await writeFile(cleanupMarker, "owned", "utf8");
       let transactionToken = "";
       const prompt = "recover after restart";
+      const profileDir = path.join(tmpDir, "restart-profile");
+      const targetGenerationId = "10000000-0000-4000-8000-000000000011";
+      const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/restart-target-generation";
+      const baseChromeProcessIdentity = processIdentity(
+        profileDir,
+        4330,
+        "10000000-0000-4000-8000-000000000010",
+      );
+      const chromeProcessIdentity = {
+        ...baseChromeProcessIdentity,
+        launchClaim: {
+          ...baseChromeProcessIdentity.launchClaim,
+          generationId: targetGenerationId,
+        },
+      };
+      const targetCloseCapability = {
+        version: 1 as const,
+        generationId: targetGenerationId,
+        capabilityId: "restart-target-capability",
+        targetId: "restart-target",
+        browserWSEndpoint,
+      };
       const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: chromeProcessIdentity.pid,
+        chromeProcessIdentity,
         chromeHost: "127.0.0.1",
         chromePort: 9222,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
         chromeTargetId: "restart-target",
         conversationId: "remote-conversation",
         promptEpoch: committedPromptEpoch(prompt),
         recoveryCleanupResources: [
           {
+            chromePid: chromeProcessIdentity.pid,
+            chromeProcessIdentity,
+            profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
             chromeHost: "127.0.0.1",
             chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
             chromeTargetId: "restart-target",
+            targetCloseCapability,
+            acquisition: {
+              generationId: targetGenerationId,
+              processLaunchClaim: chromeProcessIdentity.launchClaim,
+            },
             conversationId: "remote-conversation",
             promptEpoch: committedPromptEpoch(prompt),
             recoveryCleanup: {
@@ -427,6 +474,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const beforeCrash = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: "controller-before-partial-followup",
       });
       await beforeCrash.begin({
@@ -510,6 +561,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
         const reloaded = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "partial-followup-reader",
         });
         const settled = await reloaded.read(transactionToken);
@@ -633,6 +688,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionToken = "7".repeat(64);
       const previousController = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: previousControllerGeneration,
       });
       await seedRemoteTransaction(previousController, transactionToken, {
@@ -656,6 +715,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       ) => {
         const reloaded = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: recoveryControllerGeneration,
         });
         await expect(reloaded.read(transactionToken)).resolves.toMatchObject({
@@ -677,6 +740,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           _logger: BrowserLogger,
           deps?: ReattachDeps,
         ) => {
+          expect(deps?.sessionId).toBe(transactionToken);
           const runtimeHintCb = deps?.runtimeHintCb;
           if (!runtimeHintCb) throw new Error("remote retry must provide a runtime hint callback");
           await runtimeHintCb(preIntent);
@@ -814,6 +878,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(abort).toHaveBeenCalledOnce();
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
         }).then((store) => store.read(transactionToken));
         expect(record).toMatchObject({
           state: "recoverable-error",
@@ -907,6 +975,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const seeded = await RemoteTransactionStore.open({
         directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
         controllerGeneration: "controller-before-restart",
       });
       await seedRemoteTransaction(seeded, transactionToken, {

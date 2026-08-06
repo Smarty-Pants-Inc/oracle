@@ -50,6 +50,7 @@ export interface RemoteBrowserExecutionContext {
   readonly chromeProfileRoot: string | undefined;
   readonly followUpPrompts: string[];
   readonly remoteLeaseProfileDir: string | null;
+  readonly resourceOwnerId: string;
   readonly acquisitionGenerationId: string;
   readonly acquisitionLeaseId: string;
   readonly acquisitionTargetMarkerUrl: string;
@@ -117,6 +118,7 @@ export function createRemoteBrowserExecutionContext(
     ? null
     : resolveRemoteTabLeaseProfileDir(config);
   const acquisitionGenerationId = randomUUID();
+  const resourceOwnerId = options.sessionId?.trim() || randomUUID();
   const acquisitionLeaseId = randomUUID();
   const acquisitionTargetMarkerUrl = `about:blank#oracle-acquisition=${acquisitionGenerationId}`;
   const runtimeHintCb = options.runtimeHintCb;
@@ -150,6 +152,7 @@ export function createRemoteBrowserExecutionContext(
     chromeProfileRoot,
     followUpPrompts,
     remoteLeaseProfileDir,
+    resourceOwnerId,
     acquisitionGenerationId,
     acquisitionLeaseId,
     acquisitionTargetMarkerUrl,
@@ -249,6 +252,7 @@ export function createRemoteBrowserExecutionContext(
         tabLease:
           remoteLeaseProfileDir && context.remoteLeaseProfileIdentity
             ? {
+                generationId: context.tabLease?.generationId ?? acquisitionGenerationId,
                 id: context.tabLease?.id ?? acquisitionLeaseId,
                 profileDirectory:
                   context.tabLease?.profileDirectory ?? context.remoteLeaseProfileIdentity,

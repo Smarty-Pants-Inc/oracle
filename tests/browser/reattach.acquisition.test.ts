@@ -15,7 +15,6 @@ import {
   captureProfileDirectoryIdentity,
   readOracleChromeOwner,
   writeOracleChromeOwner,
-  type ChromeProcessIdentity,
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
@@ -377,12 +376,9 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     const releaseBrowserTabLease = vi.fn(
       async (
         _profileDir: string,
-        _leaseId: string,
+        _lease: Parameters<NonNullable<ReattachCleanupDeps["releaseBrowserTabLease"]>>[1],
         _logger?: BrowserLogger,
-        options?: {
-          onRelease?: (context: { isLastLease: boolean }) => Promise<void>;
-          expectedProfileIdentity?: ChromeProcessIdentity["profileDirectory"];
-        },
+        options?: { onRelease?: (context: { isLastLease: boolean }) => Promise<void> },
       ) => {
         await options?.onRelease?.({ isLastLease: true });
       },
@@ -404,12 +400,19 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
           { manualLogin: true, manualLoginProfileDir: profileDir, timeoutMs: 1_000 },
           createBrowserLogger(),
           {
-            acquireBrowserTabLease: vi.fn(async () => ({
-              id: "crash-window-lease",
-              profileDirectory: processIdentity.profileDirectory,
-              update: vi.fn(async () => undefined),
-              release: vi.fn(async () => undefined),
-            })) as never,
+            acquireBrowserTabLease: vi.fn(
+              async (
+                _profileDir: string,
+                options: { sessionId: string; generationId: string },
+              ) => ({
+                id: "crash-window-lease",
+                sessionId: options.sessionId,
+                generationId: options.generationId,
+                profileDirectory: processIdentity.profileDirectory,
+                update: vi.fn(async () => undefined),
+                release: vi.fn(async () => undefined),
+              }),
+            ) as never,
             acquireManualChromeOwner: acquireManualChromeOwner as never,
             runtimeHintCb: async (hint) => {
               runtimeHints.push(structuredClone(hint));

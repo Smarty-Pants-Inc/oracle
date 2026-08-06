@@ -28,6 +28,7 @@ import {
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpGetJson, httpPostJson } from "./serverTestHttp.js";
+import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -68,7 +69,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         {
           runBrowser: async (options) => {
             runLog.push(options.prompt);
-            expect(options.sessionId).toBe("remote-session-id");
+            expect(options.sessionId).toMatch(/^[0-9a-f]{64}$/u);
+            expect(options.sessionId).not.toBe("remote-session-id");
             expect(options.artifactWriteAuthority?.artifactsDirectory).not.toContain(
               "remote-session-id",
             );
@@ -154,8 +156,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect((await stat(transactionStoreDir)).mode & 0o777).toBe(0o700);
         expect((await stat(path.join(transactionStoreDir, recordName))).mode & 0o777).toBe(0o600);
       }
-      const pendingRecord = JSON.parse(
-        await readFile(path.join(transactionStoreDir, recordName), "utf8"),
+      const pendingRecord = await readAuthenticatedTransactionRecord(
+        transactionStoreDir,
+        recordName.slice(0, -".json".length),
       );
       expect(pendingRecord).toMatchObject({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -178,8 +181,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
       await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
       expect(finalize).toHaveBeenCalledTimes(1);
-      const finalizedRecord = JSON.parse(
-        await readFile(path.join(transactionStoreDir, recordName), "utf8"),
+      const finalizedRecord = await readAuthenticatedTransactionRecord(
+        transactionStoreDir,
+        recordName.slice(0, -".json".length),
       );
       expect(finalizedRecord).toMatchObject({
         state: "finalized",
@@ -261,6 +265,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     "isolates concurrent same-session artifact writes by exact transaction namespace",
     async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-authority-"));
+      const transactionStoreDir = path.join(root, "transactions");
       setOracleHomeDirOverrideForTest(root);
       let server: RemoteServerInstance | null = null;
       const bothStarted = Promise.withResolvers<void>();
@@ -272,7 +277,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         server = await createRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
-            transactionStoreDir: path.join(root, "transactions"),
+            transactionStoreDir,
             runBrowser: async (options) => {
               observedSessions.push(options.sessionId ?? "");
               const artifactWriteAuthority = options.artifactWriteAuthority;
@@ -323,7 +328,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           ),
         );
 
-        expect(observedSessions).toEqual(["shared-client-session", "shared-client-session"]);
+        expect(observedSessions).toHaveLength(2);
+        expect(new Set(observedSessions).size).toBe(2);
+        expect(observedSessions.every((ownerId) => /^[0-9a-f]{64}$/u.test(ownerId))).toBe(true);
         expect(new Set(observedAuthorities).size).toBe(2);
         expect(hostArtifacts).toHaveLength(2);
         await Promise.all(
@@ -335,11 +342,16 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           }),
         );
         const records = await Promise.all(
-          (await readdir(path.join(root, "transactions")))
+          (await readdir(transactionStoreDir))
             .filter((name) => name.endsWith(".json"))
-            .map((name) => readFile(path.join(root, "transactions", name), "utf8")),
+            .map((name) =>
+              readAuthenticatedTransactionRecord(
+                transactionStoreDir,
+                name.slice(0, -".json".length),
+              ),
+            ),
         );
-        expect(new Set(records.map((raw) => JSON.parse(raw).artifactNamespace)).size).toBe(2);
+        expect(new Set(records.map((record) => record.artifactNamespace)).size).toBe(2);
         await Promise.all([first.finalize(), second.finalize()]);
       } finally {
         await server?.close().catch(() => undefined);

@@ -111,6 +111,10 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
         expect(runBrowser).toHaveBeenCalledOnce();
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "admission-window-reader",
         }).then((store) => store.read(transactionToken));
         expect(record).toMatchObject({
@@ -173,6 +177,10 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
         });
         const record = await RemoteTransactionStore.open({
           directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
           controllerGeneration: "admission-begin-failure-reader",
         }).then((store) => store.read(transactionToken));
         expect(record).toBeNull();

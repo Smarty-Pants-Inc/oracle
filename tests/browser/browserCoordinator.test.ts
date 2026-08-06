@@ -97,6 +97,7 @@ describe("browser coordinator public settlement", () => {
 
     const result = await runBrowserMode({
       prompt: "review this",
+      sessionId: "test-owner",
       config: { remoteChrome: { host: "remote.example", port: 9333 } },
     });
 
@@ -106,6 +107,7 @@ describe("browser coordinator public settlement", () => {
     expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledWith(
       runtime,
       finalizedRuntime,
+      "test-owner",
     );
     expect(result).toEqual({
       answerText: "settled answer",
@@ -166,6 +168,7 @@ describe("browser coordinator public settlement", () => {
       const targetId = `preserved-target-${index}`;
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       const capability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: `preserved-generation-${index}`,
         targetId,
         close: closeTarget,
@@ -193,6 +196,7 @@ describe("browser coordinator public settlement", () => {
       );
 
       await runBrowserMode({
+        sessionId: "test-owner",
         prompt: `preserve ${index}`,
         config: { keepBrowser: true },
       });
@@ -206,6 +210,7 @@ describe("browser coordinator public settlement", () => {
     const targetId = "partially-cleaned-target";
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "partially-cleaned-generation",
       targetId,
       close: closeTarget,
@@ -255,6 +260,7 @@ describe("browser coordinator public settlement", () => {
     };
     const finalize = vi.fn(async () => {
       await closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability,
         targetId,
         logger: vi.fn<(message: string) => void>(),
@@ -268,6 +274,7 @@ describe("browser coordinator public settlement", () => {
     runRemoteBrowserMode.mockResolvedValueOnce(browserTransaction(finalize, undefined, runtime));
 
     await runBrowserMode({
+      sessionId: "test-owner",
       prompt: "partial cleanup",
       config: { remoteChrome: { host: "remote.example", port: 9333 } },
     });
@@ -336,6 +343,7 @@ describe("browser coordinator public settlement", () => {
 
     const result = await runBrowserMode({
       prompt: "review this",
+      sessionId: "test-owner",
       config: { remoteChrome: { host: "remote.example", port: 9333 } },
     });
 
@@ -362,7 +370,11 @@ describe("browser coordinator public settlement", () => {
     expect(acknowledgeSettledTargetCloseCapabilities).not.toHaveBeenCalled();
     await expect(result.retryCleanup!()).resolves.toBe("completed");
     expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledOnce();
-    expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledWith(runtime, {});
+    expect(acknowledgeSettledTargetCloseCapabilities).toHaveBeenCalledWith(
+      runtime,
+      {},
+      "test-owner",
+    );
     expect(finalize).toHaveBeenCalledTimes(3);
     expect(abort).not.toHaveBeenCalled();
   });

@@ -16,6 +16,7 @@ import {
   retainChromeTargetCloseCapability,
 } from "../../src/browser/targetCloseAuthority.js";
 import { completedBrowserCaptureCleanup } from "../../src/browser/ownedBrowserResources.js";
+import { createReattachSettlement } from "../../src/browser/reattachSettlement.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
@@ -35,6 +36,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
     const generationId = "d0000000-0000-4000-8000-00000000000d";
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId,
       targetId,
       close: closeTarget,
@@ -70,6 +72,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
         throw new Error("Target close authority is missing");
       }
       await closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: resource.targetCloseCapability,
         targetId: resource.chromeTargetId,
         logger,
@@ -85,6 +88,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
       runtime,
       logger,
       {
+        ownerId: "test-owner",
         acquireRecoveryLock,
         loadRuntimeUnderLock: async () => durableRuntime,
         persistFinalizationResult: persist,
@@ -109,6 +113,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
       runtime,
       logger,
       {
+        ownerId: "test-owner",
         acquireRecoveryLock,
         loadRuntimeUnderLock: async () => durableRuntime,
         persistFinalizationResult: persist,
@@ -131,6 +136,97 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
     );
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
   });
+  test.each([
+    {
+      authorityCase: "a reserialized exact",
+      transactionToken: "c".repeat(64),
+      expectedCaptureCalls: 1,
+      expectedRecoveryCalls: 0,
+    },
+    {
+      authorityCase: "a replacement",
+      transactionToken: "d".repeat(64),
+      expectedCaptureCalls: 0,
+      expectedRecoveryCalls: 1,
+    },
+  ])(
+    "uses captured cleanup only for $authorityCase authority",
+    async ({ transactionToken, expectedCaptureCalls, expectedRecoveryCalls }) => {
+      const remoteRecovery = {
+        protocolVersion: 3,
+        host: "remote.example.test:9443",
+        transactionToken: "c".repeat(64),
+        state: "pending" as const,
+      };
+      const captureRuntime = withCommittedPromptEpoch(
+        withRecoveryCleanup(
+          {
+            chromeHost: "remote.example.test",
+            chromePort: 9222,
+            chromeTargetId: "remote-owned-target",
+          },
+          {
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+          remoteRecovery,
+        ),
+      );
+      const capturedResource = captureRuntime.recoveryCleanupResources?.[0];
+      if (!capturedResource) throw new Error("Missing captured cleanup authority fixture");
+      const { recoveryCleanup, ...resourceAuthority } = capturedResource;
+      let durableRuntime: BrowserRuntimeMetadata = {
+        ...captureRuntime,
+        recoveryCleanupResources: [
+          {
+            recoveryCleanup,
+            ...resourceAuthority,
+            remoteRecovery: { ...remoteRecovery, transactionToken },
+          },
+        ],
+      };
+      const finalizeResources = vi.fn(async () => ({
+        status: "completed" as const,
+        runtime: {},
+      }));
+      const settleRemoteBrowserRecovery = vi.fn(async () => ({
+        status: "completed" as const,
+        runtime: {},
+      }));
+      const release = vi.fn(async (complete?: () => Promise<void>) => {
+        await complete?.();
+      });
+      const result = createReattachSettlement(
+        {
+          answerText: "captured",
+          answerMarkdown: "captured",
+          runtime: captureRuntime,
+          finalizeResources,
+        },
+        captureRuntime,
+        null,
+        createBrowserLogger(),
+        {
+          loadRuntimeUnderLock: async () => durableRuntime,
+          runtimeHintCb: async (runtime) => {
+            durableRuntime = runtime;
+          },
+          recoveryCleanup: {
+            settleRemoteBrowserRecovery,
+            resolveRemoteRecoveryConfig: async () => ({ host: remoteRecovery.host }),
+          },
+          isRemotePublicationAcknowledged: () => true,
+        },
+        { ensure: async () => undefined, release },
+      );
+
+      await expect(result.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(finalizeResources).toHaveBeenCalledTimes(expectedCaptureCalls);
+      expect(settleRemoteBrowserRecovery).toHaveBeenCalledTimes(expectedRecoveryCalls);
+    },
+  );
 
   test("requires durable remote publication before finalize but permits abort", async () => {
     const remoteRecovery = {
@@ -260,6 +356,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
         .mockResolvedValueOnce({ status: "completed" });
 
       const result = await retryBrowserRecoveryCleanup(runtime, createBrowserLogger(), {
+        ownerId: "test-owner",
         acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
         recoveryCleanup: {
           ...authenticatedLocalTargetCleanupDeps(),
@@ -292,6 +389,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
       });
       await expect(
         retryBrowserRecoveryCleanup(result.runtime, createBrowserLogger(), {
+          ownerId: "test-owner",
           acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
           recoveryCleanup: {
             ...authenticatedLocalTargetCleanupDeps(),

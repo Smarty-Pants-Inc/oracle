@@ -630,7 +630,7 @@ module.exports = () => ({
   );
 
   test(
-    "keeps predecessor remote credentials dormant for local and explicit API commands",
+    "keeps predecessor remote credentials dormant until actual remote transport use",
     async () => {
       const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-dormant-remote-home-"));
       await writeFile(
@@ -653,6 +653,56 @@ module.exports = () => ({
       const local = await execCli(["status"], { env, timeout: INTEGRATION_TIMEOUT });
       expect(local.code).toBe(0);
       expect(`${local.stdout}\n${local.stderr}`).not.toMatch(/base-generated|remote credential/i);
+      const rootStatus = await execCli(["--status"], { env, timeout: INTEGRATION_TIMEOUT });
+      expect(rootStatus.code).toBe(0);
+      expect(`${rootStatus.stdout}\n${rootStatus.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
+      );
+
+      const rootSession = await execCli(["--session", "missing-local-session"], {
+        env,
+        timeout: INTEGRATION_TIMEOUT,
+      });
+      expect(rootSession.code).toBe(1);
+      expect(`${rootSession.stdout}\n${rootSession.stderr}`).toContain(
+        "No session found with ID missing-local-session",
+      );
+      expect(`${rootSession.stdout}\n${rootSession.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
+      );
+
+      const rendered = await execCli(
+        ["--render-markdown", "--prompt", "Dormant remote state stays local while rendering"],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(rendered.code).toBe(0);
+      expect(rendered.stdout).toContain("Dormant remote state stays local while rendering");
+      expect(`${rendered.stdout}\n${rendered.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
+      );
+
+      const copied = await execCli(
+        ["--copy-markdown", "--prompt", "Dormant remote state stays local while copying"],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(copied.code).toBe(0);
+      expect(`${copied.stdout}\n${copied.stderr}`).toMatch(/Copied markdown|Copy failed/);
+      expect(`${copied.stdout}\n${copied.stderr}`).not.toMatch(/base-generated|remote credential/i);
+
+      const browserPreview = await execCli(
+        [
+          "--dry-run",
+          "--engine",
+          "browser",
+          "--prompt",
+          "Browser preview must not construct remote transport",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserPreview.code).toBe(0);
+      expect(`${browserPreview.stdout}\n${browserPreview.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
+      );
 
       const api = await execCli(
         [
@@ -672,7 +722,7 @@ module.exports = () => ({
 
       const remote = await execCli(
         [
-          "--dry-run",
+          "--wait",
           "--engine",
           "browser",
           "--prompt",
@@ -683,6 +733,55 @@ module.exports = () => ({
       expect(remote.code).toBe(1);
       expect(`${remote.stdout}\n${remote.stderr}`).toMatch(
         /immediately preceding base-generated.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
+      );
+
+      const useScopedEnv = {
+        ...env,
+        ORACLE_REMOTE_HOST: "127.0.0.1:19473",
+        ORACLE_REMOTE_TOKEN: "b".repeat(64),
+      };
+      const envRemote = await execCli(
+        [
+          "--dry-run",
+          "--engine",
+          "browser",
+          "--prompt",
+          "Use-scoped remote authority must override dormant mutable config",
+        ],
+        { env: useScopedEnv, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(envRemote.code).toBe(0);
+      expect(`${envRemote.stdout}\n${envRemote.stderr}`).toContain(
+        "Remote browser host detected: 127.0.0.1:19473",
+      );
+      expect(`${envRemote.stdout}\n${envRemote.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
+      );
+
+      const cliRemote = await execCli(
+        [
+          "--dry-run",
+          "--engine",
+          "browser",
+          "--remote-host",
+          "127.0.0.1:29473",
+          "--remote-token",
+          "c".repeat(64),
+          "--prompt",
+          "Explicit CLI authority must override environment and mutable config",
+        ],
+        {
+          env: { ...useScopedEnv, ORACLE_REMOTE_TOKEN: "weak" },
+          timeout: INTEGRATION_TIMEOUT,
+        },
+      );
+      expect(cliRemote.code).toBe(0);
+      expect(`${cliRemote.stdout}\n${cliRemote.stderr}`).toContain(
+        "Remote browser host detected: 127.0.0.1:29473",
+      );
+      expect(`${cliRemote.stdout}\n${cliRemote.stderr}`).not.toContain("127.0.0.1:19473");
+      expect(`${cliRemote.stdout}\n${cliRemote.stderr}`).not.toMatch(
+        /base-generated|remote credential/i,
       );
 
       await rm(oracleHome, { recursive: true, force: true });

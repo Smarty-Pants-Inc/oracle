@@ -62,12 +62,16 @@ describe("openGeminiBrowserSession fresh profile", () => {
       })),
       release: vi.fn(async () => undefined),
     };
-    acquireBrowserTabLease.mockImplementationOnce(async () => ({
-      id: "fresh-profile-lease",
-      profileDirectory: await captureProfileDirectoryIdentity(profileDir),
-      update: vi.fn(async () => undefined),
-      release: vi.fn(async () => undefined),
-    }));
+    acquireBrowserTabLease.mockImplementationOnce(
+      async (_profileDir: string, options: { sessionId: string; generationId: string }) => ({
+        id: "fresh-profile-lease",
+        sessionId: options.sessionId,
+        generationId: options.generationId,
+        profileDirectory: await captureProfileDirectoryIdentity(profileDir),
+        update: vi.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
+      }),
+    );
     acquireManualChromeOwner.mockImplementationOnce(async () => {
       const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
       const processIdentity = {

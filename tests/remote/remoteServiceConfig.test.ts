@@ -49,20 +49,24 @@ describe("resolveRemoteServiceConfig", () => {
     expect(resolved.sources.token).toBe("config.browser");
   });
 
-  it("falls back to env token when browser.remoteToken is missing", () => {
-    const env = {} as NodeJS.ProcessEnv;
-    // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
-    env["ORACLE_REMOTE_TOKEN"] = ENV_TOKEN;
+  it("prefers use-scoped env values over malformed browser config", () => {
+    const env = {
+      ORACLE_REMOTE_HOST: "127.0.0.4:9473",
+      ORACLE_REMOTE_TOKEN: ENV_TOKEN,
+    } as NodeJS.ProcessEnv;
     const resolved = resolveRemoteServiceConfig({
       userConfig: {
-        browser: { remoteHost: "localhost:9473" },
+        browser: {
+          remoteHost: "bridge.example.com:9473",
+          remoteToken: "a".repeat(32),
+        },
       },
       env,
     });
 
-    expect(resolved.host).toBe("localhost:9473");
+    expect(resolved.host).toBe("127.0.0.4:9473");
     expect(resolved.token).toBe(ENV_TOKEN);
-    expect(resolved.sources.host).toBe("config.browser");
+    expect(resolved.sources.host).toBe("env");
     expect(resolved.sources.token).toBe("env");
   });
 
@@ -92,7 +96,15 @@ describe("resolveRemoteServiceConfig", () => {
       ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL: "1",
     } as NodeJS.ProcessEnv;
 
-    const resolved = resolveRemoteServiceConfig({ userConfig: {}, env });
+    const resolved = resolveRemoteServiceConfig({
+      userConfig: {
+        browser: {
+          remoteLegacyToken: "weak",
+          remoteAllowLegacyTextProtocol: false,
+        },
+      },
+      env,
+    });
 
     expect(resolved.legacyToken).toBe(LEGACY_TOKEN);
     expect(resolved.allowLegacyTextProtocol).toBe(true);

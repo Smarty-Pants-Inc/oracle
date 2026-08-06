@@ -172,6 +172,7 @@ describe("browser recovery cleanup", () => {
     ).resolves.toEqual(completedHarvest);
 
     expect(recoverConversationTab).toHaveBeenCalledWith(baseMeta, expect.any(Function), {
+      loadRuntimeUnderLock: expect.any(Function),
       persistRuntime: expect.any(Function),
     });
     expect(harvestChatGptTab).toHaveBeenLastCalledWith(

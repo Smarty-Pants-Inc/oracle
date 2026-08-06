@@ -607,24 +607,17 @@ export async function runConsultTool(
       )
       .catch(() => {});
 
-  const resolvedRemote = resolveRemoteServiceConfig({
-    userConfig,
-    env: process.env,
-    validate: false,
-  });
+  const resolvedRemote =
+    resolvedEngine === "browser"
+      ? resolveRemoteServiceConfig({
+          userConfig,
+          env: process.env,
+          validate: false,
+        })
+      : undefined;
 
-  if (resolvedEngine === "browser" && resolvedRemote.host) {
-    try {
-      validateResolvedRemoteServiceConfig(resolvedRemote);
-    } catch (error) {
-      return {
-        isError: true,
-        content: textContent(error instanceof Error ? error.message : String(error)),
-      };
-    }
-  }
   const imageOutputPath = runOptions.generateImage ?? runOptions.outputPath;
-  if (resolvedEngine === "browser" && resolvedRemote.host && imageOutputPath) {
+  if (resolvedRemote?.host && imageOutputPath) {
     return {
       isError: true,
       content: textContent(
@@ -684,7 +677,7 @@ export async function runConsultTool(
   }
 
   const browserGuard = ensureBrowserAvailable(resolvedEngine, {
-    remoteHost: resolvedRemote.host,
+    remoteHost: resolvedRemote?.host,
   });
   if (resolvedEngine === "browser" && browserGuard) {
     return {
@@ -694,7 +687,7 @@ export async function runConsultTool(
   }
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
-  if (resolvedEngine === "browser" && resolvedRemote.host) {
+  if (resolvedRemote?.host) {
     if (
       !resolvedRemote.token &&
       !(resolvedRemote.allowLegacyTextProtocol && resolvedRemote.legacyToken)
@@ -704,6 +697,14 @@ export async function runConsultTool(
         content: textContent(
           `Remote host configured (${resolvedRemote.host}) but no usable remote credential is configured. Set ORACLE_REMOTE_TOKEN for v3, or explicitly opt into predecessor text-only compatibility with ORACLE_REMOTE_LEGACY_TOKEN and ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1.`,
         ),
+      };
+    }
+    try {
+      validateResolvedRemoteServiceConfig(resolvedRemote);
+    } catch (error) {
+      return {
+        isError: true,
+        content: textContent(error instanceof Error ? error.message : String(error)),
       };
     }
     browserDeps = {

@@ -432,16 +432,22 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
     const targetId = "stale-r0-target";
     const generationId = "c0000000-0000-4000-8000-00000000000c";
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId,
       targetId,
       close: async () => ({ status: "completed" as const }),
     });
     await closeChromeTargetWithRetainedCapability({
+      ownerId: "test-owner",
       capability: targetCloseCapability,
       targetId,
       logger,
     });
-    acknowledgeChromeTargetCloseCapability({ capability: targetCloseCapability, targetId });
+    acknowledgeChromeTargetCloseCapability({
+      ownerId: "test-owner",
+      capability: targetCloseCapability,
+      targetId,
+    });
     for (
       let index = 0;
       index < targetCloseAuthorityTest.retainedTerminalTargetCloseCapabilityLimit + 1;
@@ -449,22 +455,26 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
     ) {
       const churnTargetId = `reload-churn-${index}`;
       const churnCapability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: `reload-churn-generation-${index}`,
         targetId: churnTargetId,
         close: async () => ({ status: "completed" as const }),
       });
       await closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: churnCapability,
         targetId: churnTargetId,
         logger,
       });
       acknowledgeChromeTargetCloseCapability({
+        ownerId: "test-owner",
         capability: churnCapability,
         targetId: churnTargetId,
       });
     }
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: targetCloseCapability,
         targetId,
         logger,
@@ -537,6 +547,7 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
     const generationId = "e0000000-0000-4000-8000-00000000000e";
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const targetCloseCapability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId,
       targetId,
       close: closeTarget,
@@ -555,7 +566,7 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
         {
           chromeTargetId: targetId,
           targetCloseCapability,
-          tabLease: { id: "partial-persistence-lease", profileDirectory },
+          tabLease: { id: "partial-persistence-lease", generationId, profileDirectory },
           acquisition: { generationId },
           recoveryCleanup: {
             ownsTarget: true,
@@ -573,10 +584,12 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
       runtime,
       logger,
       {
+        ownerId: "test-owner",
         acquireRecoveryLock: vi.fn(async () => ({ release: vi.fn(async () => undefined) })),
         loadRuntimeUnderLock: async () => durableRuntime,
         finalizeRuntime: async (currentRuntime, mode) => {
           await closeChromeTargetWithRetainedCapability({
+            ownerId: "test-owner",
             capability: targetCloseCapability,
             targetId,
             logger,

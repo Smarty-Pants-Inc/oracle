@@ -137,6 +137,7 @@ export async function settleRemoteResources(
       errors.push("Owned remote Chrome target has no retained exact close capability");
     } else {
       const closed = await closeChromeTargetWithRetainedCapability({
+        ownerId: context.resourceOwnerId,
         capability: targetCloseCapability,
         targetId,
         logger: context.logger,

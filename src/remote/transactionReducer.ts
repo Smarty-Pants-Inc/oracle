@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { projectRuntimeAfterChromeTargetLoss } from "../browser/publicationSettlementCoordinator.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
 import { hasRestartDurableChromeTargetCleanupAuthority } from "../browser/targetCloseAuthority.js";
@@ -7,6 +8,7 @@ import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
 import type {
   AppliedRemoteTransactionTransition,
   DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactManualCopyWaiver,
   DurableRemoteArtifactRegistration,
   DurableRemoteAutomationError,
   DurableRemoteCaptureWarning,
@@ -24,6 +26,7 @@ import {
   missingRequiredArtifactDeliveries,
   RemoteTransactionValidationError,
   validateRemoteArtifactDeliveryReceipt,
+  validateRemoteArtifactManualCopyWaiver,
   validateRemoteArtifactOwnership,
   remoteTransactionSettlementPhase,
   validateRemoteStagedCapture,
@@ -285,7 +288,9 @@ const reducers: RemoteTransactionReducers = {
     commitCapture(
       record,
       mergeCaptureWarnings(staged.result, result, transition.warning),
-      transition.stripTargetAuthority ? projectRuntimeAfterTargetLoss(runtime) : runtime,
+      transition.projectTargetSelectionLoss
+        ? projectRuntimeAfterChromeTargetLoss(runtime)
+        : runtime,
       staged.modelSelection,
       staged.artifacts,
       context,
@@ -415,8 +420,47 @@ const reducers: RemoteTransactionReducers = {
       }
       return { persist: false, outcome: registration.deliveryReceipt };
     }
+    registration.manualCopyWaiver = undefined;
     registration.deliveryReceipt = transition.receipt;
     return { persist: true, outcome: transition.receipt };
+  },
+  "record-artifact-manual-copy-waiver": (record, transition, context) => {
+    if (record.state !== "pending" || !record.result || !record.runtime) {
+      throw new Error(
+        `Cannot record artifact manual-copy waiver from transaction state ${record.state}`,
+      );
+    }
+    if (record.settlementMode) {
+      throw new Error("Cannot record artifact manual-copy waiver after settlement is bound");
+    }
+    if (Date.parse(record.leaseExpiresAt ?? "") <= context.now()) {
+      throw new Error("Cannot record artifact manual-copy waiver for an expired transaction lease");
+    }
+    const registration = record.artifacts?.find(
+      (artifact) => artifact.descriptor.artifactId === transition.artifactId,
+    );
+    if (!registration) throw new Error("Remote artifact registration does not exist");
+    if (!registration.descriptor.required) {
+      throw new Error("Only required artifacts may receive a manual-copy waiver");
+    }
+    validateRemoteArtifactManualCopyWaiver(
+      {
+        transactionToken: registration.transactionToken,
+        artifactId: registration.descriptor.artifactId,
+        byteSize: registration.descriptor.byteSize,
+        sha256: registration.descriptor.sha256,
+      },
+      transition.waiver,
+    );
+    if (registration.deliveryReceipt) return { persist: false, outcome: null };
+    if (registration.manualCopyWaiver) {
+      if (!sameArtifactManualCopyWaiver(registration.manualCopyWaiver, transition.waiver)) {
+        throw new Error("Remote artifact already has a different manual-copy waiver");
+      }
+      return { persist: false, outcome: registration.manualCopyWaiver };
+    }
+    registration.manualCopyWaiver = transition.waiver;
+    return { persist: true, outcome: transition.waiver };
   },
   "bind-settlement": (record, transition, context) => {
     const completed = completedSettlement(record, transition.mode);
@@ -463,7 +507,7 @@ const reducers: RemoteTransactionReducers = {
       if (missingDeliveries.length > 0) {
         throw new RemoteTransactionTransitionError(
           "required_artifact_delivery_incomplete",
-          `${missingDeliveries.length} required artifact delivery receipt(s) are missing`,
+          `${missingDeliveries.length} required artifact delivery receipt(s) or manual-copy waiver(s) are missing`,
         );
       }
       if (!record.publicationAcknowledgedAt) {
@@ -521,7 +565,7 @@ const reducers: RemoteTransactionReducers = {
       if (missingDeliveries.length > 0) {
         throw new RemoteTransactionTransitionError(
           "required_artifact_delivery_incomplete",
-          `${missingDeliveries.length} required artifact delivery receipt(s) are missing`,
+          `${missingDeliveries.length} required artifact delivery receipt(s) or manual-copy waiver(s) are missing`,
         );
       }
     }
@@ -932,50 +976,6 @@ function commitCapture(
   record.restartRecovery = undefined;
 }
 
-function projectRuntimeAfterTargetLoss(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  const projected: BrowserRuntimeMetadata = { ...runtime };
-  delete projected.chromeTargetId;
-  const remainingResources: NonNullable<BrowserRuntimeMetadata["recoveryCleanupResources"]> = [];
-  for (const resource of runtime.recoveryCleanupResources ?? []) {
-    if (!resource.chromeTargetId) {
-      remainingResources.push(resource);
-      continue;
-    }
-    const hasNonTargetAuthority = Boolean(
-      resource.chromePid ||
-      resource.chromeProcessIdentity ||
-      resource.profileDirectoryIdentity ||
-      resource.userDataDir ||
-      resource.tabLease,
-    );
-    if (!hasNonTargetAuthority) continue;
-    remainingResources.push({
-      ...resource,
-      chromeTargetId: undefined,
-      recoveryCleanup: {
-        ...resource.recoveryCleanup,
-        ownsTarget: false,
-        closeOwnedTargetOnComplete: false,
-      },
-    });
-  }
-  if (remainingResources.length > 0) {
-    projected.recoveryCleanupResources = remainingResources;
-  } else {
-    delete projected.browserTransport;
-    delete projected.chromePid;
-    delete projected.chromeProcessIdentity;
-    delete projected.chromePort;
-    delete projected.chromeHost;
-    delete projected.chromeBrowserWSEndpoint;
-    delete projected.chromeProfileRoot;
-    delete projected.userDataDir;
-    delete projected.recoveryCleanupResources;
-    delete projected.recoveryCleanupResult;
-  }
-  return projected;
-}
-
 function projectRunningRecordToFailure(
   record: RemoteTransactionRecord,
   error: DurableRemoteAutomationError,
@@ -1005,6 +1005,7 @@ function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: strin
       runId: artifact.descriptor.runId,
       required: artifact.descriptor.required,
       deliveryReceipt: artifact.deliveryReceipt,
+      manualCopyWaiver: artifact.manualCopyWaiver,
     })),
     errorCode: record.error?.code,
     errorStage: record.error?.stage,
@@ -1039,6 +1040,18 @@ function sameArtifactDeliveryReceipt(
 ): boolean {
   return (
     left.receiptId === right.receiptId &&
+    left.byteSize === right.byteSize &&
+    left.sha256 === right.sha256
+  );
+}
+
+function sameArtifactManualCopyWaiver(
+  left: DurableRemoteArtifactManualCopyWaiver,
+  right: DurableRemoteArtifactManualCopyWaiver,
+): boolean {
+  return (
+    left.waiverId === right.waiverId &&
+    left.disposition === right.disposition &&
     left.byteSize === right.byteSize &&
     left.sha256 === right.sha256
   );

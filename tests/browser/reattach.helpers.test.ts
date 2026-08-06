@@ -55,6 +55,7 @@ describe("reattach helpers", () => {
     }));
 
     const connection = await createOwnedRecoveryTargetConnection(
+      "test-owner",
       endpointAuthority as never,
       "generation-a",
       logger,
@@ -87,6 +88,7 @@ describe("reattach helpers", () => {
 
     await expect(
       createOwnedRecoveryTargetConnection(
+        "test-owner",
         endpointAuthority as never,
         "generation-a",
         logger,
@@ -131,6 +133,7 @@ describe("reattach helpers", () => {
 
     await expect(
       createOwnedRecoveryTargetConnection(
+        "test-owner",
         endpointAuthority as never,
         "generation-a",
         createBrowserLogger(),

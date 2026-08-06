@@ -22,6 +22,7 @@ import type { BrowserTabLease } from "./tabLeaseRegistry.js";
 import type { BrowserLogger } from "./types.js";
 
 export interface ReattachFallbackAuthorityOptions {
+  ownerId: string;
   baseRuntime: BrowserRuntimeMetadata;
   userDataDir: string;
   profileIdentity: ProfileDirectoryIdentity;
@@ -41,6 +42,21 @@ export class ReattachFallbackAuthority {
   private readonly resources: LocalOwnedBrowserResourceAuthority;
 
   constructor(options: ReattachFallbackAuthorityOptions) {
+    const ownerId = options.ownerId.trim();
+    const generationId = options.generationId.trim();
+    if (!ownerId || !generationId) {
+      throw new Error("Reattach fallback authority requires an owner and acquisition generation.");
+    }
+    options = Object.freeze({
+      ...options,
+      ownerId,
+      generationId,
+      profileIdentity: Object.freeze({ ...options.profileIdentity }),
+      launchClaim: Object.freeze({ ...options.launchClaim }),
+      ...(options.recoveryCleanup
+        ? { recoveryCleanup: Object.freeze({ ...options.recoveryCleanup }) }
+        : {}),
+    });
     const cleanup = options.recoveryCleanup;
     const releaseLease = cleanup?.releaseBrowserTabLease;
     const pendingProcess = (reason: string): LocalOwnedBrowserProcessSettlement => ({
@@ -99,6 +115,7 @@ export class ReattachFallbackAuthority {
         }
       : undefined;
     this.resources = new LocalOwnedBrowserResourceAuthority({
+      ownerId: options.ownerId,
       purpose: "ChatGPT reattach fallback",
       targetLabel: "Owned fallback Chrome",
       baseRuntime: options.baseRuntime,
@@ -118,10 +135,7 @@ export class ReattachFallbackAuthority {
       ...(releaseLease
         ? {
             releaseLease: (lease: BrowserTabLease, releaseOptions) =>
-              releaseLease(options.userDataDir, lease.id, options.logger, {
-                ...releaseOptions,
-                expectedProfileIdentity: lease.profileDirectory,
-              }),
+              releaseLease(options.userDataDir, lease, options.logger, releaseOptions),
           }
         : {}),
       settleManualProcess,
@@ -137,7 +151,12 @@ export class ReattachFallbackAuthority {
           }
         : {}),
       settleRemainingResources: (mode, runtime) =>
-        finalizeRecoveredRuntime(runtime, options.logger, options.recoveryCleanup, mode),
+        finalizeRecoveredRuntime(
+          runtime,
+          options.logger,
+          { ...options.recoveryCleanup, ownerId: options.ownerId },
+          mode,
+        ),
     });
   }
 

@@ -13,12 +13,17 @@ import {
   type RemoteRequestAuthenticator,
 } from "./auth.js";
 import type { RemoteArtifactStore } from "./artifactStore.js";
-import { serveRemoteArtifact, serveRemoteArtifactReceipt } from "./serverArtifacts.js";
+import {
+  serveRemoteArtifact,
+  serveRemoteArtifactManualCopyWaiver,
+  serveRemoteArtifactReceipt,
+} from "./serverArtifacts.js";
 import { handleRemoteRunRequest } from "./serverExecution.js";
 import {
   authenticateCurrentRemoteRequest,
   authenticateLegacyRemoteRequest,
   formatSocket,
+  matchArtifactManualCopyWaiverRequest,
   matchArtifactReceiptRequest,
   matchArtifactRequest,
   matchLegacyRunRequest,
@@ -81,6 +86,10 @@ export interface RemoteRequestRouterDeps {
   admitControllerOperation: () => (() => void) | null;
   admitRemoteTransaction: (transactionToken: string) => (() => void) | null;
   isRemoteTransactionAdmitted: (transactionToken: string) => boolean;
+  runRemoteTransactionRetryWork: <T>(
+    transactionToken: string,
+    operation: () => Promise<T>,
+  ) => Promise<T>;
   isClosing: () => boolean;
   isBrowserWorkBusy: () => boolean;
   isBrowserWorkExclusive: () => boolean;
@@ -208,6 +217,20 @@ export function attachRemoteRequestRouter(
         return;
       }
 
+      const artifactWaiverMatch = matchArtifactManualCopyWaiverRequest(req);
+      if (artifactWaiverMatch) {
+        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
+        await serveRemoteArtifactManualCopyWaiver({
+          req,
+          res,
+          artifactStore: deps.artifactStore,
+          transactionStore: deps.transactionStore,
+          transactionToken: artifactWaiverMatch.transactionToken,
+          artifactId: artifactWaiverMatch.artifactId,
+        });
+        return;
+      }
+
       const artifactReceiptMatch = matchArtifactReceiptRequest(req);
       if (artifactReceiptMatch) {
         if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
@@ -314,6 +337,7 @@ export function attachRemoteRequestRouter(
             logger: deps.cleanupLogger,
             serverLogger: deps.logger,
             isTransactionAdmitted: deps.isRemoteTransactionAdmitted,
+            runTransactionRetryWork: deps.runRemoteTransactionRetryWork,
           });
           return;
         }

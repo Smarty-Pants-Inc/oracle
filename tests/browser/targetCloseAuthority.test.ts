@@ -19,12 +19,14 @@ describe("retained Chrome target close capabilities", () => {
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;
     const pending = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "pending-generation",
       targetId: "pending-target",
       close,
     });
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: pending,
         targetId: "pending-target",
         logger,
@@ -35,16 +37,22 @@ describe("retained Chrome target close capabilities", () => {
     const acknowledged: (typeof pending)[] = [];
     for (let index = 0; index < count; index += 1) {
       const capability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: `generation-${index}`,
         targetId: `target-${index}`,
         close,
       });
       await closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability,
         targetId: `target-${index}`,
         logger,
       });
-      acknowledgeChromeTargetCloseCapability({ capability, targetId: `target-${index}` });
+      acknowledgeChromeTargetCloseCapability({
+        ownerId: "test-owner",
+        capability,
+        targetId: `target-${index}`,
+      });
       acknowledged.push(capability);
     }
 
@@ -56,6 +64,7 @@ describe("retained Chrome target close capabilities", () => {
     );
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: pending,
         targetId: "pending-target",
         logger,
@@ -63,12 +72,17 @@ describe("retained Chrome target close capabilities", () => {
     ).resolves.toEqual({ status: "completed" });
     expect(close).toHaveBeenCalledTimes(count + 1);
 
-    acknowledgeChromeTargetCloseCapability({ capability: pending, targetId: "pending-target" });
+    acknowledgeChromeTargetCloseCapability({
+      ownerId: "test-owner",
+      capability: pending,
+      targetId: "pending-target",
+    });
     expect(__test__.retainedTargetCloseAuthorityCount()).toBe(
       __test__.retainedTerminalTargetCloseCapabilityLimit,
     );
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: acknowledged[0]!,
         targetId: "target-0",
         logger,
@@ -76,6 +90,7 @@ describe("retained Chrome target close capabilities", () => {
     ).resolves.toMatchObject({ status: "unavailable" });
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: pending,
         targetId: "pending-target",
         logger,
@@ -83,6 +98,7 @@ describe("retained Chrome target close capabilities", () => {
     ).resolves.toEqual({ status: "completed" });
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability: {
           version: 1,
           generationId: "unknown-generation",
@@ -99,13 +115,18 @@ describe("retained Chrome target close capabilities", () => {
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const release = vi.fn(async () => undefined);
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "preserved-generation",
       targetId: "preserved-target",
       close,
       release,
     });
 
-    await discardChromeTargetCloseCapability({ capability, targetId: "preserved-target" });
+    await discardChromeTargetCloseCapability({
+      ownerId: "test-owner",
+      capability,
+      targetId: "preserved-target",
+    });
 
     expect(close).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledOnce();
@@ -118,6 +139,7 @@ describe("retained Chrome target close capabilities", () => {
       .mockRejectedValueOnce(new Error("endpoint release deferred"))
       .mockResolvedValueOnce(undefined);
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "release-retry-generation",
       targetId: "release-retry-target",
       close: vi.fn(async () => ({ status: "completed" as const })),
@@ -125,12 +147,73 @@ describe("retained Chrome target close capabilities", () => {
     });
 
     await expect(
-      discardChromeTargetCloseCapability({ capability, targetId: "release-retry-target" }),
+      discardChromeTargetCloseCapability({
+        ownerId: "test-owner",
+        capability,
+        targetId: "release-retry-target",
+      }),
     ).rejects.toThrow(/release deferred/i);
     expect(__test__.retainedTargetCloseAuthorityCount()).toBe(1);
-    await discardChromeTargetCloseCapability({ capability, targetId: "release-retry-target" });
+    await discardChromeTargetCloseCapability({
+      ownerId: "test-owner",
+      capability,
+      targetId: "release-retry-target",
+    });
     expect(release).toHaveBeenCalledTimes(2);
     expect(__test__.retainedTargetCloseAuthorityCount()).toBe(0);
+  });
+
+  test("does not transfer a retained close capability to a different owner", async () => {
+    const close = vi.fn(async () => ({ status: "completed" as const }));
+    const release = vi.fn(async () => undefined);
+    const logger = vi.fn<(message: string) => void>() as BrowserLogger;
+    const capability = retainChromeTargetCloseCapability({
+      ownerId: "owner-a",
+      generationId: "shared-generation",
+      targetId: "shared-target",
+      close,
+      release,
+    });
+
+    await expect(
+      closeChromeTargetWithRetainedCapability({
+        ownerId: "owner-b",
+        capability: { ...capability },
+        targetId: "shared-target",
+        logger,
+      }),
+    ).resolves.toMatchObject({ status: "unavailable" });
+    await discardChromeTargetCloseCapability({
+      ownerId: "owner-b",
+      capability: { ...capability },
+      targetId: "shared-target",
+    });
+    expect(close).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(__test__.retainedTargetCloseAuthorityCount()).toBe(1);
+
+    await expect(
+      closeChromeTargetWithRetainedCapability({
+        ownerId: "owner-a",
+        capability,
+        targetId: "shared-target",
+        logger,
+      }),
+    ).resolves.toEqual({ status: "completed" });
+    acknowledgeChromeTargetCloseCapability({
+      ownerId: "owner-b",
+      capability: { ...capability },
+      targetId: "shared-target",
+    });
+    expect(__test__.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(0);
+    acknowledgeChromeTargetCloseCapability({
+      ownerId: "owner-a",
+      capability,
+      targetId: "shared-target",
+    });
+    expect(__test__.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(1);
+    expect(close).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
   });
 
   test("treats cleanup-free captures as restart durable", () => {
@@ -144,6 +227,7 @@ describe("retained Chrome target close capabilities", () => {
     const browserWSEndpoint = "ws://service.example:9222/devtools/browser/live-generation";
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "live-generation",
       targetId: "owned-target",
       browserWSEndpoint,
@@ -201,6 +285,7 @@ describe("retained Chrome target close capabilities", () => {
     ).toEqual([false, false, false]);
     await expect(
       closeChromeTargetWithRetainedCapability({
+        ownerId: "test-owner",
         capability,
         targetId: "unrelated-target",
         logger: vi.fn<(message: string) => void>() as BrowserLogger,

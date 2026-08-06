@@ -291,6 +291,12 @@ async function persistRecoveredConversationRuntime(
   });
 }
 
+async function loadRecoveredConversationRuntime(
+  sessionId: string,
+): Promise<BrowserRuntimeMetadata> {
+  return (await sessionStore.readSession(sessionId))?.browser?.runtime ?? {};
+}
+
 async function settleRecoveredConversationCleanup(
   sessionId: string,
   cleanup: RecoveredConversationCleanup,
@@ -432,6 +438,7 @@ export async function harvestSessionBrowserOutput(
         ...(remoteRecoveryEndpoint
           ? { existingEndpoint: { ...remoteRecoveryEndpoint, ownership: "non-owned" as const } }
           : {}),
+        loadRuntimeUnderLock: () => loadRecoveredConversationRuntime(sessionId),
         persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
@@ -515,6 +522,7 @@ export async function liveTailSessionBrowserOutput(
           ? { existingEndpoint: { ...remoteRecoveryEndpoint, ownership: "non-owned" as const } }
           : {}),
         waitForReady: false,
+        loadRuntimeUnderLock: () => loadRecoveredConversationRuntime(sessionId),
         persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;

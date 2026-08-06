@@ -6,6 +6,7 @@ import type {
 } from "./transactionModel.js";
 import type { RemoteTransactionStore } from "./transactionStore.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
+import { isTerminalRemoteTransactionState } from "./transactionValidation.js";
 
 interface RemoteTransactionServerAuthority {
   transactionStore: RemoteTransactionStore;
@@ -62,7 +63,9 @@ export async function settleRemoteControllerShutdown(
     activeTransactions: Map<string, BrowserRunTransaction>;
   },
 ): Promise<void> {
-  for (const transactionToken of params.transactionCoordinator.activeTransactionTokens()) {
+  for (const record of await params.transactionStore.list()) {
+    if (isTerminalRemoteTransactionState(record.state)) continue;
+    const transactionToken = record.transactionToken;
     const shutdown = await params.transactionStore.prepareControllerShutdown(transactionToken);
     if (shutdown.action !== "settle") {
       params.activeTransactions.delete(transactionToken);

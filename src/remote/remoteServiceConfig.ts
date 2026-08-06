@@ -3,7 +3,7 @@ import { assertCurrentRemoteCredential, parseHostPort } from "../bridge/connecti
 
 import type { UserConfig } from "../config.js";
 
-export type RemoteServiceConfigSource = "cli" | "config.browser" | "env" | "unset";
+export type RemoteServiceConfigSource = "cli" | "env" | "config.browser" | "unset";
 
 export interface ResolvedRemoteServiceConfig {
   host?: string;
@@ -75,12 +75,12 @@ function normalizeBoolean(value: unknown): boolean | undefined {
 
 function resolveSource(
   cliValue: unknown,
-  configValue: unknown,
   envValue: unknown,
+  configValue: unknown,
 ): RemoteServiceConfigSource {
   if (cliValue !== undefined) return "cli";
-  if (configValue !== undefined) return "config.browser";
   if (envValue !== undefined) return "env";
+  if (configValue !== undefined) return "config.browser";
   return "unset";
 }
 
@@ -147,20 +147,14 @@ export function resolveRemoteServiceConfig({
   const cliLegacyTokenValue = normalizeCredential(cliLegacyToken);
   const cliAllowLegacyTextProtocolValue = normalizeBoolean(cliAllowLegacyTextProtocol);
 
-  const host = cliHostValue ?? configBrowserHost ?? envHost;
-  const token = cliTokenValue ?? configBrowserToken ?? envToken;
-  const legacyToken = cliLegacyTokenValue ?? configBrowserLegacyToken ?? envLegacyToken;
+  const host = cliHostValue ?? envHost ?? configBrowserHost;
+  const token = cliTokenValue ?? envToken ?? configBrowserToken;
+  const legacyToken = cliLegacyTokenValue ?? envLegacyToken ?? configBrowserLegacyToken;
   const allowLegacyTextProtocol =
     cliAllowLegacyTextProtocolValue ??
-    configAllowLegacyTextProtocol ??
     envAllowLegacyTextProtocol ??
+    configAllowLegacyTextProtocol ??
     false;
-  const tokenSource = resolveSource(cliTokenValue, configBrowserToken, envToken);
-  const legacyTokenSource = resolveSource(
-    cliLegacyTokenValue,
-    configBrowserLegacyToken,
-    envLegacyToken,
-  );
 
   const resolved: ResolvedRemoteServiceConfig = {
     host,
@@ -168,13 +162,13 @@ export function resolveRemoteServiceConfig({
     legacyToken,
     allowLegacyTextProtocol,
     sources: {
-      host: resolveSource(cliHostValue, configBrowserHost, envHost),
-      token: tokenSource,
-      legacyToken: legacyTokenSource,
+      host: resolveSource(cliHostValue, envHost, configBrowserHost),
+      token: resolveSource(cliTokenValue, envToken, configBrowserToken),
+      legacyToken: resolveSource(cliLegacyTokenValue, envLegacyToken, configBrowserLegacyToken),
       allowLegacyTextProtocol: resolveSource(
         cliAllowLegacyTextProtocolValue,
-        configAllowLegacyTextProtocol,
         envAllowLegacyTextProtocol,
+        configAllowLegacyTextProtocol,
       ),
     },
   };

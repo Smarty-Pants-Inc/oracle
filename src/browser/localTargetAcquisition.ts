@@ -66,6 +66,7 @@ export async function acquireExactLocalBrowserTarget({
         authority: (opened) => {
           const targetId = opened.targetId as string;
           const targetCloseCapability = retainChromeTargetCloseCapability({
+            ownerId: resourceAuthority.ownerIdValue(),
             generationId: resourceAuthority.generationId(),
             targetId,
             browserWSEndpoint: endpointAuthority.browserWSEndpoint,

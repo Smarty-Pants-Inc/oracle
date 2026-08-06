@@ -1,4 +1,5 @@
 import { describe, expect, test, vi, afterEach, beforeEach } from "vitest";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -472,16 +473,17 @@ describe("browser reattach end-to-end (simulated)", () => {
         chromeTargetId: "t-1",
         tabUrl: "https://chatgpt.com/c/deep",
       });
+      const replacementAnswer = "# Deep report\n\nRecovered report body.";
       resumeMock.mockResolvedValue(
-        createReattachResult(
-          "# Deep report\n\nRecovered report body.",
-          "# Deep report\n\nRecovered report body.",
-          runtime,
-        ),
+        createReattachResult(replacementAnswer, replacementAnswer, runtime),
       );
 
+      // Dynamic imports preserve the per-test module graph after resetModules and home override.
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+      const { persistDurableBrowserAnswer } = await import("../../src/cli/durableAnswer.js");
+      const { BrowserPublicationJournalStore } =
+        await import("../../src/cli/browserPublicationJournal.js");
 
       await sessionStore.ensureStorage();
       const sessionMeta = await sessionStore.createSession(
@@ -493,14 +495,59 @@ describe("browser reattach end-to-end (simulated)", () => {
         },
         "/repo",
       );
+      const placeholderAnswer = "Called tool";
+      const placeholderReceipt = await persistDurableBrowserAnswer({
+        sessionId: sessionMeta.id,
+        answer: placeholderAnswer,
+      });
+      const placeholderCompletedAt = sessionMeta.createdAt;
+      const placeholderUsage = {
+        inputTokens: 0,
+        outputTokens: 3,
+        reasoningTokens: 0,
+        totalTokens: 3,
+      };
+      const publicationStore = new BrowserPublicationJournalStore(sessionMeta.id);
+      const preparing = await publicationStore.transition(null, {
+        type: "prepare",
+        journal: {
+          sessionId: sessionMeta.id,
+          receipt: placeholderReceipt,
+          artifacts: [],
+          completedAt: placeholderCompletedAt,
+          usage: placeholderUsage,
+          response: { status: "completed" },
+          browserAudit: { config: { researchMode: "deep" }, runtime },
+          runtime,
+        },
+      });
+      const staged = await publicationStore.transition(preparing, {
+        type: "answer-staged",
+        receipt: placeholderReceipt,
+        artifacts: [placeholderReceipt.artifact],
+      });
+      const finalizeBound = await publicationStore.transition(staged, {
+        type: "finalize-bound",
+        receipt: placeholderReceipt,
+        settlementMode: "finalize",
+        runtime,
+        browserAudit: { config: { researchMode: "deep" }, runtime },
+      });
+      await publicationStore.transition(finalizeBound, {
+        type: "completed-session-persisted",
+        receipt: placeholderReceipt,
+        completedSessionPersisted: true,
+      });
       await sessionStore.updateModelRun(sessionMeta.id, "gpt-5.6-sol-pro", {
         status: "completed",
-        usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
+        usage: placeholderUsage,
       });
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
+        completedAt: placeholderCompletedAt,
         mode: "browser",
-        usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
+        usage: placeholderUsage,
+        artifacts: [placeholderReceipt.artifact],
         browser: {
           config: { researchMode: "deep" },
           runtime,
@@ -508,7 +555,7 @@ describe("browser reattach end-to-end (simulated)", () => {
         response: { status: "completed" },
       });
       const paths = await sessionStore.getPaths(sessionMeta.id);
-      await fs.writeFile(paths.log, "Answer:\nCalled tool\n", "utf8");
+      await fs.writeFile(paths.log, `Answer:\n${placeholderAnswer}\n`, "utf8");
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -518,11 +565,24 @@ describe("browser reattach end-to-end (simulated)", () => {
 
       const updated = await sessionStore.readSession(sessionMeta.id);
       const log = await sessionStore.readLog(sessionMeta.id);
+      const replacementHash = createHash("sha256").update(replacementAnswer).digest("hex");
+      const replacementArtifact = updated?.artifacts?.find(
+        (artifact) =>
+          artifact.kind === "transcript" &&
+          artifact.sha256 === replacementHash &&
+          path.basename(artifact.path) === `browser-answer-${replacementHash}.md`,
+      );
       expect(updated?.status).toBe("completed");
       expect(updated?.response?.status).toBe("completed");
       expect(resumeMock).toHaveBeenCalledTimes(1);
       expect(log).toContain("Recovered report body");
       expect(log).not.toContain("Called tool");
+      expect(replacementArtifact).toBeDefined();
+      expect(replacementArtifact?.path).not.toBe(placeholderReceipt.artifact.path);
+      expect(replacementArtifact?.sha256).not.toBe(placeholderReceipt.artifact.sha256);
+      if (!replacementArtifact) throw new Error("replacement durable answer artifact missing");
+      expect(await fs.readFile(replacementArtifact.path, "utf8")).toBe(replacementAnswer);
+      await expect(publicationStore.read()).resolves.toBeNull();
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);

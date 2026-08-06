@@ -549,6 +549,12 @@ export const RemoteArtifactDeliveryReceiptRequestSchema = z
     byteSize: z.number().int().positive().max(MAX_REMOTE_ARTIFACT_BYTES),
   })
   .strict();
+export const RemoteArtifactManualCopyWaiverRequestSchema = z
+  .object({
+    sha256: z.string().regex(SHA256_PATTERN),
+    byteSize: z.number().int().positive().max(MAX_REMOTE_ARTIFACT_BYTES),
+  })
+  .strict();
 
 export const RemoteHealthAuthenticationSchema = z
   .object({
@@ -594,6 +600,9 @@ export type RemoteArtifactCapabilities = z.infer<typeof RemoteArtifactCapabiliti
 export type RemoteArtifactDescriptor = z.infer<typeof RemoteArtifactDescriptorSchema>;
 export type RemoteArtifactDeliveryReceiptRequest = z.infer<
   typeof RemoteArtifactDeliveryReceiptRequestSchema
+>;
+export type RemoteArtifactManualCopyWaiverRequest = z.infer<
+  typeof RemoteArtifactManualCopyWaiverRequestSchema
 >;
 export type RemoteCommittedPromptEpoch = z.infer<typeof RemoteCommittedPromptEpochSchema>;
 export type RemotePublicRuntime = z.infer<typeof RemotePublicRuntimeSchema>;

@@ -77,6 +77,7 @@ export function recoveryCleanupResourceKey(
     resource.chromeBrowserWSEndpoint ?? null,
     resource.chromeProcessIdentity?.launchNonce ?? null,
     profileDirectoryIdentityKey(resource.profileDirectoryIdentity) ?? null,
+    browserTabLeaseAuthorityKey(resource.tabLease),
     [
       resource.targetCloseCapability?.version ?? null,
       resource.targetCloseCapability?.generationId ?? null,
@@ -137,6 +138,17 @@ function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | nu
   ];
 }
 
+export function browserTabLeaseAuthorityKey(
+  lease: BrowserRecoveryCleanupResourceMetadata["tabLease"],
+): string | null {
+  if (!lease) return null;
+  return JSON.stringify([
+    lease.id,
+    lease.generationId,
+    profileDirectoryIdentityKey(lease.profileDirectory),
+  ]);
+}
+
 export function immutablePromptIdentity(
   promptEpoch: BrowserRecoveryCleanupResourceMetadata["promptEpoch"],
 ): readonly unknown[] | null {
@@ -178,10 +190,10 @@ export function teardownOnlyEntry(entry: RecoveryCleanupEntry): RecoveryCleanupE
 
 export function removeReleasedLeaseAuthority(
   entry: RecoveryCleanupEntry,
-  releasedLeaseIds: Set<string>,
+  releasedLeaseAuthorities: Set<string>,
 ): RecoveryCleanupEntry {
-  const leaseId = entry.resource.tabLease?.id;
-  if (!leaseId || !releasedLeaseIds.has(leaseId)) return entry;
+  const leaseAuthority = browserTabLeaseAuthorityKey(entry.resource.tabLease);
+  if (!leaseAuthority || !releasedLeaseAuthorities.has(leaseAuthority)) return entry;
   return {
     ...entry,
     resource: { ...entry.resource, tabLease: undefined },

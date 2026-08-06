@@ -15,3 +15,9 @@ export interface RemoteServerInstance {
   token: string;
   close(): Promise<void>;
 }
+
+export interface RemoteServerLifecycle {
+  onReady?: (
+    server: Readonly<Pick<RemoteServerInstance, "port" | "token">>,
+  ) => void | Promise<void>;
+}

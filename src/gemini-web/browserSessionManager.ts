@@ -61,12 +61,14 @@ export async function openGeminiBrowserSession(
   const profileDir =
     resolvedConfig.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   const generationId = randomUUID();
+  const resourceOwnerId = randomUUID();
   const launchClaim = createChromeProcessLaunchClaim(generationId);
   const ownerDisposition = resolvedConfig.keepBrowser ? "preserve" : "close-on-last-lease";
   const leaseId = randomUUID();
   const targetMarkerUrl = `about:blank#oracle-acquisition=${generationId}`;
   const profileDirectory = await captureProfileDirectoryIdentity(profileDir, { create: true });
   const resources = new LocalOwnedBrowserResourceAuthority({
+    ownerId: resourceOwnerId,
     purpose,
     targetLabel: "Owned Gemini",
     userDataDir: profileDir,
@@ -102,7 +104,8 @@ export async function openGeminiBrowserSession(
           maxConcurrentTabs: resolvedConfig.maxConcurrentTabs,
           timeoutMs: resolvedConfig.timeoutMs,
           logger,
-          sessionId: purpose,
+          sessionId: resourceOwnerId,
+          generationId,
           leaseId,
         }),
       authority: (lease) => lease,
@@ -135,6 +138,7 @@ export async function openGeminiBrowserSession(
       authority: (opened) => ({
         targetId: opened.targetId as string,
         capability: retainChromeTargetCloseCapability({
+          ownerId: resourceOwnerId,
           generationId,
           targetId: opened.targetId as string,
           browserWSEndpoint: endpointAuthority.browserWSEndpoint,

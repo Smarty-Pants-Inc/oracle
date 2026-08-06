@@ -38,7 +38,7 @@ What it does:
 - Starts a local `oracle serve` instance bound to `127.0.0.1:9473` by default.
 - Generates a 32-byte CSPRNG access key encoded as exactly 64 lowercase hexadecimal characters (stored to disk; not printed unless you ask).
 - Starts an SSH reverse tunnel so the Linux host can reach the Windows service at `127.0.0.1:9473`.
-- Writes a connection artifact to `~/.oracle/bridge-connection.json` (contains host + token).
+- Writes `~/.oracle/bridge-connection.json` (contains host + token) only after the listener and requested SSH forward report ready.
 
 Useful flags:
 
@@ -48,7 +48,7 @@ Useful flags:
 - Print the connection string (includes token): `--print`
 - Print only the token: `--print-token`
 - SSH port/custom args: `--ssh-extra-args "-p 2222"`
-- Background mode (writes pid/log files under `~/.oracle`): `--background`
+- Background mode (writes pid/log files under `~/.oracle`): `--background`. The detached child receives both bridge credentials through a bounded one-shot inherited pipe, not through argv or environment; the parent closes the pipe and publishes the connection/PID files only after nonce-authenticated child readiness.
 
 ## 2) Linux: configure the client once
 
@@ -91,7 +91,7 @@ Use this rotate/clear/re-import sequence:
    oracle bridge client --connect ~/bridge-connection.json
    ```
 
-Until this migration is complete, remote browser use fails closed with rotation guidance. Dormant remote settings do not block local commands, explicit API CLI runs, or MCP consults explicitly using `engine: "api"`.
+Until this migration is complete, remote browser use fails closed with rotation guidance. Dormant remote settings do not block `oracle --status`, `oracle --session <id>`, `oracle --render-markdown`, `oracle --copy-markdown`, `oracle bridge claude-config --local-browser`, explicit API CLI runs, or MCP consults explicitly using `engine: "api"`.
 
 ### Explicit mixed-version text bridge
 
@@ -194,9 +194,15 @@ It checks:
 - Authenticated protocol negotiation via `GET /health`, including the selected `transaction-v3` or `legacy-text-v1` protocol
 - If no remote is configured, it probes local Chrome + cookie DB detection and suggests `--browser-chrome-path` / `--browser-cookie-path`
 
+Transaction-v3 request signatures are accepted only when their issued-at timestamp is no more than **5 minutes old** and no more than **30 seconds in the future** according to the bridge host. If authenticated requests fail with `401 invalid_request_authentication`, synchronize both machines with NTP (or the platform time service), then retry so Oracle creates a fresh timestamp, nonce, and signature; replaying the rejected request does not repair clock skew.
+
 ## Security notes
 
 - Tokens are not printed by default.
+- Detached background child process arguments and environment do not contain either bridge credential; credentials cross only the inherited one-shot pipe and are never copied to the log.
 - The connection artifact and config file contain secrets; keep them private (Oracle writes them with restrictive permissions on Unix).
 - A legacy bearer must be distinct from the modern v3 HMAC root key; the modern key is never sent or accepted as bearer authentication.
+- Durable remote-transaction records use a separate owner-bound integrity key (by default `~/.oracle/.remote-transaction-integrity.key`, mode `0600` on Unix), not the mutable bridge connection credential. Rotating the connection credential therefore does not invalidate pending cleanup or recovery authority.
+- Each transaction envelope authenticates its format version, key identifier, resolved store directory, trusted filename token, exact payload length, and exact payload bytes before Oracle parses or uses the record. Unsigned, modified, wrong-key, renamed, or copied records cannot authorize recovery, target closure, artifact cleanup, or retention deletion; when safe containment is possible, their exact bytes are preserved in hidden `.quarantine` files for manual recovery.
+- The integrity key and transaction store are one durable security boundary. Do not delete or rotate the key while canonical or quarantined transaction records remain, and do not move the store directory without an explicit offline migration. If records exist but their integrity key is missing, startup fails closed and preserves them. Pre-integrity unsigned records are never trusted or automatically migrated: archive them for manual review outside the live store, then start Oracle with an empty transaction store to create a new key.
 - Bridge does **not** extract/decrypt cookies from arbitrary profiles; the Windows machine keeps the authenticated session locally.

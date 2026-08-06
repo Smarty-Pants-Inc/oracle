@@ -309,7 +309,23 @@ describe("performSessionRun", () => {
       recoveryCleanupResult: { status: "pending" as const },
     } satisfies BrowserRuntimeMetadata;
     const reattach = createReattachResult("ok text", "ok markdown", recoveredRuntime);
-    vi.mocked(resumeBrowserSession).mockResolvedValue(reattach.value);
+    let isRemotePublicationAcknowledged: (() => boolean) | undefined;
+    let publicationAcknowledgedDuringFinalize = false;
+    vi.mocked(resumeBrowserSession).mockImplementationOnce(
+      async (_runtime, _config, _logger, deps) => {
+        isRemotePublicationAcknowledged = deps?.isRemotePublicationAcknowledged;
+        return reattach.value;
+      },
+    );
+    const {
+      recoveryCleanupResources: _recoveryCleanupResources,
+      recoveryCleanupResult: _recoveryCleanupResult,
+      ...finalizedRuntime
+    } = recoveredRuntime;
+    reattach.finalize.mockImplementationOnce(async () => {
+      publicationAcknowledgedDuringFinalize = Boolean(isRemotePublicationAcknowledged?.());
+      return { status: "completed", runtime: finalizedRuntime };
+    });
     vi.mocked(ensureSessionArtifacts).mockResolvedValue([
       { kind: "transcript", path: "/tmp/transcript.md" },
       { kind: "deep-research-report", path: "/tmp/deep-research-report.md" },
@@ -388,9 +404,8 @@ describe("performSessionRun", () => {
         }),
       }),
     );
-    expect(
-      vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.(),
-    ).toBe(true);
+    expect(publicationAcknowledgedDuringFinalize).toBe(true);
+    expect(isRemotePublicationAcknowledged?.()).toBe(false);
     expect(vi.mocked(persistDurableBrowserAnswer).mock.invocationCallOrder[0]).toBeLessThan(
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );

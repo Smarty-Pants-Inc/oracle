@@ -37,6 +37,32 @@ export interface DurableRemoteArtifactDeliveryReceipt {
   sha256: string;
 }
 
+export interface DurableRemoteArtifactManualCopyWaiver {
+  waiverId: string;
+  waivedAt: string;
+  disposition: "manual-copy-required";
+  byteSize: number;
+  sha256: string;
+}
+
+export function deriveRemoteArtifactManualCopyWaiverId(params: {
+  transactionToken: string;
+  artifactId: string;
+  byteSize: number;
+  sha256: string;
+}): string {
+  return createHash("sha256")
+    .update("oracle-remote-artifact-manual-copy-waiver-v1\0")
+    .update(params.transactionToken)
+    .update("\0")
+    .update(params.artifactId)
+    .update("\0")
+    .update(params.sha256)
+    .update("\0")
+    .update(String(params.byteSize))
+    .digest("hex");
+}
+
 export interface DurableRemoteFileIdentity {
   device: string;
   inode: string;
@@ -66,6 +92,7 @@ export interface DurableRemoteArtifactRegistration {
   canonicalPath: string;
   fileIdentity: DurableRemoteFileIdentity;
   deliveryReceipt?: DurableRemoteArtifactDeliveryReceipt;
+  manualCopyWaiver?: DurableRemoteArtifactManualCopyWaiver;
 }
 
 export interface DurableRemoteTerminalAudit {
@@ -77,6 +104,7 @@ export interface DurableRemoteTerminalAudit {
     runId: string;
     required: boolean;
     deliveryReceipt?: DurableRemoteArtifactDeliveryReceipt;
+    manualCopyWaiver?: DurableRemoteArtifactManualCopyWaiver;
   }>;
   errorCode?: string;
   errorStage?: string;
@@ -254,7 +282,7 @@ interface RemoteTransactionTransitionDefinitions {
       result?: RemotePublicRunResult;
       runtime?: BrowserRuntimeMetadata;
       warning?: DurableRemoteCaptureWarning;
-      stripTargetAuthority: boolean;
+      projectTargetSelectionLoss: boolean;
     };
     outcome: undefined;
   };
@@ -290,6 +318,13 @@ interface RemoteTransactionTransitionDefinitions {
       receipt: DurableRemoteArtifactDeliveryReceipt;
     };
     outcome: DurableRemoteArtifactDeliveryReceipt;
+  };
+  "record-artifact-manual-copy-waiver": {
+    params: {
+      artifactId: string;
+      waiver: DurableRemoteArtifactManualCopyWaiver;
+    };
+    outcome: DurableRemoteArtifactManualCopyWaiver | null;
   };
   "bind-settlement": {
     params: {

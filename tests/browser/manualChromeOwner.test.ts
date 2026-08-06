@@ -110,11 +110,13 @@ describe("manual Chrome owner acquisition", () => {
         maxConcurrentTabs: 2,
         timeoutMs: 1_000,
         sessionId: "normal-run",
+        generationId: "normal-generation",
       });
       fallbackLease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 2,
         timeoutMs: 1_000,
         sessionId: "fallback-recovery",
+        generationId: "fallback-generation",
       });
 
       const canonicalPid = 43_210;
@@ -760,10 +762,12 @@ describe("manual Chrome owner acquisition", () => {
       const firstLease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 2,
         sessionId: "bootstrap",
+        generationId: "bootstrap-generation",
       });
       const finalLease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 2,
         sessionId: "normal",
+        generationId: "normal-generation",
       });
       const firstTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease, {
         onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(bootstrap),
@@ -1100,10 +1104,12 @@ describe("manual Chrome owner settlement", () => {
       const firstLease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 2,
         sessionId: "run-a",
+        generationId: "run-a-generation",
       });
       const secondLease = await acquireBrowserTabLease(profileDir, {
         maxConcurrentTabs: 2,
         sessionId: "run-b",
+        generationId: "run-b-generation",
       });
       const acquireDeps = {
         discoverExactProfileChrome: vi.fn(async () => null),

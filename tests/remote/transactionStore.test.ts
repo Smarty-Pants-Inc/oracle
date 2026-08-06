@@ -14,9 +14,18 @@ import type {
 } from "../../src/remote/transactionModel.js";
 import {
   RemoteTransactionCapacityError,
+  RemoteTransactionRecordIntegrityError,
   RemoteTransactionStore,
 } from "../../src/remote/transactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
+function openTransactionStore(
+  options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
+) {
+  return RemoteTransactionStore.open({
+    ...options,
+    integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
+  });
+}
 
 const committedPromptEpoch = {
   status: "committed" as const,
@@ -159,7 +168,7 @@ describe("RemoteTransactionStore", () => {
     const finalizedToken = "a".repeat(64);
     const retriedToken = "b".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, finalizedToken);
       await store.journalRuntime(finalizedToken, runtime);
       await publish(store, finalizedToken, [registration(finalizedToken)]);
@@ -287,7 +296,7 @@ describe("RemoteTransactionStore", () => {
       recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
     };
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: root,
         controllerGeneration,
       });
@@ -309,7 +318,7 @@ describe("RemoteTransactionStore", () => {
         "exact durable settlement mode",
       );
 
-      const staleStore = await RemoteTransactionStore.open({
+      const staleStore = await openTransactionStore({
         directory: root,
         controllerGeneration: "stale-settlement-controller",
       });
@@ -340,7 +349,7 @@ describe("RemoteTransactionStore", () => {
       recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
     };
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, transactionToken);
       await store.publishCapture({
         transactionToken,
@@ -386,7 +395,7 @@ describe("RemoteTransactionStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-staged-failure-"));
     const transactionToken = "5".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, transactionToken);
       await store.stageCapture({
         transactionToken,
@@ -442,7 +451,7 @@ describe("RemoteTransactionStore", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-incomplete-manifest-"));
     const transactionToken = "4".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, transactionToken);
       await store.stageCapture({
         transactionToken,
@@ -488,7 +497,7 @@ describe("RemoteTransactionStore", () => {
       modelSelection: optionalModelSelection,
     };
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, transactionToken);
       await store.stageCapture({
         transactionToken,
@@ -564,7 +573,7 @@ describe("RemoteTransactionStore", () => {
       })),
     };
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: root,
         controllerGeneration: "controller-before-shutdown",
       });
@@ -664,7 +673,7 @@ describe("RemoteTransactionStore", () => {
       })),
     };
     try {
-      const store = await RemoteTransactionStore.open({ directory: root });
+      const store = await openTransactionStore({ directory: root });
       await begin(store, transactionToken);
       await store.publishCapture({
         transactionToken,
@@ -847,7 +856,7 @@ describe("RemoteTransactionStore", () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-rejected-transition-"));
       const token = "e".repeat(64);
       try {
-        const store = await RemoteTransactionStore.open({ directory: root });
+        const store = await openTransactionStore({ directory: root });
         await scenario.setup(store, token);
         await expect(scenario.act(store, token)).rejects.toThrow(scenario.message);
       } finally {
@@ -954,14 +963,14 @@ describe("RemoteTransactionStore", () => {
       ],
     };
     try {
-      const initial = await RemoteTransactionStore.open({
+      const initial = await openTransactionStore({
         directory: root,
         controllerGeneration: previousControllerGeneration,
       });
       await begin(initial, transactionToken);
       await initial.journalRuntime(transactionToken, preIntent);
 
-      const recovered = await RemoteTransactionStore.open({
+      const recovered = await openTransactionStore({
         directory: root,
         controllerGeneration: recoveryControllerGeneration,
       });
@@ -970,7 +979,7 @@ describe("RemoteTransactionStore", () => {
       });
 
       const assertDurablyReloaded = async (expected: BrowserRuntimeMetadata) => {
-        const reloaded = await RemoteTransactionStore.open({
+        const reloaded = await openTransactionStore({
           directory: root,
           controllerGeneration: recoveryControllerGeneration,
         });
@@ -1005,7 +1014,7 @@ describe("RemoteTransactionStore", () => {
     const finalizedToken = "b".repeat(64);
     const staleToken = "a".repeat(64);
     try {
-      const current = await RemoteTransactionStore.open({
+      const current = await openTransactionStore({
         directory: root,
         controllerGeneration: currentControllerGeneration,
       });
@@ -1046,7 +1055,7 @@ describe("RemoteTransactionStore", () => {
         "Cannot journal recovery runtime for transaction in state finalized",
       );
 
-      const stale = await RemoteTransactionStore.open({
+      const stale = await openTransactionStore({
         directory: root,
         controllerGeneration: "controller-stale",
       });
@@ -1108,7 +1117,7 @@ describe("RemoteTransactionStore", () => {
       recoveryCleanupResult: { status: "pending" as const },
     };
     try {
-      const first = await RemoteTransactionStore.open({
+      const first = await openTransactionStore({
         directory: root,
         controllerGeneration: "controller-generation-1",
       });
@@ -1118,7 +1127,7 @@ describe("RemoteTransactionStore", () => {
       await begin(first, acquisitionToken);
       await first.journalRuntime(acquisitionToken, acquisitionRuntime);
 
-      const restarted = await RemoteTransactionStore.open({
+      const restarted = await openTransactionStore({
         directory: root,
         controllerGeneration: "controller-generation-2",
       });
@@ -1183,13 +1192,301 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
+  test("recovers a valid authenticated record after a controller restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-restart-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "4".repeat(64);
+    try {
+      const first = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        controllerGeneration: "controller-before-integrity-restart",
+      });
+      await begin(first, transactionToken);
+      await first.journalRuntime(transactionToken, runtime, modelSelection);
+
+      const restarted = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        controllerGeneration: "controller-after-integrity-restart",
+      });
+      await expect(restarted.read(transactionToken)).resolves.toMatchObject({
+        transactionToken,
+        state: "running",
+        runtime,
+        controllerGeneration: "controller-before-integrity-restart",
+      });
+      await expect(
+        restarted.reconcileStaleRunningRecords({
+          buildError: (_record, hadRuntimeAuthority) => failure(hadRuntimeAuthority),
+        }),
+      ).resolves.toEqual([
+        {
+          transactionToken,
+          previousControllerGeneration: "controller-before-integrity-restart",
+          state: "recoverable-error",
+          hadRuntimeAuthority: true,
+        },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects copied cleanup authority, filename swaps, and modified payload bytes", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-forgery-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const victimToken = "5".repeat(64);
+    const attackerToken = "6".repeat(64);
+    const swappedToken = "7".repeat(64);
+    const baseProcessIdentity = processIdentity(
+      path.join(root, "victim-profile"),
+      4567,
+      "10000000-0000-4000-8000-000000000005",
+    );
+    const victimProcessIdentity = {
+      ...baseProcessIdentity,
+      launchClaim: { ...baseProcessIdentity.launchClaim, generationId: "store-generation" },
+    };
+    const victimRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      chromePid: victimProcessIdentity.pid,
+      chromeProcessIdentity: victimProcessIdentity,
+      chromeProfileRoot: path.join(root, "victim-profile"),
+      userDataDir: path.join(root, "victim-profile"),
+      recoveryCleanupResources: runtime.recoveryCleanupResources.map((resource) => ({
+        ...resource,
+        chromePid: victimProcessIdentity.pid,
+        chromeProcessIdentity: victimProcessIdentity,
+        profileDirectoryIdentity: victimProcessIdentity.profileDirectory,
+        chromeProfileRoot: path.join(root, "victim-profile"),
+        userDataDir: path.join(root, "victim-profile"),
+        acquisition: {
+          generationId: victimProcessIdentity.launchClaim.generationId,
+          processLaunchClaim: victimProcessIdentity.launchClaim,
+        },
+      })),
+    };
+    try {
+      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(store, victimToken, "victim-run");
+      await store.journalRuntime(victimToken, victimRuntime);
+      await begin(store, attackerToken, "attacker-run");
+
+      const victimRaw = await readFile(store.recordPath(victimToken), "utf8");
+      const attackerEnvelope = JSON.parse(
+        await readFile(store.recordPath(attackerToken), "utf8"),
+      ) as { payload: string } & Record<string, unknown>;
+      const victimEnvelope = JSON.parse(victimRaw) as {
+        payload: string;
+      } & Record<string, unknown>;
+
+      await fs.writeFile(
+        store.recordPath(attackerToken),
+        `${JSON.stringify({ ...attackerEnvelope, payload: victimEnvelope.payload }, null, 2)}\n`,
+      );
+      await expect(store.read(attackerToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      await fs.writeFile(store.recordPath(swappedToken), victimRaw, { mode: 0o600 });
+      await expect(store.read(swappedToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      const modifiedPayload = JSON.parse(
+        Buffer.from(victimEnvelope.payload, "base64").toString("utf8"),
+      ) as { runtime: { chromeTargetId?: string } };
+      modifiedPayload.runtime.chromeTargetId = "forged-target";
+      await fs.writeFile(
+        store.recordPath(victimToken),
+        `${JSON.stringify(
+          {
+            ...victimEnvelope,
+            payload: Buffer.from(`${JSON.stringify(modifiedPayload, null, 2)}\n`).toString(
+              "base64",
+            ),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      await expect(store.read(victimToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      const quarantined = (await fs.readdir(directory)).filter((name) =>
+        name.endsWith(".quarantine"),
+      );
+      expect(quarantined).toHaveLength(3);
+      expect(quarantined).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(attackerToken),
+          expect.stringContaining(swappedToken),
+          expect.stringContaining(victimToken),
+        ]),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("quarantines unsigned legacy and wrong-key records without cleanup", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-quarantine-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const wrongKeyPath = path.join(root, "other-protected", "record-integrity.key");
+    const unsignedToken = "8".repeat(64);
+    const wrongKeyToken = "9".repeat(64);
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        terminalRetentionMs: 1,
+        now: () => now,
+      });
+      await begin(store, unsignedToken, "unsigned-run");
+      await store.beginArtifactNamespaceInitialization({
+        transactionToken: unsignedToken,
+        runId: "unsigned-run",
+      });
+      await store.bindArtifactNamespaceIdentity({
+        transactionToken: unsignedToken,
+        runId: "unsigned-run",
+        identity: { device: "1", inode: "2", birthtimeNs: "3" },
+      });
+      await store.completeArtifactNamespaceInitialization({
+        transactionToken: unsignedToken,
+        runId: "unsigned-run",
+      });
+      await store.recordRecoverableFailure({
+        transactionToken: unsignedToken,
+        error: failure(false),
+      });
+      const signedEnvelope = JSON.parse(
+        await readFile(store.recordPath(unsignedToken), "utf8"),
+      ) as { payload: string };
+      const unsignedBytes = Buffer.from(signedEnvelope.payload, "base64");
+      await fs.writeFile(store.recordPath(unsignedToken), unsignedBytes);
+      const cleanup = vi.fn(async () => true);
+      store.registerArtifactNamespaceCleanup(cleanup);
+      now += 2;
+      await expect(store.list()).resolves.toEqual([]);
+      expect(cleanup).not.toHaveBeenCalled();
+      const unsignedQuarantine = (await fs.readdir(directory)).find(
+        (name) => name.includes(unsignedToken) && name.endsWith(".quarantine"),
+      );
+      if (!unsignedQuarantine) throw new Error("missing unsigned record quarantine");
+      await expect(fs.readFile(path.join(directory, unsignedQuarantine))).resolves.toEqual(
+        unsignedBytes,
+      );
+
+      const originalStore = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(originalStore, wrongKeyToken, "wrong-key-run");
+      await originalStore.journalRuntime(wrongKeyToken, runtime);
+      const wrongKeyBytes = await fs.readFile(originalStore.recordPath(wrongKeyToken));
+      await fs.mkdir(path.dirname(wrongKeyPath), { recursive: true, mode: 0o700 });
+      await fs.writeFile(wrongKeyPath, Buffer.alloc(32, 0x5a), { mode: 0o600 });
+      const wrongKeyStore = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath: wrongKeyPath,
+      });
+      await expect(wrongKeyStore.list()).resolves.toEqual([]);
+      const wrongKeyQuarantine = (await fs.readdir(directory)).find(
+        (name) => name.includes(wrongKeyToken) && name.endsWith(".quarantine"),
+      );
+      if (!wrongKeyQuarantine) throw new Error("missing wrong-key record quarantine");
+      await expect(fs.readFile(path.join(directory, wrongKeyQuarantine))).resolves.toEqual(
+        wrongKeyBytes,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "rejects an integrity key whose mode is no longer 0600",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-key-mode-"));
+      const directory = path.join(root, "transactions");
+      const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+      const transactionToken = "c".repeat(64);
+      try {
+        const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+        await begin(store, transactionToken);
+        const signedRecord = await readFile(store.recordPath(transactionToken));
+        await fs.chmod(integrityKeyPath, 0o640);
+
+        await expect(RemoteTransactionStore.open({ directory, integrityKeyPath })).rejects.toThrow(
+          "Remote transaction integrity key permissions must be 0600",
+        );
+        await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
+          signedRecord,
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("does not replace a missing integrity key while authenticated records remain", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-missing-key-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "b".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(store, transactionToken);
+      const signedRecord = await readFile(store.recordPath(transactionToken));
+      await fs.rm(integrityKeyPath);
+
+      await expect(RemoteTransactionStore.open({ directory, integrityKeyPath })).rejects.toThrow(
+        "Remote transaction integrity key is missing",
+      );
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(signedRecord);
+      await expect(fs.stat(integrityKeyPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a swapped store-root generation before reading signed authority", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-root-swap-"));
+    const directory = path.join(root, "transactions");
+    const displacedDirectory = path.join(root, "transactions-displaced");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "a".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(store, transactionToken);
+      const signedRecord = await readFile(store.recordPath(transactionToken));
+      await fs.rename(directory, displacedDirectory);
+      await fs.mkdir(directory, { mode: 0o700 });
+      await fs.writeFile(path.join(directory, `${transactionToken}.json`), signedRecord, {
+        mode: 0o600,
+      });
+
+      await expect(store.read(transactionToken)).rejects.toThrow(
+        "Remote transaction store root generation changed",
+      );
+      await expect(fs.readFile(path.join(directory, `${transactionToken}.json`))).resolves.toEqual(
+        signedRecord,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("expires authority atomically from the exact observed lease", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-expiry-store-"));
     let now = Date.parse("2026-01-01T00:00:00.000Z");
     const runtimeToken = "3".repeat(64);
     const preAuthorityToken = "4".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: root,
         leaseDurationMs: 1_000,
         now: () => now,
@@ -1240,7 +1537,7 @@ describe("RemoteTransactionStore", () => {
   test("enforces capacity and publishes begin records atomically without overwriting tokens", async () => {
     const capacityRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-capacity-store-"));
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: capacityRoot,
         maximumRecords: 1,
       });
@@ -1258,7 +1555,7 @@ describe("RemoteTransactionStore", () => {
 
     const byteRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-byte-store-"));
     try {
-      const store = await RemoteTransactionStore.open({ directory: byteRoot, maximumBytes: 64 });
+      const store = await openTransactionStore({ directory: byteRoot, maximumBytes: 64 });
       await expect(begin(store, "7".repeat(64))).rejects.toBeInstanceOf(
         RemoteTransactionCapacityError,
       );
@@ -1280,7 +1577,10 @@ describe("RemoteTransactionStore", () => {
     const { RemoteTransactionStore: IsolatedRemoteTransactionStore } =
       await import("../../src/remote/transactionStore.js");
     try {
-      const store = await IsolatedRemoteTransactionStore.open({ directory: atomicRoot });
+      const store = await IsolatedRemoteTransactionStore.open({
+        directory: atomicRoot,
+        integrityKeyPath: path.join(atomicRoot, ".test-integrity", "record.key"),
+      });
       await expect(
         store.begin({
           protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -1293,7 +1593,7 @@ describe("RemoteTransactionStore", () => {
       await expect(fs.access(store.recordPath(interruptedToken))).rejects.toMatchObject({
         code: "ENOENT",
       });
-      expect(await fs.readdir(atomicRoot)).toEqual([]);
+      expect(await fs.readdir(atomicRoot)).toEqual([".test-integrity"]);
 
       await store.begin({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -1325,7 +1625,7 @@ describe("RemoteTransactionStore", () => {
     const transactionToken = "f".repeat(64);
     let now = Date.parse("2026-01-01T00:00:00.000Z");
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTransactionStore({
         directory: root,
         terminalRetentionMs: 1_000,
         now: () => now,
@@ -1364,7 +1664,7 @@ describe("RemoteTransactionStore", () => {
       expect(raw).not.toContain("target-1");
 
       now += 1_001;
-      const reopened = await RemoteTransactionStore.open({
+      const reopened = await openTransactionStore({
         directory: root,
         terminalRetentionMs: 1_000,
         now: () => now,

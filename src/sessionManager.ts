@@ -130,6 +130,8 @@ export interface BrowserRemoteRecoveryMetadata {
 }
 export interface BrowserRecoveryTabLeaseMetadata {
   id: string;
+  /** Acquisition generation bound to the lease. Absent only on legacy recovery records. */
+  generationId?: string;
   profileDirectory: ProfileDirectoryIdentity;
 }
 export interface BrowserRecoveryTargetCloseCapabilityMetadata {

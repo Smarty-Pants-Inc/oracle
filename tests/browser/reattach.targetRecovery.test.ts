@@ -209,6 +209,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         ),
         createBrowserLogger(),
         {
+          ownerId: "test-owner",
           retainChromeEndpointAuthority,
           retainChromeBrowserWebSocketAuthority,
           closeChromeTargetWithExactAuthority,
@@ -264,6 +265,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         ),
         createBrowserLogger(),
         {
+          ownerId: "test-owner",
           retainChromeEndpointAuthority,
           retainChromeBrowserWebSocketAuthority,
           closeChromeTargetWithExactAuthority,
@@ -382,6 +384,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const release = vi.fn(async () => undefined);
     const capability = retainChromeTargetCloseCapability({
+      ownerId: "test-owner",
       generationId: "live-generation",
       targetId: "valid-target",
       close: async () => close(),
@@ -403,8 +406,12 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         acquisition: { generationId: "live-generation" },
       },
     );
-    const result = await finalizeRecoveredRuntime(runtime, createBrowserLogger(), {});
-    const replay = await finalizeRecoveredRuntime(runtime, createBrowserLogger(), {});
+    const result = await finalizeRecoveredRuntime(runtime, createBrowserLogger(), {
+      ownerId: "test-owner",
+    });
+    const replay = await finalizeRecoveredRuntime(runtime, createBrowserLogger(), {
+      ownerId: "test-owner",
+    });
 
     expect(result.status).toBe("completed");
     expect(replay.status).toBe("completed");
@@ -569,6 +576,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
           ),
           createBrowserLogger(),
           {
+            ownerId: "test-owner",
             terminateExactChromeForProfile,
           },
         );

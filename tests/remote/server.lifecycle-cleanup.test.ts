@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import {
   createRemoteServer,
@@ -45,6 +45,7 @@ import {
   prepareTestAuthentication,
   sendTestRequestBody,
 } from "./serverTestHttp.js";
+import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
@@ -113,9 +114,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           name.endsWith(".json"),
         );
         if (!recordName) throw new Error("missing durable remote transaction record");
-        await expect(
-          readFile(path.join(transactionStoreDir, recordName), "utf8"),
-        ).resolves.toContain(`"settlementMode": "${mode}"`);
+        const settledRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          recordName.slice(0, -".json".length),
+        );
+        expect(settledRecord).toMatchObject({ terminalAudit: { settlementMode: mode } });
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -201,13 +204,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           });
         });
         expect(finalize).not.toHaveBeenCalled();
-        const recordName = (await readdir(transactionStoreDir)).find((name) =>
-          name.endsWith(".json"),
+        const pendingRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
         );
-        if (!recordName) throw new Error("missing disconnected transaction record");
-        expect(
-          JSON.parse(await readFile(path.join(transactionStoreDir, recordName), "utf8")),
-        ).toMatchObject({ state: "pending", runtime: { chromeTargetId: "disconnect-target" } });
+        expect(pendingRecord).toMatchObject({
+          state: "pending",
+          runtime: { chromeTargetId: "disconnect-target" },
+        });
 
         await vi.waitFor(async () => {
           const settlement = await httpPostJson({
@@ -381,7 +385,6 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const tunnelStarted = Promise.withResolvers<void>();
       const transactionToken = "5".repeat(64);
       const rejectedTransactionToken = "6".repeat(64);
-      const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
       const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/graceful-drain-generation";
       const profileDir = path.join(tmpDir, "graceful-drain-profile");
       const baseChromeProcessIdentity = processIdentity(
@@ -460,14 +463,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       let hostPromise: Promise<void> | undefined;
       let hostSettled = false;
       let lockPresentAtTunnelStop: boolean | undefined;
-      let recordAtTunnelStop: Record<string, unknown> | undefined;
+      let recordAtTunnelStop: Promise<unknown> | undefined;
       let listenerProbeAtTunnelStop: Promise<unknown> | undefined;
       const stopTunnel = vi.fn(() => {
         lockPresentAtTunnelStop = existsSync(controllerLockPath);
-        recordAtTunnelStop = JSON.parse(readFileSync(recordPath, "utf8")) as Record<
-          string,
-          unknown
-        >;
+        recordAtTunnelStop = readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
         listenerProbeAtTunnelStop = httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
@@ -491,14 +494,18 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             ssh: "synthetic-bridge-host",
           },
           {
-            serveRemote: () =>
-              drainRemoteServerShutdown(server, shutdownRequested.promise, {
+            serveRemote: async (options, lifecycle) => {
+              const token = options?.token;
+              if (!token) throw new Error("missing bridge credential");
+              await lifecycle?.onReady?.({ port: server.port, token });
+              return drainRemoteServerShutdown(server, shutdownRequested.promise, {
                 logger: () => {},
                 retryDelayMs: 1,
-              }),
+              });
+            },
             startReverseTunnel: () => {
               tunnelStarted.resolve();
-              return { stop: stopTunnel };
+              return { ready: Promise.resolve(), stop: stopTunnel };
             },
           },
         );
@@ -568,7 +575,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await hostPromise;
         expect(stopTunnel).toHaveBeenCalledOnce();
         expect(lockPresentAtTunnelStop).toBe(false);
-        expect(recordAtTunnelStop).toMatchObject({
+        if (!recordAtTunnelStop) throw new Error("missing transaction read at tunnel teardown");
+        await expect(recordAtTunnelStop).resolves.toMatchObject({
           state: "pending",
           result: { answerText: "durable shutdown answer" },
           runtime: { chromeTargetId: "graceful-drain-target" },
@@ -609,6 +617,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       const targetCloseCapability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
         generationId: "manual-kept-generation",
         targetId,
         browserWSEndpoint,
@@ -647,6 +656,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const finalize = vi.fn(async () => {
         const closeResult = await closeChromeTargetWithRetainedCapability({
+          ownerId: "test-owner",
           capability: targetCloseCapability,
           targetId,
           logger: () => {},
@@ -716,8 +726,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(existsSync(controllerLockPath)).toBe(true);
         expect(closeTarget).not.toHaveBeenCalled();
         expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
-        const pendingRecord = JSON.parse(
-          await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+        const pendingRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
         );
         expect(pendingRecord).toMatchObject({
           state: "pending",
@@ -761,16 +772,19 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(liveFinalization.runtime).not.toHaveProperty("recoveryCleanupResources");
         await drain;
         expect(existsSync(controllerLockPath)).toBe(false);
-        const finalizedRecord = JSON.parse(
-          await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+        const finalizedRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
         );
         expect(finalizedRecord).toMatchObject({
           state: "finalized",
           finalization: { status: "completed" },
         });
         expect(finalizedRecord).not.toHaveProperty("runtime");
-        expect(finalizedRecord.finalization.runtime).not.toHaveProperty("chromeTargetId");
-        expect(finalizedRecord.finalization.runtime).not.toHaveProperty("recoveryCleanupResources");
+        expect(finalizedRecord?.finalization?.runtime).not.toHaveProperty("chromeTargetId");
+        expect(finalizedRecord?.finalization?.runtime).not.toHaveProperty(
+          "recoveryCleanupResources",
+        );
       } finally {
         shutdownRequested.resolve();
         if (server) {
@@ -784,6 +798,158 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           await drain?.catch(() => undefined);
           await server.close().catch(() => undefined);
         }
+        targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "settles store-only recoverable manual kept target authority before graceful shutdown",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recoverable-close-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const controllerLockPath = path.join(transactionStoreDir, ".controller.lock");
+      const controllerGeneration = "controller-with-live-recoverable-target";
+      const transactionToken = "7".repeat(64);
+      const targetId = "recoverable-manual-kept-target";
+      const browserWSEndpoint =
+        "ws://127.0.0.1:9222/devtools/browser/recoverable-manual-kept-generation";
+      const profileDir = path.join(tmpDir, "manual-profile");
+      const chromeProcessIdentity = processIdentity(
+        profileDir,
+        4328,
+        "10000000-0000-4000-8000-000000000008",
+      );
+      const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+      targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+      const targetCloseCapability = retainChromeTargetCloseCapability({
+        ownerId: "test-owner",
+        generationId: "recoverable-manual-kept-generation",
+        targetId,
+        browserWSEndpoint,
+        close: closeTarget,
+      });
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: chromeProcessIdentity.pid,
+        chromeProcessIdentity,
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
+        chromeTargetId: targetId,
+        recoveryCleanupResources: [
+          {
+            chromePid: chromeProcessIdentity.pid,
+            chromeProcessIdentity,
+            profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            chromeTargetId: targetId,
+            targetCloseCapability,
+            acquisition: { generationId: "recoverable-manual-kept-generation" },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "manual-login",
+              keepBrowser: true,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const seededStore = await RemoteTransactionStore.open({
+        directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
+        controllerGeneration,
+      });
+      await seededStore.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "recoverable-manual-kept-run",
+        createdAt: new Date().toISOString(),
+        requestIdentity: {
+          acceptedPromptSha256: ["a".repeat(64)],
+          followUpOrdinal: 0,
+          remainingFollowUps: 0,
+        },
+        browserConfig: { chatgptUrl: "https://chatgpt.com/" },
+      });
+      await seededStore.journalRuntime(transactionToken, runtime);
+      await seededStore.recordRecoverableFailure({
+        transactionToken,
+        runtime,
+        error: {
+          name: "BrowserAutomationError",
+          category: "browser-automation",
+          message: "capture failed before durable publication",
+          stage: "wait-for-answer",
+          recoverableDisconnect: true,
+        },
+      });
+      const retryCleanup = vi.fn(
+        async (
+          cleanupRuntime: BrowserRunTransaction["runtime"],
+          _logger: unknown,
+          _deps: unknown,
+          mode?: "finalize" | "abort",
+        ) => {
+          expect(mode).toBe("abort");
+          const closeResult = await closeChromeTargetWithRetainedCapability({
+            ownerId: "test-owner",
+            capability: targetCloseCapability,
+            targetId,
+            logger: () => {},
+          });
+          if (closeResult.status !== "completed" && closeResult.status !== "gone") {
+            return pendingBrowserCaptureCleanup(cleanupRuntime, closeResult.reason, "abort");
+          }
+          const settledRuntime = { ...cleanupRuntime };
+          delete settledRuntime.chromeTargetId;
+          return completedBrowserCaptureCleanup(settledRuntime);
+        },
+      );
+      let server: RemoteServerInstance | undefined;
+
+      try {
+        server = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+          { transactionStoreDir, controllerGeneration, retryCleanup },
+        );
+        expect(existsSync(controllerLockPath)).toBe(true);
+        expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
+
+        await drainRemoteServerShutdown(server, Promise.resolve(), {
+          logger: () => {},
+          retryDelayMs: 1,
+        });
+
+        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(closeTarget).toHaveBeenCalledOnce();
+        expect(existsSync(controllerLockPath)).toBe(false);
+        const terminalRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
+        expect(terminalRecord).toMatchObject({
+          state: "aborted",
+          terminalAudit: { settlementMode: "abort" },
+          finalization: { status: "completed" },
+        });
+        expect(terminalRecord).not.toHaveProperty("runtime");
+        expect(terminalRecord?.finalization?.runtime).not.toHaveProperty("chromeTargetId");
+        expect(terminalRecord?.finalization?.runtime).not.toHaveProperty(
+          "recoveryCleanupResources",
+        );
+      } finally {
+        await server?.close().catch(() => undefined);
         targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
         await rm(tmpDir, { recursive: true, force: true });
       }
@@ -928,24 +1094,27 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
 
         if (!hostArtifactPath) throw new Error("Missing restart artifact path");
-        const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
-        const pendingBeforeClose = await readFile(recordPath, "utf8");
-        const pendingRecord = JSON.parse(pendingBeforeClose);
-        expect(pendingRecord).toMatchObject({
+        const pendingBeforeClose = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
+        expect(pendingBeforeClose).toMatchObject({
           state: "pending",
           result: { answerText: "restart-safe answer" },
           runtime: { chromeTargetId: "shutdown-handoff-target" },
           artifacts: [{ canonicalPath: await realpath(hostArtifactPath) }],
         });
-        expect(pendingRecord).not.toHaveProperty("settlementMode");
-        expect(pendingRecord).not.toHaveProperty("publicationAcknowledgedAt");
-        expect(pendingRecord).not.toHaveProperty("finalization");
+        expect(pendingBeforeClose).not.toHaveProperty("settlementMode");
+        expect(pendingBeforeClose).not.toHaveProperty("publicationAcknowledgedAt");
+        expect(pendingBeforeClose).not.toHaveProperty("finalization");
 
         await first.close();
         first = undefined;
         expect(finalize).not.toHaveBeenCalled();
         expect(abort).not.toHaveBeenCalled();
-        await expect(readFile(recordPath, "utf8")).resolves.toBe(pendingBeforeClose);
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toEqual(pendingBeforeClose);
 
         const retryCleanup = vi.fn(
           async (
@@ -988,7 +1157,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(resumed.answerText).toBe("restart-safe answer");
         expect(resumed.artifacts).toHaveLength(1);
         await expect(readFile(resumed.artifacts![0]!.path)).resolves.toEqual(emptyZip);
-        const deliveredRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        const deliveredRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
         expect(deliveredRecord).toMatchObject({
           state: "pending",
           result: { answerText: "restart-safe answer" },
@@ -1007,7 +1179,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           name: "BrowserAutomationError",
           details: { code: "settlement-mode-conflict" },
         });
-        const finalizedRecord = JSON.parse(await readFile(recordPath, "utf8"));
+        const finalizedRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          transactionToken,
+        );
         expect(finalizedRecord).toMatchObject({
           state: "finalized",
           terminalAudit: {
@@ -1118,8 +1293,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           name.endsWith(".json"),
         );
         if (!recordName) throw new Error("missing durable remote transaction record");
-        const partialRecord = JSON.parse(
-          await readFile(path.join(transactionStoreDir, recordName), "utf8"),
+        const partialRecord = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          recordName.slice(0, -".json".length),
         );
         expect(partialRecord).toMatchObject({
           state: "pending",

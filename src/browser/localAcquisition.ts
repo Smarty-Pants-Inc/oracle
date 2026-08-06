@@ -74,6 +74,7 @@ export async function acquireLocalBrowserResources({
     : await mkdtemp(path.join(await resolveUserDataBaseDir(), "oracle-browser-"));
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const generationId = randomUUID();
+  const resourceOwnerId = options.sessionId?.trim() || randomUUID();
   const launchClaim = createChromeProcessLaunchClaim(generationId);
   const ownerDisposition: ChromeOwnerDisposition = effectiveKeepBrowser
     ? "preserve"
@@ -95,6 +96,7 @@ export async function acquireLocalBrowserResources({
 
     const profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
     resourceAuthority = new LocalOwnedBrowserResourceAuthority({
+      ownerId: resourceOwnerId,
       purpose: "Local ChatGPT",
       targetLabel: "Owned Chrome",
       userDataDir,
@@ -121,7 +123,7 @@ export async function acquireLocalBrowserResources({
           }
         : {}),
       settleRemainingResources: (mode, runtime) =>
-        finalizeRecoveredRuntime(runtime, logger, {}, mode),
+        finalizeRecoveredRuntime(runtime, logger, { ownerId: resourceOwnerId }, mode),
     });
 
     if (manualLogin) {
@@ -132,7 +134,8 @@ export async function acquireLocalBrowserResources({
             maxConcurrentTabs: config.maxConcurrentTabs,
             timeoutMs: config.timeoutMs,
             logger,
-            sessionId: options.sessionId,
+            sessionId: resourceOwnerId,
+            generationId,
             leaseId,
           }),
         authority: (lease) => lease,
@@ -176,6 +179,30 @@ export async function acquireLocalBrowserResources({
       },
       authority: (authority) => authority,
     });
+    if (!resourceAuthority || !processAuthority) {
+      throw new Error("Chrome acquisition completed without resource authority.");
+    }
+    const chrome = resourceAuthority.acquiredChrome();
+    const chromeOwnerDisposition =
+      processAuthority.kind === "manual" ? processAuthority.owner.disposition : ownerDisposition;
+    const chromeHost = chrome.host ?? "127.0.0.1";
+    const tabLease = resourceAuthority.acquiredLease();
+    if (tabLease) {
+      await tabLease.update({ chromeHost, chromePort: chrome.port });
+    }
+
+    return {
+      config,
+      manualLogin,
+      profileIsPreSigned,
+      userDataDir,
+      effectiveKeepBrowser,
+      resourceAuthority,
+      chrome,
+      chromeOwnerDisposition,
+      chromeHost,
+      tabLease,
+    };
   } catch (error) {
     if (!resourceAuthority) throw error;
     let cleanup: BrowserCaptureFinalizationResult;
@@ -211,29 +238,4 @@ export async function acquireLocalBrowserResources({
     }
     throw error;
   }
-
-  if (!resourceAuthority || !processAuthority) {
-    throw new Error("Chrome acquisition completed without resource authority.");
-  }
-  const chrome = resourceAuthority.acquiredChrome();
-  const chromeOwnerDisposition =
-    processAuthority.kind === "manual" ? processAuthority.owner.disposition : ownerDisposition;
-  const chromeHost = chrome.host ?? "127.0.0.1";
-  const tabLease = resourceAuthority.acquiredLease();
-  if (tabLease) {
-    await tabLease.update({ chromeHost, chromePort: chrome.port });
-  }
-
-  return {
-    config,
-    manualLogin,
-    profileIsPreSigned,
-    userDataDir,
-    effectiveKeepBrowser,
-    resourceAuthority,
-    chrome,
-    chromeOwnerDisposition,
-    chromeHost,
-    tabLease,
-  };
 }

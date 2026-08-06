@@ -1163,8 +1163,7 @@ bridgeCommand
   )
   .option(
     "--token <64-lowercase-hex|auto>",
-    "Modern v3 HMAC root key: auto or exactly 64 lowercase hexadecimal characters (32 bytes).",
-    "auto",
+    "Modern v3 HMAC root key: auto or exactly 64 lowercase hexadecimal characters (32 bytes; default auto).",
   )
   .option(
     "--legacy-token <64-lowercase-hex>",
@@ -1184,6 +1183,7 @@ bridgeCommand
   .option("--ssh-extra-args <args>", "Extra args passed to ssh (quoted string).")
   .option("--background", "Run the host in the background and write pid/log files.", false)
   .option("--foreground", "Run the host in the foreground (default).", false)
+  .addOption(new Option("--background-child").default(false).hideHelp())
   .option("--print", "Print the client connection string (includes token).", false)
   .option("--print-token", "Print only the token.", false)
   .action(async (commandOptions) => {
@@ -1914,21 +1914,6 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     }
   };
   applyRetentionOption();
-
-  const remoteConfig = resolveRemoteServiceConfig({
-    cliHost: options.remoteHost,
-    cliToken: options.remoteToken,
-    cliLegacyToken: options.remoteLegacyToken,
-    cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
-    userConfig,
-    env: process.env,
-    validate: false,
-  });
-  const remoteHost = remoteConfig.host;
-  const remoteToken = remoteConfig.token;
-  const remoteLegacyToken = remoteConfig.legacyToken;
-  const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
-
   if (routingCliArgs.length === 0) {
     console.log(
       chalk.yellow(
@@ -1945,7 +1930,27 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   if (options.dryRun && renderMarkdown) {
     throw new Error("--dry-run cannot be combined with --render-markdown.");
   }
+  if (options.status || options.session || renderMarkdown || copyMarkdown) {
+    const retentionHours =
+      typeof options.retainHours === "number" ? options.retainHours : undefined;
+    await sessionStore.ensureStorage();
+    await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));
+  }
+  if (options.status) {
+    const { attachSession, showStatus } = await import("../src/cli/sessionDisplay.js");
+    if (options.session) {
+      await attachSession(options.session);
+    } else {
+      await showStatus({ hours: 24, includeAll: false, limit: 100, showExamples: true });
+    }
+    return;
+  }
 
+  if (options.session) {
+    const { attachSession } = await import("../src/cli/sessionDisplay.js");
+    await attachSession(options.session);
+    return;
+  }
   if (!multiModelProvided && optionUsesDefault("model") && userConfig.model) {
     options.model = userConfig.model;
   }
@@ -1961,6 +1966,76 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   if (optionUsesDefault("baseUrl") && userConfig.apiBaseUrl) {
     options.baseUrl = userConfig.apiBaseUrl;
   }
+  if (renderMarkdown || copyMarkdown) {
+    if (!options.prompt) {
+      throw new Error("Prompt is required when using --render-markdown or --copy-markdown.");
+    }
+    const bundle = await buildMarkdownBundle(
+      { prompt: options.prompt, file: options.file, system: options.system },
+      { cwd: process.cwd() },
+    );
+    const renderModel = resolveApiModel(
+      multiModelProvided
+        ? options.models![0]!
+        : normalizeModelOption(options.model) || DEFAULT_MODEL,
+    );
+    const modelConfig = isKnownModel(renderModel)
+      ? MODEL_CONFIGS[renderModel]
+      : MODEL_CONFIGS["gpt-5.1"];
+    const { buildRequestBody } = await import("../src/oracle/request.js");
+    const { estimateRequestTokens } = await import("../src/oracle/tokenEstimate.js");
+    const requestBody = buildRequestBody({
+      modelConfig,
+      systemPrompt: bundle.systemPrompt,
+      userPrompt: bundle.promptWithFiles,
+      searchEnabled: options.search !== false,
+      background: false,
+      storeResponse: false,
+    });
+    const estimatedTokens = estimateRequestTokens(requestBody, modelConfig);
+    const warnThreshold = Math.min(196_000, modelConfig.inputLimit ?? 196_000);
+    warnIfOversizeBundle(estimatedTokens, warnThreshold, console.log);
+    if (renderMarkdown) {
+      const output = renderPlain
+        ? bundle.markdown
+        : await formatRenderedMarkdown(bundle.markdown, { richTty: isTty });
+      // Trim trailing newlines from the rendered bundle so we print exactly one blank before the summary line.
+      console.log(output.replace(/\n+$/u, ""));
+    }
+    if (copyMarkdown) {
+      const result = await copyToClipboard(bundle.markdown);
+      if (result.success) {
+        const filesPart = bundle.files.length > 0 ? `; ${bundle.files.length} files` : "";
+        const summary = `Copied markdown to clipboard (~${formatCompactNumber(estimatedTokens)} tokens${filesPart}).`;
+        console.log(chalk.green(summary));
+      } else {
+        const reason =
+          result.error instanceof Error
+            ? result.error.message
+            : String(result.error ?? "unknown error");
+        console.log(
+          chalk.dim(
+            `Copy failed (${reason}); markdown not printed. Re-run with --render-markdown if you need the content.`,
+          ),
+        );
+      }
+    }
+    return;
+  }
+
+  const remoteConfig = resolveRemoteServiceConfig({
+    cliHost: options.remoteHost,
+    cliToken: options.remoteToken,
+    cliLegacyToken: options.remoteLegacyToken,
+    cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
+    userConfig,
+    env: process.env,
+    validate: false,
+  });
+  const remoteHost = remoteConfig.host;
+  const remoteToken = remoteConfig.token;
+  const remoteLegacyToken = remoteConfig.legacyToken;
+  const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
 
   const providerMode = resolveApiProviderMode(options);
   const engineModels = multiModelProvided
@@ -2131,7 +2206,6 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     throw new Error("--remote-host does not support --models yet. Use API engine locally instead.");
   }
   if (engine === "browser" && remoteHost) {
-    validateResolvedRemoteServiceConfig(remoteConfig);
     console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
   }
   const resolvedModel: ModelName =
@@ -2163,77 +2237,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   resolvedOptions.provider = providerMode;
   resolvedOptions.writeOutputPath = resolveOutputPath(options.writeOutput, process.cwd());
 
-  if (options.status) {
-    const { attachSession, showStatus } = await import("../src/cli/sessionDisplay.js");
-    if (options.session) {
-      await attachSession(options.session);
-    } else {
-      await showStatus({ hours: 24, includeAll: false, limit: 100, showExamples: true });
-    }
-    return;
-  }
-
-  if (options.session) {
-    const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(options.session);
-    return;
-  }
-
   if (options.execSession) {
     await waitForDetachedStartGate();
     await executeSession(options.execSession);
-    return;
-  }
-
-  if (renderMarkdown || copyMarkdown) {
-    if (!options.prompt) {
-      throw new Error("Prompt is required when using --render-markdown or --copy-markdown.");
-    }
-    const bundle = await buildMarkdownBundle(
-      { prompt: options.prompt, file: options.file, system: options.system },
-      { cwd: process.cwd() },
-    );
-    const modelConfig = isKnownModel(resolvedModel)
-      ? MODEL_CONFIGS[resolvedModel]
-      : MODEL_CONFIGS["gpt-5.1"];
-    const { buildRequestBody } = await import("../src/oracle/request.js");
-    const { estimateRequestTokens } = await import("../src/oracle/tokenEstimate.js");
-    const requestBody = buildRequestBody({
-      modelConfig,
-      systemPrompt: bundle.systemPrompt,
-      userPrompt: bundle.promptWithFiles,
-      searchEnabled: options.search !== false,
-      background: false,
-      storeResponse: false,
-    });
-    const estimatedTokens = estimateRequestTokens(requestBody, modelConfig);
-    const warnThreshold = Math.min(196_000, modelConfig.inputLimit ?? 196_000);
-    warnIfOversizeBundle(estimatedTokens, warnThreshold, console.log);
-    if (renderMarkdown) {
-      const output = renderPlain
-        ? bundle.markdown
-        : await formatRenderedMarkdown(bundle.markdown, { richTty: isTty });
-      // Trim trailing newlines from the rendered bundle so we print exactly one blank before the summary line.
-      console.log(output.replace(/\n+$/u, ""));
-    }
-    if (copyMarkdown) {
-      const result = await copyToClipboard(bundle.markdown);
-      if (result.success) {
-        const filesPart = bundle.files.length > 0 ? `; ${bundle.files.length} files` : "";
-        const summary = `Copied markdown to clipboard (~${formatCompactNumber(estimatedTokens)} tokens${filesPart}).`;
-        console.log(chalk.green(summary));
-      } else {
-        const reason =
-          result.error instanceof Error
-            ? result.error.message
-            : String(result.error ?? "unknown error");
-        console.log(
-          chalk.dim(
-            `Copy failed (${reason}); markdown not printed. Re-run with --render-markdown if you need the content.`,
-          ),
-        );
-      }
-    }
     return;
   }
 
@@ -2409,6 +2415,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
       executeBrowser: createRemoteBrowserExecutor({
         host: remoteHost,
@@ -2806,7 +2813,6 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     throw new Error("--remote-host requires a browser session.");
   }
   if (remoteHost) {
-    validateResolvedRemoteServiceConfig(remoteConfig);
     console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
   }
   if (remoteHost && waitPreference === false) {
@@ -2817,6 +2823,7 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
     const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
       executeBrowser: createRemoteBrowserExecutor({
         host: remoteHost,

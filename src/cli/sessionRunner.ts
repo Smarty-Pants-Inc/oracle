@@ -149,14 +149,19 @@ export async function performSessionRun({
       (sessionMeta.status === "running" || sessionMeta.status === "error") &&
       !restartControllerAlive &&
       !restartWorkerAlive;
-    const hasAcquisitionOnlyRestart =
+    const hasCleanupOnlyRestart =
       mode === "browser" &&
       staleRestartLifecycle &&
-      hasPendingChromeAcquisitionIntent(restartRuntime) &&
+      Boolean(
+        restartRuntime?.recoveryCleanupResources?.length && restartRuntime.recoveryCleanupResult,
+      ) &&
       !hasRemoteRecoveryAuthority(restartRuntime) &&
       !hasRecoverableChatGptConversation(restartRuntime);
-    if (hasAcquisitionOnlyRestart && restartRuntime) {
-      if (!hasExactPendingChromeAcquisitionAuthority(restartRuntime)) {
+    if (hasCleanupOnlyRestart && restartRuntime) {
+      if (
+        hasPendingChromeAcquisitionIntent(restartRuntime) &&
+        !hasExactPendingChromeAcquisitionAuthority(restartRuntime)
+      ) {
         throw new BrowserAutomationError(
           "Refusing browser restart because pending Chrome acquisition authority is incomplete or malformed.",
           {
@@ -173,7 +178,7 @@ export async function performSessionRun({
         { verbose: true },
       );
       const sessionPaths = await sessionStore.getPaths(sessionMeta.id);
-      const recoveryMode = "abort";
+      const recoveryMode = restartRuntime.recoveryCleanupResult?.settlementMode ?? "abort";
       const persistRecovery = async (result: BrowserCaptureFinalizationResult) => {
         await sessionStore.updateSession(sessionMeta.id, {
           browser: {
@@ -188,6 +193,7 @@ export async function performSessionRun({
         restartRuntime,
         recoveryLogger,
         {
+          ownerId: sessionMeta.id,
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
           recoveryCleanup: { retainChromeEndpointAuthority },
           isRemotePublicationAcknowledged: () => false,

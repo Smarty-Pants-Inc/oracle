@@ -93,7 +93,11 @@ test("preserves an in-flight Project Sources target after recovery capability lo
     });
 
     await expect(
-      projectSourcesRecovery.retryPendingProjectSourcesCleanup(() => undefined),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(
+        () => undefined,
+        undefined,
+        "test-owner",
+      ),
     ).rejects.toThrow(/cleanup remains retryable/i);
     expect(retainChromeEndpointAuthority).not.toHaveBeenCalled();
     expect(listChromeTargetsWithExactAuthority).not.toHaveBeenCalled();

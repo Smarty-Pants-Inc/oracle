@@ -274,6 +274,111 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("blocks replacement acquisition while cleanup-only lease and process settlement is pending", async () => {
+    const acquisitionRuntime = createPendingChromeAcquisitionRuntime();
+    const resource = acquisitionRuntime.recoveryCleanupResources?.[0];
+    const acquisition = resource?.acquisition;
+    const profileDirectory = resource?.profileDirectoryIdentity;
+    const launchClaim = acquisition?.processLaunchClaim;
+    if (!resource || !acquisition || !profileDirectory || !launchClaim) {
+      throw new Error("Missing exact cleanup-only acquisition fixture");
+    }
+    const acquiredAcquisition = { ...acquisition };
+    delete acquiredAcquisition.pendingResource;
+    acquiredAcquisition.processOwnerProvenance = "manual-canonical-owner";
+    const normalizedUserDataDir =
+      process.platform === "win32"
+        ? profileDirectory.canonicalPath.toLowerCase()
+        : profileDirectory.canonicalPath;
+    const processIdentity = {
+      pid: acquisitionRuntime.chromePid ?? 7_777,
+      processStartTime: "cleanup-only-process-generation",
+      executablePath:
+        process.platform === "win32"
+          ? String.raw`c:\program files\google\chrome\application\chrome.exe`
+          : process.platform === "darwin"
+            ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            : "/usr/bin/google-chrome",
+      normalizedUserDataDir,
+      launchNonce: launchClaim.nonce,
+      launchClaim,
+      profileDirectory,
+    };
+    const cleanupOnlyRuntime: BrowserRuntimeMetadata = {
+      ...acquisitionRuntime,
+      chromePort: 9222,
+      chromeProcessIdentity: processIdentity,
+      recoveryCleanupResources: [
+        {
+          ...resource,
+          chromePort: 9222,
+          chromeProcessIdentity: processIdentity,
+          tabLease: { id: "cleanup-only-lease", profileDirectory },
+          acquisition: acquiredAcquisition,
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: false,
+          },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        error: "lease endpoint update abort remains pending",
+        settlementMode: "abort",
+      },
+    };
+    vi.mocked(settleBrowserRecoveryCleanup).mockResolvedValueOnce({
+      finalization: {
+        status: "pending",
+        runtime: cleanupOnlyRuntime,
+        error: "lease endpoint update abort remains pending",
+      },
+      persistence: { status: "persisted" },
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: {
+          ...baseSessionMeta,
+          status: "error",
+          mode: "browser",
+          browser: { config: { chromePath: null }, runtime: cleanupOnlyRuntime },
+        },
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/acquisition cleanup remains pending/i);
+
+    expect(sessionStoreMock.updateSession.mock.calls[0]?.[1]).toMatchObject({
+      browser: { runtime: cleanupOnlyRuntime },
+    });
+    expect(settleBrowserRecoveryCleanup).toHaveBeenCalledWith(
+      cleanupOnlyRuntime,
+      expect.any(Function),
+      expect.any(Object),
+      "abort",
+    );
+    expect(runBrowserSessionExecution).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime: cleanupOnlyRuntime },
+      error: {
+        category: "browser-automation",
+        details: {
+          code: "browser-acquisition-cleanup-pending",
+          runtime: cleanupOnlyRuntime,
+        },
+      },
+    });
+  });
+
   test("rejects PID-only acquisition state without starting recovery or a replacement browser", async () => {
     const pendingRuntime = createPendingChromeAcquisitionRuntime();
     const resource = pendingRuntime.recoveryCleanupResources?.[0];
