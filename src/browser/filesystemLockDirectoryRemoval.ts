@@ -56,6 +56,10 @@ interface IsolatedDirectoryCleanupCompletion extends IsolatedDirectoryCleanupJou
 export interface IsolatedDirectoryRemovalDeps {
   afterChildAttestation?: (rootPath: string) => void | Promise<void>;
   verifyGenerationForRemoval?: (generationPath: string) => Promise<boolean>;
+  assertParentAuthority?: () => Promise<void>;
+}
+async function assertParentAuthority(deps: IsolatedDirectoryRemovalDeps): Promise<void> {
+  await deps.assertParentAuthority?.();
 }
 
 interface InFlightIsolatedDirectoryRemoval {
@@ -76,6 +80,7 @@ export async function isolateDirectoryGenerationForRemoval(
   candidatePath: string,
   verifyGeneration: (generationPath: string) => Promise<boolean>,
   replayKey = candidatePath,
+  deps: IsolatedDirectoryRemovalDeps = {},
 ): Promise<
   | { status: "isolated"; rootPath: string; generationPath: string }
   | { status: "missing" }
@@ -87,42 +92,49 @@ export async function isolateDirectoryGenerationForRemoval(
   if (path.dirname(canonicalReplayKey) !== parentPath) {
     throw new Error(`Isolated cleanup replay key escapes its parent directory: ${replayKey}`);
   }
+  await assertParentAuthority(deps);
   const rootPath = await mkdtemp(
     path.join(parentPath, isolatedDirectoryRemovalRootPrefix(canonicalReplayKey)),
   );
+  await assertParentAuthority(deps);
   const preparation = Promise.withResolvers<void>();
   inFlightIsolatedDirectoryPreparations.set(rootPath, preparation.promise);
   try {
     try {
       await chmod(rootPath, 0o700);
     } catch (error) {
-      await removeFreshEmptyIsolationRoot(rootPath);
+      await removeFreshEmptyIsolationRoot(rootPath, deps);
       throw error;
     }
 
-    const rootIdentity = await capturePhysicalDirectoryIdentity(rootPath);
+    const rootIdentity = await inspectRequiredIsolatedDirectoryIdentity(rootPath, deps);
     let generationIdentity: IsolatedDirectoryIdentity;
     try {
-      generationIdentity = await capturePhysicalDirectoryIdentity(canonicalCandidatePath);
+      generationIdentity = await inspectRequiredIsolatedDirectoryIdentity(
+        canonicalCandidatePath,
+        deps,
+      );
     } catch (error) {
-      await removeFreshEmptyIsolationRoot(rootPath);
+      await removeFreshEmptyIsolationRoot(rootPath, deps);
       if (readErrorCode(error) === "ENOENT") return { status: "missing" };
       throw error;
     }
 
     let matches: boolean;
     try {
+      await assertParentAuthority(deps);
       matches = await verifyGeneration(canonicalCandidatePath);
     } catch (error) {
-      await removeFreshEmptyIsolationRoot(rootPath);
+      await removeFreshEmptyIsolationRoot(rootPath, deps);
       throw error;
     }
     const candidateAfterVerification = await inspectIsolatedDirectoryIdentity(
       canonicalCandidatePath,
       generationIdentity,
+      deps,
     );
     if (!matches || candidateAfterVerification !== "matches") {
-      await removeFreshEmptyIsolationRoot(rootPath);
+      await removeFreshEmptyIsolationRoot(rootPath, deps);
       return candidateAfterVerification === "missing"
         ? { status: "missing" }
         : { status: "changed" };
@@ -137,17 +149,18 @@ export async function isolateDirectoryGenerationForRemoval(
       generationName: ISOLATED_REMOVAL_GENERATION_NAME,
       generationIdentity,
     };
-    await persistIsolatedDirectoryCleanupJournal(journal);
-    if ((await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches") {
+    await persistIsolatedDirectoryCleanupJournal(journal, deps);
+    if ((await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity, deps)) !== "matches") {
       throw new Error(`Isolated cleanup root changed before generation move: ${rootPath}`);
     }
 
     const generationPath = path.join(rootPath, ISOLATED_REMOVAL_GENERATION_NAME);
     try {
+      await assertParentAuthority(deps);
       await renameLockPath(canonicalCandidatePath, generationPath);
     } catch (error) {
       try {
-        await removeIsolatedDirectoryGenerationNow(rootPath);
+        await removeIsolatedDirectoryGenerationNow(rootPath, deps);
       } catch (cleanupError) {
         throw new AggregateError(
           [error, cleanupError],
@@ -157,19 +170,23 @@ export async function isolateDirectoryGenerationForRemoval(
       if (readErrorCode(error) === "ENOENT") return { status: "missing" };
       throw error;
     }
+    await assertParentAuthority(deps);
 
     try {
       await syncDirectory(rootPath);
       await syncDirectory(parentPath);
       if (
-        (await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches" ||
-        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
+        (await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity, deps)) !== "matches" ||
+        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity, deps)) !==
+          "matches"
       ) {
         throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
       }
+      await assertParentAuthority(deps);
       matches = await verifyGeneration(generationPath);
       if (
-        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
+        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity, deps)) !==
+        "matches"
       ) {
         throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
       }
@@ -179,6 +196,7 @@ export async function isolateDirectoryGenerationForRemoval(
         rootPath,
         generationPath,
         journal,
+        deps,
       );
       throw error;
     }
@@ -188,6 +206,7 @@ export async function isolateDirectoryGenerationForRemoval(
         rootPath,
         generationPath,
         journal,
+        deps,
       );
       return { status: "changed" };
     }
@@ -220,10 +239,12 @@ function removeIsolatedDirectoryGenerationNow(
   const existing = inFlightIsolatedDirectoryRemovals.get(canonicalRootPath);
   if (existing !== undefined) return existing.removal;
 
-  const authority = readIsolatedDirectoryCleanupAuthority(canonicalRootPath);
+  const authority = readIsolatedDirectoryCleanupAuthority(canonicalRootPath, deps);
   const removal: Promise<void> = authority.then(async (journal) => {
     if (journal === null) return;
+    await assertParentAuthority(deps);
     await removeAuthorizedIsolatedDirectoryGeneration(canonicalRootPath, journal, deps);
+    await assertParentAuthority(deps);
   });
   const entry = { removal };
   inFlightIsolatedDirectoryRemovals.set(canonicalRootPath, entry);
@@ -238,20 +259,27 @@ function removeIsolatedDirectoryGenerationNow(
 
 async function readIsolatedDirectoryCleanupAuthority(
   canonicalRootPath: string,
+  deps: IsolatedDirectoryRemovalDeps,
 ): Promise<IsolatedDirectoryCleanupJournal | null> {
   const journalPath = isolatedDirectoryCleanupJournalPath(canonicalRootPath);
   const completionPath = isolatedDirectoryCleanupCompletionPath(canonicalRootPath);
   let journal: IsolatedDirectoryCleanupJournal;
   try {
+    await assertParentAuthority(deps);
     journal = await readIsolatedDirectoryCleanupJournal(journalPath);
+    await assertParentAuthority(deps);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
     try {
+      await assertParentAuthority(deps);
       journal = await readIsolatedDirectoryCleanupCompletion(completionPath);
+      await assertParentAuthority(deps);
     } catch (completionError) {
       if (readErrorCode(completionError) === "ENOENT") {
         try {
+          await assertParentAuthority(deps);
           await lstat(canonicalRootPath);
+          await assertParentAuthority(deps);
         } catch (rootError) {
           if (readErrorCode(rootError) === "ENOENT") return null;
           throw rootError;
@@ -273,26 +301,33 @@ async function removeAuthorizedIsolatedDirectoryGeneration(
 ): Promise<void> {
   const journalPath = isolatedDirectoryCleanupJournalPath(canonicalRootPath);
   const completionPath = isolatedDirectoryCleanupCompletionPath(canonicalRootPath);
+  await assertParentAuthority(deps);
   const completion = await readIsolatedDirectoryCleanupCompletion(completionPath, true);
+  await assertParentAuthority(deps);
   if (completion !== null) {
     assertCleanupCompletionMatchesJournal(completion, journal);
-    await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath);
+    await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath, deps);
     return;
   }
 
   const rootStatus = await inspectIsolatedDirectoryIdentity(
     canonicalRootPath,
     journal.rootIdentity,
+    deps,
   );
   if (rootStatus === "missing") {
+    await assertParentAuthority(deps);
     const racedCompletion = await readIsolatedDirectoryCleanupCompletion(completionPath, true);
+    await assertParentAuthority(deps);
     if (racedCompletion !== null) {
       assertCleanupCompletionMatchesJournal(racedCompletion, journal);
-      await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath);
+      await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath, deps);
       return;
     }
     try {
+      await assertParentAuthority(deps);
       await readIsolatedDirectoryCleanupJournal(journalPath);
+      await assertParentAuthority(deps);
     } catch (error) {
       if (readErrorCode(error) !== "ENOENT") throw error;
     }
@@ -305,9 +340,11 @@ async function removeAuthorizedIsolatedDirectoryGeneration(
       `Isolated cleanup root identity changed at ${canonicalRootPath}; cleanup remains pending`,
     );
   }
+  await assertParentAuthority(deps);
   const entries = await readdir(canonicalRootPath);
+  await assertParentAuthority(deps);
   if (entries.length === 0) {
-    await persistIsolatedDirectoryCleanupCompletion(journal, completionPath);
+    await persistIsolatedDirectoryCleanupCompletion(journal, completionPath, deps);
   } else {
     if (entries.length !== 1 || entries[0] !== journal.generationName) {
       throw new Error(
@@ -316,25 +353,26 @@ async function removeAuthorizedIsolatedDirectoryGeneration(
     }
     const generationPath = path.join(canonicalRootPath, journal.generationName);
     if (
-      (await inspectIsolatedDirectoryIdentity(generationPath, journal.generationIdentity)) !==
+      (await inspectIsolatedDirectoryIdentity(generationPath, journal.generationIdentity, deps)) !==
       "matches"
     ) {
       throw new Error(
         `Isolated cleanup generation identity changed at ${generationPath}; cleanup remains pending`,
       );
     }
-    if (
-      deps.verifyGenerationForRemoval &&
-      !(await deps.verifyGenerationForRemoval(generationPath))
-    ) {
-      throw new Error(
-        `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
-      );
+    if (deps.verifyGenerationForRemoval) {
+      await assertParentAuthority(deps);
+      if (!(await deps.verifyGenerationForRemoval(generationPath))) {
+        throw new Error(
+          `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
+        );
+      }
+      await assertParentAuthority(deps);
     }
     await deleteIsolatedGenerationWithBoundHelper(journal, deps);
-    await persistIsolatedDirectoryCleanupCompletion(journal, completionPath);
+    await persistIsolatedDirectoryCleanupCompletion(journal, completionPath, deps);
   }
-  await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath);
+  await finalizeIsolatedDirectoryCleanup(journal, journalPath, completionPath, deps);
 }
 export async function replayPendingIsolatedDirectoryRemovals(
   parentPath: string,
@@ -354,12 +392,14 @@ export async function replayPendingIsolatedDirectoryRemovals(
       ? ISOLATED_REMOVAL_ROOT_PREFIX
       : isolatedDirectoryRemovalRootPrefix(canonicalReplayKey);
   let entries: Dirent[];
+  await assertParentAuthority(deps);
   try {
     entries = await readdir(canonicalParentPath, { withFileTypes: true });
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return;
     throw error;
   }
+  await assertParentAuthority(deps);
   const cleanupAuthorityNames = entries
     .map((entry) => entry.name)
     .filter(
@@ -374,9 +414,11 @@ export async function replayPendingIsolatedDirectoryRemovals(
     const authorityPath = path.join(canonicalParentPath, authorityName);
     let authority: IsolatedDirectoryCleanupJournal | IsolatedDirectoryCleanupCompletion;
     try {
+      await assertParentAuthority(deps);
       authority = authorityName.endsWith(ISOLATED_REMOVAL_JOURNAL_SUFFIX)
         ? await readIsolatedDirectoryCleanupJournal(authorityPath)
         : await readIsolatedDirectoryCleanupCompletion(authorityPath);
+      await assertParentAuthority(deps);
     } catch (error) {
       if (readErrorCode(error) === "ENOENT") continue;
       throw error;
@@ -387,6 +429,7 @@ export async function replayPendingIsolatedDirectoryRemovals(
     rootPaths.add(authority.rootPath);
   }
   for (const rootPath of [...rootPaths].sort()) {
+    await assertParentAuthority(deps);
     await removeIsolatedDirectoryGeneration(rootPath, deps);
   }
 }
@@ -396,10 +439,11 @@ async function restoreIsolatedDirectoryGeneration(
   rootPath: string,
   generationPath: string,
   journal: IsolatedDirectoryCleanupJournal,
+  deps: IsolatedDirectoryRemovalDeps,
 ): Promise<void> {
   if (
-    (await inspectIsolatedDirectoryIdentity(rootPath, journal.rootIdentity)) !== "matches" ||
-    (await inspectIsolatedDirectoryIdentity(generationPath, journal.generationIdentity)) !==
+    (await inspectIsolatedDirectoryIdentity(rootPath, journal.rootIdentity, deps)) !== "matches" ||
+    (await inspectIsolatedDirectoryIdentity(generationPath, journal.generationIdentity, deps)) !==
       "matches"
   ) {
     throw new Error(
@@ -407,15 +451,17 @@ async function restoreIsolatedDirectoryGeneration(
     );
   }
   try {
+    await assertParentAuthority(deps);
     await renameLockPath(generationPath, candidatePath);
     await syncDirectory(path.dirname(candidatePath));
+    await assertParentAuthority(deps);
   } catch (error) {
     throw new Error(
       `Filesystem generation changed at ${candidatePath}; unexpected directory preserved at ${generationPath}`,
       { cause: error },
     );
   }
-  await removeIsolatedDirectoryGenerationNow(rootPath);
+  await removeIsolatedDirectoryGenerationNow(rootPath, deps);
 }
 
 async function deleteIsolatedGenerationWithBoundHelper(
@@ -435,6 +481,7 @@ async function deleteIsolatedGenerationWithBoundHelper(
   const workerArgs = sourceWorker
     ? ["--import", import.meta.resolve("tsx"), workerPath, token]
     : [workerPath, token];
+  await assertParentAuthority(deps);
   const child = spawn(process.execPath, workerArgs, {
     cwd: journal.rootPath,
     env: {
@@ -446,6 +493,7 @@ async function deleteIsolatedGenerationWithBoundHelper(
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
+  await assertParentAuthority(deps);
   let childError: Error | undefined;
   let childExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   let stderr = "";
@@ -508,18 +556,22 @@ async function deleteIsolatedGenerationWithBoundHelper(
     ) {
       throw new Error(`Bound removal helper attested the wrong generation at ${journal.rootPath}`);
     }
+    await assertParentAuthority(deps);
     const generationPath = path.join(journal.rootPath, journal.generationName);
-    if (
-      deps.verifyGenerationForRemoval &&
-      !(await deps.verifyGenerationForRemoval(generationPath))
-    ) {
-      throw new Error(
-        `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
-      );
+    if (deps.verifyGenerationForRemoval) {
+      await assertParentAuthority(deps);
+      if (!(await deps.verifyGenerationForRemoval(generationPath))) {
+        throw new Error(
+          `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
+        );
+      }
+      await assertParentAuthority(deps);
     }
     await deps.afterChildAttestation?.(journal.rootPath);
+    await assertParentAuthority(deps);
     // Arm the read before releasing the helper so a fast deletion cannot close stdout first.
     const completionLinePromise = readRemovalHelperLine(iterator, earlyExitMessage);
+    await assertParentAuthority(deps);
     child.stdin.end(encodeDirectoryRemovalMessage({ type: "go", token }));
 
     const completion = parseDirectoryRemovalMessage(await completionLinePromise);
@@ -527,6 +579,7 @@ async function deleteIsolatedGenerationWithBoundHelper(
       throw new Error(`Bound removal helper returned an invalid completion at ${journal.rootPath}`);
     }
     childExit = await childClosed.promise;
+    await assertParentAuthority(deps);
     if (childError !== undefined || childExit.code !== 0) {
       throw new Error(
         `Bound removal helper failed at ${journal.rootPath}: ${await describeChildExit()}`,
@@ -568,35 +621,49 @@ async function readRemovalHelperLine(
 
 async function persistIsolatedDirectoryCleanupJournal(
   journal: IsolatedDirectoryCleanupJournal,
+  deps: IsolatedDirectoryRemovalDeps,
 ): Promise<void> {
   if (
-    (await inspectIsolatedDirectoryIdentity(journal.rootPath, journal.rootIdentity)) !== "matches"
+    (await inspectIsolatedDirectoryIdentity(journal.rootPath, journal.rootIdentity, deps)) !==
+    "matches"
   ) {
     throw new Error(`Isolated cleanup root changed before journaling: ${journal.rootPath}`);
   }
-  await writeDurableExclusiveJson(isolatedDirectoryCleanupJournalPath(journal.rootPath), journal);
+  await writeDurableExclusiveJson(
+    isolatedDirectoryCleanupJournalPath(journal.rootPath),
+    journal,
+    deps,
+  );
 }
 
 async function persistIsolatedDirectoryCleanupCompletion(
   journal: IsolatedDirectoryCleanupJournal,
   completionPath: string,
+  deps: IsolatedDirectoryRemovalDeps,
 ): Promise<void> {
   const completion: IsolatedDirectoryCleanupCompletion = {
     ...journal,
     contentsDeleted: true,
   };
   try {
-    await writeDurableExclusiveJson(completionPath, completion);
+    await writeDurableExclusiveJson(completionPath, completion, deps);
   } catch (error) {
     if (readErrorCode(error) !== "EEXIST") throw error;
+    await assertParentAuthority(deps);
     assertCleanupCompletionMatchesJournal(
       await readIsolatedDirectoryCleanupCompletion(completionPath),
       journal,
     );
+    await assertParentAuthority(deps);
   }
 }
 
-async function writeDurableExclusiveJson(filePath: string, value: unknown): Promise<void> {
+async function writeDurableExclusiveJson(
+  filePath: string,
+  value: unknown,
+  deps: IsolatedDirectoryRemovalDeps,
+): Promise<void> {
+  await assertParentAuthority(deps);
   const handle = await open(filePath, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
@@ -604,7 +671,9 @@ async function writeDurableExclusiveJson(filePath: string, value: unknown): Prom
   } finally {
     await handle.close();
   }
+  await assertParentAuthority(deps);
   await syncDirectory(path.dirname(filePath));
+  await assertParentAuthority(deps);
 }
 
 async function readIsolatedDirectoryCleanupJournal(
@@ -724,21 +793,28 @@ async function finalizeIsolatedDirectoryCleanup(
   journal: IsolatedDirectoryCleanupJournal,
   journalPath: string,
   completionPath: string,
+  deps: IsolatedDirectoryRemovalDeps,
 ): Promise<void> {
-  const rootStatus = await inspectIsolatedDirectoryIdentity(journal.rootPath, journal.rootIdentity);
+  const rootStatus = await inspectIsolatedDirectoryIdentity(
+    journal.rootPath,
+    journal.rootIdentity,
+    deps,
+  );
   if (rootStatus === "changed") {
     throw new Error(
       `Isolated cleanup root identity changed at ${journal.rootPath}; cleanup remains pending`,
     );
   }
   if (rootStatus === "matches") {
+    await assertParentAuthority(deps);
     if ((await readdir(journal.rootPath)).length !== 0) {
       throw new Error(`Isolated cleanup root is not empty at ${journal.rootPath}`);
     }
+    await assertParentAuthority(deps);
     const deadline = Date.now() + WINDOWS_LOCK_MUTATION_TIMEOUT_MS;
     for (;;) {
       if (
-        (await inspectIsolatedDirectoryIdentity(journal.rootPath, journal.rootIdentity)) !==
+        (await inspectIsolatedDirectoryIdentity(journal.rootPath, journal.rootIdentity, deps)) !==
         "matches"
       ) {
         throw new Error(
@@ -746,7 +822,9 @@ async function finalizeIsolatedDirectoryCleanup(
         );
       }
       try {
+        await assertParentAuthority(deps);
         await rmdir(journal.rootPath);
+        await assertParentAuthority(deps);
         break;
       } catch (error) {
         if (readErrorCode(error) === "ENOENT") break;
@@ -756,34 +834,60 @@ async function finalizeIsolatedDirectoryCleanup(
     }
   }
   const parentPath = path.dirname(journal.rootPath);
+  await assertParentAuthority(deps);
   await syncDirectory(parentPath);
+  await assertParentAuthority(deps);
   try {
+    await assertParentAuthority(deps);
     await unlink(journalPath);
+    await assertParentAuthority(deps);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
   }
   await syncDirectory(parentPath);
+  await assertParentAuthority(deps);
   try {
+    await assertParentAuthority(deps);
     await unlink(completionPath);
+    await assertParentAuthority(deps);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
   }
   await syncDirectory(parentPath);
+  await assertParentAuthority(deps);
 }
 
-async function removeFreshEmptyIsolationRoot(rootPath: string): Promise<void> {
+async function removeFreshEmptyIsolationRoot(
+  rootPath: string,
+  deps: IsolatedDirectoryRemovalDeps,
+): Promise<void> {
   try {
+    await assertParentAuthority(deps);
     await rmdir(rootPath);
+    await assertParentAuthority(deps);
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
   }
   await syncDirectoryIfPresent(path.dirname(rootPath));
+  await assertParentAuthority(deps);
+}
+
+async function inspectRequiredIsolatedDirectoryIdentity(
+  directoryPath: string,
+  deps: IsolatedDirectoryRemovalDeps,
+): Promise<IsolatedDirectoryIdentity> {
+  await assertParentAuthority(deps);
+  const identity = await capturePhysicalDirectoryIdentity(directoryPath);
+  await assertParentAuthority(deps);
+  return identity;
 }
 
 async function inspectIsolatedDirectoryIdentity(
   directoryPath: string,
   expected: IsolatedDirectoryIdentity,
+  deps: IsolatedDirectoryRemovalDeps = {},
 ): Promise<"matches" | "missing" | "changed"> {
+  await assertParentAuthority(deps);
   let current: IsolatedDirectoryIdentity;
   try {
     current = await capturePhysicalDirectoryIdentity(directoryPath);
@@ -791,6 +895,7 @@ async function inspectIsolatedDirectoryIdentity(
     if (readErrorCode(error) === "ENOENT") return "missing";
     return "changed";
   }
+  await assertParentAuthority(deps);
   return samePhysicalDirectoryIdentity(current, expected) ? "matches" : "changed";
 }
 

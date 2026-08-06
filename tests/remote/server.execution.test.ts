@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
-import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
+import type { RemoteServerInstance } from "../../src/remote/server.js";
 import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
@@ -22,6 +22,7 @@ import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.
 import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
+  createTestRemoteServer,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpGetJson, httpPostJson } from "./serverTestHttp.js";
@@ -61,7 +62,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       };
       const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: hostRuntime }));
       const runLog: string[] = [];
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           runBrowser: async (options) => {
@@ -271,7 +272,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const observedAuthorities: string[] = [];
 
       try {
-        server = await createRemoteServer(
+        server = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir,
@@ -363,7 +364,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const manualLoginProfileDir = "/tmp/oracle-manual-login-profile-test";
       const cleanupPolicies: Array<boolean | undefined> = [];
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         {
           host: "127.0.0.1",
           port: 0,
@@ -482,7 +483,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           answerChars: 10,
         }),
       );
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         { runBrowser, transactionStoreDir: path.join(tmpDir, "transactions") },
       );

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import type { Server as NetServer, Socket as NetSocket } from "node:net";
@@ -7,10 +7,12 @@ import os from "node:os";
 import path from "node:path";
 import { checkRemoteHealth } from "../../remote/health.js";
 import type { RemoteHealthResult } from "../../remote/health.js";
+import { resolveWindowsOpenSshExecutable } from "../../windowsSystemExecutable.js";
 import { BRIDGE_HOST_READINESS_TIMEOUT_MS } from "./childProtocol.js";
 import type { BridgeHostSpawn } from "./childProtocol.js";
 
 const REVERSE_TUNNEL_SHUTDOWN_TIMEOUT_MS = 5_000;
+type SpawnOpenSsh = (args: readonly string[], options: SpawnOptions) => ChildProcess;
 
 export interface ReverseTunnelHandle {
   ready: Promise<void>;
@@ -125,12 +127,12 @@ function assertWindowsSshExtraArgs(args: readonly string[]): void {
 
 async function probeReverseTunnelHealth({
   sshTarget,
+  spawnOpenSsh,
   remotePort,
   token,
   identity,
   extraArgs,
   timeoutMs,
-  spawnSsh,
   trackChild,
   terminateChildren,
   state,
@@ -141,7 +143,7 @@ async function probeReverseTunnelHealth({
   identity?: string;
   extraArgs: readonly string[];
   timeoutMs: number;
-  spawnSsh: BridgeHostSpawn;
+  spawnOpenSsh: SpawnOpenSsh;
   trackChild: (child: ChildProcess) => ChildProcess;
   terminateChildren: (children: readonly ChildProcess[]) => Promise<void>;
   state: ReverseTunnelProbeState;
@@ -165,7 +167,7 @@ async function probeReverseTunnelHealth({
     let child: ChildProcess;
     try {
       child = trackChild(
-        spawnSsh("ssh", probeArgs, {
+        spawnOpenSsh(probeArgs, {
           stdio: ["pipe", "pipe", "ignore"],
           windowsHide: true,
         }),
@@ -226,6 +228,8 @@ export function startReverseTunnel({
   const initialReady = Promise.withResolvers<void>();
   const parsedExtraArgs = extraArgs ? splitArgs(extraArgs) : [];
   if (platform === "win32") assertWindowsSshExtraArgs(parsedExtraArgs);
+  const sshExecutable = platform === "win32" ? resolveWindowsOpenSshExecutable() : "ssh";
+  const spawnOpenSsh: SpawnOpenSsh = (args, options) => spawnSsh(sshExecutable, args, options);
   const probeState: ReverseTunnelProbeState = {
     child: null,
     server: null,
@@ -361,7 +365,7 @@ export function startReverseTunnel({
     const result = Promise.withResolvers<number>();
     let settled = false;
     let timeout: NodeJS.Timeout;
-    const child = trackChild(spawnSsh("ssh", args, { stdio: "ignore", windowsHide: true }));
+    const child = trackChild(spawnOpenSsh(args, { stdio: "ignore", windowsHide: true }));
     controlChild = child;
     const settle = (code: number) => {
       if (settled) return;
@@ -390,12 +394,12 @@ export function startReverseTunnel({
       const result = await Promise.race([
         probeReverseTunnelHealth({
           sshTarget,
+          spawnOpenSsh,
           remotePort,
           token,
           identity,
           extraArgs: parsedExtraArgs,
           timeoutMs: Math.min(5_000, remainingMs),
-          spawnSsh,
           trackChild,
           terminateChildren,
           state: probeState,
@@ -434,7 +438,7 @@ export function startReverseTunnel({
     ];
     if (identity) masterArgs.push("-i", identity);
     masterArgs.push(...parsedExtraArgs, sshTarget);
-    master = trackChild(spawnSsh("ssh", masterArgs, { stdio: "ignore", windowsHide: true }));
+    master = trackChild(spawnOpenSsh(masterArgs, { stdio: "ignore", windowsHide: true }));
     const currentMaster = master;
     const masterClosed = Promise.withResolvers<void>();
     currentMaster.once("error", () => masterClosed.resolve());
@@ -474,7 +478,7 @@ export function startReverseTunnel({
     if (identity) masterArgs.push("-i", identity);
     masterArgs.push(...parsedExtraArgs, sshTarget);
 
-    master = trackChild(spawnSsh("ssh", masterArgs, { stdio: "ignore", windowsHide: true }));
+    master = trackChild(spawnOpenSsh(masterArgs, { stdio: "ignore", windowsHide: true }));
     const currentMaster = master;
     const masterClosed = Promise.withResolvers<void>();
     currentMaster.once("error", () => masterClosed.resolve());

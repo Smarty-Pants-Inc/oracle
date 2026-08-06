@@ -5,6 +5,7 @@ import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { committedPromptEpoch } from "./serverTestBuilders.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 
 export const TEST_CONTROLLER_GENERATION = "server-test-controller";
 
@@ -13,7 +14,7 @@ export async function openSeedTransactionStore(
   leaseDurationMs: number,
   now: () => number,
 ) {
-  return await RemoteTransactionStore.open({
+  return await openTestRemoteTransactionStore({
     directory,
     integrityKeyPath: path.join(path.dirname(directory), ".remote-transaction-integrity.key"),
     controllerGeneration: TEST_CONTROLLER_GENERATION,
@@ -26,7 +27,7 @@ export async function readAuthenticatedTransactionRecord(
   directory: string,
   transactionToken: string,
 ) {
-  const store = await RemoteTransactionStore.open({
+  const store = await openTestRemoteTransactionStore({
     directory,
     integrityKeyPath: path.join(path.dirname(directory), ".remote-transaction-integrity.key"),
     controllerGeneration: "server-test-authenticated-reader",

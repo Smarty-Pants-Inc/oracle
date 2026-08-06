@@ -54,27 +54,35 @@ export async function releaseCrashRecoverableFilesystemLock(
   mutationOptions: FilesystemLockMutationOptions,
   state: FilesystemLockReleaseState,
   beforeReleasedLockRemoval?: (isolatedRootPath: string) => Promise<void>,
+  assertParentAuthority: () => Promise<void> = async () => undefined,
 ): Promise<void> {
+  const removalDeps = { assertParentAuthority };
+  await assertParentAuthority();
   // A post-isolation retry owns only its journaled private root. It must not publish another
   // request doorway or inspect a successor that may already own the canonical lock path.
   if (state.mutationLease === undefined && state.isolatedRemovalRootPath !== undefined) {
     const isolatedRemovalRootPath = state.isolatedRemovalRootPath;
     await beforeReleasedLockRemoval?.(isolatedRemovalRootPath);
-    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath);
+    await assertParentAuthority();
+    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath, removalDeps);
+    await assertParentAuthority();
     state.isolatedRemovalRootPath = undefined;
     return;
   }
 
   if (state.mutationLease === undefined) {
     const rejectChangedOwner = async (): Promise<void> => {
+      await assertParentAuthority();
       const owner = await readLockOwnerForRelease(lockPath);
       if (owner !== null && !sameLockOwner(owner, expectedOwner)) {
         throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
       }
+      await assertParentAuthority();
     };
     // A live but stalled queue head must project retryable release authority instead of pinning
     // controller shutdown forever. The lock object retains all state for a later release retry.
     const mutationDeadlineMs = Date.now() + LOCK_RELEASE_MUTATION_TIMEOUT_MS;
+    await assertParentAuthority();
     const mutationLease = await acquireFilesystemLockMutationLease(
       lockPath,
       mutationOptions,
@@ -82,6 +90,7 @@ export async function releaseCrashRecoverableFilesystemLock(
       rejectChangedOwner,
       Date.now,
     );
+    await assertParentAuthority();
     if (mutationLease === null) {
       throw new FilesystemLockReleasePendingError(lockPath, expectedOwner);
     }
@@ -90,20 +99,26 @@ export async function releaseCrashRecoverableFilesystemLock(
 
   if (!state.canonicalReleased) {
     try {
+      await assertParentAuthority();
       const ownedGeneration = await readLockOwnerGenerationForRelease(lockPath);
       if (ownedGeneration === null) {
+        await assertParentAuthority();
         state.canonicalReleased = true;
       } else {
         if (!sameLockOwner(ownedGeneration.owner, expectedOwner)) {
           throw new Error(`Filesystem lock ownership changed at ${lockPath}`);
         }
+        await assertParentAuthority();
         if (!(await lockGenerationMatches(lockPath, state.expectedGeneration))) {
           throw new Error(`Filesystem lock generation changed at ${lockPath}`);
         }
+        await assertParentAuthority();
 
         const releasedPath = `${lockPath}.released-${expectedOwner.ownerNonce}`;
         try {
+          await assertParentAuthority();
           await renameLockPath(lockPath, releasedPath);
+          await assertParentAuthority();
           state.canonicalReleased = true;
           state.detachedPath = releasedPath;
           state.detachedGeneration = state.expectedGeneration;
@@ -115,8 +130,10 @@ export async function releaseCrashRecoverableFilesystemLock(
     } catch (error) {
       const mutationLease = state.mutationLease;
       try {
+        await assertParentAuthority();
         await mutationLease.release();
         state.mutationLease = undefined;
+        await assertParentAuthority();
       } catch (cleanupError) {
         throw new AggregateError(
           [error, cleanupError],
@@ -137,14 +154,17 @@ export async function releaseCrashRecoverableFilesystemLock(
       detachedPath,
       (generationPath) => lockGenerationMatches(generationPath, releasedGeneration),
       lockPath,
+      removalDeps,
     );
     if (isolation.status === "missing") {
       state.detachedPath = undefined;
       state.detachedGeneration = undefined;
     } else if (isolation.status === "changed") {
       try {
+        await assertParentAuthority();
         await renameLockPath(detachedPath, lockPath);
         await syncDirectory(path.dirname(lockPath));
+        await assertParentAuthority();
       } catch (restoreError) {
         throw new Error(
           `Filesystem lock ownership changed at ${lockPath}; unexpected lock preserved at ${detachedPath}`,
@@ -157,8 +177,10 @@ export async function releaseCrashRecoverableFilesystemLock(
       const error = new Error(`Filesystem lock ownership changed at ${lockPath}`);
       const mutationLease = state.mutationLease;
       try {
+        await assertParentAuthority();
         await mutationLease.release();
         state.mutationLease = undefined;
+        await assertParentAuthority();
       } catch (cleanupError) {
         throw new AggregateError(
           [error, cleanupError],
@@ -177,14 +199,18 @@ export async function releaseCrashRecoverableFilesystemLock(
   // collection, leaving only the recorded private root for an idempotent retry.
   const mutationLease = state.mutationLease;
   if (mutationLease !== undefined) {
+    await assertParentAuthority();
     await mutationLease.release();
     state.mutationLease = undefined;
+    await assertParentAuthority();
   }
 
   if (state.isolatedRemovalRootPath !== undefined) {
     const isolatedRemovalRootPath = state.isolatedRemovalRootPath;
     await beforeReleasedLockRemoval?.(isolatedRemovalRootPath);
-    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath);
+    await assertParentAuthority();
+    await removeIsolatedDirectoryGeneration(isolatedRemovalRootPath, removalDeps);
+    await assertParentAuthority();
     state.isolatedRemovalRootPath = undefined;
   }
 }

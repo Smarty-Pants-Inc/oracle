@@ -8,11 +8,23 @@ import {
   type BrowserCaptureSettlementAdapters,
 } from "../../src/browser/runLifecycle.js";
 import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
+import { createRemoteServer } from "../../src/remote/server.js";
 import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   type RemoteArtifactDescriptor,
   type RemoteRunPayload,
 } from "../../src/remote/types.js";
+import { testWindowsPrivateTreeAuthority } from "./testTransactionStore.js";
+
+export function createTestRemoteServer(
+  options: Parameters<typeof createRemoteServer>[0] = {},
+  deps: Parameters<typeof createRemoteServer>[1] = {},
+) {
+  return createRemoteServer(options, {
+    windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
+    ...deps,
+  });
+}
 
 export const CAN_LISTEN_LOCALHOST =
   spawnSync(

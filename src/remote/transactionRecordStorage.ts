@@ -167,10 +167,12 @@ export async function readStableRemoteTransactionRecordBytes(options: {
   platform: NodeJS.Platform;
   maximumEncodedBytes: number;
   assertIntegrityAuthority: () => Promise<void>;
+  expectedLinkCount?: bigint;
 }): Promise<{ contents: Buffer; fileIdentity: BigIntStats }> {
+  const expectedLinkCount = options.expectedLinkCount ?? 1n;
   await options.assertIntegrityAuthority();
   const before = await lstat(options.targetPath, { bigint: true });
-  assertPhysicalTransactionRecordFile(before, options.platform);
+  assertProtectedTransactionRecordFile(before, options.platform, expectedLinkCount);
   const flags =
     options.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
   const handle = await open(options.targetPath, flags);
@@ -178,7 +180,7 @@ export async function readStableRemoteTransactionRecordBytes(options: {
   let authenticated: BigIntStats;
   try {
     authenticated = await handle.stat({ bigint: true });
-    assertPhysicalTransactionRecordFile(authenticated, options.platform);
+    assertProtectedTransactionRecordFile(authenticated, options.platform, expectedLinkCount);
     if (!samePhysicalFile(before, authenticated)) {
       throw new RemoteTransactionRecordIntegrityError();
     }
@@ -204,7 +206,7 @@ export async function readStableRemoteTransactionRecordBytes(options: {
       }
     }
     const afterRead = await handle.stat({ bigint: true });
-    assertPhysicalTransactionRecordFile(afterRead, options.platform);
+    assertProtectedTransactionRecordFile(afterRead, options.platform, expectedLinkCount);
     if (!samePhysicalFile(authenticated, afterRead)) {
       throw new RemoteTransactionRecordIntegrityError();
     }
@@ -213,7 +215,7 @@ export async function readStableRemoteTransactionRecordBytes(options: {
     await handle.close();
   }
   const namedAfterRead = await lstat(options.targetPath, { bigint: true });
-  assertPhysicalTransactionRecordFile(namedAfterRead, options.platform);
+  assertProtectedTransactionRecordFile(namedAfterRead, options.platform, expectedLinkCount);
   if (!samePhysicalFile(authenticated, namedAfterRead)) {
     throw new RemoteTransactionRecordIntegrityError();
   }
@@ -302,7 +304,11 @@ export async function repairStaleCreatePublicationAliases(options: {
   directory: string;
   platform: NodeJS.Platform;
   assertIntegrityAuthority: () => Promise<void>;
-  authenticateTarget: (targetPath: string, transactionToken: string) => Promise<void>;
+  authenticateTarget: (
+    targetPath: string,
+    transactionToken: string,
+    expectedLinkCount: bigint,
+  ) => Promise<{ contents: Buffer; fileIdentity: BigIntStats }>;
 }): Promise<void> {
   await options.assertIntegrityAuthority();
   const candidates = new Map<string, string>();
@@ -328,13 +334,19 @@ export async function repairStaleCreatePublicationAliases(options: {
       throw new RemoteTransactionRecordIntegrityError();
     }
 
+    const authenticatedBeforeUnlink = await options.authenticateTarget(
+      targetPath,
+      transactionToken,
+      2n,
+    );
     await options.assertIntegrityAuthority();
     const tempConfirmed = await lstat(tempPath, { bigint: true });
     const targetConfirmed = await lstat(targetPath, { bigint: true });
     if (
       !samePhysicalFile(tempBefore, tempConfirmed) ||
       !samePhysicalFile(targetBefore, targetConfirmed) ||
-      !samePhysicalFile(tempConfirmed, targetConfirmed)
+      !samePhysicalFile(tempConfirmed, targetConfirmed) ||
+      !samePhysicalFile(authenticatedBeforeUnlink.fileIdentity, targetConfirmed)
     ) {
       throw new RemoteTransactionRecordIntegrityError();
     }
@@ -344,14 +356,26 @@ export async function repairStaleCreatePublicationAliases(options: {
     const targetAfterUnlink = await lstat(targetPath, { bigint: true });
     if (
       !isPhysicalTransactionRecordFile(targetAfterUnlink, options.platform) ||
-      !sameFileGeneration(targetConfirmed, targetAfterUnlink) ||
-      targetConfirmed.size !== targetAfterUnlink.size ||
-      targetConfirmed.mode !== targetAfterUnlink.mode
+      !sameFileGeneration(authenticatedBeforeUnlink.fileIdentity, targetAfterUnlink)
+    ) {
+      throw new RemoteTransactionRecordIntegrityError();
+    }
+    const authenticatedAfterUnlink = await options.authenticateTarget(
+      targetPath,
+      transactionToken,
+      1n,
+    );
+    if (
+      !samePhysicalFile(targetAfterUnlink, authenticatedAfterUnlink.fileIdentity) ||
+      !sameFileGeneration(
+        authenticatedBeforeUnlink.fileIdentity,
+        authenticatedAfterUnlink.fileIdentity,
+      ) ||
+      !authenticatedBeforeUnlink.contents.equals(authenticatedAfterUnlink.contents)
     ) {
       throw new RemoteTransactionRecordIntegrityError();
     }
     await syncDirectory(options.directory);
-    await options.authenticateTarget(targetPath, transactionToken);
   }
 }
 
@@ -379,7 +403,15 @@ export function assertPhysicalTransactionRecordFile(
   entry: BigIntStats,
   platform: NodeJS.Platform,
 ): void {
-  if (!isPhysicalTransactionRecordFile(entry, platform)) {
+  assertProtectedTransactionRecordFile(entry, platform, 1n);
+}
+
+function assertProtectedTransactionRecordFile(
+  entry: BigIntStats,
+  platform: NodeJS.Platform,
+  linkCount: bigint,
+): void {
+  if (!isProtectedTransactionRecordFile(entry, platform, linkCount)) {
     throw new RemoteTransactionRecordIntegrityError();
   }
 }

@@ -4,17 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, writeFile, readFile } from "node:fs/promises";
-import {
-  createRemoteServer,
-  drainRemoteServerShutdown,
-  type RemoteServerInstance,
-} from "../../src/remote/server.js";
+import { drainRemoteServerShutdown, type RemoteServerInstance } from "../../src/remote/server.js";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   createRemoteBrowserExecutor,
   resumeRemoteBrowserTransaction,
 } from "../../src/remote/client.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
 import {
@@ -34,6 +30,7 @@ import {
 } from "../../src/browser/targetCloseAuthority.js";
 import {
   CAN_LISTEN_LOCALHOST,
+  createTestRemoteServer,
   browserTransaction,
   lifecycleBrowserTransaction,
   remoteRunPayload,
@@ -46,6 +43,7 @@ import {
   sendTestRequestBody,
 } from "./serverTestHttp.js";
 import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
@@ -71,7 +69,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -149,7 +147,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ],
       };
       const finalize = vi.fn(async () => ({ status: "completed" as const, runtime }));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -246,7 +244,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const mutationStarted = Promise.withResolvers<void>();
       const allowMutationFailure = Promise.withResolvers<void>();
       setOracleHomeDirOverrideForTest(tmpDir);
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -353,7 +351,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(closeSettled).toBe(false);
         expect(existsSync(controllerLockPath)).toBe(true);
         await expect(
-          createRemoteServer(
+          createTestRemoteServer(
             { host: "127.0.0.1", port: 0, token: "e".repeat(64), logger: () => {} },
             { transactionStoreDir },
           ),
@@ -439,7 +437,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -674,7 +672,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       let drain: Promise<void> | undefined;
 
       try {
-        server = await createRemoteServer(
+        server = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir,
@@ -862,7 +860,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const seededStore = await RemoteTransactionStore.open({
+      const seededStore = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -919,7 +917,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       let server: RemoteServerInstance | undefined;
 
       try {
-        server = await createRemoteServer(
+        server = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           { transactionStoreDir, controllerGeneration, retryCleanup },
         );
@@ -1032,7 +1030,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       setOracleHomeDirOverrideForTest(oracleHome);
 
       try {
-        first = await createRemoteServer(
+        first = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir,
@@ -1127,7 +1125,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             return { status: "completed" as const, runtime: settlementRuntime };
           },
         );
-        restarted = await createRemoteServer(
+        restarted = await createTestRemoteServer(
           { host: "127.0.0.1", port, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir,
@@ -1227,7 +1225,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ],
       };
       let cleanupAttempts = 0;
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -1354,7 +1352,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),

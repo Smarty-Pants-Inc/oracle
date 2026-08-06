@@ -20,10 +20,14 @@ import {
   type RemoteTransactionPublicationCheckpoint,
 } from "../../src/remote/transactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
+import {
+  openTestRemoteTransactionStore,
+  testWindowsPrivateTreeAuthority,
+} from "./testTransactionStore.js";
 function openTransactionStore(
   options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
 ) {
-  return RemoteTransactionStore.open({
+  return openTestRemoteTransactionStore({
     ...options,
     integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
   });
@@ -1245,7 +1249,7 @@ describe("RemoteTransactionStore", () => {
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
     const transactionToken = "4".repeat(64);
     try {
-      const first = await RemoteTransactionStore.open({
+      const first = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath,
         controllerGeneration: "controller-before-integrity-restart",
@@ -1255,7 +1259,7 @@ describe("RemoteTransactionStore", () => {
       const beforeRestart = await readTransactionEnvelope(first, transactionToken);
       expect(beforeRestart.revision).toBe(2);
 
-      const restarted = await RemoteTransactionStore.open({
+      const restarted = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath,
         controllerGeneration: "controller-after-integrity-restart",
@@ -1296,13 +1300,13 @@ describe("RemoteTransactionStore", () => {
       `.${transactionToken}.${process.pid}.${randomUUID()}.tmp`,
     );
     try {
-      const first = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const first = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(first, transactionToken, "create-alias-run");
       const targetPath = first.recordPath(transactionToken);
       await fs.link(targetPath, tempPath);
       await expect(fs.lstat(targetPath, { bigint: true })).resolves.toMatchObject({ nlink: 2n });
 
-      const restarted = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const restarted = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
 
       await expect(fs.lstat(tempPath)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.lstat(targetPath, { bigint: true })).resolves.toMatchObject({ nlink: 1n });
@@ -1310,6 +1314,43 @@ describe("RemoteTransactionStore", () => {
         transactionToken,
         runId: "create-alias-run",
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an unauthenticated two-name hardlink create alias", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-create-alias-corrupt-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "f".repeat(64);
+    const tempPath = path.join(
+      directory,
+      `.${transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    const corruptBytes = Buffer.from("not an authenticated transaction record\n");
+    try {
+      const first = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
+      await begin(first, transactionToken, "corrupt-alias-run");
+      const targetPath = first.recordPath(transactionToken);
+      await fs.link(targetPath, tempPath);
+      await fs.writeFile(targetPath, corruptBytes);
+      await expect(fs.lstat(targetPath, { bigint: true })).resolves.toMatchObject({ nlink: 2n });
+
+      await expect(
+        openTestRemoteTransactionStore({ directory, integrityKeyPath }),
+      ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
+
+      const [targetAfterFailure, tempAfterFailure] = await Promise.all([
+        fs.lstat(targetPath, { bigint: true }),
+        fs.lstat(tempPath, { bigint: true }),
+      ]);
+      expect(targetAfterFailure).toMatchObject({ nlink: 2n });
+      expect(tempAfterFailure).toMatchObject({ nlink: 2n });
+      expect(targetAfterFailure.dev).toBe(tempAfterFailure.dev);
+      expect(targetAfterFailure.ino).toBe(tempAfterFailure.ino);
+      await expect(fs.readFile(targetPath)).resolves.toEqual(corruptBytes);
+      await expect(fs.readFile(tempPath)).resolves.toEqual(corruptBytes);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1325,14 +1366,14 @@ describe("RemoteTransactionStore", () => {
       `.${transactionToken}.${process.pid}.${randomUUID()}.tmp`,
     );
     try {
-      const first = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const first = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(first, transactionToken, "substituted-alias-run");
       const targetPath = first.recordPath(transactionToken);
       const targetBytes = await fs.readFile(targetPath);
       await fs.writeFile(tempPath, targetBytes, { mode: 0o600 });
 
       await expect(
-        RemoteTransactionStore.open({ directory, integrityKeyPath }),
+        openTestRemoteTransactionStore({ directory, integrityKeyPath }),
       ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
       await expect(fs.readFile(targetPath)).resolves.toEqual(targetBytes);
       await expect(fs.readFile(tempPath)).resolves.toEqual(targetBytes);
@@ -1393,7 +1434,7 @@ describe("RemoteTransactionStore", () => {
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
     const transactionToken = "2".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const store = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(store, transactionToken);
       const originalBytes = await readFile(store.recordPath(transactionToken));
       const originalEnvelope = JSON.parse(
@@ -1528,7 +1569,7 @@ describe("RemoteTransactionStore", () => {
       })),
     };
     try {
-      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const store = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(store, victimToken, "victim-run");
       await store.journalRuntime(victimToken, victimRuntime);
       await begin(store, attackerToken, "attacker-run");
@@ -1605,7 +1646,7 @@ describe("RemoteTransactionStore", () => {
       await fs.writeFile(recordPath, replacementBytes, { mode: 0o600 });
     });
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath,
         beforeQuarantineUnlink,
@@ -1757,7 +1798,7 @@ describe("RemoteTransactionStore", () => {
     const wrongKeyToken = "9".repeat(64);
     let now = Date.parse("2026-01-01T00:00:00.000Z");
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath,
         terminalRetentionMs: 1,
@@ -1799,13 +1840,13 @@ describe("RemoteTransactionStore", () => {
         unsignedBytes,
       );
 
-      const originalStore = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const originalStore = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(originalStore, wrongKeyToken, "wrong-key-run");
       await originalStore.journalRuntime(wrongKeyToken, runtime);
       const wrongKeyBytes = await fs.readFile(originalStore.recordPath(wrongKeyToken));
       await fs.mkdir(path.dirname(wrongKeyPath), { recursive: true, mode: 0o700 });
       await fs.writeFile(wrongKeyPath, Buffer.alloc(32, 0x5a), { mode: 0o600 });
-      const wrongKeyStore = await RemoteTransactionStore.open({
+      const wrongKeyStore = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath: wrongKeyPath,
       });
@@ -1830,14 +1871,14 @@ describe("RemoteTransactionStore", () => {
       const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
       const transactionToken = "c".repeat(64);
       try {
-        const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+        const store = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
         await begin(store, transactionToken);
         const signedRecord = await readFile(store.recordPath(transactionToken));
         await fs.chmod(integrityKeyPath, 0o640);
 
-        await expect(RemoteTransactionStore.open({ directory, integrityKeyPath })).rejects.toThrow(
-          "Remote transaction integrity key permissions must be 0600",
-        );
+        await expect(
+          openTestRemoteTransactionStore({ directory, integrityKeyPath }),
+        ).rejects.toThrow("Remote transaction integrity key permissions must be 0600");
         await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
           signedRecord,
         );
@@ -1864,7 +1905,7 @@ describe("RemoteTransactionStore", () => {
       });
 
       await expect(
-        RemoteTransactionStore.open({
+        openTestRemoteTransactionStore({
           directory,
           integrityKeyPath,
           platform: "win32",
@@ -1910,7 +1951,7 @@ describe("RemoteTransactionStore", () => {
         await fs.mkdir(integrityKeyDirectory, { recursive: true });
 
         await expect(
-          RemoteTransactionStore.open({
+          openTestRemoteTransactionStore({
             directory,
             integrityKeyPath,
             platform: "win32",
@@ -1971,7 +2012,7 @@ describe("RemoteTransactionStore", () => {
         await replacement?.();
       });
       try {
-        const store = await RemoteTransactionStore.open({
+        const store = await openTestRemoteTransactionStore({
           directory,
           integrityKeyPath,
           platform: "win32",
@@ -2016,7 +2057,7 @@ describe("RemoteTransactionStore", () => {
       await replacement?.();
     });
     try {
-      const store = await RemoteTransactionStore.open({
+      const store = await openTestRemoteTransactionStore({
         directory,
         integrityKeyPath,
         platform: "win32",
@@ -2087,12 +2128,12 @@ describe("RemoteTransactionStore", () => {
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
     const transactionToken = "b".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const store = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(store, transactionToken);
       const signedRecord = await readFile(store.recordPath(transactionToken));
       await fs.rm(integrityKeyPath);
 
-      await expect(RemoteTransactionStore.open({ directory, integrityKeyPath })).rejects.toThrow(
+      await expect(openTestRemoteTransactionStore({ directory, integrityKeyPath })).rejects.toThrow(
         "Remote transaction integrity key is missing",
       );
       await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(signedRecord);
@@ -2109,7 +2150,7 @@ describe("RemoteTransactionStore", () => {
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
     const transactionToken = "a".repeat(64);
     try {
-      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      const store = await openTestRemoteTransactionStore({ directory, integrityKeyPath });
       await begin(store, transactionToken);
       const signedRecord = await readFile(store.recordPath(transactionToken));
       await fs.rename(directory, displacedDirectory);
@@ -2229,6 +2270,7 @@ describe("RemoteTransactionStore", () => {
       const store = await IsolatedRemoteTransactionStore.open({
         directory: atomicRoot,
         integrityKeyPath: path.join(atomicRoot, ".test-integrity", "record.key"),
+        windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
       });
       await expect(
         store.begin({
@@ -2286,6 +2328,7 @@ describe("RemoteTransactionStore", () => {
       const store = await IsolatedRemoteTransactionStore.open({
         directory: root,
         integrityKeyPath: path.join(root, ".test-integrity", "record.key"),
+        windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
       });
       await store.begin({
         protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,

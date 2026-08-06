@@ -135,14 +135,6 @@ function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | nu
     physicalProfile.device,
     physicalProfile.inode,
     physicalProfile.birthtimeNs,
-    physicalProfile.generationMarker
-      ? [
-          physicalProfile.generationMarker.device,
-          physicalProfile.generationMarker.inode,
-          physicalProfile.generationMarker.ctimeNs,
-          physicalProfile.generationMarker.token,
-        ]
-      : null,
   ];
 }
 

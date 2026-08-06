@@ -45,6 +45,7 @@ import {
   prepareRemoteTransactionStoreRoot,
   RemoteTransactionStore,
 } from "./transactionStore.js";
+import type { WindowsPrivateTreeAuthority } from "./windowsPrivateTreeAcl.js";
 import {
   DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS,
   DEFAULT_REMOTE_RUN_OVERALL_TIMEOUT_MS,
@@ -74,6 +75,8 @@ interface RemoteServerDeps {
   transactionStoreNow?: () => number;
   leaseSweepIntervalMs?: number;
   controllerLockDeps?: CrashRecoverableFilesystemLockDeps;
+  transactionStorePlatform?: NodeJS.Platform;
+  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
 }
 
 export async function createRemoteServer(
@@ -122,6 +125,8 @@ export async function createRemoteServer(
   const transactionStoreRoot = await prepareRemoteTransactionStoreRoot({
     directory: transactionStoreDir,
     integrityKeyPath: transactionIntegrityKeyPath,
+    platform: deps.transactionStorePlatform,
+    windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
   });
   const controllerLock = await acquireCrashRecoverableFilesystemLock(
     path.join(transactionStoreRoot.directory, ".controller.lock"),
@@ -142,6 +147,8 @@ export async function createRemoteServer(
       now: deps.transactionStoreNow,
       controllerGeneration,
       rootAuthority: transactionStoreRoot,
+      platform: deps.transactionStorePlatform,
+      windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
     });
   } catch (error) {
     await controllerLock.release().catch(() => undefined);

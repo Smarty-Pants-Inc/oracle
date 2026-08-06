@@ -66,6 +66,172 @@ function execCli(
   });
 }
 
+interface GeminiCliEvent {
+  type: "factory" | "executor" | "bind" | "finalize";
+  sessionId?: string;
+  conversationId?: string;
+}
+
+interface CliCommandOutput {
+  stdout: string;
+  stderr: string;
+}
+
+interface GeminiCliHarness {
+  eventsPath: string;
+  run(args: string[]): Promise<CliCommandOutput>;
+}
+
+async function createGeminiCliHarness(oracleHome: string): Promise<GeminiCliHarness> {
+  const fixtureDir = await mkdtemp(path.join(oracleHome, "gemini-cli-wiring-"));
+  const stubPath = path.join(fixtureDir, "gemini-executor.mjs");
+  const loaderPath = path.join(fixtureDir, "gemini-loader.mjs");
+  const eventsPath = path.join(fixtureDir, "events.ndjson");
+  await writeFile(eventsPath, "", "utf8");
+  await writeFile(
+    stubPath,
+    `
+import { appendFileSync } from "node:fs";
+
+const eventsPath = process.env.ORACLE_GEMINI_WIRING_EVENTS;
+if (!eventsPath) throw new Error("ORACLE_GEMINI_WIRING_EVENTS is required");
+const record = (event) => appendFileSync(eventsPath, JSON.stringify(event) + "\\n");
+
+export function createGeminiWebExecutor() {
+  record({ type: "factory" });
+  return async function executeBrowser(options) {
+    const conversationId = "gemini-cli-wiring-" + options.sessionId;
+    const runtime = {
+      conversationId,
+      tabUrl: "https://gemini.google.com/app/" + conversationId,
+      promptEpoch: {
+        status: "committed",
+        epochId: "epoch-" + options.sessionId,
+        promptSha256: "a".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "user-" + options.sessionId,
+        verifiedUserMessageId: "user-" + options.sessionId,
+        conversationId,
+      },
+    };
+    record({ type: "executor", sessionId: options.sessionId, conversationId });
+    return {
+      answerText: "Gemini CLI wiring answer for " + options.sessionId,
+      answerMarkdown: "Gemini CLI wiring answer for " + options.sessionId,
+      tookMs: 1,
+      answerTokens: 3,
+      answerChars: 30,
+      conversationId,
+      runtime,
+      bindSettlement: async () => {
+        record({ type: "bind", sessionId: options.sessionId, conversationId });
+        return runtime;
+      },
+      finalize: async () => {
+        record({ type: "finalize", sessionId: options.sessionId, conversationId });
+        return { status: "completed", runtime };
+      },
+      abort: async () => ({ status: "completed", runtime }),
+    };
+  };
+}
+`,
+    "utf8",
+  );
+  await writeFile(
+    loaderPath,
+    `
+const stubUrl = ${JSON.stringify(pathToFileURL(stubPath).href)};
+
+export async function resolve(specifier, context, nextResolve) {
+  if (
+    specifier === "../src/gemini-web/index.js" ||
+    specifier.endsWith("/src/gemini-web/index.js") ||
+    specifier.endsWith("/src/gemini-web/index.ts")
+  ) {
+    return { url: stubUrl, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`,
+    "utf8",
+  );
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // biome-ignore lint/style/useNamingConvention: env var name
+    ORACLE_HOME_DIR: oracleHome,
+    // biome-ignore lint/style/useNamingConvention: env var name
+    ORACLE_GEMINI_WIRING_EVENTS: eventsPath,
+    // biome-ignore lint/style/useNamingConvention: env var name
+    ORACLE_NO_DETACH: "1",
+    // biome-ignore lint/style/useNamingConvention: force the CLI's browser production branch
+    ORACLE_ENGINE: "browser",
+    // biome-ignore lint/style/useNamingConvention: env var name
+    ORACLE_DISABLE_KEYTAR: "1",
+    // biome-ignore lint/style/useNamingConvention: env var name
+    DOTENV_CONFIG_PATH: "/tmp/nonexistent-oracle-env",
+  };
+  delete env.GEMINI_API_KEY;
+  return {
+    eventsPath,
+    run: async (args) => {
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          process.execPath,
+          ["--loader", loaderPath, "--import", TSX_LOADER, CLI_ENTRY, ...args],
+          { env, timeout: INTEGRATION_TIMEOUT },
+        );
+        return { stdout: stdout.toString(), stderr: stderr.toString() };
+      } catch (error) {
+        const output = error as { stdout?: string | Buffer; stderr?: string | Buffer };
+        throw new Error(
+          `Gemini CLI failed: ${output.stdout?.toString() ?? ""}${output.stderr?.toString() ?? ""}`,
+        );
+      }
+    },
+  };
+}
+
+async function readGeminiCliEvents(eventsPath: string): Promise<GeminiCliEvent[]> {
+  const contents = await readFile(eventsPath, "utf8");
+  return contents
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as GeminiCliEvent);
+}
+
+async function readSessionMetadata(
+  oracleHome: string,
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  return JSON.parse(
+    await readFile(path.join(oracleHome, "sessions", sessionId, "meta.json"), "utf8"),
+  );
+}
+
+function expectGeminiCliPersistence(metadata: Record<string, unknown>, sessionId: string): void {
+  const conversationId = `gemini-cli-wiring-${sessionId}`;
+  expect(metadata).toMatchObject({
+    status: "completed",
+    mode: "browser",
+    response: { status: "completed" },
+    browser: {
+      runtime: {
+        conversationId,
+        promptEpoch: {
+          status: "committed",
+          conversationId,
+          verifiedUserMessageId: `user-${sessionId}`,
+        },
+      },
+    },
+    models: [expect.objectContaining({ model: "gemini-3.1-pro", status: "completed" })],
+  });
+}
+
 type CliChild = ChildProcessByStdio<null, Readable, Readable>;
 
 function waitForChildExit(
@@ -434,6 +600,75 @@ module.exports = () => ({
       expect(stdout).toContain("browser mode (target=Gemini 3.1 Pro; requested=gemini-3.1-pro)");
 
       await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
+    "uses the Gemini web executor and persists its committed runtime on a fresh browser run",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-fresh-wiring-"));
+      try {
+        const gemini = await createGeminiCliHarness(oracleHome);
+        await gemini.run([
+          "--wait",
+          "--prompt",
+          "Fresh Gemini executor wiring",
+          "--model",
+          "gemini-3.1-pro",
+        ]);
+
+        const [sessionId] = await readdir(path.join(oracleHome, "sessions"));
+        expect(sessionId).toBeDefined();
+        const events = await readGeminiCliEvents(gemini.eventsPath);
+        expect(events.map(({ type }) => type)).toEqual(["factory", "executor", "bind", "finalize"]);
+        expect(events[1]).toMatchObject({
+          sessionId,
+          conversationId: `gemini-cli-wiring-${sessionId}`,
+        });
+        expectGeminiCliPersistence(await readSessionMetadata(oracleHome, sessionId), sessionId);
+      } finally {
+        await rm(oracleHome, { recursive: true, force: true });
+      }
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
+    "uses the Gemini web executor and persists its committed runtime when restarting a browser run",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-restart-wiring-"));
+      try {
+        const gemini = await createGeminiCliHarness(oracleHome);
+        await gemini.run([
+          "--wait",
+          "--prompt",
+          "Seed Gemini restart wiring",
+          "--model",
+          "gemini-3.1-pro",
+        ]);
+        const [sourceSessionId] = await readdir(path.join(oracleHome, "sessions"));
+        expect(sourceSessionId).toBeDefined();
+        await writeFile(gemini.eventsPath, "", "utf8");
+
+        await gemini.run(["restart", sourceSessionId, "--wait"]);
+
+        const sessionIds = await readdir(path.join(oracleHome, "sessions"));
+        const restartedSessionId = sessionIds.find((sessionId) => sessionId !== sourceSessionId);
+        expect(restartedSessionId).toBeDefined();
+        const events = await readGeminiCliEvents(gemini.eventsPath);
+        expect(events.map(({ type }) => type)).toEqual(["factory", "executor", "bind", "finalize"]);
+        expect(events[1]).toMatchObject({
+          sessionId: restartedSessionId,
+          conversationId: `gemini-cli-wiring-${restartedSessionId}`,
+        });
+        expectGeminiCliPersistence(
+          await readSessionMetadata(oracleHome, restartedSessionId!),
+          restartedSessionId!,
+        );
+      } finally {
+        await rm(oracleHome, { recursive: true, force: true });
+      }
     },
     INTEGRATION_TIMEOUT,
   );

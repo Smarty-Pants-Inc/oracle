@@ -3,7 +3,6 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
-import { createRemoteServer } from "../../src/remote/server.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browser/types.js";
 import { RemoteLegacyTextResultSchema } from "../../src/remote/legacyProtocol.js";
@@ -11,7 +10,7 @@ import {
   browserRunResultFromTransaction,
   projectRemotePublicResult,
 } from "../../src/remote/transactionCapture.js";
-import { CAN_LISTEN_LOCALHOST } from "./serverTestBuilders.js";
+import { CAN_LISTEN_LOCALHOST, createTestRemoteServer } from "./serverTestBuilders.js";
 
 // This exercises Node's actual TCP response-idle timer; fake timers cannot advance socket I/O.
 const wait = (milliseconds: number) =>
@@ -87,7 +86,7 @@ describe("legacy remote protocol integration", () => {
       const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-protocol-"));
       const logEvents: string[] = [];
       const heartbeatPauseMs = 100;
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         {
           host: "127.0.0.1",
           port: 0,

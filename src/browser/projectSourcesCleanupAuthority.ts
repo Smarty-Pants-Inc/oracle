@@ -103,7 +103,6 @@ export interface ProjectSourcesAuthorityDeps {
 
 export function projectSourcesCleanupOwnerId(storage: ProjectSourcesCleanupStorage): string {
   const root = storage.root;
-  const marker = root.generationMarker;
   const storageAuthority = JSON.stringify([
     root.version,
     root.platform,
@@ -111,10 +110,6 @@ export function projectSourcesCleanupOwnerId(storage: ProjectSourcesCleanupStora
     root.device,
     root.inode,
     root.birthtimeNs,
-    marker?.device ?? null,
-    marker?.inode ?? null,
-    marker?.ctimeNs ?? null,
-    marker?.token ?? null,
   ]);
   return `project-sources:${createHash("sha256").update(storageAuthority).digest("hex")}`;
 }

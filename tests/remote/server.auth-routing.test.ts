@@ -2,16 +2,20 @@ import { describe, expect, test } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
-import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
+import type { RemoteServerInstance } from "../../src/remote/server.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
-import { CAN_LISTEN_LOCALHOST, browserTransaction } from "./serverTestBuilders.js";
+import {
+  CAN_LISTEN_LOCALHOST,
+  browserTransaction,
+  createTestRemoteServer,
+} from "./serverTestBuilders.js";
 import { httpGetJson, httpPostJson, httpRaw, prepareTestAuthentication } from "./serverTestHttp.js";
 import {
   TEST_CONTROLLER_GENERATION,
   openSeedTransactionStore,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 import {
   REMOTE_BODY_SHA256_HEADER,
   REMOTE_REQUEST_MAC_HEADER,
@@ -25,7 +29,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-startup-token-"));
       const configuredToken = "f".repeat(64); // gitleaks:allow — synthetic test sentinel
       const configuredLogs: string[] = [];
-      const configured = await createRemoteServer(
+      const configured = await createTestRemoteServer(
         {
           host: "127.0.0.1",
           port: 0,
@@ -39,7 +43,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       try {
         expect(configured.token).toBe(configuredToken);
         expect(configuredLogs.join("\n")).not.toContain(configuredToken);
-        generated = await createRemoteServer(
+        generated = await createTestRemoteServer(
           {
             host: "127.0.0.1",
             port: 0,
@@ -65,12 +69,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       "a".repeat(63),
       "g".repeat(64),
     ]) {
-      await expect(createRemoteServer({ token })).rejects.toThrow(
+      await expect(createTestRemoteServer({ token })).rejects.toThrow(
         /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
       );
     }
     await expect(
-      createRemoteServer({ token: "a".repeat(64), legacyToken: "weak" }),
+      createTestRemoteServer({ token: "a".repeat(64), legacyToken: "weak" }),
     ).rejects.toThrow(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i);
   });
 
@@ -78,7 +82,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     "keeps the legacy bearer scoped to predecessor health and text runs",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-legacy-auth-"));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         {
           host: "127.0.0.1",
           port: 0,
@@ -134,7 +138,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-legacy-cookies-"));
       let receivedBrowserConfig: BrowserSessionConfig | undefined;
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         {
           host: "127.0.0.1",
           port: 0,
@@ -205,7 +209,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionStoreNow = () => now;
       const store = await openSeedTransactionStore(transactionStoreDir, 5_000, transactionStoreNow);
       await seedRemoteTransaction(store, transactionToken, { prompt: "renew exact lease" });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -220,7 +224,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       const readCurrent = async () => {
-        const reader = await RemoteTransactionStore.open({
+        const reader = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath,
           controllerGeneration: "auth-renewal-reader",
@@ -348,7 +352,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await seedRemoteTransaction(store, transactionToken, {
         prompt: "authenticate exact body first",
       });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -473,7 +477,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     "rejects retry bodies with mismatched signed digests and shared size limits",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retry-body-auth-"));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         { transactionStoreDir: path.join(tmpDir, "transactions") },
       );
@@ -529,7 +533,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-auth-order-"));
       let browserRuns = 0;
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),
@@ -591,15 +595,15 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-lock-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
-      const first = await createRemoteServer(options, { transactionStoreDir });
+      const first = await createTestRemoteServer(options, { transactionStoreDir });
       try {
-        await expect(createRemoteServer(options, { transactionStoreDir })).rejects.toThrow(
+        await expect(createTestRemoteServer(options, { transactionStoreDir })).rejects.toThrow(
           /lock|owner|active/i,
         );
       } finally {
         await first.close();
       }
-      const restarted = await createRemoteServer(options, { transactionStoreDir });
+      const restarted = await createTestRemoteServer(options, { transactionStoreDir });
       await restarted.close();
       await rm(tmpDir, { recursive: true, force: true });
     },
@@ -614,7 +618,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       let racedStartup: Promise<RemoteServerInstance> | undefined;
       let replacement: RemoteServerInstance | undefined;
       try {
-        racedStartup = createRemoteServer(options, {
+        racedStartup = createTestRemoteServer(options, {
           transactionStoreDir,
           controllerLockDeps: {
             beforeLockPublication: async () => {
@@ -626,7 +630,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         await expect(racedStartup).rejects.toThrow("Filesystem lock parent generation changed");
         expect(await readdir(transactionStoreDir)).toEqual([]);
         expect(await readdir(displacedStoreDir)).not.toContain(".controller.lock");
-        replacement = await createRemoteServer(options, { transactionStoreDir });
+        replacement = await createTestRemoteServer(options, { transactionStoreDir });
       } finally {
         const raced = racedStartup ? await racedStartup.catch(() => undefined) : undefined;
         await raced?.close();
@@ -642,13 +646,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const integrityKeyPath = path.join(tmpDir, ".remote-transaction-integrity.key");
       const transactionToken = "e".repeat(64);
-      const first = await createRemoteServer(
+      const first = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         { transactionStoreDir, controllerGeneration: "controller-before-credential-rotation" },
       );
       try {
         await first.close();
-        const seeded = await RemoteTransactionStore.open({
+        const seeded = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath,
           controllerGeneration: "credential-rotation-seeder",
@@ -662,7 +666,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ) as { revision: number };
         expect(beforeRotationEnvelope.revision).toBeGreaterThan(0);
 
-        const rotated = await createRemoteServer(
+        const rotated = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "b".repeat(64), logger: () => {} },
           {
             transactionStoreDir,

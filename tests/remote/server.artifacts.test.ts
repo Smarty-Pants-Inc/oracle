@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, readFile, stat, writeFile } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
   REMOTE_PROTOCOL_HEADER,
@@ -13,9 +12,9 @@ import {
   RemoteRequestAuthenticator,
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
@@ -36,6 +35,7 @@ import {
 } from "../../src/browser/runLifecycle.js";
 import {
   CAN_LISTEN_LOCALHOST,
+  createTestRemoteServer,
   browserTransaction,
   committedPromptEpoch,
   createArtifactDescriptor,
@@ -43,6 +43,7 @@ import {
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpPostJson, httpPostNdjson, readIncomingBody } from "./serverTestHttp.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -72,7 +73,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const resumeBrowser = vi.fn(async () => {
         throw new Error("text-only fallback must not require browser recovery");
       });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -117,7 +118,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
         });
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
-        const records = await RemoteTransactionStore.open({
+        const records = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -176,7 +177,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           }
           return originalStageCapture.call(this, params);
         });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -225,7 +226,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
         });
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
-        const records = await RemoteTransactionStore.open({
+        const records = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -255,7 +256,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-count-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
       setOracleHomeDirOverrideForTest(tmpDir);
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -291,7 +292,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
         });
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
-        const records = await RemoteTransactionStore.open({
+        const records = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -324,7 +325,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       ]);
 
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           runBrowser: async (options) => {
@@ -490,7 +491,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
         async (_mode, pendingRuntime) => completedBrowserCaptureCleanup(pendingRuntime),
       );
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -564,7 +565,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(captured).not.toHaveProperty("artifacts");
         expect(captured).not.toHaveProperty("savedFiles");
         await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
-        const records = await RemoteTransactionStore.open({
+        const records = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -641,7 +642,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const firstPayload = Buffer.from("first artifact");
       const secondPayload = Buffer.from("second artifact with a different size");
       setOracleHomeDirOverrideForTest(tmpDir);
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -695,7 +696,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           }),
         ).resolves.toMatchObject({ statusCode: 200 });
         const readCurrent = async () =>
-          await RemoteTransactionStore.open({
+          await openTestRemoteTransactionStore({
             directory: transactionStoreDir,
             integrityKeyPath: path.join(tmpDir, ".remote-transaction-integrity.key"),
           }).then((reader) => reader.read(transactionToken));

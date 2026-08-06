@@ -1,9 +1,9 @@
-import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { constants } from "node:fs";
 import type { BigIntStats, Stats } from "node:fs";
-import { link, lstat, mkdir, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import {
+  PhysicalDirectoryIdentityUnavailableError,
   physicalDirectoryIdentityFromStats,
   parsePhysicalDirectoryIdentity,
   samePhysicalDirectoryIdentity,
@@ -11,16 +11,13 @@ import {
 } from "./filesystemLockDirectoryIdentity.js";
 
 export type ProfileStateLogger = (message: string) => void;
+
 interface PlatformPath {
   isAbsolute(candidate: string): boolean;
   resolve(...pathSegments: string[]): string;
 }
-const BIRTHTIME_PROFILE_IDENTITY_VERSION = 2 as const;
-const MARKER_PROFILE_IDENTITY_VERSION = 3 as const;
-const PROFILE_GENERATION_MARKER_FILENAME = ".oracle-profile-generation";
-const PROFILE_GENERATION_MARKER_PREFIX = "oracle-profile-generation-v1:";
-const PROFILE_GENERATION_MARKER_PATTERN = /^oracle-profile-generation-v1:([0-9a-f]{64})\n$/u;
-const PROFILE_GENERATION_MARKER_SIZE = PROFILE_GENERATION_MARKER_PREFIX.length + 65;
+
+const PROFILE_IDENTITY_VERSION = 2 as const;
 const hasDirectoryCapabilityFlags =
   Number.isInteger(constants.O_RDONLY) &&
   Number.isInteger(constants.O_DIRECTORY) &&
@@ -28,34 +25,13 @@ const hasDirectoryCapabilityFlags =
 const directoryOpenFlags = hasDirectoryCapabilityFlags
   ? constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
   : 0;
-const inFlightLinuxProfileGenerationMarkerCreations = new Map<string, Promise<void>>();
-
-export interface ProfileDirectoryGenerationMarker {
-  readonly device: string;
-  readonly inode: string;
-  readonly ctimeNs: string;
-  readonly token: string;
-}
 
 export interface ProfileDirectoryIdentity extends PhysicalDirectoryIdentity {
-  readonly version:
-    | typeof BIRTHTIME_PROFILE_IDENTITY_VERSION
-    | typeof MARKER_PROFILE_IDENTITY_VERSION;
+  readonly version: typeof PROFILE_IDENTITY_VERSION;
   readonly platform: NodeJS.Platform;
   readonly canonicalPath: string;
-  readonly generationMarker?: ProfileDirectoryGenerationMarker;
 }
 
-interface AuthenticatedProfileDirectory {
-  readonly stats: BigIntStats;
-  readonly generationMarker?: ProfileDirectoryGenerationMarker;
-}
-interface AuthenticatedProfileDirectoryOptions {
-  readonly forceLinuxGenerationMarker?: boolean;
-  readonly beforeGenerationMarkerPublication?: () => void | Promise<void>;
-  readonly onGenerationMarkerCreationWait?: () => void;
-  readonly beforeFinalEntry?: () => void | Promise<void>;
-}
 export async function captureProfileDirectoryIdentity(
   userDataDir: string,
   options: { create?: boolean } = {},
@@ -63,82 +39,30 @@ export async function captureProfileDirectoryIdentity(
   const resolvedPath = path.resolve(userDataDir);
   if (options.create) {
     await rejectProfileSymlinkTraversal(resolvedPath, { allowMissing: true });
+    await assertProfileCreationStorageBirthtime(resolvedPath);
     await mkdir(resolvedPath, { recursive: true });
   }
   await rejectProfileSymlinkTraversal(resolvedPath);
   const canonicalPath = await realpath(resolvedPath);
-  const authenticated = await captureAuthenticatedProfileDirectory(canonicalPath);
-  const physicalIdentity = physicalDirectoryIdentityFromStats(authenticated.stats);
-  if (physicalIdentity.birthtimeNs === "0") {
-    if (
-      process.platform !== "linux" ||
-      physicalIdentity.inode === "0" ||
-      !authenticated.generationMarker ||
-      authenticated.generationMarker.device !== physicalIdentity.device
-    ) {
-      throw profileGenerationPrerequisiteError(canonicalPath);
-    }
-    return Object.freeze({
-      version: MARKER_PROFILE_IDENTITY_VERSION,
-      platform: process.platform,
-      canonicalPath,
-      ...physicalIdentity,
-      generationMarker: authenticated.generationMarker,
-    });
-  }
+  const stats = await captureAuthenticatedProfileDirectory(canonicalPath);
   return Object.freeze({
-    version: BIRTHTIME_PROFILE_IDENTITY_VERSION,
+    version: PROFILE_IDENTITY_VERSION,
     platform: process.platform,
     canonicalPath,
-    ...physicalIdentity,
-  });
-}
-export async function captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(
-  userDataDir: string,
-  options: {
-    beforeGenerationMarkerPublication?: () => void | Promise<void>;
-    onGenerationMarkerCreationWait?: () => void;
-    beforeFinalEntry?: () => void | Promise<void>;
-  } = {},
-): Promise<ProfileDirectoryIdentity> {
-  const resolvedPath = path.resolve(userDataDir);
-  await rejectProfileSymlinkTraversal(resolvedPath);
-  const canonicalPath = await realpath(resolvedPath);
-  const authenticated = await captureAuthenticatedProfileDirectory(canonicalPath, {
-    forceLinuxGenerationMarker: true,
-    beforeGenerationMarkerPublication: options.beforeGenerationMarkerPublication,
-    onGenerationMarkerCreationWait: options.onGenerationMarkerCreationWait,
-    beforeFinalEntry: options.beforeFinalEntry,
-  });
-  const physicalIdentity = physicalDirectoryIdentityFromStats(authenticated.stats);
-  if (
-    process.platform !== "linux" ||
-    physicalIdentity.inode === "0" ||
-    !authenticated.generationMarker ||
-    authenticated.generationMarker.device !== physicalIdentity.device
-  ) {
-    throw profileGenerationPrerequisiteError(canonicalPath);
-  }
-  return Object.freeze({
-    version: MARKER_PROFILE_IDENTITY_VERSION,
-    platform: "linux",
-    canonicalPath,
-    ...physicalIdentity,
-    birthtimeNs: "0",
-    generationMarker: authenticated.generationMarker,
+    ...physicalDirectoryIdentityFromStats(stats),
   });
 }
 
-async function captureAuthenticatedProfileDirectory(
-  canonicalPath: string,
-  options: AuthenticatedProfileDirectoryOptions = {},
-): Promise<AuthenticatedProfileDirectory> {
+async function captureAuthenticatedProfileDirectory(canonicalPath: string): Promise<BigIntStats> {
   const before = await lstat(canonicalPath, { bigint: true });
   if (!before.isDirectory() || before.isSymbolicLink()) {
     throw new Error(`Profile path is not a physical directory: ${canonicalPath}`);
   }
+  assertStableProfileDirectoryBirthtime(before, canonicalPath);
+
   if (process.platform === "win32") {
     const after = await lstat(canonicalPath, { bigint: true });
+    assertStableProfileDirectoryBirthtime(after, canonicalPath);
     if (
       !after.isDirectory() ||
       after.isSymbolicLink() ||
@@ -151,13 +75,15 @@ async function captureAuthenticatedProfileDirectory(
         `Profile directory generation changed while authenticating: ${canonicalPath}`,
       );
     }
-    return { stats: after };
+    return after;
   }
 
   const handle = await open(canonicalPath, directoryOpenFlags);
   try {
     const authenticated = await handle.stat({ bigint: true });
     const after = await lstat(canonicalPath, { bigint: true });
+    assertStableProfileDirectoryBirthtime(authenticated, canonicalPath);
+    assertStableProfileDirectoryBirthtime(after, canonicalPath);
     if (
       !authenticated.isDirectory() ||
       !after.isDirectory() ||
@@ -165,256 +91,45 @@ async function captureAuthenticatedProfileDirectory(
       !samePhysicalDirectoryIdentity(
         physicalDirectoryIdentityFromStats(before),
         physicalDirectoryIdentityFromStats(authenticated),
-        { allowZeroBirthtime: true },
       ) ||
       !samePhysicalDirectoryIdentity(
         physicalDirectoryIdentityFromStats(authenticated),
         physicalDirectoryIdentityFromStats(after),
-        { allowZeroBirthtime: true },
       )
     ) {
       throw new Error(
         `Profile directory generation changed while authenticating: ${canonicalPath}`,
       );
     }
-    if (authenticated.birthtimeNs === 0n && authenticated.ino <= 0n) {
-      throw profileGenerationPrerequisiteError(canonicalPath);
-    }
-    const generationMarker =
-      authenticated.birthtimeNs === 0n || options.forceLinuxGenerationMarker
-        ? await captureLinuxProfileGenerationMarker(handle, authenticated, canonicalPath, options)
-        : undefined;
-    await options.beforeFinalEntry?.();
-    const finalEntry = await lstat(canonicalPath, { bigint: true });
-    if (
-      !finalEntry.isDirectory() ||
-      finalEntry.isSymbolicLink() ||
-      !samePhysicalDirectoryIdentity(
-        physicalDirectoryIdentityFromStats(authenticated),
-        physicalDirectoryIdentityFromStats(finalEntry),
-        { allowZeroBirthtime: true },
-      )
-    ) {
-      throw new Error(
-        `Profile directory generation changed while authenticating: ${canonicalPath}`,
-      );
-    }
-    return { stats: authenticated, generationMarker };
+    return authenticated;
   } finally {
     await handle.close();
   }
 }
 
-async function captureLinuxProfileGenerationMarker(
-  directoryHandle: FileHandle,
-  directoryStats: BigIntStats,
-  canonicalPath: string,
-  options: AuthenticatedProfileDirectoryOptions,
-): Promise<ProfileDirectoryGenerationMarker> {
-  if (process.platform !== "linux" || !hasDirectoryCapabilityFlags) {
-    throw profileGenerationPrerequisiteError(canonicalPath);
-  }
-  const markerDirectoryPath = path.join("/proc/self/fd", directoryHandle.fd.toString());
-  const markerPath = path.join(markerDirectoryPath, PROFILE_GENERATION_MARKER_FILENAME);
-  const creationKey = `${directoryStats.dev}:${directoryStats.ino}`;
-  try {
-    const creationBeforeRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
-    if (creationBeforeRead) {
-      return await readLinuxProfileGenerationMarkerAfterCreation(
-        markerPath,
-        directoryStats,
-        creationBeforeRead,
-        options,
-      );
-    }
-
+async function assertProfileCreationStorageBirthtime(resolvedPath: string): Promise<void> {
+  let ancestor = resolvedPath;
+  while (true) {
     try {
-      const marker = await readLinuxProfileGenerationMarker(markerPath, directoryStats);
-      const creationAfterRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
-      return creationAfterRead
-        ? await readLinuxProfileGenerationMarkerAfterCreation(
-            markerPath,
-            directoryStats,
-            creationAfterRead,
-            options,
-          )
-        : marker;
+      const entry = await lstat(ancestor, { bigint: true });
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new Error(`Profile path is not a physical directory: ${ancestor}`);
+      }
+      assertStableProfileDirectoryBirthtime(entry, ancestor);
+      return;
     } catch (error) {
-      const creationAfterRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
-      if (creationAfterRead) {
-        return await readLinuxProfileGenerationMarkerAfterCreation(
-          markerPath,
-          directoryStats,
-          creationAfterRead,
-          options,
-        );
-      }
-      if (readErrorCode(error) !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
     }
-
-    const existingCreation = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
-    if (existingCreation) {
-      return await readLinuxProfileGenerationMarkerAfterCreation(
-        markerPath,
-        directoryStats,
-        existingCreation,
-        options,
-      );
-    }
-
-    const creation = Promise.withResolvers<void>();
-    inFlightLinuxProfileGenerationMarkerCreations.set(creationKey, creation.promise);
-    try {
-      const token = randomBytes(32).toString("hex");
-      const stagingMarkerPath = path.join(
-        markerDirectoryPath,
-        `${PROFILE_GENERATION_MARKER_FILENAME}.staging-${randomBytes(16).toString("hex")}`,
-      );
-      let stagingMarkerCreated = false;
-      let publishedMarker: { readonly device: string; readonly inode: string } | undefined;
-      let markerHandle: FileHandle | undefined;
-      try {
-        markerHandle = await open(
-          stagingMarkerPath,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-          0o600,
-        );
-        stagingMarkerCreated = true;
-        await markerHandle.writeFile(`${PROFILE_GENERATION_MARKER_PREFIX}${token}\n`, "utf8");
-        await markerHandle.sync();
-        const stagingMarker = await markerHandle.stat({ bigint: true });
-        await options.beforeGenerationMarkerPublication?.();
-        try {
-          await link(stagingMarkerPath, markerPath);
-          publishedMarker = {
-            device: stagingMarker.dev.toString(),
-            inode: stagingMarker.ino.toString(),
-          };
-          await directoryHandle.sync();
-        } catch (error) {
-          if (readErrorCode(error) !== "EEXIST") throw error;
-        }
-      } finally {
-        try {
-          await markerHandle?.close();
-        } finally {
-          if (stagingMarkerCreated) {
-            await unlink(stagingMarkerPath);
-            await directoryHandle.sync();
-          }
-        }
-      }
-      const marker = await readLinuxProfileGenerationMarker(markerPath, directoryStats);
-      if (
-        publishedMarker &&
-        (marker.token !== token ||
-          marker.device !== publishedMarker.device ||
-          marker.inode !== publishedMarker.inode)
-      ) {
-        throw new Error(`Profile generation marker changed while publishing: ${markerPath}`);
-      }
-      return marker;
-    } finally {
-      if (inFlightLinuxProfileGenerationMarkerCreations.get(creationKey) === creation.promise) {
-        inFlightLinuxProfileGenerationMarkerCreations.delete(creationKey);
-      }
-      creation.resolve();
-    }
-  } catch (error) {
-    throw profileGenerationPrerequisiteError(canonicalPath, error);
   }
 }
 
-async function readLinuxProfileGenerationMarkerAfterCreation(
-  markerPath: string,
-  directoryStats: BigIntStats,
-  creation: Promise<void>,
-  options: AuthenticatedProfileDirectoryOptions,
-): Promise<ProfileDirectoryGenerationMarker> {
-  options.onGenerationMarkerCreationWait?.();
-  await creation;
-  return await readLinuxProfileGenerationMarker(markerPath, directoryStats);
-}
-
-async function readLinuxProfileGenerationMarker(
-  markerPath: string,
-  directoryStats: BigIntStats,
-): Promise<ProfileDirectoryGenerationMarker> {
-  const markerHandle = await open(markerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const before = await markerHandle.stat({ bigint: true });
-    assertTrustworthyProfileGenerationMarker(before, directoryStats, markerPath);
-    const markerBuffer = Buffer.alloc(PROFILE_GENERATION_MARKER_SIZE + 1);
-    const { bytesRead } = await markerHandle.read(markerBuffer, 0, markerBuffer.length, 0);
-    const raw = markerBuffer.subarray(0, bytesRead).toString("utf8");
-    const after = await markerHandle.stat({ bigint: true });
-    const linked = await lstat(markerPath, { bigint: true });
-    if (
-      !sameProfileGenerationMarkerStats(before, after) ||
-      !sameProfileGenerationMarkerStats(after, linked)
-    ) {
-      throw new Error(`Profile generation marker changed while reading: ${markerPath}`);
-    }
-    const match = PROFILE_GENERATION_MARKER_PATTERN.exec(raw);
-    if (!match) throw new Error(`Profile generation marker is invalid: ${markerPath}`);
-    return Object.freeze({
-      device: after.dev.toString(),
-      inode: after.ino.toString(),
-      ctimeNs: after.ctimeNs.toString(),
-      token: match[1],
-    });
-  } finally {
-    await markerHandle.close();
+function assertStableProfileDirectoryBirthtime(stats: BigIntStats, canonicalPath: string): void {
+  if (stats.birthtimeNs === 0n) {
+    throw new PhysicalDirectoryIdentityUnavailableError(canonicalPath);
   }
-}
-
-function assertTrustworthyProfileGenerationMarker(
-  marker: BigIntStats,
-  directory: BigIntStats,
-  markerPath: string,
-): void {
-  const permissions = marker.mode & 0o777n;
-  if (
-    !marker.isFile() ||
-    marker.isSymbolicLink() ||
-    marker.nlink !== 1n ||
-    marker.dev !== directory.dev ||
-    marker.uid !== directory.uid ||
-    (permissions & 0o077n) !== 0n ||
-    (permissions & 0o400n) !== 0o400n ||
-    marker.ino <= 0n ||
-    marker.ctimeNs <= 0n ||
-    marker.size !== BigInt(PROFILE_GENERATION_MARKER_SIZE)
-  ) {
-    throw new Error(`Profile generation marker is not owner-private and stable: ${markerPath}`);
-  }
-}
-
-function sameProfileGenerationMarkerStats(left: BigIntStats, right: BigIntStats): boolean {
-  return (
-    right.isFile() &&
-    !right.isSymbolicLink() &&
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.ctimeNs === right.ctimeNs &&
-    left.size === right.size &&
-    left.mode === right.mode &&
-    left.uid === right.uid &&
-    left.nlink === right.nlink
-  );
-}
-
-function profileGenerationPrerequisiteError(canonicalPath: string, cause?: unknown): Error {
-  return new Error(
-    `Profile directory ${canonicalPath} has no filesystem birth time. Oracle requires stable nonzero inode/ctime metadata, atomic owner-private file creation, and /proc/self/fd access for its Linux generation marker. Relocate ORACLE_HOME_DIR and ORACLE_BROWSER_PROFILE_DIR to compatible storage or repair the marker after stopping Oracle and Chrome.`,
-    cause === undefined ? undefined : { cause },
-  );
-}
-
-function readErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object") return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
 }
 
 export async function verifyProfileDirectoryIdentity(
@@ -430,6 +145,7 @@ export async function verifyProfileDirectoryIdentity(
     return false;
   }
 }
+
 export async function assertProfileDirectoryIdentity(
   userDataDir: string,
   expected: ProfileDirectoryIdentity,
@@ -446,37 +162,15 @@ export function samePhysicalProfileDirectoryIdentity(
   left: ProfileDirectoryIdentity,
   right: ProfileDirectoryIdentity,
 ): boolean {
-  if (
-    left.version !== right.version ||
-    left.platform !== right.platform ||
-    left.device !== right.device ||
-    left.inode !== right.inode
-  ) {
-    return false;
-  }
-  if (left.version === BIRTHTIME_PROFILE_IDENTITY_VERSION) {
-    return (
-      left.birthtimeNs !== "0" &&
-      right.birthtimeNs !== "0" &&
-      left.birthtimeNs === right.birthtimeNs &&
-      left.generationMarker === undefined &&
-      right.generationMarker === undefined
-    );
-  }
-  if (left.version !== MARKER_PROFILE_IDENTITY_VERSION) return false;
-  const leftMarker = left.generationMarker;
-  const rightMarker = right.generationMarker;
-  return Boolean(
-    left.platform === "linux" &&
-    left.birthtimeNs === "0" &&
-    right.birthtimeNs === "0" &&
-    leftMarker &&
-    rightMarker &&
-    leftMarker.device === left.device &&
-    rightMarker.device === right.device &&
-    leftMarker.inode === rightMarker.inode &&
-    leftMarker.ctimeNs === rightMarker.ctimeNs &&
-    leftMarker.token === rightMarker.token,
+  return (
+    left.version === PROFILE_IDENTITY_VERSION &&
+    right.version === PROFILE_IDENTITY_VERSION &&
+    left.platform === right.platform &&
+    left.birthtimeNs !== "0" &&
+    right.birthtimeNs !== "0" &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.birthtimeNs === right.birthtimeNs
   );
 }
 
@@ -489,6 +183,7 @@ export function sameProfileDirectoryIdentity(
     sameProfileDirectoryPath(left.canonicalPath, right.canonicalPath, left.platform)
   );
 }
+
 async function rejectProfileSymlinkTraversal(
   resolvedPath: string,
   options: { allowMissing?: boolean } = {},
@@ -537,6 +232,7 @@ export function sameProfileDirectoryPath(
   const normalizedRight = profileDirectoryPathComparisonKey(right, platform);
   return normalizedLeft !== null && normalizedRight !== null && normalizedLeft === normalizedRight;
 }
+
 export function parseProfileDirectoryIdentity(
   value: unknown,
   platform: NodeJS.Platform,
@@ -544,80 +240,26 @@ export function parseProfileDirectoryIdentity(
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (
+    record.version !== PROFILE_IDENTITY_VERSION ||
     record.platform !== platform ||
     typeof record.canonicalPath !== "string" ||
-    !pathForPlatform(platform).isAbsolute(record.canonicalPath)
-  ) {
-    return null;
-  }
-  const canonicalPath = pathForPlatform(platform).resolve(record.canonicalPath);
-  if (record.version === BIRTHTIME_PROFILE_IDENTITY_VERSION) {
-    const physical = parsePhysicalDirectoryIdentity({
-      device: record.device,
-      inode: record.inode,
-      birthtimeNs: record.birthtimeNs,
-    });
-    if (
-      !physical ||
-      Object.keys(record).sort().join(",") !==
-        "birthtimeNs,canonicalPath,device,inode,platform,version" ||
-      physical.birthtimeNs === "0"
-    ) {
-      return null;
-    }
-    return Object.freeze({
-      version: BIRTHTIME_PROFILE_IDENTITY_VERSION,
-      platform,
-      canonicalPath,
-      ...physical,
-    });
-  }
-  if (
-    record.version !== MARKER_PROFILE_IDENTITY_VERSION ||
-    platform !== "linux" ||
+    !pathForPlatform(platform).isAbsolute(record.canonicalPath) ||
     Object.keys(record).sort().join(",") !==
-      "birthtimeNs,canonicalPath,device,generationMarker,inode,platform,version" ||
-    !record.generationMarker ||
-    typeof record.generationMarker !== "object" ||
-    Array.isArray(record.generationMarker)
+      "birthtimeNs,canonicalPath,device,inode,platform,version"
   ) {
     return null;
   }
-  const physical = parsePhysicalDirectoryIdentity(
-    {
-      device: record.device,
-      inode: record.inode,
-      birthtimeNs: record.birthtimeNs,
-    },
-    { allowZeroBirthtime: true },
-  );
-  if (!physical || physical.birthtimeNs !== "0" || physical.inode === "0") return null;
-  const marker = record.generationMarker as Record<string, unknown>;
-  if (
-    Object.keys(marker).sort().join(",") !== "ctimeNs,device,inode,token" ||
-    typeof marker.device !== "string" ||
-    typeof marker.inode !== "string" ||
-    typeof marker.ctimeNs !== "string" ||
-    typeof marker.token !== "string" ||
-    !/^(?:0|[1-9]\d*)$/u.test(marker.device) ||
-    !/^[1-9]\d*$/u.test(marker.inode) ||
-    !/^[1-9]\d*$/u.test(marker.ctimeNs) ||
-    !/^[0-9a-f]{64}$/u.test(marker.token) ||
-    marker.device !== physical.device
-  ) {
-    return null;
-  }
+  const physical = parsePhysicalDirectoryIdentity({
+    device: record.device,
+    inode: record.inode,
+    birthtimeNs: record.birthtimeNs,
+  });
+  if (!physical) return null;
   return Object.freeze({
-    version: MARKER_PROFILE_IDENTITY_VERSION,
+    version: PROFILE_IDENTITY_VERSION,
     platform,
-    canonicalPath,
+    canonicalPath: pathForPlatform(platform).resolve(record.canonicalPath),
     ...physical,
-    generationMarker: Object.freeze({
-      device: marker.device,
-      inode: marker.inode,
-      ctimeNs: marker.ctimeNs,
-      token: marker.token,
-    }),
   });
 }
 

@@ -887,22 +887,22 @@ async function readChromeProcessSnapshot(
     if (platform === "linux") {
       const procRoot = `/proc/${Math.trunc(pid)}`;
       const initialStat = parseLinuxProcStat(
-        (await linuxProcfs.readFile(path.join(procRoot, "stat"), "utf8")).toString(),
+        (await linuxProcfs.readFile(path.posix.join(procRoot, "stat"), "utf8")).toString(),
       );
       const initialBootId = parseLinuxBootId(
         (await linuxProcfs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).toString(),
       );
       if (!initialStat || initialStat.pid !== pid || !initialBootId) return null;
-      const executablePath = await linuxProcfs.readlink(path.join(procRoot, "exe"));
-      const rawCommandLine = (await linuxProcfs.readFile(path.join(procRoot, "cmdline"))).toString(
-        "utf8",
-      );
-      const confirmedExecutablePath = await linuxProcfs.readlink(path.join(procRoot, "exe"));
+      const executablePath = await linuxProcfs.readlink(path.posix.join(procRoot, "exe"));
+      const rawCommandLine = (
+        await linuxProcfs.readFile(path.posix.join(procRoot, "cmdline"))
+      ).toString("utf8");
+      const confirmedExecutablePath = await linuxProcfs.readlink(path.posix.join(procRoot, "exe"));
       const confirmedCommandLine = (
-        await linuxProcfs.readFile(path.join(procRoot, "cmdline"))
+        await linuxProcfs.readFile(path.posix.join(procRoot, "cmdline"))
       ).toString("utf8");
       const confirmedStat = parseLinuxProcStat(
-        (await linuxProcfs.readFile(path.join(procRoot, "stat"), "utf8")).toString(),
+        (await linuxProcfs.readFile(path.posix.join(procRoot, "stat"), "utf8")).toString(),
       );
       const confirmedBootId = parseLinuxBootId(
         (await linuxProcfs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).toString(),

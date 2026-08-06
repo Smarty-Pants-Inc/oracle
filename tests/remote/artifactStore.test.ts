@@ -19,10 +19,11 @@ import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { missingRequiredArtifactDeliveries } from "../../src/remote/transactionValidation.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 function openTransactionStore(
   options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
 ) {
-  return RemoteTransactionStore.open({
+  return openTestRemoteTransactionStore({
     ...options,
     integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
   });

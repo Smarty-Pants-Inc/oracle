@@ -2,9 +2,8 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import type { retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
@@ -18,18 +17,20 @@ import {
 import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
+  createTestRemoteServer,
   committedPromptEpoch,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpPostJson, httpPostNdjson } from "./serverTestHttp.js";
 import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "returns canonical bound and completed authority on opposite-mode conflicts",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-http-conflict-"));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),
@@ -115,7 +116,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         archived: true,
         conversationUrl: "https://chatgpt.com/c/remote-conversation",
       };
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -150,7 +151,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           }),
         );
         expect(preArchiveResult).not.toHaveProperty("archive");
-        const store = await RemoteTransactionStore.open({
+        const store = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -195,7 +196,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const publishCapture = vi
         .spyOn(RemoteTransactionStore.prototype, "publishCapture")
         .mockRejectedValueOnce(new Error("simulated initial publication write failure"));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -234,7 +235,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             }),
           }),
         );
-        const record = await RemoteTransactionStore.open({
+        const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -307,7 +308,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const beforeCrash = await RemoteTransactionStore.open({
+      const beforeCrash = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -343,7 +344,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const resumeBrowser = vi.fn(async () => {
         throw new Error("retry must not recapture a durable staged answer");
       });
-      const restarted = await createRemoteServer(
+      const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -454,7 +455,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const beforeCrash = await RemoteTransactionStore.open({
+      const beforeCrash = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -494,7 +495,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         finalize: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
         abort: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
       }));
-      const restarted = await createRemoteServer(
+      const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -522,7 +523,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         });
         expect(resumeBrowser).toHaveBeenCalledOnce();
-        const record = await RemoteTransactionStore.open({
+        const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -572,7 +573,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         status: "completed" as const,
         runtime: cleanupRuntime,
       }));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,

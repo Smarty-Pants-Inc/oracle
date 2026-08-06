@@ -4,8 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
-import { createRemoteServer } from "../../src/remote/server.js";
-import { CAN_LISTEN_LOCALHOST } from "./serverTestBuilders.js";
+import { CAN_LISTEN_LOCALHOST, createTestRemoteServer } from "./serverTestBuilders.js";
 
 const cryptoHarness = vi.hoisted(() => {
   const bytes = Array.from({ length: 32 }, (_, index) => index);
@@ -72,7 +71,7 @@ describe("remote credential generation", () => {
         await fs.chmod(path.join(tempDir, ".remote-transaction-integrity.key"), 0o600);
       }
       cryptoHarness.randomBytes.mockClear();
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, logger: () => undefined },
         { transactionStoreDir: path.join(tempDir, "transactions") },
       );

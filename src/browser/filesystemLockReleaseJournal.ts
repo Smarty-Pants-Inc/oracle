@@ -4,7 +4,10 @@ import {
   filesystemLockReleaseKey,
   LOCK_MUTATION_DIRECTORY_SUFFIX,
 } from "./filesystemLockModel.js";
-import { replayPendingIsolatedDirectoryRemovals } from "./filesystemLockDirectoryRemoval.js";
+import {
+  replayPendingIsolatedDirectoryRemovals,
+  type IsolatedDirectoryRemovalDeps,
+} from "./filesystemLockDirectoryRemoval.js";
 
 export interface FilesystemLockReleaseGeneration {
   pid: number;
@@ -27,6 +30,7 @@ type RetainedReleaseEntry = RetainedFilesystemLockRelease & {
   attempt: () => Promise<void>;
   inFlight?: Promise<void>;
   finalize?: () => Promise<void>;
+  assertParentAuthority?: () => Promise<void>;
 };
 
 const retainedReleases = new Map<string, RetainedReleaseEntry>();
@@ -35,6 +39,7 @@ export function retainFilesystemLockRelease(
   lockPath: string,
   generation: FilesystemLockReleaseGeneration,
   attempt: () => Promise<void>,
+  assertParentAuthority?: () => Promise<void>,
 ): RetainedFilesystemLockRelease {
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
   const key = filesystemLockReleaseKey(canonicalPath, generation);
@@ -48,6 +53,7 @@ export function retainFilesystemLockRelease(
     pending: false,
     released: false,
     attempt,
+    assertParentAuthority,
     release: async (finalize) => {
       if (finalize) entry.finalize ??= finalize;
       if (!retainedReleases.has(key)) return;
@@ -56,10 +62,16 @@ export function retainFilesystemLockRelease(
       currentAttempt = (async () => {
         try {
           if (!entry.released) {
+            await entry.assertParentAuthority?.();
             await entry.attempt();
+            await entry.assertParentAuthority?.();
             entry.released = true;
           }
-          await entry.finalize?.();
+          if (entry.finalize) {
+            await entry.assertParentAuthority?.();
+            await entry.finalize();
+            await entry.assertParentAuthority?.();
+          }
           retainedReleases.delete(key);
         } catch (error) {
           entry.pending = true;
@@ -76,14 +88,31 @@ export function retainFilesystemLockRelease(
   return entry;
 }
 
-export async function retryPendingFilesystemLockReleases(lockPath: string): Promise<void> {
+export async function retryPendingFilesystemLockReleases(
+  lockPath: string,
+  removalDeps: IsolatedDirectoryRemovalDeps = {},
+): Promise<void> {
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
-  await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath);
-  await replayPendingIsolatedDirectoryRemovals(`${canonicalPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`);
+  await removalDeps.assertParentAuthority?.();
+  await replayPendingIsolatedDirectoryRemovals(
+    path.dirname(canonicalPath),
+    canonicalPath,
+    removalDeps,
+  );
+  await replayPendingIsolatedDirectoryRemovals(
+    `${canonicalPath}${LOCK_MUTATION_DIRECTORY_SUFFIX}`,
+    undefined,
+    removalDeps,
+  );
+  await removalDeps.assertParentAuthority?.();
   const pending = [...retainedReleases.values()].filter(
     (entry) => entry.lockPath === canonicalPath && entry.pending,
   );
-  for (const entry of pending) await entry.release();
+  for (const entry of pending) {
+    await removalDeps.assertParentAuthority?.();
+    await entry.release();
+    await removalDeps.assertParentAuthority?.();
+  }
 }
 
 export function hasRetainedFilesystemLockRelease(lockPath: string): boolean {

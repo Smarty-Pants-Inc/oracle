@@ -340,9 +340,8 @@ export class RemoteTransactionStore {
         directory,
         platform,
         assertIntegrityAuthority: () => store.assertIntegrityAuthority(),
-        authenticateTarget: async (targetPath, transactionToken) => {
-          await store.readAuthenticatedRecord(targetPath, transactionToken);
-        },
+        authenticateTarget: (targetPath, transactionToken, expectedLinkCount) =>
+          store.readAuthenticatedRecord(targetPath, transactionToken, expectedLinkCount),
       });
       await store.#maintenance.run();
     });
@@ -855,12 +854,17 @@ export class RemoteTransactionStore {
     });
   }
 
-  private async readAuthenticatedRecord(targetPath: string, transactionToken: string) {
+  private async readAuthenticatedRecord(
+    targetPath: string,
+    transactionToken: string,
+    expectedLinkCount = 1n,
+  ) {
     const authenticated = await readStableRemoteTransactionRecordBytes({
       targetPath,
       platform: this.#platform,
       maximumEncodedBytes: this.#maximumBytes,
       assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+      expectedLinkCount,
     });
     const { contents } = authenticated;
     try {

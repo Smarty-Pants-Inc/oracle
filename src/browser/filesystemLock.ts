@@ -101,6 +101,7 @@ export interface CrashRecoverableFilesystemLockDeps {
   beforeMutationRequestTicketPublication?: (requestPath: string, ticket: number) => Promise<void>;
   beforeMutationRequestRemoval?: (requestPath: string) => Promise<void>;
   beforeReleasedLockRemoval?: (isolatedRootPath: string) => Promise<void>;
+  afterPendingReleaseRemovalAttestation?: (isolatedRootPath: string) => Promise<void>;
 }
 
 export class FilesystemLockBusyError extends Error {
@@ -180,9 +181,21 @@ export async function acquireCrashRecoverableFilesystemLock(
     readLiveness,
     readProcessIdentity,
     createNonce,
-    beforeRequestOwnerWrite: deps.beforeMutationRequestOwnerWrite,
-    beforeTicketPublication: deps.beforeMutationRequestTicketPublication,
-    beforeRequestRemoval: deps.beforeMutationRequestRemoval,
+    beforeRequestOwnerWrite: async (preparedPath, requestPath) => {
+      await assertExpectedParentIdentity();
+      await deps.beforeMutationRequestOwnerWrite?.(preparedPath, requestPath);
+      await assertExpectedParentIdentity();
+    },
+    beforeTicketPublication: async (requestPath, ticket) => {
+      await assertExpectedParentIdentity();
+      await deps.beforeMutationRequestTicketPublication?.(requestPath, ticket);
+      await assertExpectedParentIdentity();
+    },
+    beforeRequestRemoval: async (requestPath) => {
+      await assertExpectedParentIdentity();
+      await deps.beforeMutationRequestRemoval?.(requestPath);
+      await assertExpectedParentIdentity();
+    },
   };
 
   if (options.expectedParentIdentity && options.createParent !== false) {
@@ -192,7 +205,10 @@ export async function acquireCrashRecoverableFilesystemLock(
     await mkdir(parentPath, { recursive: true });
   }
   await assertExpectedParentIdentity();
-  await retryPendingFilesystemLockReleases(lockPath);
+  await retryPendingFilesystemLockReleases(lockPath, {
+    assertParentAuthority: assertExpectedParentIdentity,
+    afterChildAttestation: deps.afterPendingReleaseRemovalAttestation,
+  });
 
   const completeAcquisition = (
     acquiredOwner: FilesystemLockOwnerRecord,
@@ -204,15 +220,21 @@ export async function acquireCrashRecoverableFilesystemLock(
       expectedGeneration,
       canonicalReleased: false,
     };
-    const retainedRelease = retainFilesystemLockRelease(lockPath, acquiredOwner, async () => {
-      await releaseCrashRecoverableFilesystemLock(
-        lockPath,
-        acquiredOwner,
-        mutationOptions,
-        releaseState,
-        deps.beforeReleasedLockRemoval,
-      );
-    });
+    const retainedRelease = retainFilesystemLockRelease(
+      lockPath,
+      acquiredOwner,
+      async () => {
+        await releaseCrashRecoverableFilesystemLock(
+          lockPath,
+          acquiredOwner,
+          mutationOptions,
+          releaseState,
+          deps.beforeReleasedLockRemoval,
+          assertExpectedParentIdentity,
+        );
+      },
+      assertExpectedParentIdentity,
+    );
     return {
       path: lockPath,
       owner: acquiredOwner,

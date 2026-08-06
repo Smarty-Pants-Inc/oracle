@@ -1,4 +1,4 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { execFile, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES,
@@ -22,7 +23,11 @@ import {
 import * as fsDurability from "../../src/fsDurability.js";
 import * as sessionManager from "../../src/sessionManager.js";
 
-import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
+import {
+  resolveWindowsOpenSshExecutable,
+  resolveWindowsPowerShellExecutable,
+} from "../../src/windowsSystemExecutable.js";
+const execFileAsync = promisify(execFile);
 const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
 const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
@@ -166,12 +171,14 @@ function createFakeSshChild(io?: net.Socket, pid = 5000): FakeSshChild {
 
 function createFakeSshTunnelHarness(platform: NodeJS.Platform, healthPort: number) {
   const sshArgs: Array<readonly string[]> = [];
+  const sshCommands: string[] = [];
   const sshChildren: FakeSshChild[] = [];
   const mainChildren: FakeSshChild[] = [];
   const controlChildren: FakeSshChild[] = [];
   const probeChildren: FakeSshChild[] = [];
   const tunnelSpawn = vi.fn(
-    (_command: string, args: readonly string[], _options: SpawnOptions): ChildProcess => {
+    (command: string, args: readonly string[], _options: SpawnOptions): ChildProcess => {
+      sshCommands.push(command);
       sshArgs.push([...args]);
       const isProbe = args[0] === "-W";
       const isControl = platform !== "win32" && args.includes("-O");
@@ -193,12 +200,19 @@ function createFakeSshTunnelHarness(platform: NodeJS.Platform, healthPort: numbe
   );
   return {
     tunnelSpawn,
+    sshCommands,
     sshArgs,
     sshChildren,
     mainChildren,
     controlChildren,
     probeChildren,
   };
+}
+
+function expectSshExecutables(commands: readonly string[], platform: NodeJS.Platform): void {
+  const expected = platform === "win32" ? resolveWindowsOpenSshExecutable() : "ssh";
+  expect(commands.length).toBeGreaterThan(0);
+  for (const command of commands) expect(command).toBe(expected);
 }
 
 async function listenLoopback(server: http.Server): Promise<number> {
@@ -357,6 +371,7 @@ describe("bridge host detached child transport", () => {
         },
         {
           spawn: spawnChild,
+          backgroundPlatform: "linux",
           generateReadinessNonce: () => READINESS_NONCE,
           env: {
             SAFE_VALUE: "kept",
@@ -457,6 +472,16 @@ describe("bridge host detached child transport", () => {
       const supervisorScript = Buffer.from(args[4]!, "base64").toString("utf16le");
       expect(supervisorScript).toContain("KillOnClose");
       expect(supervisorScript).toContain("AssignProcessToJobObject");
+      expect(supervisorScript).toContain("$assigned = $false");
+      expect(supervisorScript).toContain(
+        "[OracleBridgeJob]::Assign($job, $child.Handle)\n  $assigned = $true",
+      );
+      expect(supervisorScript).toContain(
+        "if (!$assigned -and $null -ne $child -and !$child.HasExited) { try { $child.Kill() } catch {} }",
+      );
+      expect(supervisorScript).toContain(
+        "if ($null -ne $child) { try { $child.WaitForExit(5000) | Out-Null } catch {} }",
+      );
       expect(supervisorScript).not.toContain("taskkill");
       expect(options.stdio).toEqual(["pipe", "pipe", expect.any(Number)]);
       expect(options.env?.[WINDOWS_BRIDGE_CHILD_READINESS_STDOUT]).toBe("1");
@@ -474,6 +499,85 @@ describe("bridge host detached child transport", () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it.runIf(process.platform === "win32")(
+    "kills and waits for the raw child when Job assignment throws after start",
+    async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-job-assign-fail-"));
+      const artifactPath = path.join(tempDir, "connection.json");
+      const childPath = path.join(tempDir, "raw-child.cjs");
+      const childPidPath = path.join(tempDir, "raw-child.pid");
+      let rawChildPid: number | undefined;
+      await fs.writeFile(childPath, 'require("node:net").createServer().listen(0, "127.0.0.1");\n');
+      const harness = createFakeBridgeChild(
+        (_payload, readiness) => {
+          readiness.push(readinessPayload(READINESS_NONCE));
+          readiness.push(null);
+        },
+        4242,
+        true,
+      );
+      const spawnChild = vi.fn(
+        (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+      );
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      try {
+        await runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: spawnChild,
+            backgroundPlatform: "win32",
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        );
+        const [command, args, options] = spawnChild.mock.calls[0]!;
+        const supervisorScript = Buffer.from(args[4]!, "base64").toString("utf16le");
+        const escapedPidPath = childPidPath.replaceAll("'", "''");
+        const assignmentFailureScript = supervisorScript.replace(
+          "  [OracleBridgeJob]::Assign($job, $child.Handle)",
+          `  [IO.File]::WriteAllText('${escapedPidPath}', [string]$child.Id)\n  throw 'injected assignment failure'`,
+        );
+        expect(assignmentFailureScript).not.toBe(supervisorScript);
+        const launchConfig = Buffer.from(
+          JSON.stringify({ file: process.execPath, arguments: `"${childPath}"` }),
+          "utf8",
+        ).toString("base64");
+        const supervisorArgs = [...args];
+        supervisorArgs[4] = Buffer.from(assignmentFailureScript, "utf16le").toString("base64");
+
+        await expect(
+          execFileAsync(command, supervisorArgs, {
+            encoding: "utf8",
+            env: {
+              ...options.env,
+              ORACLE_BRIDGE_CHILD_LAUNCH_CONFIG: launchConfig,
+            },
+            timeout: 12_000,
+            windowsHide: true,
+          }),
+        ).rejects.toMatchObject({ code: 1 });
+        rawChildPid = Number(await fs.readFile(childPidPath, "utf8"));
+        expect(Number.isSafeInteger(rawChildPid) && rawChildPid > 0).toBe(true);
+        let rawChildAlive = true;
+        try {
+          process.kill(rawChildPid, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          rawChildAlive = false;
+        }
+        expect(rawChildAlive).toBe(false);
+      } finally {
+        if (rawChildPid) {
+          try {
+            process.kill(rawChildPid, "SIGKILL");
+          } catch {}
+        }
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 
   it("requires authenticated readiness before replacing prior artifact or pid state", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-not-ready-"));
@@ -500,6 +604,7 @@ describe("bridge host detached child transport", () => {
           },
           {
             spawn: () => harness.child,
+            backgroundPlatform: "linux",
             generateReadinessNonce: () => READINESS_NONCE,
           },
         ),
@@ -551,6 +656,7 @@ describe("bridge host detached child transport", () => {
           { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
           {
             spawn: () => harness.child,
+            backgroundPlatform: "linux",
             generateReadinessNonce: () => READINESS_NONCE,
             readinessTimeoutMs: name === "readiness timeout" ? 5 : 1_000,
           },
@@ -592,6 +698,7 @@ describe("bridge host detached child transport", () => {
           { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
           {
             spawn: () => harness.child,
+            backgroundPlatform: "linux",
             generateReadinessNonce: () => READINESS_NONCE,
           },
         ),
@@ -987,6 +1094,7 @@ describe.each([
       releaseHealth.resolve();
       await run;
       expectSshArgs(harness.sshArgs);
+      expectSshExecutables(harness.sshCommands, platform);
       expect(harness.mainChildren).toHaveLength(1);
       expect(harness.controlChildren).toHaveLength(platform === "win32" ? 0 : 2);
       expect(harness.probeChildren).toHaveLength(1);
@@ -1081,6 +1189,7 @@ describe.each([
           }),
         ]);
         expectSshArgs(harness.sshArgs);
+        expectSshExecutables(harness.sshCommands, platform);
         if (backgroundChild) {
           expect(readinessWrites).toHaveLength(0);
         } else {
@@ -1187,6 +1296,38 @@ describe("reverse tunnel shutdown drain", () => {
 });
 
 describe("native Windows OpenSSH bridge tunnel contract", () => {
+  it("binds hostile-PATH Windows master and probe launches to trusted native OpenSSH", async () => {
+    const originalPath = process.env.PATH;
+    const healthServer = http.createServer((req, res) =>
+      writeHealthResponse(req, res, MODERN_TOKEN),
+    );
+    const healthPort = await listenLoopback(healthServer);
+    const harness = createFakeSshTunnelHarness("win32", healthPort);
+    process.env.PATH = String.raw`C:\attacker\bin`;
+    const tunnel = startReverseTunnel({
+      sshTarget: "synthetic-host",
+      remotePort: 9473,
+      localPort: 9473,
+      token: MODERN_TOKEN,
+      log: () => undefined,
+      platform: "win32",
+      spawnSsh: harness.tunnelSpawn,
+    });
+
+    try {
+      await tunnel.ready;
+      expect(harness.mainChildren).toHaveLength(1);
+      expect(harness.probeChildren).toHaveLength(1);
+      expectSshExecutables(harness.sshCommands, "win32");
+      expect(harness.sshCommands).not.toContain("ssh");
+    } finally {
+      await Promise.resolve(tunnel.stop()).catch(() => undefined);
+      await closeServer(healthServer);
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
   it("rejects Windows control-socket options before spawning SSH", async () => {
     const tunnelSpawn = vi.fn();
     await expect(

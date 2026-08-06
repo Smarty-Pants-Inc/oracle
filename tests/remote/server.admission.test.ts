@@ -5,15 +5,16 @@ import { describe, expect, test, vi } from "vitest";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import { recoverRemoteRunTransaction } from "../../src/remote/clientRecovery.js";
 import { RemoteTransportInterruption } from "../../src/remote/clientTransport.js";
-import { createRemoteServer } from "../../src/remote/server.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import {
   CAN_LISTEN_LOCALHOST,
+  createTestRemoteServer,
   browserTransaction,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpPostJson } from "./serverTestHttp.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 
 describe("remote transaction admission", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -32,7 +33,7 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
           answerChars: 19,
         });
       });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -109,7 +110,7 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
         releaseMaintenance.resolve();
         await expect(run).resolves.toMatchObject({ statusCode: 200 });
         expect(runBrowser).toHaveBeenCalledOnce();
-        const record = await RemoteTransactionStore.open({
+        const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -137,7 +138,7 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
       const transactionStoreDir = path.join(root, "transactions");
       const transactionToken = "d".repeat(64);
       const runBrowser = vi.fn();
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -175,7 +176,7 @@ describe("remote transaction admission", { timeout: 15_000 }, () => {
           statusCode: 404,
           json: { error: "transaction_not_retained", transactionToken },
         });
-        const record = await RemoteTransactionStore.open({
+        const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),

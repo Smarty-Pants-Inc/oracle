@@ -52,6 +52,7 @@ public static class OracleBridgeJob {
 '@
 $job = [IntPtr]::Zero
 $child = $null
+$assigned = $false
 $exitCode = 1
 try {
   $encodedConfig = [Environment]::GetEnvironmentVariable('${WINDOWS_BRIDGE_CHILD_LAUNCH_CONFIG}', 'Process')
@@ -72,6 +73,7 @@ try {
   $child.StartInfo = $start
   if (!$child.Start()) { throw 'child process did not start' }
   [OracleBridgeJob]::Assign($job, $child.Handle)
+  $assigned = $true
   $stdoutCopy = $child.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())
   $stderrCopy = $child.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())
   [Console]::OpenStandardInput().CopyTo($child.StandardInput.BaseStream)
@@ -83,9 +85,9 @@ try {
 } catch {
   [Console]::Error.WriteLine('Bridge host Windows supervisor failed.')
 } finally {
-  if ($job -ne [IntPtr]::Zero) { try { [OracleBridgeJob]::Terminate($job) } catch {} }
-  elseif ($null -ne $child -and !$child.HasExited) { try { $child.Kill() } catch {} }
-  if ($null -ne $child -and !$child.HasExited) { try { $child.WaitForExit(5000) | Out-Null } catch {} }
+  if ($assigned -and $job -ne [IntPtr]::Zero) { try { [OracleBridgeJob]::Terminate($job) } catch {} }
+  if (!$assigned -and $null -ne $child -and !$child.HasExited) { try { $child.Kill() } catch {} }
+  if ($null -ne $child) { try { $child.WaitForExit(5000) | Out-Null } catch {} }
   if ($job -ne [IntPtr]::Zero) { [OracleBridgeJob]::Close($job) }
 }
 exit $exitCode`;

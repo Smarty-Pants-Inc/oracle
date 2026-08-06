@@ -3,8 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import {
   createRemoteBrowserExecutor,
@@ -27,6 +25,7 @@ import {
 import { completedBrowserCaptureCleanup } from "../../src/browser/runLifecycle.js";
 import {
   CAN_LISTEN_LOCALHOST,
+  createTestRemoteServer,
   committedPromptEpoch,
   lifecycleBrowserTransaction,
 } from "./serverTestBuilders.js";
@@ -36,6 +35,7 @@ import {
   remoteRecoveryTransactionToken,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
+import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
@@ -62,7 +62,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         status: "completed" as const,
         runtime: recoverableRuntime,
       }));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),
@@ -166,7 +166,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       ],
     };
-    const seeded = await RemoteTransactionStore.open({
+    const seeded = await openTestRemoteTransactionStore({
       directory: transactionStoreDir,
       integrityKeyPath: path.join(
         path.dirname(transactionStoreDir),
@@ -192,7 +192,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         runtime: recoveryRuntime,
       });
     });
-    const server = await createRemoteServer(
+    const server = await createTestRemoteServer(
       { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
       {
         transactionStoreDir,
@@ -223,7 +223,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       expect(resumeBrowser).toHaveBeenCalledOnce();
       expect(retryCleanup).toHaveBeenCalledOnce();
       expect(retryCleanup.mock.calls[0]?.[3]).toBe("abort");
-      const record = await RemoteTransactionStore.open({
+      const record = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -315,7 +315,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const first = await createRemoteServer(
+      const first = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -386,7 +386,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           };
         },
       );
-      const restarted = await createRemoteServer(
+      const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         { transactionStoreDir, resumeBrowser },
       );
@@ -476,7 +476,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           promptEpoch: stagedPromptEpoch,
         })),
       };
-      const beforeCrash = await RemoteTransactionStore.open({
+      const beforeCrash = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -529,7 +529,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           return completedBrowserCaptureCleanup(cleanupRuntime);
         },
       );
-      const restarted = await createRemoteServer(
+      const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -563,7 +563,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(resumeBrowser).not.toHaveBeenCalled();
         expect(retryCleanup).toHaveBeenCalledOnce();
 
-        const reloaded = await RemoteTransactionStore.open({
+        const reloaded = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -690,7 +690,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ],
       };
       const transactionToken = "7".repeat(64);
-      const previousController = await RemoteTransactionStore.open({
+      const previousController = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -717,7 +717,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         stage: "pre-intent" | "process" | "target",
         runtime: BrowserRunTransaction["runtime"],
       ) => {
-        const reloaded = await RemoteTransactionStore.open({
+        const reloaded = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -766,7 +766,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           };
         },
       );
-      const restarted = await createRemoteServer(
+      const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -836,7 +836,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         finalize: vi.fn(async () => ({ status: "completed" as const, runtime: mismatchedRuntime })),
         abort,
       }));
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -880,7 +880,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         });
         expect(abort).toHaveBeenCalledOnce();
-        const record = await RemoteTransactionStore.open({
+        const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
             path.dirname(transactionStoreDir),
@@ -977,7 +977,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ],
         recoveryCleanupResult: { status: "failed", settlementMode: "abort" },
       };
-      const seeded = await RemoteTransactionStore.open({
+      const seeded = await openTestRemoteTransactionStore({
         directory: transactionStoreDir,
         integrityKeyPath: path.join(
           path.dirname(transactionStoreDir),
@@ -1038,7 +1038,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           });
         },
       );
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,

@@ -2,14 +2,14 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
-import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
+  createTestRemoteServer,
   committedPromptEpoch,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
@@ -47,7 +47,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
         };
       });
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),
@@ -138,7 +138,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           return { status: "completed" as const, runtime };
         },
       );
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -244,7 +244,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           return { status: "completed" as const, runtime };
         },
       );
-      const server = await createRemoteServer(
+      const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
@@ -384,7 +384,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             };
           },
         );
-        const server = await createRemoteServer(
+        const server = await createTestRemoteServer(
           { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir,
