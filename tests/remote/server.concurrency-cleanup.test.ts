@@ -17,6 +17,7 @@ import { httpPostJson } from "./serverTestHttp.js";
 import {
   TEST_CONTROLLER_GENERATION,
   openSeedTransactionStore,
+  readAuthenticatedTransactionRecord,
   remoteRecoveryTransactionToken,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
@@ -256,16 +257,25 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
       try {
         expect(cleanupModes).toEqual(["abort", "finalize"]);
-        expect(await store.read(abortToken)).toMatchObject({
+        expect(
+          await readAuthenticatedTransactionRecord(transactionStoreDir, abortToken),
+        ).toMatchObject({
           state: "aborted",
           terminalAudit: { settlementMode: "abort" },
         });
-        const failed = await store.read(preAuthorityToken);
+        const failed = await readAuthenticatedTransactionRecord(
+          transactionStoreDir,
+          preAuthorityToken,
+        );
         expect(failed).toMatchObject({ state: "failed" });
         expect(failed).not.toHaveProperty("runtime");
         expect(failed).not.toHaveProperty("requestIdentity");
         expect(failed).not.toHaveProperty("browserConfig");
-        expect(await store.read(finalizeToken)).toMatchObject({ state: "finalized" });
+        expect(
+          await readAuthenticatedTransactionRecord(transactionStoreDir, finalizeToken),
+        ).toMatchObject({
+          state: "finalized",
+        });
 
         const abortRetry = await httpPostJson({
           hostname: "127.0.0.1",
@@ -417,7 +427,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           if (!retryResponse) throw new Error("pending settlement retry did not acquire authority");
           expect(retryCleanup).toHaveBeenCalledTimes(3);
           expect(retryCleanup.mock.calls.every((call) => call[3] === "abort")).toBe(true);
-          expect(await store.read(transactionToken)).toMatchObject({
+          expect(
+            await readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+          ).toMatchObject({
             state: "pending",
             settlementMode: "abort",
             finalization: { status: "pending" },

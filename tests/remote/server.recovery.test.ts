@@ -31,7 +31,11 @@ import {
   lifecycleBrowserTransaction,
 } from "./serverTestBuilders.js";
 import { httpPostJson } from "./serverTestHttp.js";
-import { remoteRecoveryTransactionToken, seedRemoteTransaction } from "./serverTestTransactions.js";
+import {
+  readAuthenticatedTransactionRecord,
+  remoteRecoveryTransactionToken,
+  seedRemoteTransaction,
+} from "./serverTestTransactions.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
@@ -1062,7 +1066,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(exactChromeCleanup).toHaveBeenCalledOnce();
         expect(removeCleanupProfile).not.toHaveBeenCalled();
         await expect(stat(profileDir)).resolves.toBeDefined();
-        await expect(seeded.read(transactionToken)).resolves.toMatchObject({
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toMatchObject({
           state: "pending",
           settlementMode: "abort",
           finalization: { status: "pending" },
@@ -1094,7 +1100,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         );
         expect(removeCleanupProfile).toHaveBeenCalledOnce();
         await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
-        await expect(seeded.read(transactionToken)).resolves.toMatchObject({
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toMatchObject({
           state: "aborted",
           terminalAudit: { settlementMode: "abort" },
         });

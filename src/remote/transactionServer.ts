@@ -78,7 +78,7 @@ export async function settleRemoteControllerShutdown(
     });
     if (outcome.finalization.status !== "completed") {
       throw new Error(
-        `Remote server cannot close while transaction ${transactionToken} cleanup remains pending`,
+        `Remote server cannot close while transaction ${transactionToken.slice(0, 12)} cleanup remains pending`,
       );
     }
   }

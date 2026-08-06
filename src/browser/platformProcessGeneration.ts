@@ -23,6 +23,29 @@ export type ProcessGenerationCommandExecutor = (
   args: string[],
   options?: ProcessGenerationCommandOptions,
 ) => Promise<{ stdout: string }>;
+export type TrustedProcessProbe = (
+  args: string[],
+  options?: ProcessGenerationCommandOptions,
+) => Promise<{ stdout: string }>;
+
+// Process authority must never resolve an executable through the caller's PATH.
+export function createTrustedProcessProbe(
+  platform: NodeJS.Platform,
+  execute: ProcessGenerationCommandExecutor,
+): TrustedProcessProbe | null {
+  const executable =
+    platform === "darwin"
+      ? "/bin/ps"
+      : platform === "linux"
+        ? "/usr/bin/ps"
+        : platform === "win32"
+          ? String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`
+          : null;
+  if (!executable) return null;
+  return (args, options) =>
+    options === undefined ? execute(executable, args) : execute(executable, args, options);
+}
+
 type ProcessGenerationFileReader = (path: string, encoding: "utf8") => Promise<string>;
 
 export interface PlatformProcessGenerationProvider {
@@ -33,6 +56,7 @@ export interface PlatformProcessGenerationProvider {
 export interface PlatformProcessGenerationProviderDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessGenerationCommandExecutor;
+  trustedProcessProbe?: TrustedProcessProbe | null;
   readFile?: ProcessGenerationFileReader;
 }
 
@@ -95,10 +119,21 @@ export function createPlatformProcessGenerationProvider(
   const platform = deps.platform ?? process.platform;
   const execute = deps.execute ?? executeProcessGenerationCommand;
   const readFile = deps.readFile ?? readFileFromDisk;
+  const trustedProcessProbe =
+    deps.trustedProcessProbe === undefined
+      ? createTrustedProcessProbe(platform, execute)
+      : deps.trustedProcessProbe;
   return {
     platform,
     readProcessGeneration: (pid, timeoutMs) =>
-      readPlatformProcessGeneration(pid, platform, execute, readFile, timeoutMs),
+      readPlatformProcessGeneration(
+        pid,
+        platform,
+        execute,
+        trustedProcessProbe,
+        readFile,
+        timeoutMs,
+      ),
   };
 }
 
@@ -106,13 +141,16 @@ async function readPlatformProcessGeneration(
   pid: number,
   platform: NodeJS.Platform,
   execute: ProcessGenerationCommandExecutor,
+  trustedProcessProbe: TrustedProcessProbe | null,
   readFile: ProcessGenerationFileReader,
   timeoutMs?: number,
 ): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     if (platform === "linux") return await readLinuxProcessGeneration(pid, readFile);
-    if (platform === "win32") return await readWindowsProcessGeneration(pid, execute, timeoutMs);
+    if (platform === "win32") {
+      return await readWindowsProcessGeneration(pid, trustedProcessProbe, timeoutMs);
+    }
     if (platform === "darwin") return await readDarwinProcessGeneration(pid, execute, timeoutMs);
     return null;
   } catch {
@@ -144,9 +182,10 @@ async function readLinuxProcessGeneration(
 
 async function readWindowsProcessGeneration(
   pid: number,
-  execute: ProcessGenerationCommandExecutor,
+  trustedProcessProbe: TrustedProcessProbe | null,
   timeoutMs?: number,
 ): Promise<string | null> {
+  if (!trustedProcessProbe) return null;
   // Get-Process.StartTime is unavailable for the Node process on hosted Windows runners.
   // Win32_Process.CreationDate is provider-backed creation metadata, and distinguishes a later
   // process that reuses the same numeric identifier.
@@ -158,8 +197,8 @@ async function readWindowsProcessGeneration(
   ];
   const { stdout } =
     timeoutMs === undefined
-      ? await execute("powershell.exe", args)
-      : await execute("powershell.exe", args, { timeoutMs });
+      ? await trustedProcessProbe(args)
+      : await trustedProcessProbe(args, { timeoutMs });
   const startTime = stdout.trim();
   return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/u.test(startTime)
     ? `win32:${startTime}`

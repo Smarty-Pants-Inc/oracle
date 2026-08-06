@@ -751,10 +751,17 @@ export function rehydrateRemoteBrowserError(
   } = {},
 ): BrowserAutomationError {
   if (!error.recoverableDisconnect) {
+    const runtime = authority.authoritativeRuntime
+      ? projectBrowserCaptureFinalization(authority.authoritativeRuntime, {
+          status: "completed",
+          runtime: projectRemoteRecoveryRuntime({ cleanup: { status: "completed" } }, null),
+        }).runtime
+      : undefined;
     return new BrowserAutomationError(error.message, {
       code: error.code,
       stage: error.stage,
       recoverableDisconnect: false,
+      ...(runtime ? { runtime } : {}),
     });
   }
   const transactionToken = expectedTransactionToken ?? error.recoveryToken;

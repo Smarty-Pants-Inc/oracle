@@ -222,6 +222,8 @@ oracle project-sources add \
 
 This command uses browser automation but does not select a model, start a consult, or send a prompt. It only opens the Project Sources surface, lists existing files, or appends new files. Destructive operations such as delete, replace, and sync are intentionally left out until the UI path is safer and better covered by live tests.
 
+On Linux, Project Sources state under `ORACLE_HOME_DIR` must meet the [generation-safe storage requirements](linux.md#browser-profile-and-oracle-home-storage) used by startup and recovery.
+
 ### Multi-turn browser consults
 
 Use browser follow-ups when a one-shot review would be too easy for the model to answer shallowly. Oracle keeps the same ChatGPT conversation open, waits for each answer, then submits the next follow-up:
@@ -274,6 +276,7 @@ oracle --engine browser \
 ```
 
 - Oracle launches Chrome headful with a persistent automation profile at `~/.oracle/browser-profile` (override with `ORACLE_BROWSER_PROFILE_DIR` or `browser.manualLoginProfileDir` in `~/.oracle/config.json`).
+- On Linux, custom Oracle-home and profile locations must meet the [generation-safe storage requirements](linux.md#browser-profile-and-oracle-home-storage); incompatible filesystems fail with relocation guidance rather than weakening directory swap detection.
 - Log into chatgpt.com in that window the first time; Oracle polls until the session is active, then proceeds.
 - Reuse the same profile on subsequent runs (no re-login unless the session expires).
 - Add `--browser-keep-browser` (or config `browser.keepBrowser=true`) when doing the initial login/setup or debugging so the Chrome window stays open after that run. A later normal run, or `--no-browser-keep-browser`, changes the shared direct-run owner back to close on its final tab lease; the profile remains on disk. The remote `oracle serve` bootstrap is separately service-owned, so direct-run flags cannot override its preserved owner.

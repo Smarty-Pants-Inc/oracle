@@ -16,12 +16,15 @@ import { readDevToolsPort } from "./profileDevToolsState.js";
 import {
   comparePlatformProcessGenerations,
   createPlatformProcessGenerationProvider,
+  createTrustedProcessProbe,
   type ProcessGenerationCommandExecutor,
+  type TrustedProcessProbe,
 } from "./platformProcessGeneration.js";
 
 export interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
+  trustedProcessProbe?: TrustedProcessProbe | null;
   readOwner?: (userDataDir: string) => Promise<{ processIdentity: ChromeProcessIdentity } | null>;
   launchClaim?: ChromeProcessLaunchClaim;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
@@ -150,9 +153,14 @@ async function captureChromeProcessIdentityWithDeps(
   if (!Number.isInteger(pid) || pid <= 0 || !normalizedUserDataDir) {
     throw new Error(`Cannot capture Chrome process identity for ${userDataDir}`);
   }
+  const execute = deps.execute ?? executeProcessCommand;
+  const trustedProcessProbe =
+    deps.trustedProcessProbe === undefined
+      ? createTrustedProcessProbe(platform, execute)
+      : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(pid)
-    : readChromeProcessSnapshot(pid, platform, deps.execute ?? executeProcessCommand));
+    : readChromeProcessSnapshot(pid, platform, execute, trustedProcessProbe));
   const executablePath = snapshot
     ? normalizeExecutablePath(snapshot.executablePath, platform)
     : null;
@@ -214,9 +222,14 @@ export async function inspectChromeProcessIdentityWithDeps(
 
   const processAlive = deps.isProcessAlive ?? isProcessAlive;
   if (!processAlive(identity.pid)) return "exited";
+  const execute = deps.execute ?? executeProcessCommand;
+  const trustedProcessProbe =
+    deps.trustedProcessProbe === undefined
+      ? createTrustedProcessProbe(platform, execute)
+      : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(identity.pid)
-    : readChromeProcessSnapshot(identity.pid, platform, deps.execute ?? executeProcessCommand));
+    : readChromeProcessSnapshot(identity.pid, platform, execute, trustedProcessProbe));
   if (!snapshot) return processAlive(identity.pid) ? "unavailable" : "exited";
   if (snapshot.pid !== identity.pid) return "unavailable";
   const generationComparison = comparePlatformProcessGenerations(
@@ -357,6 +370,7 @@ export type ChromeProfileDirectoryUseInspection =
 interface ChromeProfileDirectoryUseDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
+  trustedProcessProbe?: TrustedProcessProbe | null;
   listProcesses?: () => Promise<readonly RunningChromeProcessCommand[]>;
   readProcessGeneration?: (pid: number) => Promise<string | null>;
   captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
@@ -385,7 +399,15 @@ async function inspectChromeProfileDirectoryUseWithDeps(
     return { status: "unavailable", candidates: [], reason: "Profile identity is invalid" };
   }
   const execute = deps.execute ?? executeProcessCommand;
-  const processGenerationProvider = createPlatformProcessGenerationProvider({ platform, execute });
+  const trustedProcessProbe =
+    deps.trustedProcessProbe === undefined
+      ? createTrustedProcessProbe(platform, execute)
+      : deps.trustedProcessProbe;
+  const processGenerationProvider = createPlatformProcessGenerationProvider({
+    platform,
+    execute,
+    trustedProcessProbe,
+  });
   const readProcessGeneration =
     deps.readProcessGeneration ?? processGenerationProvider.readProcessGeneration;
   const captureProfileIdentity = deps.captureProfileIdentity ?? captureProfileDirectoryIdentity;
@@ -393,7 +415,7 @@ async function inspectChromeProfileDirectoryUseWithDeps(
   try {
     processes = await (deps.listProcesses
       ? deps.listProcesses()
-      : listRunningChromeProcessCommands(platform, execute));
+      : listRunningChromeProcessCommands(platform, trustedProcessProbe));
   } catch {
     return {
       status: "unavailable",
@@ -557,9 +579,10 @@ export async function inspectRunningChromeProcessesForLaunchClaim(
   const validated = parseChromeProcessLaunchClaim(claim);
   if (!validated) throw new Error("Chrome launch claim is invalid");
   const platform = process.platform;
+  const trustedProcessProbe = createTrustedProcessProbe(platform, executeProcessCommand);
   const [activePort, processes] = await Promise.all([
     readDevToolsPort(userDataDir),
-    listRunningChromeProcessCommands(platform, executeProcessCommand),
+    listRunningChromeProcessCommands(platform, trustedProcessProbe),
   ]);
   return inspectChromeProcessesForLaunchClaim(
     processes,
@@ -574,10 +597,12 @@ export async function findRunningChromeDebugTargetForProfile(
   userDataDir: string,
 ): Promise<RunningChromeDebugTarget | null> {
   if (process.platform === "win32") return null;
+  const trustedProcessProbe = createTrustedProcessProbe(process.platform, executeProcessCommand);
+  if (!trustedProcessProbe) return null;
   try {
     const [activePort, { stdout }] = await Promise.all([
       readDevToolsPort(userDataDir),
-      executeProcessCommand("ps", ["-ax", "-o", "pid=", "-o", "command="]),
+      trustedProcessProbe(["-ax", "-o", "pid=", "-o", "command="]),
     ]);
     return findChromeDebugTargetForProfileFromProcessList(
       String(stdout ?? ""),
@@ -596,8 +621,10 @@ export async function findRunningChromeProcessForProfile(
   expectedLaunchClaim?: ChromeProcessLaunchClaim,
 ): Promise<{ pid: number } | null> {
   if (process.platform === "win32") return null;
+  const trustedProcessProbe = createTrustedProcessProbe(process.platform, executeProcessCommand);
+  if (!trustedProcessProbe) return null;
   try {
-    const { stdout } = await executeProcessCommand("ps", ["-ax", "-o", "pid=", "-o", "command="]);
+    const { stdout } = await trustedProcessProbe(["-ax", "-o", "pid=", "-o", "command="]);
     for (const line of String(stdout ?? "").split("\n")) {
       const match = line.match(/^\s*(\d+)\s+(.+)$/u);
       if (!match) continue;
@@ -707,13 +734,14 @@ function inspectChromeProcessesForLaunchClaim(
 
 async function listRunningChromeProcessCommands(
   platform: NodeJS.Platform,
-  execute: ProcessCommandExecutor,
+  trustedProcessProbe: TrustedProcessProbe | null,
 ): Promise<readonly RunningChromeProcessCommand[]> {
+  if (!trustedProcessProbe) throw new Error("Trusted process probe is unavailable");
   if (platform !== "win32") {
-    const { stdout } = await execute("ps", ["-axww", "-o", "pid=", "-o", "command="]);
+    const { stdout } = await trustedProcessProbe(["-axww", "-o", "pid=", "-o", "command="]);
     return parsePosixProcessCommands(stdout);
   }
-  const { stdout } = await execute("powershell.exe", [
+  const { stdout } = await trustedProcessProbe([
     "-NoProfile",
     "-NonInteractive",
     "-Command",
@@ -809,8 +837,10 @@ async function readChromeProcessSnapshot(
   pid: number,
   platform: NodeJS.Platform,
   execute: ProcessCommandExecutor,
+  trustedProcessProbe: TrustedProcessProbe | null,
 ): Promise<ChromeProcessSnapshot | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  if ((platform === "win32" || platform === "darwin") && !trustedProcessProbe) return null;
   try {
     if (platform === "linux") {
       const procRoot = `/proc/${Math.trunc(pid)}`;
@@ -846,7 +876,8 @@ async function readChromeProcessSnapshot(
     }
 
     if (platform === "win32") {
-      const { stdout } = await execute("powershell.exe", [
+      if (!trustedProcessProbe) return null;
+      const { stdout } = await trustedProcessProbe([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
@@ -873,6 +904,7 @@ async function readChromeProcessSnapshot(
     const processGenerationProvider = createPlatformProcessGenerationProvider({
       platform,
       execute,
+      trustedProcessProbe,
     });
     const processStartTime = await processGenerationProvider.readProcessGeneration(pid);
     const { stdout: executableFiles } = await execute("/usr/sbin/lsof", [
@@ -894,7 +926,8 @@ async function readChromeProcessSnapshot(
           isChromeExecutablePath(candidate, platform),
         ),
       );
-    const { stdout: commandOutput } = await execute("ps", [
+    if (!trustedProcessProbe) return null;
+    const { stdout: commandOutput } = await trustedProcessProbe([
       "-p",
       String(Math.trunc(pid)),
       "-o",

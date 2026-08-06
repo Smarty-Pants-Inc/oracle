@@ -1,23 +1,22 @@
 import { describe, expect, test } from "vitest";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import { CAN_LISTEN_LOCALHOST, browserTransaction } from "./serverTestBuilders.js";
-import {
-  httpGetJson,
-  httpPostJson,
-  prepareTestAuthentication,
-  readIncomingBody,
-} from "./serverTestHttp.js";
+import { httpGetJson, httpPostJson, httpRaw, prepareTestAuthentication } from "./serverTestHttp.js";
 import {
   TEST_CONTROLLER_GENERATION,
   openSeedTransactionStore,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
+import {
+  REMOTE_BODY_SHA256_HEADER,
+  REMOTE_REQUEST_MAC_HEADER,
+  remoteBodySha256,
+} from "../../src/remote/auth.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -196,10 +195,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "renews authenticated retry, artifact, receipt, and settlement requests only after auth",
+    "renews route leases only after authentication and body validation",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-auth-renewal-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
+      const integrityKeyPath = path.join(tmpDir, ".remote-transaction-integrity.key");
       const transactionToken = "c".repeat(64);
       let now = Date.now();
       const transactionStoreNow = () => now;
@@ -213,10 +213,24 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           transactionLeaseDurationMs: 5_000,
           transactionStoreNow,
           leaseSweepIntervalMs: 1_000,
+          retryCleanup: async (cleanupRuntime) => ({
+            status: "completed" as const,
+            runtime: cleanupRuntime,
+          }),
         },
       );
+      const readCurrent = async () => {
+        const reader = await RemoteTransactionStore.open({
+          directory: transactionStoreDir,
+          integrityKeyPath,
+          controllerGeneration: "auth-renewal-reader",
+          leaseDurationMs: 5_000,
+          now: transactionStoreNow,
+        });
+        return await reader.read(transactionToken);
+      };
       try {
-        const initialLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        const initialLease = (await readCurrent())?.leaseExpiresAt;
         const unauthorizedRetry = await httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
@@ -224,7 +238,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: {},
         });
         expect(unauthorizedRetry.statusCode).toBe(401);
-        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(initialLease);
+        expect((await readCurrent())?.leaseExpiresAt).toBe(initialLease);
 
         now += 10;
         const authenticatedRetry = await httpPostJson({
@@ -235,7 +249,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: {},
         });
         expect(authenticatedRetry.statusCode).toBe(200);
-        const retryLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        const retryLease = (await readCurrent())?.leaseExpiresAt;
         expect(Date.parse(retryLease ?? "")).toBeGreaterThan(Date.parse(initialLease ?? ""));
 
         const unauthorizedArtifact = await httpGetJson({
@@ -244,7 +258,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           path: `/transactions/${transactionToken}/artifacts/missing-artifact`,
         });
         expect(unauthorizedArtifact.statusCode).toBe(401);
-        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(retryLease);
+        expect((await readCurrent())?.leaseExpiresAt).toBe(retryLease);
 
         now += 10;
         const authenticatedArtifact = await httpGetJson({
@@ -254,7 +268,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           token: "a".repeat(64),
         });
         expect(authenticatedArtifact.statusCode).toBe(404);
-        const artifactLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        const artifactLease = (await readCurrent())?.leaseExpiresAt;
         expect(Date.parse(artifactLease ?? "")).toBeGreaterThan(Date.parse(retryLease ?? ""));
 
         const unauthorizedReceipt = await httpPostJson({
@@ -264,7 +278,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: { sha256: "d".repeat(64), byteSize: 1 },
         });
         expect(unauthorizedReceipt.statusCode).toBe(401);
-        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(artifactLease);
+        expect((await readCurrent())?.leaseExpiresAt).toBe(artifactLease);
 
         now += 10;
         const receipt = await httpPostJson({
@@ -275,7 +289,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: { sha256: "d".repeat(64), byteSize: 1 },
         });
         expect(receipt.statusCode).toBe(404);
-        const receiptLease = (await store.read(transactionToken))?.leaseExpiresAt;
+        const receiptLease = (await readCurrent())?.leaseExpiresAt;
         expect(Date.parse(receiptLease ?? "")).toBeGreaterThan(Date.parse(artifactLease ?? ""));
 
         const unauthorizedSettlement = await httpPostJson({
@@ -285,7 +299,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: {},
         });
         expect(unauthorizedSettlement.statusCode).toBe(401);
-        expect((await store.read(transactionToken))?.leaseExpiresAt).toBe(receiptLease);
+        expect((await readCurrent())?.leaseExpiresAt).toBe(receiptLease);
 
         now += 10;
         const invalidSettlement = await httpPostJson({
@@ -296,10 +310,148 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: {},
         });
         expect(invalidSettlement.statusCode).toBe(400);
-        const settlementLease = (await store.read(transactionToken))?.leaseExpiresAt;
-        expect(Date.parse(settlementLease ?? "")).toBeGreaterThan(Date.parse(receiptLease ?? ""));
+        expect((await readCurrent())?.leaseExpiresAt).toBe(receiptLease);
+        const binding = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/bind`,
+          token: "a".repeat(64),
+          body: { mode: "abort", durablePublication: false },
+        });
+        expect(binding.statusCode).toBe(200);
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/abort`,
+          token: "a".repeat(64),
+          body: {},
+        });
+        expect(settlement).toMatchObject({
+          statusCode: 200,
+          json: { state: "aborted", finalization: { status: "completed" } },
+        });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "rejects invalid route bodies before durable lease or state changes",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-body-order-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "d".repeat(64);
+      let now = Date.now();
+      const transactionStoreNow = () => now;
+      const store = await openSeedTransactionStore(transactionStoreDir, 5_000, transactionStoreNow);
+      await seedRemoteTransaction(store, transactionToken, {
+        prompt: "authenticate exact body first",
+      });
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir,
+          controllerGeneration: TEST_CONTROLLER_GENERATION,
+          transactionLeaseDurationMs: 5_000,
+          transactionStoreNow,
+          leaseSweepIntervalMs: 1_000,
+        },
+      );
+      try {
+        const baseline = await store.read(transactionToken);
+        if (!baseline) throw new Error("missing request-order transaction");
+        const request = async (params: {
+          path: string;
+          method: "GET" | "POST";
+          signedBody: Buffer;
+          sentBody: Buffer;
+        }) => {
+          now += 10;
+          const authentication = await prepareTestAuthentication({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: params.path,
+            token: "a".repeat(64),
+            method: params.method,
+            body: params.signedBody,
+          });
+          if (!authentication) throw new Error("missing request-order authentication");
+          return await httpRaw({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: params.path,
+            method: params.method,
+            body: params.sentBody,
+            headers: {
+              "Content-Type": "application/json",
+              ...authentication.authentication.headers,
+            },
+          });
+        };
+
+        const bind = await request({
+          path: `/transactions/${transactionToken}/bind`,
+          method: "POST",
+          signedBody: Buffer.from(JSON.stringify({ mode: "finalize", durablePublication: true })),
+          sentBody: Buffer.from(JSON.stringify({ mode: "abort", durablePublication: false })),
+        });
+        expect(bind).toMatchObject({
+          statusCode: 400,
+          body: JSON.stringify({ error: "invalid_settlement_binding_request" }),
+        });
+        expect(await store.read(transactionToken)).toEqual(baseline);
+
+        const settlementBody = Buffer.from('{"durablePublication":');
+        const settlement = await request({
+          path: `/transactions/${transactionToken}/finalize`,
+          method: "POST",
+          signedBody: settlementBody,
+          sentBody: settlementBody,
+        });
+        expect(settlement).toMatchObject({
+          statusCode: 400,
+          body: JSON.stringify({ error: "invalid_settlement_request" }),
+        });
+        expect(await store.read(transactionToken)).toEqual(baseline);
+
+        const receipt = await request({
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact/receipt`,
+          method: "POST",
+          signedBody: Buffer.from(JSON.stringify({ sha256: "e".repeat(64), byteSize: 1 })),
+          sentBody: Buffer.from(JSON.stringify({ sha256: "f".repeat(64), byteSize: 1 })),
+        });
+        expect(receipt).toMatchObject({
+          statusCode: 400,
+          body: JSON.stringify({ error: "invalid_artifact_delivery_receipt" }),
+        });
+        expect(await store.read(transactionToken)).toEqual(baseline);
+
+        const waiverBody = Buffer.from('{"sha256":');
+        const waiver = await request({
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact/manual-copy-waiver`,
+          method: "POST",
+          signedBody: waiverBody,
+          sentBody: waiverBody,
+        });
+        expect(waiver).toMatchObject({
+          statusCode: 400,
+          body: JSON.stringify({ error: "invalid_artifact_manual_copy_waiver" }),
+        });
+        expect(await store.read(transactionToken)).toEqual(baseline);
+
+        const unexpectedGetBody = Buffer.from("{}");
+        const artifact = await request({
+          path: `/transactions/${transactionToken}/artifacts/missing-artifact`,
+          method: "GET",
+          signedBody: unexpectedGetBody,
+          sentBody: unexpectedGetBody,
+        });
+        expect(artifact.statusCode).toBe(413);
+        expect(JSON.parse(artifact.body)).toMatchObject({ error: "request_too_large" });
+        expect(await store.read(transactionToken)).toEqual(baseline);
         const pending = await store.read(transactionToken);
-        if (!pending?.runtime) throw new Error("missing auth-renewal runtime");
+        if (!pending?.runtime) throw new Error("missing request-order runtime");
         await store.bindSettlement({
           transactionToken,
           mode: "abort",
@@ -339,31 +491,17 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         if (!authentication) throw new Error("missing retry request authentication");
 
-        const digestMismatch = await new Promise<{ statusCode: number; body: string }>(
-          (resolve, reject) => {
-            const request = http.request(
-              {
-                hostname: "127.0.0.1",
-                port: server.port,
-                path: retryPath,
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Content-Length": sentBody.byteLength,
-                  ...authentication.authentication.headers,
-                },
-              },
-              (response) => {
-                void readIncomingBody(response).then(
-                  (body) => resolve({ statusCode: response.statusCode ?? 0, body }),
-                  reject,
-                );
-              },
-            );
-            request.on("error", reject);
-            request.end(sentBody);
+        const digestMismatch = await httpRaw({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: retryPath,
+          method: "POST",
+          body: sentBody,
+          headers: {
+            "Content-Type": "application/json",
+            ...authentication.authentication.headers,
           },
-        );
+        });
         expect(digestMismatch.statusCode).toBe(401);
         expect(JSON.parse(digestMismatch.body)).toMatchObject({
           error: "request_body_authentication_failed",
@@ -380,6 +518,66 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           statusCode: 413,
           json: { error: "request_too_large" },
         });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "authenticates malformed transaction bodies before parsing or admitting a run",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-auth-order-"));
+      let browserRuns = 0;
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir: path.join(tmpDir, "transactions"),
+          runBrowser: async () => {
+            browserRuns += 1;
+            throw new Error("invalid authentication reached the browser handler");
+          },
+        },
+      );
+      try {
+        const runPath = `/transactions/${"c".repeat(64)}/run`;
+        const malformedBody = Buffer.from('{"prompt":');
+        const requestAuthentication = await prepareTestAuthentication({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: runPath,
+          token: "a".repeat(64),
+          method: "POST",
+          body: malformedBody,
+        });
+        if (!requestAuthentication) throw new Error("missing malformed request authentication");
+        expect(requestAuthentication.authentication.headers[REMOTE_BODY_SHA256_HEADER]).toBe(
+          remoteBodySha256(malformedBody),
+        );
+        const authenticatedMac =
+          requestAuthentication.authentication.headers[REMOTE_REQUEST_MAC_HEADER];
+        if (!authenticatedMac) throw new Error("missing malformed request MAC");
+        const invalidFirstNibble = authenticatedMac[0] === "0" ? "1" : "0";
+        const invalidMac = `${invalidFirstNibble}${authenticatedMac.slice(1)}`;
+
+        const response = await httpRaw({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: runPath,
+          method: "POST",
+          body: malformedBody,
+          headers: {
+            "Content-Type": "application/json",
+            ...requestAuthentication.authentication.headers,
+            [REMOTE_REQUEST_MAC_HEADER]: invalidMac,
+          },
+        });
+
+        expect(response).toMatchObject({
+          statusCode: 401,
+          body: JSON.stringify({ error: "invalid_request_authentication" }),
+        });
+        expect(browserRuns).toBe(0);
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -407,7 +605,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "keeps pending transaction authentication valid across connection credential rotation",
+    "preserves persisted recovery across network credential and controller-generation rotation",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-credential-rotation-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -426,35 +624,87 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         await seedRemoteTransaction(seeded, transactionToken, {
           prompt: "preserve authenticated transaction across credential rotation",
+          state: "recoverable-error",
         });
+        const beforeRotationEnvelope = JSON.parse(
+          await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+        ) as { revision: number };
+        expect(beforeRotationEnvelope.revision).toBeGreaterThan(0);
 
         const rotated = await createRemoteServer(
           { host: "127.0.0.1", port: 0, token: "b".repeat(64), logger: () => {} },
-          { transactionStoreDir, controllerGeneration: "controller-after-credential-rotation" },
+          {
+            transactionStoreDir,
+            controllerGeneration: "controller-after-credential-rotation",
+            retryCleanup: async (cleanupRuntime) => ({
+              status: "completed" as const,
+              runtime: cleanupRuntime,
+            }),
+          },
         );
         try {
-          const reader = await RemoteTransactionStore.open({
-            directory: transactionStoreDir,
-            integrityKeyPath,
-            controllerGeneration: "credential-rotation-reader",
+          await expect(
+            prepareTestAuthentication({
+              hostname: "127.0.0.1",
+              port: rotated.port,
+              path: `/transactions/${transactionToken}/bind`,
+              token: "a".repeat(64),
+              method: "POST",
+              body: Buffer.from(JSON.stringify({ mode: "abort", durablePublication: false })),
+            }),
+          ).rejects.toThrow("remote health generation proof was invalid");
+          const afterRejectedEnvelope = JSON.parse(
+            await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+          ) as { revision: number };
+          expect(afterRejectedEnvelope.revision).toBe(beforeRotationEnvelope.revision);
+
+          const currentCredential = await httpPostJson({
+            hostname: "127.0.0.1",
+            port: rotated.port,
+            path: `/transactions/${transactionToken}/bind`,
+            token: "b".repeat(64),
+            body: { mode: "abort", durablePublication: false },
           });
-          const record = await reader.read(transactionToken);
-          expect(record).toMatchObject({
+          expect(currentCredential).toMatchObject({
+            statusCode: 200,
+            json: { transactionToken, settlementAuthority: { mode: "abort" } },
+          });
+          const afterBindingEnvelope = JSON.parse(
+            await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+          ) as { revision: number; payload: string };
+          expect(afterBindingEnvelope.revision).toBe(beforeRotationEnvelope.revision + 2);
+          const boundRecord = JSON.parse(
+            Buffer.from(afterBindingEnvelope.payload, "base64").toString("utf8"),
+          ) as {
+            transactionToken: string;
+            state: string;
+            settlementMode?: string;
+            controllerGeneration: string;
+          };
+          expect(boundRecord).toMatchObject({
             transactionToken,
-            state: "pending",
+            state: "recoverable-error",
+            settlementMode: "abort",
+            controllerGeneration: "controller-after-credential-rotation",
           });
-          if (!record?.runtime) throw new Error("missing credential-rotation runtime");
-          await reader.bindSettlement({
-            transactionToken,
-            mode: "abort",
-            durablePublication: false,
+          const settled = await httpPostJson({
+            hostname: "127.0.0.1",
+            port: rotated.port,
+            path: `/transactions/${transactionToken}/abort`,
+            token: "b".repeat(64),
+            body: {},
           });
-          await reader.beginSettlementExecution({ transactionToken, mode: "abort" });
-          await reader.completeSettlement({
-            transactionToken,
-            mode: "abort",
-            finalization: { status: "completed", runtime: record.runtime },
+          expect(settled).toMatchObject({
+            statusCode: 200,
+            json: { state: "aborted", finalization: { status: "completed" } },
           });
+          const terminalEnvelope = JSON.parse(
+            await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+          ) as { revision: number; payload: string };
+          expect(terminalEnvelope.revision).toBe(afterBindingEnvelope.revision + 3);
+          expect(
+            JSON.parse(Buffer.from(terminalEnvelope.payload, "base64").toString("utf8")),
+          ).toMatchObject({ state: "aborted" });
         } finally {
           await rotated.close();
         }

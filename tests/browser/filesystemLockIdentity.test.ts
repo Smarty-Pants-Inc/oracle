@@ -12,19 +12,26 @@ import type {
 } from "../../src/browser/filesystemLock.js";
 import { createPlatformProcessGenerationProvider } from "../../src/browser/platformProcessGeneration.js";
 import { createProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
+const WINDOWS_TRUSTED_PROCESS_PROBE = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
 
-test("reads an exact Windows CIM creation generation without accepting a PID", async () => {
-  const execute = vi.fn(async (_file: string, _args: string[]) => ({
-    stdout: "2026-08-05T12:34:56.1234567Z\n",
-  }));
+test("ignores a hostile PATH when reading an exact Windows CIM creation generation", async () => {
+  const attackerPowerShell = vi.fn(async () => ({ stdout: "1900-01-01T00:00:00.0000000Z\n" }));
+  const execute = vi.fn(async (file: string, _args: string[]) => {
+    if (file === "powershell.exe") return attackerPowerShell();
+    if (file !== WINDOWS_TRUSTED_PROCESS_PROBE) {
+      throw new Error(`Unexpected process probe: ${file}`);
+    }
+    return { stdout: "2026-08-05T12:34:56.1234567Z\n" };
+  });
   const provider = createPlatformProcessGenerationProvider({ platform: "win32", execute });
   const identity = await provider.readProcessGeneration(10_005);
   const retryIdentity = await provider.readProcessGeneration(10_005);
 
   expect(identity).toBe("win32:2026-08-05T12:34:56.1234567Z");
   expect(retryIdentity).toBe(identity);
+  expect(attackerPowerShell).not.toHaveBeenCalled();
   expect(execute).toHaveBeenCalledTimes(2);
-  expect(execute.mock.calls[0]?.[0]).toBe("powershell.exe");
+  expect(execute.mock.calls[0]?.[0]).toBe(WINDOWS_TRUSTED_PROCESS_PROBE);
   expect(execute.mock.calls[0]?.[1]?.at(-1)).toContain(
     "Get-CimInstance Win32_Process -Filter 'ProcessId = 10005'",
   );
@@ -45,6 +52,18 @@ test("reads an exact Windows CIM creation generation without accepting a PID", a
       },
     }).readProcessGeneration(10_005),
   ).resolves.toBeNull();
+});
+
+test("fails closed when the trusted Windows process probe is unavailable", async () => {
+  const execute = vi.fn(async () => ({ stdout: "2026-08-05T12:34:56.1234567Z\n" }));
+  const provider = createPlatformProcessGenerationProvider({
+    platform: "win32",
+    execute,
+    trustedProcessProbe: null,
+  });
+
+  await expect(provider.readProcessGeneration(10_005)).resolves.toBeNull();
+  expect(execute).not.toHaveBeenCalled();
 });
 
 test("uses the Darwin audit pidversion rather than second-resolution lstart", async () => {

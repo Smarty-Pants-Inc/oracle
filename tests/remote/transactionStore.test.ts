@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs/promises";
@@ -25,6 +26,51 @@ function openTransactionStore(
     ...options,
     integrityKeyPath: path.join(options.directory, ".test-integrity", "record.key"),
   });
+}
+
+type TestTransactionEnvelope = {
+  version: number;
+  algorithm: string;
+  keyId: string;
+  revision: number;
+  payload: string;
+  mac: string;
+};
+
+async function readTransactionEnvelope(
+  store: RemoteTransactionStore,
+  transactionToken: string,
+): Promise<TestTransactionEnvelope> {
+  return JSON.parse(
+    await readFile(store.recordPath(transactionToken), "utf8"),
+  ) as TestTransactionEnvelope;
+}
+
+function recomputeEnvelopeMac(params: {
+  envelope: TestTransactionEnvelope;
+  integrityKey: Buffer;
+  directory: string;
+  transactionToken: string;
+}): string {
+  const payload = Buffer.from(params.envelope.payload, "base64");
+  const header = Buffer.from(
+    JSON.stringify([
+      "oracle.remote-controller.transaction-store.record.v1",
+      params.envelope.version,
+      params.envelope.algorithm,
+      params.envelope.keyId,
+      path.resolve(params.directory),
+      params.transactionToken,
+      params.envelope.revision,
+      payload.byteLength,
+    ]),
+    "utf8",
+  );
+  return createHmac("sha256", params.integrityKey)
+    .update(header)
+    .update(Buffer.of(0))
+    .update(payload)
+    .digest("hex");
 }
 
 const committedPromptEpoch = {
@@ -1192,7 +1238,7 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
-  test("recovers a valid authenticated record after a controller restart", async () => {
+  test("seeds the controller-lifetime head from the authenticated record after restart", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-restart-"));
     const directory = path.join(root, "transactions");
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
@@ -1205,6 +1251,8 @@ describe("RemoteTransactionStore", () => {
       });
       await begin(first, transactionToken);
       await first.journalRuntime(transactionToken, runtime, modelSelection);
+      const beforeRestart = await readTransactionEnvelope(first, transactionToken);
+      expect(beforeRestart.revision).toBe(2);
 
       const restarted = await RemoteTransactionStore.open({
         directory,
@@ -1229,6 +1277,126 @@ describe("RemoteTransactionStore", () => {
           hadRuntimeAuthority: true,
         },
       ]);
+      expect((await readTransactionEnvelope(restarted, transactionToken)).revision).toBe(3);
+      await restarted.journalRecoveryRuntime(transactionToken, runtime);
+      expect((await readTransactionEnvelope(restarted, transactionToken)).revision).toBe(4);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a same-controller replay of an older signed revision before effects", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-replay-"));
+    const transactionToken = "3".repeat(64);
+    try {
+      const store = await openTransactionStore({ directory: root });
+      await begin(store, transactionToken);
+      await publish(store, transactionToken);
+      const olderBytes = await readFile(store.recordPath(transactionToken));
+      const olderRevision = (JSON.parse(olderBytes.toString("utf8")) as TestTransactionEnvelope)
+        .revision;
+      await store.bindSettlement({
+        transactionToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await store.beginSettlementExecution({ transactionToken, mode: "finalize" });
+      await store.completeSettlement({
+        transactionToken,
+        mode: "finalize",
+        finalization: { status: "completed", runtime },
+      });
+      const terminalBytes = await readFile(store.recordPath(transactionToken));
+      const terminalRevision = (
+        JSON.parse(terminalBytes.toString("utf8")) as TestTransactionEnvelope
+      ).revision;
+      expect(terminalRevision).toBeGreaterThan(olderRevision);
+      const cleanup = vi.fn(async () => true);
+      store.registerArtifactNamespaceCleanup(cleanup);
+
+      await fs.writeFile(store.recordPath(transactionToken), olderBytes, { mode: 0o600 });
+      await expect(
+        store.bindSettlement({
+          transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        }),
+      ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
+      expect(cleanup).not.toHaveBeenCalled();
+
+      await fs.writeFile(store.recordPath(transactionToken), terminalBytes, { mode: 0o600 });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ state: "finalized" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects recomputed forged envelopes and noncanonical or unauthenticated revisions", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-forgery-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "2".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+      await begin(store, transactionToken);
+      const originalBytes = await readFile(store.recordPath(transactionToken));
+      const originalEnvelope = JSON.parse(
+        originalBytes.toString("utf8"),
+      ) as TestTransactionEnvelope;
+      const integrityKey = await readFile(integrityKeyPath);
+
+      const forgedEnvelope = structuredClone(originalEnvelope);
+      const forgedPayload = JSON.parse(
+        Buffer.from(forgedEnvelope.payload, "base64").toString("utf8"),
+      ) as { browserConfig: { chatgptUrl?: string } };
+      forgedPayload.browserConfig.chatgptUrl = "https://forged.invalid/";
+      forgedEnvelope.payload = Buffer.from(`${JSON.stringify(forgedPayload, null, 2)}\n`).toString(
+        "base64",
+      );
+      forgedEnvelope.mac = recomputeEnvelopeMac({
+        envelope: forgedEnvelope,
+        integrityKey,
+        directory,
+        transactionToken,
+      });
+      await fs.writeFile(
+        store.recordPath(transactionToken),
+        `${JSON.stringify(forgedEnvelope, null, 2)}\n`,
+      );
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      await fs.writeFile(store.recordPath(transactionToken), originalBytes, { mode: 0o600 });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+
+      const fractionalRevision = { ...originalEnvelope, revision: 1.5 };
+      fractionalRevision.mac = recomputeEnvelopeMac({
+        envelope: fractionalRevision,
+        integrityKey,
+        directory,
+        transactionToken,
+      });
+      await fs.writeFile(
+        store.recordPath(transactionToken),
+        `${JSON.stringify(fractionalRevision, null, 2)}\n`,
+      );
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      await fs.writeFile(store.recordPath(transactionToken), originalBytes, { mode: 0o600 });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+
+      const unauthenticatedRevision = {
+        ...originalEnvelope,
+        revision: originalEnvelope.revision + 1,
+      };
+      await fs.writeFile(
+        store.recordPath(transactionToken),
+        `${JSON.stringify(unauthenticatedRevision, null, 2)}\n`,
+      );
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1328,6 +1496,163 @@ describe("RemoteTransactionStore", () => {
           expect.stringContaining(victimToken),
         ]),
       );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a canonical replacement raced before atomic quarantine rename", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-quarantine-race-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "d".repeat(64);
+    const corruptBytes = Buffer.from("corrupt authenticated generation\n", "utf8");
+    let replacementBytes: Buffer | undefined;
+    let recordPath: string | undefined;
+    const beforeQuarantineUnlink = vi.fn(async () => {
+      if (!recordPath || !replacementBytes) throw new Error("quarantine race was not prepared");
+      await fs.unlink(recordPath);
+      await fs.writeFile(recordPath, replacementBytes, { mode: 0o600 });
+    });
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        beforeQuarantineUnlink,
+      });
+      await begin(store, transactionToken, "quarantine-race-run");
+      recordPath = store.recordPath(transactionToken);
+      replacementBytes = await fs.readFile(recordPath);
+      await fs.writeFile(recordPath, corruptBytes);
+
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+
+      expect(beforeQuarantineUnlink).toHaveBeenCalledOnce();
+      await expect(fs.readFile(recordPath)).resolves.toEqual(replacementBytes);
+      const quarantined = (await fs.readdir(directory)).filter(
+        (name) => name.includes(transactionToken) && name.endsWith(".quarantine"),
+      );
+      expect(quarantined).toHaveLength(1);
+      const [quarantineName] = quarantined;
+      if (!quarantineName) throw new Error("missing raced record quarantine");
+      await expect(fs.readFile(path.join(directory, quarantineName))).resolves.toEqual(
+        corruptBytes,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("quarantines oversized encoded and decoded records with exact bytes intact", async () => {
+    const encodedRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-encoded-bound-"));
+    const encodedToken = "1".repeat(64);
+    const encodedBytes = Buffer.alloc(65, 0x78);
+    try {
+      const store = await openTransactionStore({
+        directory: encodedRoot,
+        maximumBytes: 64,
+      });
+      await fs.writeFile(store.recordPath(encodedToken), encodedBytes, { mode: 0o600 });
+
+      await expect(store.read(encodedToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      await expect(fs.access(store.recordPath(encodedToken))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const encodedQuarantine = (await fs.readdir(encodedRoot)).find(
+        (name) => name.includes(encodedToken) && name.endsWith(".quarantine"),
+      );
+      if (!encodedQuarantine) throw new Error("missing oversized encoded quarantine");
+      await expect(fs.readFile(path.join(encodedRoot, encodedQuarantine))).resolves.toEqual(
+        encodedBytes,
+      );
+    } finally {
+      await rm(encodedRoot, { recursive: true, force: true });
+    }
+
+    const decodedRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-decoded-bound-"));
+    const decodedToken = "2".repeat(64);
+    try {
+      const store = await openTransactionStore({
+        directory: decodedRoot,
+        maximumDecodedRecordBytes: 64,
+      });
+      await begin(store, decodedToken, "oversized-decoded-run");
+      const recordPath = store.recordPath(decodedToken);
+      const envelope = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+        payload: string;
+      } & Record<string, unknown>;
+      const oversizedEnvelope = Buffer.from(
+        `${JSON.stringify(
+          { ...envelope, payload: Buffer.alloc(65, 0x79).toString("base64") },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      await fs.writeFile(recordPath, oversizedEnvelope);
+
+      await expect(store.read(decodedToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      const decodedQuarantine = (await fs.readdir(decodedRoot)).find(
+        (name) => name.includes(decodedToken) && name.endsWith(".quarantine"),
+      );
+      if (!decodedQuarantine) throw new Error("missing oversized decoded quarantine");
+      await expect(fs.readFile(path.join(decodedRoot, decodedQuarantine))).resolves.toEqual(
+        oversizedEnvelope,
+      );
+    } finally {
+      await rm(decodedRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("enforces deterministic quarantine count and byte retention", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-quarantine-retention-"));
+    const tokens = ["3".repeat(64), "4".repeat(64), "5".repeat(64), "6".repeat(64)];
+    try {
+      const store = await openTransactionStore({
+        directory: root,
+        maximumQuarantineRecords: 2,
+        maximumQuarantineBytes: 7,
+      });
+      const quarantine = async (token: string, contents: Buffer): Promise<string> => {
+        await fs.writeFile(store.recordPath(token), contents, { mode: 0o600 });
+        await expect(store.read(token)).rejects.toBeInstanceOf(
+          RemoteTransactionRecordIntegrityError,
+        );
+        const name = (await fs.readdir(root)).find(
+          (candidate) => candidate.includes(token) && candidate.endsWith(".quarantine"),
+        );
+        if (!name) throw new Error(`missing quarantine for ${token}`);
+        await expect(fs.readFile(path.join(root, name))).resolves.toEqual(contents);
+        return name;
+      };
+
+      const first = await quarantine(tokens[0]!, Buffer.alloc(3, 0x61));
+      await fs.utimes(path.join(root, first), new Date(1_000), new Date(1_000));
+      const second = await quarantine(tokens[1]!, Buffer.alloc(3, 0x62));
+      await fs.utimes(path.join(root, second), new Date(2_000), new Date(2_000));
+      const third = await quarantine(tokens[2]!, Buffer.alloc(1, 0x63));
+      await fs.utimes(path.join(root, third), new Date(3_000), new Date(3_000));
+
+      let retained = (await fs.readdir(root)).filter((name) => name.endsWith(".quarantine"));
+      expect(retained).toEqual(expect.arrayContaining([second, third]));
+      expect(retained).toHaveLength(2);
+      expect(
+        (await Promise.all(retained.map((name) => fs.stat(path.join(root, name))))).reduce(
+          (total, entry) => total + entry.size,
+          0,
+        ),
+      ).toBe(4);
+
+      const fourth = await quarantine(tokens[3]!, Buffer.alloc(7, 0x64));
+      retained = (await fs.readdir(root)).filter((name) => name.endsWith(".quarantine"));
+      expect(retained).toEqual([fourth]);
+      await expect(fs.readFile(path.join(root, fourth))).resolves.toEqual(Buffer.alloc(7, 0x64));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1617,6 +1942,58 @@ describe("RemoteTransactionStore", () => {
       vi.doUnmock("node:fs/promises");
       vi.resetModules();
       await rm(atomicRoot, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("advances the controller-lifetime head only after a durable mutation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-head-advance-"));
+    const transactionToken = "1".repeat(64);
+    const actualFs = await vi.importActual<typeof fs>("node:fs/promises");
+    const rename = vi.fn(actualFs.rename);
+    rename.mockRejectedValueOnce(
+      Object.assign(new Error("mutation publication interrupted"), { code: "EINTR" }),
+    );
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, rename }));
+    // Reload the mocked built-in export; a static import cannot observe this isolated fs failure seam.
+    const { RemoteTransactionStore: IsolatedRemoteTransactionStore } =
+      await import("../../src/remote/transactionStore.js");
+    try {
+      const store = await IsolatedRemoteTransactionStore.open({
+        directory: root,
+        integrityKeyPath: path.join(root, ".test-integrity", "record.key"),
+      });
+      await store.begin({
+        protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+        transactionToken,
+        runId: "run-1",
+        createdAt: new Date().toISOString(),
+        ...authority,
+      });
+      const afterBegin = JSON.parse(
+        await readFile(store.recordPath(transactionToken), "utf8"),
+      ) as TestTransactionEnvelope;
+      expect(afterBegin.revision).toBe(1);
+
+      await expect(store.journalRuntime(transactionToken, runtime)).rejects.toMatchObject({
+        code: "EINTR",
+      });
+      const afterFailedMutation = JSON.parse(
+        await readFile(store.recordPath(transactionToken), "utf8"),
+      ) as TestTransactionEnvelope;
+      expect(afterFailedMutation.revision).toBe(afterBegin.revision);
+      await expect(store.read(transactionToken)).resolves.not.toHaveProperty("runtime");
+
+      await store.journalRuntime(transactionToken, runtime);
+      const afterRetry = JSON.parse(
+        await readFile(store.recordPath(transactionToken), "utf8"),
+      ) as TestTransactionEnvelope;
+      expect(afterRetry.revision).toBe(afterBegin.revision + 1);
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ runtime });
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
 

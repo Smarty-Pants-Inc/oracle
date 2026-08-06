@@ -284,6 +284,81 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("persists an initial remote terminal error instead of cleanup-pending authority", async () => {
+    const preReceiptRuntime: BrowserRuntimeMetadata = {
+      controllerPid: process.pid,
+      recoveryCleanupResources: [
+        {
+          remoteRecovery: {
+            protocolVersion: 3,
+            host: "bridge.example:9443",
+            transactionToken: "a".repeat(64),
+            state: "pre-receipt",
+            requestIdentity: {
+              acceptedPromptSha256: ["b".repeat(64)],
+              followUpOrdinal: 0,
+              remainingFollowUps: 0,
+            },
+          },
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+        },
+      ],
+    };
+    const terminalRuntime: BrowserRuntimeMetadata = { controllerPid: process.pid };
+    const automationError = new BrowserAutomationError("remote run failed terminally", {
+      stage: "remote-run",
+      code: "remote-run-terminal",
+      recoverableDisconnect: false,
+      runtime: {},
+    });
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.(preReceiptRuntime);
+      await deps?.persistRuntimeHint?.(terminalRuntime);
+      throw automationError;
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("remote run failed terminally");
+
+    const terminalHintIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
+      ([, update]) =>
+        update.browser?.runtime?.controllerPid === process.pid &&
+        update.browser.runtime.recoveryCleanupResources === undefined,
+    );
+    expect(terminalHintIndex).toBeGreaterThanOrEqual(0);
+    for (const [, update] of sessionStoreMock.updateSession.mock.calls.slice(terminalHintIndex)) {
+      expect(update.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
+      expect(update.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
+    }
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "error",
+      errorMessage: "remote run failed terminally",
+      browser: { runtime: terminalRuntime },
+      error: {
+        details: {
+          code: "remote-run-terminal",
+          recoverableDisconnect: false,
+          runtime: terminalRuntime,
+        },
+      },
+    });
+    expect(finalUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(finalUpdate?.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
+    expect(finalUpdate?.error?.details?.runtime).not.toHaveProperty("recoveryCleanupResources");
+    expect(finalUpdate?.error?.details?.runtime).not.toHaveProperty("recoveryCleanupResult");
+  });
+
   test("does not overwrite completed cleanup with the stale pending runtime on the escaping error", async () => {
     const pendingRuntime = createCleanupRuntime("TARGET-SETTLED");
     const completedRuntime: BrowserRuntimeMetadata = { ...pendingRuntime };

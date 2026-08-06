@@ -395,6 +395,99 @@ describe("profileState", () => {
     ).toBe(true);
   });
 
+  test("accepts zero birthtime on Linux with an owner-bound generation marker", () => {
+    const identity = {
+      version: 3 as const,
+      platform: "linux" as const,
+      canonicalPath: "/mnt/profile-store/oracle/browser-profile",
+      device: "41",
+      inode: "9001",
+      birthtimeNs: "0",
+      generationMarker: {
+        device: "41",
+        inode: "9002",
+        ctimeNs: "1700000000000000000",
+        token: "a".repeat(64),
+      },
+    };
+
+    const parsed = profileState.parseProfileDirectoryIdentity(identity, "linux");
+    expect(parsed).toEqual(identity);
+    expect(parsed && profileState.sameProfileDirectoryIdentity(parsed, identity)).toBe(true);
+  });
+
+  test("distinguishes zero-birthtime replacement generations without trusting the path", () => {
+    const originalRecord = {
+      version: 3,
+      platform: "linux",
+      canonicalPath: "/mnt/profile-store/oracle/browser-profile",
+      device: "41",
+      inode: "9001",
+      birthtimeNs: "0",
+      generationMarker: {
+        device: "41",
+        inode: "9002",
+        ctimeNs: "1700000000000000000",
+        token: "a".repeat(64),
+      },
+    };
+    const original = profileState.parseProfileDirectoryIdentity(originalRecord, "linux");
+    const replacement = profileState.parseProfileDirectoryIdentity(
+      {
+        ...originalRecord,
+        generationMarker: {
+          device: "41",
+          inode: "9003",
+          ctimeNs: "1700000000000000001",
+          token: "b".repeat(64),
+        },
+      },
+      "linux",
+    );
+
+    expect(original).not.toBeNull();
+    expect(replacement).not.toBeNull();
+    expect(
+      original &&
+        replacement &&
+        profileState.samePhysicalProfileDirectoryIdentity(original, replacement),
+    ).toBe(false);
+    expect(
+      original && replacement && profileState.sameProfileDirectoryIdentity(original, replacement),
+    ).toBe(false);
+  });
+
+  test("accepts NFS-like zero device metadata only with a stable marker generation", () => {
+    const identity = {
+      version: 3,
+      platform: "linux",
+      canonicalPath: "/net/home/oracle/browser-profile",
+      device: "0",
+      inode: "7001",
+      birthtimeNs: "0",
+      generationMarker: {
+        device: "0",
+        inode: "7002",
+        ctimeNs: "1700000000000000000",
+        token: "c".repeat(64),
+      },
+    };
+
+    expect(profileState.parseProfileDirectoryIdentity(identity, "linux")).toEqual(identity);
+    expect(
+      profileState.parseProfileDirectoryIdentity(
+        { ...identity, generationMarker: { ...identity.generationMarker, ctimeNs: "0" } },
+        "linux",
+      ),
+    ).toBeNull();
+    expect(
+      profileState.parseProfileDirectoryIdentity(
+        { ...identity, generationMarker: undefined },
+        "linux",
+      ),
+    ).toBeNull();
+  });
+
   test("captures a macOS Chrome generation from its audit token and physical text vnode", async () => {
     const userDataDir = "/tmp/oracle-mac-profile";
     const launchClaim = {
@@ -422,7 +515,7 @@ describe("profileState", () => {
           stdout: "p4321\nftxt\nn/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n",
         };
       }
-      if (file === "ps" && args.at(-1) === "command=") {
+      if (file === "/bin/ps" && args.at(-1) === "command=") {
         return {
           stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir} --oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}\n`,
         };
@@ -484,7 +577,7 @@ describe("profileState", () => {
             stdout: "p4321\nftxt\nn/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n",
           };
         }
-        if (file === "ps" && args.at(-1) === "command=") {
+        if (file === "/bin/ps" && args.at(-1) === "command=") {
           return {
             stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir}\n`,
           };
@@ -511,7 +604,7 @@ describe("profileState", () => {
     await expect(verifyWith(samePidReplacement)).resolves.toBe(false);
     expect(
       samePidReplacement.mock.calls.some(
-        ([file, args]) => file === "ps" && args.at(-1) === "lstart=",
+        ([file, args]) => file === "/bin/ps" && args.at(-1) === "lstart=",
       ),
     ).toBe(false);
   });
@@ -653,9 +746,15 @@ describe("profileState", () => {
       expect(existsSync(path.join(cleanupDir, "DevToolsActivePort"))).toBe(true);
 
       expect(execFileAsync.mock.calls).toHaveLength(2);
-      expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
+      expect(execFileAsync.mock.calls[0]?.[0]).toBe(
+        String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+      );
       expect(execFileAsync.mock.calls[1]?.[0]).toBe(
-        process.platform === "win32" ? "powershell.exe" : "ps",
+        process.platform === "win32"
+          ? String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`
+          : process.platform === "darwin"
+            ? "/bin/ps"
+            : "/usr/bin/ps",
       );
       if (process.platform !== "win32") {
         expect(execFileAsync.mock.calls[1]?.[1]).toEqual(["-axww", "-o", "pid=", "-o", "command="]);

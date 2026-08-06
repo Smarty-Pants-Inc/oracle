@@ -567,6 +567,70 @@ describe("remote client transport deadlines", () => {
     }
   });
 
+  it("projects an initial streamed terminal error over pre-receipt authority", async () => {
+    const persistedRuntimes: BrowserRuntimeMetadata[] = [];
+    const server = createAuthenticatedServer(async (req, res) => {
+      const transactionToken = runTransactionToken(req);
+      if (!transactionToken) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      await readJson(req);
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end(
+        `${JSON.stringify({
+          type: "error",
+          error: {
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "remote run failed terminally",
+            code: "remote-run-terminal",
+            stage: "remote-run",
+            recoverableDisconnect: false,
+          },
+        })}\n`,
+      );
+    });
+    const port = await listen(server);
+    try {
+      const caught = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "a".repeat(64),
+        deadlines,
+      })({
+        prompt: "terminal initial run",
+        config: {},
+        runtimeHintCb: async (runtime) => {
+          persistedRuntimes.push(runtime);
+        },
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(caught).toMatchObject({
+        name: "BrowserAutomationError",
+        message: "remote run failed terminally",
+        details: {
+          code: "remote-run-terminal",
+          stage: "remote-run",
+          recoverableDisconnect: false,
+          runtime: {},
+        },
+      });
+      expect(persistedRuntimes).toHaveLength(2);
+      expect(remoteRecovery(persistedRuntimes[0])).toMatchObject({ state: "pre-receipt" });
+      expect(persistedRuntimes[1]).toEqual({});
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResources");
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResult");
+      expect(persistedRuntimes[1]).not.toHaveProperty("recoveryCleanupResources");
+      expect(persistedRuntimes[1]).not.toHaveProperty("recoveryCleanupResult");
+    } finally {
+      await close(server);
+    }
+  });
+
   it("retries a pre-receipt 404 until the transaction record appears", async () => {
     let transactionToken: string | null = null;
     let acceptedPrompt = "";

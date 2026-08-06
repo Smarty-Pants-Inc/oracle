@@ -6,6 +6,8 @@ import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type * as ChromeLifecycleModule from "../../src/browser/chromeLifecycle.js";
 import type * as PageActionsModule from "../../src/browser/pageActions.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
+import { resolveBrowserConfig } from "../../src/browser/config.js";
+import { finalizeRecoveredRuntime } from "../../src/browser/reattachCleanup.js";
 
 function runtimeFromError(error: unknown): BrowserRuntimeMetadata {
   if (!error || typeof error !== "object") throw new Error("missing browser cleanup error");
@@ -257,32 +259,36 @@ describe("remote browser unpublished cleanup", () => {
     }));
 
     try {
-      const [{ runBrowserMode }, { __test__: reattachTest }] = await Promise.all([
-        import("../../src/browser/index.js"),
-        import("../../src/browser/reattach.js"),
-      ]);
-      await runBrowserMode({
-        prompt: "direct target journal",
-        config: {
-          remoteChrome: { host: "remote.example", port: 9333 },
-          keepBrowser: false,
-          cookieSync: false,
-          headless: true,
-          modelStrategy: "ignore",
-          archiveConversations: "never",
-        },
-        runtimeHintCb: async (runtime) => {
-          persistedRuntimes.push(structuredClone(runtime));
-          const resource = runtime.recoveryCleanupResources?.[0];
-          if (resource?.acquisition?.pendingResource === "chrome-target") {
-            acquisitionOrder.push("persist:marker-intent");
-          } else if (resource?.chromeTargetId === targetId) {
-            acquisitionOrder.push("persist:exact-target");
-          }
-        },
-      }).catch((caught) => {
-        expect(caught).toBe(originalFailure);
-      });
+      // The focused coordinator must load after the target and page fixtures are installed.
+      const { runRemoteBrowserMode } =
+        await import("../../src/browser/remoteBrowserCoordinator.js");
+      await expect(
+        runRemoteBrowserMode(
+          "direct target journal",
+          [],
+          resolveBrowserConfig({
+            remoteChrome: { host: "remote.example", port: 9333 },
+            keepBrowser: false,
+            cookieSync: false,
+            headless: true,
+            modelStrategy: "ignore",
+            archiveConversations: "never",
+          }),
+          vi.fn() as BrowserLogger,
+          {
+            prompt: "direct target journal",
+            runtimeHintCb: async (runtime) => {
+              persistedRuntimes.push(structuredClone(runtime));
+              const resource = runtime.recoveryCleanupResources?.[0];
+              if (resource?.acquisition?.pendingResource === "chrome-target") {
+                acquisitionOrder.push("persist:marker-intent");
+              } else if (resource?.chromeTargetId === targetId) {
+                acquisitionOrder.push("persist:exact-target");
+              }
+            },
+          },
+        ),
+      ).rejects.toBe(originalFailure);
 
       expect(acquisitionOrder.slice(0, 3)).toEqual([
         "persist:marker-intent",
@@ -311,7 +317,7 @@ describe("remote browser unpublished cleanup", () => {
       if (!markerUrl) throw new Error("direct target marker URL was not persisted");
       const listChromeTargetsWithExactAuthority = vi.fn();
       await expect(
-        reattachTest.finalizeRecoveredRuntime(
+        finalizeRecoveredRuntime(
           markerRuntime,
           vi.fn() as BrowserLogger,
           { closeChromeTargetWithExactAuthority, listChromeTargetsWithExactAuthority },
@@ -326,24 +332,29 @@ describe("remote browser unpublished cleanup", () => {
       expect(listChromeTargetsWithExactAuthority).not.toHaveBeenCalled();
       expect(closeChromeTarget).not.toHaveBeenCalled();
 
-      await runBrowserMode({
-        prompt: "borrowed tab remains unowned",
-        config: {
-          remoteChrome: { host: "remote.example", port: 9333 },
-          browserTabRef: "borrowed-tab-ref",
-          resumeConversationUrl: "https://chatgpt.com/c/borrowed-target",
-          keepBrowser: false,
-          cookieSync: false,
-          headless: true,
-          modelStrategy: "ignore",
-          archiveConversations: "never",
-        },
-        runtimeHintCb: async (runtime) => {
-          borrowedRuntimes.push(structuredClone(runtime));
-        },
-      }).catch((caught) => {
-        expect(caught).toBe(originalFailure);
-      });
+      await expect(
+        runRemoteBrowserMode(
+          "borrowed tab remains unowned",
+          [],
+          resolveBrowserConfig({
+            remoteChrome: { host: "remote.example", port: 9333 },
+            browserTabRef: "borrowed-tab-ref",
+            resumeConversationUrl: "https://chatgpt.com/c/borrowed-target",
+            keepBrowser: false,
+            cookieSync: false,
+            headless: true,
+            modelStrategy: "ignore",
+            archiveConversations: "never",
+          }),
+          vi.fn() as BrowserLogger,
+          {
+            prompt: "borrowed tab remains unowned",
+            runtimeHintCb: async (runtime) => {
+              borrowedRuntimes.push(structuredClone(runtime));
+            },
+          },
+        ),
+      ).rejects.toBe(originalFailure);
       const borrowedRuntime = borrowedRuntimes.find(
         (runtime) => runtime.chromeTargetId === "borrowed-target",
       );

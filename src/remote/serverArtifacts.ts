@@ -9,7 +9,7 @@ import {
   type RemoteArtifactDeliveryReceiptRequest,
   type RemoteArtifactManualCopyWaiverRequest,
 } from "./types.js";
-import { readRequestBody, sendJson } from "./serverHttp.js";
+import { readRequestBody, RemoteRequestError, sendJson } from "./serverHttp.js";
 import { renewAuthenticatedTransactionLease } from "./serverTransactionRuntime.js";
 
 export async function serveRemoteArtifact(params: {
@@ -21,6 +21,14 @@ export async function serveRemoteArtifact(params: {
   transactionToken: string;
   artifactId: string;
 }): Promise<void> {
+  try {
+    await readRequestBody(params.req, 0);
+  } catch (error) {
+    if (!(error instanceof RemoteRequestError)) throw error;
+    sendJson(params.res, error.statusCode, { error: error.code, message: error.message });
+    return;
+  }
+
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
     params.transactionToken,
@@ -83,6 +91,14 @@ export async function serveRemoteArtifactReceipt(params: {
   transactionToken: string;
   artifactId: string;
 }): Promise<void> {
+  let body: RemoteArtifactDeliveryReceiptRequest;
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    body = RemoteArtifactDeliveryReceiptRequestSchema.parse(raw ? JSON.parse(raw) : {});
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_artifact_delivery_receipt" });
+    return;
+  }
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
     params.transactionToken,
@@ -93,15 +109,6 @@ export async function serveRemoteArtifactReceipt(params: {
   }
   if (!renewed) {
     sendJson(params.res, 404, { error: "transaction_not_found" });
-    return;
-  }
-
-  let body: RemoteArtifactDeliveryReceiptRequest;
-  try {
-    const raw = await readRequestBody(params.req, 4096);
-    body = RemoteArtifactDeliveryReceiptRequestSchema.parse(raw ? JSON.parse(raw) : {});
-  } catch {
-    sendJson(params.res, 400, { error: "invalid_artifact_delivery_receipt" });
     return;
   }
   try {
@@ -134,6 +141,14 @@ export async function serveRemoteArtifactManualCopyWaiver(params: {
   transactionToken: string;
   artifactId: string;
 }): Promise<void> {
+  let body: RemoteArtifactManualCopyWaiverRequest;
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    body = RemoteArtifactManualCopyWaiverRequestSchema.parse(raw ? JSON.parse(raw) : {});
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_artifact_manual_copy_waiver" });
+    return;
+  }
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
     params.transactionToken,
@@ -144,15 +159,6 @@ export async function serveRemoteArtifactManualCopyWaiver(params: {
   }
   if (!renewed) {
     sendJson(params.res, 404, { error: "transaction_not_found" });
-    return;
-  }
-
-  let body: RemoteArtifactManualCopyWaiverRequest;
-  try {
-    const raw = await readRequestBody(params.req, 4096);
-    body = RemoteArtifactManualCopyWaiverRequestSchema.parse(raw ? JSON.parse(raw) : {});
-  } catch {
-    sendJson(params.res, 400, { error: "invalid_artifact_manual_copy_waiver" });
     return;
   }
   try {

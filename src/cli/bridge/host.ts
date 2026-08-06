@@ -2,6 +2,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
+import net, { type Server as NetServer, type Socket as NetSocket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { TextDecoder } from "node:util";
@@ -16,6 +17,7 @@ import type { BridgeConnectionArtifact } from "../../bridge/connection.js";
 import { serveRemote } from "../../remote/server.js";
 import { assertLoopbackRemoteBind } from "../../remote/remoteServiceConfig.js";
 import { assertRemoteCredential, generateRemoteCredential } from "../../remote/auth.js";
+import { checkRemoteHealth, type RemoteHealthResult } from "../../remote/health.js";
 
 export const BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES = 512;
 export const BRIDGE_HOST_READINESS_PAYLOAD_MAX_BYTES = 256;
@@ -94,6 +96,8 @@ export interface BridgeHostDeps {
   env?: NodeJS.ProcessEnv;
   generateReadinessNonce?: () => string;
   readinessTimeoutMs?: number;
+  tunnelPlatform?: NodeJS.Platform;
+  tunnelSpawn?: BridgeHostSpawn;
 }
 
 export async function runBridgeHost(
@@ -223,9 +227,12 @@ export async function runBridgeHost(
               sshTarget,
               remotePort: sshRemotePort,
               localPort: bindPort,
+              token: credentials.token,
               identity: options.sshIdentity?.trim() || undefined,
               extraArgs: options.sshExtraArgs?.trim() || undefined,
               log: (message) => console.log(chalk.dim(message)),
+              platform: deps.tunnelPlatform,
+              spawnSsh: deps.tunnelSpawn,
             });
             await tunnelHandle.current.ready;
           }
@@ -702,22 +709,164 @@ async function rethrowAfterRestoring(
   throw error;
 }
 
+interface WindowsReverseTunnelProbeState {
+  child: ChildProcess | null;
+  server: NetServer | null;
+  socket: NetSocket | null;
+}
+
+async function closeWindowsReverseTunnelProbe(
+  state: WindowsReverseTunnelProbeState,
+  expectedServer?: NetServer,
+): Promise<void> {
+  if (expectedServer && state.server !== expectedServer) return;
+  const server = state.server;
+  const socket = state.socket;
+  const child = state.child;
+  state.server = null;
+  state.socket = null;
+  state.child = null;
+  socket?.destroy();
+  child?.kill();
+  if (!server) return;
+  await new Promise<void>((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function assertWindowsSshExtraArgs(args: readonly string[]): void {
+  const isControlOption = (value: string): boolean =>
+    /^(?:controlmaster|controlpath|controlpersist)(?:=|\s|$)/iu.test(value);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] ?? "";
+    if (
+      arg.startsWith("-M") ||
+      arg.startsWith("-S") ||
+      arg.startsWith("-O") ||
+      (arg.startsWith("-o") && arg.length > 2 && isControlOption(arg.slice(2))) ||
+      (arg === "-o" && isControlOption(args[index + 1] ?? ""))
+    ) {
+      throw new Error(
+        "Native Windows OpenSSH bridge tunnels do not accept ControlMaster, ControlPath, ControlPersist, -M, -S, or -O options.",
+      );
+    }
+  }
+}
+
+async function probeWindowsReverseTunnelHealth({
+  sshTarget,
+  remotePort,
+  token,
+  identity,
+  extraArgs,
+  timeoutMs,
+  spawnSsh,
+  state,
+}: {
+  sshTarget: string;
+  remotePort: number;
+  token: string;
+  identity?: string;
+  extraArgs: readonly string[];
+  timeoutMs: number;
+  spawnSsh: BridgeHostSpawn;
+  state: WindowsReverseTunnelProbeState;
+}): Promise<RemoteHealthResult> {
+  const server = net.createServer();
+  state.server = server;
+  server.on("error", () => state.socket?.destroy());
+  let accepted = false;
+  server.on("connection", (socket) => {
+    if (accepted || state.server !== server) {
+      socket.destroy();
+      return;
+    }
+    accepted = true;
+    state.socket = socket;
+    socket.on("error", () => undefined);
+    const probeArgs = ["-W", `127.0.0.1:${remotePort}`];
+    if (identity) probeArgs.push("-i", identity);
+    probeArgs.push(...extraArgs, sshTarget);
+    let child: ChildProcess;
+    try {
+      child = spawnSsh("ssh", probeArgs, {
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      socket.destroy(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    state.child = child;
+    if (!child.stdin || !child.stdout) {
+      socket.destroy(new Error("Windows SSH bridge health probe started without stdio pipes."));
+      return;
+    }
+    child.stdin.on("error", () => socket.destroy());
+    child.stdout.on("error", () => socket.destroy());
+    child.once("error", () => socket.destroy());
+    child.once("exit", () => socket.destroy());
+    socket.pipe(child.stdin);
+    child.stdout.pipe(socket);
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once("error", onError);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", onError);
+        resolve();
+      });
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Windows SSH bridge health probe did not acquire a loopback port.");
+    }
+    return await checkRemoteHealth({
+      host: `127.0.0.1:${address.port}`,
+      token,
+      timeoutMs,
+      idleTimeoutMs: timeoutMs,
+    });
+  } finally {
+    await closeWindowsReverseTunnelProbe(state, server);
+  }
+}
+
 function startReverseTunnel({
   sshTarget,
   remotePort,
   localPort,
+  token,
   identity,
   extraArgs,
   log,
+  platform = process.platform,
+  spawnSsh = (command, args, options) => spawn(command, args, options),
 }: {
   sshTarget: string;
   remotePort: number;
   localPort: number;
+  token: string;
   identity?: string;
   extraArgs?: string;
   log: (message: string) => void;
+  platform?: NodeJS.Platform;
+  spawnSsh?: BridgeHostSpawn;
 }): ReverseTunnelHandle {
   const initialReady = Promise.withResolvers<void>();
+  const parsedExtraArgs = extraArgs ? splitArgs(extraArgs) : [];
+  if (platform === "win32") assertWindowsSshExtraArgs(parsedExtraArgs);
+  const windowsProbeState: WindowsReverseTunnelProbeState = {
+    child: null,
+    server: null,
+    socket: null,
+  };
   let stopped = false;
   let becameReady = false;
   let master: ChildProcess | null = null;
@@ -745,11 +894,21 @@ function startReverseTunnel({
     timer = setTimeout(() => void spawnOnce(), delayMs);
     timer.unref?.();
   };
+  const markReady = (currentMaster: ChildProcess): void => {
+    attempt = 0;
+    log(
+      `[bridge host] ssh reverse tunnel ready${currentMaster.pid ? ` (pid ${currentMaster.pid})` : ""}: ${sshTarget}`,
+    );
+    if (!becameReady) {
+      becameReady = true;
+      initialReady.resolve();
+    }
+  };
   const runControlCommand = (args: string[]): Promise<number> => {
     const result = Promise.withResolvers<number>();
     let settled = false;
     let timeout: NodeJS.Timeout;
-    const child = spawn("ssh", args, { stdio: "ignore", windowsHide: true });
+    const child = spawnSsh("ssh", args, { stdio: "ignore", windowsHide: true });
     controlChild = child;
     const settle = (code: number) => {
       if (settled) return;
@@ -767,106 +926,165 @@ function startReverseTunnel({
     return result.promise;
   };
 
+  const runWindowsTunnel = async (): Promise<void> => {
+    const masterArgs = [
+      "-N",
+      "-R",
+      `${remotePort}:127.0.0.1:${localPort}`,
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "ServerAliveInterval=30",
+      "-o",
+      "ServerAliveCountMax=3",
+    ];
+    if (identity) masterArgs.push("-i", identity);
+    masterArgs.push(...parsedExtraArgs, sshTarget);
+    master = spawnSsh("ssh", masterArgs, { stdio: "ignore", windowsHide: true });
+    const currentMaster = master;
+    const masterClosed = Promise.withResolvers<void>();
+    currentMaster.once("error", () => masterClosed.resolve());
+    currentMaster.once("exit", () => masterClosed.resolve());
+
+    const deadline = Date.now() + BRIDGE_HOST_READINESS_TIMEOUT_MS;
+    let authenticatedReady = false;
+    while (!stopped && Date.now() < deadline) {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const result = await Promise.race([
+        probeWindowsReverseTunnelHealth({
+          sshTarget,
+          remotePort,
+          token,
+          identity,
+          extraArgs: parsedExtraArgs,
+          timeoutMs: Math.min(5_000, remainingMs),
+          spawnSsh,
+          state: windowsProbeState,
+        }).then((health) => ({ type: "health" as const, health })),
+        masterClosed.promise.then(() => ({ type: "master-closed" as const })),
+      ]);
+      if (result.type === "master-closed") {
+        throw new Error("Reverse SSH tunnel exited before remote health readiness.");
+      }
+      if (
+        result.health.ok &&
+        result.health.protocol === "transaction-v3" &&
+        result.health.serverGeneration &&
+        !stopped &&
+        currentMaster.exitCode === null &&
+        currentMaster.signalCode === null
+      ) {
+        authenticatedReady = true;
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    if (!authenticatedReady || stopped) {
+      throw new Error("Reverse SSH tunnel remote authenticated health did not become ready.");
+    }
+    markReady(currentMaster);
+    await masterClosed.promise;
+    if (master === currentMaster) master = null;
+  };
+
+  const runPosixTunnel = async (): Promise<void> => {
+    controlDir = await fs.mkdtemp(path.join(os.tmpdir(), "o-ssh-"));
+    await fs.chmod(controlDir, 0o700);
+    if (stopped) {
+      await cleanupControlDir();
+      return;
+    }
+    const controlPath = path.join(controlDir, "ctl");
+    const masterArgs = [
+      "-M",
+      "-S",
+      controlPath,
+      "-N",
+      "-o",
+      "ControlMaster=yes",
+      "-o",
+      "ControlPersist=no",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "ServerAliveInterval=30",
+      "-o",
+      "ServerAliveCountMax=3",
+    ];
+    if (identity) masterArgs.push("-i", identity);
+    masterArgs.push(...parsedExtraArgs, sshTarget);
+
+    master = spawnSsh("ssh", masterArgs, { stdio: "ignore", windowsHide: true });
+    const currentMaster = master;
+    const masterClosed = Promise.withResolvers<void>();
+    currentMaster.once("error", () => masterClosed.resolve());
+    currentMaster.once("exit", () => masterClosed.resolve());
+
+    const deadline = Date.now() + BRIDGE_HOST_READINESS_TIMEOUT_MS;
+    let controlReady = false;
+    while (!stopped && Date.now() < deadline) {
+      const result = await Promise.race([
+        runControlCommand(["-S", controlPath, "-O", "check", sshTarget]).then((code) => ({
+          type: "control" as const,
+          code,
+        })),
+        masterClosed.promise.then(() => ({ type: "master-closed" as const })),
+      ]);
+      if (result.type === "master-closed") {
+        throw new Error("Reverse SSH tunnel master exited before readiness.");
+      }
+      if (result.code === 0) {
+        controlReady = true;
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    if (!controlReady || stopped) {
+      throw new Error("Reverse SSH tunnel control socket did not become ready.");
+    }
+
+    const forwardResult = await Promise.race([
+      runControlCommand([
+        "-S",
+        controlPath,
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-O",
+        "forward",
+        "-R",
+        `${remotePort}:127.0.0.1:${localPort}`,
+        sshTarget,
+      ]).then((code) => ({ type: "forward" as const, code })),
+      masterClosed.promise.then(() => ({ type: "master-closed" as const })),
+    ]);
+    if (
+      forwardResult.type !== "forward" ||
+      forwardResult.code !== 0 ||
+      stopped ||
+      currentMaster.exitCode !== null ||
+      currentMaster.signalCode !== null
+    ) {
+      throw new Error("Reverse SSH tunnel forwarding request failed.");
+    }
+
+    markReady(currentMaster);
+    await masterClosed.promise;
+    if (master === currentMaster) master = null;
+    await cleanupControlDir();
+  };
+
   const spawnOnce = async (): Promise<void> => {
     if (stopped) return;
     try {
-      controlDir = await fs.mkdtemp(path.join(os.tmpdir(), "o-ssh-"));
-      if (process.platform !== "win32") await fs.chmod(controlDir, 0o700);
-      if (stopped) {
-        await cleanupControlDir();
-        return;
+      if (platform === "win32") {
+        await runWindowsTunnel();
+      } else {
+        await runPosixTunnel();
       }
-      const controlPath = path.join(controlDir, "ctl");
-      const masterArgs = [
-        "-M",
-        "-S",
-        controlPath,
-        "-N",
-        "-o",
-        "ControlMaster=yes",
-        "-o",
-        "ControlPersist=no",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "ServerAliveInterval=30",
-        "-o",
-        "ServerAliveCountMax=3",
-      ];
-      if (identity) masterArgs.push("-i", identity);
-      if (extraArgs) masterArgs.push(...splitArgs(extraArgs));
-      masterArgs.push(sshTarget);
-
-      master = spawn("ssh", masterArgs, { stdio: "ignore", windowsHide: true });
-      const currentMaster = master;
-      const masterClosed = Promise.withResolvers<void>();
-      currentMaster.once("error", () => masterClosed.resolve());
-      currentMaster.once("exit", () => masterClosed.resolve());
-
-      const deadline = Date.now() + BRIDGE_HOST_READINESS_TIMEOUT_MS;
-      let controlReady = false;
-      while (!stopped && Date.now() < deadline) {
-        const result = await Promise.race([
-          runControlCommand(["-S", controlPath, "-O", "check", sshTarget]).then((code) => ({
-            type: "control" as const,
-            code,
-          })),
-          masterClosed.promise.then(() => ({ type: "master-closed" as const })),
-        ]);
-        if (result.type === "master-closed") {
-          throw new Error("Reverse SSH tunnel master exited before readiness.");
-        }
-        if (result.code === 0) {
-          controlReady = true;
-          break;
-        }
-        const delayed = Promise.withResolvers<void>();
-        setTimeout(delayed.resolve, 100);
-        await delayed.promise;
-      }
-      if (!controlReady || stopped) {
-        throw new Error("Reverse SSH tunnel control socket did not become ready.");
-      }
-
-      const forwardResult = await Promise.race([
-        runControlCommand([
-          "-S",
-          controlPath,
-          "-o",
-          "ExitOnForwardFailure=yes",
-          "-O",
-          "forward",
-          "-R",
-          `${remotePort}:127.0.0.1:${localPort}`,
-          sshTarget,
-        ]).then((code) => ({ type: "forward" as const, code })),
-        masterClosed.promise.then(() => ({ type: "master-closed" as const })),
-      ]);
-      if (
-        forwardResult.type !== "forward" ||
-        forwardResult.code !== 0 ||
-        stopped ||
-        currentMaster.exitCode !== null ||
-        currentMaster.signalCode !== null
-      ) {
-        throw new Error("Reverse SSH tunnel forwarding request failed.");
-      }
-
-      attempt = 0;
-      log(
-        `[bridge host] ssh reverse tunnel ready${currentMaster.pid ? ` (pid ${currentMaster.pid})` : ""}: ${sshTarget}`,
-      );
-      if (!becameReady) {
-        becameReady = true;
-        initialReady.resolve();
-      }
-      await masterClosed.promise;
-      if (master === currentMaster) master = null;
-      await cleanupControlDir();
       scheduleRestart();
     } catch {
       stopProcesses();
-      await cleanupControlDir();
+      await Promise.all([closeWindowsReverseTunnelProbe(windowsProbeState), cleanupControlDir()]);
       if (!becameReady) {
         initialReady.reject(
           new Error("Reverse SSH tunnel failed before the remote forward was ready."),
@@ -890,7 +1108,7 @@ function startReverseTunnel({
         initialReady.reject(new Error("Reverse SSH tunnel stopped before readiness."));
       }
       stopProcesses();
-      await cleanupControlDir();
+      await Promise.all([closeWindowsReverseTunnelProbe(windowsProbeState), cleanupControlDir()]);
     },
   };
 }

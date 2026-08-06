@@ -226,6 +226,42 @@ export async function httpPostJson({
   sendTestRequestBody({ req, authentication, method: "POST", path, body: serialized });
   return await deferred.promise;
 }
+export async function httpRaw({
+  hostname,
+  port,
+  path,
+  method,
+  body,
+  headers,
+}: {
+  hostname: string;
+  port: number;
+  path: string;
+  method: "GET" | "POST";
+  body: Buffer;
+  headers: Record<string, string>;
+}): Promise<{ statusCode: number; body: string }> {
+  const deferred = Promise.withResolvers<{ statusCode: number; body: string }>();
+  const req = http.request(
+    {
+      hostname,
+      port,
+      path,
+      method,
+      headers: { "Content-Length": body.byteLength, ...headers },
+    },
+    (res) => {
+      readIncomingBody(res)
+        .then((responseBody) =>
+          deferred.resolve({ statusCode: res.statusCode ?? 0, body: responseBody }),
+        )
+        .catch(deferred.reject);
+    },
+  );
+  req.on("error", deferred.reject);
+  req.end(body);
+  return await deferred.promise;
+}
 
 export async function httpPostNdjson({
   hostname,

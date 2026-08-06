@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import type { OptionValues } from "commander";
 // Allow `npx @steipete/oracle oracle-mcp` to resolve the MCP server even though npx runs the default binary.
 if (process.argv[2] === "oracle-mcp") {
+  // Static import would eagerly load MCP dependencies for every CLI invocation.
   const { startMcpServer } = await import("../src/mcp/server.js");
-  await startMcpServer();
+  await Promise.race([startMcpServer(), once(process.stdin, "end")]);
   process.exit(0);
 }
 import { resolveEngine, type EngineMode, defaultWaitPreference } from "../src/cli/engine.js";

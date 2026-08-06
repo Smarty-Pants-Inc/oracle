@@ -109,6 +109,14 @@ export async function serveRemoteTransactionBinding(params: {
   transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
 }): Promise<void> {
+  let request;
+  try {
+    const raw = await readRequestBody(params.req, 4096);
+    request = RemoteBindSettlementRequestSchema.parse(raw ? JSON.parse(raw) : {});
+  } catch {
+    sendJson(params.res, 400, { error: "invalid_settlement_binding_request" });
+    return;
+  }
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
     params.transactionToken,
@@ -119,14 +127,6 @@ export async function serveRemoteTransactionBinding(params: {
   }
   if (!renewed) {
     sendJson(params.res, 404, { error: "transaction_not_found" });
-    return;
-  }
-  let request;
-  try {
-    const raw = await readRequestBody(params.req, 4096);
-    request = RemoteBindSettlementRequestSchema.parse(raw ? JSON.parse(raw) : {});
-  } catch {
-    sendJson(params.res, 400, { error: "invalid_settlement_binding_request" });
     return;
   }
   try {
@@ -165,18 +165,6 @@ export async function serveRemoteTransactionSettlement(params: {
   transactionCoordinator: RemoteTransactionCoordinator;
   runSettlementWork: <T>(operation: () => Promise<T>) => Promise<T>;
 }): Promise<void> {
-  const renewed = await renewAuthenticatedTransactionLease(
-    params.transactionStore,
-    params.transactionToken,
-  );
-  if (renewed === "expired") {
-    sendJson(params.res, 409, { error: "transaction_lease_expired" });
-    return;
-  }
-  if (!renewed) {
-    sendJson(params.res, 404, { error: "transaction_not_found" });
-    return;
-  }
   let durablePublication = false;
   try {
     const raw = await readRequestBody(params.req, 4096);
@@ -188,6 +176,18 @@ export async function serveRemoteTransactionSettlement(params: {
     }
   } catch {
     sendJson(params.res, 400, { error: "invalid_settlement_request" });
+    return;
+  }
+  const renewed = await renewAuthenticatedTransactionLease(
+    params.transactionStore,
+    params.transactionToken,
+  );
+  if (renewed === "expired") {
+    sendJson(params.res, 409, { error: "transaction_lease_expired" });
+    return;
+  }
+  if (!renewed) {
+    sendJson(params.res, 404, { error: "transaction_not_found" });
     return;
   }
 

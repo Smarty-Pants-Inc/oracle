@@ -243,7 +243,10 @@ export function createRemoteBrowserExecutor({
         assertTransactionOwnership: (transaction) =>
           assertRemoteTransactionOwnership(transaction, transactionToken),
         rehydrateError: (remoteError) =>
-          rehydrateRemoteBrowserError(remoteError, host, transactionToken, { requestIdentity }),
+          rehydrateRemoteBrowserError(remoteError, host, transactionToken, {
+            requestIdentity,
+            authoritativeRuntime: preReceiptRuntime,
+          }),
       });
     } catch (error) {
       if (error instanceof RemoteTransportInterruption) {
@@ -260,6 +263,14 @@ export function createRemoteBrowserExecutor({
         });
       } else if (
         error instanceof BrowserAutomationError &&
+        error.details?.recoverableDisconnect === false
+      ) {
+        const terminalRuntime = error.details.runtime as BrowserRuntimeMetadata | undefined;
+        if (terminalRuntime) await options.runtimeHintCb?.(terminalRuntime);
+        throw error;
+      } else if (
+        error instanceof BrowserAutomationError &&
+        error.details?.recoverableDisconnect !== false &&
         !error.details?.runtime &&
         error.details?.code !== "remote-settlement-mode-conflict"
       ) {

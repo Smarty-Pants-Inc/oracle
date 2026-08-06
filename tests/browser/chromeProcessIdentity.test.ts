@@ -505,7 +505,62 @@ describe("physical Chrome profile use authority", () => {
     });
   });
 
-  test("enumerates all platform processes before proving a profile unused", async () => {
+  test("ignores a hostile PATH when enumerating Darwin processes", async () => {
+    const expected = Object.freeze({
+      version: 2 as const,
+      platform: "darwin" as const,
+      canonicalPath: "/private/var/folders/oracle/profile",
+      device: "7",
+      inode: "99",
+      birthtimeNs: "3",
+    }) satisfies ProfileDirectoryIdentity;
+    const attackerPs = vi.fn(async () => ({ stdout: "999 fake-attacker-process\n" }));
+    const execute = vi.fn(async (file: string) => {
+      if (file === "ps") return attackerPs();
+      if (file !== "/bin/ps") throw new Error(`Unexpected process probe: ${file}`);
+      return { stdout: "123 /usr/bin/node server.js\n" };
+    });
+
+    await expect(
+      inspectChromeProfileDirectoryUseForTest(expected, { platform: "darwin", execute }),
+    ).resolves.toEqual({ status: "unused", candidates: [] });
+    expect(attackerPs).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith("/bin/ps", ["-axww", "-o", "pid=", "-o", "command="]);
+  });
+
+  test("uses only the fixed System32 probe for Windows Chrome enumeration", async () => {
+    const expected = Object.freeze({
+      version: 2 as const,
+      platform: "win32" as const,
+      canonicalPath: String.raw`C:\Users\Oracle\chrome-profile`,
+      device: "7",
+      inode: "99",
+      birthtimeNs: "3",
+    }) satisfies ProfileDirectoryIdentity;
+    const attackerPowerShell = vi.fn(async () => ({ stdout: "999:\n" }));
+    const trustedPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const execute = vi.fn(async (file: string, _args: string[]) => {
+      if (file === "powershell.exe") return attackerPowerShell();
+      if (file !== trustedPowerShell) throw new Error(`Unexpected process probe: ${file}`);
+      return { stdout: "" };
+    });
+
+    await expect(
+      inspectChromeProfileDirectoryUseForTest(expected, { platform: "win32", execute }),
+    ).resolves.toEqual({ status: "unused", candidates: [] });
+    expect(attackerPowerShell).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]?.[0]).toBe(trustedPowerShell);
+    expect(execute.mock.calls[0]?.[1]).toEqual([
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      expect.stringContaining("Get-CimInstance Win32_Process"),
+    ]);
+  });
+
+  test("fails closed when the trusted process probe is unavailable", async () => {
     const expected = Object.freeze({
       version: 2 as const,
       platform: "darwin" as const,
@@ -517,10 +572,17 @@ describe("physical Chrome profile use authority", () => {
     const execute = vi.fn(async () => ({ stdout: "123 /usr/bin/node server.js\n" }));
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, { platform: "darwin", execute }),
-    ).resolves.toEqual({ status: "unused", candidates: [] });
-    expect(execute).toHaveBeenCalledOnce();
-    expect(execute).toHaveBeenCalledWith("ps", ["-axww", "-o", "pid=", "-o", "command="]);
+      inspectChromeProfileDirectoryUseForTest(expected, {
+        platform: "darwin",
+        execute,
+        trustedProcessProbe: null,
+      }),
+    ).resolves.toEqual({
+      status: "unavailable",
+      candidates: [],
+      reason: "Complete Chrome process enumeration failed",
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   test("fails closed when a Chrome candidate profile identity is unreadable", async () => {

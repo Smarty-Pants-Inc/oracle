@@ -40,8 +40,9 @@ import {
   committedPromptEpoch,
   createArtifactDescriptor,
   lifecycleBrowserTransaction,
+  remoteRunPayload,
 } from "./serverTestBuilders.js";
-import { readIncomingBody } from "./serverTestHttp.js";
+import { httpPostJson, httpPostNdjson, readIncomingBody } from "./serverTestHttp.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -603,6 +604,161 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       }
     },
     15_000,
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST).each([
+    {
+      name: "a different artifact",
+      targetIndex: 1,
+      body: (first: RemoteArtifactDescriptor) => ({
+        sha256: first.sha256,
+        byteSize: first.byteSize,
+      }),
+    },
+    {
+      name: "a mismatched byte size",
+      targetIndex: 0,
+      body: (first: RemoteArtifactDescriptor) => ({
+        sha256: first.sha256,
+        byteSize: first.byteSize + 1,
+      }),
+    },
+    {
+      name: "a mismatched hash",
+      targetIndex: 0,
+      body: (_first: RemoteArtifactDescriptor, second: RemoteArtifactDescriptor) => ({
+        sha256: second.sha256,
+        byteSize: second.byteSize,
+      }),
+    },
+  ])(
+    "rejects a schema-valid manual-copy waiver for $name and blocks finalization",
+    async ({ targetIndex, body }) => {
+      const tmpDir = await mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-artifact-waiver-binding-"),
+      );
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "1".repeat(64);
+      const firstPayload = Buffer.from("first artifact");
+      const secondPayload = Buffer.from("second artifact with a different size");
+      setOracleHomeDirOverrideForTest(tmpDir);
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            const [firstArtifact, secondArtifact] = await Promise.all(
+              [
+                { filename: "first.zip", contents: firstPayload },
+                { filename: "second.zip", contents: secondPayload },
+              ].map(async ({ filename, contents }) =>
+                writeBinaryBrowserArtifact({
+                  sessionId: options.sessionId,
+                  artifactWriteAuthority: options.artifactWriteAuthority,
+                  kind: "file",
+                  filename,
+                  contents,
+                  label: filename,
+                  mimeType: "application/zip",
+                  sourceUrl: `sandbox:/mnt/data/${filename}`,
+                }),
+              ),
+            );
+            if (!firstArtifact || !secondArtifact) {
+              throw new Error("Expected required waiver binding artifact fixtures");
+            }
+            return browserTransaction(options.prompt, {
+              answerText: "captured with required artifacts",
+              answerMarkdown: "captured with required artifacts",
+              tookMs: 1,
+              answerTokens: 4,
+              answerChars: 32,
+              savedFiles: [firstArtifact, secondArtifact].map((artifact) => ({
+                ...artifact,
+                kind: "file" as const,
+                url: "browser-download",
+                finalUrl: "browser-download",
+                filename: path.basename(artifact.path),
+              })),
+            });
+          },
+        },
+      );
+
+      try {
+        await expect(
+          httpPostNdjson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/run`,
+            token: "a".repeat(64),
+            body: remoteRunPayload(),
+          }),
+        ).resolves.toMatchObject({ statusCode: 200 });
+        const readCurrent = async () =>
+          await RemoteTransactionStore.open({
+            directory: transactionStoreDir,
+            integrityKeyPath: path.join(tmpDir, ".remote-transaction-integrity.key"),
+          }).then((reader) => reader.read(transactionToken));
+        const artifacts = (await readCurrent())?.artifacts;
+        expect(artifacts).toHaveLength(2);
+        const [first, second] = artifacts ?? [];
+        if (!first || !second) throw new Error("Expected registered waiver binding artifacts");
+        const waiver = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/artifacts/${encodeURIComponent(
+            [first, second][targetIndex]!.descriptor.artifactId,
+          )}/manual-copy-waiver`,
+          token: "a".repeat(64),
+          body: body(first.descriptor, second.descriptor),
+        });
+        expect(waiver).toMatchObject({
+          statusCode: 409,
+          json: { error: "artifact_manual_copy_waiver_conflict" },
+        });
+        const persistedArtifacts = (await readCurrent())?.artifacts;
+        expect(persistedArtifacts).toHaveLength(2);
+        expect(persistedArtifacts?.every((artifact) => !artifact.manualCopyWaiver)).toBe(true);
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            token: "a".repeat(64),
+            body: { durablePublication: true },
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 409,
+          json: { error: "required_artifact_delivery_incomplete" },
+        });
+        for (const artifact of [first.descriptor, second.descriptor]) {
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/artifacts/${encodeURIComponent(
+                artifact.artifactId,
+              )}/manual-copy-waiver`,
+              token: "a".repeat(64),
+              body: { sha256: artifact.sha256, byteSize: artifact.byteSize },
+            }),
+          ).resolves.toMatchObject({ statusCode: 200, json: { ok: true } });
+        }
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            token: "a".repeat(64),
+            body: { durablePublication: true },
+          }),
+        ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(

@@ -115,13 +115,18 @@ describe("local acquisition durability", () => {
     }));
 
     try {
-      // The production runner must load after this test's module mocks are installed.
-      const { runBrowserMode: isolatedRunBrowserMode } = await import("../../src/browser/index.js");
+      // The acquisition module must load after this test's module mocks are installed.
+      const { acquireLocalBrowserResources } =
+        await import("../../src/browser/localAcquisition.js");
       await expect(
-        isolatedRunBrowserMode({
-          prompt: "test",
-          config: { manualLogin: true, manualLoginProfileDir: profileDir },
-          runtimeHintCb,
+        acquireLocalBrowserResources({
+          options: { prompt: "test", runtimeHintCb },
+          config: resolveBrowserConfig({
+            manualLogin: true,
+            manualLoginProfileDir: profileDir,
+          }),
+          logger: vi.fn() as BrowserLogger,
+          usingCopiedProfile: false,
         }),
       ).rejects.toBe(persistenceFailure);
 
