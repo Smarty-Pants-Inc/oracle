@@ -1,12 +1,6 @@
 import type { BigIntStats } from "node:fs";
 import { lstat, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import {
-  closeChromeTargetWithExactAuthority,
-  retainChromeEndpointAuthority,
-  type RetainedChromeEndpointAuthority,
-} from "./chromeLifecycle.js";
-import { listChromeTargetsWithExactAuthority } from "./chromeTargetConnection.js";
 import { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { getOracleHomeDir } from "../oracleHome.js";
@@ -266,43 +260,6 @@ function ownedProjectSourcesTarget(
   );
 }
 
-async function inspectProjectSourcesTargetMarker(
-  authority: RetainedChromeEndpointAuthority,
-  targetId: string,
-  marker: string,
-) {
-  if (!authority.runExactOperation) {
-    return {
-      status: "unsafe" as const,
-      reason: "Exact target inspection authority is unavailable",
-    };
-  }
-  return await authority.runExactOperation(async (browser) => {
-    const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
-    try {
-      const evaluated = (await browser.send(
-        "Runtime.evaluate",
-        { expression: "window.name", returnByValue: true },
-        attached.sessionId,
-      )) as { result?: { value?: unknown } };
-      return evaluated.result?.value === marker;
-    } finally {
-      await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-        () => undefined,
-      );
-    }
-  });
-}
-
-async function hasProjectSourcesTargetMarker(
-  authority: RetainedChromeEndpointAuthority,
-  targetId: string,
-  marker: string,
-): Promise<boolean> {
-  const inspected = await inspectProjectSourcesTargetMarker(authority, targetId, marker);
-  return inspected.status === "completed" && inspected.value;
-}
-
 export async function closeProjectSourcesTargetFromJournal(options: {
   runtime: BrowserRuntimeMetadata;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
@@ -316,70 +273,13 @@ export async function closeProjectSourcesTargetFromJournal(options: {
       reason: "Project Sources target cleanup capability is malformed",
     };
   }
-  const resource = ownedProjectSourcesTarget(runtime, capability, targetId);
-  if (!resource) {
+  if (!ownedProjectSourcesTarget(runtime, capability, targetId)) {
     return {
       status: "unavailable",
       reason: "Project Sources cleanup target does not match its durable generation authority",
     };
   }
-  const live = await closeChromeTargetWithRetainedCapability({ capability, targetId, logger });
-  if (live.status !== "unavailable") return live;
-
-  const profileRoot = resource.chromeProfileRoot ?? resource.userDataDir;
-  const endpoint = resource.chromeBrowserWSEndpoint;
-  const host = resource.chromeHost ?? (endpoint ? new URL(endpoint).hostname : "127.0.0.1");
-  const port = resource.chromePort ?? (endpoint ? Number.parseInt(new URL(endpoint).port, 10) : 0);
-  if (!profileRoot || !resource.chromeProcessIdentity || !Number.isInteger(port) || port < 1) {
-    return {
-      status: "unavailable",
-      reason: "Project Sources cleanup has no exact Chrome endpoint authority",
-    };
-  }
-
-  let authority: RetainedChromeEndpointAuthority | undefined;
-  let result: RetainedTargetCloseCapabilityResult;
-  try {
-    authority = await retainChromeEndpointAuthority({
-      host,
-      port,
-      ...(endpoint ? { browserWSEndpoint: endpoint } : {}),
-      userDataDir: profileRoot,
-      processIdentity: resource.chromeProcessIdentity,
-    });
-    const listed = await listChromeTargetsWithExactAuthority(authority);
-    const marker = resource.acquisition?.targetMarkerUrl;
-    if (
-      listed.status !== "completed" ||
-      !marker ||
-      !listed.value.some((target) => target.targetId === targetId) ||
-      !(await hasProjectSourcesTargetMarker(authority, targetId, marker))
-    ) {
-      return {
-        status: "unsafe",
-        reason:
-          "Project Sources durable target cleanup refused because the exact target marker was not observed.",
-      };
-    }
-    result = await closeChromeTargetWithExactAuthority({ authority, targetId, logger });
-  } catch (error) {
-    return {
-      status: "unsafe",
-      reason: `Project Sources durable target cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  } finally {
-    if (authority) {
-      try {
-        await authority.release();
-      } catch (error) {
-        result = {
-          status: "unsafe",
-          reason: `Project Sources exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
-    }
-  }
-  return result!;
+  return await closeChromeTargetWithRetainedCapability({ capability, targetId, logger });
 }
 
 export async function recoverPendingProjectSourcesProfileCreate(
@@ -444,28 +344,9 @@ function bindProjectSourcesAbortRecovery(runtime: BrowserRuntimeMetadata): Brows
   };
 }
 
-function clearPendingProjectSourcesTarget(runtime: BrowserRuntimeMetadata): BrowserRuntimeMetadata {
-  const resources = runtime.recoveryCleanupResources?.map((resource) => {
-    if (resource.acquisition?.pendingResource !== "chrome-target") return resource;
-    const { pendingResource: _pendingResource, ...acquisition } = resource.acquisition;
-    return {
-      ...resource,
-      chromeTargetId: undefined,
-      targetCloseCapability: undefined,
-      acquisition,
-      recoveryCleanup: {
-        ...resource.recoveryCleanup,
-        ownsTarget: false,
-        closeOwnedTargetOnComplete: undefined,
-      },
-    };
-  });
-  return { ...runtime, chromeTargetId: undefined, recoveryCleanupResources: resources };
-}
-
 export async function reconcilePendingProjectSourcesTarget(
   runtime: BrowserRuntimeMetadata,
-  logger: BrowserLogger,
+  _logger: BrowserLogger,
 ): Promise<BrowserRuntimeMetadata> {
   const pendingResources = runtime.recoveryCleanupResources?.filter(
     (candidate) => candidate.acquisition?.pendingResource === "chrome-target",
@@ -476,78 +357,7 @@ export async function reconcilePendingProjectSourcesTarget(
       "Project Sources interrupted target acquisition names multiple pending resources.",
     );
   }
-  const resource = pendingResources[0];
-  const marker = resource.acquisition?.targetMarkerUrl;
-  const profileRoot = resource.chromeProfileRoot ?? resource.userDataDir;
-  const endpoint = resource.chromeBrowserWSEndpoint;
-  const host = resource.chromeHost ?? (endpoint ? new URL(endpoint).hostname : "127.0.0.1");
-  const port = resource.chromePort ?? (endpoint ? Number.parseInt(new URL(endpoint).port, 10) : 0);
-  if (
-    !marker ||
-    !profileRoot ||
-    !resource.chromeProcessIdentity ||
-    !Number.isInteger(port) ||
-    port < 1
-  ) {
-    throw new Error(
-      "Project Sources interrupted target acquisition has no exact endpoint authority.",
-    );
-  }
-
-  let authority: RetainedChromeEndpointAuthority | undefined;
-  try {
-    authority = await retainChromeEndpointAuthority({
-      host,
-      port,
-      ...(endpoint ? { browserWSEndpoint: endpoint } : {}),
-      userDataDir: profileRoot,
-      processIdentity: resource.chromeProcessIdentity,
-    });
-    const listed = await listChromeTargetsWithExactAuthority(authority);
-    if (listed.status === "gone") return clearPendingProjectSourcesTarget(runtime);
-    if (listed.status !== "completed") {
-      throw new Error(
-        `Project Sources interrupted target acquisition could not list the exact endpoint: ${listed.reason}`,
-      );
-    }
-    const candidates: string[] = [];
-    for (const target of listed.value) {
-      if (!target.targetId || target.type !== "page") continue;
-      if (target.url === marker) {
-        candidates.push(target.targetId);
-        continue;
-      }
-      const inspected = await inspectProjectSourcesTargetMarker(authority, target.targetId, marker);
-      if (inspected.status === "gone") return clearPendingProjectSourcesTarget(runtime);
-      if (inspected.status === "unsafe") {
-        throw new Error(
-          `Project Sources interrupted target acquisition could not inspect the exact endpoint: ${inspected.reason}`,
-        );
-      }
-      if (inspected.value) candidates.push(target.targetId);
-    }
-    if (candidates.length === 0) return clearPendingProjectSourcesTarget(runtime);
-    if (candidates.length !== 1) {
-      throw new Error(
-        "Project Sources interrupted target acquisition matched multiple generation markers.",
-      );
-    }
-    if (resource.recoveryCleanup.closeOwnedTargetOnComplete === true) {
-      const closed = await closeChromeTargetWithExactAuthority({
-        authority,
-        targetId: candidates[0],
-        logger,
-      });
-      if (closed.status !== "completed" && closed.status !== "gone") {
-        throw new Error(
-          `Project Sources interrupted target cleanup was not confirmed: ${closed.reason}`,
-        );
-      }
-    }
-    return clearPendingProjectSourcesTarget(runtime);
-  } finally {
-    await authority?.release();
-  }
+  return runtime;
 }
 
 export async function retryPendingProjectSourcesCleanup(

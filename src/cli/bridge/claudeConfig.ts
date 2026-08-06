@@ -82,13 +82,15 @@ export function formatClaudeMcpConfig({
     env["ORACLE_REMOTE_HOST"] = remoteHost;
     if (remoteToken || !allowLegacyTextProtocol) {
       // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
-      env["ORACLE_REMOTE_TOKEN"] = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+      env["ORACLE_REMOTE_TOKEN"] = includeToken
+        ? (remoteToken ?? "<64_LOWERCASE_HEX_CHARACTERS>")
+        : "<64_LOWERCASE_HEX_CHARACTERS>";
     }
     if (allowLegacyTextProtocol) {
       // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
       env["ORACLE_REMOTE_LEGACY_TOKEN"] = includeToken
-        ? (remoteLegacyToken ?? "<YOUR_LEGACY_TOKEN>")
-        : "<YOUR_LEGACY_TOKEN>";
+        ? (remoteLegacyToken ?? "<DISTINCT_64_LOWERCASE_HEX_CHARACTERS>")
+        : "<DISTINCT_64_LOWERCASE_HEX_CHARACTERS>";
       // biome-ignore lint/complexity/useLiteralKeys: env vars are uppercase and include underscores.
       env["ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL"] = "1";
     }

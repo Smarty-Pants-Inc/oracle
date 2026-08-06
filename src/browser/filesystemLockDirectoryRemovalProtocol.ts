@@ -1,12 +1,6 @@
 import { parsePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 
-export type DirectoryRemovalIdentity = PhysicalDirectoryIdentity;
-export {
-  parsePhysicalDirectoryIdentity as parseDirectoryRemovalIdentity,
-  samePhysicalDirectoryIdentity as sameDirectoryRemovalIdentity,
-} from "./filesystemLockDirectoryIdentity.js";
-
 export interface DirectoryRemovalGoMessage {
   readonly type: "go";
   readonly token: string;
@@ -15,14 +9,14 @@ export interface DirectoryRemovalGoMessage {
 export interface DirectoryRemovalRootAttestation {
   readonly type: "attested";
   readonly token: string;
-  readonly rootIdentity: DirectoryRemovalIdentity;
-  readonly generationIdentity: DirectoryRemovalIdentity;
+  readonly rootIdentity: PhysicalDirectoryIdentity;
+  readonly generationIdentity: PhysicalDirectoryIdentity;
 }
 
 export interface DirectoryRemovalDirectoryAttestation {
   readonly type: "attested-directory";
   readonly token: string;
-  readonly directoryIdentity: DirectoryRemovalIdentity;
+  readonly directoryIdentity: PhysicalDirectoryIdentity;
   readonly mountId: null;
 }
 

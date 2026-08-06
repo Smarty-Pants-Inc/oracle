@@ -54,11 +54,12 @@ const {
   delay: vi.fn(async () => undefined),
   captureProfileDirectoryIdentity: vi.fn(
     async (profileDir: string, _options?: { create?: boolean }) => ({
-      version: 1 as const,
+      version: 2 as const,
       platform: process.platform,
       canonicalPath: profileDir,
       device: "test-device",
       inode: "test-inode",
+      birthtimeNs: "3",
     }),
   ),
   acquireManualChromeOwner: vi.fn(),

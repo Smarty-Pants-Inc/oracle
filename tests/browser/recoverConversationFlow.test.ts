@@ -48,11 +48,12 @@ const readyHarvest = {
 };
 
 const profileDirectory = {
-  version: 1 as const,
+  version: 2 as const,
   platform: process.platform,
   canonicalPath: "/tmp/recover-profile",
   device: "1",
   inode: "2",
+  birthtimeNs: "3",
 };
 
 function processIdentity(port: number) {

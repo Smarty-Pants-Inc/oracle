@@ -4,6 +4,7 @@ import net from "node:net";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
   REMOTE_PROTOCOL_HEADER,
+  assertRemoteCredential,
   verifyRemoteHealthAuthenticationProof,
 } from "./auth.js";
 import { RemoteLegacyHealthResponseSchema } from "./legacyProtocol.js";
@@ -86,12 +87,15 @@ export async function checkRemoteHealth({
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-  if (
-    allowLegacyTextProtocol &&
-    token?.trim() &&
-    legacyToken?.trim() &&
-    token.trim() === legacyToken.trim()
-  ) {
+  try {
+    if (token !== undefined) assertRemoteCredential(token, "Remote v3 HMAC root key");
+    if (legacyToken !== undefined) {
+      assertRemoteCredential(legacyToken, "Remote legacy bearer credential");
+    }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (allowLegacyTextProtocol && token && legacyToken && token === legacyToken) {
     return {
       ok: false,
       error:
@@ -100,7 +104,7 @@ export async function checkRemoteHealth({
   }
 
   try {
-    if (token?.trim()) {
+    if (token) {
       const clientNonce = randomBytes(32).toString("hex");
       const current = await requestJson({
         ...endpoint,
@@ -159,7 +163,7 @@ export async function checkRemoteHealth({
     if (!allowLegacyTextProtocol) {
       return { ok: false, error: "Legacy text protocol is disabled." };
     }
-    if (!legacyToken?.trim()) {
+    if (!legacyToken) {
       return {
         ok: false,
         error: "Legacy text protocol requires a distinct scoped legacy bearer credential.",

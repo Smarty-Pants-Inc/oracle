@@ -1,7 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import chalk from "chalk";
 import { getOracleHomeDir } from "../../oracleHome.js";
 import {
@@ -12,6 +11,7 @@ import {
 import type { BridgeConnectionArtifact } from "../../bridge/connection.js";
 import { serveRemote } from "../../remote/server.js";
 import { assertLoopbackRemoteBind } from "../../remote/remoteServiceConfig.js";
+import { assertRemoteCredential, generateRemoteCredential } from "../../remote/auth.js";
 
 export interface BridgeHostCliOptions {
   bind?: string;
@@ -45,12 +45,15 @@ export async function runBridgeHost(
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
   assertLoopbackRemoteBind(bindHost);
 
-  const tokenRaw = options.token?.trim() || "auto";
-  const token = tokenRaw === "auto" ? randomBytes(16).toString("hex") : tokenRaw;
-  if (!token.trim()) {
-    throw new Error("Token is required (use --token auto to generate one).");
-  }
-  const legacyToken = options.legacyToken?.trim() || undefined;
+  const tokenRaw = options.token ?? "auto";
+  const token =
+    tokenRaw === "auto"
+      ? generateRemoteCredential()
+      : assertRemoteCredential(tokenRaw, "Bridge host --token");
+  const legacyToken =
+    options.legacyToken === undefined
+      ? undefined
+      : assertRemoteCredential(options.legacyToken, "Bridge host --legacy-token");
   if (legacyToken && legacyToken === token) {
     throw new Error(
       "Legacy text clients require a bearer credential distinct from the modern v3 HMAC root key.",

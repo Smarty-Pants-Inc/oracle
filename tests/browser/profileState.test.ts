@@ -48,11 +48,12 @@ function syntheticWindowsChromeIdentity(
     normalizedUserDataDir: canonicalPath.toLowerCase(),
     launchNonce: PROCESS_NONCE_S,
     profileDirectory: {
-      version: 1,
+      version: 2,
       platform: "win32",
       canonicalPath,
       device: "1",
       inode: "1",
+      birthtimeNs: "3",
     },
     ...overrides,
   };
@@ -325,20 +326,22 @@ describe("profileState", () => {
   test("compares the Darwin /var alias without rewriting public identity", () => {
     const aliasIdentity = profileState.parseProfileDirectoryIdentity(
       {
-        version: 1,
+        version: 2,
         platform: "darwin",
         canonicalPath: "/var/folders/oracle/profile",
         device: "7",
         inode: "99",
+        birthtimeNs: "3",
       },
       "darwin",
     );
     const canonicalIdentity = {
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: "/private/var/folders/oracle/profile",
       device: "7",
       inode: "99",
+      birthtimeNs: "3",
     };
     expect(aliasIdentity).toEqual({
       ...canonicalIdentity,
@@ -354,6 +357,27 @@ describe("profileState", () => {
           inode: "100",
         }),
     ).toBe(false);
+    expect(
+      aliasIdentity &&
+        profileState.sameProfileDirectoryIdentity(aliasIdentity, {
+          ...canonicalIdentity,
+          birthtimeNs: "4",
+        }),
+    ).toBe(false);
+    expect(
+      profileState.parseProfileDirectoryIdentity({ ...canonicalIdentity, version: 1 }, "darwin"),
+    ).toBeNull();
+    const legacyIdentity = {
+      ...canonicalIdentity,
+      version: 1,
+    } as unknown as typeof canonicalIdentity;
+    expect(profileState.sameProfileDirectoryIdentity(legacyIdentity, legacyIdentity)).toBe(false);
+    expect(
+      profileState.parseProfileDirectoryIdentity(
+        { ...canonicalIdentity, birthtimeNs: "0" },
+        "darwin",
+      ),
+    ).toBeNull();
 
     expect(
       profileState.isChromeCommandForUserDataDirForTest(
@@ -379,11 +403,12 @@ describe("profileState", () => {
       nonce: "50000000-0000-4000-8000-000000000005",
     };
     const profileDirectory = {
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: userDataDir,
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     };
     const execute = vi.fn(async (file: string, args: string[]) => {
       if (file === "/usr/bin/lsappinfo") {
@@ -432,11 +457,12 @@ describe("profileState", () => {
   test("rejects a same-pid same-second macOS replacement while accepting the exact audit generation", async () => {
     const userDataDir = "/tmp/oracle-mac-generation";
     const profileDirectory = {
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: userDataDir,
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     };
     const identity = {
       pid: 4321,
@@ -506,11 +532,12 @@ describe("profileState", () => {
       launchNonce: launchClaim.nonce,
       launchClaim,
       profileDirectory: {
-        version: 1 as const,
+        version: 2 as const,
         platform: "darwin" as const,
         canonicalPath: userDataDir,
         device: "1",
         inode: "2",
+        birthtimeNs: "3",
       },
     } satisfies ChromeProcessIdentity;
     const claimlessIdentity: ChromeProcessIdentity = {
@@ -652,11 +679,12 @@ describe("profileState", () => {
       normalizedUserDataDir: userDataDir,
       launchNonce: "00000000-0000-4000-8000-000000009876",
       profileDirectory: {
-        version: 1 as const,
+        version: 2 as const,
         platform: "linux" as const,
         canonicalPath: userDataDir,
         device: "1",
         inode: "2",
+        birthtimeNs: "3",
       },
     } satisfies ChromeProcessIdentity;
     const verifyWithBoot = (bootId: string) =>
@@ -815,7 +843,7 @@ describe("profileState", () => {
     }
   });
 
-  test("removes a matching profile while unrelated candidate generations remain exact", async () => {
+  test("removes the exact current birth generation while unrelated candidates remain", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-owned-"));
     const profileDir = path.join(root, "profile");
     try {
@@ -847,6 +875,44 @@ describe("profileState", () => {
       expect(existsSync(profileDir)).toBe(false);
       expect((await readdir(root)).filter((entry) => entry.startsWith(".oracle-remove-"))).toEqual(
         [],
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a same-path device/inode replacement with a different birth generation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-birth-replacement-"));
+    const profileDir = path.join(root, "profile");
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "replacement-marker"), "preserve");
+      const current = await profileState.captureProfileDirectoryIdentity(profileDir);
+      const stale = Object.freeze({
+        ...current,
+        birthtimeNs: (BigInt(current.birthtimeNs) + 1n).toString(),
+      });
+      const beforeQuarantineRename = vi.fn();
+      const beforeQuarantineDelete = vi.fn();
+
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, stale, {
+          ...UNUSED_PROFILE_USE_DEPS,
+          beforeQuarantineRename,
+          beforeQuarantineDelete,
+        }),
+      ).resolves.toBe(false);
+
+      expect(stale).toMatchObject({
+        canonicalPath: current.canonicalPath,
+        device: current.device,
+        inode: current.inode,
+      });
+      expect(stale.birthtimeNs).not.toBe(current.birthtimeNs);
+      expect(beforeQuarantineRename).not.toHaveBeenCalled();
+      expect(beforeQuarantineDelete).not.toHaveBeenCalled();
+      await expect(readFile(path.join(profileDir, "replacement-marker"), "utf8")).resolves.toBe(
+        "preserve",
       );
     } finally {
       await rm(root, { recursive: true, force: true });

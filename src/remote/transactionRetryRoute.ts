@@ -24,7 +24,7 @@ import {
   terminalTransactionRetryResponse,
 } from "./transactionProtocol.js";
 import { settleExpiredRemoteTransaction } from "./transactionServer.js";
-import { sendJson } from "./serverHttp.js";
+import { readRequestBody, RemoteRequestError, sendJson } from "./serverHttp.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
 import { RemoteTransactionStore } from "./transactionStore.js";
 import {
@@ -61,10 +61,14 @@ export async function serveRemoteTransactionRetry(
   params: RemoteTransactionRetryRouteParams,
 ): Promise<void> {
   try {
-    const raw = await readRetryRequestBody(params.req);
+    const raw = await readRequestBody(params.req, 4096);
     RemoteRetryRequestSchema.parse(raw ? JSON.parse(raw) : {});
-  } catch {
-    sendJson(params.res, 400, { error: "invalid_retry_request" });
+  } catch (error) {
+    if (error instanceof RemoteRequestError) {
+      sendJson(params.res, error.statusCode, { error: error.code, message: error.message });
+    } else {
+      sendJson(params.res, 400, { error: "invalid_retry_request" });
+    }
     return;
   }
 
@@ -336,16 +340,4 @@ function retryFailureResponse(record: RemoteTransactionRecord): RemoteTransactio
           ? remoteBrowserAutomationError(record)
           : remotePendingSettlementError(record),
   };
-}
-
-async function readRetryRequestBody(req: http.IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  let receivedBytes = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    receivedBytes += buffer.byteLength;
-    if (receivedBytes > 4096) throw new Error("Remote retry request body exceeds size limit");
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks, receivedBytes).toString("utf8");
 }

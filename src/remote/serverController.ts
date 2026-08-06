@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import chalk from "chalk";
 import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
@@ -15,7 +15,11 @@ import { runBrowserModeTransaction } from "../browser/browserCoordinator.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { RemoteArtifactStore } from "./artifactStore.js";
-import { RemoteRequestAuthenticator } from "./auth.js";
+import {
+  assertRemoteCredential,
+  generateRemoteCredential,
+  RemoteRequestAuthenticator,
+} from "./auth.js";
 import {
   assertLoopbackRemoteBind,
   REMOTE_PLAINTEXT_TRANSPORT_GUIDANCE,
@@ -74,8 +78,14 @@ export async function createRemoteServer(
   const injectedRetryCleanup = deps.retryCleanup;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
-  const authToken = options.token ?? randomBytes(32).toString("hex");
-  const legacyToken = options.legacyToken?.trim() || undefined;
+  const authToken =
+    options.token === undefined
+      ? generateRemoteCredential()
+      : assertRemoteCredential(options.token, "Remote server v3 HMAC root key");
+  const legacyToken =
+    options.legacyToken === undefined
+      ? undefined
+      : assertRemoteCredential(options.legacyToken, "Remote server legacy bearer credential");
   if (legacyToken && legacyToken === authToken) {
     throw new Error(
       "Legacy bearer credential must be distinct from the transaction HMAC root key.",

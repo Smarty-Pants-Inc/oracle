@@ -29,6 +29,7 @@ import {
 import { sendSessionNotification, type NotificationSettings } from "./notifier.js";
 import { formatError } from "./errorUtils.js";
 import { persistBrowserSessionOutcome } from "./browserSessionOutcome.js";
+import { journalHasFinalizeAuthorityForReceipt } from "./browserPublicationJournal.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -276,13 +277,7 @@ export async function autoReattachUntilComplete({
             : userError?.details;
         const receipt = await verifiedDurableBrowserAnswerReceiptFromError(error);
         const journal = publication.journal ?? (await publication.refresh());
-        if (
-          receipt &&
-          journal &&
-          (journal.phase === "finalize-bound" ||
-            journal.phase === "published" ||
-            journal.phase === "cleanup-pending")
-        ) {
+        if (journalHasFinalizeAuthorityForReceipt(journal, receipt)) {
           log(
             dim(
               `Auto-reattach answer is durable under FINALIZE authority; publication repair remains pending: ${message}`,

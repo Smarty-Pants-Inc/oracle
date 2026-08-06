@@ -1,8 +1,4 @@
-import {
-  projectBrowserCaptureCleanupRuntime,
-  projectBrowserCaptureFinalization,
-} from "../browser/runLifecycle.js";
-import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import { projectBrowserCaptureCleanupRuntime } from "../browser/runLifecycle.js";
 import type { BrowserRemoteRecoveryMetadata, BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { RemotePublicRuntime } from "./types.js";
 export { findRemoteRecoveryAuthority } from "../browser/reattachability.js";
@@ -52,12 +48,4 @@ export function projectRemoteRecoveryRuntime(
       ? { recoveryCleanupResult: projected.recoveryCleanupResult }
       : {}),
   };
-}
-
-export function projectRemoteRecoveryFinalization(
-  authoritativeRuntime: BrowserRuntimeMetadata,
-  finalization: BrowserCaptureFinalizationResult,
-  settlementMode?: "finalize" | "abort",
-): BrowserCaptureFinalizationResult {
-  return projectBrowserCaptureFinalization(authoritativeRuntime, finalization, settlementMode);
 }

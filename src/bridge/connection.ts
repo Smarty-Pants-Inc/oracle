@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { assertRemoteCredential } from "../remote/auth.js";
 
 export interface BridgeTunnelInfo {
   ssh?: string;
@@ -70,10 +71,13 @@ export function parseBridgeConnectionString(input: string): {
   remoteHost: string;
   remoteToken: string;
 } {
-  const raw = input.trim();
-  if (!raw) {
+  if (!input.length) {
     throw new Error("Missing connection string.");
   }
+  if (input !== input.trim()) {
+    throw new Error("Invalid connection string: surrounding whitespace is not allowed.");
+  }
+  const raw = input;
 
   let url: URL;
   try {
@@ -90,10 +94,11 @@ export function parseBridgeConnectionString(input: string): {
     throw new Error(`Invalid connection string host: ${raw}. Expected host:port.`);
   }
 
-  const token = url.searchParams.get("token")?.trim() ?? "";
-  if (!token) {
+  const token = url.searchParams.get("token");
+  if (token === null) {
     throw new Error('Connection string is missing token. Expected "?token=...".');
   }
+  assertRemoteCredential(token, "Bridge connection token");
 
   const remoteHost = normalizeHostPort(hostname, port);
   return { remoteHost, remoteToken: token };
@@ -103,6 +108,7 @@ export function formatBridgeConnectionString(
   connection: { remoteHost: string; remoteToken: string },
   options: { includeToken?: boolean } = {},
 ): string {
+  assertRemoteCredential(connection.remoteToken, "Bridge connection token");
   const { hostname, port } = parseHostPort(connection.remoteHost);
   const base = `oracle+tcp://${normalizeHostPort(hostname, port)}`;
   if (!options.includeToken) {
@@ -137,9 +143,10 @@ export async function readBridgeConnectionArtifact(
   if (typeof remoteHost !== "string" || remoteHost.trim().length === 0) {
     throw new Error(`Invalid connection artifact at ${resolved}: remoteHost is missing.`);
   }
-  if (typeof remoteToken !== "string" || remoteToken.trim().length === 0) {
+  if (typeof remoteToken !== "string") {
     throw new Error(`Invalid connection artifact at ${resolved}: remoteToken is missing.`);
   }
+  assertRemoteCredential(remoteToken, `Connection artifact remoteToken at ${resolved}`);
   // Validate host formatting early so downstream checks don't crash.
   parseHostPort(remoteHost);
   return parsed as BridgeConnectionArtifact;

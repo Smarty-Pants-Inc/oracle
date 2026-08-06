@@ -67,10 +67,7 @@ export async function verifyDevToolsReachable({
   const versionUrl = `http://${host}:${port}/json/version`;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-      const response = await fetch(versionUrl, { signal: controller.signal });
-      clearTimeout(timeout);
+      const response = await fetch(versionUrl, { signal: AbortSignal.timeout(timeoutMs) });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }

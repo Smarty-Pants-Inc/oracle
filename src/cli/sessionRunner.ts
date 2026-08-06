@@ -75,7 +75,10 @@ import {
   persistBrowserSessionOutcome,
   type BrowserSessionOutcome,
 } from "./browserSessionOutcome.js";
-import { readBrowserCapturePublicationJournal } from "./browserPublicationJournal.js";
+import {
+  journalHasFinalizeAuthorityForReceipt,
+  readBrowserCapturePublicationJournal,
+} from "./browserPublicationJournal.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -697,17 +700,7 @@ export async function performSessionRun({
       const publicationJournal = await readBrowserCapturePublicationJournal(sessionMeta.id).catch(
         () => null,
       );
-      const receipt = publicationJournal?.receipt.artifact;
-      const durableArtifact = durableAnswerReceipt.artifact;
-      if (
-        publicationJournal &&
-        (publicationJournal.phase === "finalize-bound" ||
-          publicationJournal.phase === "published" ||
-          publicationJournal.phase === "cleanup-pending") &&
-        receipt?.path === durableArtifact.path &&
-        receipt.sha256 === durableArtifact.sha256 &&
-        receipt.sizeBytes === durableArtifact.sizeBytes
-      ) {
+      if (journalHasFinalizeAuthorityForReceipt(publicationJournal, durableAnswerReceipt)) {
         log(
           dim(
             `Browser answer is durable under FINALIZE authority; terminal projection/finalization remains retryable: ${message}`,

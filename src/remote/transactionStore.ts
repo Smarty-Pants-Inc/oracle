@@ -37,6 +37,7 @@ import {
 } from "./types.js";
 
 const MAX_REMOTE_TRANSACTION_LEASE_MS = 24 * 60 * 60 * 1000;
+type RemoteArtifactNamespaceCleanup = (record: RemoteTransactionRecord) => Promise<boolean>;
 
 export interface RemoteTransactionStoreOptions {
   directory: string;
@@ -57,6 +58,7 @@ export class RemoteTransactionStore {
   readonly #maximumBytes: number;
   readonly #now: () => number;
   #maintenanceLock: Promise<void> = Promise.resolve();
+  #artifactNamespaceCleanup?: RemoteArtifactNamespaceCleanup;
 
   private constructor(options: RemoteTransactionStoreOptions) {
     this.directory = options.directory;
@@ -88,6 +90,10 @@ export class RemoteTransactionStore {
     await syncDirectory(store.directory);
     await store.runMaintenance();
     return store;
+  }
+
+  registerArtifactNamespaceCleanup(cleanup: RemoteArtifactNamespaceCleanup): void {
+    this.#artifactNamespaceCleanup = cleanup;
   }
 
   async begin(record: RemoteTransactionBeginRecord): Promise<void> {
@@ -139,6 +145,43 @@ export class RemoteTransactionStore {
       if (readErrorCode(error) === "ENOENT") return null;
       throw error;
     }
+  }
+  async beginArtifactNamespaceInitialization(params: {
+    transactionToken: string;
+    runId: string;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "begin-artifact-namespace-initialization",
+        runId: params.runId,
+      })
+    ).record;
+  }
+
+  async bindArtifactNamespaceIdentity(params: {
+    transactionToken: string;
+    runId: string;
+    identity: NonNullable<RemoteTransactionRecord["artifactNamespaceIdentity"]>;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "bind-artifact-namespace-identity",
+        runId: params.runId,
+        identity: params.identity,
+      })
+    ).record;
+  }
+
+  async completeArtifactNamespaceInitialization(params: {
+    transactionToken: string;
+    runId: string;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "complete-artifact-namespace-initialization",
+        runId: params.runId,
+      })
+    ).record;
   }
 
   async renewLease(transactionToken: string): Promise<RemoteTransactionRecord> {
@@ -529,6 +572,17 @@ export class RemoteTransactionStore {
         Date.parse(record.updatedAt) > cutoff
       ) {
         continue;
+      }
+      if (record.artifactNamespaceState !== "uninitialized") {
+        const cleanup = this.#artifactNamespaceCleanup;
+        if (!cleanup) continue;
+        let cleaned = false;
+        try {
+          cleaned = await cleanup(record);
+        } catch {
+          continue;
+        }
+        if (!cleaned) continue;
       }
       await rm(targetPath, { force: true });
       removed = true;

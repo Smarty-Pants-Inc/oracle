@@ -398,7 +398,7 @@ describe("summarizeModelRunsForConsult", () => {
     const prevHost = process.env.ORACLE_REMOTE_HOST;
     const prevToken = process.env.ORACLE_REMOTE_TOKEN;
     process.env.ORACLE_REMOTE_HOST = "127.0.0.1:8080";
-    process.env.ORACLE_REMOTE_TOKEN = "remote-token";
+    process.env.ORACLE_REMOTE_TOKEN = "a".repeat(64);
     try {
       const handlers: Array<(input: unknown) => Promise<unknown>> = [];
       registerConsultTool({

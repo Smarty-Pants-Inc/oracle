@@ -10,10 +10,10 @@ import { delay } from "../browser/utils.js";
 import {
   markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
+  projectBrowserCaptureFinalization,
 } from "../browser/runLifecycle.js";
 import {
   findRemoteRecoveryAuthority,
-  projectRemoteRecoveryFinalization,
   projectRemoteRecoveryRuntime,
 } from "./transactionClientRuntime.js";
 import {
@@ -129,8 +129,12 @@ export async function recoverRemoteRunTransaction(params: {
       requestIdentity: params.requestIdentity,
     }) satisfies BrowserRemoteRecoveryMetadata;
   const deadline = Date.now() + params.deadlines.recoveryWindowMs;
+  const retryPreReceiptAbsence =
+    findRemoteRecoveryAuthority(params.authoritativeRuntime)?.state === "pre-receipt";
+  let lastRetryProvedAbsent = false;
   let lastReachableAt = Date.now();
   while (Date.now() < deadline) {
+    lastRetryProvedAbsent = false;
     try {
       const response = await postRemoteJson({
         hostname: params.hostname,
@@ -144,7 +148,10 @@ export async function recoverRemoteRunTransaction(params: {
       });
       lastReachableAt = Date.now();
       if (response.statusCode === 404) {
-        throw terminalRetryNotRetainedError(params);
+        if (!retryPreReceiptAbsence) throw terminalRetryNotRetainedError(params);
+        lastRetryProvedAbsent = true;
+        await delay(500);
+        continue;
       }
       if (response.statusCode === 202) {
         await delay(500);
@@ -227,6 +234,12 @@ export async function recoverRemoteRunTransaction(params: {
       await delay(500);
     }
   }
+  if (lastRetryProvedAbsent) {
+    throw terminalRetryNotRetainedError(
+      params,
+      "Remote transaction record did not appear before the pre-receipt recovery deadline.",
+    );
+  }
   const message = "Remote browser transaction did not become recoverable before its deadline.";
   throw new BrowserAutomationError(
     message,
@@ -273,7 +286,7 @@ function terminalRetryOutcomeError(
       ? ({ cleanup: { status: "completed" } } as const)
       : retry.outcome.finalization.runtime;
   const resourceRuntime = projectRemoteRecoveryRuntime(publicRuntime, null);
-  const completedRuntime = projectRemoteRecoveryFinalization(params.authoritativeRuntime, {
+  const completedRuntime = projectBrowserCaptureFinalization(params.authoritativeRuntime, {
     status: "completed",
     runtime: resourceRuntime,
   }).runtime;
@@ -314,25 +327,25 @@ function terminalRetryOutcomeError(
   );
 }
 
-function terminalRetryNotRetainedError(params: {
-  transactionToken: string;
-  authoritativeRuntime: BrowserRuntimeMetadata;
-}): BrowserAutomationError {
+function terminalRetryNotRetainedError(
+  params: {
+    transactionToken: string;
+    authoritativeRuntime: BrowserRuntimeMetadata;
+  },
+  message = "Remote transaction terminal state is no longer retained by the server.",
+): BrowserAutomationError {
   const resourceRuntime = projectRemoteRecoveryRuntime({ cleanup: { status: "completed" } }, null);
-  const completedRuntime = projectRemoteRecoveryFinalization(params.authoritativeRuntime, {
+  const completedRuntime = projectBrowserCaptureFinalization(params.authoritativeRuntime, {
     status: "completed",
     runtime: resourceRuntime,
   }).runtime;
-  return new BrowserAutomationError(
-    "Remote transaction terminal state is no longer retained by the server.",
-    {
-      stage: "remote-retry",
-      code: "remote-transaction-not-retained",
-      transactionToken: params.transactionToken,
-      recoverableDisconnect: false,
-      runtime: completedRuntime,
-    },
-  );
+  return new BrowserAutomationError(message, {
+    stage: "remote-retry",
+    code: "remote-transaction-not-retained",
+    transactionToken: params.transactionToken,
+    recoverableDisconnect: false,
+    runtime: completedRuntime,
+  });
 }
 
 export function unresolvedRemoteTransactionRuntime(
@@ -426,7 +439,7 @@ function convergeRemoteSettlementAuthority(
       { cleanup: { status: "completed" } },
       null,
     );
-    return projectRemoteRecoveryFinalization(
+    return projectBrowserCaptureFinalization(
       runtime,
       { status: "completed", runtime: resourceRuntime },
       authority.mode,
@@ -533,7 +546,7 @@ export async function bindRemoteBrowserSettlement(params: {
   const resourceRuntime = projectRemoteRecoveryRuntime(binding.runtime, remoteRecovery);
   const authoritativeRuntime =
     binding.settlementAuthority.outcome === "completed"
-      ? projectRemoteRecoveryFinalization(params.runtime, {
+      ? projectBrowserCaptureFinalization(params.runtime, {
           status: "completed",
           runtime: resourceRuntime,
         }).runtime
@@ -663,7 +676,7 @@ export async function settleRemoteBrowserTransaction(params: {
     settlement.finalization.status === "pending"
       ? pendingBrowserCaptureCleanup(resourceRuntime, settlement.finalization.error, params.mode)
       : ({ status: "completed", runtime: resourceRuntime } as const);
-  return projectRemoteRecoveryFinalization(params.runtime, resourceFinalization, params.mode);
+  return projectBrowserCaptureFinalization(params.runtime, resourceFinalization, params.mode);
 }
 
 export function bindRemoteSettlementMode(

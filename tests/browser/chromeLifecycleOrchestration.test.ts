@@ -6,10 +6,8 @@ import path from "node:path";
 import {
   chromeLaunchResult,
   createBrowserLogger,
-  deferred,
   physicalProcessIdentity,
 } from "./chromeLifecycleTestHelpers.js";
-
 const UNUSED_PROFILE_USE = Object.freeze({
   status: "unused" as const,
   candidates: Object.freeze([]),
@@ -36,7 +34,7 @@ describe("registerTerminationHooks", { timeout: 15_000 }, () => {
     }));
     const chrome = chromeLaunchResult(identity, kill);
     const emitRuntimeHint = vi.fn().mockResolvedValue(undefined);
-    const handled = deferred<void>();
+    const handled = Promise.withResolvers<void>();
     const previousExitCode = process.exitCode;
     const removeHooks = registerTerminationHooks(
       chrome,
@@ -81,7 +79,7 @@ describe("registerTerminationHooks", { timeout: 15_000 }, () => {
     }));
     const chrome = chromeLaunchResult(identity, kill);
     const logger = vi.fn<(message: string) => void>();
-    const handled = deferred<void>();
+    const handled = Promise.withResolvers<void>();
     const previousExitCode = process.exitCode;
     const removeHooks = registerTerminationHooks(chrome, userDataDir, false, logger, {
       forceProfileCleanup: true,
@@ -116,7 +114,7 @@ describe("registerTerminationHooks", { timeout: 15_000 }, () => {
     }));
     const chrome = chromeLaunchResult(identity, kill);
     const logger = vi.fn<(message: string) => void>();
-    const handled = deferred<void>();
+    const handled = Promise.withResolvers<void>();
     const removeHooks = registerTerminationHooks(chrome, userDataDir, false, logger, {
       preserveUserDataDir: true,
       profileDirectoryUseDeps: PROFILE_DIRECTORY_USE_DEPS,

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -26,11 +28,13 @@ vi.mock("../../src/browser/reattach.ts", () => ({
   settleBrowserRecoveryCleanup: vi.fn(),
 }));
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
+const publishCompletedBrowserCaptureMock = vi.hoisted(() => vi.fn());
 vi.mock("../../src/cli/durableAnswer.ts", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../../src/cli/durableAnswer.ts");
   return {
     ...actual,
     persistDurableBrowserAnswer: persistDurableBrowserAnswerMock,
+    publishCompletedBrowserCapture: publishCompletedBrowserCaptureMock,
   };
 });
 
@@ -79,11 +83,23 @@ import {
 import { sendSessionNotification } from "../../src/cli/notifier.ts";
 import { getCliVersion } from "../../src/version.ts";
 import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
-import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
+import {
+  persistDurableBrowserAnswer,
+  publishCompletedBrowserCapture,
+} from "../../src/cli/durableAnswer.ts";
+import type { DurableBrowserAnswerReceipt } from "../../src/cli/durableAnswer.ts";
 import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
-import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
+import {
+  readBrowserCapturePublicationJournal,
+  reduceBrowserPublicationEvent,
+} from "../../src/cli/browserPublicationJournal.js";
+import type { BrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
 
 const log = vi.fn();
+
+type DurableAnswerModule = {
+  publishCompletedBrowserCapture: typeof publishCompletedBrowserCapture;
+};
 const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
 
@@ -121,6 +137,46 @@ function createReattachResult(
   };
 }
 
+function receiptFor(answer: string, answerPath: string): DurableBrowserAnswerReceipt {
+  const payload = Buffer.from(answer, "utf8");
+  return {
+    artifact: {
+      kind: "transcript",
+      path: answerPath,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+      sizeBytes: payload.byteLength,
+    },
+  };
+}
+
+function finalizeBoundJournal(
+  receipt: DurableBrowserAnswerReceipt,
+): BrowserCapturePublicationJournal {
+  const preparing = reduceBrowserPublicationEvent(null, {
+    type: "prepare",
+    journal: {
+      sessionId: baseSessionMeta.id,
+      receipt,
+      artifacts: [receipt.artifact],
+      completedAt: "2026-01-01T00:00:00.000Z",
+      browserAudit: { runtime: {} },
+      runtime: {},
+    },
+  });
+  const staged = reduceBrowserPublicationEvent(preparing, {
+    type: "answer-staged",
+    receipt,
+    artifacts: [receipt.artifact],
+  });
+  return reduceBrowserPublicationEvent(staged, {
+    type: "finalize-bound",
+    receipt,
+    settlementMode: "finalize",
+    runtime: {},
+    browserAudit: { runtime: {} },
+  });
+}
+
 beforeEach(async () => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
@@ -139,6 +195,13 @@ beforeEach(async () => {
   vi.mocked(runBrowserSessionExecution).mockReset();
   vi.mocked(ensureSessionArtifacts).mockReset();
   vi.mocked(persistDurableBrowserAnswer).mockReset();
+  vi.mocked(publishCompletedBrowserCapture).mockReset();
+  const actualDurableAnswer = await vi.importActual<DurableAnswerModule>(
+    "../../src/cli/durableAnswer.ts",
+  );
+  vi.mocked(publishCompletedBrowserCapture).mockImplementation(
+    actualDurableAnswer.publishCompletedBrowserCapture,
+  );
   vi.mocked(persistDurableBrowserAnswer).mockImplementation(async (_options, expectedReceipt) => {
     if (!expectedReceipt) throw new Error("publication intent receipt missing");
     return expectedReceipt;
@@ -335,6 +398,94 @@ describe("performSessionRun", () => {
       sessionStoreMock.updateSession.mock.invocationCallOrder[completedCallIndex] ?? 0,
     );
     expect(reattach.abort).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    {
+      name: "does not classify a stale FINALIZE journal with a different verified receipt completed",
+      matchingReceipt: false,
+    },
+    {
+      name: "classifies a FINALIZE journal with its exact verified receipt completed",
+      matchingReceipt: true,
+    },
+  ])("$name", async ({ matchingReceipt }) => {
+    const initialRuntime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      tabUrl: "https://chatgpt.com/c/demo",
+      ...committedDemoAuthority,
+    } satisfies BrowserRuntimeMetadata;
+    const recoveredRuntime = {
+      ...initialRuntime,
+      chromeTargetId: "TARGET-RECEIPT-AUTHORITY",
+    } satisfies BrowserRuntimeMetadata;
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("assistant timed out", {
+        stage: "assistant-timeout",
+        runtime: initialRuntime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValue(
+      createReattachResult("captured answer", "captured answer", recoveredRuntime).value,
+    );
+
+    const artifactsDirectory = path.join(os.tmpdir(), "oracle-test-session", "artifacts");
+    mkdirSync(artifactsDirectory, { recursive: true });
+    const verifiedReceipt = receiptFor(
+      "verified receipt",
+      path.join(artifactsDirectory, "verified-receipt.md"),
+    );
+    writeFileSync(verifiedReceipt.artifact.path, "verified receipt");
+    const staleReceipt = matchingReceipt
+      ? verifiedReceipt
+      : receiptFor("stale receipt", path.join(artifactsDirectory, "stale-receipt.md"));
+    vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal").mockResolvedValue(
+      finalizeBoundJournal(staleReceipt),
+    );
+    const publicationError = new BrowserAutomationError("publication projection failed", {
+      stage: "browser-capture-publication",
+      runtime: recoveredRuntime,
+      answerReceipt: verifiedReceipt,
+    });
+    vi.mocked(publishCompletedBrowserCapture).mockImplementationOnce(async (options) => {
+      await options.publication?.bind(options.answer.sessionId);
+      throw publicationError;
+    });
+
+    const run = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 0,
+        autoReattachIntervalMs: 1,
+        autoReattachTimeoutMs: 1000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    if (matchingReceipt) {
+      await expect(run).resolves.toBeUndefined();
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("Auto-reattach answer is durable under FINALIZE authority"),
+      );
+      expect(
+        sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+      ).toBe(false);
+    } else {
+      await expect(run).rejects.toThrow("publication projection failed");
+      expect(log).not.toHaveBeenCalledWith(
+        expect.stringContaining("Auto-reattach answer is durable under FINALIZE authority"),
+      );
+      expect(
+        sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+      ).toBe(true);
+    }
   });
 
   test("keeps auto-reattach completed when final runtime persistence fails once", async () => {

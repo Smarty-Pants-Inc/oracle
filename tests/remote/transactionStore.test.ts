@@ -796,11 +796,12 @@ describe("RemoteTransactionStore", () => {
     const previousControllerGeneration = "controller-before-recovery";
     const recoveryControllerGeneration = "controller-after-recovery";
     const profileDirectory = {
-      version: 1 as const,
+      version: 2 as const,
       platform: process.platform,
       canonicalPath: "/tmp/oracle-recovery-runtime",
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     };
     const preIntent: BrowserRuntimeMetadata = {
       browserTransport: "cdp",
@@ -1017,11 +1018,12 @@ describe("RemoteTransactionStore", () => {
           tabLease: {
             id: "planned-lease-id",
             profileDirectory: {
-              version: 1 as const,
+              version: 2 as const,
               platform: process.platform,
               canonicalPath: "/tmp/oracle-browser-acquisition",
               device: "1",
               inode: "2",
+              birthtimeNs: "3",
             },
           },
           acquisition: {

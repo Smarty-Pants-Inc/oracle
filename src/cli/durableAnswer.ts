@@ -51,11 +51,7 @@ import {
 export { persistDurableBrowserAnswer, readDurableBrowserAnswer };
 export type { DurableBrowserAnswerReceipt, PersistDurableBrowserAnswerOptions };
 
-export type BrowserPublicationProjectionPersistence =
-  | { status: "persisted"; recoveredError?: string }
-  | { status: "pending"; error: string };
-
-export type BrowserPublicationFinalizationPersistence =
+export type BrowserPublicationPersistence =
   | { status: "persisted"; recoveredError?: string }
   | { status: "pending"; error: string };
 
@@ -63,9 +59,9 @@ export interface PublishedBrowserCapture {
   published: true;
   receipt: DurableBrowserAnswerReceipt;
   artifacts: SessionArtifact[];
-  projection: BrowserPublicationProjectionPersistence;
+  projection: BrowserPublicationPersistence;
   finalization: BrowserCaptureFinalizationResult;
-  finalizationPersistence: BrowserPublicationFinalizationPersistence;
+  finalizationPersistence: BrowserPublicationPersistence;
 }
 
 export interface PublishCompletedBrowserCaptureOptions {
@@ -100,7 +96,7 @@ export class BrowserPublicationTransaction {
   private publicationAcknowledged = false;
   private recoveryLock: ReattachRecoveryLock | null = null;
   private recoveryLockPath: string | null = null;
-  private persistenceState: BrowserPublicationFinalizationPersistence | undefined;
+  private persistenceState: BrowserPublicationPersistence | undefined;
   private durableAnswerAcknowledged = false;
   private acquireRecoveryLockEffect: typeof acquireReattachRecoveryLock =
     acquireReattachRecoveryLock;
@@ -209,7 +205,7 @@ export class BrowserPublicationTransaction {
     return durableAnswer ?? capturedAnswer;
   }
 
-  finalizationPersistence(): BrowserPublicationFinalizationPersistence | undefined {
+  finalizationPersistence(): BrowserPublicationPersistence | undefined {
     return this.persistenceState;
   }
 
@@ -413,7 +409,7 @@ export class BrowserPublicationTransaction {
       this.durableAnswerAcknowledged = true;
     }
 
-    let projection: BrowserPublicationProjectionPersistence;
+    let projection: BrowserPublicationPersistence;
     try {
       if (journal.phase === "staged") {
         journal = this.observe(
@@ -892,7 +888,7 @@ async function commitTerminalPublication(
   journalStore: BrowserPublicationJournalStore,
 ): Promise<{
   journal: BrowserCapturePublicationJournal;
-  projection: BrowserPublicationProjectionPersistence;
+  projection: BrowserPublicationPersistence;
 }> {
   const outcome = browserPublicationOutcome(
     options,
@@ -901,7 +897,7 @@ async function commitTerminalPublication(
     journal.phase === "cleanup-pending" ? journal.cleanupErrorMessage : undefined,
   );
   const persisted = await commitBrowserSessionOutcomeProjection(options.answer.sessionId, outcome);
-  const projection: BrowserPublicationProjectionPersistence =
+  const projection: BrowserPublicationPersistence =
     persisted.status === "persisted"
       ? {
           status: "persisted",
@@ -1005,7 +1001,7 @@ export interface PersistBrowserCaptureFinalizationOptions {
 }
 interface PersistedBrowserCaptureFinalizationState {
   finalization: BrowserCaptureFinalizationResult;
-  projection: BrowserPublicationProjectionPersistence;
+  projection: BrowserPublicationPersistence;
 }
 
 export async function persistBrowserCaptureFinalizationState(
@@ -1304,9 +1300,9 @@ function isRuntimeAuthorityPersistenceFailure(error: unknown): boolean {
 
 function completedPublication(
   journal: BrowserCapturePublicationJournal,
-  projection: BrowserPublicationProjectionPersistence,
+  projection: BrowserPublicationPersistence,
   finalization: BrowserCaptureFinalizationResult,
-  finalizationPersistence: BrowserPublicationFinalizationPersistence,
+  finalizationPersistence: BrowserPublicationPersistence,
 ): PublishedBrowserCapture {
   return {
     published: true,

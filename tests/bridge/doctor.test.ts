@@ -9,6 +9,9 @@ import { PROJECT_CONFIG_RELATIVE_PATH } from "../../src/config.js";
 const ansiRegex = new RegExp("\\x1B\\[[0-9;]*m", "g");
 const stripAnsi = (text: string): string => text.replace(ansiRegex, "");
 
+const MODERN_TOKEN = "a".repeat(64);
+const LEGACY_TOKEN = "b".repeat(64);
+
 vi.mock("../../src/remote/health.js", () => ({
   checkTcpConnection: vi.fn(async () => ({ ok: true })),
   checkRemoteHealth: vi.fn(async () => ({
@@ -55,7 +58,11 @@ describe("oracle bridge doctor", () => {
   it("reports healthy remote configuration", async () => {
     await fs.writeFile(
       path.join(tempDir, "config.json"),
-      JSON.stringify({ browser: { remoteHost: "127.0.0.1:9473", remoteToken: "secret" } }, null, 2),
+      JSON.stringify(
+        { browser: { remoteHost: "127.0.0.1:9473", remoteToken: MODERN_TOKEN } },
+        null,
+        2,
+      ),
       "utf8",
     );
 
@@ -79,7 +86,7 @@ describe("oracle bridge doctor", () => {
         {
           browser: {
             remoteHost: "127.0.0.1:9473",
-            remoteLegacyToken: "legacy-bearer",
+            remoteLegacyToken: LEGACY_TOKEN,
             remoteAllowLegacyTextProtocol: true,
           },
         },
@@ -114,7 +121,7 @@ describe("oracle bridge doctor", () => {
 
     await runBridgeClient({
       connect: "127.0.0.1:9473",
-      legacyToken: "legacy-bearer",
+      legacyToken: LEGACY_TOKEN,
       allowLegacyTextProtocol: true,
       config: configFile,
       test: false,
@@ -124,7 +131,7 @@ describe("oracle bridge doctor", () => {
     expect(config.browser).toMatchObject({
       remoteHost: "127.0.0.1:9473",
       remoteToken: null,
-      remoteLegacyToken: "legacy-bearer",
+      remoteLegacyToken: LEGACY_TOKEN,
       remoteAllowLegacyTextProtocol: true,
     });
   });
@@ -132,8 +139,8 @@ describe("oracle bridge doctor", () => {
   it("refuses to reuse a modern connection token as the legacy bearer", async () => {
     await expect(
       runBridgeClient({
-        connect: "127.0.0.1:9473?token=shared-credential",
-        legacyToken: "shared-credential",
+        connect: `127.0.0.1:9473?token=${MODERN_TOKEN}`,
+        legacyToken: MODERN_TOKEN,
         allowLegacyTextProtocol: true,
         writeConfig: false,
         test: false,
@@ -141,10 +148,30 @@ describe("oracle bridge doctor", () => {
     ).rejects.toThrow(/distinct from the v3 HMAC root key/i);
   });
 
+  it("rejects weak bridge client credentials before writing config", async () => {
+    await expect(
+      runBridgeClient({
+        connect: "127.0.0.1:9473?token=weak",
+        config: path.join(tempDir, "weak-modern.json"),
+        test: false,
+      }),
+    ).rejects.toThrow(/exactly 64 lowercase hexadecimal characters/i);
+
+    await expect(
+      runBridgeClient({
+        connect: "127.0.0.1:9473",
+        legacyToken: "weak",
+        allowLegacyTextProtocol: true,
+        config: path.join(tempDir, "weak-legacy.json"),
+        test: false,
+      }),
+    ).rejects.toThrow(/exactly 64 lowercase hexadecimal characters/i);
+  });
+
   it("rejects non-loopback bridge artifacts even when the health check is skipped", async () => {
     await expect(
       runBridgeClient({
-        connect: "oracle+tcp://bridge.example.test:9473?token=secret",
+        connect: `oracle+tcp://bridge.example.test:9473?token=${MODERN_TOKEN}`,
         writeConfig: false,
         test: false,
       }),

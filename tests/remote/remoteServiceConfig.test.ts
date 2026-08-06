@@ -6,25 +6,30 @@ import {
   resolveRemoteServiceConfig,
 } from "../../src/remote/remoteServiceConfig.js";
 
+const CLI_TOKEN = "a".repeat(64);
+const CONFIG_TOKEN = "b".repeat(64);
+const ENV_TOKEN = "c".repeat(64);
+const LEGACY_TOKEN = "d".repeat(64);
+
 describe("resolveRemoteServiceConfig", () => {
   it("prefers CLI values over config and env", () => {
     const env = {} as NodeJS.ProcessEnv;
     // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
     env["ORACLE_REMOTE_HOST"] = "127.0.0.4:4";
     // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
-    env["ORACLE_REMOTE_TOKEN"] = "env-token";
+    env["ORACLE_REMOTE_TOKEN"] = ENV_TOKEN;
 
     const resolved = resolveRemoteServiceConfig({
       cliHost: "127.0.0.1:1",
-      cliToken: "cli-token",
+      cliToken: CLI_TOKEN,
       userConfig: {
-        browser: { remoteHost: "127.0.0.2:2", remoteToken: "config-token" },
+        browser: { remoteHost: "127.0.0.2:2", remoteToken: CONFIG_TOKEN },
       },
       env,
     });
 
     expect(resolved.host).toBe("127.0.0.1:1");
-    expect(resolved.token).toBe("cli-token");
+    expect(resolved.token).toBe(CLI_TOKEN);
     expect(resolved.sources.host).toBe("cli");
     expect(resolved.sources.token).toBe("cli");
   });
@@ -32,13 +37,13 @@ describe("resolveRemoteServiceConfig", () => {
   it("prefers browser.remoteHost/browser.remoteToken when present", () => {
     const resolved = resolveRemoteServiceConfig({
       userConfig: {
-        browser: { remoteHost: "127.0.0.3:9473", remoteToken: "cfg-token" },
+        browser: { remoteHost: "127.0.0.3:9473", remoteToken: CONFIG_TOKEN },
       },
       env: {} as NodeJS.ProcessEnv,
     });
 
     expect(resolved.host).toBe("127.0.0.3:9473");
-    expect(resolved.token).toBe("cfg-token");
+    expect(resolved.token).toBe(CONFIG_TOKEN);
     expect(resolved.sources.host).toBe("config.browser");
     expect(resolved.sources.token).toBe("config.browser");
   });
@@ -46,7 +51,7 @@ describe("resolveRemoteServiceConfig", () => {
   it("falls back to env token when browser.remoteToken is missing", () => {
     const env = {} as NodeJS.ProcessEnv;
     // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
-    env["ORACLE_REMOTE_TOKEN"] = "env-token";
+    env["ORACLE_REMOTE_TOKEN"] = ENV_TOKEN;
     const resolved = resolveRemoteServiceConfig({
       userConfig: {
         browser: { remoteHost: "localhost:9473" },
@@ -55,7 +60,7 @@ describe("resolveRemoteServiceConfig", () => {
     });
 
     expect(resolved.host).toBe("localhost:9473");
-    expect(resolved.token).toBe("env-token");
+    expect(resolved.token).toBe(ENV_TOKEN);
     expect(resolved.sources.host).toBe("config.browser");
     expect(resolved.sources.token).toBe("env");
   });
@@ -65,7 +70,7 @@ describe("resolveRemoteServiceConfig", () => {
     // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
     env["ORACLE_REMOTE_HOST"] = "[::1]:9473";
     // biome-ignore lint/complexity/useLiteralKeys: env var names are uppercase with underscores
-    env["ORACLE_REMOTE_TOKEN"] = "env-token";
+    env["ORACLE_REMOTE_TOKEN"] = ENV_TOKEN;
 
     const resolved = resolveRemoteServiceConfig({
       userConfig: {},
@@ -73,7 +78,7 @@ describe("resolveRemoteServiceConfig", () => {
     });
 
     expect(resolved.host).toBe("[::1]:9473");
-    expect(resolved.token).toBe("env-token");
+    expect(resolved.token).toBe(ENV_TOKEN);
     expect(resolved.sources.host).toBe("env");
     expect(resolved.sources.token).toBe("env");
   });
@@ -81,37 +86,61 @@ describe("resolveRemoteServiceConfig", () => {
   it("requires explicit legacy fallback and keeps its bearer distinct", () => {
     const env = {
       ORACLE_REMOTE_HOST: "127.0.0.4:9473",
-      ORACLE_REMOTE_TOKEN: "env-v3-key",
-      ORACLE_REMOTE_LEGACY_TOKEN: "env-legacy-bearer",
+      ORACLE_REMOTE_TOKEN: ENV_TOKEN,
+      ORACLE_REMOTE_LEGACY_TOKEN: LEGACY_TOKEN,
       ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL: "1",
     } as NodeJS.ProcessEnv;
 
     const resolved = resolveRemoteServiceConfig({ userConfig: {}, env });
 
-    expect(resolved.legacyToken).toBe("env-legacy-bearer");
+    expect(resolved.legacyToken).toBe(LEGACY_TOKEN);
     expect(resolved.allowLegacyTextProtocol).toBe(true);
     expect(resolved.sources.legacyToken).toBe("env");
     expect(resolved.sources.allowLegacyTextProtocol).toBe("env");
     expect(() =>
       resolveRemoteServiceConfig({
         cliHost: "127.0.0.1:9473",
-        cliToken: "shared-credential",
-        cliLegacyToken: "shared-credential",
+        cliToken: "d".repeat(64),
+        cliLegacyToken: "d".repeat(64),
         cliAllowLegacyTextProtocol: true,
         env: {} as NodeJS.ProcessEnv,
       }),
     ).toThrow(/distinct from the v3 HMAC root key/i);
   });
 
+  it("rejects empty, weak, uppercase, wrong-length, and non-hex config credentials", () => {
+    const invalid = ["", " ", "dictionary-word", "A".repeat(64), "a".repeat(63), "g".repeat(64)];
+    for (const credential of invalid) {
+      for (const input of [
+        { cliToken: credential, env: {} as NodeJS.ProcessEnv },
+        {
+          userConfig: { browser: { remoteToken: credential } },
+          env: {} as NodeJS.ProcessEnv,
+        },
+        { env: { ORACLE_REMOTE_TOKEN: credential } as NodeJS.ProcessEnv },
+        { cliLegacyToken: credential, env: {} as NodeJS.ProcessEnv },
+        {
+          userConfig: { browser: { remoteLegacyToken: credential } },
+          env: {} as NodeJS.ProcessEnv,
+        },
+        { env: { ORACLE_REMOTE_LEGACY_TOKEN: credential } as NodeJS.ProcessEnv },
+      ]) {
+        expect(() => resolveRemoteServiceConfig(input)).toThrow(
+          /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
+        );
+      }
+    }
+  });
+
   it("does not enable legacy fallback merely because a legacy token exists", () => {
     const resolved = resolveRemoteServiceConfig({
       userConfig: {
-        browser: { remoteLegacyToken: "legacy-bearer" },
+        browser: { remoteLegacyToken: "c".repeat(64) },
       },
       env: {} as NodeJS.ProcessEnv,
     });
 
-    expect(resolved.legacyToken).toBe("legacy-bearer");
+    expect(resolved.legacyToken).toBe("c".repeat(64));
     expect(resolved.allowLegacyTextProtocol).toBe(false);
   });
 

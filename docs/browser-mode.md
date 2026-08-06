@@ -349,10 +349,10 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
 1. **Start the host on loopback**
 
    ```bash
-   oracle serve --host 127.0.0.1 --port 9473 --token <modern-v3-hmac-root-key>
+   oracle serve --host 127.0.0.1 --port 9473 --token <64-lowercase-hex-characters>
    ```
 
-   Oracle launches Chrome and starts the authenticated HTTP/SSE API. `--token` is required and must be supplied out of band; Oracle never logs the modern v3 HMAC root key. Use `--port` to select a fixed port. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
+   Oracle launches Chrome and starts the authenticated HTTP/SSE API. `--token` is required, must be exactly 64 lowercase hexadecimal characters (a 32-byte key), and must be supplied out of band; Oracle never logs the modern v3 HMAC root key. Use `--port` to select a fixed port. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
 
 2. **Create the client-side SSH tunnel**
 
@@ -367,12 +367,12 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
    ```bash
    oracle --engine browser \
      --remote-host 127.0.0.1:9473 \
-     --remote-token <modern-v3-hmac-root-key> \
+     --remote-token <64-lowercase-hex-characters> \
      --prompt "Summarize the incident doc" \
      --file docs/incidents/latest.md
    ```
 
-   Store the same loopback host and modern key in `browser.remoteHost` / `browser.remoteToken`, or use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
+   Store the same loopback host and 64-character lowercase hexadecimal key in `browser.remoteHost` / `browser.remoteToken`, or use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
 
 4. **Stop the host**
 
@@ -389,19 +389,19 @@ Secure defaults never downgrade. A new client may contact a predecessor text-onl
 ```bash
 oracle --engine browser \
   --remote-host 127.0.0.1:9473 \
-  --remote-legacy-token <predecessor-bearer> \
+  --remote-legacy-token <64-lowercase-hex-characters> \
   --allow-legacy-text-protocol \
   --prompt "Text-only compatibility run"
 ```
 
-Omit `--remote-token` when the predecessor host has no modern v3 key. The equivalent persistent settings are `browser.remoteLegacyToken` and `browser.remoteAllowLegacyTextProtocol`; the env equivalents are `ORACLE_REMOTE_LEGACY_TOKEN` and `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`.
+Omit `--remote-token` when the predecessor host has no modern v3 key. The equivalent persistent settings are `browser.remoteLegacyToken` and `browser.remoteAllowLegacyTextProtocol`; the env equivalents are `ORACLE_REMOTE_LEGACY_TOKEN` and `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`. The explicitly enabled legacy bearer must also be exactly 64 lowercase hexadecimal characters.
 
 For an old client contacting a new host, start the new host with a **distinct** legacy bearer:
 
 ```bash
 oracle serve --host 127.0.0.1 --port 9473 \
-  --token <modern-v3-hmac-root-key> \
-  --legacy-token <different-predecessor-bearer>
+  --token <64-lowercase-hex-characters> \
+  --legacy-token <distinct-64-lowercase-hex-characters>
 ```
 
 Configure the old client with only the predecessor bearer. The modern HMAC root key is never accepted as a bearer token. Legacy mode is text-only: generated files require manual transfer, and transaction-v3 generation-bound recovery is unavailable.

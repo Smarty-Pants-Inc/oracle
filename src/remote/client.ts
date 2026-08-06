@@ -15,6 +15,7 @@ import type {
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
 import { sanitizeArtifactFilename } from "../browser/artifacts.js";
+import { assertRemoteCredential } from "./auth.js";
 import {
   MAX_REMOTE_ATTACHMENT_BYTES,
   MAX_REMOTE_ATTACHMENTS,
@@ -80,6 +81,15 @@ export function createRemoteBrowserExecutor({
   allowLegacyTextProtocol = false,
   deadlines,
 }: RemoteExecutorOptions) {
+  if (token !== undefined) assertRemoteCredential(token, "Remote v3 HMAC root key");
+  if (legacyToken !== undefined) {
+    assertRemoteCredential(legacyToken, "Remote legacy bearer credential");
+  }
+  if (allowLegacyTextProtocol && token && legacyToken && token === legacyToken) {
+    throw new Error(
+      "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
+    );
+  }
   return async function remoteBrowserExecutor(
     options: BrowserRunOptions,
   ): Promise<BrowserRunTransaction> {
@@ -153,7 +163,7 @@ export function createRemoteBrowserExecutor({
         );
       }
       if (health.protocol === "legacy-text-v1") {
-        if (!legacyToken?.trim()) {
+        if (!legacyToken) {
           throw new BrowserAutomationError(
             "Legacy text compatibility requires a distinct scoped legacy bearer credential.",
             { stage: "remote-authentication" },
@@ -374,12 +384,13 @@ export async function resumeRemoteBrowserTransaction(params: {
       { stage: "remote-resume", recoverableDisconnect: true, runtime: params.runtime },
     );
   }
-  if (!params.authToken?.trim()) {
+  if (!params.authToken) {
     throw new BrowserAutomationError(
       "Remote transaction authentication is unavailable; configure ORACLE_REMOTE_TOKEN.",
       { stage: "remote-resume", recoverableDisconnect: true, runtime: params.runtime },
     );
   }
+  assertRemoteCredential(params.authToken, "Remote v3 HMAC root key");
   if (authority.host !== params.configuredHost) {
     throw new BrowserAutomationError(
       `Remote transaction host mismatch; refusing to send credentials to ${authority.host}.`,

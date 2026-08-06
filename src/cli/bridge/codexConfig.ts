@@ -51,13 +51,15 @@ export function formatCodexMcpSnippet({
     `ORACLE_REMOTE_HOST = "${escapeTomlString(hostValue)}"`,
   ];
   if (remoteToken || !allowLegacyTextProtocol) {
-    const tokenValue = includeToken ? (remoteToken ?? "<YOUR_TOKEN>") : "<YOUR_TOKEN>";
+    const tokenValue = includeToken
+      ? (remoteToken ?? "<64_LOWERCASE_HEX_CHARACTERS>")
+      : "<64_LOWERCASE_HEX_CHARACTERS>";
     envEntries.push(`ORACLE_REMOTE_TOKEN = "${escapeTomlString(tokenValue)}"`);
   }
   if (allowLegacyTextProtocol) {
     const legacyTokenValue = includeToken
-      ? (remoteLegacyToken ?? "<YOUR_LEGACY_TOKEN>")
-      : "<YOUR_LEGACY_TOKEN>";
+      ? (remoteLegacyToken ?? "<DISTINCT_64_LOWERCASE_HEX_CHARACTERS>")
+      : "<DISTINCT_64_LOWERCASE_HEX_CHARACTERS>";
     envEntries.push(
       `ORACLE_REMOTE_LEGACY_TOKEN = "${escapeTomlString(legacyTokenValue)}"`,
       `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL = "1"`,

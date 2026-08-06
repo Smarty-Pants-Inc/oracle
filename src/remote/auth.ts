@@ -15,6 +15,16 @@ export const REMOTE_REQUEST_PROOF_HEADER = "x-oracle-request-proof";
 const HEX_256_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_AUTHENTICATED_NONCES = 8_192;
 const AUTHENTICATED_NONCE_TTL_MS = 30 * 60 * 1000;
+export function assertRemoteCredential(value: string, label = "Remote credential"): string {
+  if (!HEX_256_PATTERN.test(value)) {
+    throw new Error(`${label} must be exactly 64 lowercase hexadecimal characters (32 bytes).`);
+  }
+  return value;
+}
+
+export function generateRemoteCredential(): string {
+  return randomBytes(32).toString("hex");
+}
 
 export interface RemoteHealthAuthenticationProof {
   scheme: typeof REMOTE_AUTH_SCHEME;
@@ -48,6 +58,7 @@ export type RemoteRequestAuthFailure = {
 };
 
 function keyedDigest(secret: string, domain: string, values: string[]): string {
+  assertRemoteCredential(secret);
   return createHmac("sha256", secret)
     .update(JSON.stringify([domain, ...values]))
     .digest("hex");
@@ -161,6 +172,7 @@ export class RemoteRequestAuthenticator {
   readonly #verifiedRequests = new WeakMap<http.IncomingMessage, VerifiedRemoteRequestAuth>();
 
   constructor(params: { rootKey: string; serverGeneration: string; now?: () => number }) {
+    assertRemoteCredential(params.rootKey, "Remote v3 HMAC root key");
     this.#rootKey = params.rootKey;
     this.#serverGeneration = params.serverGeneration;
     this.#now = params.now ?? Date.now;

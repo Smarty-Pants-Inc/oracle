@@ -542,11 +542,12 @@ describe("recovery settlement", { timeout: 15_000 }, () => {
       close: closeTarget,
     });
     const profileDirectory = {
-      version: 1 as const,
+      version: 2 as const,
       platform: process.platform,
       canonicalPath: "/tmp/partial-persistence-profile",
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     };
     const runtime: BrowserRuntimeMetadata = {
       chromeTargetId: targetId,

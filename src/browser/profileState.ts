@@ -14,6 +14,7 @@ import {
 import {
   assertProfileDirectoryIdentity,
   captureProfileDirectoryIdentity,
+  parseProfileDirectoryIdentity,
   sameProfileDirectoryIdentity,
   verifyProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
@@ -143,9 +144,11 @@ async function replayPendingProfileDirectoryRemovalsWithDeps(
 
 async function removeProfileDirectoryIfIdentityMatchesWithDeps(
   userDataDir: string,
-  expected: ProfileDirectoryIdentity,
+  expectedValue: ProfileDirectoryIdentity,
   deps: RemoveProfileDirectoryDeps,
 ): Promise<boolean> {
+  const expected = parseProfileDirectoryIdentity(expectedValue, process.platform);
+  if (!expected) return false;
   if (!(await pathExists(expected.canonicalPath))) return true;
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
   const inspectProfileUse =
@@ -675,6 +678,13 @@ async function cleanupStaleProfileStateWithDeps(
   },
   deps: CleanupStaleProfileStateDeps,
 ): Promise<boolean> {
+  const expectedProfile = options.expectedProfileIdentity
+    ? parseProfileDirectoryIdentity(options.expectedProfileIdentity, process.platform)
+    : null;
+  if (options.expectedProfileIdentity && !expectedProfile) {
+    logger?.("Refusing stale profile cleanup because its persisted identity is invalid");
+    return false;
+  }
   try {
     await replayPendingProfileDirectoryRemovalsWithDeps(userDataDir, deps);
   } catch (error) {
@@ -687,7 +697,7 @@ async function cleanupStaleProfileStateWithDeps(
   const verifyProfile = deps.verifyProfileIdentity ?? verifyProfileDirectoryIdentity;
   let profile: ProfileDirectoryIdentity;
   try {
-    profile = options.expectedProfileIdentity ?? (await captureProfile(userDataDir));
+    profile = expectedProfile ?? (await captureProfile(userDataDir));
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return true;
     logger?.(`Refusing stale profile cleanup: ${error instanceof Error ? error.message : error}`);

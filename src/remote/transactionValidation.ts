@@ -1,4 +1,5 @@
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import { parsePhysicalDirectoryIdentity } from "../browser/filesystemLockDirectoryIdentity.js";
 import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
@@ -257,6 +258,17 @@ export function validateRemoteTransactionRecord(
     )
   ) {
     invalidRecord("Invalid remote transaction record");
+  }
+  const artifactNamespaceIdentity = record.artifactNamespaceIdentity;
+  if (
+    !["uninitialized", "initializing", "initialized"].includes(record.artifactNamespaceState) ||
+    (artifactNamespaceIdentity !== undefined &&
+      !parsePhysicalDirectoryIdentity(artifactNamespaceIdentity)) ||
+    (record.artifactNamespaceState === "uninitialized" &&
+      artifactNamespaceIdentity !== undefined) ||
+    (record.artifactNamespaceState === "initialized" && artifactNamespaceIdentity === undefined)
+  ) {
+    invalidRecord("Remote transaction artifact namespace authority is invalid");
   }
   if (typeof record.controllerGeneration !== "string" || !record.controllerGeneration) {
     invalidRecord("Remote transaction record is missing controller generation");

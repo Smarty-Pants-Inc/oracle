@@ -7,7 +7,7 @@
 - Date: 2025-11-20 (US timezone)
 - Goal: Run Oracle browser mode from a local laptop against VM-hosted Chrome via the then-new `oracle serve` remote service.
 - Current transport replacement: client and service both use `127.0.0.1:49810`, connected through SSH `-L`.
-- Credentials below are redacted.
+- Credential examples below use the descriptive placeholder `<64-lowercase-hex-characters>`.
 
 ## Attempts
 
@@ -19,7 +19,7 @@ Command:
 ssh -N -L 49810:127.0.0.1:49810 user@remote-host
 oracle --engine browser \
   --remote-host 127.0.0.1:49810 \
-  --remote-token <redacted> \
+  --remote-token <64-lowercase-hex-characters> \
   --prompt "Remote service sanity check" \
   --wait
 ```
@@ -42,7 +42,7 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <redacted>
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <64-lowercase-hex-characters>
   ```
 - When started correctly, logs show:
   ```
@@ -65,7 +65,7 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <redacted>
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <64-lowercase-hex-characters>
   ```
   Leave it running; verify with `lsof -nP -iTCP:49810 -sTCP:LISTEN`.
 - Sign into ChatGPT in the VM’s Chrome profile used by the service so model switching succeeds. (Currently we rely on host cookies only; client cookie shipping is disabled.)

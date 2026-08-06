@@ -5,8 +5,10 @@ import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
   RemoteRequestAuthenticator,
+  assertRemoteCredential,
   createRemoteAuthenticatedRequest,
   createRemoteHealthAuthenticationProof,
+  generateRemoteCredential,
   verifyRemoteHealthAuthenticationProof,
   verifyRemoteRequestProof,
 } from "../../src/remote/auth.js";
@@ -29,30 +31,51 @@ async function close(server: http.Server): Promise<void> {
 }
 
 describe("remote HMAC authentication", () => {
+  it("accepts only exact 32-byte lowercase hexadecimal credentials", () => {
+    const generated = generateRemoteCredential();
+    expect(generated).toMatch(/^[0-9a-f]{64}$/u);
+    expect(assertRemoteCredential("a".repeat(64))).toBe("a".repeat(64));
+
+    for (const invalid of [
+      "",
+      " ",
+      "dictionary-word",
+      "A".repeat(64),
+      "a".repeat(63),
+      "g".repeat(64),
+    ]) {
+      expect(() => assertRemoteCredential(invalid)).toThrow(
+        /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
+      );
+    }
+  });
+
   it("binds health proofs to the root key and client nonce", () => {
     const clientNonce = "a".repeat(64);
     const proof = createRemoteHealthAuthenticationProof({
-      rootKey: "secret",
+      rootKey: "a".repeat(64),
       serverGeneration: "generation-1",
       clientNonce,
     });
-    expect(verifyRemoteHealthAuthenticationProof("secret", clientNonce, proof)).toBe(true);
-    expect(verifyRemoteHealthAuthenticationProof("wrong", clientNonce, proof)).toBe(false);
-    expect(verifyRemoteHealthAuthenticationProof("secret", "b".repeat(64), proof)).toBe(false);
+    expect(verifyRemoteHealthAuthenticationProof("a".repeat(64), clientNonce, proof)).toBe(true);
+    expect(verifyRemoteHealthAuthenticationProof("b".repeat(64), clientNonce, proof)).toBe(false);
+    expect(verifyRemoteHealthAuthenticationProof("a".repeat(64), "b".repeat(64), proof)).toBe(
+      false,
+    );
   });
 
   it("verifies request MACs and rejects nonce replay", () => {
     const path = `/transactions/${"a".repeat(64)}/bind`;
     const body = Buffer.from(JSON.stringify({ mode: "finalize" }));
     const authentication = createRemoteAuthenticatedRequest({
-      rootKey: "secret",
+      rootKey: "a".repeat(64),
       serverGeneration: "generation-1",
       method: "POST",
       path,
       body,
     });
     const authenticator = new RemoteRequestAuthenticator({
-      rootKey: "secret",
+      rootKey: "a".repeat(64),
       serverGeneration: "generation-1",
     });
     const request = {
@@ -65,7 +88,7 @@ describe("remote HMAC authentication", () => {
     if ("statusCode" in verified) throw new Error(verified.code);
     expect(
       verifyRemoteRequestProof({
-        rootKey: "secret",
+        rootKey: "a".repeat(64),
         method: "POST",
         path,
         authentication,
@@ -83,9 +106,28 @@ describe("remote HMAC authentication", () => {
 });
 
 describe("remote health transport", () => {
+  it("rejects malformed modern and legacy credentials before connection use", async () => {
+    for (const credentials of [
+      { token: "" },
+      { token: " " },
+      { token: "dictionary-word" },
+      { token: "A".repeat(64) },
+      { token: "a".repeat(63) },
+      { token: "g".repeat(64) },
+      { legacyToken: "weak", allowLegacyTextProtocol: true },
+    ]) {
+      await expect(
+        checkRemoteHealth({ host: "127.0.0.1:1", timeoutMs: 50, ...credentials }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: expect.stringMatching(/exactly 64 lowercase hexadecimal characters/i),
+      });
+    }
+  });
+
   it("refuses non-loopback plaintext before opening a connection", async () => {
     await expect(
-      checkRemoteHealth({ host: "192.0.2.40:9473", token: "secret", timeoutMs: 50 }),
+      checkRemoteHealth({ host: "192.0.2.40:9473", token: "a".repeat(64), timeoutMs: 50 }),
     ).resolves.toMatchObject({
       ok: false,
       error: expect.stringMatching(/loopback-only.*SSH tunnel/i),
@@ -101,7 +143,7 @@ describe("remote health transport", () => {
       const startedAt = Date.now();
       const health = await checkRemoteHealth({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         timeoutMs: 500,
         idleTimeoutMs: 50,
       });
@@ -117,7 +159,7 @@ describe("remote health transport", () => {
     let totalRequests = 0;
     const server = http.createServer((req, res) => {
       totalRequests += 1;
-      if (req.headers.authorization === "Bearer legacy-bearer") {
+      if (req.headers.authorization === `Bearer ${"c".repeat(64)}`) {
         legacyRequests += 1;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, version: "legacy", uptimeSeconds: 1 }));
@@ -131,8 +173,8 @@ describe("remote health transport", () => {
       await expect(
         checkRemoteHealth({
           host: `127.0.0.1:${port}`,
-          token: "v3-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           timeoutMs: 500,
         }),
       ).resolves.toMatchObject({ ok: false, statusCode: 401 });
@@ -142,8 +184,8 @@ describe("remote health transport", () => {
       await expect(
         checkRemoteHealth({
           host: `127.0.0.1:${port}`,
-          token: "v3-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           allowLegacyTextProtocol: true,
           timeoutMs: 500,
         }),
@@ -154,8 +196,8 @@ describe("remote health transport", () => {
       await expect(
         checkRemoteHealth({
           host: `127.0.0.1:${port}`,
-          token: "shared-credential",
-          legacyToken: "shared-credential",
+          token: "d".repeat(64),
+          legacyToken: "d".repeat(64),
           allowLegacyTextProtocol: true,
           timeoutMs: 500,
         }),
@@ -173,7 +215,7 @@ describe("remote health transport", () => {
   it("does not downgrade after a current-protocol proof failure", async () => {
     let legacyRequests = 0;
     const server = http.createServer((req, res) => {
-      if (req.headers.authorization === "Bearer legacy-bearer") {
+      if (req.headers.authorization === `Bearer ${"c".repeat(64)}`) {
         legacyRequests += 1;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, version: "legacy", uptimeSeconds: 1 }));
@@ -201,7 +243,7 @@ describe("remote health transport", () => {
             boundedTransactionStore: true,
           },
           authentication: createRemoteHealthAuthenticationProof({
-            rootKey: "wrong-root-key",
+            rootKey: "b".repeat(64),
             serverGeneration: "generation-1",
             clientNonce,
           }),
@@ -213,8 +255,8 @@ describe("remote health transport", () => {
       await expect(
         checkRemoteHealth({
           host: `127.0.0.1:${port}`,
-          token: "v3-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           allowLegacyTextProtocol: true,
           timeoutMs: 500,
         }),
@@ -252,7 +294,7 @@ describe("remote health transport", () => {
             boundedTransactionStore: true,
           },
           authentication: createRemoteHealthAuthenticationProof({
-            rootKey: "secret",
+            rootKey: "a".repeat(64),
             serverGeneration: "generation-1",
             clientNonce,
           }),
@@ -263,7 +305,7 @@ describe("remote health transport", () => {
     const port = await listen(server);
     try {
       await expect(
-        checkRemoteHealth({ host: `127.0.0.1:${port}`, token: "secret", timeoutMs: 500 }),
+        checkRemoteHealth({ host: `127.0.0.1:${port}`, token: "a".repeat(64), timeoutMs: 500 }),
       ).resolves.toMatchObject({
         ok: false,
         error: expect.stringMatching(/invalid remote health protocol/i),

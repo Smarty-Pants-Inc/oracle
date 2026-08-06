@@ -82,6 +82,7 @@ import {
   assertLoopbackRemoteBind,
   resolveRemoteServiceConfig,
 } from "../src/remote/remoteServiceConfig.js";
+import { assertRemoteCredential } from "../src/remote/auth.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
 import {
   isAzureOpenAICandidateModel,
@@ -875,11 +876,16 @@ program
       "Delegate browser runs to a loopback `oracle serve` endpoint, normally through SSH.",
     ),
   )
-  .addOption(new Option("--remote-token <token>", "Modern v3 HMAC root key for `oracle serve`."))
   .addOption(
     new Option(
-      "--remote-legacy-token <token>",
-      "Bearer token scoped to an explicitly enabled predecessor text-only remote host.",
+      "--remote-token <64-lowercase-hex>",
+      "Modern v3 HMAC root key: exactly 64 lowercase hexadecimal characters (32 bytes).",
+    ),
+  )
+  .addOption(
+    new Option(
+      "--remote-legacy-token <64-lowercase-hex>",
+      "Distinct predecessor bearer: exactly 64 lowercase hexadecimal characters (32 bytes); requires explicit opt-in.",
     ),
   )
   .addOption(
@@ -986,10 +992,13 @@ program
     "Loopback interface to bind (default 127.0.0.1; non-loopback addresses are rejected).",
   )
   .option("--port <number>", "Port to listen on (default random).", parseIntOption)
-  .requiredOption("--token <value>", "Modern v3 HMAC root key (required; never logged).")
+  .requiredOption(
+    "--token <64-lowercase-hex>",
+    "Modern v3 HMAC root key: exactly 64 lowercase hexadecimal characters (32 bytes; never logged).",
+  )
   .option(
-    "--legacy-token <value>",
-    "Distinct bearer token for opt-in predecessor text-only clients; never reuse --token.",
+    "--legacy-token <64-lowercase-hex>",
+    "Distinct predecessor bearer: exactly 64 lowercase hexadecimal characters (32 bytes).",
   )
   .option(
     "--manual-login",
@@ -1004,9 +1013,11 @@ program
     const { serveRemote } = await import("../src/remote/server.js");
     const host = commandOptions.host?.trim() || "127.0.0.1";
     assertLoopbackRemoteBind(host);
-    const token = commandOptions.token?.trim();
-    if (!token) throw new Error("--token must be a non-empty v3 HMAC root key.");
-    const legacyToken = commandOptions.legacyToken?.trim() || undefined;
+    const token = assertRemoteCredential(commandOptions.token, "--token");
+    const legacyToken =
+      commandOptions.legacyToken === undefined
+        ? undefined
+        : assertRemoteCredential(commandOptions.legacyToken, "--legacy-token");
     if (token && legacyToken && token === legacyToken) {
       throw new Error(
         "Legacy text clients require a bearer credential distinct from the modern v3 HMAC root key.",
@@ -1149,10 +1160,14 @@ bridgeCommand
     "--bind <host:port>",
     "Loopback bind address for the host service (default 127.0.0.1:9473; non-loopback rejected).",
   )
-  .option("--token <token|auto>", "Modern v3 HMAC root key (default auto).", "auto")
   .option(
-    "--legacy-token <token>",
-    "Distinct bearer token for predecessor text-only clients; never reuse --token.",
+    "--token <64-lowercase-hex|auto>",
+    "Modern v3 HMAC root key: auto or exactly 64 lowercase hexadecimal characters (32 bytes).",
+    "auto",
+  )
+  .option(
+    "--legacy-token <64-lowercase-hex>",
+    "Distinct predecessor bearer: exactly 64 lowercase hexadecimal characters (32 bytes).",
   )
   .option(
     "--write-connection <path>",
@@ -1180,8 +1195,8 @@ bridgeCommand
   .description("Configure this machine to use a remote oracle serve host.")
   .requiredOption("--connect <connection>", "Connection string or path to bridge-connection.json.")
   .option(
-    "--legacy-token <token>",
-    "Distinct predecessor bearer required for explicit legacy text compatibility.",
+    "--legacy-token <64-lowercase-hex>",
+    "Distinct predecessor bearer: exactly 64 lowercase hexadecimal characters (32 bytes); requires explicit opt-in.",
   )
   .addOption(
     new Option(

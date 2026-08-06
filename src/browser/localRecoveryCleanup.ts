@@ -1,12 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-  closeChromeTargetWithExactAuthority,
-  type RetainedChromeEndpointAuthority,
-} from "./chromeLifecycle.js";
-import {
-  retainChromeBrowserWebSocketAuthority,
-  type RetainedChromeBrowserWebSocketAuthority,
-} from "./chromeEndpointAuthority.js";
+import type { RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import { bindPersistedLocalEndpoint } from "./pendingProcessAcquisition.js";
 import {
   recoveryCleanupResourceKey,
@@ -31,14 +24,8 @@ import { releaseBrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   canExactOwnedProcessTeardownSubsumeTargetClose,
   closeChromeTargetWithRetainedCapability,
-  isRestartDurableChromeTargetCloseCapability,
 } from "./targetCloseAuthority.js";
 import type { BrowserLogger } from "./types.js";
-
-const pendingRecoveredTargetEndpointReleases = new Map<
-  string,
-  RetainedChromeBrowserWebSocketAuthority
->();
 
 export async function finalizeLocalRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
@@ -72,28 +59,8 @@ export async function finalizeLocalRecoveryCleanupGroup(
   };
 
   let endpointAuthority: RetainedChromeEndpointAuthority | undefined;
-  let recoveredTargetEndpointAuthority: RetainedChromeBrowserWebSocketAuthority | undefined;
   let endpointPendingEntry: RecoveryCleanupEntry | undefined;
   try {
-    for (const entry of group.entries) {
-      const browserWSEndpoint = entry.resource.chromeBrowserWSEndpoint;
-      if (!browserWSEndpoint) continue;
-      const pendingRelease = pendingRecoveredTargetEndpointReleases.get(browserWSEndpoint);
-      if (!pendingRelease) continue;
-      try {
-        await pendingRelease.release();
-        if (pendingRecoveredTargetEndpointReleases.get(browserWSEndpoint) === pendingRelease) {
-          pendingRecoveredTargetEndpointReleases.delete(browserWSEndpoint);
-        }
-      } catch (error) {
-        addPending(
-          teardownOnlyEntry(entry),
-          `Exact Chrome browser endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        return { pending, errors };
-      }
-    }
-
     const teardownEntries = group.entries.filter((entry) =>
       requestsProcessTeardown(entry.resource),
     );
@@ -234,66 +201,9 @@ export async function finalizeLocalRecoveryCleanupGroup(
           continue;
         }
         try {
-          let closed = await (
+          const closed = await (
             deps.closeChromeTargetWithRetainedCapability ?? closeChromeTargetWithRetainedCapability
           )({ capability, targetId, logger });
-          if (
-            closed.status === "unavailable" &&
-            isRestartDurableChromeTargetCloseCapability({
-              capability,
-              targetId,
-              browserWSEndpoint: resource.chromeBrowserWSEndpoint,
-            })
-          ) {
-            endpointPendingEntry = representative;
-            if (resource.chromeProcessIdentity) {
-              if (!endpointAuthority && !recordedProcessExited) {
-                try {
-                  const binding = await bindPersistedLocalEndpoint(resource, deps);
-                  if (binding.status === "gone") recordedProcessExited = true;
-                  else endpointAuthority = binding.authority;
-                } catch (error) {
-                  closed = {
-                    status: "unsafe",
-                    reason: `Exact Chrome endpoint authentication failed: ${error instanceof Error ? error.message : String(error)}`,
-                  };
-                }
-              }
-              if (recordedProcessExited) {
-                closed = { status: "gone" };
-              } else if (endpointAuthority) {
-                closed = await (
-                  deps.closeChromeTargetWithExactAuthority ?? closeChromeTargetWithExactAuthority
-                )({ authority: endpointAuthority, targetId, logger });
-              }
-            } else if (resource.recoveryCleanup.profileKind === "none") {
-              if (!recoveredTargetEndpointAuthority) {
-                const endpoint = new URL(capability.browserWSEndpoint!);
-                const binding = await (
-                  deps.retainChromeBrowserWebSocketAuthority ??
-                  retainChromeBrowserWebSocketAuthority
-                )({
-                  host: resource.chromeHost ?? endpoint.hostname,
-                  port:
-                    resource.chromePort ??
-                    inferPortFromBrowserWSEndpoint(resource.chromeBrowserWSEndpoint)!,
-                  browserWSEndpoint: capability.browserWSEndpoint!,
-                });
-                if (binding.status === "gone") {
-                  closed = { status: "gone" };
-                } else if (binding.status === "unsafe") {
-                  closed = binding;
-                } else {
-                  recoveredTargetEndpointAuthority = binding.authority;
-                }
-              }
-              if (recoveredTargetEndpointAuthority && closed.status === "unavailable") {
-                closed = await (
-                  deps.closeChromeTargetWithExactAuthority ?? closeChromeTargetWithExactAuthority
-                )({ authority: recoveredTargetEndpointAuthority, targetId, logger });
-              }
-            }
-          }
           if (closed.status === "completed" || closed.status === "gone") {
             settledTargetCapabilities.add(capability.capabilityId);
           }
@@ -457,30 +367,6 @@ export async function finalizeLocalRecoveryCleanupGroup(
           addPending(
             removeReleasedLeaseAuthority(entry, releasedLeaseIds),
             `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-    }
-    if (recoveredTargetEndpointAuthority) {
-      const browserWSEndpoint = recoveredTargetEndpointAuthority.browserWSEndpoint;
-      try {
-        await recoveredTargetEndpointAuthority.release();
-        if (
-          pendingRecoveredTargetEndpointReleases.get(browserWSEndpoint) ===
-          recoveredTargetEndpointAuthority
-        ) {
-          pendingRecoveredTargetEndpointReleases.delete(browserWSEndpoint);
-        }
-      } catch (error) {
-        pendingRecoveredTargetEndpointReleases.set(
-          browserWSEndpoint,
-          recoveredTargetEndpointAuthority,
-        );
-        const entry = endpointPendingEntry ?? group.entries[0];
-        if (entry) {
-          addPending(
-            removeReleasedLeaseAuthority(entry, releasedLeaseIds),
-            `Exact Chrome browser endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
       }

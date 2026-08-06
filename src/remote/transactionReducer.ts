@@ -60,6 +60,49 @@ type RemoteTransactionReducers = {
   [Type in RemoteTransactionTransitionType]: RemoteTransactionReducer<Type>;
 };
 const reducers: RemoteTransactionReducers = {
+  "begin-artifact-namespace-initialization": (record, transition, context) => {
+    if (record.state !== "running" || record.runId !== transition.runId) {
+      throw new Error("Remote artifact namespace initialization is not owned by the exact run");
+    }
+    assertCurrentController(record, context, "initialize artifact namespace");
+    if (record.artifactNamespaceState !== "uninitialized") {
+      throw new Error("Remote artifact namespace initialization has already started");
+    }
+    record.artifactNamespaceState = "initializing";
+    return { persist: true, outcome: undefined };
+  },
+  "bind-artifact-namespace-identity": (record, transition, context) => {
+    if (
+      record.state !== "running" ||
+      record.runId !== transition.runId ||
+      record.artifactNamespaceState !== "initializing"
+    ) {
+      throw new Error("Remote artifact namespace identity is not owned by the initializing run");
+    }
+    assertCurrentController(record, context, "bind artifact namespace identity");
+    if (
+      record.artifactNamespaceIdentity &&
+      !isDeepStrictEqual(record.artifactNamespaceIdentity, transition.identity)
+    ) {
+      throw new Error("Remote artifact namespace physical identity changed during initialization");
+    }
+    if (record.artifactNamespaceIdentity) return { persist: false, outcome: undefined };
+    record.artifactNamespaceIdentity = transition.identity;
+    return { persist: true, outcome: undefined };
+  },
+  "complete-artifact-namespace-initialization": (record, transition, context) => {
+    if (
+      record.state !== "running" ||
+      record.runId !== transition.runId ||
+      record.artifactNamespaceState !== "initializing" ||
+      !record.artifactNamespaceIdentity
+    ) {
+      throw new Error("Remote artifact namespace cannot complete without exact physical authority");
+    }
+    assertCurrentController(record, context, "complete artifact namespace initialization");
+    record.artifactNamespaceState = "initialized";
+    return { persist: true, outcome: undefined };
+  },
   "renew-lease": (record, _transition, context) => {
     if (isTerminalRemoteTransactionState(record.state)) {
       throw new Error(`Cannot renew lease for terminal transaction in state ${record.state}`);
@@ -139,10 +182,16 @@ const reducers: RemoteTransactionReducers = {
     assertValidRemoteStagedCapture(record, stagedCapture);
     if (record.stagedCapture) {
       const existing = record.stagedCapture;
-      if (existing.artifacts === undefined && stagedCapture.artifacts?.length === 0) {
+      if (
+        existing.artifacts === undefined &&
+        stagedCapture.artifacts?.length === 0 &&
+        !stagedCapture.result.warnings?.some(
+          (warning) => warning.code === "remote-artifact-manual-copy-required",
+        )
+      ) {
         throw new RemoteTransactionTransitionError(
           "staged_capture_artifact_manifest_incomplete",
-          "An artifact-bearing staged capture cannot be completed with an empty manifest",
+          "An artifact-bearing staged capture requires an explicit manual-copy fallback",
         );
       }
       assertCapturePromotionMatchesStage(existing, stagedCapture.result, stagedCapture.runtime);
@@ -632,6 +681,7 @@ export function createRemoteTransactionRecord(
   const record: RemoteTransactionRecord = {
     ...begin,
     artifactNamespace: deriveRemoteArtifactNamespace(begin),
+    artifactNamespaceState: "uninitialized",
     updatedAt,
     controllerGeneration: context.controllerGeneration,
     state: "running",

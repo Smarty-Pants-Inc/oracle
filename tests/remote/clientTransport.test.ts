@@ -75,7 +75,7 @@ function createAuthenticatedServer(
   handler: (req: http.IncomingMessage, res: http.ServerResponse) => void | Promise<void>,
   options: { handleBind?: boolean } = {},
 ): http.Server {
-  const rootKey = "secret";
+  const rootKey = "a".repeat(64);
   const serverGeneration = "client-transport-test-generation";
   const authenticator = new RemoteRequestAuthenticator({ rootKey, serverGeneration });
   const server = http.createServer();
@@ -227,6 +227,28 @@ const deadlines = {
 };
 
 describe("remote client transport deadlines", () => {
+  it("rejects malformed modern and legacy executor credentials before use", () => {
+    for (const token of [
+      "",
+      " ",
+      "dictionary-word",
+      "A".repeat(64),
+      "a".repeat(63),
+      "g".repeat(64),
+    ]) {
+      expect(() => createRemoteBrowserExecutor({ host: "127.0.0.1:9473", token })).toThrow(
+        /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
+      );
+    }
+    expect(() =>
+      createRemoteBrowserExecutor({
+        host: "127.0.0.1:9473",
+        legacyToken: "weak",
+        allowLegacyTextProtocol: true,
+      }),
+    ).toThrow(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i);
+  });
+
   it("times out held run and retry requests while preserving opaque retry authority", async () => {
     const server = createAuthenticatedServer(async (req, res) => {
       if (runTransactionToken(req)) {
@@ -241,7 +263,7 @@ describe("remote client transport deadlines", () => {
     try {
       const error = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({ prompt: "timeout", config: {} }).then(
         () => null,
@@ -283,7 +305,7 @@ describe("remote client transport deadlines", () => {
     try {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({ prompt: "settle", config: {} });
       const finalization = await transaction.finalize();
@@ -337,7 +359,7 @@ describe("remote client transport deadlines", () => {
     try {
       const error = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({ prompt: "artifact", config: {}, sessionId: "held-artifact" }).then(
         () => null,
@@ -379,7 +401,7 @@ describe("remote client transport deadlines", () => {
     try {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({
         prompt: "persist before network",
@@ -415,6 +437,117 @@ describe("remote client transport deadlines", () => {
     }
   });
 
+  it("retries a pre-receipt 404 until the transaction record appears", async () => {
+    let transactionToken: string | null = null;
+    let acceptedPrompt = "";
+    let retryRequests = 0;
+    const server = createAuthenticatedServer(async (req, res) => {
+      const runToken = runTransactionToken(req);
+      if (runToken) {
+        transactionToken = runToken;
+        acceptedPrompt = String((await readJson(req)).prompt);
+        req.socket.destroy();
+        return;
+      }
+      const retryToken = transactionToken;
+      if (retryToken && req.url === `/transactions/${retryToken}/retry`) {
+        retryRequests += 1;
+        await readJson(req);
+        res.setHeader("content-type", "application/json");
+        if (retryRequests === 1) {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: "transaction_not_retained" }));
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            status: "transaction",
+            transaction: transactionEvent(retryToken, acceptedPrompt).transaction,
+          }),
+        );
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    try {
+      const transaction = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "a".repeat(64),
+        deadlines: {
+          ...deadlines,
+          runOverallTimeoutMs: 500,
+          controlOverallTimeoutMs: 500,
+          socketIdleTimeoutMs: 250,
+          recoveryWindowMs: 2_000,
+        },
+      })({ prompt: "record appears after retry", config: {} });
+
+      expect(retryRequests).toBe(2);
+      expect(transaction.answerText).toBe("answer");
+      expect(remoteRecovery(transaction.runtime)).toMatchObject({ state: "pending" });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("proves pre-receipt absence only after the recovery deadline", async () => {
+    let transactionToken: string | null = null;
+    let retryRequests = 0;
+    const server = createAuthenticatedServer(async (req, res) => {
+      const runToken = runTransactionToken(req);
+      if (runToken) {
+        transactionToken = runToken;
+        await readJson(req);
+        req.socket.destroy();
+        return;
+      }
+      const retryToken = transactionToken;
+      if (retryToken && req.url === `/transactions/${retryToken}/retry`) {
+        retryRequests += 1;
+        await readJson(req);
+        res.statusCode = 404;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: "transaction_not_retained" }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+    try {
+      const caught = await createRemoteBrowserExecutor({
+        host: `127.0.0.1:${port}`,
+        token: "a".repeat(64),
+        deadlines: {
+          ...deadlines,
+          runOverallTimeoutMs: 500,
+          controlOverallTimeoutMs: 500,
+          socketIdleTimeoutMs: 250,
+          recoveryWindowMs: 900,
+        },
+      })({ prompt: "record never appears", config: {} }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(retryRequests).toBeGreaterThan(1);
+      expect(caught).toMatchObject({
+        message:
+          "Remote transaction record did not appear before the pre-receipt recovery deadline.",
+        details: {
+          code: "remote-transaction-not-retained",
+          recoverableDisconnect: false,
+        },
+      });
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResources");
+      expect(caught).not.toHaveProperty("details.runtime.recoveryCleanupResult");
+    } finally {
+      await close(server);
+    }
+  });
+
   it("does not send the run request when pre-receipt persistence fails", async () => {
     let runRequests = 0;
     const persistedRuntimes: BrowserRuntimeMetadata[] = [];
@@ -428,7 +561,7 @@ describe("remote client transport deadlines", () => {
       await expect(
         createRemoteBrowserExecutor({
           host: `127.0.0.1:${port}`,
-          token: "secret",
+          token: "a".repeat(64),
           deadlines,
         })({
           prompt: "must persist first",
@@ -471,7 +604,7 @@ describe("remote client transport deadlines", () => {
     const remoteHost = `127.0.0.1:${port}`;
     try {
       await expect(
-        createRemoteBrowserExecutor({ host: remoteHost, token: "secret", deadlines })({
+        createRemoteBrowserExecutor({ host: remoteHost, token: "a".repeat(64), deadlines })({
           prompt: "must preserve explicit target authority",
           config: { browserTabRef: "explicit-target" },
           runtimeHintCb,
@@ -521,7 +654,7 @@ describe("remote client transport deadlines", () => {
     try {
       const caught = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
       })({ prompt: "abort-bound error", config: {} }).then(
         () => null,
         (error: unknown) => error,
@@ -595,7 +728,7 @@ describe("remote client transport deadlines", () => {
             ],
           },
           configuredHost: `127.0.0.1:${port}`,
-          authToken: "secret",
+          authToken: "a".repeat(64),
         }),
       ).rejects.toMatchObject({
         name: "BrowserAutomationError",
@@ -667,7 +800,7 @@ describe("remote client transport deadlines", () => {
         const caught = await resumeRemoteBrowserTransaction({
           runtime: recoveryRuntime(host, transactionToken, mode),
           configuredHost: host,
-          authToken: "secret",
+          authToken: "a".repeat(64),
         }).then(
           () => null,
           (error: unknown) => error,
@@ -706,7 +839,7 @@ describe("remote client transport deadlines", () => {
       const caught = await resumeRemoteBrowserTransaction({
         runtime: recoveryRuntime(host, transactionToken, "abort"),
         configuredHost: host,
-        authToken: "secret",
+        authToken: "a".repeat(64),
       }).then(
         () => null,
         (error: unknown) => error,
@@ -748,7 +881,7 @@ describe("remote client transport deadlines", () => {
         resumeRemoteBrowserTransaction({
           runtime: recoveryRuntime(host, transactionToken, "abort"),
           configuredHost: host,
-          authToken: "secret",
+          authToken: "a".repeat(64),
         }),
       ).rejects.toMatchObject({
         details: {
@@ -837,7 +970,7 @@ describe("remote client transport deadlines", () => {
       const transaction = await resumeRemoteBrowserTransaction({
         runtime,
         configuredHost: `127.0.0.1:${port}`,
-        authToken: "secret",
+        authToken: "a".repeat(64),
       });
       expect(transaction.answerText).toBe("answer");
       expect(transaction.runtime).toMatchObject({
@@ -939,7 +1072,7 @@ describe("remote client transport deadlines", () => {
       const transaction = await resumeRemoteBrowserTransaction({
         runtime,
         configuredHost: host,
-        authToken: "secret",
+        authToken: "a".repeat(64),
         sessionId: "recovering-local-session",
       });
       expect(receipted).toBe(true);
@@ -1008,7 +1141,7 @@ describe("remote client transport deadlines", () => {
         resumeRemoteBrowserTransaction({
           runtime,
           configuredHost: `127.0.0.1:${port}`,
-          authToken: "secret",
+          authToken: "a".repeat(64),
         }),
       ).rejects.toMatchObject({
         name: "BrowserAutomationError",
@@ -1077,7 +1210,7 @@ describe("remote client transport deadlines", () => {
         resumeRemoteBrowserTransaction({
           runtime,
           configuredHost: `127.0.0.1:${port}`,
-          authToken: "secret",
+          authToken: "a".repeat(64),
         }),
       ).rejects.toMatchObject({
         name: "BrowserAutomationError",
@@ -1135,7 +1268,7 @@ describe("remote client transport deadlines", () => {
       try {
         const transaction = await createRemoteBrowserExecutor({
           host: `127.0.0.1:${port}`,
-          token: "secret",
+          token: "a".repeat(64),
           deadlines,
         })({ prompt, config: {} });
         const caught = await transaction.abort().then(
@@ -1225,7 +1358,7 @@ describe("remote client transport deadlines", () => {
     try {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({
         prompt,
@@ -1326,7 +1459,7 @@ describe("remote client transport deadlines", () => {
     try {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines: { ...deadlines, controlOverallTimeoutMs: 1_000, socketIdleTimeoutMs: 500 },
       })({
         prompt,
@@ -1412,7 +1545,7 @@ describe("remote client transport deadlines", () => {
     try {
       const transaction = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({
         prompt,
@@ -1529,7 +1662,7 @@ describe("remote client transport deadlines", () => {
     try {
       const executor = createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines: {
           ...deadlines,
           controlOverallTimeoutMs: 1_000,
@@ -1622,7 +1755,7 @@ describe("remote client transport deadlines", () => {
     try {
       const error = await createRemoteBrowserExecutor({
         host: `127.0.0.1:${port}`,
-        token: "secret",
+        token: "a".repeat(64),
         deadlines,
       })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" }).then(
         () => null,

@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import { verifyProfileDirectoryIdentity, type ProfileDirectoryIdentity } from "./profileState.js";
+import {
+  parseProfileDirectoryIdentity,
+  verifyProfileDirectoryIdentity,
+  type ProfileDirectoryIdentity,
+} from "./profileState.js";
 import type { RecoveryCleanupEntry, RecoveryCleanupGroup } from "./reattachCleanupTypes.js";
 export function groupRecoveryCleanupResources(
   runtime: BrowserRuntimeMetadata,
@@ -117,18 +121,7 @@ export function chromeProcessIdentityKey(
 export function physicalProfileDirectoryIdentity(
   identity: unknown,
 ): ProfileDirectoryIdentity | null {
-  if (!identity || typeof identity !== "object") return null;
-  const candidate = identity as Record<string, unknown>;
-  if (
-    candidate.version !== 1 ||
-    typeof candidate.platform !== "string" ||
-    typeof candidate.canonicalPath !== "string" ||
-    typeof candidate.device !== "string" ||
-    typeof candidate.inode !== "string"
-  ) {
-    return null;
-  }
-  return identity as ProfileDirectoryIdentity;
+  return parseProfileDirectoryIdentity(identity, process.platform);
 }
 
 function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | null {
@@ -140,6 +133,7 @@ function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | nu
     physicalProfile.canonicalPath,
     physicalProfile.device,
     physicalProfile.inode,
+    physicalProfile.birthtimeNs,
   ];
 }
 

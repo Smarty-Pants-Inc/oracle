@@ -316,11 +316,12 @@ describe("local manual Chrome owner settlement", () => {
     const ownerMocks = manualOwnerSettlementMocks();
     vi.doMock("../../src/browser/manualChromeOwner.js", () => ownerMocks);
     const profileDirectory: ProfileDirectoryIdentity = {
-      version: 1,
+      version: 2,
       platform: process.platform,
       canonicalPath: path.join(os.tmpdir(), "oracle-mixed-owner-settlement"),
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     };
     const { owner, authority } = manualOwner(profileDirectory, scenario.ownerDisposition);
     const releaseLease = vi.fn(async () => undefined);

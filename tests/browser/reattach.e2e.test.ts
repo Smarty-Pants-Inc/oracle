@@ -59,11 +59,12 @@ function chromeProcessIdentity(userDataDir: string, pid: number) {
     normalizedUserDataDir,
     launchNonce: "44444444-4444-4444-8444-444444444444",
     profileDirectory: {
-      version: 1 as const,
+      version: 2 as const,
       platform: process.platform,
       canonicalPath,
       device: "1",
       inode: "2",
+      birthtimeNs: "3",
     },
   };
 }

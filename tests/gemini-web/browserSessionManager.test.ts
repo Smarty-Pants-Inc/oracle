@@ -42,11 +42,12 @@ const {
     async (_profileDir, _logger, _options) => true,
   ),
   captureProfileDirectoryIdentity: vi.fn(async (profileDir: string) => ({
-    version: 1,
+    version: 2,
     platform: "darwin",
     canonicalPath: profileDir,
     device: "1",
     inode: "1",
+    birthtimeNs: "3",
   })),
   createChromeProcessLaunchClaim: vi.fn((generationId: string) => ({
     version: 1 as const,
@@ -107,11 +108,12 @@ describe("openGeminiBrowserSession", () => {
     normalizedUserDataDir: "/tmp/gemini-profile",
     launchNonce: "canonical-owner",
     profileDirectory: {
-      version: 1,
+      version: 2,
       platform: "darwin",
       canonicalPath: "/tmp/gemini-profile",
       device: "1",
       inode: "1",
+      birthtimeNs: "3",
     },
   };
   const endpointAuthority = {

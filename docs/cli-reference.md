@@ -106,15 +106,15 @@ See [Browser Mode](browser-mode.md) for usage.
 
 ## Remote browser
 
-| Flag                             | Purpose                                                                        |
-| -------------------------------- | ------------------------------------------------------------------------------ |
-| `--remote-host <host:port>`      | Use a loopback `oracle serve` endpoint, normally through an SSH tunnel.        |
-| `--remote-token <secret>`        | Modern transaction-v3 HMAC root key for the remote host.                       |
-| `--remote-legacy-token <secret>` | Distinct predecessor text-only bearer; inert without explicit opt-in.          |
-| `--allow-legacy-text-protocol`   | Explicitly permit predecessor text-only fallback; no artifacts or v3 recovery. |
-| `--remote-chrome <host:port>`    | Attach to an existing remote Chrome session.                                   |
+| Flag                                       | Purpose                                                                          |
+| ------------------------------------------ | -------------------------------------------------------------------------------- |
+| `--remote-host <host:port>`                | Use a loopback `oracle serve` endpoint, normally through an SSH tunnel.          |
+| `--remote-token <64-lowercase-hex>`        | Modern transaction-v3 key: exactly 64 lowercase hexadecimal characters.          |
+| `--remote-legacy-token <64-lowercase-hex>` | Distinct predecessor bearer with the same required format; inert without opt-in. |
+| `--allow-legacy-text-protocol`             | Explicitly permit predecessor text-only fallback; no artifacts or v3 recovery.   |
+| `--remote-chrome <host:port>`              | Attach to an existing remote Chrome session.                                     |
 
-`oracle serve` requires a non-empty `--token <modern-v3-hmac-root-key>`, never prints that key, and rejects non-loopback plaintext binds. Use SSH tunneling between machines; verified TLS is not implemented. For predecessor clients, add `--legacy-token <distinct-secret>` to expose only the legacy health/text routes; the modern v3 key is never accepted as a bearer.
+`oracle serve` requires `--token <64-lowercase-hex-characters>` (a 32-byte key), never prints that key, and rejects non-loopback plaintext binds. Use SSH tunneling between machines; verified TLS is not implemented. For predecessor clients, add `--legacy-token <distinct-64-lowercase-hex-characters>` to expose only the legacy health/text routes; the modern v3 key is never accepted as a bearer.
 
 ## Approved ChatGPT conversation export
 

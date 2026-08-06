@@ -28,11 +28,12 @@ export function syntheticProfileIdentity(userDataDir: string): ProfileDirectoryI
   const canonicalPath = existsSync(resolvedPath) ? realpathSync(resolvedPath) : resolvedPath;
   const physical = existsSync(canonicalPath) ? statSync(canonicalPath, { bigint: true }) : null;
   return {
-    version: 1,
+    version: 2,
     platform: process.platform,
     canonicalPath,
     device: physical?.dev.toString() ?? "1",
     inode: physical?.ino.toString() ?? "2",
+    birthtimeNs: physical?.birthtimeNs.toString() ?? "3",
   };
 }
 
@@ -133,15 +134,4 @@ export function chromeLaunchResult(
     kill,
     processIdentity: identity,
   };
-}
-
-export function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
 }

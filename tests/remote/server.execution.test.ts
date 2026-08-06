@@ -64,7 +64,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: hostRuntime }));
       const runLog: string[] = [];
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           runBrowser: async (options) => {
             runLog.push(options.prompt);
@@ -104,7 +104,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       const executor = createRemoteBrowserExecutor({
         host: `127.0.0.1:${server.port}`,
-        token: "secret",
+        token: "a".repeat(64),
       });
       const clientLogs: string[] = [];
       const result = await executor({
@@ -210,7 +210,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         hostname: "127.0.0.1",
         port: server.port,
         path: "/health",
-        token: "secret",
+        token: "a".repeat(64),
       });
       expect(healthOk.statusCode).toBe(200);
       expect(healthOk.json?.ok).toBe(true);
@@ -241,7 +241,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         hostname: "127.0.0.1",
         port: server.port,
         path: "/transactions/%E0%A4%A/artifacts/artifact-id",
-        token: "secret",
+        token: "a".repeat(64),
       });
       expect(malformedArtifactPath.statusCode).toBe(404);
 
@@ -249,7 +249,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         hostname: "127.0.0.1",
         port: server.port,
         path: "/health",
-        token: "secret",
+        token: "a".repeat(64),
       });
       expect(healthAfterMalformedPath.statusCode).toBe(200);
 
@@ -270,7 +270,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       try {
         server = await createRemoteServer(
-          { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
           {
             transactionStoreDir: path.join(root, "transactions"),
             runBrowser: async (options) => {
@@ -315,7 +315,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         );
         const executor = createRemoteBrowserExecutor({
           host: `127.0.0.1:${server.port}`,
-          token: "secret",
+          token: "a".repeat(64),
         });
         const [first, second] = await Promise.all(
           ["first", "second"].map((prompt) =>
@@ -358,7 +358,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         {
           host: "127.0.0.1",
           port: 0,
-          token: "secret",
+          token: "a".repeat(64),
           logger: () => {},
           manualLoginDefault: true,
           manualLoginProfileDir,
@@ -385,7 +385,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       try {
         const executor = createRemoteBrowserExecutor({
           host: `127.0.0.1:${server.port}`,
-          token: "secret",
+          token: "a".repeat(64),
         });
         const result = await executor({
           prompt: "remote manual-login cleanup",
@@ -474,7 +474,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         }),
       );
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         { runBrowser, transactionStoreDir: path.join(tmpDir, "transactions") },
       );
 
@@ -483,7 +483,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${"1".repeat(64)}/run`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {
             ...remoteRunPayload(),
             browserConfig: { remoteChrome: { host: "attacker.invalid", port: 9222 } },
@@ -498,7 +498,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${"2".repeat(64)}/run`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {
             ...remoteRunPayload(),
             attachments: [

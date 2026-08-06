@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type {
   BrowserAttachment,
+  BrowserArtifactWriteAuthority,
   BrowserLogger,
   BrowserRunResult,
   BrowserRunTransaction,
@@ -48,6 +49,7 @@ import type {
 import { RemoteTransactionCapacityError, type RemoteTransactionStore } from "./transactionStore.js";
 import {
   buildRemotePromptRequestIdentity,
+  MAX_REMOTE_ATTACHMENTS,
   MAX_REMOTE_REQUEST_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteRunPayloadSchema,
@@ -130,10 +132,24 @@ export async function handleRemoteRunRequest(params: {
     }
     throw error;
   }
-  const artifactWriteAuthority = await params.artifactStore.createArtifactWriteAuthority({
-    transactionToken: params.transactionToken,
-    runId,
-  });
+  let artifactWriteAuthority: BrowserArtifactWriteAuthority;
+  try {
+    artifactWriteAuthority = await params.artifactStore.createArtifactWriteAuthority({
+      transactionToken: params.transactionToken,
+      runId,
+    });
+  } catch (error) {
+    const failed = await params.transactionStore.read(params.transactionToken);
+    params.logger(
+      `[serve] Run ${runId} failed artifact namespace initialization before browser work: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    sendJson(params.res, 500, {
+      error: "remote_artifact_namespace_initialization_failed",
+      state: failed?.state ?? "failed",
+      transactionToken: params.transactionToken,
+    });
+    return;
+  }
 
   params.logger(
     `[serve] Accepted run ${runId} from ${formatSocket(params.req)} (prompt ${payload.prompt.length} chars)`,
@@ -176,6 +192,20 @@ export async function handleRemoteRunRequest(params: {
       ...(result.savedFiles ?? []),
       ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
     ];
+    const withManualCopyWarning = (
+      source: BrowserRunResult,
+      message: string,
+    ): BrowserRunResult => ({
+      ...source,
+      warnings: [
+        ...(source.warnings ?? []),
+        {
+          code: "remote-artifact-manual-copy-required",
+          severity: "warning" as const,
+          message,
+        },
+      ].slice(-64),
+    });
     let stagedResult = result;
     let registrations: DurableRemoteArtifactRegistration[] | undefined =
       fileArtifacts.length === 0 || params.protocol === "legacy-text-v1" ? [] : undefined;
@@ -192,6 +222,12 @@ export async function handleRemoteRunRequest(params: {
           },
         ],
       };
+    } else if (fileArtifacts.length > MAX_REMOTE_ATTACHMENTS) {
+      registrations = [];
+      stagedResult = withManualCopyWarning(
+        result,
+        `Automatic remote transfer supports at most ${MAX_REMOTE_ATTACHMENTS} files. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.`,
+      );
     }
     let stagedRecord = await params.transactionStore.stageCapture({
       transactionToken: params.transactionToken,
@@ -201,31 +237,32 @@ export async function handleRemoteRunRequest(params: {
       modelSelection: result.modelSelection,
       artifacts: registrations,
     });
-    if (params.protocol === "transaction-v3" && fileArtifacts.length > 0) {
+    if (
+      params.protocol === "transaction-v3" &&
+      fileArtifacts.length > 0 &&
+      registrations === undefined
+    ) {
       try {
         registrations = await params.artifactStore.prepareRequiredArtifacts({
           transactionToken: params.transactionToken,
           runId,
           artifacts: fileArtifacts,
         });
+        if (registrations.length > MAX_REMOTE_ATTACHMENTS) {
+          throw new Error("Remote artifact manifest exceeds the public transaction limit");
+        }
       } catch (artifactError) {
         const artifactMessage =
           artifactError instanceof Error ? artifactError.message : String(artifactError);
-        stagedResult = {
-          ...result,
-          warnings: [
-            ...(result.warnings ?? []),
-            {
-              code: "remote-artifact-preparation-pending",
-              severity: "warning",
-              message: `The captured answer was preserved without remote artifact transfer: ${artifactMessage}`,
-              details: { stage: "remote-artifact-preparation" },
-            },
-          ],
-        };
+        registrations = [];
+        stagedResult = withManualCopyWarning(
+          result,
+          "Automatic remote artifact transfer could not be prepared. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
+        );
         sendEvent({
           type: "log",
-          message: `[browser] Answer captured; remote artifact transfer remains unavailable: ${artifactMessage}`,
+          message:
+            "[browser] Answer captured; generated files require manual copy from the remote host.",
         });
         params.logger(
           `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
@@ -241,8 +278,22 @@ export async function handleRemoteRunRequest(params: {
           artifacts: registrations,
         });
       } catch (enrichmentError) {
+        if (registrations.length === 0) throw enrichmentError;
+        stagedResult = withManualCopyWarning(
+          stagedResult,
+          "Automatic remote artifact transfer could not be published. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
+        );
+        registrations = [];
+        stagedRecord = await params.transactionStore.stageCapture({
+          transactionToken: params.transactionToken,
+          runId,
+          result: projectRemotePublicResult(stagedResult),
+          runtime,
+          modelSelection: result.modelSelection,
+          artifacts: registrations,
+        });
         params.logger(
-          `[serve] Run ${runId} retained its exact staged answer without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
+          `[serve] Run ${runId} published its captured text without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
         );
       }
     }

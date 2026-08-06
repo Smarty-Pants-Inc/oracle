@@ -12,6 +12,7 @@ import {
 import type { BridgeTunnelInfo } from "../../bridge/connection.js";
 import { readUserConfigFile, writeUserConfigFile } from "../../bridge/userConfigFile.js";
 import { checkRemoteHealth } from "../../remote/health.js";
+import { assertRemoteCredential } from "../../remote/auth.js";
 import { parsePlaintextRemoteEndpoint } from "../../remote/remoteServiceConfig.js";
 
 export interface BridgeClientCliOptions {
@@ -25,7 +26,7 @@ export interface BridgeClientCliOptions {
 }
 
 export async function runBridgeClient(options: BridgeClientCliOptions): Promise<void> {
-  const connectRaw = options.connect?.trim();
+  const connectRaw = options.connect;
   if (!connectRaw) {
     throw new Error(
       "Missing --connect. Provide a connection string or a bridge-connection.json path.",
@@ -33,21 +34,27 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
   }
 
   const allowLegacyTextProtocol = options.allowLegacyTextProtocol === true;
-  const explicitLegacyToken = options.legacyToken?.trim() || undefined;
-  if (allowLegacyTextProtocol && !explicitLegacyToken) {
+  const explicitLegacyToken = options.legacyToken;
+  if (allowLegacyTextProtocol && explicitLegacyToken === undefined) {
     throw new Error(
       "--allow-legacy-text-protocol requires a distinct --legacy-token; connection tokens are never reused as legacy bearers.",
     );
   }
-  if (explicitLegacyToken && !allowLegacyTextProtocol) {
+  if (explicitLegacyToken !== undefined && !allowLegacyTextProtocol) {
     throw new Error("--legacy-token requires explicit --allow-legacy-text-protocol opt-in.");
   }
   const { remoteHost, remoteToken, tunnel } = await resolveConnection(connectRaw, {
     allowTokenless: allowLegacyTextProtocol,
   });
   parsePlaintextRemoteEndpoint(remoteHost);
-  const token = remoteToken;
-  const legacyToken = allowLegacyTextProtocol ? explicitLegacyToken : undefined;
+  const token =
+    remoteToken === undefined
+      ? undefined
+      : assertRemoteCredential(remoteToken, "Bridge connection token");
+  const legacyToken =
+    allowLegacyTextProtocol && explicitLegacyToken !== undefined
+      ? assertRemoteCredential(explicitLegacyToken, "Bridge client --legacy-token")
+      : undefined;
   if (token && legacyToken && token === legacyToken) {
     throw new Error(
       "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
@@ -121,6 +128,11 @@ async function resolveConnection(
   input: string,
   options: { allowTokenless?: boolean } = {},
 ): Promise<{ remoteHost: string; remoteToken?: string; tunnel?: BridgeTunnelInfo }> {
+  if (input !== input.trim()) {
+    throw new Error(
+      "Invalid connection string or artifact path: surrounding whitespace is not allowed.",
+    );
+  }
   if (
     options.allowTokenless &&
     (input.includes("://") || !looksLikePath(input)) &&

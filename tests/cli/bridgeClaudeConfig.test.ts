@@ -10,6 +10,9 @@ import { formatCodexMcpSnippet } from "../../src/cli/bridge/codexConfig.ts";
 const execFileAsync = promisify(execFile);
 const CLI_ENTRY = path.join(process.cwd(), "bin", "oracle-cli.ts");
 
+const MODERN_TOKEN = "a".repeat(64);
+const LEGACY_TOKEN = "b".repeat(64);
+
 describe("formatClaudeMcpConfig", () => {
   test("prints a remote Claude Code MCP config without exposing tokens by default", () => {
     const parsed = JSON.parse(
@@ -17,7 +20,7 @@ describe("formatClaudeMcpConfig", () => {
         oracleHomeDir: "/Users/test/.oracle-local",
         browserProfileDir: "/Users/test/.oracle-local/browser-profile",
         remoteHost: "127.0.0.1:9473",
-        remoteToken: "secret-token",
+        remoteToken: MODERN_TOKEN,
         includeToken: false,
       }),
     );
@@ -32,7 +35,7 @@ describe("formatClaudeMcpConfig", () => {
       ORACLE_HOME_DIR: "/Users/test/.oracle-local",
       ORACLE_BROWSER_PROFILE_DIR: "/Users/test/.oracle-local/browser-profile",
       ORACLE_REMOTE_HOST: "127.0.0.1:9473",
-      ORACLE_REMOTE_TOKEN: "<YOUR_TOKEN>",
+      ORACLE_REMOTE_TOKEN: "<64_LOWERCASE_HEX_CHARACTERS>",
     });
   });
 
@@ -42,7 +45,7 @@ describe("formatClaudeMcpConfig", () => {
         oracleHomeDir: "/Users/test/.oracle-local",
         browserProfileDir: "/Users/test/.oracle-local/browser-profile",
         remoteHost: "127.0.0.1:9473",
-        remoteLegacyToken: "legacy-bearer",
+        remoteLegacyToken: LEGACY_TOKEN,
         allowLegacyTextProtocol: true,
         includeToken: false,
       }),
@@ -50,18 +53,18 @@ describe("formatClaudeMcpConfig", () => {
 
     expect(parsed.mcpServers.oracle.env).toMatchObject({
       ORACLE_REMOTE_HOST: "127.0.0.1:9473",
-      ORACLE_REMOTE_LEGACY_TOKEN: "<YOUR_LEGACY_TOKEN>",
+      ORACLE_REMOTE_LEGACY_TOKEN: "<DISTINCT_64_LOWERCASE_HEX_CHARACTERS>",
       ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL: "1",
     });
     expect(parsed.mcpServers.oracle.env).not.toHaveProperty("ORACLE_REMOTE_TOKEN");
 
     const codex = formatCodexMcpSnippet({
       remoteHost: "127.0.0.1:9473",
-      remoteLegacyToken: "legacy-bearer",
+      remoteLegacyToken: LEGACY_TOKEN,
       allowLegacyTextProtocol: true,
       includeToken: true,
     });
-    expect(codex).toContain('ORACLE_REMOTE_LEGACY_TOKEN = "legacy-bearer"');
+    expect(codex).toContain(`ORACLE_REMOTE_LEGACY_TOKEN = "${LEGACY_TOKEN}"`);
     expect(codex).toContain('ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL = "1"');
     expect(codex).not.toContain("ORACLE_REMOTE_TOKEN =");
   });
@@ -72,7 +75,7 @@ describe("formatClaudeMcpConfig", () => {
         oracleHomeDir: "/Users/test/.oracle",
         browserProfileDir: "/Users/test/.oracle/browser-profile",
         remoteHost: "127.0.0.1:9473",
-        remoteToken: "secret-token",
+        remoteToken: MODERN_TOKEN,
         includeToken: true,
         localBrowser: true,
       }),
@@ -84,6 +87,46 @@ describe("formatClaudeMcpConfig", () => {
       ORACLE_BROWSER_PROFILE_DIR: "/Users/test/.oracle/browser-profile",
     });
   });
+
+  test("rejects malformed remote credentials at CLI boundaries", async () => {
+    for (const token of ["dictionary-word", "A".repeat(64), "a".repeat(63), "g".repeat(64)]) {
+      await expect(
+        execFileAsync(process.execPath, ["--import", "tsx", CLI_ENTRY, "serve", "--token", token]),
+      ).rejects.toMatchObject({
+        stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
+      });
+    }
+    await expect(
+      execFileAsync(process.execPath, [
+        "--import",
+        "tsx",
+        CLI_ENTRY,
+        "serve",
+        "--token",
+        MODERN_TOKEN,
+        "--legacy-token",
+        "weak",
+      ]),
+    ).rejects.toMatchObject({
+      stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
+    });
+    for (const args of [
+      ["--remote-host", "127.0.0.1:9473", "--remote-token", "weak"],
+      [
+        "--remote-host",
+        "127.0.0.1:9473",
+        "--remote-legacy-token",
+        "weak",
+        "--allow-legacy-text-protocol",
+      ],
+    ]) {
+      await expect(
+        execFileAsync(process.execPath, ["--import", "tsx", CLI_ENTRY, ...args]),
+      ).rejects.toMatchObject({
+        stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
+      });
+    }
+  }, 30_000);
 
   test("prints local-browser CLI config as parseable stdout JSON", async () => {
     const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-claude-config-"));

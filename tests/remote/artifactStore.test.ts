@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { access, mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { describe, expect, test, vi } from "vitest";
 import type { SessionArtifact } from "../../src/sessionManager.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
@@ -213,6 +213,10 @@ describe("RemoteArtifactStore", () => {
       await begin(store, firstToken, "run-a");
       await begin(store, secondToken, "run-b");
       const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      await artifacts.createArtifactWriteAuthority({
+        transactionToken: firstToken,
+        runId: "run-a",
+      });
       const foreignAuthority = await artifacts.createArtifactWriteAuthority({
         transactionToken: secondToken,
         runId: "run-b",
@@ -356,6 +360,118 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
+  test("settles namespace initialization failure and removes only its exact fresh directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-init-failure-"));
+    const transactionToken = "2".repeat(64);
+    const actualFs = await vi.importActual<Record<string, unknown> & { mkdir: typeof mkdir }>(
+      "node:fs/promises",
+    );
+    const mkdirFailure = Object.assign(new Error("simulated artifacts directory failure"), {
+      code: "EIO",
+    });
+    const mockedMkdir = vi.fn(async (...args: unknown[]) => {
+      const [directoryPath] = args;
+      if (path.basename(String(directoryPath)) === "artifacts") throw mkdirFailure;
+      return await Reflect.apply(actualFs.mkdir, actualFs, args);
+    });
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, mkdir: mockedMkdir }));
+    // Test-isolated reload is required because the built-in ESM bindings predate vi.doMock.
+    const { RemoteArtifactStore: IsolatedRemoteArtifactStore } =
+      await import("../../src/remote/artifactStore.js");
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+      });
+      const begun = await begin(store, transactionToken, "run-init-failure");
+      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+
+      await expect(
+        artifacts.createArtifactWriteAuthority({
+          transactionToken,
+          runId: "run-init-failure",
+        }),
+      ).rejects.toBe(mkdirFailure);
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "failed",
+        artifactNamespaceState: "initializing",
+        artifactNamespaceIdentity: expect.objectContaining({ device: expect.any(String) }),
+        terminalAudit: {
+          errorCode: "remote-artifact-namespace-initialization-failed",
+          errorStage: "remote-artifact-namespace-initialization",
+        },
+      });
+      await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prunes a terminal record only after exact namespace cleanup and fails closed on substitution", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-retention-"));
+    const sessionsRoot = path.join(root, "sessions");
+    const cleanedToken = "3".repeat(64);
+    const substitutedToken = "4".repeat(64);
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+        terminalRetentionMs: 1_000,
+        now: () => now,
+      });
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const cleaned = await begin(store, cleanedToken, "run-cleaned");
+      await artifacts.createArtifactWriteAuthority({
+        transactionToken: cleanedToken,
+        runId: "run-cleaned",
+      });
+      await store.recordRecoverableFailure({
+        transactionToken: cleanedToken,
+        error: {
+          name: "BrowserAutomationError",
+          category: "browser-automation",
+          message: "terminal fixture",
+          recoverableDisconnect: false,
+        },
+      });
+
+      const substituted = await begin(store, substitutedToken, "run-substituted");
+      await artifacts.createArtifactWriteAuthority({
+        transactionToken: substitutedToken,
+        runId: "run-substituted",
+      });
+      await store.recordRecoverableFailure({
+        transactionToken: substitutedToken,
+        error: {
+          name: "BrowserAutomationError",
+          category: "browser-automation",
+          message: "terminal fixture",
+          recoverableDisconnect: false,
+        },
+      });
+      const substitutedPath = path.join(sessionsRoot, substituted.artifactNamespace);
+      await rm(substitutedPath, { recursive: true });
+      await mkdir(substitutedPath);
+
+      now += 1_001;
+      await expect(store.list()).resolves.toEqual([
+        expect.objectContaining({ transactionToken: substitutedToken, state: "failed" }),
+      ]);
+      await expect(store.read(cleanedToken)).resolves.toBeNull();
+      await expect(
+        access(path.join(sessionsRoot, cleaned.artifactNamespace)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(substitutedPath)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a symlinked transaction namespace", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-namespace-alias-"));
     try {
@@ -374,6 +490,17 @@ describe("RemoteArtifactStore", () => {
       await expect(
         artifacts.createArtifactWriteAuthority({ transactionToken, runId: "run-alias" }),
       ).rejects.toThrow("not created exclusively");
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "failed",
+        artifactNamespaceState: "initializing",
+        terminalAudit: {
+          errorCode: "remote-artifact-namespace-initialization-failed",
+          errorStage: "remote-artifact-namespace-initialization",
+        },
+      });
+      await expect(realpath(path.join(sessionsRoot, record.artifactNamespace))).resolves.toBe(
+        await realpath(foreignDirectory),
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -29,13 +29,6 @@ import type {
 
 const logger = vi.fn<(message: string) => void>();
 
-function createDeferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = () => resolvePromise();
-  });
-  return { promise, resolve };
-}
 async function writeNativeDevToolsActivePort(profileDir: string, port: number): Promise<void> {
   await fs.writeFile(
     path.join(profileDir, "DevToolsActivePort"),
@@ -132,8 +125,8 @@ describe("manual Chrome owner acquisition", () => {
         "00000000-0000-4000-8000-000000000001",
       );
       let ownerLaunched = false;
-      const launchStarted = createDeferred();
-      const allowLaunchToFinish = createDeferred();
+      const launchStarted = Promise.withResolvers<void>();
+      const allowLaunchToFinish = Promise.withResolvers<void>();
       const launch = vi.fn(async () => {
         ownerLaunched = true;
         launchStarted.resolve();
@@ -150,8 +143,8 @@ describe("manual Chrome owner acquisition", () => {
       );
       const endpointAuthority = retainedEndpointAuthority(canonicalIdentity, canonicalPort);
       const retainEndpointAuthority = vi.fn(async () => endpointAuthority);
-      const fallbackLockQueued = createDeferred();
-      const normalLockReleased = createDeferred();
+      const fallbackLockQueued = Promise.withResolvers<void>();
+      const normalLockReleased = Promise.withResolvers<void>();
       const lockHandoff: string[] = [];
       let lockAttempts = 0;
       // Filesystem-lock mechanics have dedicated coverage; keep this fixture focused on the

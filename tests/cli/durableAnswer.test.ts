@@ -10,16 +10,17 @@ import {
   persistBrowserCaptureFinalizationState,
   readDurableBrowserAnswer,
   verifiedDurableBrowserAnswerReceiptFromError,
-  type DurableBrowserAnswerReceipt,
 } from "../../src/cli/durableAnswer.js";
+import type { DurableBrowserAnswerReceipt } from "../../src/cli/durableAnswer.js";
 import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
 import {
   BrowserPublicationJournalStore,
   isBrowserPublicationAcknowledged,
+  journalHasFinalizeAuthorityForReceipt,
   readBrowserCapturePublicationJournal,
   reduceBrowserPublicationEvent,
-  type BrowserCapturePublicationJournal,
 } from "../../src/cli/browserPublicationJournal.js";
+import type { BrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
 import type {
   BrowserRuntimeMetadata,
   SessionMetadata,
@@ -223,6 +224,34 @@ describe("browser publication phase model", () => {
     expect(isBrowserPublicationAcknowledged(published, terminalMetadata)).toBe(true);
     expect(isBrowserPublicationAcknowledged(cleanupPending, terminalMetadata)).toBe(true);
     expect(isBrowserPublicationAcknowledged(published, null)).toBe(false);
+  });
+
+  test("grants FINALIZE authority only to the journal's exact durable receipt", () => {
+    const published = reduceBrowserPublicationEvent(finalizeBound, {
+      type: "completed-session-persisted",
+      receipt: { artifact },
+      completedSessionPersisted: true,
+    });
+    const cleanupPending = reduceBrowserPublicationEvent(published, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: {
+        status: "pending",
+        runtime: finalizeBound.runtime,
+        errorCode: "browser-cleanup-finalize-pending",
+        errorMessage: "cleanup remains pending",
+      },
+    });
+    const differentReceipt = {
+      artifact: { ...artifact, path: "/tmp/different-browser-answer.md" },
+    };
+
+    expect(journalHasFinalizeAuthorityForReceipt(preparing, { artifact })).toBe(false);
+    expect(journalHasFinalizeAuthorityForReceipt(staged, { artifact })).toBe(false);
+    expect(journalHasFinalizeAuthorityForReceipt(finalizeBound, { artifact })).toBe(true);
+    expect(journalHasFinalizeAuthorityForReceipt(published, { artifact })).toBe(true);
+    expect(journalHasFinalizeAuthorityForReceipt(cleanupPending, { artifact })).toBe(true);
+    expect(journalHasFinalizeAuthorityForReceipt(finalizeBound, differentReceipt)).toBe(false);
   });
 
   test("reduces every legal publication edge", () => {

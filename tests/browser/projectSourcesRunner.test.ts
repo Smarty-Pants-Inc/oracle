@@ -107,11 +107,12 @@ test("persists and resolves Project Sources cleanup while discarding successful 
         async (directory: string, options?: { create?: boolean }) =>
           path.basename(directory).startsWith("oracle-browser-")
             ? {
-                version: 1 as const,
+                version: 2 as const,
                 platform: process.platform,
                 canonicalPath: path.resolve(directory),
                 device: "1",
                 inode: "1",
+                birthtimeNs: "3",
               }
             : actual.captureProfileDirectoryIdentity(directory, options),
       ),
@@ -229,11 +230,12 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       pid: 1,
       processIdentity: {
         profileDirectory: {
-          version: 1,
+          version: 2,
           platform: process.platform,
           canonicalPath: path.resolve(profileDir),
           device: "1",
           inode: "1",
+          birthtimeNs: "3",
         },
         launchClaim: options?.launchClaim,
       },
@@ -272,37 +274,33 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       },
       recoveryCleanup: { ownsTarget: true, closeOwnedTargetOnComplete: true },
     });
-    let observedTargetMarker =
-      pendingJournal.runtime.recoveryCleanupResources[0].acquisition.targetMarkerUrl;
-    mocks.listTargets.mockResolvedValue({
-      status: "completed",
-      value: [{ targetId: "project-sources-target" }],
-    });
+    mocks.listTargets.mockClear();
+    mocks.retainEndpoint.mockClear();
+    mocks.closeTarget.mockClear();
     expect(targetCloseAuthority.retainedTargetCloseAuthorityCount()).toBe(1);
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();
-    mocks.retainEndpoint.mockResolvedValue({
-      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recovered-project",
-      release: vi.fn(async () => undefined),
-      runExactOperation: vi.fn(async (operation) => ({
-        status: "completed",
-        value: await operation({
-          Target: {
-            attachToTarget: vi.fn(async () => ({ sessionId: "project-sources-session" })),
-            detachFromTarget: vi.fn(async () => undefined),
-          },
-          send: vi.fn(async () => ({ result: { value: observedTargetMarker } })),
-        }),
-      })),
-    });
     mocks.retryCleanup.mockImplementationOnce(async (runtime, logger, deps) => {
       const resource = runtime.recoveryCleanupResources[0];
+      expect(resource.recoveryCleanup).toMatchObject({
+        ownsTarget: true,
+        profileKind: "temporary",
+        keepBrowser: false,
+      });
       await expect(
         deps.recoveryCleanup.closeChromeTargetWithRetainedCapability({
           capability: resource.targetCloseCapability,
           targetId: resource.chromeTargetId,
           logger,
         }),
-      ).resolves.toMatchObject({ status: "completed" });
+      ).resolves.toMatchObject({
+        status: "unavailable",
+        reason: expect.stringMatching(/no longer live/i),
+      });
+      expect(mocks.retainEndpoint).not.toHaveBeenCalled();
+      expect(mocks.listTargets).not.toHaveBeenCalled();
+      expect(mocks.closeTarget).not.toHaveBeenCalled();
+
+      // The local finalizer may converge this exact temporary owner by tearing down its process.
       const completedRuntime = { ...runtime };
       delete completedRuntime.recoveryCleanupResources;
       delete completedRuntime.recoveryCleanupResult;
@@ -312,111 +310,40 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     mocks.closeTarget.mockResolvedValue({ status: "completed" });
     await expect(runBrowserProjectSources(request)).resolves.toMatchObject({ status: "ok" });
     expect(mocks.retryCleanup).toHaveBeenCalledOnce();
-    expect(mocks.retainEndpoint).toHaveBeenCalledOnce();
+    expect(mocks.retainEndpoint).not.toHaveBeenCalled();
+    expect(mocks.listTargets).not.toHaveBeenCalled();
     await expect(
       readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(targetCloseAuthority.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(1);
+
     const pendingTargetAcquisition = JSON.parse(JSON.stringify(pendingJournal.runtime));
     const pendingTargetResource = pendingTargetAcquisition.recoveryCleanupResources[0];
-    delete pendingTargetResource.chromeTargetId;
-    delete pendingTargetResource.targetCloseCapability;
     pendingTargetResource.acquisition.pendingResource = "chrome-target";
     pendingTargetResource.recoveryCleanup.ownsTarget = true;
     pendingTargetResource.recoveryCleanup.closeOwnedTargetOnComplete = true;
     mocks.closeTarget.mockClear();
-    mocks.listTargets.mockResolvedValue({
-      status: "completed",
-      value: [
-        { targetId: "interrupted-project-sources-target", type: "page", url: observedTargetMarker },
-      ],
-    });
-    mocks.retainEndpoint.mockResolvedValue({
-      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/recovered-project",
-      release: vi.fn(async () => undefined),
-      runExactOperation: vi.fn(async () => ({ status: "completed", value: false })),
-    });
+    mocks.listTargets.mockClear();
+    mocks.retainEndpoint.mockClear();
     const reconciledTargetAcquisition =
       await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
         pendingTargetAcquisition,
         vi.fn<(message: string) => void>(),
       );
-    expect(reconciledTargetAcquisition).toMatchObject({
-      chromeTargetId: undefined,
-      recoveryCleanupResources: [
-        {
-          chromeTargetId: undefined,
-          targetCloseCapability: undefined,
-          recoveryCleanup: { ownsTarget: false, closeOwnedTargetOnComplete: undefined },
-        },
-      ],
+    expect(reconciledTargetAcquisition).toBe(pendingTargetAcquisition);
+    expect(reconciledTargetAcquisition.recoveryCleanupResources?.[0]).toMatchObject({
+      chromeTargetId: "project-sources-target",
+      targetCloseCapability: {
+        generationId: expect.any(String),
+        capabilityId: expect.any(String),
+      },
+      acquisition: { pendingResource: "chrome-target" },
+      recoveryCleanup: { ownsTarget: true, closeOwnedTargetOnComplete: true },
     });
-    expect(
-      reconciledTargetAcquisition.recoveryCleanupResources?.[0]?.acquisition,
-    ).not.toHaveProperty("pendingResource");
-    expect(mocks.closeTarget).toHaveBeenCalledWith(
-      expect.objectContaining({ targetId: "interrupted-project-sources-target" }),
-    );
+    expect(mocks.retainEndpoint).not.toHaveBeenCalled();
+    expect(mocks.listTargets).not.toHaveBeenCalled();
+    expect(mocks.closeTarget).not.toHaveBeenCalled();
 
-    // A marker collision in an intentionally preserved manual-browser target must converge the
-    // journal without closing the live manual target or retaining a stale close closure.
-    pendingTargetResource.recoveryCleanup.closeOwnedTargetOnComplete = false;
-    mocks.closeTarget.mockClear();
-    const reconciledPreservedTarget =
-      await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
-        pendingTargetAcquisition,
-        vi.fn<(message: string) => void>(),
-      );
-    expect(reconciledPreservedTarget).toMatchObject({
-      chromeTargetId: undefined,
-      recoveryCleanupResources: [
-        {
-          chromeTargetId: undefined,
-          targetCloseCapability: undefined,
-          recoveryCleanup: { ownsTarget: false, closeOwnedTargetOnComplete: undefined },
-        },
-      ],
-    });
-    expect(reconciledPreservedTarget.recoveryCleanupResources?.[0]?.acquisition).not.toHaveProperty(
-      "pendingResource",
-    );
-    expect(mocks.closeTarget).not.toHaveBeenCalled();
-    // A pre-existing manual target without this generation's URL or window marker is not an
-    // acquired Project Sources target and must not be closed during recovery.
-    pendingTargetResource.recoveryCleanup.closeOwnedTargetOnComplete = true;
-    mocks.closeTarget.mockClear();
-    mocks.listTargets.mockResolvedValue({
-      status: "completed",
-      value: [{ targetId: "pre-existing-manual-target", type: "page", url: "about:blank" }],
-    });
-    const reconciledAbsentTarget =
-      await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
-        pendingTargetAcquisition,
-        vi.fn<(message: string) => void>(),
-      );
-    expect(reconciledAbsentTarget.recoveryCleanupResources?.[0]?.acquisition).not.toHaveProperty(
-      "pendingResource",
-    );
-    mocks.listTargets.mockResolvedValue({
-      status: "completed",
-      value: [
-        { targetId: "ambiguous-project-sources-target-a", type: "page", url: observedTargetMarker },
-        { targetId: "ambiguous-project-sources-target-b", type: "page", url: observedTargetMarker },
-      ],
-    });
-    await expect(
-      projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
-        pendingTargetAcquisition,
-        vi.fn<(message: string) => void>(),
-      ),
-    ).rejects.toThrow(/multiple generation markers/i);
-    expect(mocks.closeTarget).not.toHaveBeenCalled();
-    mocks.closeTarget.mockClear();
-    observedTargetMarker = "about:blank#substituted-target";
-    mocks.listTargets.mockResolvedValue({
-      status: "completed",
-      value: [{ targetId: "project-sources-target" }],
-    });
     await expect(
       projectSourcesRecovery.closeProjectSourcesTargetFromJournal({
         runtime: pendingJournal.runtime,
@@ -424,7 +351,12 @@ test("persists and resolves Project Sources cleanup while discarding successful 
         targetId: "project-sources-target",
         logger: vi.fn<(message: string) => void>(),
       }),
-    ).resolves.toMatchObject({ status: "unsafe", reason: expect.stringMatching(/marker/i) });
+    ).resolves.toMatchObject({
+      status: "unavailable",
+      reason: expect.stringMatching(/no longer live/i),
+    });
+    expect(mocks.retainEndpoint).not.toHaveBeenCalled();
+    expect(mocks.listTargets).not.toHaveBeenCalled();
     expect(mocks.closeTarget).not.toHaveBeenCalled();
 
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();

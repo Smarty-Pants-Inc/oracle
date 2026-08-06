@@ -130,6 +130,22 @@ export type BrowserPublicationRemovalEvent =
       completedSessionPersisted: true;
     };
 
+export function journalHasFinalizeAuthorityForReceipt(
+  journal: BrowserCapturePublicationJournal | null | undefined,
+  receipt: DurableBrowserAnswerReceipt | null | undefined,
+): boolean {
+  return Boolean(
+    journal &&
+    receipt &&
+    (journal.phase === "finalize-bound" ||
+      journal.phase === "published" ||
+      journal.phase === "cleanup-pending") &&
+    journal.receipt.artifact.path === receipt.artifact.path &&
+    journal.receipt.artifact.sha256 === receipt.artifact.sha256 &&
+    journal.receipt.artifact.sizeBytes === receipt.artifact.sizeBytes,
+  );
+}
+
 export function isBrowserPublicationAcknowledged(
   journal: BrowserCapturePublicationJournal | null | undefined,
   metadata: SessionMetadata | null | undefined,

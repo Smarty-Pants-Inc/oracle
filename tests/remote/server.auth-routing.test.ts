@@ -1,11 +1,17 @@
 import { describe, expect, test } from "vitest";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import { CAN_LISTEN_LOCALHOST, browserTransaction } from "./serverTestBuilders.js";
-import { httpGetJson, httpPostJson } from "./serverTestHttp.js";
+import {
+  httpGetJson,
+  httpPostJson,
+  prepareTestAuthentication,
+  readIncomingBody,
+} from "./serverTestHttp.js";
 import {
   TEST_CONTROLLER_GENERATION,
   openSeedTransactionStore,
@@ -17,7 +23,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     "keeps configured and generated v3 root keys out of ordinary startup diagnostics",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-startup-token-"));
-      const configuredToken = "v3-root-key-sentinel"; // gitleaks:allow — synthetic test sentinel
+      const configuredToken = "f".repeat(64); // gitleaks:allow — synthetic test sentinel
       const configuredLogs: string[] = [];
       const configured = await createRemoteServer(
         {
@@ -42,6 +48,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           { transactionStoreDir: path.join(tmpDir, "generated-transactions") },
         );
         expect(generatedLogs.join("\n")).not.toContain(generated.token);
+        expect(generated.token).toMatch(/^[0-9a-f]{64}$/u);
       } finally {
         await generated?.close();
         await configured.close();
@@ -49,6 +56,24 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       }
     },
   );
+  test("rejects malformed configured modern and legacy credentials before startup", async () => {
+    for (const token of [
+      "",
+      " ",
+      "dictionary-word",
+      "A".repeat(64),
+      "a".repeat(63),
+      "g".repeat(64),
+    ]) {
+      await expect(createRemoteServer({ token })).rejects.toThrow(
+        /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
+      );
+    }
+    await expect(
+      createRemoteServer({ token: "a".repeat(64), legacyToken: "weak" }),
+    ).rejects.toThrow(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i);
+  });
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "keeps the legacy bearer scoped to predecessor health and text runs",
     async () => {
@@ -57,8 +82,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         {
           host: "127.0.0.1",
           port: 0,
-          token: "v3-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           logger: () => {},
         },
         { transactionStoreDir: path.join(tmpDir, "transactions") },
@@ -69,7 +94,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             hostname: "127.0.0.1",
             port: server.port,
             path: "/health",
-            headers: { authorization: "Bearer v3-root-key" },
+            headers: { authorization: `Bearer ${"a".repeat(64)}` },
           }),
         ).resolves.toMatchObject({ statusCode: 401 });
         await expect(
@@ -77,7 +102,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             hostname: "127.0.0.1",
             port: server.port,
             path: "/health",
-            headers: { authorization: "Bearer legacy-bearer" },
+            headers: { authorization: `Bearer ${"c".repeat(64)}` },
           }),
         ).resolves.toMatchObject({ statusCode: 200, json: { ok: true } });
         await expect(
@@ -86,7 +111,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             port: server.port,
             path: "/runs",
             body: {},
-            headers: { authorization: "Bearer v3-root-key" },
+            headers: { authorization: `Bearer ${"a".repeat(64)}` },
           }),
         ).resolves.toMatchObject({ statusCode: 401 });
         await expect(
@@ -95,7 +120,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             port: server.port,
             path: "/runs",
             body: {},
-            headers: { authorization: "Bearer legacy-bearer" },
+            headers: { authorization: `Bearer ${"c".repeat(64)}` },
           }),
         ).resolves.toMatchObject({ statusCode: 400 });
       } finally {
@@ -113,8 +138,8 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         {
           host: "127.0.0.1",
           port: 0,
-          token: "v3-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           logger: () => {},
         },
         {
@@ -136,7 +161,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: "/runs",
-          headers: { authorization: "Bearer legacy-bearer" },
+          headers: { authorization: `Bearer ${"c".repeat(64)}` },
           body: {
             prompt: "legacy cookie payload",
             attachments: [],
@@ -180,7 +205,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const store = await openSeedTransactionStore(transactionStoreDir, 5_000, transactionStoreNow);
       await seedRemoteTransaction(store, transactionToken, { prompt: "renew exact lease" });
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           controllerGeneration: TEST_CONTROLLER_GENERATION,
@@ -205,7 +230,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/retry`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {},
         });
         expect(authenticatedRetry.statusCode).toBe(200);
@@ -225,7 +250,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/artifacts/missing-artifact`,
-          token: "secret",
+          token: "a".repeat(64),
         });
         expect(authenticatedArtifact.statusCode).toBe(404);
         const artifactLease = (await store.read(transactionToken))?.leaseExpiresAt;
@@ -245,7 +270,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/artifacts/missing-artifact/receipt`,
-          token: "secret",
+          token: "a".repeat(64),
           body: { sha256: "d".repeat(64), byteSize: 1 },
         });
         expect(receipt.statusCode).toBe(404);
@@ -266,12 +291,81 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/finalize`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {},
         });
         expect(invalidSettlement.statusCode).toBe(400);
         const settlementLease = (await store.read(transactionToken))?.leaseExpiresAt;
         expect(Date.parse(settlementLease ?? "")).toBeGreaterThan(Date.parse(receiptLease ?? ""));
+      } finally {
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "rejects retry bodies with mismatched signed digests and shared size limits",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retry-body-auth-"));
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        { transactionStoreDir: path.join(tmpDir, "transactions") },
+      );
+      try {
+        const retryPath = `/transactions/${"c".repeat(64)}/retry`;
+        const signedBody = Buffer.from("{}");
+        const sentBody = Buffer.from('{"unexpected":true}');
+        const authentication = await prepareTestAuthentication({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: retryPath,
+          token: "a".repeat(64),
+          method: "POST",
+          body: signedBody,
+        });
+        if (!authentication) throw new Error("missing retry request authentication");
+
+        const digestMismatch = await new Promise<{ statusCode: number; body: string }>(
+          (resolve, reject) => {
+            const request = http.request(
+              {
+                hostname: "127.0.0.1",
+                port: server.port,
+                path: retryPath,
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Content-Length": sentBody.byteLength,
+                  ...authentication.authentication.headers,
+                },
+              },
+              (response) => {
+                void readIncomingBody(response).then(
+                  (body) => resolve({ statusCode: response.statusCode ?? 0, body }),
+                  reject,
+                );
+              },
+            );
+            request.on("error", reject);
+            request.end(sentBody);
+          },
+        );
+        expect(digestMismatch.statusCode).toBe(401);
+        expect(JSON.parse(digestMismatch.body)).toMatchObject({
+          error: "request_body_authentication_failed",
+        });
+
+        const oversized = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: retryPath,
+          token: "a".repeat(64),
+          body: { padding: "x".repeat(4096) },
+        });
+        expect(oversized).toMatchObject({
+          statusCode: 413,
+          json: { error: "request_too_large" },
+        });
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -284,7 +378,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-lock-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
-      const options = { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} };
+      const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
       const first = await createRemoteServer(options, { transactionStoreDir });
       try {
         await expect(createRemoteServer(options, { transactionStoreDir })).rejects.toThrow(

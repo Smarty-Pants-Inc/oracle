@@ -78,11 +78,12 @@ export function createPendingChromeAcquisitionRuntime(): BrowserRuntimeMetadata 
         chromeProfileRoot: userDataDir,
         userDataDir,
         profileDirectoryIdentity: {
-          version: 1,
+          version: 2,
           platform: process.platform,
           canonicalPath: userDataDir,
           device: "1",
           inode: "2",
+          birthtimeNs: "3",
         },
         acquisition: {
           generationId,

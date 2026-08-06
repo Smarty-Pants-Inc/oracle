@@ -250,11 +250,12 @@ describe("hidden macOS Chrome launch", () => {
       normalizedUserDataDir: userDataDir,
       launchNonce: "00000000-0000-4000-8000-000000007004",
       profileDirectory: {
-        version: 1,
+        version: 2,
         platform: "darwin",
         canonicalPath: userDataDir,
         device: "1",
         inode: "2",
+        birthtimeNs: "3",
       },
     };
     const commandTokens = [

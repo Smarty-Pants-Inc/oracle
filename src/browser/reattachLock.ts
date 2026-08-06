@@ -3,8 +3,8 @@ import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
 } from "./filesystemLock.js";
+import { canonicalFilesystemLockPath } from "./filesystemLockModel.js";
 import {
-  canonicalFilesystemLockPath,
   hasRetainedFilesystemLockRelease,
   retryPendingFilesystemLockReleases,
 } from "./filesystemLockReleaseJournal.js";

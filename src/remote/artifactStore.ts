@@ -6,15 +6,26 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
+import {
+  capturePhysicalDirectoryIdentity,
+  samePhysicalDirectoryIdentity,
+} from "../browser/filesystemLockDirectoryIdentity.js";
+import {
+  isolateDirectoryGenerationForRemoval,
+  removeIsolatedDirectoryGeneration,
+  replayPendingIsolatedDirectoryRemovals,
+} from "../browser/filesystemLockDirectoryRemoval.js";
 import type { BrowserArtifactWriteAuthority } from "../browser/types.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactDescriptor } from "./types.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
+  DurableRemoteArtifactNamespaceIdentity,
   DurableRemoteArtifactRegistration,
   DurableRemoteFileIdentity,
+  RemoteTransactionRecord,
 } from "./transactionModel.js";
-import { RemoteTransactionStore } from "./transactionStore.js";
+import type { RemoteTransactionStore } from "./transactionStore.js";
 
 export interface RemoteArtifactStoreOptions {
   transactionStore: RemoteTransactionStore;
@@ -39,35 +50,73 @@ export class RemoteArtifactStore {
     this.#sessionsRoot = options.sessionsRoot;
     this.#maximumArtifactBytes = options.maximumArtifactBytes ?? MAX_REMOTE_ARTIFACT_BYTES;
     this.#now = options.now ?? Date.now;
+    this.#transactionStore.registerArtifactNamespaceCleanup((record) =>
+      this.cleanupArtifactNamespace(record),
+    );
   }
   async createArtifactWriteAuthority(params: {
     transactionToken: string;
     runId: string;
   }): Promise<BrowserArtifactWriteAuthority> {
     const record = await this.#transactionStore.read(params.transactionToken);
-    if (!record || record.runId !== params.runId) {
-      throw new Error("Remote artifact namespace is not owned by the exact transaction");
+    if (
+      !record ||
+      record.runId !== params.runId ||
+      record.state !== "running" ||
+      record.artifactNamespaceState !== "uninitialized"
+    ) {
+      throw new Error("Remote artifact namespace is not owned by the exact fresh transaction");
     }
-    await mkdir(this.#sessionsRoot, { recursive: true, mode: 0o700 });
-    const namespaceDirectory = path.join(this.#sessionsRoot, record.artifactNamespace);
+
     try {
-      await mkdir(namespaceDirectory, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new Error("Remote artifact namespace was not created exclusively");
+      await this.#transactionStore.beginArtifactNamespaceInitialization(params);
+      await mkdir(this.#sessionsRoot, { recursive: true, mode: 0o700 });
+      const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
+      try {
+        await mkdir(namespaceDirectory, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error("Remote artifact namespace was not created exclusively");
+        }
+        throw error;
       }
+      const identity = await capturePhysicalDirectoryIdentity(namespaceDirectory);
+      await this.#transactionStore.bindArtifactNamespaceIdentity({ ...params, identity });
+      const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
+      await mkdir(artifactsDirectory, { mode: 0o700 });
+      if (process.platform !== "win32") {
+        await chmod(namespaceDirectory, 0o700);
+        await chmod(artifactsDirectory, 0o700);
+      }
+      const canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
+        record.artifactNamespace,
+        identity,
+      );
+      await this.#transactionStore.completeArtifactNamespaceInitialization(params);
+      return { artifactsDirectory: canonicalArtifactsDirectory };
+    } catch (error) {
+      let failed: RemoteTransactionRecord;
+      try {
+        failed = await this.#transactionStore.recordRecoverableFailure({
+          transactionToken: params.transactionToken,
+          error: {
+            name: "BrowserAutomationError",
+            category: "browser-automation",
+            message: "Remote artifact namespace initialization failed before browser work started.",
+            code: "remote-artifact-namespace-initialization-failed",
+            stage: "remote-artifact-namespace-initialization",
+            recoverableDisconnect: false,
+          },
+        });
+      } catch (settlementError) {
+        throw new AggregateError(
+          [error, settlementError],
+          "Remote artifact namespace initialization and durable failure settlement both failed",
+        );
+      }
+      await this.cleanupArtifactNamespace(failed).catch(() => false);
       throw error;
     }
-    const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
-    await mkdir(artifactsDirectory, { mode: 0o700 });
-    if (process.platform !== "win32") {
-      await chmod(namespaceDirectory, 0o700);
-      await chmod(artifactsDirectory, 0o700);
-    }
-    const canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
-      record.artifactNamespace,
-    );
-    return { artifactsDirectory: canonicalArtifactsDirectory };
   }
 
   async prepareRequiredArtifacts(params: {
@@ -76,8 +125,15 @@ export class RemoteArtifactStore {
     artifacts: SessionArtifact[];
   }): Promise<DurableRemoteArtifactRegistration[]> {
     const record = await this.#transactionStore.read(params.transactionToken);
-    if (!record || record.runId !== params.runId) {
-      throw new Error("Remote artifact registration is not owned by the exact transaction");
+    if (
+      !record ||
+      record.runId !== params.runId ||
+      record.artifactNamespaceState !== "initialized" ||
+      !record.artifactNamespaceIdentity
+    ) {
+      throw new Error(
+        "Remote artifact registration is not owned by the exact initialized transaction",
+      );
     }
     const seenCanonicalPaths = new Set<string>();
     const registrations: DurableRemoteArtifactRegistration[] = [];
@@ -87,6 +143,7 @@ export class RemoteArtifactStore {
         transactionToken: params.transactionToken,
         runId: params.runId,
         artifactNamespace: record.artifactNamespace,
+        artifactNamespaceIdentity: record.artifactNamespaceIdentity,
         artifact,
       });
       if (seenCanonicalPaths.has(registration.canonicalPath)) continue;
@@ -109,10 +166,14 @@ export class RemoteArtifactStore {
     if (!record.leaseExpiresAt || this.#now() >= Date.parse(record.leaseExpiresAt)) {
       throw new RemoteArtifactUnavailableError("transaction_lease_expired");
     }
+    if (record.artifactNamespaceState !== "initialized" || !record.artifactNamespaceIdentity) {
+      throw new RemoteArtifactUnavailableError("artifact_identity_changed");
+    }
 
     const currentCanonicalPath = await this.resolveContainedArtifactPath(
       registration.canonicalPath,
       record.artifactNamespace,
+      record.artifactNamespaceIdentity,
     ).catch(() => null);
     if (!currentCanonicalPath || currentCanonicalPath !== registration.canonicalPath) {
       throw new RemoteArtifactUnavailableError("artifact_identity_changed");
@@ -186,10 +247,77 @@ export class RemoteArtifactStore {
     }
   }
 
+  private namespaceDirectory(artifactNamespace: string): string {
+    const sessionsRoot = path.resolve(this.#sessionsRoot);
+    const namespaceDirectory = path.resolve(sessionsRoot, artifactNamespace);
+    if (path.dirname(namespaceDirectory) !== sessionsRoot) {
+      throw new Error("Remote artifact namespace escapes the configured sessions root");
+    }
+    return namespaceDirectory;
+  }
+
+  private async cleanupArtifactNamespace(record: RemoteTransactionRecord): Promise<boolean> {
+    if (record.artifactNamespaceState === "uninitialized") return true;
+    const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
+    const identity = record.artifactNamespaceIdentity;
+    if (!identity) {
+      try {
+        await capturePhysicalDirectoryIdentity(namespaceDirectory);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        throw error;
+      }
+    }
+
+    const verifyIdentity = async (candidatePath: string): Promise<boolean> => {
+      try {
+        return samePhysicalDirectoryIdentity(
+          await capturePhysicalDirectoryIdentity(candidatePath),
+          identity,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    };
+    await replayPendingIsolatedDirectoryRemovals(this.#sessionsRoot, namespaceDirectory, {
+      verifyGenerationForRemoval: verifyIdentity,
+    });
+    let currentMatches: boolean;
+    try {
+      currentMatches = await verifyIdentity(namespaceDirectory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+    if (!currentMatches) {
+      try {
+        await capturePhysicalDirectoryIdentity(namespaceDirectory);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        throw error;
+      }
+    }
+    const isolation = await isolateDirectoryGenerationForRemoval(
+      namespaceDirectory,
+      verifyIdentity,
+      namespaceDirectory,
+    );
+    if (isolation.status === "missing") return true;
+    if (isolation.status === "changed") return false;
+    await removeIsolatedDirectoryGeneration(isolation.rootPath, {
+      verifyGenerationForRemoval: verifyIdentity,
+    });
+    return true;
+  }
+
   private async buildRegistration(params: {
     transactionToken: string;
     runId: string;
     artifactNamespace: string;
+    artifactNamespaceIdentity: DurableRemoteArtifactNamespaceIdentity;
     artifact: SessionArtifact;
   }): Promise<DurableRemoteArtifactRegistration> {
     if (params.artifact.path.endsWith(".crdownload")) {
@@ -206,6 +334,7 @@ export class RemoteArtifactStore {
     const canonicalPath = await this.resolveContainedArtifactPath(
       params.artifact.path,
       params.artifactNamespace,
+      params.artifactNamespaceIdentity,
     );
     const handle = await open(canonicalPath, "r");
     try {
@@ -264,13 +393,31 @@ export class RemoteArtifactStore {
     }
   }
 
-  private async resolveArtifactNamespaceDirectory(artifactNamespace: string): Promise<string> {
+  private async resolveArtifactNamespaceDirectory(
+    artifactNamespace: string,
+    expectedIdentity: DurableRemoteArtifactNamespaceIdentity,
+  ): Promise<string> {
+    const namespaceDirectory = this.namespaceDirectory(artifactNamespace);
+    if (
+      !samePhysicalDirectoryIdentity(
+        await capturePhysicalDirectoryIdentity(namespaceDirectory),
+        expectedIdentity,
+      )
+    ) {
+      throw new Error("Remote artifact namespace physical identity changed");
+    }
     const [canonicalSessionsRoot, canonicalArtifactsDirectory] = await Promise.all([
       realpath(this.#sessionsRoot),
-      realpath(path.join(this.#sessionsRoot, artifactNamespace, "artifacts")),
+      realpath(path.join(namespaceDirectory, "artifacts")),
     ]);
     const expectedDirectory = path.join(canonicalSessionsRoot, artifactNamespace, "artifacts");
-    if (canonicalArtifactsDirectory !== expectedDirectory) {
+    if (
+      canonicalArtifactsDirectory !== expectedDirectory ||
+      !samePhysicalDirectoryIdentity(
+        await capturePhysicalDirectoryIdentity(namespaceDirectory),
+        expectedIdentity,
+      )
+    ) {
       throw new Error("Remote artifact namespace is not the exact server-owned directory");
     }
     return canonicalArtifactsDirectory;
@@ -279,6 +426,7 @@ export class RemoteArtifactStore {
   private async resolveContainedArtifactPath(
     filePath: string,
     artifactNamespace: string,
+    artifactNamespaceIdentity: DurableRemoteArtifactNamespaceIdentity,
   ): Promise<string> {
     const lexicalArtifactsDirectory = path.resolve(
       this.#sessionsRoot,
@@ -288,11 +436,16 @@ export class RemoteArtifactStore {
     const requestedDirectory = path.dirname(path.resolve(filePath));
     let canonicalArtifactsDirectory: string;
     if (requestedDirectory === lexicalArtifactsDirectory) {
-      canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(artifactNamespace);
+      canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
+        artifactNamespace,
+        artifactNamespaceIdentity,
+      );
     } else {
       try {
-        canonicalArtifactsDirectory =
-          await this.resolveArtifactNamespaceDirectory(artifactNamespace);
+        canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
+          artifactNamespace,
+          artifactNamespaceIdentity,
+        );
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
           throw new Error("Remote artifact is outside its exact transaction artifact namespace");

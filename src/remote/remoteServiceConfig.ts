@@ -1,5 +1,6 @@
 import net from "node:net";
 import { parseHostPort } from "../bridge/connection.js";
+import { assertRemoteCredential } from "./auth.js";
 
 import type { UserConfig } from "../config.js";
 
@@ -51,6 +52,11 @@ function normalizeString(value: unknown): string | undefined {
   return trimmed.length ? trimmed : undefined;
 }
 
+function normalizeCredential(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value;
+}
+
 function normalizeBoolean(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (typeof value !== "string") return undefined;
@@ -95,20 +101,20 @@ export function resolveRemoteServiceConfig({
   env?: NodeJS.ProcessEnv;
 }): ResolvedRemoteServiceConfig {
   const configBrowserHost = normalizeString(userConfig?.browser?.remoteHost);
-  const configBrowserToken = normalizeString(userConfig?.browser?.remoteToken);
-  const configBrowserLegacyToken = normalizeString(userConfig?.browser?.remoteLegacyToken);
+  const configBrowserToken = normalizeCredential(userConfig?.browser?.remoteToken);
+  const configBrowserLegacyToken = normalizeCredential(userConfig?.browser?.remoteLegacyToken);
   const configAllowLegacyTextProtocol = normalizeBoolean(
     userConfig?.browser?.remoteAllowLegacyTextProtocol,
   );
 
   const envHost = normalizeString(env.ORACLE_REMOTE_HOST);
-  const envToken = normalizeString(env.ORACLE_REMOTE_TOKEN);
-  const envLegacyToken = normalizeString(env.ORACLE_REMOTE_LEGACY_TOKEN);
+  const envToken = normalizeCredential(env.ORACLE_REMOTE_TOKEN);
+  const envLegacyToken = normalizeCredential(env.ORACLE_REMOTE_LEGACY_TOKEN);
   const envAllowLegacyTextProtocol = normalizeBoolean(env.ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL);
 
   const cliHostValue = normalizeString(cliHost);
-  const cliTokenValue = normalizeString(cliToken);
-  const cliLegacyTokenValue = normalizeString(cliLegacyToken);
+  const cliTokenValue = normalizeCredential(cliToken);
+  const cliLegacyTokenValue = normalizeCredential(cliLegacyToken);
   const cliAllowLegacyTextProtocolValue = normalizeBoolean(cliAllowLegacyTextProtocol);
 
   const host = cliHostValue ?? configBrowserHost ?? envHost;
@@ -119,8 +125,22 @@ export function resolveRemoteServiceConfig({
     configAllowLegacyTextProtocol ??
     envAllowLegacyTextProtocol ??
     false;
-
+  const tokenSource = resolveSource(cliTokenValue, configBrowserToken, envToken);
+  const legacyTokenSource = resolveSource(
+    cliLegacyTokenValue,
+    configBrowserLegacyToken,
+    envLegacyToken,
+  );
   if (host) parsePlaintextRemoteEndpoint(host);
+  if (token !== undefined) {
+    assertRemoteCredential(token, `Remote v3 HMAC root key from ${tokenSource}`);
+  }
+  if (legacyToken !== undefined) {
+    assertRemoteCredential(
+      legacyToken,
+      `Remote legacy bearer credential from ${legacyTokenSource}`,
+    );
+  }
   if (allowLegacyTextProtocol && token && legacyToken && token === legacyToken) {
     throw new Error(
       "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
@@ -134,8 +154,8 @@ export function resolveRemoteServiceConfig({
     allowLegacyTextProtocol,
     sources: {
       host: resolveSource(cliHostValue, configBrowserHost, envHost),
-      token: resolveSource(cliTokenValue, configBrowserToken, envToken),
-      legacyToken: resolveSource(cliLegacyTokenValue, configBrowserLegacyToken, envLegacyToken),
+      token: tokenSource,
+      legacyToken: legacyTokenSource,
       allowLegacyTextProtocol: resolveSource(
         cliAllowLegacyTextProtocolValue,
         configAllowLegacyTextProtocol,

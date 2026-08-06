@@ -1,20 +1,32 @@
 import path from "node:path";
-import { lstat, mkdir, realpath, stat } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import { constants } from "node:fs";
+import type { BigIntStats, Stats } from "node:fs";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import {
+  physicalDirectoryIdentityFromStats,
+  parsePhysicalDirectoryIdentity,
+  samePhysicalDirectoryIdentity,
+  type PhysicalDirectoryIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
 
 export type ProfileStateLogger = (message: string) => void;
 interface PlatformPath {
   isAbsolute(candidate: string): boolean;
   resolve(...pathSegments: string[]): string;
 }
-const PHYSICAL_PROFILE_IDENTITY_VERSION = 1 as const;
+const PHYSICAL_PROFILE_IDENTITY_VERSION = 2 as const;
+const hasDirectoryCapabilityFlags =
+  Number.isInteger(constants.O_RDONLY) &&
+  Number.isInteger(constants.O_DIRECTORY) &&
+  Number.isInteger(constants.O_NOFOLLOW);
+const directoryOpenFlags = hasDirectoryCapabilityFlags
+  ? constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  : 0;
 
-export interface ProfileDirectoryIdentity {
+export interface ProfileDirectoryIdentity extends PhysicalDirectoryIdentity {
   readonly version: typeof PHYSICAL_PROFILE_IDENTITY_VERSION;
   readonly platform: NodeJS.Platform;
   readonly canonicalPath: string;
-  readonly device: string;
-  readonly inode: string;
 }
 export async function captureProfileDirectoryIdentity(
   userDataDir: string,
@@ -27,25 +39,76 @@ export async function captureProfileDirectoryIdentity(
   }
   await rejectProfileSymlinkTraversal(resolvedPath);
   const canonicalPath = await realpath(resolvedPath);
-  const physical = await stat(canonicalPath, { bigint: true });
-  if (!physical.isDirectory()) {
-    throw new Error(`Profile path is not a directory: ${userDataDir}`);
+  const physical = await captureAuthenticatedProfileDirectoryStats(canonicalPath);
+  const physicalIdentity = physicalDirectoryIdentityFromStats(physical);
+  if (physicalIdentity.birthtimeNs === "0") {
+    throw new Error(`Profile directory has no trustworthy birth generation: ${userDataDir}`);
   }
   return Object.freeze({
     version: PHYSICAL_PROFILE_IDENTITY_VERSION,
     platform: process.platform,
     canonicalPath,
-    device: physical.dev.toString(),
-    inode: physical.ino.toString(),
+    ...physicalIdentity,
   });
+}
+
+async function captureAuthenticatedProfileDirectoryStats(
+  canonicalPath: string,
+): Promise<BigIntStats> {
+  const before = await lstat(canonicalPath, { bigint: true });
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw new Error(`Profile path is not a physical directory: ${canonicalPath}`);
+  }
+  if (process.platform === "win32") {
+    const after = await lstat(canonicalPath, { bigint: true });
+    if (
+      !after.isDirectory() ||
+      after.isSymbolicLink() ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(before),
+        physicalDirectoryIdentityFromStats(after),
+      )
+    ) {
+      throw new Error(
+        `Profile directory generation changed while authenticating: ${canonicalPath}`,
+      );
+    }
+    return after;
+  }
+
+  const handle = await open(canonicalPath, directoryOpenFlags);
+  try {
+    const authenticated = await handle.stat({ bigint: true });
+    const after = await lstat(canonicalPath, { bigint: true });
+    if (
+      !authenticated.isDirectory() ||
+      !after.isDirectory() ||
+      after.isSymbolicLink() ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(before),
+        physicalDirectoryIdentityFromStats(authenticated),
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(authenticated),
+        physicalDirectoryIdentityFromStats(after),
+      )
+    ) {
+      throw new Error(
+        `Profile directory generation changed while authenticating: ${canonicalPath}`,
+      );
+    }
+    return authenticated;
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function verifyProfileDirectoryIdentity(
   userDataDir: string,
   expected: ProfileDirectoryIdentity,
 ): Promise<boolean> {
-  const parsed = parseProfileDirectoryIdentity(expected, expected.platform);
-  if (!parsed || expected.platform !== process.platform) return false;
+  const parsed = parseProfileDirectoryIdentity(expected, process.platform);
+  if (!parsed) return false;
   try {
     const current = await captureProfileDirectoryIdentity(userDataDir);
     return sameProfileDirectoryIdentity(current, parsed);
@@ -70,10 +133,12 @@ export function samePhysicalProfileDirectoryIdentity(
   right: ProfileDirectoryIdentity,
 ): boolean {
   return (
-    left.version === right.version &&
+    left.version === PHYSICAL_PROFILE_IDENTITY_VERSION &&
+    right.version === PHYSICAL_PROFILE_IDENTITY_VERSION &&
     left.platform === right.platform &&
-    left.device === right.device &&
-    left.inode === right.inode
+    left.birthtimeNs !== "0" &&
+    right.birthtimeNs !== "0" &&
+    samePhysicalDirectoryIdentity(left, right)
   );
 }
 
@@ -138,27 +203,30 @@ export function parseProfileDirectoryIdentity(
   value: unknown,
   platform: NodeJS.Platform,
 ): ProfileDirectoryIdentity | null {
-  if (!value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (
+    Object.keys(record).sort().join(",") !==
+      "birthtimeNs,canonicalPath,device,inode,platform,version" ||
     record.version !== PHYSICAL_PROFILE_IDENTITY_VERSION ||
     record.platform !== platform ||
     typeof record.canonicalPath !== "string" ||
-    !pathForPlatform(platform).isAbsolute(record.canonicalPath) ||
-    typeof record.device !== "string" ||
-    !/^\d+$/u.test(record.device) ||
-    typeof record.inode !== "string" ||
-    !/^\d+$/u.test(record.inode)
+    !pathForPlatform(platform).isAbsolute(record.canonicalPath)
   ) {
     return null;
   }
+  const physical = parsePhysicalDirectoryIdentity({
+    device: record.device,
+    inode: record.inode,
+    birthtimeNs: record.birthtimeNs,
+  });
+  if (!physical || physical.birthtimeNs === "0") return null;
   const canonicalPath = pathForPlatform(platform).resolve(record.canonicalPath);
   return Object.freeze({
     version: PHYSICAL_PROFILE_IDENTITY_VERSION,
     platform,
     canonicalPath,
-    device: record.device,
-    inode: record.inode,
+    ...physical,
   });
 }
 

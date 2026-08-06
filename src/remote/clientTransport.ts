@@ -1,6 +1,7 @@
 import http from "node:http";
 import {
   REMOTE_REQUEST_PROOF_HEADER,
+  assertRemoteCredential,
   createRemoteAuthenticatedRequest,
   verifyRemoteRequestProof,
   type RemoteAuthenticatedRequest,
@@ -150,12 +151,13 @@ async function prepareAuthenticatedRequest(params: {
   overallTimeoutMs: number;
   idleTimeoutMs: number;
 }): Promise<{ rootKey: string; authentication: RemoteAuthenticatedRequest }> {
-  const rootKey = params.token?.trim();
+  const rootKey = params.token;
   if (!rootKey) {
     throw new BrowserAutomationError("Remote transaction HMAC root key is missing.", {
       stage: "remote-authentication",
     });
   }
+  assertRemoteCredential(rootKey, "Remote v3 HMAC root key");
   const host = params.hostname.includes(":")
     ? `[${params.hostname}]:${params.port}`
     : `${params.hostname}:${params.port}`;
@@ -409,6 +411,7 @@ export async function streamLegacyRemoteRun(params: {
   options: Pick<BrowserRunOptions, "log" | "verbose">;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<RemoteLegacyTextResult> {
+  assertRemoteCredential(params.legacyToken, "Remote legacy bearer credential");
   const body = Buffer.from(JSON.stringify(RemoteLegacyRunPayloadSchema.parse(params.payload)));
   if (body.byteLength > MAX_REMOTE_REQUEST_BYTES) {
     throw new BrowserAutomationError("Legacy remote browser request exceeds the size limit.", {

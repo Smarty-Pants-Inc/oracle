@@ -6,10 +6,11 @@
 
 - Remote/Bridge: require authenticated transaction v3 by default and expose predecessor text compatibility only through explicit opt-in with a distinct scoped bearer that is never reused from the modern HMAC key.
 - Remote/Bridge: make plaintext serve and client endpoints loopback-only, reject direct LAN binds, document SSH tunnel migration, and report the negotiated protocol in `oracle bridge doctor`.
+- Remote/Bridge: require modern and explicitly configured legacy credentials to be 32-byte keys encoded as exactly 64 lowercase hexadecimal characters at CLI, config, health, client, server, and bridge artifact boundaries; bridge and server auto-generation use 32 CSPRNG bytes.
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
 - Browser: submit uploaded prompts whenever ChatGPT exposes an enabled send button even if secondary attachment evidence is stale, and close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 - Browser: serialize manual-login Chrome ownership across normal runs, Project Sources, and recovery, reusing only exact-profile owners while keeping PID authority stable and tab leases independent.
-- Browser: bind deferred tab cleanup to opaque, generation-scoped live close capabilities instead of reconstructing destructive authority from saved DevTools addresses, target ids, or marker URLs. Pre-upgrade browser sessions without this capability now stay cleanup-pending and preserve the tab; complete them with the original running controller or restart them under the current version.
+- Browser: bind deferred tab cleanup to opaque, generation-scoped live close capabilities. After capability loss, saved DevTools addresses, target ids, and marker URLs remain diagnostic only; Oracle preserves the tab and retryable cleanup state unless authenticated teardown of the exact owned temporary Chrome process safely subsumes target closure.
 - Browser/Gemini: require immutable provider user-message identity for live and recovered response publication. Provider-id-less accepted turns retain committed audit and cleanup state, but cannot publish or reattach; owned resources can still be cleaned without resubmitting.
 - CLI/Browser follow-up: accept pre-prompt-epoch completed browser follow-ups only with unambiguous GPT/ChatGPT provenance and one exact ChatGPT conversation locator, rejecting Gemini, non-GPT, and conflicting metadata.
 

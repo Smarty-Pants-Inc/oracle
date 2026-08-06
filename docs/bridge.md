@@ -36,15 +36,15 @@ oracle bridge host --token auto --ssh user@your-linux-host
 What it does:
 
 - Starts a local `oracle serve` instance bound to `127.0.0.1:9473` by default.
-- Generates an access token (stored to disk; not printed unless you ask).
+- Generates a 32-byte CSPRNG access key encoded as exactly 64 lowercase hexadecimal characters (stored to disk; not printed unless you ask).
 - Starts an SSH reverse tunnel so the Linux host can reach the Windows service at `127.0.0.1:9473`.
 - Writes a connection artifact to `~/.oracle/bridge-connection.json` (contains host + token).
 
 Useful flags:
 
 - Bind a different local port: `--bind 127.0.0.1:9474`
-- Use a specific token: `--token <value>`
-- Allow predecessor text-only clients with a separate bearer: `--legacy-token <different-value>`
+- Use a specific key: `--token <64-lowercase-hex-characters>`
+- Allow predecessor text-only clients with a separate bearer: `--legacy-token <distinct-64-lowercase-hex-characters>`
 - Print the connection string (includes token): `--print`
 - Print only the token: `--print-token`
 - SSH port/custom args: `--ssh-extra-args "-p 2222"`
@@ -64,7 +64,7 @@ Then on the Linux host:
 oracle bridge client --connect ~/bridge-connection.json
 ```
 
-This writes the loopback endpoint and modern v3 key to `browser.remoteHost` and `browser.remoteToken`. Bridge client rejects non-loopback connection artifacts even with `--no-test`.
+This writes the loopback endpoint and modern v3 key to `browser.remoteHost` and `browser.remoteToken`. Bridge client rejects non-loopback connection artifacts and any key that is not exactly 64 lowercase hexadecimal characters, even with `--no-test`.
 
 Now browser runs automatically route through the host:
 
@@ -81,15 +81,15 @@ There is no silent downgrade.
   ```bash
   oracle bridge client \
     --connect 127.0.0.1:9473 \
-    --legacy-token <predecessor-bearer> \
+    --legacy-token <64-lowercase-hex-characters> \
     --allow-legacy-text-protocol
   ```
 
   To configure modern v3 plus fallback concurrently, use a normal connection artifact and pass a legacy token that differs from its modern connection token.
 
-- **Predecessor client → new host:** start the new host with `--legacy-token <different-predecessor-bearer>`, then configure the predecessor client with that bearer. Never give the predecessor client the modern `--token` value; modern HMAC root keys are not bearer credentials.
+- **Predecessor client → new host:** start the new host with `--legacy-token <distinct-64-lowercase-hex-characters>`, then configure the predecessor client with that bearer. Never give the predecessor client the modern `--token` value; modern HMAC root keys are not bearer credentials.
 
-Persistent compatibility uses `browser.remoteLegacyToken` plus `browser.remoteAllowLegacyTextProtocol: true`. Environment-only clients use `ORACLE_REMOTE_LEGACY_TOKEN` plus `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`. Legacy runs return text only and require manual artifact transfer.
+Persistent compatibility uses `browser.remoteLegacyToken` plus `browser.remoteAllowLegacyTextProtocol: true`. Environment-only clients use `ORACLE_REMOTE_LEGACY_TOKEN` plus `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`. Modern and explicitly enabled legacy credentials must each be exactly 64 lowercase hexadecimal characters and must remain distinct. Legacy runs return text only and require manual artifact transfer.
 
 ## 2b) Linux desktop: local manual-login (no bridge)
 

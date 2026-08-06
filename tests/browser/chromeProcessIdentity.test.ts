@@ -420,11 +420,12 @@ describe("physical Chrome profile use authority", () => {
   test("detects Darwin /var and /private/var as the same physical profile", async () => {
     const aliasPath = "/var/folders/oracle/profile";
     const expected = Object.freeze({
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: "/private/var/folders/oracle/profile",
       device: "7",
       inode: "99",
+      birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const captureProfileIdentity = vi.fn(async (candidate: string) => {
       expect(candidate).toBe(aliasPath);
@@ -460,11 +461,12 @@ describe("physical Chrome profile use authority", () => {
 
   test("fails closed when a retained candidate generation becomes incomparable", async () => {
     const expected = Object.freeze({
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: "/private/var/folders/oracle/profile",
       device: "7",
       inode: "99",
+      birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const unrelated = Object.freeze({
       ...expected,
@@ -505,11 +507,12 @@ describe("physical Chrome profile use authority", () => {
 
   test("enumerates all platform processes before proving a profile unused", async () => {
     const expected = Object.freeze({
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: "/private/var/folders/oracle/profile",
       device: "7",
       inode: "99",
+      birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const execute = vi.fn(async () => ({ stdout: "123 /usr/bin/node server.js\n" }));
 
@@ -522,11 +525,12 @@ describe("physical Chrome profile use authority", () => {
 
   test("fails closed when a Chrome candidate profile identity is unreadable", async () => {
     const expected = Object.freeze({
-      version: 1 as const,
+      version: 2 as const,
       platform: "darwin" as const,
       canonicalPath: "/private/var/folders/oracle/profile",
       device: "7",
       inode: "99",
+      birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
 
     await expect(

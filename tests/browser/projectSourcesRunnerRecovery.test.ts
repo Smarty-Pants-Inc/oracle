@@ -9,27 +9,28 @@ import {
   createChromeProcessLaunchClaim,
 } from "../../src/browser/profileState.js";
 
-test("reconciles an in-flight Project Sources target then settles through the real abort helper", async () => {
+test("preserves an in-flight Project Sources target after recovery capability loss", async () => {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-recovery-"));
   const profileDir = path.join(oracleHome, "manual-profile");
   const persistedJournals: unknown[] = [];
   await mkdir(profileDir);
   setOracleHomeDirOverrideForTest(oracleHome);
   vi.resetModules();
+  const retainChromeEndpointAuthority = vi.fn();
+  const closeChromeTargetWithExactAuthority = vi.fn();
+  const listChromeTargetsWithExactAuthority = vi.fn();
   vi.doMock("../../src/browser/chromeLifecycle.js", async () => ({
     ...(await vi.importActual<typeof import("../../src/browser/chromeLifecycle.js")>(
       "../../src/browser/chromeLifecycle.js",
     )),
-    retainChromeEndpointAuthority: vi.fn(async () => ({
-      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/project-sources-recovery",
-      release: vi.fn(async () => undefined),
-    })),
+    retainChromeEndpointAuthority,
+    closeChromeTargetWithExactAuthority,
   }));
   vi.doMock("../../src/browser/chromeTargetConnection.js", async () => ({
     ...(await vi.importActual<typeof import("../../src/browser/chromeTargetConnection.js")>(
       "../../src/browser/chromeTargetConnection.js",
     )),
-    listChromeTargetsWithExactAuthority: vi.fn(async () => ({ status: "completed", value: [] })),
+    listChromeTargetsWithExactAuthority,
   }));
   vi.doMock("../../src/sessionManager.js", async () => {
     const actual = await vi.importActual<typeof import("../../src/sessionManager.js")>(
@@ -93,29 +94,30 @@ test("reconciles an in-flight Project Sources target then settles through the re
 
     await expect(
       projectSourcesRecovery.retryPendingProjectSourcesCleanup(() => undefined),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow(/cleanup remains retryable/i);
+    expect(retainChromeEndpointAuthority).not.toHaveBeenCalled();
+    expect(listChromeTargetsWithExactAuthority).not.toHaveBeenCalled();
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(persistedJournals).toContainEqual(
       expect.objectContaining({
         runtime: expect.objectContaining({
           recoveryCleanupResult: expect.objectContaining({ settlementMode: "abort" }),
-        }),
-      }),
-    );
-    expect(persistedJournals).toContainEqual(
-      expect.objectContaining({
-        runtime: expect.objectContaining({
           recoveryCleanupResources: [
             expect.objectContaining({
-              acquisition: expect.not.objectContaining({ pendingResource: expect.anything() }),
-              recoveryCleanup: expect.objectContaining({ ownsTarget: false }),
+              acquisition: expect.objectContaining({ pendingResource: "chrome-target" }),
+              recoveryCleanup: expect.objectContaining({ ownsTarget: true }),
             }),
           ],
         }),
       }),
     );
-    await expect(
-      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    const persistedJournal = JSON.parse(
+      await readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
+    );
+    expect(persistedJournal.runtime.recoveryCleanupResources[0]).toMatchObject({
+      acquisition: { pendingResource: "chrome-target" },
+      recoveryCleanup: { ownsTarget: true, closeOwnedTargetOnComplete: true },
+    });
   } finally {
     setOracleHomeDirOverrideForTest(null);
     vi.doUnmock("../../src/browser/chromeLifecycle.js");

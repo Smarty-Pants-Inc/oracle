@@ -6,11 +6,6 @@ import {
 } from "./filesystemLockModel.js";
 import { replayPendingIsolatedDirectoryRemovals } from "./filesystemLockDirectoryRemoval.js";
 
-export {
-  canonicalFilesystemLockPath,
-  filesystemLockReleaseKey,
-  replayPendingIsolatedDirectoryRemovals,
-};
 export interface FilesystemLockReleaseGeneration {
   pid: number;
   processStartIdentity: string | null;

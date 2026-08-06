@@ -43,6 +43,13 @@ export interface DurableRemoteFileIdentity {
   birthtimeNs: string;
   ctimeNs: string;
 }
+export type RemoteArtifactNamespaceState = "uninitialized" | "initializing" | "initialized";
+
+export interface DurableRemoteArtifactNamespaceIdentity {
+  device: string;
+  inode: string;
+  birthtimeNs: string;
+}
 
 export interface DurableRemoteAutomationError {
   name: "BrowserAutomationError";
@@ -100,6 +107,8 @@ export interface RemoteTransactionRecord {
   transactionToken: string;
   runId: string;
   artifactNamespace: string;
+  artifactNamespaceState: RemoteArtifactNamespaceState;
+  artifactNamespaceIdentity?: DurableRemoteArtifactNamespaceIdentity;
   createdAt: string;
   updatedAt: string;
   controllerGeneration: string;
@@ -194,6 +203,19 @@ export type RemoteTransactionControllerShutdownPlan = RemoteTransactionControlle
 };
 
 interface RemoteTransactionTransitionDefinitions {
+  "begin-artifact-namespace-initialization": {
+    params: { runId: string };
+    outcome: undefined;
+  };
+  "bind-artifact-namespace-identity": {
+    params: { runId: string; identity: DurableRemoteArtifactNamespaceIdentity };
+    outcome: undefined;
+  };
+  "complete-artifact-namespace-initialization": {
+    params: { runId: string };
+    outcome: undefined;
+  };
+
   "renew-lease": {
     params: Record<never, never>;
     outcome: undefined;

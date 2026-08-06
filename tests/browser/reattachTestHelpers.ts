@@ -39,11 +39,12 @@ export function syntheticChromeProcessIdentity(
       process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath,
     launchNonce: "11111111-1111-4111-8111-111111111111",
     profileDirectory: {
-      version: 1,
+      version: 2,
       platform: process.platform,
       canonicalPath,
       device: physical?.dev.toString() ?? "1",
       inode: physical?.ino.toString() ?? "1",
+      birthtimeNs: physical?.birthtimeNs.toString() ?? "3",
     },
   };
 }

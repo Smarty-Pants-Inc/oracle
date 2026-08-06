@@ -218,11 +218,12 @@ describe("browser coordinator public settlement", () => {
           tabLease: {
             id: "remaining-lease",
             profileDirectory: {
-              version: 1,
+              version: 2,
               platform: process.platform,
               canonicalPath: "/tmp/remaining-lease",
               device: "1",
               inode: "2",
+              birthtimeNs: "3",
             },
           },
           recoveryCleanup: {

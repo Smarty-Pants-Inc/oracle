@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -12,21 +11,7 @@ import {
   browserRunResultFromTransaction,
   projectRemotePublicResult,
 } from "../../src/remote/transactionCapture.js";
-
-const CAN_LISTEN_LOCALHOST =
-  spawnSync(
-    process.execPath,
-    [
-      "-e",
-      `
-      const net = require('net');
-      const server = net.createServer();
-      server.on('error', () => process.exit(1));
-      server.listen(0, '127.0.0.1', () => server.close(() => process.exit(0)));
-    `,
-    ],
-    { stdio: "ignore" },
-  ).status === 0;
+import { CAN_LISTEN_LOCALHOST } from "./serverTestBuilders.js";
 
 // This exercises Node's actual TCP response-idle timer; fake timers cannot advance socket I/O.
 const wait = (milliseconds: number) =>
@@ -106,8 +91,8 @@ describe("legacy remote protocol integration", () => {
         {
           host: "127.0.0.1",
           port: 0,
-          token: "current-root-key",
-          legacyToken: "legacy-bearer",
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
           logger: () => {},
         },
         {
@@ -147,7 +132,7 @@ describe("legacy remote protocol integration", () => {
       try {
         const transaction = await createRemoteBrowserExecutor({
           host: `127.0.0.1:${server.port}`,
-          legacyToken: "legacy-bearer",
+          legacyToken: "c".repeat(64),
           allowLegacyTextProtocol: true,
           deadlines: {
             runOverallTimeoutMs: 1_000,

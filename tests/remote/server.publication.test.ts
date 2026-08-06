@@ -25,7 +25,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-http-conflict-"));
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir: path.join(tmpDir, "transactions"),
           runBrowser: async (options) =>
@@ -41,7 +41,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       try {
         const transaction = await createRemoteBrowserExecutor({
           host: `127.0.0.1:${server.port}`,
-          token: "secret",
+          token: "a".repeat(64),
         })({ prompt: "canonical HTTP conflict", config: {} });
         const transactionToken = transaction.runtime.recoveryCleanupResources?.find(
           (resource) => resource.remoteRecovery,
@@ -54,7 +54,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             hostname: "127.0.0.1",
             port: server.port,
             path: `/transactions/${transactionToken}/bind`,
-            token: "secret",
+            token: "a".repeat(64),
             body: { mode: "abort", durablePublication: false },
           }),
         ).resolves.toMatchObject({
@@ -71,7 +71,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             hostname: "127.0.0.1",
             port: server.port,
             path: `/transactions/${transactionToken}/abort`,
-            token: "secret",
+            token: "a".repeat(64),
             body: {},
           }),
         ).resolves.toMatchObject({
@@ -111,7 +111,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         conversationUrl: "https://chatgpt.com/c/remote-conversation",
       };
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           runBrowser: async (options) => {
@@ -130,7 +130,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/run`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {
             ...remoteRunPayload(),
             browserConfig: { archiveConversations: "always" },
@@ -187,7 +187,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         .spyOn(RemoteTransactionStore.prototype, "publishCapture")
         .mockRejectedValueOnce(new Error("simulated initial publication write failure"));
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           runBrowser: async (options) => {
@@ -209,7 +209,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${"1".repeat(64)}/run`,
-          token: "secret",
+          token: "a".repeat(64),
           body: remoteRunPayload(),
         });
         expect(response.events).toContainEqual(
@@ -240,7 +240,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${"1".repeat(64)}/finalize`,
-          token: "secret",
+          token: "a".repeat(64),
           body: { durablePublication: true },
         });
         expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
@@ -315,7 +315,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         throw new Error("retry must not recapture a durable staged answer");
       });
       const restarted = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           controllerGeneration: "controller-after-staged-crash",
@@ -327,7 +327,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: restarted.port,
           path: `/transactions/${transactionToken}/retry`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {},
         });
         expect(retry).toMatchObject({
@@ -435,7 +435,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         abort: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
       }));
       const restarted = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           controllerGeneration: "controller-after-pre-artifact-crash",
@@ -448,7 +448,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: restarted.port,
           path: `/transactions/${transactionToken}/retry`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {},
         });
         expect(retry).toMatchObject({
@@ -509,7 +509,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         runtime: cleanupRuntime,
       }));
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
           transactionStoreDir,
           retryCleanup,
@@ -535,7 +535,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/run`,
-          token: "secret",
+          token: "a".repeat(64),
           body: remoteRunPayload(),
         });
         expect(run.events.some((event) => event.type === "transaction")).toBe(false);
@@ -545,7 +545,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/retry`,
-          token: "secret",
+          token: "a".repeat(64),
           body: {},
         });
         expect(retry).toMatchObject({
