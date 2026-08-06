@@ -14,7 +14,6 @@ import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecu
 
 const execFileAsync = promisify(execFile);
 const WINDOWS_PRIVATE_TREE_ACL_MARKER = "oracle.remote-transaction.private-tree.v1";
-const TEST_WINDOWS_SYSTEM_ROOT = String.raw`D:\Windows`;
 
 function buildWindowsTestPathCommandArgs(script: string, itemPaths: string[]): string[] {
   const pathExpressions = itemPaths
@@ -44,15 +43,13 @@ const commandScope = {
 };
 
 describe("Windows remote transaction private ACL authority", () => {
-  test("uses one bounded native command resolved from an injected non-C SystemRoot", async () => {
+  test("uses one bounded native command resolved from the OS-rooted namespace", async () => {
     const execute = vi.fn(async () => ({ stdout: WINDOWS_PRIVATE_TREE_ACL_MARKER }));
 
-    await protectWindowsPrivateTreeAcl(commandScope, execute, TEST_WINDOWS_SYSTEM_ROOT);
+    await protectWindowsPrivateTreeAcl(commandScope, execute);
 
-    const command = buildWindowsPrivateTreeAclCommand(commandScope, TEST_WINDOWS_SYSTEM_ROOT);
-    expect(command.file).toBe(
-      String.raw`D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
-    );
+    const command = buildWindowsPrivateTreeAclCommand(commandScope);
+    expect(command.file).toBe(resolveWindowsPowerShellExecutable());
     expect(command.args.slice(0, 4)).toEqual([
       "-NoLogo",
       "-NoProfile",
@@ -76,7 +73,7 @@ describe("Windows remote transaction private ACL authority", () => {
       hostileScope.integrityKeyDirectory,
       hostileScope.integrityKeyPath,
     ];
-    const command = buildWindowsPrivateTreeAclCommand(hostileScope, TEST_WINDOWS_SYSTEM_ROOT);
+    const command = buildWindowsPrivateTreeAclCommand(hostileScope);
     const encodedCommand = command.args.at(-1);
     expect(encodedCommand).toBeDefined();
     const decodedCommand = Buffer.from(encodedCommand ?? "", "base64").toString("utf16le");
@@ -131,25 +128,17 @@ describe("Windows remote transaction private ACL authority", () => {
 
   test("fails closed when the native ACL probe does not complete exactly", async () => {
     await expect(
-      protectWindowsPrivateTreeAcl(
-        commandScope,
-        async () => ({ stdout: "partial" }),
-        TEST_WINDOWS_SYSTEM_ROOT,
-      ),
+      protectWindowsPrivateTreeAcl(commandScope, async () => ({ stdout: "partial" })),
     ).rejects.toThrow("private ACL verification did not complete");
     await expect(
-      protectWindowsPrivateTreeAcl(
-        commandScope,
-        async () => {
-          throw new Error("probe unavailable");
-        },
-        TEST_WINDOWS_SYSTEM_ROOT,
-      ),
+      protectWindowsPrivateTreeAcl(commandScope, async () => {
+        throw new Error("probe unavailable");
+      }),
     ).rejects.toThrow("private ACL protection failed");
   });
 
   test.runIf(process.platform === "win32")(
-    "repairs an Everyone-readable key and transaction tree before record use",
+    "repairs an Everyone-readable key and transaction tree once without mutating the repaired key identity",
     async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-private-acl-"));
       const directory = path.join(root, "remote-transactions");
@@ -198,16 +187,62 @@ foreach ($ItemPath in $ItemPaths) {
 
         const reopened = await RemoteTransactionStore.open({ directory, integrityKeyPath });
         await expect(reopened.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+        const keyAfterRepair = await fs.lstat(integrityKeyPath, { bigint: true });
+
+        const secondAuthorityPass = await RemoteTransactionStore.open({
+          directory,
+          integrityKeyPath,
+        });
+        await expect(secondAuthorityPass.read(transactionToken)).resolves.toMatchObject({
+          transactionToken,
+        });
+        const keyAfterSecondAuthorityPass = await fs.lstat(integrityKeyPath, { bigint: true });
+        expect([
+          keyAfterSecondAuthorityPass.dev,
+          keyAfterSecondAuthorityPass.ino,
+          keyAfterSecondAuthorityPass.birthtimeNs,
+          keyAfterSecondAuthorityPass.ctimeNs,
+          keyAfterSecondAuthorityPass.size,
+          keyAfterSecondAuthorityPass.mode,
+          keyAfterSecondAuthorityPass.nlink,
+        ]).toEqual([
+          keyAfterRepair.dev,
+          keyAfterRepair.ino,
+          keyAfterRepair.birthtimeNs,
+          keyAfterRepair.ctimeNs,
+          keyAfterRepair.size,
+          keyAfterRepair.mode,
+          keyAfterRepair.nlink,
+        ]);
 
         const verifyScript = String.raw`
 $ErrorActionPreference = 'Stop'
-$Everyone = 'S-1-1-0'
+$CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$AllowedSids = @(
+  $CurrentSid,
+  [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+  [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+)
+$FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$Allow = [System.Security.AccessControl.AccessControlType]::Allow
+$NoPropagation = [System.Security.AccessControl.PropagationFlags]::None
+$DirectoryInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$NoInheritance = [System.Security.AccessControl.InheritanceFlags]::None
 foreach ($ItemPath in $ItemPaths) {
   $Item = Get-Item -LiteralPath $ItemPath -Force
   $Acl = $Item.GetAccessControl()
-  if (-not $Acl.AreAccessRulesProtected) { exit 20 }
   $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-  if (@($Rules | Where-Object { $_.IdentityReference.Value -eq $Everyone }).Count -ne 0) { exit 21 }
+  $DescribeRules = @($Rules | ForEach-Object { "$($_.IdentityReference.Value)|$([int64]$_.FileSystemRights)|$([int]$_.AccessControlType)|$([int]$_.InheritanceFlags)|$([int]$_.PropagationFlags)|$($_.IsInherited)" } | Sort-Object) -join ', '
+  if ($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value) { throw "Unexpected private ACL owner for $ItemPath; actual=$($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value); expected=$($CurrentSid.Value)" }
+  if (-not $Acl.AreAccessRulesProtected) { throw "Inherited private ACL for $ItemPath; actual=[$DescribeRules]" }
+  if ($Rules.Count -ne $AllowedSids.Count) { throw "Unexpected private ACL rule count for $ItemPath; actual=[$DescribeRules]" }
+  $ExpectedInheritance = if ($Item.PSIsContainer) { $DirectoryInheritance } else { $NoInheritance }
+  foreach ($Sid in $AllowedSids) {
+    $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid.Value })
+    if ($Matches.Count -ne 1) { throw "Unexpected private ACL principal rules for $ItemPath; actual=[$DescribeRules]" }
+    $Rule = $Matches[0]
+    if ($Rule.IsInherited -or $Rule.AccessControlType -ne $Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl -or $Rule.InheritanceFlags -ne $ExpectedInheritance -or $Rule.PropagationFlags -ne $NoPropagation) { throw "Unexpected private ACL rule for $ItemPath; actual=[$DescribeRules]" }
+  }
 }
 [Console]::Out.Write('private')`;
         const { stdout } = await execFileAsync(

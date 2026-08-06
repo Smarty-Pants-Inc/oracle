@@ -189,6 +189,38 @@ export async function persistProjectSourcesCleanupRuntime(
   await syncDirectoryIfPresent(path.dirname(resolvedStorage.journalPath));
 }
 
+/**
+ * Retire the cleanup journal before its manual-admission receipt.  If journal
+ * retirement is not durable, restore the exact retry authority before returning.
+ */
+export async function retireProjectSourcesCleanupJournal(
+  runtime: BrowserRuntimeMetadata,
+  proof: ProjectSourcesCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  logger: BrowserLogger,
+): Promise<void> {
+  try {
+    await persistProjectSourcesCleanupRuntime({}, storage);
+  } catch (retirementError) {
+    try {
+      await persistProjectSourcesCleanupRuntime(runtime, storage, { proof });
+    } catch (restoreError) {
+      throw new AggregateError(
+        [retirementError, restoreError],
+        "Project Sources cleanup journal retirement failed and retry authority could not be restored.",
+      );
+    }
+    throw retirementError;
+  }
+  try {
+    await removeProjectSourcesCleanupProofArtifacts(proof, storage);
+  } catch (error) {
+    logger(
+      `[browser] Project Sources cleanup journal retired; retained its admission receipt after removal failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function ownedProjectSourcesTarget(
   runtime: BrowserRuntimeMetadata,
   proof: ProjectSourcesCleanupProof,
@@ -331,8 +363,7 @@ export async function retryPendingProjectSourcesCleanup(
 
   const acquisition = await reconcilePendingProjectSourcesManualAcquisition(runtime, proof, deps);
   if (!acquisition) {
-    await removeProjectSourcesCleanupProofArtifacts(proof, resolvedStorage);
-    await persistProjectSourcesCleanupRuntime({}, resolvedStorage);
+    await retireProjectSourcesCleanupJournal(runtime, proof, resolvedStorage, logger);
     return;
   }
   if (acquisition.runtime !== runtime || acquisition.proof !== proof) {
@@ -361,6 +392,7 @@ export async function retryPendingProjectSourcesCleanup(
 
   const runtimeAuthority = runtime;
   let durableProof = proof;
+  let durableRuntime = runtime;
   const finalization = await (deps.retryCleanup ?? retryBrowserRecoveryCleanup)(
     runtime,
     logger,
@@ -390,9 +422,14 @@ export async function retryPendingProjectSourcesCleanup(
           await persistProjectSourcesCleanupRuntime(result.runtime, resolvedStorage, {
             proof: durableProof,
           });
+          durableRuntime = result.runtime;
         } else {
-          await removeProjectSourcesCleanupProofArtifacts(durableProof, resolvedStorage);
-          await persistProjectSourcesCleanupRuntime({}, resolvedStorage);
+          await retireProjectSourcesCleanupJournal(
+            durableRuntime,
+            durableProof,
+            resolvedStorage,
+            logger,
+          );
         }
         return result;
       },

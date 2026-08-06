@@ -4,7 +4,11 @@ import {
   promptIdentitySha256,
 } from "../../src/browser/actions/committedPrompt.js";
 import type { PromptCommitVerification } from "../../src/browser/actions/promptCommitVerification.js";
-import { geminiDeepThinkDomProvider } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
+import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
+import {
+  geminiDeepThinkDomProvider,
+  recoverCommittedGeminiDeepThinkResponse,
+} from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 
 type FixtureTurn = {
   kind: "user" | "response";
@@ -205,6 +209,30 @@ function responseState(
       userStableId: "data-message-id:user-current",
       ...overrides,
     },
+  };
+}
+
+function committedGeminiPromptLocator(): CommittedPromptEpochLocator {
+  const promptSha256 = promptIdentitySha256("New request");
+  return {
+    epoch: {
+      status: "committed",
+      epochId: "gemini-epoch",
+      promptSha256,
+      baselineTurns: 0,
+      followUpOrdinal: 0,
+      remainingFollowUps: 0,
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "data-message-id:user-current",
+      verifiedUserMessageId: "data-message-id:user-current",
+      conversationId: "gemini-conversation",
+    },
+    conversationId: "gemini-conversation",
+    promptSha256,
+    verifiedUserTurnIndex: 0,
+    verifiedUserTurnId: "data-message-id:user-current",
+    verifiedUserMessageId: "data-message-id:user-current",
+    conversationUrls: [],
   };
 }
 
@@ -411,6 +439,86 @@ describe("geminiDeepThinkDomProvider", () => {
     await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).rejects.toThrow(
       "response lacks a stable provider message identifier",
     );
+  });
+
+  it("refuses reattach publication when the exact completed response has no stable provider id", async () => {
+    const ctx = createContext(
+      [
+        { kind: "user", order: 1, text: "New request", stableId: "user-current" },
+        { kind: "response", order: 2, text: "answer", complete: true },
+      ],
+      {},
+    );
+
+    await expect(
+      recoverCommittedGeminiDeepThinkResponse(ctx, committedGeminiPromptLocator(), 1_000),
+    ).rejects.toMatchObject({
+      details: {
+        code: "gemini-response-ownership-unavailable",
+        reattachable: false,
+      },
+    });
+  });
+
+  it("refuses reattach publication when the exact response stable id is duplicated", async () => {
+    const ctx = createContext(
+      [
+        { kind: "user", order: 1, text: "Earlier request", stableId: "user-earlier" },
+        {
+          kind: "response",
+          order: 2,
+          text: "earlier answer",
+          stableId: "response-duplicated",
+          complete: true,
+        },
+        { kind: "user", order: 3, text: "New request", stableId: "user-current" },
+        {
+          kind: "response",
+          order: 4,
+          text: "exact answer",
+          stableId: "response-duplicated",
+          complete: true,
+        },
+      ],
+      {},
+    );
+
+    await expect(
+      recoverCommittedGeminiDeepThinkResponse(ctx, committedGeminiPromptLocator(), 1_000),
+    ).rejects.toMatchObject({
+      details: {
+        code: "gemini-response-ownership-ambiguous",
+        reattachable: false,
+      },
+    });
+  });
+
+  it("recovers the exact completed Gemini response with a unique stable provider id", async () => {
+    const ctx = createContext(
+      [
+        { kind: "user", order: 1, text: "Earlier request", stableId: "user-earlier" },
+        {
+          kind: "response",
+          order: 2,
+          text: "earlier answer",
+          stableId: "response-earlier",
+          complete: true,
+        },
+        { kind: "user", order: 3, text: "New request", stableId: "user-current" },
+        {
+          kind: "response",
+          order: 4,
+          text: "exact recovered answer",
+          stableId: "response-current",
+          complete: true,
+        },
+      ],
+      {},
+    );
+
+    await expect(
+      recoverCommittedGeminiDeepThinkResponse(ctx, committedGeminiPromptLocator(), 1_000),
+    ).resolves.toEqual({ text: "exact recovered answer" });
   });
 
   it("extracts thoughts only from the exact paired response after a response rerender", async () => {

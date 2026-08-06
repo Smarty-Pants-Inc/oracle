@@ -26,7 +26,6 @@ export interface RemoteHealthResult {
   uptimeSeconds?: number;
   serverGeneration?: string;
   capabilities?: RemoteArtifactCapabilities;
-  legacyArtifactCapabilityAdvertised?: boolean;
 }
 
 export async function checkTcpConnection(
@@ -195,7 +194,6 @@ export async function checkRemoteHealth({
       statusCode: legacy.statusCode,
       version: parsed.data.version,
       uptimeSeconds: parsed.data.uptimeSeconds,
-      legacyArtifactCapabilityAdvertised: parsed.data.capabilities?.artifactTransfer === true,
     };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

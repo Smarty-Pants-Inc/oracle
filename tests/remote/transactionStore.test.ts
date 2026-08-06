@@ -1332,7 +1332,7 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
-  test("rejects recomputed forged envelopes and noncanonical or unauthenticated revisions", async () => {
+  test("rejects legacy authenticated envelopes and noncanonical or unauthenticated revisions", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-forgery-"));
     const directory = path.join(root, "transactions");
     const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
@@ -1386,6 +1386,40 @@ describe("RemoteTransactionStore", () => {
       );
       await fs.writeFile(store.recordPath(transactionToken), originalBytes, { mode: 0o600 });
       await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+      const { revision: _revision, ...legacyEnvelope } = {
+        ...originalEnvelope,
+        version: 1,
+      };
+      const legacyPayload = Buffer.from(legacyEnvelope.payload, "base64");
+      legacyEnvelope.mac = createHmac("sha256", integrityKey)
+        .update(
+          Buffer.from(
+            JSON.stringify([
+              "oracle.remote-controller.transaction-store.record.v1",
+              legacyEnvelope.version,
+              legacyEnvelope.algorithm,
+              legacyEnvelope.keyId,
+              path.resolve(directory),
+              transactionToken,
+              legacyPayload.byteLength,
+            ]),
+            "utf8",
+          ),
+        )
+        .update(Buffer.of(0))
+        .update(legacyPayload)
+        .digest("hex");
+      const legacyBytes = Buffer.from(`${JSON.stringify(legacyEnvelope, null, 2)}\n`, "utf8");
+      await fs.writeFile(store.recordPath(transactionToken), legacyBytes, { mode: 0o600 });
+      await expect(store.read(transactionToken)).rejects.toBeInstanceOf(
+        RemoteTransactionRecordIntegrityError,
+      );
+      const quarantinedContents = await Promise.all(
+        (await fs.readdir(directory))
+          .filter((name) => name.includes(transactionToken) && name.endsWith(".quarantine"))
+          .map((name) => fs.readFile(path.join(directory, name))),
+      );
+      expect(quarantinedContents).toContainEqual(legacyBytes);
 
       const unauthenticatedRevision = {
         ...originalEnvelope,

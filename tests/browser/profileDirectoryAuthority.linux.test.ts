@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   stat,
@@ -33,6 +34,7 @@ describe("Linux zero-birthtime profile generation marker", () => {
       expect(first).toEqual(second);
       expect(first).toMatchObject({ version: 3, platform: "linux", birthtimeNs: "0" });
       expect(markerStats.mode & 0o777n).toBe(0o600n);
+      expect(markerStats.nlink).toBe(1n);
       await expect(readFile(markerPath, "utf8")).resolves.toMatch(
         /^oracle-profile-generation-v1:[0-9a-f]{64}\n$/u,
       );
@@ -41,38 +43,86 @@ describe("Linux zero-birthtime profile generation marker", () => {
     }
   });
 
-  linuxTest("waits for the exact same-process first-use marker creation", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-profile-race-"));
-    const markerCreated = Promise.withResolvers<void>();
-    const finishMarker = Promise.withResolvers<void>();
-    const concurrentWait = Promise.withResolvers<void>();
-    const creator = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
-      beforeGenerationMarkerWrite: async () => {
-        markerCreated.resolve();
-        await finishMarker.promise;
-      },
-    });
-    let concurrent = creator;
-    try {
-      await markerCreated.promise;
-      await expect(
-        stat(path.join(profileDir, MARKER_FILENAME), { bigint: true }),
-      ).resolves.toMatchObject({ size: 0n });
-
-      concurrent = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
-        onGenerationMarkerCreationWait: concurrentWait.resolve,
+  linuxTest(
+    "keeps the final marker absent until publication and converges same-process creators",
+    async () => {
+      const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-profile-race-"));
+      const markerPrepared = Promise.withResolvers<void>();
+      const finishPublication = Promise.withResolvers<void>();
+      const concurrentWait = Promise.withResolvers<void>();
+      const creator = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
+        beforeGenerationMarkerPublication: async () => {
+          markerPrepared.resolve();
+          await finishPublication.promise;
+        },
       });
-      await concurrentWait.promise;
-      finishMarker.resolve();
+      let concurrent = creator;
+      try {
+        await markerPrepared.promise;
+        await expect(lstat(path.join(profileDir, MARKER_FILENAME))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
 
-      const [created, reused] = await Promise.all([creator, concurrent]);
-      expect(reused).toEqual(created);
-      await expect(readFile(path.join(profileDir, MARKER_FILENAME), "utf8")).resolves.toMatch(
-        /^oracle-profile-generation-v1:[0-9a-f]{64}\n$/u,
+        concurrent = captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
+          onGenerationMarkerCreationWait: concurrentWait.resolve,
+        });
+        await concurrentWait.promise;
+        finishPublication.resolve();
+
+        const [created, reused] = await Promise.all([creator, concurrent]);
+        expect(reused).toEqual(created);
+        await expect(readFile(path.join(profileDir, MARKER_FILENAME), "utf8")).resolves.toMatch(
+          /^oracle-profile-generation-v1:[0-9a-f]{64}\n$/u,
+        );
+      } finally {
+        finishPublication.resolve();
+        await Promise.allSettled([creator, concurrent]);
+        await rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  linuxTest(
+    "cleans interrupted preparation so a retry converges without stale marker bytes",
+    async () => {
+      const profileDir = await mkdtemp(
+        path.join(os.tmpdir(), "oracle-linux-profile-interruption-"),
       );
+      const markerPath = path.join(profileDir, MARKER_FILENAME);
+      try {
+        await expect(
+          captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir, {
+            beforeGenerationMarkerPublication: () => {
+              throw new Error("interrupted before publication");
+            },
+          }),
+        ).rejects.toThrow(/no filesystem birth time/i);
+        await expect(lstat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readdir(profileDir)).resolves.toEqual([]);
+
+        const recovered =
+          await captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir);
+        const markerStats = await stat(markerPath, { bigint: true });
+        expect(markerStats.nlink).toBe(1n);
+        expect(recovered.generationMarker?.token).toMatch(/^[0-9a-f]{64}$/u);
+        await expect(readdir(profileDir)).resolves.toEqual([MARKER_FILENAME]);
+      } finally {
+        await rm(profileDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  linuxTest("fails closed without overwriting a malformed existing final marker", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-linux-profile-malformed-"));
+    const markerPath = path.join(profileDir, MARKER_FILENAME);
+    try {
+      await writeFile(markerPath, "short\n", { mode: 0o600 });
+
+      await expect(
+        captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(profileDir),
+      ).rejects.toThrow(/generation marker/i);
+      await expect(readFile(markerPath, "utf8")).resolves.toBe("short\n");
     } finally {
-      finishMarker.resolve();
-      await Promise.allSettled([creator, concurrent]);
       await rm(profileDir, { recursive: true, force: true });
     }
   });

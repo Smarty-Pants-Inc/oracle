@@ -33,7 +33,6 @@ export type TrustedProcessProbe = (
 export function createTrustedProcessProbe(
   platform: NodeJS.Platform,
   execute: ProcessGenerationCommandExecutor,
-  windowsSystemRoot?: string,
 ): TrustedProcessProbe | null {
   let executable: string;
   if (platform === "darwin") {
@@ -41,11 +40,7 @@ export function createTrustedProcessProbe(
   } else if (platform === "linux") {
     executable = "/usr/bin/ps";
   } else if (platform === "win32") {
-    try {
-      executable = resolveWindowsPowerShellExecutable(windowsSystemRoot);
-    } catch {
-      return null;
-    }
+    executable = resolveWindowsPowerShellExecutable();
   } else {
     return null;
   }
@@ -64,7 +59,6 @@ export interface PlatformProcessGenerationProviderDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessGenerationCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
-  windowsSystemRoot?: string;
   readFile?: ProcessGenerationFileReader;
 }
 
@@ -129,7 +123,7 @@ export function createPlatformProcessGenerationProvider(
   const readFile = deps.readFile ?? readFileFromDisk;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
+      ? createTrustedProcessProbe(platform, execute)
       : deps.trustedProcessProbe;
   return {
     platform,

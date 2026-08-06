@@ -26,7 +26,6 @@ export interface ChromeProcessIdentityDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
-  windowsSystemRoot?: string;
   readOwner?: (userDataDir: string) => Promise<{ processIdentity: ChromeProcessIdentity } | null>;
   launchClaim?: ChromeProcessLaunchClaim;
   readProcessSnapshot?: (pid: number) => Promise<ChromeProcessSnapshot | null>;
@@ -121,6 +120,11 @@ interface ChromeProcessSnapshot {
   commandLine: string;
   commandTokens?: readonly string[];
 }
+interface LinuxProcfs {
+  readFile(filePath: string, encoding?: "utf8"): Promise<string | Buffer>;
+  readlink(filePath: string): Promise<string>;
+}
+const linuxProcfsFromDisk: LinuxProcfs = { readFile, readlink };
 export async function captureChromeProcessIdentity(
   userDataDir: string,
   pid: number,
@@ -158,7 +162,7 @@ async function captureChromeProcessIdentityWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
+      ? createTrustedProcessProbe(platform, execute)
       : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(pid)
@@ -227,7 +231,7 @@ export async function inspectChromeProcessIdentityWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
+      ? createTrustedProcessProbe(platform, execute)
       : deps.trustedProcessProbe;
   const snapshot = await (deps.readProcessSnapshot
     ? deps.readProcessSnapshot(identity.pid)
@@ -373,7 +377,6 @@ interface ChromeProfileDirectoryUseDeps {
   platform?: NodeJS.Platform;
   execute?: ProcessCommandExecutor;
   trustedProcessProbe?: TrustedProcessProbe | null;
-  windowsSystemRoot?: string;
   listProcesses?: () => Promise<readonly RunningChromeProcessCommand[]>;
   readProcessGeneration?: (pid: number) => Promise<string | null>;
   captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
@@ -404,13 +407,12 @@ async function inspectChromeProfileDirectoryUseWithDeps(
   const execute = deps.execute ?? executeProcessCommand;
   const trustedProcessProbe =
     deps.trustedProcessProbe === undefined
-      ? createTrustedProcessProbe(platform, execute, deps.windowsSystemRoot)
+      ? createTrustedProcessProbe(platform, execute)
       : deps.trustedProcessProbe;
   const processGenerationProvider = createPlatformProcessGenerationProvider({
     platform,
     execute,
     trustedProcessProbe,
-    windowsSystemRoot: deps.windowsSystemRoot,
   });
   const readProcessGeneration =
     deps.readProcessGeneration ?? processGenerationProvider.readProcessGeneration;
@@ -877,32 +879,45 @@ async function readChromeProcessSnapshot(
   platform: NodeJS.Platform,
   execute: ProcessCommandExecutor,
   trustedProcessProbe: TrustedProcessProbe | null,
+  linuxProcfs: LinuxProcfs = linuxProcfsFromDisk,
 ): Promise<ChromeProcessSnapshot | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   if ((platform === "win32" || platform === "darwin") && !trustedProcessProbe) return null;
   try {
     if (platform === "linux") {
       const procRoot = `/proc/${Math.trunc(pid)}`;
-      const initialStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
+      const initialStat = parseLinuxProcStat(
+        (await linuxProcfs.readFile(path.join(procRoot, "stat"), "utf8")).toString(),
+      );
       const initialBootId = parseLinuxBootId(
-        await readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+        (await linuxProcfs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).toString(),
       );
       if (!initialStat || initialStat.pid !== pid || !initialBootId) return null;
-      const executablePath = await readlink(path.join(procRoot, "exe"));
-      const rawCommandLine = await readFile(path.join(procRoot, "cmdline"));
-      const confirmedStat = parseLinuxProcStat(await readFile(path.join(procRoot, "stat"), "utf8"));
+      const executablePath = await linuxProcfs.readlink(path.join(procRoot, "exe"));
+      const rawCommandLine = (await linuxProcfs.readFile(path.join(procRoot, "cmdline"))).toString(
+        "utf8",
+      );
+      const confirmedExecutablePath = await linuxProcfs.readlink(path.join(procRoot, "exe"));
+      const confirmedCommandLine = (
+        await linuxProcfs.readFile(path.join(procRoot, "cmdline"))
+      ).toString("utf8");
+      const confirmedStat = parseLinuxProcStat(
+        (await linuxProcfs.readFile(path.join(procRoot, "stat"), "utf8")).toString(),
+      );
       const confirmedBootId = parseLinuxBootId(
-        await readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+        (await linuxProcfs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).toString(),
       );
       if (
         !confirmedStat ||
         confirmedStat.pid !== pid ||
         confirmedStat.startTicks !== initialStat.startTicks ||
-        confirmedBootId !== initialBootId
+        confirmedBootId !== initialBootId ||
+        confirmedExecutablePath !== executablePath ||
+        confirmedCommandLine !== rawCommandLine
       ) {
         return null;
       }
-      const commandTokens = rawCommandLine.toString("utf8").split("\0");
+      const commandTokens = rawCommandLine.split("\0");
       if (commandTokens.at(-1) === "") commandTokens.pop();
       if (commandTokens.length === 0) return null;
       return {
@@ -1208,6 +1223,12 @@ export function isChromeCommandForUserDataDirForTest(
 ): boolean {
   return isChromeCommandForUserDataDir(command, userDataDir, platform);
 }
+
+// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
+export const __test__ = {
+  readLinuxChromeProcessSnapshot: (pid: number, linuxProcfs: LinuxProcfs) =>
+    readChromeProcessSnapshot(pid, "linux", executeProcessCommand, null, linuxProcfs),
+};
 
 export function isProcessAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;

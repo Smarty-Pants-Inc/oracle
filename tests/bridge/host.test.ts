@@ -17,6 +17,8 @@ import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
+import * as fsDurability from "../../src/fsDurability.js";
+import * as sessionManager from "../../src/sessionManager.js";
 
 const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
@@ -30,10 +32,12 @@ interface FakeBridgeChild {
   readinessUnref: Mock;
   unref: Mock;
   kill: Mock;
+  exit: (code?: number | null, signal?: NodeJS.Signals | null) => void;
 }
 
 function createFakeBridgeChild(
   onCredentials: (payload: string, readiness: Readable) => void | Promise<void>,
+  pid = 4242,
 ): FakeBridgeChild {
   const stdinWrites: Buffer[] = [];
   const readiness = new Readable({ read() {} });
@@ -55,20 +59,37 @@ function createFakeBridgeChild(
     );
   });
 
+  const emitter = new EventEmitter();
+  let exited = false;
+  let exitCode: number | null = null;
+  let signalCode: NodeJS.Signals | null = null;
+  const exit = (code: number | null = null, signal: NodeJS.Signals | null = "SIGTERM") => {
+    if (exited) return;
+    exited = true;
+    exitCode = code;
+    signalCode = signal;
+    emitter.emit("exit", code, signal);
+  };
   const unref = vi.fn();
-  const kill = vi.fn(() => true);
-  const child = Object.assign(new EventEmitter(), {
-    pid: 4242,
+  const kill = vi.fn((signal?: NodeJS.Signals) => {
+    exit(null, signal ?? "SIGTERM");
+    return true;
+  });
+  Object.assign(emitter, {
+    pid,
     stdin,
     stdio: [stdin, null, null, readiness],
     stdout: null,
     stderr: null,
-    exitCode: null,
-    signalCode: null,
     unref,
     kill,
-  }) as unknown as ChildProcess;
-  return { child, stdinWrites, stdinUnref, readinessUnref, unref, kill };
+  });
+  Object.defineProperties(emitter, {
+    exitCode: { configurable: true, get: () => exitCode },
+    signalCode: { configurable: true, get: () => signalCode },
+  });
+  const child = emitter as unknown as ChildProcess;
+  return { child, stdinWrites, stdinUnref, readinessUnref, unref, kill, exit };
 }
 
 function credentialPayload(
@@ -461,7 +482,7 @@ describe("bridge host detached child transport", () => {
           },
         ),
       ).rejects.toThrow(expected);
-      expect(harness.kill).toHaveBeenCalledOnce();
+      expect(harness.kill).toHaveBeenCalledTimes(name === "early child exit" ? 0 : 1);
       expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
       expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
       expect(log.mock.calls.flat().join("\n")).not.toContain("running in background");
@@ -505,6 +526,69 @@ describe("bridge host detached child transport", () => {
       expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
       expect(log.mock.calls.flat().join("\n")).not.toContain("running in background");
     } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for the ready child tree to stop before rolling back a durable publication failure", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-host-durable-failure-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
+    const oldArtifact = '{"old":"artifact"}\n';
+    const oldPid = "8181\n";
+    await fs.writeFile(artifactPath, oldArtifact);
+    await fs.writeFile(pidPath, oldPid);
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild((_payload, readiness) => {
+      readiness.push(readinessPayload(READINESS_NONCE));
+      readiness.push(null);
+    }, 0);
+    const shutdownRequested = Promise.withResolvers<void>();
+    let tunnelLive = true;
+    harness.kill.mockImplementation(() => {
+      shutdownRequested.resolve();
+      return true;
+    });
+    const durableWrite = sessionManager.writeFileAtomicDurable;
+    let failPublishedArtifact = true;
+    let rollbackStarted = false;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        if (targetPath === artifactPath && !failPublishedArtifact) rollbackStarted = true;
+        await durableWrite(targetPath, data, mode);
+        if (targetPath === artifactPath && failPublishedArtifact) {
+          failPublishedArtifact = false;
+          throw new Error("injected directory sync failure after artifact publication");
+        }
+      },
+    );
+    const syncDirectory = vi.spyOn(fsDurability, "syncDirectory");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const publication = runBridgeHost(
+        { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+        {
+          spawn: () => harness.child,
+          generateReadinessNonce: () => READINESS_NONCE,
+        },
+      );
+      await shutdownRequested.promise;
+      expect(tunnelLive).toBe(true);
+      expect(await fs.readFile(pidPath, "utf8")).toBe("0\n");
+      await Promise.resolve();
+      expect(rollbackStarted).toBe(false);
+
+      tunnelLive = false;
+      harness.exit();
+      await expect(publication).rejects.toThrow(/injected directory sync failure/i);
+      expect(tunnelLive).toBe(false);
+      expect(harness.kill).toHaveBeenCalledOnce();
+      expect(await fs.readFile(artifactPath, "utf8")).toBe(oldArtifact);
+      expect(await fs.readFile(pidPath, "utf8")).toBe(oldPid);
+      expect(syncDirectory).toHaveBeenCalledWith(tempDir);
+    } finally {
+      harness.exit();
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });

@@ -12,8 +12,7 @@ import type {
 } from "../../src/browser/filesystemLock.js";
 import { createPlatformProcessGenerationProvider } from "../../src/browser/platformProcessGeneration.js";
 import { createProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
-const WINDOWS_SYSTEM_ROOT = String.raw`D:\Windows`;
-const WINDOWS_TRUSTED_PROCESS_PROBE = String.raw`${WINDOWS_SYSTEM_ROOT}\System32\WindowsPowerShell\v1.0\powershell.exe`;
+const WINDOWS_TRUSTED_PROCESS_PROBE = String.raw`\\?\GLOBALROOT\SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`;
 
 test("ignores a hostile PATH when reading an exact Windows CIM creation generation", async () => {
   const attackerPowerShell = vi.fn(async () => ({ stdout: "1900-01-01T00:00:00.0000000Z\n" }));
@@ -27,7 +26,6 @@ test("ignores a hostile PATH when reading an exact Windows CIM creation generati
   const provider = createPlatformProcessGenerationProvider({
     platform: "win32",
     execute,
-    windowsSystemRoot: WINDOWS_SYSTEM_ROOT,
   });
   const identity = await provider.readProcessGeneration(10_005);
   const retryIdentity = await provider.readProcessGeneration(10_005);
@@ -47,7 +45,6 @@ test("ignores a hostile PATH when reading an exact Windows CIM creation generati
     createPlatformProcessGenerationProvider({
       platform: "win32",
       execute: async () => ({ stdout: "10005" }),
-      windowsSystemRoot: WINDOWS_SYSTEM_ROOT,
     }).readProcessGeneration(10_005),
   ).resolves.toBeNull();
   await expect(
@@ -56,7 +53,6 @@ test("ignores a hostile PATH when reading an exact Windows CIM creation generati
       execute: async () => {
         throw new Error("CIM unavailable");
       },
-      windowsSystemRoot: WINDOWS_SYSTEM_ROOT,
     }).readProcessGeneration(10_005),
   ).resolves.toBeNull();
 });
@@ -73,16 +69,24 @@ test("fails closed when the trusted Windows process probe is unavailable", async
   expect(execute).not.toHaveBeenCalled();
 });
 
-test("fails closed before execution when Windows SystemRoot is invalid", async () => {
-  const execute = vi.fn(async () => ({ stdout: "2026-08-05T12:34:56.1234567Z\n" }));
-  const provider = createPlatformProcessGenerationProvider({
-    platform: "win32",
-    execute,
-    windowsSystemRoot: String.raw`..\Windows`,
-  });
-
-  await expect(provider.readProcessGeneration(10_005)).resolves.toBeNull();
-  expect(execute).not.toHaveBeenCalled();
+test("rejects an inherited attacker SystemRoot before the Windows process probe executes", async () => {
+  const originalSystemRoot = process.env.SystemRoot;
+  const attackerSystemRoot = String.raw`D:\Users\attacker\Windows`;
+  process.env.SystemRoot = attackerSystemRoot;
+  const execute = vi.fn(async (_file: string) => ({
+    stdout: "2026-08-05T12:34:56.1234567Z\n",
+  }));
+  try {
+    const provider = createPlatformProcessGenerationProvider({ platform: "win32", execute });
+    await expect(provider.readProcessGeneration(10_005)).resolves.toBe(
+      "win32:2026-08-05T12:34:56.1234567Z",
+    );
+    expect(execute.mock.calls[0]?.[0]).toBe(WINDOWS_TRUSTED_PROCESS_PROBE);
+    expect(execute.mock.calls[0]?.[0]).not.toContain(attackerSystemRoot);
+  } finally {
+    if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = originalSystemRoot;
+  }
 });
 
 test("uses the Darwin audit pidversion rather than second-resolution lstart", async () => {
@@ -461,7 +465,6 @@ describe("crash-recoverable filesystem lock", () => {
     const generationProvider = createPlatformProcessGenerationProvider({
       platform: "win32",
       execute,
-      windowsSystemRoot: WINDOWS_SYSTEM_ROOT,
     });
     const readProcessStartIdentity = vi.fn((pid: number, timeoutMs?: number) =>
       generationProvider.readProcessGeneration(pid, timeoutMs),

@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
-import { lstat, open, readFile, rm } from "node:fs/promises";
+import { link, lstat, open, readFile, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { syncDirectory } from "../fsDurability.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { resolveUserDataBaseDir } from "./localExecutionContext.js";
 import {
   captureProfileDirectoryIdentity,
-  parseChromeProcessIdentity,
   parseChromeProcessLaunchClaim,
+  parseOracleChromeOwnerRecord,
   parseProfileDirectoryIdentity,
   readOracleChromeOwner,
   sameChromeProcessIdentity,
@@ -21,6 +21,13 @@ import { hasExactBrowserTabLease, type BrowserTabLeaseIdentity } from "./tabLeas
 
 const PROJECT_SOURCES_PROFILE_MARKER = ".oracle-project-sources-authority.json";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+let beforeManualAdmissionPublicationForTest:
+  | ((preparationPath: string) => void | Promise<void>)
+  | undefined;
+let beforeManualAdmissionPreparationCleanupForTest:
+  | ((preparationPath: string) => void | Promise<void>)
+  | undefined;
 
 export interface ProjectSourcesMarkerFileIdentity {
   readonly device: string;
@@ -254,26 +261,9 @@ function parseMarkerFileIdentity(value: unknown): ProjectSourcesMarkerFileIdenti
 }
 
 function parseManualOwner(value: unknown): OracleChromeOwnerRecord | null {
-  if (!value || typeof value !== "object") return null;
-  const candidate = value as Record<string, unknown>;
-  const processIdentity = parseChromeProcessIdentity(candidate.processIdentity, process.platform);
-  const disposition = candidate.disposition;
-  const preservationPolicy = candidate.preservationPolicy;
-  if (
-    !Number.isInteger(candidate.port) ||
-    Number(candidate.port) <= 0 ||
-    !processIdentity ||
-    (disposition !== "preserve" && disposition !== "close-on-last-lease") ||
-    (preservationPolicy !== undefined && preservationPolicy !== "service-persistent")
-  ) {
-    return null;
-  }
-  return {
-    port: Number(candidate.port),
-    processIdentity,
-    disposition,
-    ...(preservationPolicy ? { preservationPolicy } : {}),
-  };
+  return value && typeof value === "object" && Object.hasOwn(value, "disposition")
+    ? parseOracleChromeOwnerRecord(value, process.platform)
+    : null;
 }
 
 function parseTemporaryProof(value: unknown): ProjectSourcesTemporaryCleanupProof | null {
@@ -580,6 +570,129 @@ function manualAdmissionContent(
   })}\n`;
 }
 
+function manualAdmissionPreparationPath(
+  expectedPath: string,
+  proof: ProjectSourcesManualCleanupProof,
+): string {
+  if (!UUID_PATTERN.test(proof.admission.token)) {
+    throw new Error("Project Sources manual admission has an invalid receipt token.");
+  }
+  return `${expectedPath}.${proof.admission.token}.preparing`;
+}
+
+async function authenticateManualAdmissionReceipt(
+  receiptPath: string,
+  proof: ProjectSourcesManualCleanupProof,
+  owner: OracleChromeOwnerRecord,
+  requireSingleLink: boolean,
+): Promise<ProjectSourcesMarkerFileIdentity> {
+  const beforeStats = await lstat(receiptPath, { bigint: true });
+  if (requireSingleLink && beforeStats.nlink !== 1n) {
+    throw new Error("Project Sources manual admission receipt has a writable hard-link alias.");
+  }
+  const before = captureMarkerFileIdentity(beforeStats);
+  const parsed: unknown = JSON.parse(await readFile(receiptPath, "utf8"));
+  const afterStats = await lstat(receiptPath, { bigint: true });
+  const after = captureMarkerFileIdentity(afterStats);
+  if (
+    (requireSingleLink && afterStats.nlink !== 1n) ||
+    !sameMarkerFileIdentity(before, after) ||
+    !manualAdmissionContentMatches(parsed, proof, owner)
+  ) {
+    throw new Error("Project Sources manual admission receipt changed or mismatched.");
+  }
+  return before;
+}
+
+async function removePublishedManualAdmissionPreparation(
+  preparationPath: string,
+  proof: ProjectSourcesManualCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  owner: OracleChromeOwnerRecord,
+): Promise<void> {
+  try {
+    await authenticateManualAdmissionReceipt(preparationPath, proof, owner, false);
+  } catch {
+    return;
+  }
+  try {
+    await unlink(preparationPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await syncDirectory(storage.root.canonicalPath);
+}
+
+async function prepareManualAdmissionReceipt(
+  preparationPath: string,
+  proof: ProjectSourcesManualCleanupProof,
+  owner: OracleChromeOwnerRecord,
+): Promise<void> {
+  const content = manualAdmissionContent(proof, owner);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(preparationPath, "wx", 0o600);
+      try {
+        await handle.writeFile(content, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        await authenticateManualAdmissionReceipt(preparationPath, proof, owner, true);
+        return;
+      } catch {
+        await rm(preparationPath, { force: true });
+      }
+    }
+  }
+  throw new Error("Project Sources manual admission preparation remains unavailable.");
+}
+
+async function publishManualAdmissionReceipt(
+  expectedPath: string,
+  proof: ProjectSourcesManualCleanupProof,
+  storage: ProjectSourcesCleanupStorage,
+  owner: OracleChromeOwnerRecord,
+): Promise<ProjectSourcesMarkerFileIdentity> {
+  const preparationPath = manualAdmissionPreparationPath(expectedPath, proof);
+  try {
+    await authenticateManualAdmissionReceipt(expectedPath, proof, owner, false);
+    await removePublishedManualAdmissionPreparation(preparationPath, proof, storage, owner);
+    return await authenticateManualAdmissionReceipt(expectedPath, proof, owner, true);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await prepareManualAdmissionReceipt(preparationPath, proof, owner);
+  await beforeManualAdmissionPublicationForTest?.(preparationPath);
+  try {
+    await link(preparationPath, expectedPath);
+    await syncDirectory(storage.root.canonicalPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  await beforeManualAdmissionPreparationCleanupForTest?.(preparationPath);
+  await removePublishedManualAdmissionPreparation(preparationPath, proof, storage, owner);
+  return await authenticateManualAdmissionReceipt(expectedPath, proof, owner, true);
+}
+
+export const __test__ = {
+  manualAdmissionPreparationPath,
+  setBeforeManualAdmissionPublication(
+    callback: ((preparationPath: string) => void | Promise<void>) | undefined,
+  ): void {
+    beforeManualAdmissionPublicationForTest = callback;
+  },
+  setBeforeManualAdmissionPreparationCleanup(
+    callback: ((preparationPath: string) => void | Promise<void>) | undefined,
+  ): void {
+    beforeManualAdmissionPreparationCleanupForTest = callback;
+  },
+};
+
 export async function authenticateProjectSourcesManualAdmission(
   proof: ProjectSourcesManualCleanupProof,
   storage: ProjectSourcesCleanupStorage,
@@ -601,33 +714,15 @@ export async function authenticateProjectSourcesManualAdmission(
   ) {
     throw new Error("Project Sources manual admission owner has a different physical profile.");
   }
-  if (options.create) {
-    try {
-      const handle = await open(expectedPath, "wx", 0o600);
-      try {
-        await handle.writeFile(manualAdmissionContent(proof, owner), "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await syncDirectory(storage.root.canonicalPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-  }
-  const before = captureMarkerFileIdentity(await lstat(expectedPath, { bigint: true }));
-  const parsed: unknown = JSON.parse(await readFile(expectedPath, "utf8"));
-  const after = captureMarkerFileIdentity(await lstat(expectedPath, { bigint: true }));
-  if (
-    !sameMarkerFileIdentity(before, after) ||
-    (proof.admission.identity && !sameMarkerFileIdentity(before, proof.admission.identity)) ||
-    !manualAdmissionContentMatches(parsed, proof, owner)
-  ) {
+  const identity = options.create
+    ? await publishManualAdmissionReceipt(expectedPath, proof, storage, owner)
+    : await authenticateManualAdmissionReceipt(expectedPath, proof, owner, true);
+  if (proof.admission.identity && !sameMarkerFileIdentity(identity, proof.admission.identity)) {
     throw new Error("Project Sources manual admission receipt changed or mismatched.");
   }
   return {
     ...proof,
-    admission: { ...proof.admission, identity: before },
+    admission: { ...proof.admission, identity },
     owner,
     authenticated: true,
   };

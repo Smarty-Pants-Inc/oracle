@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, test, vi } from "vitest";
@@ -25,6 +25,24 @@ import {
   __test__ as targetCloseAuthority,
 } from "../../src/browser/targetCloseAuthority.js";
 import * as recovery from "../../src/browser/projectSourcesRecovery.js";
+
+interface TemporaryAuthority {
+  oracleHome: string;
+  storage: recovery.ProjectSourcesCleanupStorage;
+  intent: recovery.ProjectSourcesProfileCreateIntent;
+  proof: recovery.ProjectSourcesTemporaryCleanupProof;
+}
+
+interface ManualAuthority {
+  oracleHome: string;
+  storage: recovery.ProjectSourcesCleanupStorage;
+  profileDir: string;
+  profileDirectory: ProfileDirectoryIdentity;
+  generationId: string;
+  leaseId: string;
+  owner: OracleChromeOwnerRecord;
+  proof: recovery.ProjectSourcesManualCleanupProof;
+}
 
 function processIdentity(
   profileDirectory: ProfileDirectoryIdentity,
@@ -122,7 +140,7 @@ function cleanupRuntime(
   };
 }
 
-async function temporaryAuthority() {
+async function temporaryAuthority(): Promise<TemporaryAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-proof-home-"));
   setOracleHomeDirOverrideForTest(oracleHome);
   const storage = await recovery.establishProjectSourcesCleanupStorage();
@@ -134,7 +152,7 @@ async function temporaryAuthority() {
   return { oracleHome, storage, intent, proof };
 }
 
-async function manualAuthority() {
+async function manualAuthority(): Promise<ManualAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-manual-home-"));
   const requestedProfileDir = path.join(oracleHome, "manual-profile");
   await mkdir(requestedProfileDir);
@@ -659,3 +677,288 @@ test("retains physical admission through partial lease settlement and later conv
     await removeAuthority(authority.oracleHome);
   }
 });
+
+async function fileIdentity(pathname: string) {
+  const stats = await lstat(pathname, { bigint: true });
+  return {
+    device: String(stats.dev),
+    inode: String(stats.ino),
+    birthtimeNs: String(stats.birthtimeNs),
+    ctimeNs: String(stats.ctimeNs),
+    mode: String(stats.mode),
+    size: String(stats.size),
+  };
+}
+
+async function rewriteManualAdmission(
+  authority: ManualAuthority,
+  mutate: (receipt: Record<string, unknown>) => void,
+): Promise<recovery.ProjectSourcesManualCleanupProof> {
+  const receipt: Record<string, unknown> = JSON.parse(
+    await readFile(authority.proof.admission.path, "utf8"),
+  );
+  mutate(receipt);
+  await writeFile(authority.proof.admission.path, `${JSON.stringify(receipt)}\n`);
+  return {
+    ...authority.proof,
+    admission: {
+      ...authority.proof.admission,
+      identity: await fileIdentity(authority.proof.admission.path),
+    },
+  };
+}
+
+const manualAdmissionTamperCases: ReadonlyArray<{
+  readonly name: string;
+  readonly mutate: (
+    authority: ManualAuthority,
+  ) => Promise<{ proof: recovery.ProjectSourcesManualCleanupProof; occupantPath: string }>;
+}> = [
+  {
+    name: "receipt owner",
+    mutate: async (authority) => ({
+      proof: await rewriteManualAdmission(authority, (receipt) => {
+        const owner = receipt.owner;
+        if (
+          !owner ||
+          typeof owner !== "object" ||
+          !("port" in owner) ||
+          typeof owner.port !== "number"
+        ) {
+          throw new Error("expected manual admission owner");
+        }
+        owner.port += 1;
+      }),
+      occupantPath: authority.proof.admission.path,
+    }),
+  },
+  {
+    name: "receipt generation",
+    mutate: async (authority) => ({
+      proof: await rewriteManualAdmission(authority, (receipt) => {
+        receipt.generationId = randomUUID();
+      }),
+      occupantPath: authority.proof.admission.path,
+    }),
+  },
+  {
+    name: "physical profile directory",
+    mutate: async (authority) => {
+      const preservedProfile = `${authority.profileDir}-replacement-${randomUUID()}`;
+      await rename(authority.profileDir, preservedProfile);
+      await mkdir(authority.profileDir);
+      const occupantPath = path.join(authority.profileDir, "replacement-owner.txt");
+      await writeFile(occupantPath, "preserve replacement profile");
+      return { proof: authority.proof, occupantPath };
+    },
+  },
+  {
+    name: "receipt token binding",
+    mutate: async (authority) => ({
+      proof: await rewriteManualAdmission(authority, (receipt) => {
+        receipt.token = randomUUID();
+      }),
+      occupantPath: authority.proof.admission.path,
+    }),
+  },
+  {
+    name: "receipt content",
+    mutate: async (authority) => ({
+      proof: await rewriteManualAdmission(authority, (receipt) => {
+        for (const key of Object.keys(receipt)) delete receipt[key];
+      }),
+      occupantPath: authority.proof.admission.path,
+    }),
+  },
+  {
+    name: "receipt inode",
+    mutate: async (authority) => {
+      const receipt = await readFile(authority.proof.admission.path, "utf8");
+      await rm(authority.proof.admission.path);
+      await writeFile(authority.proof.admission.path, receipt);
+      return { proof: authority.proof, occupantPath: authority.proof.admission.path };
+    },
+  },
+];
+
+for (const { name, mutate } of manualAdmissionTamperCases) {
+  test(`rejects manual cleanup after ${name} tampering before any owned effect`, async () => {
+    const authority = await manualAuthority();
+    const retryCleanup = vi.fn();
+    const closeTarget = vi.fn();
+    const removeProfile = vi.fn();
+    try {
+      const { proof, occupantPath } = await mutate(authority);
+      await recovery.persistProjectSourcesCleanupRuntime(
+        cleanupRuntime(proof, {
+          owner: authority.owner,
+          pendingResource: "chrome-target",
+        }),
+        authority.storage,
+        { proof },
+      );
+      await expect(
+        recovery.retryPendingProjectSourcesCleanup(() => undefined, authority.storage, {
+          closeChromeTargetWithExactAuthority: closeTarget,
+          removeProfileDirectoryIfIdentityMatches: removeProfile,
+          retryCleanup,
+        }),
+      ).rejects.toThrow(/Project Sources/i);
+      expect(retryCleanup).not.toHaveBeenCalled();
+      expect(closeTarget).not.toHaveBeenCalled();
+      expect(removeProfile).not.toHaveBeenCalled();
+      await expect(readFile(authority.storage.journalPath, "utf8")).resolves.toContain('"proof"');
+      await expect(readFile(occupantPath, "utf8")).resolves.toBeTruthy();
+    } finally {
+      await removeAuthority(authority.oracleHome);
+    }
+  });
+}
+
+test("rejects a partial pre-existing manual admission receipt before it can publish cleanup", async () => {
+  const authority = await manualAuthority();
+  try {
+    const { authenticated: _authenticated, owner: _owner, ...unadmittedProof } = authority.proof;
+    const proof: recovery.ProjectSourcesManualCleanupProof = {
+      ...unadmittedProof,
+      admission: {
+        path: authority.proof.admission.path,
+        token: authority.proof.admission.token,
+      },
+    };
+    await rm(proof.admission.path);
+    await writeFile(proof.admission.path, "{\n");
+    await expect(
+      recovery.updateProjectSourcesCleanupProofForPersistence(
+        cleanupRuntime(proof, { owner: authority.owner }),
+        proof,
+        authority.storage,
+        {
+          hasExactBrowserTabLease: vi.fn(async () => true),
+          readOracleChromeOwner: vi.fn(async () => authority.owner),
+        },
+      ),
+    ).rejects.toThrow();
+    await expect(readFile(proof.admission.path, "utf8")).resolves.toBe("{\n");
+    await expect(readFile(authority.storage.journalPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  } finally {
+    await removeAuthority(authority.oracleHome);
+  }
+});
+
+async function persistTemporaryProof(
+  authority: TemporaryAuthority,
+  intent: recovery.ProjectSourcesProfileCreateIntent,
+  proof: recovery.ProjectSourcesTemporaryCleanupProof,
+) {
+  await writeFile(
+    authority.storage.journalPath,
+    `${JSON.stringify({
+      version: 2,
+      oracleHome: authority.storage.root,
+      profileCreate: { ...intent, proof },
+    })}\n`,
+  );
+}
+
+const temporaryProofTamperCases: ReadonlyArray<{
+  readonly name: string;
+  readonly mutate: (authority: TemporaryAuthority) => Promise<{
+    intent: recovery.ProjectSourcesProfileCreateIntent;
+    proof: recovery.ProjectSourcesTemporaryCleanupProof;
+    occupantPath: string;
+  }>;
+}> = [
+  {
+    name: "storage owner",
+    mutate: async (authority) => {
+      const storageOwnerId = `${authority.proof.storageOwnerId}-replacement`;
+      return {
+        intent: { ...authority.intent, storageOwnerId },
+        proof: { ...authority.proof, storageOwnerId },
+        occupantPath: authority.proof.marker.path,
+      };
+    },
+  },
+  {
+    name: "generation binding",
+    mutate: async (authority) => ({
+      intent: { ...authority.intent, generationId: randomUUID() },
+      proof: authority.proof,
+      occupantPath: authority.proof.marker.path,
+    }),
+  },
+  {
+    name: "physical profile directory",
+    mutate: async (authority) => {
+      await rename(authority.intent.userDataDir, `${authority.intent.userDataDir}-original`);
+      await mkdir(authority.intent.userDataDir);
+      const occupantPath = path.join(authority.intent.userDataDir, "replacement-owner.txt");
+      await writeFile(occupantPath, "preserve replacement profile");
+      return { intent: authority.intent, proof: authority.proof, occupantPath };
+    },
+  },
+  {
+    name: "marker inode",
+    mutate: async (authority) => {
+      const marker = await readFile(authority.proof.marker.path, "utf8");
+      await rm(authority.proof.marker.path);
+      await writeFile(authority.proof.marker.path, marker);
+      return {
+        intent: authority.intent,
+        proof: authority.proof,
+        occupantPath: authority.proof.marker.path,
+      };
+    },
+  },
+  {
+    name: "marker content",
+    mutate: async (authority) => {
+      const marker: Record<string, unknown> = JSON.parse(
+        await readFile(authority.proof.marker.path, "utf8"),
+      );
+      marker.token = randomUUID();
+      await writeFile(authority.proof.marker.path, `${JSON.stringify(marker)}\n`);
+      return {
+        intent: authority.intent,
+        proof: {
+          ...authority.proof,
+          marker: {
+            ...authority.proof.marker,
+            identity: await fileIdentity(authority.proof.marker.path),
+          },
+        },
+        occupantPath: authority.proof.marker.path,
+      };
+    },
+  },
+];
+
+for (const { name, mutate } of temporaryProofTamperCases) {
+  test(`rejects temporary cleanup after ${name} tampering before any owned effect`, async () => {
+    const authority = await temporaryAuthority();
+    const retryCleanup = vi.fn();
+    const removeProfile = vi.fn();
+    try {
+      const { intent, proof, occupantPath } = await mutate(authority);
+      await persistTemporaryProof(authority, intent, proof);
+      await expect(
+        recovery.retryPendingProjectSourcesCleanup(() => undefined, authority.storage, {
+          removeProfileDirectoryIfIdentityMatches: removeProfile,
+          retryCleanup,
+        }),
+      ).rejects.toThrow(/Project Sources|journal is invalid/i);
+      expect(retryCleanup).not.toHaveBeenCalled();
+      expect(removeProfile).not.toHaveBeenCalled();
+      await expect(readFile(authority.storage.journalPath, "utf8")).resolves.toContain(
+        '"profileCreate"',
+      );
+      await expect(readFile(occupantPath, "utf8")).resolves.toBeTruthy();
+    } finally {
+      await removeAuthority(authority.oracleHome, authority.intent.userDataDir);
+      await rm(`${authority.intent.userDataDir}-original`, { recursive: true, force: true });
+    }
+  });
+}

@@ -75,39 +75,41 @@ function New-PrivateAcl([bool]$Directory) {
   $Acl.SetAccessRuleProtection($true, $false)
   $Inheritance = if ($Directory) { $DirectoryInheritance } else { $NoInheritance }
   foreach ($Sid in $AllowedSids) {
-    $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $Acl.SetAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
       $Sid,
       $FullControl,
       $Inheritance,
       $NoPropagation,
       $Allow
-    )
-    [void]$Acl.AddAccessRule($Rule)
+    ))
   }
   return $Acl
+}
+
+function Get-PrivateAclRuleSignature([System.Security.AccessControl.FileSystemAccessRule]$Rule) {
+  return "$($Rule.IdentityReference.Value)|$([int64]$Rule.FileSystemRights)|$([int]$Rule.AccessControlType)|$([int]$Rule.InheritanceFlags)|$([int]$Rule.PropagationFlags)|$($Rule.IsInherited)"
+}
+
+function Format-PrivateAclRules($Rules) {
+  return (@($Rules | ForEach-Object { Get-PrivateAclRuleSignature $_ } | Sort-Object) -join ', ')
+}
+$ExpectedPrivateAclRules = @{}
+foreach ($ExpectedDirectory in @($false, $true)) {
+  $ExpectedAcl = New-PrivateAcl $ExpectedDirectory
+  $ExpectedRules = @($ExpectedAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  $ExpectedPrivateAclRules[$ExpectedDirectory] = Format-PrivateAclRules $ExpectedRules
 }
 
 function Assert-PrivateAcl([System.IO.FileSystemInfo]$Item, [bool]$Directory) {
   $Acl = $Item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access)
   $Owner = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier])
-  if ($Owner.Value -ne $CurrentSid.Value) { throw "Protected filesystem item owner is not the controller user: $($Item.FullName)" }
+  if ($Owner.Value -ne $CurrentSid.Value) { throw "Protected filesystem item owner is not the controller user: $($Item.FullName); actual=$($Owner.Value); expected=$($CurrentSid.Value)" }
   if (-not $Acl.AreAccessRulesProtected) { throw "Protected filesystem item still inherits access rules: $($Item.FullName)" }
-  $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-  if ($Rules.Count -ne $AllowedSids.Count) { throw "Protected filesystem item has unexpected access rules: $($Item.FullName)" }
-  $ExpectedInheritance = if ($Directory) { $DirectoryInheritance } else { $NoInheritance }
-  foreach ($Sid in $AllowedSids) {
-    $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid.Value })
-    if ($Matches.Count -ne 1) { throw "Protected filesystem item is missing an exact principal rule: $($Item.FullName)" }
-    $Rule = $Matches[0]
-    if (
-      $Rule.IsInherited -or
-      $Rule.AccessControlType -ne $Allow -or
-      [int64]$Rule.FileSystemRights -ne [int64]$FullControl -or
-      $Rule.InheritanceFlags -ne $ExpectedInheritance -or
-      $Rule.PropagationFlags -ne $NoPropagation
-    ) {
-      throw "Protected filesystem item has a non-private access rule: $($Item.FullName)"
-    }
+  $ActualRules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  $Expected = $ExpectedPrivateAclRules[$Directory]
+  $Actual = Format-PrivateAclRules $ActualRules
+  if ($Actual -ne $Expected) {
+    throw "Protected filesystem item has non-canonical private access rules: $($Item.FullName); actual=[$Actual]; expected=[$Expected]"
   }
 }
 
@@ -188,10 +190,7 @@ const executeWindowsAclCommand: WindowsAclCommandExecutor = async (file, args, o
   return { stdout: String(stdout ?? "") };
 };
 
-export function buildWindowsPrivateTreeAclCommand(
-  scope: WindowsPrivateTreeScope,
-  systemRoot?: string,
-): {
+export function buildWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope): {
   readonly file: string;
   readonly args: string[];
   readonly options: WindowsAclCommandOptions;
@@ -206,7 +205,7 @@ export function buildWindowsPrivateTreeAclCommand(
     }
   }
   return {
-    file: resolveWindowsPowerShellExecutable(systemRoot),
+    file: resolveWindowsPowerShellExecutable(),
     args: [
       "-NoLogo",
       "-NoProfile",
@@ -221,9 +220,8 @@ export function buildWindowsPrivateTreeAclCommand(
 export async function protectWindowsPrivateTreeAcl(
   scope: WindowsPrivateTreeScope,
   execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
-  systemRoot?: string,
 ): Promise<void> {
-  const command = buildWindowsPrivateTreeAclCommand(scope, systemRoot);
+  const command = buildWindowsPrivateTreeAclCommand(scope);
   let stdout: string;
   try {
     ({ stdout } = await execute(command.file, command.args, command.options));

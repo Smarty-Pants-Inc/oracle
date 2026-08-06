@@ -417,7 +417,7 @@ async function verifyChromeProcessIdentityWithDeps(
   return (await inspectChromeProcessIdentityWithDeps(userDataDir, identity, deps)) === "current";
 }
 
-function parseOracleChromeOwnerRecord(
+export function parseOracleChromeOwnerRecord(
   value: unknown,
   platform: NodeJS.Platform,
 ): OracleChromeOwnerRecord | null {

@@ -48,6 +48,7 @@ import {
   persistProjectSourcesCleanupRuntime,
   projectSourcesCleanupOwnerId,
   removeProjectSourcesCleanupProofArtifacts,
+  retireProjectSourcesCleanupJournal,
   retryPendingProjectSourcesCleanup,
   updateProjectSourcesCleanupProofForPersistence,
   type ProjectSourcesCleanupProof,
@@ -178,6 +179,7 @@ async function runBrowserProjectSourcesUnlocked(
     });
   }
 
+  let cleanupRetryRuntime: BrowserRuntimeMetadata | undefined;
   const persistOwnedResources = async (
     runtimeToPersist: BrowserRuntimeMetadata,
   ): Promise<BrowserRuntimeMetadata> => {
@@ -190,9 +192,17 @@ async function runBrowserProjectSourcesUnlocked(
       await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage, {
         proof: cleanupProof,
       });
+      cleanupRetryRuntime = runtimeToPersist;
+    } else if (cleanupRetryRuntime) {
+      await retireProjectSourcesCleanupJournal(
+        cleanupRetryRuntime,
+        cleanupProof,
+        cleanupStorage,
+        logger,
+      );
     } else {
-      await removeProjectSourcesCleanupProofArtifacts(cleanupProof, cleanupStorage);
       await persistProjectSourcesCleanupRuntime({}, cleanupStorage);
+      await removeProjectSourcesCleanupProofArtifacts(cleanupProof, cleanupStorage);
     }
     return runtimeToPersist;
   };
@@ -429,6 +439,7 @@ async function runBrowserProjectSourcesUnlocked(
       await persistProjectSourcesCleanupRuntime(runtimeBeforeSettlement, cleanupStorage, {
         proof: cleanupProof,
       });
+      cleanupRetryRuntime = runtimeBeforeSettlement;
       await assertProjectSourcesCleanupProof(runtimeBeforeSettlement, cleanupProof, cleanupStorage);
     }
     finalization = await resources.settle(completed ? "finalize" : "abort");

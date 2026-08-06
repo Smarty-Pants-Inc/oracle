@@ -790,7 +790,6 @@ describe("profileState", () => {
     });
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const identity = syntheticWindowsChromeIdentity(profileDir);
-    const windowsSystemRoot = String.raw`D:\Windows`;
     let cleanupDir: string | undefined;
 
     try {
@@ -802,7 +801,6 @@ describe("profileState", () => {
       await expect(
         timedProfileState.inspectChromeProcessIdentityForTest(profileDir, identity, {
           platform: "win32",
-          windowsSystemRoot,
           verifyProfileIdentity: async () => true,
           isProcessAlive: () => true,
         }),
@@ -814,9 +812,7 @@ describe("profileState", () => {
       expect(existsSync(path.join(cleanupDir, "DevToolsActivePort"))).toBe(true);
 
       expect(execFileAsync.mock.calls).toHaveLength(2);
-      expect(execFileAsync.mock.calls[0]?.[0]).toBe(
-        resolveWindowsPowerShellExecutable(windowsSystemRoot),
-      );
+      expect(execFileAsync.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());
       expect(execFileAsync.mock.calls[1]?.[0]).toBe(
         process.platform === "win32"
           ? resolveWindowsPowerShellExecutable()

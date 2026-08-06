@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { constants } from "node:fs";
 import type { BigIntStats, Stats } from "node:fs";
-import { lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, unlink, type FileHandle } from "node:fs/promises";
 import {
   physicalDirectoryIdentityFromStats,
   parsePhysicalDirectoryIdentity,
@@ -52,7 +52,7 @@ interface AuthenticatedProfileDirectory {
 }
 interface AuthenticatedProfileDirectoryOptions {
   readonly forceLinuxGenerationMarker?: boolean;
-  readonly beforeGenerationMarkerWrite?: () => void | Promise<void>;
+  readonly beforeGenerationMarkerPublication?: () => void | Promise<void>;
   readonly onGenerationMarkerCreationWait?: () => void;
   readonly beforeFinalEntry?: () => void | Promise<void>;
 }
@@ -96,7 +96,7 @@ export async function captureProfileDirectoryIdentity(
 export async function captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(
   userDataDir: string,
   options: {
-    beforeGenerationMarkerWrite?: () => void | Promise<void>;
+    beforeGenerationMarkerPublication?: () => void | Promise<void>;
     onGenerationMarkerCreationWait?: () => void;
     beforeFinalEntry?: () => void | Promise<void>;
   } = {},
@@ -106,7 +106,7 @@ export async function captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(
   const canonicalPath = await realpath(resolvedPath);
   const authenticated = await captureAuthenticatedProfileDirectory(canonicalPath, {
     forceLinuxGenerationMarker: true,
-    beforeGenerationMarkerWrite: options.beforeGenerationMarkerWrite,
+    beforeGenerationMarkerPublication: options.beforeGenerationMarkerPublication,
     onGenerationMarkerCreationWait: options.onGenerationMarkerCreationWait,
     beforeFinalEntry: options.beforeFinalEntry,
   });
@@ -211,11 +211,8 @@ async function captureLinuxProfileGenerationMarker(
   if (process.platform !== "linux" || !hasDirectoryCapabilityFlags) {
     throw profileGenerationPrerequisiteError(canonicalPath);
   }
-  const markerPath = path.join(
-    "/proc/self/fd",
-    directoryHandle.fd.toString(),
-    PROFILE_GENERATION_MARKER_FILENAME,
-  );
+  const markerDirectoryPath = path.join("/proc/self/fd", directoryHandle.fd.toString());
+  const markerPath = path.join(markerDirectoryPath, PROFILE_GENERATION_MARKER_FILENAME);
   const creationKey = `${directoryStats.dev}:${directoryStats.ino}`;
   try {
     const creationBeforeRead = inFlightLinuxProfileGenerationMarkerCreations.get(creationKey);
@@ -266,29 +263,60 @@ async function captureLinuxProfileGenerationMarker(
     inFlightLinuxProfileGenerationMarkerCreations.set(creationKey, creation.promise);
     try {
       const token = randomBytes(32).toString("hex");
+      const stagingMarkerPath = path.join(
+        markerDirectoryPath,
+        `${PROFILE_GENERATION_MARKER_FILENAME}.staging-${randomBytes(16).toString("hex")}`,
+      );
+      let stagingMarkerCreated = false;
+      let publishedMarker: { readonly device: string; readonly inode: string } | undefined;
       let markerHandle: FileHandle | undefined;
       try {
         markerHandle = await open(
-          markerPath,
+          stagingMarkerPath,
           constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
           0o600,
         );
-        await options.beforeGenerationMarkerWrite?.();
+        stagingMarkerCreated = true;
         await markerHandle.writeFile(`${PROFILE_GENERATION_MARKER_PREFIX}${token}\n`, "utf8");
         await markerHandle.sync();
-      } catch (error) {
-        if (readErrorCode(error) !== "EEXIST") throw error;
+        const stagingMarker = await markerHandle.stat({ bigint: true });
+        await options.beforeGenerationMarkerPublication?.();
+        try {
+          await link(stagingMarkerPath, markerPath);
+          publishedMarker = {
+            device: stagingMarker.dev.toString(),
+            inode: stagingMarker.ino.toString(),
+          };
+          await directoryHandle.sync();
+        } catch (error) {
+          if (readErrorCode(error) !== "EEXIST") throw error;
+        }
       } finally {
-        await markerHandle?.close();
+        try {
+          await markerHandle?.close();
+        } finally {
+          if (stagingMarkerCreated) {
+            await unlink(stagingMarkerPath);
+            await directoryHandle.sync();
+          }
+        }
       }
-      await directoryHandle.sync();
+      const marker = await readLinuxProfileGenerationMarker(markerPath, directoryStats);
+      if (
+        publishedMarker &&
+        (marker.token !== token ||
+          marker.device !== publishedMarker.device ||
+          marker.inode !== publishedMarker.inode)
+      ) {
+        throw new Error(`Profile generation marker changed while publishing: ${markerPath}`);
+      }
+      return marker;
     } finally {
       if (inFlightLinuxProfileGenerationMarkerCreations.get(creationKey) === creation.promise) {
         inFlightLinuxProfileGenerationMarkerCreations.delete(creationKey);
       }
       creation.resolve();
     }
-    return await readLinuxProfileGenerationMarker(markerPath, directoryStats);
   } catch (error) {
     throw profileGenerationPrerequisiteError(canonicalPath, error);
   }

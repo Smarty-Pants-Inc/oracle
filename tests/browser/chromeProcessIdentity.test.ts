@@ -13,7 +13,11 @@ import {
   revalidateChromeProfileDirectoryUseForTest,
   type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
-import { inspectChromeProcessesForLaunchClaimFromProcessListForTest } from "../../src/browser/chromeProcessIdentity.js";
+import {
+  __test__ as chromeProcessIdentityTest,
+  inspectChromeProcessesForLaunchClaimFromProcessListForTest,
+} from "../../src/browser/chromeProcessIdentity.js";
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 
 describe("stable Chrome process authority", () => {
   test("carries retained endpoint release authority into a current standard launch", async () => {
@@ -442,6 +446,110 @@ describe("Darwin Chrome process command parsing", () => {
   });
 });
 
+describe("Linux Chrome procfs snapshot", () => {
+  const pid = 4321;
+  const bootId = "11111111-1111-4111-8111-111111111111";
+  const executablePath = "/opt/Google Chrome/chrome";
+  const commandTokens = [
+    executablePath,
+    "--user-data-dir=/tmp/profile with spaces",
+    "--enable-features=Value With Spaces",
+  ];
+
+  const procStat = (startTicks: string) => {
+    const fields = Array.from({ length: 20 }, (_, index) => String(10_000 + index));
+    fields[0] = "S";
+    fields[19] = startTicks;
+    return `${pid} (chrome) ${fields.join(" ")}`;
+  };
+
+  const syntheticProcfs = ({
+    statReads = [procStat("987654"), procStat("987654")],
+    bootIdReads = [bootId, bootId],
+    executableReads = [executablePath, executablePath],
+    commandLineReads = [commandTokens.join("\0") + "\0", commandTokens.join("\0") + "\0"],
+  }: {
+    statReads?: string[];
+    bootIdReads?: string[];
+    executableReads?: string[];
+    commandLineReads?: string[];
+  } = {}) => ({
+    readFile: vi.fn(async (filePath: string) => {
+      if (filePath.endsWith("/stat")) return statReads.shift() ?? "";
+      if (filePath === "/proc/sys/kernel/random/boot_id") return bootIdReads.shift() ?? "";
+      if (filePath.endsWith("/cmdline")) return commandLineReads.shift() ?? "";
+      throw new Error(`Unexpected procfs read: ${filePath}`);
+    }),
+    readlink: vi.fn(async (filePath: string) => {
+      if (filePath.endsWith("/exe")) return executableReads.shift() ?? "";
+      throw new Error(`Unexpected procfs link: ${filePath}`);
+    }),
+  });
+
+  test("captures a stable exact Linux generation and NUL-delimited spaced argv", async () => {
+    const procfs = syntheticProcfs();
+
+    await expect(
+      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(pid, procfs),
+    ).resolves.toEqual({
+      pid,
+      processStartTime: `linux:${bootId}:987654`,
+      executablePath,
+      commandLine:
+        '"/opt/Google Chrome/chrome" "--user-data-dir=/tmp/profile with spaces" "--enable-features=Value With Spaces"',
+      commandTokens,
+    });
+    expect(procfs.readlink).toHaveBeenCalledTimes(2);
+    expect(procfs.readFile).toHaveBeenCalledTimes(6);
+  });
+
+  test("fails closed when the process start ticks change during capture", async () => {
+    await expect(
+      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
+        pid,
+        syntheticProcfs({ statReads: [procStat("987654"), procStat("987655")] }),
+      ),
+    ).resolves.toBeNull();
+  });
+
+  test("fails closed when the system boot identity changes during capture", async () => {
+    await expect(
+      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
+        pid,
+        syntheticProcfs({
+          bootIdReads: [bootId, "22222222-2222-4222-8222-222222222222"],
+        }),
+      ),
+    ).resolves.toBeNull();
+  });
+
+  test.each([
+    ["executable", { executableReads: [executablePath, "/opt/Chromium/chromium"] }],
+    [
+      "command line",
+      {
+        commandLineReads: [
+          commandTokens.join("\0") + "\0",
+          `${executablePath}\0--user-data-dir=/tmp/replacement\0`,
+        ],
+      },
+    ],
+  ])("fails closed when the procfs %s changes during capture", async (_name, mutation) => {
+    await expect(
+      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(pid, syntheticProcfs(mutation)),
+    ).resolves.toBeNull();
+  });
+
+  test("fails closed for a malformed procfs stat record", async () => {
+    await expect(
+      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
+        pid,
+        syntheticProcfs({ statReads: ["4321 (chrome) S 1", procStat("987654")] }),
+      ),
+    ).resolves.toBeNull();
+  });
+});
+
 describe("physical Chrome profile use authority", () => {
   test.each([
     ["Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
@@ -557,7 +665,7 @@ describe("physical Chrome profile use authority", () => {
     expect(execute).toHaveBeenCalledWith("/bin/ps", ["-axww", "-o", "pid=", "-o", "command="]);
   });
 
-  test("uses only the injected System32 probe for Windows Chrome enumeration", async () => {
+  test("uses only the OS-rooted System PowerShell for Windows Chrome enumeration", async () => {
     const expected = Object.freeze({
       version: 2 as const,
       platform: "win32" as const,
@@ -567,8 +675,7 @@ describe("physical Chrome profile use authority", () => {
       birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const attackerPowerShell = vi.fn(async () => ({ stdout: "999:\n" }));
-    const windowsSystemRoot = String.raw`D:\Windows`;
-    const trustedPowerShell = String.raw`${windowsSystemRoot}\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const trustedPowerShell = resolveWindowsPowerShellExecutable();
     const execute = vi.fn(async (file: string, _args: string[]) => {
       if (file === "powershell.exe") return attackerPowerShell();
       if (file !== trustedPowerShell) throw new Error(`Unexpected process probe: ${file}`);
@@ -579,7 +686,6 @@ describe("physical Chrome profile use authority", () => {
       inspectChromeProfileDirectoryUseForTest(expected, {
         platform: "win32",
         execute,
-        windowsSystemRoot,
       }),
     ).resolves.toEqual({ status: "unused", candidates: [] });
     expect(attackerPowerShell).not.toHaveBeenCalled();
@@ -612,8 +718,7 @@ describe("physical Chrome profile use authority", () => {
       birthtimeNs: "3",
     }) satisfies ProfileDirectoryIdentity;
     const commandLine = `"${executablePath}" --user-data-dir="${expected.canonicalPath}"`;
-    const windowsSystemRoot = String.raw`D:\Windows`;
-    const trustedPowerShell = String.raw`${windowsSystemRoot}\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const trustedPowerShell = resolveWindowsPowerShellExecutable();
     const execute = vi.fn(async (file: string, args: string[]) => {
       expect(file).toBe(trustedPowerShell);
       expect(args[3]).toContain(
@@ -630,7 +735,6 @@ describe("physical Chrome profile use authority", () => {
       inspectChromeProfileDirectoryUseForTest(expected, {
         platform: "win32",
         execute,
-        windowsSystemRoot,
         readProcessGeneration: async () => "win32:2026-08-06T12:00:00.0000000Z",
         captureProfileIdentity,
       }),

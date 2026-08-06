@@ -2,11 +2,8 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
-import {
-  createRemoteServer,
-  __test__ as serverTest,
-  type RemoteServerInstance,
-} from "../../src/remote/server.js";
+import { createRemoteServer, type RemoteServerInstance } from "../../src/remote/server.js";
+import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
@@ -444,7 +441,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     const acquireOwner = vi.fn(async () => owner);
     const logger = vi.fn<(message: string) => void>();
 
-    await serverTest.bootstrapRemoteManualChromeOwner("/tmp/oracle-serve-bootstrap", logger, {
+    await bootstrapRemoteManualChromeOwner("/tmp/oracle-serve-bootstrap", logger, {
       acquireOwner: acquireOwner as never,
     });
 
@@ -460,7 +457,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
     const announcementFailure = new Error("bootstrap announcement failed");
     await expect(
-      serverTest.bootstrapRemoteManualChromeOwner(
+      bootstrapRemoteManualChromeOwner(
         "/tmp/oracle-serve-bootstrap",
         vi.fn(() => {
           throw announcementFailure;

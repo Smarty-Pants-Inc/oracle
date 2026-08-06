@@ -18,10 +18,13 @@ import { serveRemote } from "../../remote/server.js";
 import { assertLoopbackRemoteBind } from "../../remote/remoteServiceConfig.js";
 import { assertRemoteCredential, generateRemoteCredential } from "../../remote/auth.js";
 import { checkRemoteHealth, type RemoteHealthResult } from "../../remote/health.js";
+import { syncDirectoryIfPresent } from "../../fsDurability.js";
+import { writeFileAtomicDurable } from "../../sessionManager.js";
 
 export const BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES = 512;
 export const BRIDGE_HOST_READINESS_PAYLOAD_MAX_BYTES = 256;
 export const BRIDGE_HOST_READINESS_TIMEOUT_MS = 30_000;
+const BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS = 5_000;
 const BRIDGE_HOST_IPC_VERSION = 1;
 const BRIDGE_HOST_READINESS_NONCE_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -363,19 +366,7 @@ async function upsertConnectionArtifact(
     updatedAt: now,
     tunnel: input.tunnel,
   };
-  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
-  try {
-    await fs.writeFile(tempPath, `${JSON.stringify(artifact, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await fs.rename(tempPath, filePath);
-  } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
-  }
-  if (process.platform !== "win32") {
-    await fs.chmod(filePath, 0o600).catch(() => undefined);
-  }
+  await writeFileAtomicDurable(filePath, `${JSON.stringify(artifact, null, 2)}\n`);
   return artifact;
 }
 
@@ -652,6 +643,68 @@ async function waitForBridgeHostReadiness(params: {
     params.stream.unref?.();
   }
 }
+function bridgeHostChildExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function waitForBridgeHostChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (bridgeHostChildExited(child)) return;
+  const exited = Promise.withResolvers<void>();
+  const onExit = () => exited.resolve();
+  const timer = setTimeout(
+    () => exited.reject(new Error("Bridge host background child did not exit during shutdown.")),
+    timeoutMs,
+  );
+  child.once("exit", onExit);
+  try {
+    await exited.promise;
+  } finally {
+    clearTimeout(timer);
+    child.off("exit", onExit);
+  }
+}
+
+function signalBridgeHostChildTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid && child.pid > 0) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  child.kill(signal);
+}
+
+async function forceTerminateBridgeHostChildTree(child: ChildProcess): Promise<void> {
+  if (process.platform === "win32" && child.pid && child.pid > 0) {
+    const taskkill = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await waitForBridgeHostChildExit(taskkill, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
+    return;
+  }
+  signalBridgeHostChildTree(child, "SIGKILL");
+}
+
+async function terminateBridgeHostChildTree(child: ChildProcess): Promise<void> {
+  if (bridgeHostChildExited(child)) return;
+  signalBridgeHostChildTree(child, "SIGTERM");
+  try {
+    await waitForBridgeHostChildExit(child, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
+  } catch (shutdownError) {
+    try {
+      await forceTerminateBridgeHostChildTree(child);
+      await waitForBridgeHostChildExit(child, BRIDGE_HOST_BACKGROUND_SHUTDOWN_TIMEOUT_MS);
+    } catch (forceError) {
+      throw new AggregateError(
+        [shutdownError, forceError],
+        "Bridge host background child tree could not be confirmed stopped.",
+      );
+    }
+  }
+}
 
 interface FileSnapshot {
   contents: Buffer | null;
@@ -666,32 +719,18 @@ async function captureFileSnapshot(filePath: string): Promise<FileSnapshot> {
   }
 }
 
-async function writePrivateFileAtomic(filePath: string, contents: string | Buffer): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
-  try {
-    await fs.writeFile(tempPath, contents, { mode: 0o600 });
-    await fs.rename(tempPath, filePath);
-  } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
-  }
-  if (process.platform !== "win32") {
-    await fs.chmod(filePath, 0o600).catch(() => undefined);
-  }
-}
-
 async function restoreFileSnapshot(filePath: string, snapshot: FileSnapshot): Promise<void> {
   if (snapshot.contents === null) {
     await fs.rm(filePath, { force: true });
+    await syncDirectoryIfPresent(path.dirname(filePath));
     return;
   }
-  await writePrivateFileAtomic(filePath, snapshot.contents);
+  await writeFileAtomicDurable(filePath, snapshot.contents);
 }
 
-async function rethrowAfterRestoring(
-  error: unknown,
+async function restoreFileSnapshots(
   entries: Array<{ filePath: string; snapshot: FileSnapshot }>,
-): Promise<never> {
+): Promise<void> {
   const restorationErrors: unknown[] = [];
   for (const entry of entries) {
     try {
@@ -702,7 +741,21 @@ async function rethrowAfterRestoring(
   }
   if (restorationErrors.length > 0) {
     throw new AggregateError(
-      [error, ...restorationErrors],
+      restorationErrors,
+      "Bridge host prior published state could not be restored.",
+    );
+  }
+}
+
+async function rethrowAfterRestoring(
+  error: unknown,
+  entries: Array<{ filePath: string; snapshot: FileSnapshot }>,
+): Promise<never> {
+  try {
+    await restoreFileSnapshots(entries);
+  } catch (restoreError) {
+    throw new AggregateError(
+      [error, restoreError],
       "Bridge host startup failed and prior published state could not be fully restored.",
     );
   }
@@ -1258,12 +1311,16 @@ async function spawnBridgeHostInBackground(
       captureFileSnapshot(pidPath),
       captureFileSnapshot(writeConnectionPath),
     ]);
+    const rollbackEntries = [
+      { filePath: writeConnectionPath, snapshot: artifactSnapshot },
+      { filePath: pidPath, snapshot: pidSnapshot },
+    ];
     let childExited = false;
     const markChildExited = () => {
       childExited = true;
     };
     const assertChildRunning = () => {
-      if (childExited || child!.exitCode !== null || child!.signalCode !== null) {
+      if (childExited || bridgeHostChildExited(child!)) {
         throw new Error("Bridge host background child exited during state publication.");
       }
     };
@@ -1271,22 +1328,38 @@ async function spawnBridgeHostInBackground(
     child.once("exit", markChildExited);
     try {
       assertChildRunning();
-      await writePrivateFileAtomic(pidPath, `${childPid}\n`);
+      await writeFileAtomicDurable(pidPath, `${childPid}\n`);
       assertChildRunning();
       const artifact = await upsertConnectionArtifact(writeConnectionPath, connectionInput);
       assertChildRunning();
+      child.off("error", markChildExited);
+      child.off("exit", markChildExited);
       return { artifact, logPath, pidPath, pid: childPid };
     } catch (error) {
-      return rethrowAfterRestoring(error, [
-        { filePath: writeConnectionPath, snapshot: artifactSnapshot },
-        { filePath: pidPath, snapshot: pidSnapshot },
-      ]);
+      const cleanupErrors: unknown[] = [];
+      try {
+        await terminateBridgeHostChildTree(child);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      try {
+        await restoreFileSnapshots(rollbackEntries);
+      } catch (restoreError) {
+        cleanupErrors.push(restoreError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "Bridge host background state publication failed and cleanup could not be completed.",
+        );
+      }
+      throw error;
     } finally {
       child.off("error", markChildExited);
       child.off("exit", markChildExited);
     }
   } catch (error) {
-    child?.kill();
+    if (child) await terminateBridgeHostChildTree(child);
     throw error;
   } finally {
     await logHandle.close().catch(() => undefined);

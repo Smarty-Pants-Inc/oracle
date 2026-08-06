@@ -50,7 +50,6 @@ import {
 } from "./types.js";
 
 const MAX_REMOTE_TRANSACTION_LEASE_MS = 24 * 60 * 60 * 1000;
-const LEGACY_REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION = 1;
 const REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION = 2;
 const REMOTE_TRANSACTION_RECORD_ALGORITHM = "hmac-sha256";
 const REMOTE_TRANSACTION_KEY_ID_DOMAIN =
@@ -73,7 +72,7 @@ type RemoteTransactionRecordEnvelope = {
   version: number;
   algorithm: typeof REMOTE_TRANSACTION_RECORD_ALGORITHM;
   keyId: string;
-  revision?: number;
+  revision: number;
   payload: string;
   mac: string;
 };
@@ -889,20 +888,13 @@ export class RemoteTransactionStore {
         throw new Error("invalid envelope");
       }
       const envelope = candidate as Partial<RemoteTransactionRecordEnvelope>;
-      const legacy = envelope.version === LEGACY_REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION;
       const fields = Object.keys(candidate).sort().join(",");
-      if (
-        fields !==
-        (legacy
-          ? "algorithm,keyId,mac,payload,version"
-          : "algorithm,keyId,mac,payload,revision,version")
-      ) {
+      if (fields !== "algorithm,keyId,mac,payload,revision,version") {
         throw new Error("invalid envelope fields");
       }
-      const revision = legacy ? 1 : envelope.revision;
+      const revision = envelope.revision;
       if (
-        (envelope.version !== LEGACY_REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION &&
-          envelope.version !== REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION) ||
+        envelope.version !== REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION ||
         typeof revision !== "number" ||
         !Number.isSafeInteger(revision) ||
         revision < 1 ||
@@ -1043,10 +1035,7 @@ export class RemoteTransactionStore {
       this.directory,
       transactionToken,
     ];
-    if (envelope.version === REMOTE_TRANSACTION_RECORD_ENVELOPE_VERSION) {
-      headerValues.push(envelope.revision);
-    }
-    headerValues.push(payload.byteLength);
+    headerValues.push(envelope.revision, payload.byteLength);
     const header = Buffer.from(JSON.stringify(headerValues), "utf8");
     return createHmac("sha256", this.#integrityKey)
       .update(header)

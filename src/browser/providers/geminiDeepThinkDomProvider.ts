@@ -868,7 +868,31 @@ export async function recoverCommittedGeminiDeepThinkResponse(
           );
         }
         if (completedResponses.length === 1) {
-          return { text: completedResponses[0].text.trim() };
+          const response = completedResponses[0];
+          if (!response.stableId) {
+            throw new BrowserAutomationError(
+              "Gemini completed response lacks a stable provider message identifier during reattach.",
+              {
+                stage: "gemini-response-capture",
+                code: "gemini-response-ownership-unavailable",
+                reattachable: false,
+              },
+            );
+          }
+          const responseIdentityMatches = entries.filter(
+            (entry) => entry.kind === "response" && entry.stableId === response.stableId,
+          );
+          if (responseIdentityMatches.length !== 1) {
+            throw new BrowserAutomationError(
+              "Gemini completed response identity is not unique in the current conversation DOM during reattach.",
+              {
+                stage: "gemini-response-capture",
+                code: "gemini-response-ownership-ambiguous",
+                reattachable: false,
+              },
+            );
+          }
+          return { text: response.text.trim() };
         }
       }
     }
