@@ -4,7 +4,7 @@ import {
   resolveRecoveryProfileDir,
   resolveRecoveryUrl,
 } from "../../src/browser/recoverConversation.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 

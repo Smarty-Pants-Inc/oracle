@@ -1,5 +1,6 @@
 import path from "node:path";
 import { readFile, rm } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import type { BrowserRuntimeMetadata, SessionArtifact, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import { syncDirectory } from "../fsDurability.js";
@@ -18,14 +19,12 @@ export type BrowserPublicationPhase =
   | "finalize-bound"
   | "published"
   | "cleanup-pending";
-const BROWSER_PUBLICATION_PHASES: Readonly<
-  Record<BrowserPublicationPhase, { acknowledged: boolean }>
-> = {
-  preparing: { acknowledged: false },
-  staged: { acknowledged: false },
-  "finalize-bound": { acknowledged: false },
-  published: { acknowledged: true },
-  "cleanup-pending": { acknowledged: true },
+const BROWSER_PUBLICATION_PHASES: Readonly<Record<BrowserPublicationPhase, true>> = {
+  preparing: true,
+  staged: true,
+  "finalize-bound": true,
+  published: true,
+  "cleanup-pending": true,
 };
 
 type BrowserCapturePublicationJournalBase = {
@@ -132,9 +131,36 @@ export type BrowserPublicationRemovalEvent =
     };
 
 export function isBrowserPublicationAcknowledged(
-  phase: BrowserPublicationPhase | null | undefined,
+  journal: BrowserCapturePublicationJournal | null | undefined,
+  metadata: SessionMetadata | null | undefined,
 ): boolean {
-  return phase ? BROWSER_PUBLICATION_PHASES[phase].acknowledged : false;
+  return Boolean(
+    journal &&
+    journal.phase !== "preparing" &&
+    journal.phase !== "staged" &&
+    metadata &&
+    hasMatchingTerminalBrowserPublicationProjection(metadata, journal),
+  );
+}
+
+export function hasMatchingTerminalBrowserPublicationProjection(
+  metadata: SessionMetadata,
+  journal: BrowserCapturePublicationJournal,
+): boolean {
+  if (metadata.status !== "completed" || metadata.completedAt !== journal.completedAt) return false;
+  if (!artifactsContainReceipt(metadata.artifacts ?? [], journal.receipt)) return false;
+  if (!journal.model) return true;
+  if (metadata.modelProjectionAuthority !== "session") return false;
+  const selectedModel = metadata.models?.find((run) => run.model === journal.model);
+  return Boolean(
+    selectedModel &&
+    selectedModel.status === "completed" &&
+    selectedModel.completedAt === journal.completedAt &&
+    isDeepStrictEqual(selectedModel.usage, journal.usage) &&
+    isDeepStrictEqual(selectedModel.response, { status: "completed" }) &&
+    selectedModel.transport === undefined &&
+    selectedModel.error === undefined,
+  );
 }
 
 export function reduceBrowserPublicationEvent(

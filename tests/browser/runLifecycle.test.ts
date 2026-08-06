@@ -7,7 +7,7 @@ import {
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
 import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 
 const committedVerification = {
   committedTurns: 1,
@@ -93,6 +93,7 @@ describe("BrowserRunLifecycleController", () => {
     });
 
     expect(transaction.promptEpoch).toMatchObject({ status: "committed" });
+    expect(transaction.promptSubmitted).toBe(true);
     expect(transaction.runtime.recoveryCleanupResult).toEqual({ status: "pending" });
     expect(transaction.runtime.recoveryCleanupResources).toEqual([
       expect.objectContaining({

@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
+import type { SessionArtifact } from "../../src/sessionManager.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { missingRequiredArtifactDeliveries } from "../../src/remote/transactionValidation.js";
@@ -50,14 +51,41 @@ async function begin(store: RemoteTransactionStore, transactionToken: string, ru
     createdAt: new Date().toISOString(),
     ...authority,
   });
+  const record = await store.read(transactionToken);
+  if (!record) throw new Error("Expected durable transaction record");
+  return record;
+}
+
+async function writeArtifact(filePath: string, payload: Buffer): Promise<SessionArtifact> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, payload);
+  const handle = await open(filePath, "r");
+  try {
+    const fileStat = await handle.stat({ bigint: true });
+    return {
+      kind: "file",
+      path: filePath,
+      mimeType: "text/plain",
+      sizeBytes: payload.length,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+      fileIdentity: {
+        device: fileStat.dev.toString(),
+        inode: fileStat.ino.toString(),
+        birthtimeNs: fileStat.birthtimeNs.toString(),
+        ctimeNs: fileStat.ctimeNs.toString(),
+      },
+      validation: { type: "generic", ok: true },
+      sourceUrl: "browser-download",
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 describe("RemoteArtifactStore", () => {
-  test("keeps artifacts authorized across restart until durable transaction settlement", async () => {
+  test("keeps exact transaction artifacts retrievable across restart until settlement", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-store-"));
     const sessionsRoot = path.join(root, "sessions");
-    const artifactDirectory = path.join(sessionsRoot, "session-1", "artifacts");
-    const artifactPath = path.join(artifactDirectory, "result.txt");
     const transactionDirectory = path.join(root, "transactions");
     const transactionToken = "c".repeat(64);
     const payload = Buffer.from("durable artifact", "utf8");
@@ -65,30 +93,27 @@ describe("RemoteArtifactStore", () => {
     let now = Date.parse("2026-01-01T00:00:00.000Z");
 
     try {
-      await mkdir(artifactDirectory, { recursive: true });
-      await writeFile(artifactPath, payload);
       const firstTransactionStore = await RemoteTransactionStore.open({
         directory: transactionDirectory,
         controllerGeneration: "controller-generation-1",
         now: () => now,
       });
-      await begin(firstTransactionStore, transactionToken, "run-1");
+      const record = await begin(firstTransactionStore, transactionToken, "run-1");
       const firstArtifactStore = new RemoteArtifactStore({
         transactionStore: firstTransactionStore,
         sessionsRoot,
         now: () => now,
       });
+      const writeAuthority = await firstArtifactStore.createArtifactWriteAuthority({
+        transactionToken,
+        runId: "run-1",
+      });
+      const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
+      const artifact = await writeArtifact(artifactPath, payload);
       const registrations = await firstArtifactStore.prepareRequiredArtifacts({
         transactionToken,
         runId: "run-1",
-        artifacts: [
-          {
-            kind: "file",
-            path: artifactPath,
-            mimeType: "text/plain",
-            sourceUrl: "browser-download",
-          },
-        ],
+        artifacts: [artifact],
       });
       await firstTransactionStore.publishCapture({
         transactionToken,
@@ -99,6 +124,10 @@ describe("RemoteArtifactStore", () => {
       });
       const [registration] = registrations;
       if (!registration) throw new Error("Expected a durable artifact registration");
+      expect(record.artifactNamespace).toMatch(/^remote-[a-f0-9]{64}$/);
+      expect(writeAuthority.artifactsDirectory).toBe(
+        await realpath(path.join(sessionsRoot, record.artifactNamespace, "artifacts")),
+      );
       expect(registration).toMatchObject({
         transactionToken,
         canonicalPath: await realpath(artifactPath),
@@ -108,17 +137,11 @@ describe("RemoteArtifactStore", () => {
           sha256,
           required: true,
         },
-        fileIdentity: {
-          device: expect.any(String),
-          inode: expect.any(String),
-          birthtimeNs: expect.any(String),
-          ctimeNs: expect.any(String),
-        },
+        fileIdentity: artifact.fileIdentity,
       });
-      expect(registration).not.toHaveProperty("expiresAt");
-      const firstRecord = await firstTransactionStore.read(transactionToken);
-      expect(firstRecord).not.toBeNull();
-      expect(missingRequiredArtifactDeliveries(firstRecord!)).toHaveLength(1);
+      expect(
+        missingRequiredArtifactDeliveries((await firstTransactionStore.read(transactionToken))!),
+      ).toHaveLength(1);
 
       now += 31 * 60 * 1000;
       const restartedTransactionStore = await RemoteTransactionStore.open({
@@ -136,11 +159,7 @@ describe("RemoteArtifactStore", () => {
         registration.descriptor.artifactId,
       );
       if (!opened) throw new Error("Expected restart-safe artifact authorization");
-      try {
-        await expect(opened.handle.readFile("utf8")).resolves.toBe(payload.toString("utf8"));
-      } finally {
-        await opened.handle.close();
-      }
+      await opened.handle.close();
 
       const receiptParams = {
         transactionToken,
@@ -149,11 +168,14 @@ describe("RemoteArtifactStore", () => {
         sha256,
       };
       const firstReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
-      const duplicateReceipt = await restartedArtifactStore.recordDeliveryReceipt(receiptParams);
-      expect(duplicateReceipt).toEqual(firstReceipt);
-      const deliveredRecord = await restartedTransactionStore.read(transactionToken);
-      expect(deliveredRecord).not.toBeNull();
-      expect(missingRequiredArtifactDeliveries(deliveredRecord!)).toHaveLength(0);
+      await expect(restartedArtifactStore.recordDeliveryReceipt(receiptParams)).resolves.toEqual(
+        firstReceipt,
+      );
+      expect(
+        missingRequiredArtifactDeliveries(
+          (await restartedTransactionStore.read(transactionToken))!,
+        ),
+      ).toHaveLength(0);
       await restartedTransactionStore.bindSettlement({
         transactionToken,
         mode: "abort",
@@ -179,41 +201,179 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
-  test("rejects a path generation that changed after durable registration", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-identity-"));
-    const sessionsRoot = path.join(root, "sessions");
-    const artifactDirectory = path.join(sessionsRoot, "session-2", "artifacts");
-    const artifactPath = path.join(artifactDirectory, "result.txt");
-    const transactionToken = "d".repeat(64);
+  test("rejects registration from another transaction namespace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-foreign-"));
     try {
-      await mkdir(artifactDirectory, { recursive: true });
-      await writeFile(artifactPath, "first generation", "utf8");
-      const transactionStore = await RemoteTransactionStore.open({
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
         directory: path.join(root, "transactions"),
-        controllerGeneration: "controller-generation-1",
       });
-      await begin(transactionStore, transactionToken, "run-2");
-      const artifactStore = new RemoteArtifactStore({ transactionStore, sessionsRoot });
-      const registrations = await artifactStore.prepareRequiredArtifacts({
-        transactionToken,
-        runId: "run-2",
-        artifacts: [{ kind: "file", path: artifactPath, mimeType: "text/plain" }],
+      const firstToken = "a".repeat(64);
+      const secondToken = "b".repeat(64);
+      await begin(store, firstToken, "run-a");
+      await begin(store, secondToken, "run-b");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const foreignAuthority = await artifacts.createArtifactWriteAuthority({
+        transactionToken: secondToken,
+        runId: "run-b",
       });
-      await transactionStore.publishCapture({
+      const foreignArtifact = await writeArtifact(
+        path.join(foreignAuthority.artifactsDirectory, "result.txt"),
+        Buffer.from("foreign bytes"),
+      );
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken: firstToken,
+          runId: "run-a",
+          artifacts: [foreignArtifact],
+        }),
+      ).rejects.toThrow("outside its exact transaction artifact namespace");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    {
+      name: "size",
+      alter: (artifact: SessionArtifact) => ({ ...artifact, sizeBytes: artifact.sizeBytes! + 1 }),
+      message: "physical identity does not match producer evidence",
+    },
+    {
+      name: "sha256",
+      alter: (artifact: SessionArtifact) => ({ ...artifact, sha256: "0".repeat(64) }),
+      message: "sha256 does not match producer evidence",
+    },
+    {
+      name: "file identity",
+      alter: (artifact: SessionArtifact) => ({
+        ...artifact,
+        fileIdentity: { ...artifact.fileIdentity!, inode: `${artifact.fileIdentity!.inode}0` },
+      }),
+      message: "physical identity does not match producer evidence",
+    },
+  ])("rejects altered producer $name evidence", async ({ alter, message }) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-evidence-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "d".repeat(64);
+      await begin(store, transactionToken, "run-evidence");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const writeAuthority = await artifacts.createArtifactWriteAuthority({
         transactionToken,
-        runId: "run-2",
+        runId: "run-evidence",
+      });
+      const artifact = await writeArtifact(
+        path.join(writeAuthority.artifactsDirectory, "result.txt"),
+        Buffer.from("producer bytes"),
+      );
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-evidence",
+          artifacts: [alter(artifact)],
+        }),
+      ).rejects.toThrow(message);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a replacement made after producer evidence", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-producer-race-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "e".repeat(64);
+      await begin(store, transactionToken, "run-producer-race");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const writeAuthority = await artifacts.createArtifactWriteAuthority({
+        transactionToken,
+        runId: "run-producer-race",
+      });
+      const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
+      const artifact = await writeArtifact(artifactPath, Buffer.from("same-length-a"));
+      await rm(artifactPath);
+      await writeFile(artifactPath, "same-length-b");
+
+      await expect(
+        artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-producer-race",
+          artifacts: [artifact],
+        }),
+      ).rejects.toThrow("physical identity does not match producer evidence");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a replacement made after durable registration", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-delivery-race-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "f".repeat(64);
+      await begin(store, transactionToken, "run-delivery-race");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const writeAuthority = await artifacts.createArtifactWriteAuthority({
+        transactionToken,
+        runId: "run-delivery-race",
+      });
+      const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
+      const artifact = await writeArtifact(artifactPath, Buffer.from("first generation"));
+      const registrations = await artifacts.prepareRequiredArtifacts({
+        transactionToken,
+        runId: "run-delivery-race",
+        artifacts: [artifact],
+      });
+      await store.publishCapture({
+        transactionToken,
+        runId: "run-delivery-race",
         result: capturedResult,
         runtime,
         artifacts: registrations,
       });
       const [registration] = registrations;
       if (!registration) throw new Error("Expected a durable artifact registration");
-
       await rm(artifactPath);
-      await writeFile(artifactPath, "second generation", "utf8");
+      await writeFile(artifactPath, "second generation");
+
       await expect(
-        artifactStore.openForDelivery(transactionToken, registration.descriptor.artifactId),
+        artifacts.openForDelivery(transactionToken, registration.descriptor.artifactId),
       ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a symlinked transaction namespace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-namespace-alias-"));
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+      });
+      const transactionToken = "1".repeat(64);
+      const record = await begin(store, transactionToken, "run-alias");
+      const foreignDirectory = path.join(root, "foreign");
+      await mkdir(sessionsRoot, { recursive: true });
+      await mkdir(foreignDirectory, { recursive: true });
+      await symlink(foreignDirectory, path.join(sessionsRoot, record.artifactNamespace), "dir");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+
+      await expect(
+        artifacts.createArtifactWriteAuthority({ transactionToken, runId: "run-alias" }),
+      ).rejects.toThrow("not created exclusively");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

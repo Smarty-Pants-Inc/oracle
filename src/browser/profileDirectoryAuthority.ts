@@ -65,16 +65,25 @@ export async function assertProfileDirectoryIdentity(
   }
 }
 
-export function sameProfileDirectoryIdentity(
+export function samePhysicalProfileDirectoryIdentity(
   left: ProfileDirectoryIdentity,
   right: ProfileDirectoryIdentity,
 ): boolean {
   return (
     left.version === right.version &&
     left.platform === right.platform &&
-    samePlatformPath(left.canonicalPath, right.canonicalPath, left.platform) &&
     left.device === right.device &&
     left.inode === right.inode
+  );
+}
+
+export function sameProfileDirectoryIdentity(
+  left: ProfileDirectoryIdentity,
+  right: ProfileDirectoryIdentity,
+): boolean {
+  return (
+    samePhysicalProfileDirectoryIdentity(left, right) &&
+    sameProfileDirectoryPath(left.canonicalPath, right.canonicalPath, left.platform)
   );
 }
 async function rejectProfileSymlinkTraversal(
@@ -102,13 +111,28 @@ async function rejectProfileSymlinkTraversal(
   }
 }
 
-function samePlatformPath(left: string, right: string, platform: NodeJS.Platform): boolean {
-  const pathApi = platform === "win32" ? path.win32 : path.posix;
-  const normalizedLeft = pathApi.resolve(left);
-  const normalizedRight = pathApi.resolve(right);
-  return platform === "win32"
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
+function profileDirectoryPathComparisonKey(
+  candidate: string,
+  platform: NodeJS.Platform,
+): string | null {
+  const pathApi = pathForPlatform(platform);
+  if (!pathApi.isAbsolute(candidate)) return null;
+  const resolved = pathApi.resolve(candidate);
+  const aliased =
+    platform === "darwin" && /^\/(?:etc|tmp|var)(?:\/|$)/u.test(resolved)
+      ? `/private${resolved}`
+      : resolved;
+  return platform === "win32" ? aliased.toLowerCase() : aliased;
+}
+
+export function sameProfileDirectoryPath(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform,
+): boolean {
+  const normalizedLeft = profileDirectoryPathComparisonKey(left, platform);
+  const normalizedRight = profileDirectoryPathComparisonKey(right, platform);
+  return normalizedLeft !== null && normalizedRight !== null && normalizedLeft === normalizedRight;
 }
 export function parseProfileDirectoryIdentity(
   value: unknown,
@@ -128,10 +152,11 @@ export function parseProfileDirectoryIdentity(
   ) {
     return null;
   }
+  const canonicalPath = pathForPlatform(platform).resolve(record.canonicalPath);
   return Object.freeze({
     version: PHYSICAL_PROFILE_IDENTITY_VERSION,
     platform,
-    canonicalPath: pathForPlatform(platform).resolve(record.canonicalPath),
+    canonicalPath,
     device: record.device,
     inode: record.inode,
   });

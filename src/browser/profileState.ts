@@ -21,13 +21,17 @@ import {
 } from "./profileDirectoryAuthority.js";
 import { getDevToolsActivePortPaths } from "./profileDevToolsState.js";
 import {
+  inspectChromeProfileDirectoryUse,
   inspectChromeProcessIdentityWithDeps,
   isChromeUsingUserDataDir,
   isProcessAlive,
   parseChromeProcessIdentity,
+  revalidateChromeProfileDirectoryUse,
   sameChromeProcessIdentity,
   type ChromeProcessIdentity,
   type ChromeProcessIdentityDeps,
+  type ChromeProfileDirectoryUnusedProof,
+  type ChromeProfileDirectoryUseInspection,
 } from "./chromeProcessIdentity.js";
 
 export * from "./profileDirectoryAuthority.js";
@@ -59,8 +63,17 @@ export interface OracleChromeOwnerRecord {
   readonly preservationPolicy?: ChromeOwnerPreservationPolicy;
 }
 
-interface RemoveProfileDirectoryDeps {
-  isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
+export interface ProfileDirectoryUseDeps {
+  inspectChromeProfileDirectoryUse?: (
+    expected: ProfileDirectoryIdentity,
+  ) => Promise<ChromeProfileDirectoryUseInspection>;
+  revalidateChromeProfileDirectoryUse?: (
+    expected: ProfileDirectoryIdentity,
+    previous: ChromeProfileDirectoryUnusedProof,
+  ) => Promise<ChromeProfileDirectoryUseInspection>;
+}
+
+interface RemoveProfileDirectoryDeps extends ProfileDirectoryUseDeps {
   beforeQuarantineRename?: () => void | Promise<void>;
   beforeQuarantineDelete?: (quarantinePath: string) => void | Promise<void>;
   afterQuarantineIdentityVerification?: (quarantinePath: string) => void | Promise<void>;
@@ -70,8 +83,9 @@ interface RemoveProfileDirectoryDeps {
 export async function removeProfileDirectoryIfIdentityMatches(
   userDataDir: string,
   expected: ProfileDirectoryIdentity,
+  deps: ProfileDirectoryUseDeps = {},
 ): Promise<boolean> {
-  return removeProfileDirectoryIfIdentityMatchesWithDeps(userDataDir, expected, {});
+  return removeProfileDirectoryIfIdentityMatchesWithDeps(userDataDir, expected, deps);
 }
 
 export async function removeProfileDirectoryIfIdentityMatchesForTest(
@@ -83,9 +97,48 @@ export async function removeProfileDirectoryIfIdentityMatchesForTest(
 }
 
 export async function replayPendingProfileDirectoryRemovals(userDataDir: string): Promise<void> {
+  await replayPendingProfileDirectoryRemovalsWithDeps(userDataDir, {});
+}
+
+export async function replayPendingProfileDirectoryRemovalsForTest(
+  userDataDir: string,
+  deps: ProfileDirectoryUseDeps,
+): Promise<void> {
+  await replayPendingProfileDirectoryRemovalsWithDeps(userDataDir, deps);
+}
+
+async function replayPendingProfileDirectoryRemovalsWithDeps(
+  userDataDir: string,
+  deps: ProfileDirectoryUseDeps,
+): Promise<void> {
   const canonicalPath = await canonicalProfileRemovalPath(userDataDir);
   if (canonicalPath === null) return;
-  await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath);
+  const guards = new Map<
+    string,
+    { identity: ProfileDirectoryIdentity; proof: ChromeProfileDirectoryUnusedProof }
+  >();
+  await replayPendingIsolatedDirectoryRemovals(path.dirname(canonicalPath), canonicalPath, {
+    verifyGenerationForRemoval: async (generationPath) => {
+      const existing = guards.get(generationPath);
+      if (existing) {
+        if (!(await verifyProfileDirectoryIdentity(generationPath, existing.identity)))
+          return false;
+        const inspection = await (
+          deps.revalidateChromeProfileDirectoryUse ?? revalidateChromeProfileDirectoryUse
+        )(existing.identity, existing.proof);
+        if (inspection.status !== "unused") return false;
+        existing.proof = inspection;
+        return true;
+      }
+      const identity = await captureProfileDirectoryIdentity(generationPath);
+      const inspection = await (
+        deps.inspectChromeProfileDirectoryUse ?? inspectChromeProfileDirectoryUse
+      )(identity);
+      if (inspection.status !== "unused") return false;
+      guards.set(generationPath, { identity, proof: inspection });
+      return true;
+    },
+  });
 }
 
 async function removeProfileDirectoryIfIdentityMatchesWithDeps(
@@ -95,10 +148,22 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
 ): Promise<boolean> {
   if (!(await pathExists(expected.canonicalPath))) return true;
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
-  const profileInUse = deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir;
-  if (await profileInUse(expected.canonicalPath)) return false;
+  const inspectProfileUse =
+    deps.inspectChromeProfileDirectoryUse ?? inspectChromeProfileDirectoryUse;
+  const revalidateProfileUse =
+    deps.revalidateChromeProfileDirectoryUse ?? revalidateChromeProfileDirectoryUse;
+  let profileUse = await inspectProfileUse(expected);
+  if (profileUse.status !== "unused") return false;
+  let unusedProof: ChromeProfileDirectoryUnusedProof = profileUse;
+  const revalidateUnusedProof = async (): Promise<boolean> => {
+    profileUse = await revalidateProfileUse(expected, unusedProof);
+    if (profileUse.status !== "unused") return false;
+    unusedProof = profileUse;
+    return true;
+  };
   if (!(await verifyProfileDirectoryIdentity(userDataDir, expected))) return false;
   await deps.beforeQuarantineRename?.();
+  if (!(await revalidateUnusedProof())) return false;
 
   const quarantinePath = path.join(
     path.dirname(expected.canonicalPath),
@@ -119,11 +184,10 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
     if (await pathExists(expected.canonicalPath)) return;
     await rename(quarantinePath, expected.canonicalPath).catch(() => undefined);
   };
-  if (!(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity))) {
-    await restore();
-    return false;
-  }
-  if (await profileInUse(expected.canonicalPath)) {
+  if (
+    !(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity)) ||
+    !(await revalidateUnusedProof())
+  ) {
     await restore();
     return false;
   }
@@ -131,18 +195,27 @@ async function removeProfileDirectoryIfIdentityMatchesWithDeps(
   await deps.beforeQuarantineDelete?.(quarantinePath);
   if (!(await verifyProfileDirectoryIdentity(quarantinePath, quarantinedIdentity))) return false;
   await deps.afterQuarantineIdentityVerification?.(quarantinePath);
+  if (!(await revalidateUnusedProof())) {
+    await restore();
+    return false;
+  }
+  const verifyQuarantinedGeneration = async (generationPath: string): Promise<boolean> =>
+    (await verifyProfileDirectoryIdentity(
+      generationPath,
+      Object.freeze({ ...expected, canonicalPath: path.resolve(generationPath) }),
+    )) && (await revalidateUnusedProof());
   const isolation = await isolateDirectoryGenerationForRemoval(
     quarantinePath,
-    async (generationPath) =>
-      verifyProfileDirectoryIdentity(
-        generationPath,
-        Object.freeze({ ...expected, canonicalPath: path.resolve(generationPath) }),
-      ),
+    verifyQuarantinedGeneration,
     expected.canonicalPath,
   );
-  if (isolation.status !== "isolated") return false;
+  if (isolation.status !== "isolated") {
+    await restore();
+    return false;
+  }
   await removeIsolatedDirectoryGeneration(isolation.rootPath, {
     afterChildAttestation: deps.afterRemovalChildAttestation,
+    verifyGenerationForRemoval: verifyQuarantinedGeneration,
   });
   return true;
 }
@@ -232,6 +305,78 @@ export async function writeOracleChromeOwner(
     if (await verifyProfileDirectoryIdentity(userDataDir, profile)) {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
     }
+  }
+}
+
+export async function removeOracleChromeOwnerIfMatches(
+  userDataDir: string,
+  expectedOwner: OracleChromeOwnerRecord,
+): Promise<boolean> {
+  const expected = parseOracleChromeOwnerRecord(expectedOwner, process.platform);
+  if (
+    expected === null ||
+    !(await verifyProfileDirectoryIdentity(userDataDir, expected.processIdentity.profileDirectory))
+  ) {
+    return false;
+  }
+  const profile = expected.processIdentity.profileDirectory;
+  const ownerPath = path.join(profile.canonicalPath, ORACLE_CHROME_OWNER_FILENAME);
+  const quarantinePath = path.join(
+    profile.canonicalPath,
+    `.${ORACLE_CHROME_OWNER_FILENAME}.remove-${process.pid}-${randomUUID()}`,
+  );
+  let quarantined = false;
+  const restore = async (): Promise<void> => {
+    if (
+      !quarantined ||
+      !(await verifyProfileDirectoryIdentity(userDataDir, profile)) ||
+      (await pathExists(ownerPath))
+    ) {
+      return;
+    }
+    await rename(quarantinePath, ownerPath);
+    quarantined = false;
+    await syncProfileDirectory(profile.canonicalPath);
+  };
+
+  try {
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner removal");
+    try {
+      await rename(ownerPath, quarantinePath);
+      quarantined = true;
+    } catch (error) {
+      if (readErrorCode(error) !== "ENOENT") throw error;
+      return verifyProfileDirectoryIdentity(userDataDir, profile);
+    }
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner removal");
+    let current: OracleChromeOwnerRecord | null = null;
+    try {
+      current = parseOracleChromeOwnerRecord(
+        JSON.parse(await readFile(quarantinePath, "utf8")),
+        process.platform,
+      );
+    } catch {
+      // A malformed or unreadable record is not the caller's exact authority.
+    }
+    if (
+      current === null ||
+      current.port !== expected.port ||
+      current.disposition !== expected.disposition ||
+      current.preservationPolicy !== expected.preservationPolicy ||
+      !sameChromeProcessIdentity(current.processIdentity, expected.processIdentity)
+    ) {
+      await restore();
+      return false;
+    }
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner removal");
+    await rm(quarantinePath);
+    quarantined = false;
+    await syncProfileDirectory(profile.canonicalPath);
+    await assertProfileDirectoryIdentity(userDataDir, profile, "Chrome owner removal");
+    return true;
+  } catch (error) {
+    await restore().catch(() => undefined);
+    throw error;
   }
 }
 
@@ -491,10 +636,9 @@ export async function acquireProfileRunLock(
   };
 }
 
-interface CleanupStaleProfileStateDeps {
+interface CleanupStaleProfileStateDeps extends ProfileDirectoryUseDeps {
   captureProfileIdentity?: typeof captureProfileDirectoryIdentity;
   verifyProfileIdentity?: typeof verifyProfileDirectoryIdentity;
-  isChromeUsingUserDataDir?: typeof isChromeUsingUserDataDir;
   beforeDestructiveCleanup?: () => void | Promise<void>;
 }
 
@@ -505,8 +649,9 @@ export async function cleanupStaleProfileState(
     lockRemovalMode?: "never" | "if_oracle_pid_dead";
     expectedProfileIdentity?: ProfileDirectoryIdentity;
   } = {},
+  deps: ProfileDirectoryUseDeps = {},
 ): Promise<boolean> {
-  return cleanupStaleProfileStateWithDeps(userDataDir, logger, options, {});
+  return cleanupStaleProfileStateWithDeps(userDataDir, logger, options, deps);
 }
 
 export async function cleanupStaleProfileStateForTest(
@@ -531,7 +676,7 @@ async function cleanupStaleProfileStateWithDeps(
   deps: CleanupStaleProfileStateDeps,
 ): Promise<boolean> {
   try {
-    await replayPendingProfileDirectoryRemovals(userDataDir);
+    await replayPendingProfileDirectoryRemovalsWithDeps(userDataDir, deps);
   } catch (error) {
     logger?.(
       `Refusing stale profile cleanup because pending deletion replay failed: ${error instanceof Error ? error.message : error}`,
@@ -569,15 +714,31 @@ async function cleanupStaleProfileStateWithDeps(
       return false;
     }
   }
-  if (await (deps.isChromeUsingUserDataDir ?? isChromeUsingUserDataDir)(profile.canonicalPath)) {
-    logger?.("Detected running Chrome using this profile; preserving profile state");
+  const inspectProfileUse =
+    deps.inspectChromeProfileDirectoryUse ?? inspectChromeProfileDirectoryUse;
+  const revalidateProfileUse =
+    deps.revalidateChromeProfileDirectoryUse ?? revalidateChromeProfileDirectoryUse;
+  let profileUse = await inspectProfileUse(profile);
+  if (profileUse.status !== "unused") {
+    logger?.(
+      "Running Chrome profile use is present or could not be proven absent; preserving profile state",
+    );
     return false;
   }
+  let unusedProof: ChromeProfileDirectoryUnusedProof = profileUse;
+  const revalidateUnusedProof = async (): Promise<boolean> => {
+    profileUse = await revalidateProfileUse(profile, unusedProof);
+    if (profileUse.status !== "unused") return false;
+    unusedProof = profileUse;
+    return true;
+  };
   await deps.beforeDestructiveCleanup?.();
 
   let cleaned = true;
   for (const candidate of getDevToolsActivePortPaths(profile.canonicalPath)) {
-    if (!(await verifyProfile(userDataDir, profile))) return false;
+    if (!(await verifyProfile(userDataDir, profile)) || !(await revalidateUnusedProof())) {
+      return false;
+    }
     try {
       await rm(candidate, { force: true });
       logger?.(`Removed stale DevToolsActivePort: ${candidate}`);
@@ -586,7 +747,9 @@ async function cleanupStaleProfileStateWithDeps(
     }
   }
   if (lockRemovalMode === "never") {
-    return cleaned && (await verifyProfile(userDataDir, profile));
+    return (
+      cleaned && (await verifyProfile(userDataDir, profile)) && (await revalidateUnusedProof())
+    );
   }
 
   const staleFiles = [
@@ -597,14 +760,18 @@ async function cleanupStaleProfileStateWithDeps(
     ORACLE_CHROME_OWNER_FILENAME,
   ];
   for (const staleFile of staleFiles) {
-    if (!(await verifyProfile(userDataDir, profile))) return false;
+    if (!(await verifyProfile(userDataDir, profile)) || !(await revalidateUnusedProof())) {
+      return false;
+    }
     try {
       await rm(path.join(profile.canonicalPath, staleFile), { force: true });
     } catch {
       cleaned = false;
     }
   }
-  if (!(await verifyProfile(userDataDir, profile))) return false;
+  if (!(await verifyProfile(userDataDir, profile)) || !(await revalidateUnusedProof())) {
+    return false;
+  }
   logger?.("Cleaned up stale Chrome profile locks and owner authority");
   return cleaned;
 }

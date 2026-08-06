@@ -13,7 +13,7 @@ import type { SessionMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger, ChromeClient } from "./types.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
-import { promptIdentitySha256 } from "./actions/promptComposer.js";
+import { promptIdentitySha256 } from "./actions/committedPrompt.js";
 import {
   closeChromeTargetWithExactAuthority,
   connectWithNewTabWithRetainedLiveAuthority,

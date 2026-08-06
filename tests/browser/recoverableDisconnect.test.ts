@@ -17,7 +17,7 @@ import type {
   ChromeProcessLaunchClaim,
   OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserArchiveEffectReceipt } from "../../src/browser/actions/archiveConversation.js";
 
 type BrowserAutomationErrorConstructor = new (
@@ -83,6 +83,16 @@ function expectCompletedPublicBrowserResult(value: unknown): void {
 
 const targetId = "recoverable-target";
 const conversationUrl = `https://chatgpt.com/c/${targetId}`;
+// Synthetic Chrome has no host process; keep the production physical deletion path while
+// injecting the exact generation's stable unused-profile proof.
+const UNUSED_PROFILE_USE = Object.freeze({
+  status: "unused" as const,
+  candidates: Object.freeze([]),
+});
+const PROFILE_DIRECTORY_USE_DEPS = Object.freeze({
+  inspectChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+  revalidateChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+});
 type ArchivePromptLocator = {
   conversationId: string;
   promptSha256: string;
@@ -606,7 +616,21 @@ async function withDisconnectFixture(
         await actual.writeOracleChromeOwner(userDataDir, owner);
       },
     );
-    return { ...actual, writeOracleChromeOwner };
+    return {
+      ...actual,
+      writeOracleChromeOwner,
+      removeProfileDirectoryIfIdentityMatches: (
+        userDataDir: string,
+        expected: ChromeProcessIdentity["profileDirectory"],
+      ) =>
+        kill.mock.calls.length === 0
+          ? Promise.resolve(false)
+          : actual.removeProfileDirectoryIfIdentityMatches(
+              userDataDir,
+              expected,
+              PROFILE_DIRECTORY_USE_DEPS,
+            ),
+    };
   });
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
     launchChrome: vi.fn(

@@ -169,10 +169,13 @@ function isPathWithin(parent: string, child: string): boolean {
 async function removeCleanupProfile(
   profileDir: string,
   expectedIdentity: ProfileDirectoryIdentity,
-  removeProfile?: (profileDir: string) => Promise<boolean>,
+  removeProfile?: (
+    profileDir: string,
+    expectedIdentity: ProfileDirectoryIdentity,
+  ) => Promise<boolean>,
 ): Promise<boolean> {
   if (removeProfile) {
-    return (await removeProfile(profileDir)) === true;
+    return (await removeProfile(profileDir, expectedIdentity)) === true;
   }
   return removeProfileDirectoryIfIdentityMatches(profileDir, expectedIdentity);
 }

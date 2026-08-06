@@ -175,7 +175,13 @@ export function createRemoteBrowserExecutor({
               keepBrowser: payload.options.keepConversationTab,
             },
             options: {
-              heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
+              heartbeatIntervalMs: Math.max(
+                25,
+                Math.min(
+                  payload.options.heartbeatIntervalMs ?? Number.POSITIVE_INFINITY,
+                  Math.max(25, Math.floor(resolvedDeadlines.socketIdleTimeoutMs / 2)),
+                ),
+              ),
               verbose: payload.options.verbose,
               sessionId: payload.options.sessionId,
               followUpPrompts: payload.options.followUpPrompts,

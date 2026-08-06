@@ -110,6 +110,18 @@ function restarted(record: RemoteTransactionRecord): RemoteTransactionRecord {
 }
 
 describe("remote transaction model validation", () => {
+  test("persists an artifact namespace derived from exact transaction identity", () => {
+    const record = initialRecord();
+    expect(record.artifactNamespace).toMatch(/^remote-[a-f0-9]{64}$/);
+    expect(() => validateRemoteTransactionRecord(record)).not.toThrow();
+    expect(() =>
+      validateRemoteTransactionRecord({ ...record, artifactNamespace: `remote-${"0".repeat(64)}` }),
+    ).toThrow("Invalid remote transaction record");
+    expect(() =>
+      validateRemoteTransactionRecord({ ...record, artifactNamespace: undefined } as never),
+    ).toThrow("Invalid remote transaction record");
+  });
+
   test("uses the canonical staged and artifact validators before persistence and after restart", () => {
     const initial = initialRecord();
     const staged = applyRemoteTransactionTransition(

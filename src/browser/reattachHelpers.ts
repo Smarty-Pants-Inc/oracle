@@ -1,7 +1,7 @@
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
-import { normalizePromptForIdentity } from "./actions/promptComposer.js";
+import { normalizePromptForIdentity } from "./actions/committedPrompt.js";
 
 export type TargetInfoLite = {
   id?: string;

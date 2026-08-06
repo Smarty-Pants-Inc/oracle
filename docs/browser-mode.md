@@ -349,10 +349,10 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
 1. **Start the host on loopback**
 
    ```bash
-   oracle serve --host 127.0.0.1 --port 9473
+   oracle serve --host 127.0.0.1 --port 9473 --token <modern-v3-hmac-root-key>
    ```
 
-   Oracle launches Chrome, starts the authenticated HTTP/SSE API, and prints its loopback address plus a generated modern v3 HMAC root key. Use `--port` or `--token` to override those values. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
+   Oracle launches Chrome and starts the authenticated HTTP/SSE API. `--token` is required and must be supplied out of band; Oracle never logs the modern v3 HMAC root key. Use `--port` to select a fixed port. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
 
 2. **Create the client-side SSH tunnel**
 
@@ -376,7 +376,7 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
 
 4. **Stop the host**
 
-   `Ctrl+C` shuts down the HTTP server and Chrome. Restarting without `--token` rotates the modern key.
+   `Ctrl+C` shuts down the HTTP server and Chrome. Every restart requires an explicit `--token`; reuse or rotate the key through your secret distribution path.
 
 #### Migration from direct LAN endpoints
 

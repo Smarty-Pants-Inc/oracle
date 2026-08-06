@@ -15,7 +15,7 @@ import {
   ensureChatGptScopeRetained,
 } from "../../src/browser/pageActions.js";
 import { isAnswerNowPlaceholderText } from "../../src/browser/actions/assistantResponse.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { createContext, Script } from "node:vm";
 import {
   buildCloudflareInterstitialExpressionForTest,

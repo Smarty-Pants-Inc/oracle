@@ -3,6 +3,7 @@ import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
 import { hasRestartDurableChromeTargetCleanupAuthority } from "../browser/targetCloseAuthority.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
+import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
 import type {
   AppliedRemoteTransactionTransition,
   DurableRemoteArtifactDeliveryReceipt,
@@ -630,6 +631,7 @@ export function createRemoteTransactionRecord(
   const updatedAt = context.nowIso();
   const record: RemoteTransactionRecord = {
     ...begin,
+    artifactNamespace: deriveRemoteArtifactNamespace(begin),
     updatedAt,
     controllerGeneration: context.controllerGeneration,
     state: "running",

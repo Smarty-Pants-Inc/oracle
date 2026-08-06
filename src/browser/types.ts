@@ -122,6 +122,11 @@ export interface BrowserAutomationConfig {
   resumeConversationUrl?: string | null;
 }
 
+/** @internal Server-issued filesystem authority; never project into public run payloads. */
+export interface BrowserArtifactWriteAuthority {
+  artifactsDirectory: string;
+}
+
 export interface BrowserRunOptions {
   prompt: string;
   attachments?: BrowserAttachment[];
@@ -136,6 +141,8 @@ export interface BrowserRunOptions {
   verbose?: boolean;
   /** Session id used for cross-process browser slot diagnostics. */
   sessionId?: string;
+  /** @internal Exact server-owned directory for browser artifact writes. */
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   /** Browser-only image generation output path. */
   generateImagePath?: string;
   /** Optional output path for image operations. */
@@ -196,6 +203,8 @@ export interface BrowserRunResult {
   tabUrl?: string;
   conversationId?: string;
   promptEpoch?: BrowserPromptEpoch;
+  /** Compatibility signal derived from committed prompt authority. */
+  promptSubmitted?: boolean;
   controllerPid?: number;
 }
 

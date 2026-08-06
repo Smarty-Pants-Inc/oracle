@@ -3,7 +3,7 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import { connectToRemoteChromeTarget } from "./chromeLifecycle.js";
 import type { ManualChromeOwner } from "./manualChromeOwner.js";
 import { verifyPromptCommitted } from "./pageActions.js";
-import type { PromptCommitVerification } from "./actions/promptComposer.js";
+import type { PromptCommitVerification } from "./actions/promptCommitVerification.js";
 import {
   connectionLostUserMessage,
   isRecoverableChromeDisconnect,

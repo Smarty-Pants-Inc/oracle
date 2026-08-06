@@ -84,6 +84,8 @@ export interface CrashRecoverableFilesystemLockOptions {
   createParent?: boolean;
   sessionId?: string;
   adoptCurrentProcessGeneration?: boolean;
+  /** Tab-lease registry only: a live or unknown current Windows PID remains unreclaimable. */
+  processGenerationPolicy?: "strict" | "allow-unstable-current-win32";
 }
 
 export interface CrashRecoverableFilesystemLockDeps {
@@ -134,7 +136,11 @@ export async function acquireCrashRecoverableFilesystemLock(
   );
   const processStartIdentity =
     await readStableProcessStartIdentityForAcquisition(processIdentityProvider);
-  if (!processStartIdentity) {
+  const permitsUnstableCurrentWin32Generation =
+    options.processGenerationPolicy === "allow-unstable-current-win32" &&
+    processIdentityProvider.platform === "win32" &&
+    pid === process.pid;
+  if (!processStartIdentity && !permitsUnstableCurrentWin32Generation) {
     throw new Error(
       `Cannot acquire crash-recoverable filesystem lock at ${lockPath} without a stable process generation for pid ${pid}`,
     );
@@ -233,6 +239,7 @@ export async function acquireCrashRecoverableFilesystemLock(
         inspection.status === "active" &&
         options.adoptCurrentProcessGeneration === true &&
         Boolean(options.sessionId) &&
+        processStartIdentity !== null &&
         inspection.owner?.pid === pid &&
         inspection.owner.processStartIdentity === processStartIdentity &&
         (inspection.owner.sessionId === undefined ||

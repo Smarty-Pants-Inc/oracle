@@ -503,6 +503,7 @@ async function withRegistryLock<T>(
       timeoutMs: REGISTRY_LOCK_TIMEOUT_MS,
       pollMs: 50,
       createParent: false,
+      processGenerationPolicy: "allow-unstable-current-win32",
     });
   } catch (error) {
     if (error instanceof FilesystemLockBusyError) {

@@ -41,6 +41,7 @@ interface PublishedBrowserOutcome extends BrowserOutcomeProjection {
   transportMetadata: undefined;
   usage: SessionMetadata["usage"];
   elapsedMs: number | undefined;
+  completedAt?: string;
 }
 
 interface PublishedCleanupPendingOutcome extends BrowserOutcomeProjection {
@@ -55,6 +56,7 @@ interface PublishedCleanupPendingOutcome extends BrowserOutcomeProjection {
   transportMetadata: undefined;
   usage: SessionMetadata["usage"];
   elapsedMs: number | undefined;
+  completedAt?: string;
 }
 
 interface UnpublishedCleanupPendingOutcome extends BrowserOutcomeProjection {
@@ -82,32 +84,65 @@ export type BrowserSessionOutcome =
   | UnpublishedCleanupPendingOutcome
   | RecoveryRunningOutcome
   | TerminalErrorOutcome;
+export type BrowserSessionProjectionPersistence =
+  | { status: "persisted"; metadata: SessionMetadata; recoveredError?: string }
+  | { status: "pending"; error: string; cause: unknown };
+
+export async function commitBrowserSessionOutcomeProjection(
+  sessionId: string,
+  outcome: BrowserSessionOutcome,
+): Promise<BrowserSessionProjectionPersistence> {
+  const current = await sessionStore.readSession(sessionId).catch(() => null);
+  const projection = buildBrowserSessionOutcomeProjection(outcome, current);
+  if (matchesProjection(current, projection)) return { status: "persisted", metadata: current };
+  let firstError: unknown;
+  try {
+    const committed = await commitSessionModelProjection(sessionId, projection);
+    if (matchesProjection(committed.session, projection)) {
+      return { status: "persisted", metadata: committed.session };
+    }
+    firstError = new Error("Terminal session/model projection commit returned mismatched metadata");
+  } catch (error) {
+    firstError = error;
+  }
+  let observed = await sessionStore.readSession(sessionId).catch(() => null);
+  if (matchesProjection(observed, projection)) {
+    return { status: "persisted", metadata: observed, recoveredError: formatError(firstError) };
+  }
+
+  try {
+    const committed = await commitSessionModelProjection(sessionId, projection);
+    if (matchesProjection(committed.session, projection)) {
+      return {
+        status: "persisted",
+        metadata: committed.session,
+        recoveredError: formatError(firstError),
+      };
+    }
+    observed = await sessionStore.readSession(sessionId).catch(() => null);
+    if (matchesProjection(observed, projection)) {
+      return { status: "persisted", metadata: observed, recoveredError: formatError(firstError) };
+    }
+    const error = new Error("Terminal session/model projection retry returned mismatched metadata");
+    return { status: "pending", error: error.message, cause: error };
+  } catch (error) {
+    observed = await sessionStore.readSession(sessionId).catch(() => null);
+    if (matchesProjection(observed, projection)) {
+      return { status: "persisted", metadata: observed, recoveredError: formatError(firstError) };
+    }
+    return { status: "pending", error: formatError(error), cause: error };
+  }
+}
 
 export async function persistBrowserSessionOutcome(
   sessionId: string,
   outcome: BrowserSessionOutcome,
 ): Promise<void> {
-  const current = await sessionStore.readSession(sessionId).catch(() => null);
-  const projection = projectBrowserSessionOutcome(outcome, current);
-  if (matchesProjection(current, projection)) return;
-  try {
-    await commitSessionModelProjection(sessionId, projection);
-    return;
-  } catch {
-    const observed = await sessionStore.readSession(sessionId).catch(() => null);
-    if (matchesProjection(observed, projection)) return;
-  }
-
-  try {
-    await commitSessionModelProjection(sessionId, projection);
-  } catch (error) {
-    const observed = await sessionStore.readSession(sessionId).catch(() => null);
-    if (matchesProjection(observed, projection)) return;
-    throw error;
-  }
+  const persistence = await commitBrowserSessionOutcomeProjection(sessionId, outcome);
+  if (persistence.status === "pending") throw persistence.cause;
 }
 
-function projectBrowserSessionOutcome(
+function buildBrowserSessionOutcomeProjection(
   outcome: BrowserSessionOutcome,
   current: SessionMetadata | null,
 ): Parameters<typeof commitSessionModelProjection>[1] {
@@ -123,7 +158,7 @@ function projectBrowserSessionOutcome(
     outcome.kind === "published" ||
     (outcome.kind === "cleanup-pending" && outcome.publication === "published")
   ) {
-    const completedAt = current?.completedAt ?? new Date().toISOString();
+    const completedAt = outcome.completedAt ?? current?.completedAt ?? new Date().toISOString();
     const cleanupErrorCode =
       outcome.kind === "cleanup-pending" ? "browser-cleanup-finalize-pending" : undefined;
     const prefixedCleanupError = cleanupErrorCode ? `${cleanupErrorCode}: ` : undefined;
@@ -138,10 +173,11 @@ function projectBrowserSessionOutcome(
             },
           }
         : outcome.runtime;
-    const publishedBrowser =
-      current?.status === "completed" && current.browser
-        ? current.browser
-        : projectCompletedBrowserMetadataAudit(outcome.browser, auditRuntime, cleanupErrorCode);
+    const publishedBrowser = projectCompletedBrowserMetadataAudit(
+      outcome.browser,
+      auditRuntime,
+      cleanupErrorCode,
+    );
     const publishedArtifacts = mergeArtifacts(current?.artifacts, artifacts);
     return {
       session: {
@@ -249,16 +285,21 @@ function mergeArtifacts(
 function matchesProjection(
   current: SessionMetadata | null,
   projection: Parameters<typeof commitSessionModelProjection>[1],
-): boolean {
+): current is SessionMetadata {
   if (!current) return false;
   for (const [key, expected] of Object.entries(projection.session)) {
     if (!isDeepStrictEqual(current[key as keyof SessionMetadata], expected)) return false;
   }
   if (!projection.model) return true;
+  if (current.modelProjectionAuthority !== "session") return false;
   const model = current.models?.find((run) => run.model === projection.model?.model);
   if (!model) return false;
   for (const [key, expected] of Object.entries(projection.model.updates)) {
     if (!isDeepStrictEqual(model[key as keyof SessionModelRun], expected)) return false;
   }
   return true;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

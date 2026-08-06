@@ -23,6 +23,7 @@ import {
   type ChromeProcessIdentity,
   type ChromeProcessLaunchClaim,
   type ProfileDirectoryIdentity,
+  type ProfileDirectoryUseDeps,
   type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
 import { delay } from "./utils.js";
@@ -386,6 +387,8 @@ export function registerTerminationHooks(
     preserveUserDataDir?: boolean;
     /** Terminate Chrome and remove a throwaway copied profile even while in flight. */
     forceProfileCleanup?: boolean;
+    /** Test/embedding seam for deterministic complete process-use inspection. */
+    profileDirectoryUseDeps?: ProfileDirectoryUseDeps;
     /** Test/embedding hook invoked after signal cleanup settles and before process exit. */
     onSignalHandled?: () => void;
   },
@@ -433,16 +436,22 @@ export function registerTerminationHooks(
         return;
       }
       if (opts?.preserveUserDataDir) {
-        const cleaned = await cleanupStaleProfileState(userDataDir, logger, {
-          lockRemovalMode: "never",
-          expectedProfileIdentity: chrome.processIdentity.profileDirectory,
-        }).catch(() => false);
+        const cleaned = await cleanupStaleProfileState(
+          userDataDir,
+          logger,
+          {
+            lockRemovalMode: "never",
+            expectedProfileIdentity: chrome.processIdentity.profileDirectory,
+          },
+          opts.profileDirectoryUseDeps,
+        ).catch(() => false);
         if (!cleaned) logger(`Preserved profile state because physical cleanup was not confirmed.`);
         return;
       }
       const removed = await removeProfileDirectoryIfIdentityMatches(
         userDataDir,
         chrome.processIdentity.profileDirectory,
+        opts?.profileDirectoryUseDeps,
       ).catch(() => false);
       if (!removed) logger(`Preserved profile because its physical cleanup authority changed.`);
     })().finally(() => {

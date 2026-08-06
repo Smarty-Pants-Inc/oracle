@@ -8,6 +8,7 @@ import type {
 } from "./chromeLifecycle.js";
 import type { retainChromeBrowserWebSocketAuthority } from "./chromeEndpointAuthority.js";
 import type { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
+import type { settleManualChromeOwner } from "./manualChromeOwnerSettlement.js";
 import type {
   acquireProfileRunLock,
   captureChromeProcessIdentity,
@@ -19,6 +20,7 @@ import type {
   verifyChromeProcessIdentity,
   verifyProfileDirectoryIdentity,
   writeOracleChromeOwner,
+  ProfileDirectoryIdentity,
 } from "./profileState.js";
 import type {
   releaseBrowserTabLease,
@@ -43,8 +45,12 @@ export interface ReattachCleanupDeps {
   verifyChromeProcessIdentity?: typeof verifyChromeProcessIdentity;
   writeOracleChromeOwner?: typeof writeOracleChromeOwner;
   cleanupStaleProfileState?: typeof cleanupStaleProfileState;
+  settleManualChromeOwner?: typeof settleManualChromeOwner;
   teardownBrowserResourcesIfNoActiveLeases?: typeof teardownBrowserResourcesIfNoActiveLeases;
-  removeProfile?: (profileDir: string) => Promise<boolean>;
+  removeProfile?: (
+    profileDir: string,
+    expectedIdentity: ProfileDirectoryIdentity,
+  ) => Promise<boolean>;
   releaseBrowserTabLease?: typeof releaseBrowserTabLease;
   settleRemoteBrowserRecovery?: typeof settleRemoteBrowserRecovery;
   resolveRemoteRecoveryConfig?: () => Promise<{ host?: string; token?: string }>;

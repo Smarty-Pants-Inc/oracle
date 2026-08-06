@@ -1,10 +1,5 @@
 import path from "node:path";
-import type {
-  BrowserRuntimeMetadata,
-  SessionArtifact,
-  SessionMetadata,
-  SessionModelRun,
-} from "../sessionStore.js";
+import type { BrowserRuntimeMetadata, SessionArtifact, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import type {
   BrowserCaptureFinalizationResult,
@@ -30,6 +25,7 @@ import { appendArtifacts } from "../browser/artifacts.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import {
   BrowserPublicationJournalStore,
+  hasMatchingTerminalBrowserPublicationProjection,
   isBrowserPublicationAcknowledged,
   projectCompletedBrowserMetadataAudit,
   readBrowserCapturePublicationJournal,
@@ -47,16 +43,19 @@ import {
   type DurableBrowserAnswerReceipt,
   type PersistDurableBrowserAnswerOptions,
 } from "./durableBrowserAnswerFile.js";
+import {
+  commitBrowserSessionOutcomeProjection,
+  type BrowserSessionOutcome,
+} from "./browserSessionOutcome.js";
 
 export { persistDurableBrowserAnswer, readDurableBrowserAnswer };
 export type { DurableBrowserAnswerReceipt, PersistDurableBrowserAnswerOptions };
 
-type RuntimeAuthorityPersistence =
+export type BrowserPublicationProjectionPersistence =
   | { status: "persisted"; recoveredError?: string }
   | { status: "pending"; error: string };
 
-type ModelRunProjection =
-  | { status: "not-requested" }
+export type BrowserPublicationFinalizationPersistence =
   | { status: "persisted"; recoveredError?: string }
   | { status: "pending"; error: string };
 
@@ -64,9 +63,9 @@ export interface PublishedBrowserCapture {
   published: true;
   receipt: DurableBrowserAnswerReceipt;
   artifacts: SessionArtifact[];
+  projection: BrowserPublicationProjectionPersistence;
   finalization: BrowserCaptureFinalizationResult;
-  runtimeAuthority: RuntimeAuthorityPersistence;
-  modelRun: ModelRunProjection;
+  finalizationPersistence: BrowserPublicationFinalizationPersistence;
 }
 
 export interface PublishCompletedBrowserCaptureOptions {
@@ -101,7 +100,8 @@ export class BrowserPublicationTransaction {
   private publicationAcknowledged = false;
   private recoveryLock: ReattachRecoveryLock | null = null;
   private recoveryLockPath: string | null = null;
-  private persistenceState: RuntimeAuthorityPersistence | undefined;
+  private persistenceState: BrowserPublicationFinalizationPersistence | undefined;
+  private durableAnswerAcknowledged = false;
   private acquireRecoveryLockEffect: typeof acquireReattachRecoveryLock =
     acquireReattachRecoveryLock;
 
@@ -119,9 +119,9 @@ export class BrowserPublicationTransaction {
     return this.currentJournal !== null;
   }
 
-  readonly isPublished = (): boolean =>
-    this.publicationAcknowledged ||
-    isBrowserPublicationAcknowledged((this.currentJournal ?? this.authorityJournal)?.phase);
+  readonly isPublished = (): boolean => this.publicationAcknowledged;
+  readonly isRemotePublicationAcknowledged = (): boolean =>
+    this.publicationAcknowledged || this.durableAnswerAcknowledged;
 
   readonly acknowledge = (): void => {
     this.publicationAcknowledged = true;
@@ -149,49 +149,67 @@ export class BrowserPublicationTransaction {
   async refresh(): Promise<BrowserCapturePublicationJournal | null> {
     const sessionId = this.requireSessionId();
     const journal = await readBrowserCapturePublicationJournal(sessionId);
-    if (journal) this.observe(journal);
-    else this.currentJournal = null;
+    if (journal) {
+      this.observe(journal);
+      const metadata = await sessionStore.readSession(sessionId).catch(() => null);
+      this.publicationAcknowledged = isBrowserPublicationAcknowledged(journal, metadata);
+    } else {
+      this.currentJournal = null;
+      this.publicationAcknowledged = false;
+    }
     return journal;
   }
 
   async clear(): Promise<void> {
     if (!this.currentJournal) return;
+    const metadata = await sessionStore.readSession(this.requireSessionId());
+    if (!isBrowserPublicationAcknowledged(this.currentJournal, metadata)) {
+      throw new Error("Browser publication journal cannot retire before terminal model projection");
+    }
     await this.requireJournalStore().remove(this.currentJournal, {
       type: "retire-completed-publication",
       receipt: this.currentJournal.receipt,
       completedSessionPersisted: true,
     });
     this.currentJournal = null;
+    this.durableAnswerAcknowledged = false;
+    this.publicationAcknowledged = false;
   }
 
   async discardAbortedPreparation(runtime: BrowserRuntimeMetadata | undefined): Promise<boolean> {
-    if (
-      this.currentJournal?.phase !== "preparing" ||
-      runtime?.recoveryCleanupResult?.settlementMode !== "abort"
-    ) {
-      return false;
-    }
+    if (runtime?.recoveryCleanupResult?.settlementMode !== "abort") return false;
+    return this.discardPreparationForAbort();
+  }
+
+  async discardPreparationForAbort(): Promise<boolean> {
+    if (this.currentJournal?.phase !== "preparing") return false;
     await this.requireJournalStore().remove(this.currentJournal, {
       type: "abort-preparation",
       receipt: this.currentJournal.receipt,
     });
     this.currentJournal = null;
+    this.durableAnswerAcknowledged = false;
     return true;
   }
 
   async recoveryAnswer(): Promise<BrowserPublicationRecoveryAnswer> {
     if (!this.currentJournal) return { status: "none" };
     const answer = await readDurableBrowserAnswer(this.currentJournal.receipt);
-    if (answer !== null) return { status: "ready", answer };
+    if (answer !== null) {
+      this.durableAnswerAcknowledged = true;
+      return { status: "ready", answer };
+    }
     return this.currentJournal.phase === "preparing" ? { status: "none" } : { status: "pending" };
   }
 
   async preferDurablePreparingAnswer(capturedAnswer: string): Promise<string> {
     if (this.currentJournal?.phase !== "preparing") return capturedAnswer;
-    return (await readDurableBrowserAnswer(this.currentJournal.receipt)) ?? capturedAnswer;
+    const durableAnswer = await readDurableBrowserAnswer(this.currentJournal.receipt);
+    if (durableAnswer !== null) this.durableAnswerAcknowledged = true;
+    return durableAnswer ?? capturedAnswer;
   }
 
-  finalizationPersistence(): RuntimeAuthorityPersistence | undefined {
+  finalizationPersistence(): BrowserPublicationFinalizationPersistence | undefined {
     return this.persistenceState;
   }
 
@@ -238,9 +256,12 @@ export class BrowserPublicationTransaction {
     let firstError: string | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const persisted =
+        const persistedState: PersistedBrowserCaptureFinalizationState =
           mode === "abort"
-            ? await this.persistAbortRuntime(browser, projected)
+            ? {
+                finalization: await this.persistAbortRuntime(browser, projected),
+                projection: { status: "persisted" as const },
+              }
             : await persistBrowserCaptureFinalizationStateOnce(
                 this.requireSessionId(),
                 browser,
@@ -251,16 +272,22 @@ export class BrowserPublicationTransaction {
                 options,
               );
         await this.refresh();
+        if (persistedState.projection.status === "pending") {
+          this.persistenceState = persistedState.projection;
+          return persistedState.finalization;
+        }
+        const recoveredError = firstError ?? persistedState.projection.recoveredError;
         this.persistenceState =
-          lockReleased || !persisted.runtime.recoveryCleanupResult?.lockReleasePending
-            ? { status: "persisted", ...(firstError ? { recoveredError: firstError } : {}) }
+          lockReleased ||
+          !persistedState.finalization.runtime.recoveryCleanupResult?.lockReleasePending
+            ? { status: "persisted", ...(recoveredError ? { recoveredError } : {}) }
             : {
                 status: "pending",
                 error:
-                  persisted.runtime.recoveryCleanupResult.error ??
+                  persistedState.finalization.runtime.recoveryCleanupResult.error ??
                   "Browser recovery lock release remains pending",
               };
-        return persisted;
+        return persistedState.finalization;
       } catch (error) {
         firstError ??= formatError(error);
         if (attempt === 0) continue;
@@ -319,7 +346,7 @@ export class BrowserPublicationTransaction {
             {
               recoveryLockPath: lockPath,
               recoveryCleanup: { retainChromeEndpointAuthority },
-              isRemotePublicationAcknowledged: this.isPublished,
+              isRemotePublicationAcknowledged: this.isRemotePublicationAcknowledged,
               acquireRecoveryLock: this.acquireRecoveryLock,
               loadRuntimeUnderLock: () => this.loadCurrentRuntime(journal.runtime),
               persistFinalizationResult: (result, beforeRuntime, settlementMode) =>
@@ -333,13 +360,14 @@ export class BrowserPublicationTransaction {
             },
             mode,
           );
-          this.persistenceState =
-            outcome.persistence.status === "persisted"
-              ? { status: "persisted" }
-              : {
-                  status: "pending",
-                  error: sanitizeBrowserPublicationMessage(outcome.persistence.error),
-                };
+          if (outcome.persistence.status === "pending") {
+            this.persistenceState = {
+              status: "pending",
+              error: sanitizeBrowserPublicationMessage(outcome.persistence.error),
+            };
+          } else {
+            this.persistenceState ??= { status: "persisted" };
+          }
           return outcome.finalization;
         },
       },
@@ -382,8 +410,10 @@ export class BrowserPublicationTransaction {
         if (isBrowserCapturePublicationRecoveryPending(stageError)) throw stageError;
         return abortPreStageFailure(options, stageError, projectRuntime, journalStore);
       }
+      this.durableAnswerAcknowledged = true;
     }
 
+    let projection: BrowserPublicationProjectionPersistence;
     try {
       if (journal.phase === "staged") {
         journal = this.observe(
@@ -392,16 +422,35 @@ export class BrowserPublicationTransaction {
       }
       if (journal.phase === "finalize-bound") {
         await persistFinalizeBoundRuntime(options, journal);
-        journal = this.observe(
-          await commitStagedPublication(options, journal, label, journalStore),
-        );
       }
+      const committed = await commitTerminalPublication(options, journal, label, journalStore);
+      journal = this.observe(committed.journal);
+      projection = committed.projection;
     } catch (error) {
       await releaseSettlementLockAfterFailure(options, error);
       throw error;
     }
+
+    if (projection.status === "pending") {
+      await releaseSettlementLockAfterFailure(options, projection.error);
+      const finalizationError = `Terminal session/model projection remains retryable: ${projection.error}`;
+      const finalization = pendingBrowserCaptureCleanup(
+        journal.runtime,
+        finalizationError,
+        "finalize",
+      );
+      return completedPublication(journal, projection, finalization, {
+        status: "pending",
+        error: finalizationError,
+      });
+    }
     this.acknowledge();
-    const modelRun = await persistCompletedModelRun(options, journal.completedAt, label);
+    if (projection.recoveredError) {
+      options.log?.(
+        `${label} published; recovered terminal session/model projection after retry: ${projection.recoveredError}`,
+      );
+    }
+
     const runtimeBeforeFinalization = options.transaction.runtime;
     let finalization: BrowserCaptureFinalizationResult;
     try {
@@ -429,7 +478,7 @@ export class BrowserPublicationTransaction {
 
     const managedPersistence = this.finalizationPersistence();
     if (managedPersistence) {
-      return completedPublication(journal, finalization, managedPersistence, modelRun);
+      return completedPublication(journal, projection, finalization, managedPersistence);
     }
 
     try {
@@ -446,7 +495,7 @@ export class BrowserPublicationTransaction {
           `${label} published; recovered final cleanup authority persistence after retry: ${persistence.recoveredError}`,
         );
       }
-      return completedPublication(journal, finalization, persistence, modelRun);
+      return completedPublication(journal, projection, finalization, persistence);
     } catch (persistenceError) {
       const authorityError = runtimeAuthorityPersistenceFailure(
         journal,
@@ -462,7 +511,7 @@ export class BrowserPublicationTransaction {
       options.log?.(
         `${label} published; exact cleanup authority persistence remains deferred after retry: ${persistence.error}`,
       );
-      return completedPublication(journal, finalization, persistence, modelRun);
+      return completedPublication(journal, projection, finalization, persistence);
     }
   }
 
@@ -503,8 +552,8 @@ export class BrowserPublicationTransaction {
 /**
  * Publishes a completed browser capture through a crash-recoverable transaction:
  * journal the exact answer intent, durably stage answer/artifacts, bind FINALIZE remotely and
- * locally, commit audit-only completed projections, then execute idempotent finalize effects.
- * Only a pre-stage failure may select ABORT.
+ * locally, atomically commit the terminal session and selected-model projection, then execute
+ * idempotent finalize effects. Only a pre-stage failure may select ABORT.
  */
 export async function publishCompletedBrowserCapture(
   options: PublishCompletedBrowserCaptureOptions,
@@ -836,31 +885,37 @@ async function persistFinalizeBoundRuntime(
   }
 }
 
-async function commitStagedPublication(
+async function commitTerminalPublication(
   options: PublishCompletedBrowserCaptureOptions,
   journal: BrowserCapturePublicationJournal,
   label: string,
   journalStore: BrowserPublicationJournalStore,
-): Promise<BrowserCapturePublicationJournal> {
-  try {
-    await persistCompletedSession(options, journal, journal.runtime);
-  } catch (error) {
-    try {
-      await persistCompletedSession(options, journal, journal.runtime);
-    } catch (retryError) {
-      throw new BrowserAutomationError(
-        `${label} remains staged under FINALIZE authority because completed publication failed: ${formatError(retryError)}`,
-        {
-          stage: "browser-capture-publication",
-          code: "finalize-bound-publication-pending",
-          runtime: journal.runtime,
-          answerReceipt: journal.receipt,
-          firstError: formatError(error),
-        },
-        retryError,
-      );
-    }
+): Promise<{
+  journal: BrowserCapturePublicationJournal;
+  projection: BrowserPublicationProjectionPersistence;
+}> {
+  const outcome = browserPublicationOutcome(
+    options,
+    journal,
+    journal.runtime,
+    journal.phase === "cleanup-pending" ? journal.cleanupErrorMessage : undefined,
+  );
+  const persisted = await commitBrowserSessionOutcomeProjection(options.answer.sessionId, outcome);
+  const projection: BrowserPublicationProjectionPersistence =
+    persisted.status === "persisted"
+      ? {
+          status: "persisted",
+          ...(persisted.recoveredError ? { recoveredError: persisted.recoveredError } : {}),
+        }
+      : { status: "pending", error: persisted.error };
+  if (projection.status === "pending") {
+    options.log?.(
+      `${label} is durable under FINALIZE authority; terminal session/model projection remains retryable: ${projection.error}`,
+    );
+    return { journal, projection };
   }
+  if (journal.phase !== "finalize-bound") return { journal, projection };
+
   const event = {
     type: "completed-session-persisted",
     receipt: journal.receipt,
@@ -871,10 +926,10 @@ async function commitStagedPublication(
     await journalStore.transition(journal, event);
   } catch (error) {
     options.log?.(
-      `${label} completed projection is durable; publication journal phase update remains retryable: ${formatError(error)}`,
+      `${label} terminal session/model projection is durable; publication journal phase update remains retryable: ${formatError(error)}`,
     );
   }
-  return publishedJournal;
+  return { journal: publishedJournal, projection };
 }
 
 async function releaseSettlementLockAfterFailure(
@@ -896,15 +951,7 @@ async function recognizeCommittedPublication(
 ): Promise<BrowserCapturePublicationJournal> {
   if (journal.phase !== "finalize-bound") return journal;
   const metadata = await sessionStore.readSession(journal.sessionId);
-  if (
-    metadata?.status !== "completed" ||
-    !metadata.artifacts?.some(
-      (artifact) =>
-        artifact.path === journal.receipt.artifact.path &&
-        artifact.sha256 === journal.receipt.artifact.sha256 &&
-        artifact.sizeBytes === journal.receipt.artifact.sizeBytes,
-    )
-  ) {
+  if (!metadata || !hasMatchingTerminalBrowserPublicationProjection(metadata, journal)) {
     return journal;
   }
   return journalStore.reduce(journal, {
@@ -914,60 +961,51 @@ async function recognizeCommittedPublication(
   });
 }
 
-async function persistCompletedSession(
-  options: PublishCompletedBrowserCaptureOptions,
+function browserPublicationOutcome(
+  options: Pick<PublishCompletedBrowserCaptureOptions, "browser">,
   journal: BrowserCapturePublicationJournal,
   runtime: BrowserRuntimeMetadata,
-  cleanupErrorCode?: string,
-): Promise<void> {
-  await sessionStore.updateSession(options.answer.sessionId, {
-    status: "completed",
-    completedAt: journal.completedAt,
+  cleanupError?: string,
+): BrowserSessionOutcome {
+  const browser = { ...options.browser, runtime };
+  const shared = {
+    browser,
+    runtime,
+    response: journal.response ?? ({ status: "completed" } as const),
+    artifacts: journal.artifacts,
+    receipt: journal.receipt,
+    errorMetadata: undefined,
+    transportMetadata: undefined,
+    modelProjection: journal.model
+      ? {
+          model: journal.model,
+          updates: {
+            usage: journal.usage,
+            response: { status: "completed" as const },
+            transport: undefined,
+            error: undefined,
+          },
+        }
+      : undefined,
     usage: journal.usage,
     elapsedMs: journal.elapsedMs,
-    errorMessage: undefined,
-    browser: projectCompletedBrowserMetadataAudit(options.browser, runtime, cleanupErrorCode),
-    artifacts: journal.artifacts,
-    response: journal.response,
-    transport: undefined,
-    error: undefined,
-  });
-}
-
-async function persistCompletedModelRun(
-  options: PublishCompletedBrowserCaptureOptions,
-  completedAt: string,
-  label: string,
-): Promise<ModelRunProjection> {
-  if (!options.model) return { status: "not-requested" };
-  const updates: Partial<SessionModelRun> = {
-    status: "completed",
-    completedAt,
-    usage: options.usage,
-    response: { status: "completed" },
-    transport: undefined,
-    error: undefined,
+    completedAt: journal.completedAt,
   };
-  try {
-    await sessionStore.updateModelRun(options.answer.sessionId, options.model, updates);
-    return { status: "persisted" };
-  } catch (error) {
-    const firstError = formatError(error);
-    try {
-      await sessionStore.updateModelRun(options.answer.sessionId, options.model, updates);
-      options.log?.(
-        `${label} published; recovered model-run projection after retry: ${firstError}`,
-      );
-      return { status: "persisted", recoveredError: firstError };
-    } catch (retryError) {
-      const message = formatError(retryError);
-      options.log?.(`${label} published; model-run projection failed after retry: ${message}`);
-      return { status: "pending", error: message };
-    }
-  }
+  return cleanupError
+    ? {
+        ...shared,
+        kind: "cleanup-pending",
+        publication: "published",
+        reason: cleanupError,
+      }
+    : { ...shared, kind: "published", reason: undefined };
 }
 export interface PersistBrowserCaptureFinalizationOptions {
   acknowledgeCapabilities?: boolean;
+}
+interface PersistedBrowserCaptureFinalizationState {
+  finalization: BrowserCaptureFinalizationResult;
+  projection: BrowserPublicationProjectionPersistence;
 }
 
 export async function persistBrowserCaptureFinalizationState(
@@ -998,30 +1036,28 @@ async function persistBrowserCaptureFinalizationStateOnce(
   beforeFinalizationRuntime: BrowserRuntimeMetadata,
   journalStore: BrowserPublicationJournalStore,
   options: PersistBrowserCaptureFinalizationOptions = {},
-): Promise<BrowserCaptureFinalizationResult> {
+): Promise<PersistedBrowserCaptureFinalizationState> {
   const currentJournal = await readBrowserCapturePublicationJournal(sessionId);
   if (!currentJournal) {
     const currentSession = await sessionStore.readSession(sessionId);
     const terminalRuntime = currentSession?.browser?.runtime;
-    const expectedArtifact = expectedJournal.receipt.artifact;
     const matchingTerminalSession =
-      currentSession?.status === "completed" &&
+      currentSession !== null &&
+      currentSession !== undefined &&
+      hasMatchingTerminalBrowserPublicationProjection(currentSession, expectedJournal) &&
       terminalRuntime !== undefined &&
       !terminalRuntime.recoveryCleanupResources?.length &&
-      !terminalRuntime.recoveryCleanupResult &&
-      currentSession.artifacts?.some(
-        (artifact) =>
-          artifact.path === expectedArtifact.path &&
-          artifact.sha256 === expectedArtifact.sha256 &&
-          artifact.sizeBytes === expectedArtifact.sizeBytes,
-      );
+      !terminalRuntime.recoveryCleanupResult;
     if (!matchingTerminalSession || !terminalRuntime) {
       throw new Error("Browser finalization journal authority changed before persistence");
     }
     if (options.acknowledgeCapabilities !== false) {
       await acknowledgeSettledTargetCloseCapabilities(beforeFinalizationRuntime, terminalRuntime);
     }
-    return { status: "completed", runtime: terminalRuntime };
+    return {
+      finalization: { status: "completed", runtime: terminalRuntime },
+      projection: { status: "persisted" },
+    };
   }
   if (
     currentJournal.receipt.artifact.path !== expectedJournal.receipt.artifact.path ||
@@ -1072,22 +1108,24 @@ async function persistBrowserCaptureFinalizationStateOnce(
   if (options.acknowledgeCapabilities !== false) {
     await acknowledgeSettledTargetCloseCapabilities(beforeFinalizationRuntime, persistedRuntime);
   }
-  await sessionStore.updateSession(sessionId, {
-    status: "completed",
-    completedAt: currentJournal.completedAt,
-    usage: currentJournal.usage,
-    elapsedMs: currentJournal.elapsedMs,
-    errorMessage: undefined,
-    browser: projectCompletedBrowserMetadataAudit(
-      browser,
+  const projection = await commitBrowserSessionOutcomeProjection(
+    sessionId,
+    browserPublicationOutcome(
+      { browser },
+      currentJournal,
       effectiveFinalization.runtime,
-      cleanupErrorCode,
+      persistedFinalization.status === "pending" ? persistedFinalization.error : undefined,
     ),
-    artifacts: currentJournal.artifacts,
-    response: currentJournal.response,
-    transport: undefined,
-    error: undefined,
-  });
+  );
+  if (projection.status === "pending") {
+    return {
+      finalization: persistedFinalization,
+      projection: { status: "pending", error: projection.error },
+    };
+  }
+  if (!cleanupPending && !isBrowserPublicationAcknowledged(persistedJournal, projection.metadata)) {
+    throw new Error("Terminal browser publication projection could not be verified for retirement");
+  }
   if (!cleanupPending) {
     try {
       await journalStore.remove(persistedJournal, {
@@ -1101,7 +1139,13 @@ async function persistBrowserCaptureFinalizationStateOnce(
       await readBrowserCapturePublicationJournal(sessionId).catch(() => null);
     }
   }
-  return persistedFinalization;
+  return {
+    finalization: persistedFinalization,
+    projection: {
+      status: "persisted",
+      ...(projection.recoveredError ? { recoveredError: projection.recoveredError } : {}),
+    },
+  };
 }
 
 async function abortPreStageFailure(
@@ -1260,17 +1304,17 @@ function isRuntimeAuthorityPersistenceFailure(error: unknown): boolean {
 
 function completedPublication(
   journal: BrowserCapturePublicationJournal,
+  projection: BrowserPublicationProjectionPersistence,
   finalization: BrowserCaptureFinalizationResult,
-  runtimeAuthority: RuntimeAuthorityPersistence,
-  modelRun: ModelRunProjection,
+  finalizationPersistence: BrowserPublicationFinalizationPersistence,
 ): PublishedBrowserCapture {
   return {
     published: true,
     receipt: journal.receipt,
     artifacts: journal.artifacts,
+    projection,
     finalization,
-    runtimeAuthority,
-    modelRun,
+    finalizationPersistence,
   };
 }
 

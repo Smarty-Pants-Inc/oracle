@@ -53,6 +53,7 @@ const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 const saveBrowserTranscriptArtifactMock = vi.hoisted(() => vi.fn());
 const saveDeepResearchReportArtifactMock = vi.hoisted(() => vi.fn());
 const writeFileAtomicDurableMock = vi.hoisted(() => vi.fn());
+const commitSessionModelProjectionMock = vi.hoisted(() => vi.fn());
 const sessionStoreMock = vi.hoisted(() => ({
   readSession: vi.fn(),
   readLog: vi.fn(),
@@ -68,6 +69,7 @@ const sessionStoreMock = vi.hoisted(() => ({
 
 vi.mock("../../src/sessionStore.ts", () => ({
   sessionStore: sessionStoreMock,
+  commitSessionModelProjection: commitSessionModelProjectionMock,
   wait: waitMock,
 }));
 
@@ -129,6 +131,7 @@ async function installBrowserPublicationJournal(
   phase: BrowserPublicationPhase,
   runtime: BrowserRuntimeMetadata,
   answer: string,
+  model?: string,
 ): Promise<BrowserCapturePublicationJournal> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-display-publication-"));
   tempDirectories.push(directory);
@@ -167,6 +170,7 @@ async function installBrowserPublicationJournal(
       response: { status: "completed" },
       browserAudit: { runtime },
       runtime,
+      ...(model ? { model } : {}),
     },
   });
   if (phase === "preparing") {
@@ -180,6 +184,7 @@ async function installBrowserPublicationJournal(
         response: { status: "completed" },
         browserAudit: { runtime },
         runtime,
+        ...(model ? { model } : {}),
       },
     });
   }
@@ -310,6 +315,7 @@ beforeEach(() => {
       fn.mockReset();
     }
   });
+  commitSessionModelProjectionMock.mockReset();
   for (const mock of [
     resumeBrowserSessionMock,
     retryBrowserRecoveryCleanupMock,
@@ -334,6 +340,36 @@ beforeEach(() => {
   persistDurableBrowserAnswerMock.mockImplementation(async (_options, expectedReceipt) => {
     if (!expectedReceipt) throw new Error("publication intent receipt missing");
     return expectedReceipt;
+  });
+  commitSessionModelProjectionMock.mockImplementation(async (sessionId, projection) => {
+    const updated = await sessionStoreMock.updateSession(sessionId, projection.session);
+    const baseSession = {
+      id: sessionId,
+      createdAt: "2026-08-05T00:00:00.000Z",
+      status: "running" as const,
+      options: {},
+      ...(updated ?? {}),
+      ...projection.session,
+    };
+    if (!projection.model) return { session: baseSession };
+    const modelRun = {
+      model: projection.model.model,
+      status: projection.model.updates.status ?? "pending",
+      ...projection.model.updates,
+    };
+    await sessionStoreMock.updateModelRun(
+      sessionId,
+      projection.model.model,
+      projection.model.updates,
+    );
+    return {
+      session: {
+        ...baseSession,
+        models: [modelRun],
+        modelProjectionAuthority: "session",
+      },
+      model: modelRun,
+    };
   });
   settleBrowserRecoveryCleanupMock.mockImplementation(
     async (
@@ -1181,10 +1217,12 @@ describe("attachSession rendering", () => {
     const completedMeta: SessionMetadata = {
       ...baseMeta,
       status: "completed",
+      completedAt: journal.completedAt,
       mode: "browser",
       artifacts: [journal.receipt.artifact],
       browser: { config: {}, runtime: { browserTransport: "cdp" } },
     };
+    readSessionMetadataMock.mockResolvedValue(completedMeta);
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -1194,6 +1232,81 @@ describe("attachSession rendering", () => {
     expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
     expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
+  });
+
+  test("does not retire a published journal while selected-model projection is missing", async () => {
+    const answer = "published answer awaiting selected-model repair";
+    const runtime: BrowserRuntimeMetadata = { browserTransport: "cdp" };
+    const journal = await installBrowserPublicationJournal(
+      "published",
+      runtime,
+      answer,
+      "gpt-5.2-pro",
+    );
+    const splitMetadata: SessionMetadata = {
+      ...baseMeta,
+      status: "completed",
+      completedAt: journal.completedAt,
+      mode: "browser",
+      model: "gpt-5.2-pro",
+      artifacts: [journal.receipt.artifact],
+      browser: { config: {}, runtime },
+      models: [{ model: "gpt-5.2-pro", status: "running" }],
+      modelProjectionAuthority: "session",
+    };
+    readSessionMetadataMock.mockResolvedValue(splitMetadata);
+    commitSessionModelProjectionMock.mockRejectedValue(new Error("projection store unavailable"));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", splitMetadata);
+
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toMatchObject({
+      phase: "published",
+      model: "gpt-5.2-pro",
+    });
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledTimes(2);
+    expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+  });
+
+  test("repairs selected-model projection before retiring a recovered journal", async () => {
+    const answer = "published answer repaired on restart";
+    const runtime: BrowserRuntimeMetadata = { browserTransport: "cdp" };
+    const journal = await installBrowserPublicationJournal(
+      "published",
+      runtime,
+      answer,
+      "gpt-5.2-pro",
+    );
+    const splitMetadata: SessionMetadata = {
+      ...baseMeta,
+      status: "completed",
+      completedAt: journal.completedAt,
+      mode: "browser",
+      model: "gpt-5.2-pro",
+      artifacts: [journal.receipt.artifact],
+      browser: { config: {}, runtime },
+      models: [{ model: "gpt-5.2-pro", status: "running" }],
+      modelProjectionAuthority: "session",
+    };
+    readSessionMetadataMock.mockResolvedValue(splitMetadata);
+    mockRecoveredCleanupResult({ status: "completed", runtime });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", splitMetadata);
+
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({
+        session: expect.objectContaining({ status: "completed" }),
+        model: expect.objectContaining({
+          model: "gpt-5.2-pro",
+          updates: expect.objectContaining({ status: "completed" }),
+        }),
+      }),
+    );
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
   });
 
   test("defers journal recovery while the live publisher commits and finalizes cleanup", async () => {
@@ -1227,6 +1340,7 @@ describe("attachSession rendering", () => {
       },
       browser: { runtime: liveRuntime },
     };
+    readSessionMetadataMock.mockResolvedValue(runningMeta);
 
     await orchestrateBrowserAttachAuthority("sess", runningMeta);
 
@@ -1240,7 +1354,9 @@ describe("attachSession rendering", () => {
       ...runningMeta,
       status: "completed",
       artifacts: [journal.receipt.artifact],
+      completedAt: journal.completedAt,
     };
+    readSessionMetadataMock.mockResolvedValue(committedPreCleanupMeta);
     await orchestrateBrowserAttachAuthority("sess", committedPreCleanupMeta);
 
     expect(settleBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
@@ -1254,9 +1370,11 @@ describe("attachSession rendering", () => {
     const completedMeta: SessionMetadata = {
       ...runningMeta,
       status: "completed",
+      completedAt: journal.completedAt,
       artifacts: [journal.receipt.artifact],
       browser: { runtime: {} },
     };
+    readSessionMetadataMock.mockResolvedValue(completedMeta);
     await orchestrateBrowserAttachAuthority("sess", completedMeta);
 
     await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();

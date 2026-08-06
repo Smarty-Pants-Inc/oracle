@@ -49,11 +49,7 @@ import {
   type ExplicitTargetSelectionFailure,
   type TargetSelection,
 } from "./reattachTargetSelection.js";
-import {
-  exactOwnedTargetGeneration,
-  reconcileReattachTargetAuthority,
-  refreshAttachRuntime,
-} from "./reattachTargetAuthority.js";
+import { bindReattachTarget, refreshAttachRuntime } from "./reattachTargetAuthority.js";
 import { createReattachSettlement } from "./reattachSettlement.js";
 export {
   retryBrowserRecoveryCleanup,
@@ -373,8 +369,7 @@ export async function resumeBrowserSession(
         );
       }
       const targetId = selection.targetId;
-      const reconciledTarget = reconcileReattachTargetAuthority(liveRuntime, targetId);
-      liveRuntime = reconciledTarget.runtime;
+      liveRuntime = bindReattachTarget(liveRuntime, targetId);
       const connection = await classifyReattachFailure(
         "recoverable-transport",
         `Unable to connect to Chrome target ${targetId}.`,
@@ -621,8 +616,7 @@ export const __test__ = {
   openConversationFromSidebar,
   finalizeRecoveredRuntime,
   refreshAttachRuntime,
-  reconcileReattachTargetAuthority,
-  exactOwnedTargetGeneration,
+  bindReattachTarget,
   recoveryCleanupGroupKey,
   defaultRecoveryLockPath,
   createOwnedRecoveryTargetConnection,

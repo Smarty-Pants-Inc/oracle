@@ -2,8 +2,8 @@ import {
   buildPromptIdentityNormalizationExpression,
   normalizePromptForIdentity,
   promptIdentitySha256,
-  type PromptCommitVerification,
-} from "../actions/promptComposer.js";
+} from "../actions/committedPrompt.js";
+import type { PromptCommitVerification } from "../actions/promptCommitVerification.js";
 import type { CommittedPromptEpochLocator } from "../reattachability.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import type {

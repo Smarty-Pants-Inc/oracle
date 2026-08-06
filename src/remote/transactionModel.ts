@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type {
   BrowserModelSelectionEvidence,
@@ -18,6 +19,16 @@ export type RemoteTransactionState =
   | "aborted"
   | "recoverable-error"
   | "failed";
+export function deriveRemoteArtifactNamespace(
+  identity: Pick<RemoteTransactionRecord, "transactionToken" | "runId">,
+): string {
+  return `remote-${createHash("sha256")
+    .update("oracle-remote-artifact-namespace-v1\0")
+    .update(identity.runId)
+    .update("\0")
+    .update(identity.transactionToken)
+    .digest("hex")}`;
+}
 
 export interface DurableRemoteArtifactDeliveryReceipt {
   receiptId: string;
@@ -88,6 +99,7 @@ export interface RemoteTransactionRecord {
   protocolVersion: typeof REMOTE_TRANSACTION_PROTOCOL_VERSION;
   transactionToken: string;
   runId: string;
+  artifactNamespace: string;
   createdAt: string;
   updatedAt: string;
   controllerGeneration: string;

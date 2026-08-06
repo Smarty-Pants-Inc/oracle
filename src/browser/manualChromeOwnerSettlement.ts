@@ -1,7 +1,7 @@
 import {
-  cleanupStaleProfileState,
   isSafeChromeTerminationOutcome,
   readOracleChromeOwner,
+  removeOracleChromeOwnerIfMatches,
   sameChromeProcessIdentity,
   type OracleChromeOwnerRecord,
 } from "./profileState.js";
@@ -22,7 +22,7 @@ export async function releaseManualChromeOwnerEndpointAuthority(
 export async function settleManualChromeOwner(
   profileDir: string,
   owner: ManualChromeOwner,
-  logger: BrowserLogger,
+  _logger: BrowserLogger,
 ): Promise<ManualChromeOwnerSettlement> {
   let current: OracleChromeOwnerRecord | null;
   try {
@@ -87,19 +87,17 @@ export async function settleManualChromeOwner(
   if (!isSafeChromeTerminationOutcome(termination)) {
     return { status: "unsafe", reason: termination.reason };
   }
-  let cleaned: boolean;
   try {
-    cleaned = await cleanupStaleProfileState(profileDir, logger, {
-      lockRemovalMode: "never",
-      expectedProfileIdentity: owner.processIdentity.profileDirectory,
-    });
+    return (await removeOracleChromeOwnerIfMatches(profileDir, current))
+      ? { status: "terminated" }
+      : {
+          status: "unsafe",
+          reason: "Exact canonical Chrome owner removal was not confirmed",
+        };
   } catch (error) {
     return {
       status: "unsafe",
-      reason: `Manual-login profile cleanup failed: ${error instanceof Error ? error.message : error}`,
+      reason: `Exact canonical Chrome owner removal failed: ${error instanceof Error ? error.message : error}`,
     };
   }
-  return cleaned
-    ? { status: "terminated" }
-    : { status: "unsafe", reason: "Manual-login profile cleanup was not confirmed" };
 }

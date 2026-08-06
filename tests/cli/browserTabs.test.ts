@@ -5,7 +5,7 @@ import {
 } from "../../src/cli/browserTabs.js";
 import type { ChatGptTabSummary } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 
 describe("browser tab CLI helpers", () => {
   test("prefers stable conversation URLs over stale Chrome target ids", () => {

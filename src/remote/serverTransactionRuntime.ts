@@ -163,7 +163,7 @@ export async function serveRemoteTransactionSettlement(params: {
   mode: "finalize" | "abort";
   transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
-  runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
+  runSettlementWork: <T>(operation: () => Promise<T>) => Promise<T>;
 }): Promise<void> {
   const renewed = await renewAuthenticatedTransactionLease(
     params.transactionStore,
@@ -201,7 +201,7 @@ export async function serveRemoteTransactionSettlement(params: {
     const outcome =
       renewed.state === "finalized" || renewed.state === "aborted" || renewed.state === "failed"
         ? await settle()
-        : await params.runBrowserWork(settle);
+        : await params.runSettlementWork(settle);
     sendJson(params.res, 200, settlementResponse(outcome.record, outcome.finalization));
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {

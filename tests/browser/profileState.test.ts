@@ -25,6 +25,15 @@ import type {
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
 
+const UNUSED_PROFILE_USE = Object.freeze({
+  status: "unused" as const,
+  candidates: Object.freeze([]),
+});
+const UNUSED_PROFILE_USE_DEPS = Object.freeze({
+  inspectChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+  revalidateChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+});
+
 function syntheticWindowsChromeIdentity(
   userDataDir: string,
   overrides: Partial<ChromeProcessIdentity> = {},
@@ -135,7 +144,7 @@ describe("profileState", () => {
         dir,
         undefined,
         { lockRemovalMode: "if_oracle_pid_dead" },
-        { isChromeUsingUserDataDir: async () => false },
+        UNUSED_PROFILE_USE_DEPS,
       );
       expect(existsSync(path.join(dir, "DevToolsActivePort"))).toBe(true);
       for (const lock of lockFiles) {
@@ -165,7 +174,7 @@ describe("profileState", () => {
         dir,
         undefined,
         { lockRemovalMode: "if_oracle_pid_dead" },
-        { isChromeUsingUserDataDir: async () => false },
+        UNUSED_PROFILE_USE_DEPS,
       );
       for (const lock of lockFiles) {
         expect(existsSync(lock)).toBe(false);
@@ -173,6 +182,50 @@ describe("profileState", () => {
       expect(existsSync(path.join(dir, "oracle-chrome-owner.json"))).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("removes only the exact owner record from the attested physical profile", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-owner-removal-"));
+    const profileDir = path.join(root, "profile");
+    const movedProfileDir = path.join(root, "moved-profile");
+    try {
+      await mkdir(profileDir);
+      const identity = await physicalChromeIdentity(profileDir);
+      const owner: OracleChromeOwnerRecord = {
+        port: 12345,
+        processIdentity: identity,
+        disposition: "close-on-last-lease",
+      };
+      await profileState.writeOracleChromeOwner(profileDir, owner);
+      await expect(
+        profileState.removeOracleChromeOwnerIfMatches(profileDir, {
+          ...owner,
+          disposition: "preserve",
+        }),
+      ).resolves.toBe(false);
+      await expect(profileState.readOracleChromeOwner(profileDir)).resolves.toEqual(owner);
+
+      await rename(profileDir, movedProfileDir);
+      await mkdir(profileDir);
+      const replacementOwner: OracleChromeOwnerRecord = {
+        port: 23456,
+        processIdentity: await physicalChromeIdentity(profileDir),
+        disposition: "preserve",
+      };
+      await profileState.writeOracleChromeOwner(profileDir, replacementOwner);
+      await expect(profileState.removeOracleChromeOwnerIfMatches(profileDir, owner)).resolves.toBe(
+        false,
+      );
+      await expect(profileState.readOracleChromeOwner(profileDir)).resolves.toEqual(
+        replacementOwner,
+      );
+      await expect(
+        profileState.removeOracleChromeOwnerIfMatches(profileDir, replacementOwner),
+      ).resolves.toBe(true);
+      await expect(profileState.readOracleChromeOwner(profileDir)).resolves.toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -267,6 +320,55 @@ describe("profileState", () => {
         "win32",
       ),
     ).toBe(false);
+  });
+
+  test("compares the Darwin /var alias without rewriting public identity", () => {
+    const aliasIdentity = profileState.parseProfileDirectoryIdentity(
+      {
+        version: 1,
+        platform: "darwin",
+        canonicalPath: "/var/folders/oracle/profile",
+        device: "7",
+        inode: "99",
+      },
+      "darwin",
+    );
+    const canonicalIdentity = {
+      version: 1 as const,
+      platform: "darwin" as const,
+      canonicalPath: "/private/var/folders/oracle/profile",
+      device: "7",
+      inode: "99",
+    };
+    expect(aliasIdentity).toEqual({
+      ...canonicalIdentity,
+      canonicalPath: "/var/folders/oracle/profile",
+    });
+    expect(
+      aliasIdentity && profileState.sameProfileDirectoryIdentity(aliasIdentity, canonicalIdentity),
+    ).toBe(true);
+    expect(
+      aliasIdentity &&
+        profileState.sameProfileDirectoryIdentity(aliasIdentity, {
+          ...canonicalIdentity,
+          inode: "100",
+        }),
+    ).toBe(false);
+
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/var/folders/oracle/profile",
+        canonicalIdentity.canonicalPath,
+        "darwin",
+      ),
+    ).toBe(true);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/private/var/folders/oracle/profile",
+        "/var/folders/oracle/profile",
+        "darwin",
+      ),
+    ).toBe(true);
   });
 
   test("captures a macOS Chrome generation from its audit token and physical text vnode", async () => {
@@ -526,15 +628,10 @@ describe("profileState", () => {
       expect(execFileAsync.mock.calls).toHaveLength(2);
       expect(execFileAsync.mock.calls[0]?.[0]).toBe("powershell.exe");
       expect(execFileAsync.mock.calls[1]?.[0]).toBe(
-        process.platform === "win32" ? "powershell.exe" : "/usr/bin/pgrep",
+        process.platform === "win32" ? "powershell.exe" : "ps",
       );
       if (process.platform !== "win32") {
-        expect(execFileAsync.mock.calls[1]?.[1]).toEqual([
-          "-i",
-          "-f",
-          "--",
-          expect.stringContaining(path.resolve(cleanupDir)),
-        ]);
+        expect(execFileAsync.mock.calls[1]?.[1]).toEqual(["-axww", "-o", "pid=", "-o", "command="]);
       }
       for (const [, , options] of execFileAsync.mock.calls) {
         expect(options).toMatchObject({ timeout: 12_000 });
@@ -670,6 +767,7 @@ describe("profileState", () => {
           undefined,
           { lockRemovalMode: "never", expectedProfileIdentity: identity },
           {
+            ...UNUSED_PROFILE_USE_DEPS,
             beforeDestructiveCleanup: async () => {
               await rename(profileDir, movedDir);
               await mkdir(profileDir);
@@ -685,22 +783,102 @@ describe("profileState", () => {
     }
   });
 
-  test("removes a matching profile through an isolated directory generation", async () => {
+  test("preserves stale state when a physical Chrome user appears before deletion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-user-race-"));
+    const profileDir = path.join(root, "profile");
+    try {
+      await mkdir(profileDir);
+      await writeNativeDevToolsFixture(profileDir, 12345);
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      const candidate = Object.freeze({
+        pid: 4321,
+        processGeneration: "darwin-audit-pidversion:7001",
+        profileDirectory: identity,
+      });
+      await expect(
+        profileState.cleanupStaleProfileStateForTest(
+          profileDir,
+          undefined,
+          { lockRemovalMode: "never", expectedProfileIdentity: identity },
+          {
+            inspectChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+            revalidateChromeProfileDirectoryUse: async () => ({
+              status: "in-use",
+              candidates: [candidate],
+            }),
+          },
+        ),
+      ).resolves.toBe(false);
+      expect(existsSync(path.join(profileDir, "DevToolsActivePort"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes a matching profile while unrelated candidate generations remain exact", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-delete-owned-"));
     const profileDir = path.join(root, "profile");
     try {
       await mkdir(profileDir);
       await writeFile(path.join(profileDir, "authorized-marker"), "remove");
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      const unusedProof = Object.freeze({
+        status: "unused" as const,
+        candidates: Object.freeze([
+          Object.freeze({
+            pid: 4319,
+            processGeneration: "darwin-audit-pidversion:6999",
+            profileDirectory: Object.freeze({
+              ...identity,
+              canonicalPath: `${identity.canonicalPath}-unrelated`,
+              inode: (BigInt(identity.inode) + 1n).toString(),
+            }),
+          }),
+        ]),
+      });
+      const revalidateChromeProfileDirectoryUse = vi.fn(async () => unusedProof);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          inspectChromeProfileDirectoryUse: async () => unusedProof,
+          revalidateChromeProfileDirectoryUse,
         }),
       ).resolves.toBe(true);
+      expect(revalidateChromeProfileDirectoryUse).toHaveBeenCalled();
       expect(existsSync(profileDir)).toBe(false);
       expect((await readdir(root)).filter((entry) => entry.startsWith(".oracle-remove-"))).toEqual(
         [],
       );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores quarantine when a physical Chrome user appears during handoff", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-handoff-user-"));
+    const profileDir = path.join(root, "profile");
+    try {
+      await mkdir(profileDir);
+      await writeFile(path.join(profileDir, "authorized-marker"), "preserve");
+      const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
+      let revalidations = 0;
+      const candidate = Object.freeze({
+        pid: 4322,
+        processGeneration: "darwin-audit-pidversion:7002",
+        profileDirectory: identity,
+      });
+      await expect(
+        profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
+          inspectChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
+          revalidateChromeProfileDirectoryUse: async () => {
+            revalidations += 1;
+            return revalidations === 1
+              ? UNUSED_PROFILE_USE
+              : { status: "in-use" as const, candidates: [candidate] };
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(revalidations).toBe(2);
+      expect(existsSync(path.join(profileDir, "authorized-marker"))).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -716,7 +894,7 @@ describe("profileState", () => {
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          ...UNUSED_PROFILE_USE_DEPS,
           beforeQuarantineRename: async () => {
             await rename(profileDir, movedGeneration);
             await mkdir(profileDir);
@@ -742,7 +920,7 @@ describe("profileState", () => {
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          ...UNUSED_PROFILE_USE_DEPS,
           beforeQuarantineDelete: async (quarantinePath) => {
             replacementPath = quarantinePath;
             await rename(quarantinePath, movedGeneration);
@@ -770,7 +948,7 @@ describe("profileState", () => {
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          ...UNUSED_PROFILE_USE_DEPS,
           afterQuarantineIdentityVerification: async (quarantinePath) => {
             replacementPath = quarantinePath;
             await rename(quarantinePath, movedGeneration);
@@ -781,7 +959,7 @@ describe("profileState", () => {
       ).resolves.toBe(false);
       expect(existsSync(path.join(movedGeneration, "authorized-marker"))).toBe(true);
       expect(replacementPath).toBeDefined();
-      expect(existsSync(path.join(replacementPath ?? "", "replacement-marker"))).toBe(true);
+      expect(existsSync(path.join(profileDir, "replacement-marker"))).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -800,7 +978,7 @@ describe("profileState", () => {
         let isolatedRootPath: string | undefined;
         await expect(
           profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-            isChromeUsingUserDataDir: async () => false,
+            ...UNUSED_PROFILE_USE_DEPS,
             afterRemovalChildAttestation: async (rootPath) => {
               isolatedRootPath = rootPath;
               await rename(rootPath, movedRootPath);
@@ -831,7 +1009,7 @@ describe("profileState", () => {
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          ...UNUSED_PROFILE_USE_DEPS,
           afterRemovalChildAttestation: async () => {
             throw new Error("simulated crash after isolation");
           },
@@ -841,9 +1019,12 @@ describe("profileState", () => {
         true,
       );
 
-      await expect(profileState.replayPendingProfileDirectoryRemovals(profileDir)).resolves.toBe(
-        undefined,
-      );
+      await expect(
+        profileState.replayPendingProfileDirectoryRemovalsForTest(
+          profileDir,
+          UNUSED_PROFILE_USE_DEPS,
+        ),
+      ).resolves.toBe(undefined);
       expect(
         (await readdir(root)).filter((entry) => entry.endsWith(".cleanup-journal.json")),
       ).toEqual([]);
@@ -877,7 +1058,7 @@ describe("profileState", () => {
       const identity = await profileState.captureProfileDirectoryIdentity(profileDir);
       await expect(
         profileState.removeProfileDirectoryIfIdentityMatchesForTest(profileDir, identity, {
-          isChromeUsingUserDataDir: async () => false,
+          ...UNUSED_PROFILE_USE_DEPS,
         }),
       ).resolves.toBe(true);
       expect(existsSync(profileDir)).toBe(false);

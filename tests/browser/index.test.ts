@@ -123,9 +123,11 @@ describe("local acquisition durability", () => {
       expect(events).toEqual([
         "persist:tab-lease",
         "acquire:tab-lease",
+        "persist:acquired",
         "persist:chrome-process",
         "persist:chrome-process:abort",
         "release:tab-lease",
+        "persist:chrome-process:abort",
         "persist:acquired",
       ]);
       const initialResource = runtimeHints[0]?.recoveryCleanupResources?.at(-1);
@@ -143,13 +145,13 @@ describe("local acquisition durability", () => {
         processLaunchClaim: { generationId: acquisitionGenerationId },
       });
       expect(abortRuntime.recoveryCleanupResult).toMatchObject({
-        status: "failed",
+        status: "pending",
         settlementMode: "abort",
       });
       expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
       expect(runtimeHints.at(-1)?.recoveryCleanupResult).toBeUndefined();
       expect(release).toHaveBeenCalledOnce();
-      expect(releaseBrowserTabLease).toHaveBeenCalledOnce();
+      expect(releaseBrowserTabLease).not.toHaveBeenCalled();
     } finally {
       vi.doUnmock("../../src/browser/tabLeaseRegistry.js");
       vi.doUnmock("../../src/browser/profileState.js");
@@ -240,7 +242,7 @@ describe("local acquisition durability", () => {
         processLaunchClaim: { generationId: acquisitionGenerationId },
       });
       expect(abortRuntime.recoveryCleanupResult).toMatchObject({
-        status: "failed",
+        status: "pending",
         settlementMode: "abort",
       });
       expect(launchChrome).not.toHaveBeenCalled();
@@ -269,12 +271,18 @@ describe("local acquisition durability", () => {
     let profileDir: string | undefined;
     let ownerIdentity: ChromeProcessIdentity | undefined;
     let rejectedTargetJournal = false;
-    const kill = vi.fn(async () => ({
-      status: "stopped" as const,
-      pid: 515_151,
-      signal: "CONTROL_CHANNEL" as const,
-    }));
-    const removeProfile = vi.fn(async () => true);
+    const kill = vi.fn(async () => {
+      events.push("effect:kill");
+      return {
+        status: "stopped" as const,
+        pid: 515_151,
+        signal: "CONTROL_CHANNEL" as const,
+      };
+    });
+    const removeProfile = vi.fn(async () => {
+      events.push("effect:remove-profile");
+      return true;
+    });
 
     vi.resetModules();
     vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
@@ -315,6 +323,11 @@ describe("local acquisition durability", () => {
             host: "127.0.0.1",
             kill,
             processIdentity: ownerIdentity,
+            endpointAuthority: {
+              browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/published-owner",
+              kill,
+              release: vi.fn(async () => undefined),
+            },
           };
         },
       ),
@@ -352,8 +365,12 @@ describe("local acquisition durability", () => {
 
       expect(events).toEqual([
         "persist:chrome-process",
+        "persist:acquired",
         "persist:chrome-target",
-        "persist:chrome-process:abort",
+        "persist:chrome-target:abort",
+        "persist:acquired:abort",
+        "effect:kill",
+        "effect:remove-profile",
         "persist:acquired",
       ]);
       const abortRuntime = runtimeHints.find(
@@ -361,8 +378,8 @@ describe("local acquisition durability", () => {
       );
       expect(abortRuntime?.recoveryCleanupResources?.at(-1)).toMatchObject({
         chromeProcessIdentity: ownerIdentity,
-        acquisition: { pendingResource: "chrome-process" },
-        recoveryCleanup: { ownsTarget: false, keepBrowser: false },
+        acquisition: { pendingResource: "chrome-target" },
+        recoveryCleanup: { ownsTarget: true, keepBrowser: false },
       });
       expect(kill).toHaveBeenCalledOnce();
       if (!profileDir || !ownerIdentity)
@@ -514,7 +531,7 @@ describe("local acquisition durability", () => {
         initialRuntime.recoveryCleanupResources?.at(-1)?.chromeProcessIdentity,
       ).toBeUndefined();
       expect(abortRuntime.recoveryCleanupResult).toMatchObject({
-        status: "failed",
+        status: "pending",
         settlementMode: "abort",
       });
       if (!profileDir || !ownerIdentity) {

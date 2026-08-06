@@ -38,6 +38,7 @@ import {
   MonotonicBrowserRuntimeAuthority,
 } from "./browserRuntimeAuthority.js";
 import { formatError } from "./errorUtils.js";
+import { persistBrowserSessionOutcome } from "./browserSessionOutcome.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? chalk.dim(text) : text);
@@ -78,8 +79,18 @@ export async function orchestrateBrowserAttachAuthority(
   const controllerAlive = typeof controllerPid === "number" && isProcessAlive(controllerPid);
   const workerAlive = typeof workerPid === "number" && isProcessAlive(workerPid);
   const completedRuntime = metadata.browser?.runtime;
+  const exactEpochlessAcquisitionAbort =
+    metadata.mode === "browser" &&
+    (metadata.status === "running" || metadata.status === "error") &&
+    !controllerAlive &&
+    !workerAlive &&
+    hasPendingChromeAcquisitionIntent(completedRuntime) &&
+    hasExactPendingChromeAcquisitionAuthority(completedRuntime) &&
+    !hasRemoteRecoveryAuthority(completedRuntime) &&
+    !hasRecoverableChatGptConversation(completedRuntime);
   if (
     publicationJournal &&
+    publication.isPublished() &&
     metadata.status === "completed" &&
     completedRuntime !== undefined &&
     !completedRuntime.recoveryCleanupResources?.length &&
@@ -99,6 +110,9 @@ export async function orchestrateBrowserAttachAuthority(
     }
   }
   if (await publication.discardAbortedPreparation(metadata.browser?.runtime)) {
+    publicationJournal = publication.journal;
+  }
+  if (exactEpochlessAcquisitionAbort && (await publication.discardPreparationForAbort())) {
     publicationJournal = publication.journal;
   }
   if (publicationJournal && (controllerAlive || workerAlive)) {
@@ -217,28 +231,37 @@ export async function orchestrateBrowserAttachAuthority(
       result: BrowserCaptureFinalizationResult,
     ): Promise<BrowserCaptureFinalizationResult> => {
       const cleanupMessage = cleanupMessageFor(result);
-      await sessionStore.updateSession(sessionId, {
-        browser: { ...metadata.browser, runtime: result.runtime },
-        ...(staleRunningAcquisitionRecovered
-          ? {
-              status: "error",
-              completedAt: new Date().toISOString(),
-              errorMessage: cleanupMessage,
-              response: { status: "error", incompleteReason: "incomplete-capture" },
-              error: {
-                category: "browser-automation",
-                message: cleanupMessage,
-                details: {
-                  stage: "browser-acquisition-recovery",
-                  code:
-                    result.status === "pending"
-                      ? "browser-acquisition-cleanup-pending"
-                      : "browser-acquisition-cleanup-completed",
-                },
-              },
-            }
-          : {}),
-      });
+      const browser = { ...metadata.browser, runtime: result.runtime };
+      if (staleRunningAcquisitionRecovered) {
+        const response = { status: "error" as const, incompleteReason: "incomplete-capture" };
+        const errorMetadata = {
+          category: "browser-automation" as const,
+          message: cleanupMessage,
+          details: {
+            stage: "browser-acquisition-recovery",
+            code:
+              result.status === "pending"
+                ? "browser-acquisition-cleanup-pending"
+                : "browser-acquisition-cleanup-completed",
+          },
+        };
+        await persistBrowserSessionOutcome(sessionId, {
+          kind: "terminal-error",
+          browser,
+          runtime: result.runtime,
+          response,
+          reason: cleanupMessage,
+          artifacts: metadata.artifacts,
+          receipt: undefined,
+          errorMetadata,
+          transportMetadata: undefined,
+          modelProjection: metadata.model
+            ? { model: metadata.model, updates: { response, error: errorMetadata } }
+            : undefined,
+        });
+      } else {
+        await sessionStore.updateSession(sessionId, { browser });
+      }
       return result;
     };
     try {
@@ -379,7 +402,7 @@ export async function orchestrateBrowserAttachAuthority(
         sessionId,
         recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
         acquireRecoveryLock: publication.acquireRecoveryLock,
-        isRemotePublicationAcknowledged: publication.isPublished,
+        isRemotePublicationAcknowledged: publication.isRemotePublicationAcknowledged,
         runtimeHintCb: async (latestRuntime) => {
           authoritativeRuntime = runtimeAuthority.observeHint(latestRuntime);
           if (!publication.hasJournal) {
@@ -461,16 +484,22 @@ export async function orchestrateBrowserAttachAuthority(
     });
     answerPublished = true;
     authoritativeRuntime = publishedCapture.finalization.runtime;
-    if (publishedCapture.finalization.status === "pending") {
+    if (publishedCapture.projection.status === "pending") {
+      console.log(
+        chalk.yellow(
+          `Reattach answer is durable; terminal session/model projection remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.projection.error)}`,
+        ),
+      );
+    } else if (publishedCapture.finalization.status === "pending") {
       console.log(
         chalk.yellow(
           `Reattach completed; browser cleanup remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.finalization.error)}`,
         ),
       );
-    } else if (publishedCapture.runtimeAuthority.status === "pending") {
+    } else if (publishedCapture.finalizationPersistence.status === "pending") {
       console.log(
         chalk.yellow(
-          `Reattach answer is published; cleanup authority projection remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.runtimeAuthority.error)}`,
+          `Reattach answer is published; cleanup authority projection remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.finalizationPersistence.error)}`,
         ),
       );
     } else {
@@ -512,24 +541,26 @@ export async function orchestrateBrowserAttachAuthority(
     );
     if (completedDeepResearchPlaceholder && !answerPublished && !publicationJournal) {
       const failureMessage = `Deep Research capture incomplete: ${message}`;
-      if (metadata.model) {
-        await sessionStore.updateModelRun(metadata.id, metadata.model, {
-          status: "error",
-          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-          error: {
-            category: "browser-automation",
-            message: failureMessage,
-          },
-        });
-      }
-      await sessionStore.updateSession(sessionId, {
-        status: "error",
-        errorMessage: failureMessage,
-        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-        error: {
-          category: "browser-automation",
-          message: failureMessage,
-        },
+      const response = { status: "incomplete" as const, incompleteReason: "incomplete-capture" };
+      const errorMetadata = {
+        category: "browser-automation" as const,
+        message: failureMessage,
+      };
+      await persistBrowserSessionOutcome(sessionId, {
+        kind: "terminal-error",
+        browser: { ...metadata.browser, runtime: authoritativeRuntime },
+        runtime: authoritativeRuntime,
+        response,
+        reason: failureMessage,
+        artifacts: receipt
+          ? appendArtifacts(metadata.artifacts, [receipt.artifact])
+          : metadata.artifacts,
+        receipt,
+        errorMetadata,
+        transportMetadata: undefined,
+        modelProjection: metadata.model
+          ? { model: metadata.model, updates: { response, error: errorMetadata } }
+          : undefined,
       });
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     }
@@ -577,10 +608,22 @@ async function recoverDurableBrowserPublication(
     label: "Recovered browser answer",
     log: (message) => console.log(dim(message)),
   });
-  if (publishedCapture.finalization.status === "pending") {
+  if (publishedCapture.projection.status === "pending") {
+    console.log(
+      chalk.yellow(
+        `Durable browser answer remains retryable until terminal session/model projection is repaired: ${sanitizeBrowserPublicationMessage(publishedCapture.projection.error)}`,
+      ),
+    );
+  } else if (publishedCapture.finalization.status === "pending") {
     console.log(
       chalk.yellow(
         `Durable browser answer is published; cleanup remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.finalization.error)}`,
+      ),
+    );
+  } else if (publishedCapture.finalizationPersistence.status === "pending") {
+    console.log(
+      chalk.yellow(
+        `Durable browser answer is published; cleanup authority projection remains pending: ${sanitizeBrowserPublicationMessage(publishedCapture.finalizationPersistence.error)}`,
       ),
     );
   } else {

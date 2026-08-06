@@ -142,21 +142,13 @@ export async function runBridgeHost(
       ),
     );
   }
-
-  const filteredServeLogger = (message: string) => {
-    if (message.includes("Access token:")) {
-      return;
-    }
-    console.log(message);
-  };
-
   try {
     await runRemoteService({
       host: bindHost,
       port: bindPort,
       token,
       legacyToken,
-      logger: filteredServeLogger,
+      logger: console.log,
     });
   } finally {
     tunnel?.stop();

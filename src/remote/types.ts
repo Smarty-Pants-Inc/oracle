@@ -3,7 +3,7 @@ import type {
   BrowserRemotePromptRequestIdentity,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
-import { promptIdentitySha256 } from "../browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../browser/actions/committedPrompt.js";
 
 export const REMOTE_TRANSACTION_PROTOCOL_VERSION = 3;
 export const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024 * 1024;
@@ -285,6 +285,7 @@ export const RemotePublicRunResultSchema = z
     tookMs: z.number().int().nonnegative(),
     answerTokens: z.number().int().nonnegative(),
     answerChars: z.number().int().nonnegative(),
+    promptSubmitted: z.boolean().optional(),
   })
   .strict()
   .superRefine((result, context) => {

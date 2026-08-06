@@ -1,10 +1,14 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   __test__ as promptComposer,
-  buildReadUserPromptTextExpression,
   clearPromptComposer,
   submitPrompt,
 } from "../../src/browser/actions/promptComposer.js";
+import { buildReadUserPromptTextExpression } from "../../src/browser/actions/committedPrompt.js";
+import {
+  capturePromptTooLargeRejectionBaseline,
+  verifyPromptCommitted,
+} from "../../src/browser/actions/promptCommitVerification.js";
 import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
@@ -33,7 +37,7 @@ describe("promptComposer", () => {
     const runtime = { evaluate: vi.fn() };
 
     await expect(
-      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150, undefined, Number.NaN),
+      verifyPromptCommitted(runtime as never, "hello", 150, undefined, Number.NaN),
     ).rejects.toMatchObject({
       details: { stage: "submit-prompt", code: "prompt-baseline-unavailable" },
     });
@@ -132,7 +136,7 @@ describe("promptComposer", () => {
       })),
     };
 
-    const committed = await promptComposer.verifyPromptCommitted(
+    const committed = await verifyPromptCommitted(
       runtime as never,
       submittedPrompt,
       150,
@@ -182,7 +186,7 @@ describe("promptComposer", () => {
           },
         }),
       };
-      const pending = promptComposer.verifyPromptCommitted(
+      const pending = verifyPromptCommitted(
         runtime as never,
         acceptedLongPrompt,
         150,
@@ -236,13 +240,7 @@ describe("promptComposer", () => {
         }),
       };
       const submit = vi.fn(async () => {
-        await promptComposer.verifyPromptCommitted(
-          runtime as never,
-          acceptedLongPrompt,
-          150,
-          undefined,
-          0,
-        );
+        await verifyPromptCommitted(runtime as never, acceptedLongPrompt, 150, undefined, 0);
         throw new Error("accepted prompt unexpectedly produced committed identity");
       });
       const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
@@ -312,13 +310,11 @@ describe("promptComposer", () => {
           },
         })),
       };
-      const rejectionBaseline = await promptComposer.capturePromptTooLargeRejectionBaseline(
-        runtime as never,
-      );
+      const rejectionBaseline = await capturePromptTooLargeRejectionBaseline(runtime as never);
       expect(Object.values(rejectionBaseline?.fingerprintCounts ?? {})).toEqual([1]);
       visibleAlert = { ...staleAlert };
       const submit = vi.fn(async () => {
-        await promptComposer.verifyPromptCommitted(
+        await verifyPromptCommitted(
           runtime as never,
           acceptedLongPrompt,
           150,
@@ -401,13 +397,11 @@ describe("promptComposer", () => {
           },
         })),
       };
-      const rejectionBaseline = await promptComposer.capturePromptTooLargeRejectionBaseline(
-        runtime as never,
-      );
+      const rejectionBaseline = await capturePromptTooLargeRejectionBaseline(runtime as never);
       expect(Object.values(rejectionBaseline?.fingerprintCounts ?? {})).toEqual([1]);
       visibleAlerts = [staleAlert, { ...staleAlert }];
       const submit = vi.fn(async () => {
-        await promptComposer.verifyPromptCommitted(
+        await verifyPromptCommitted(
           runtime as never,
           acceptedLongPrompt,
           150,
@@ -499,7 +493,7 @@ describe("promptComposer", () => {
       };
       const submit = vi.fn(async (submittedPrompt: string) => {
         if (submittedPrompt === oversizedPrompt) {
-          await promptComposer.verifyPromptCommitted(
+          await verifyPromptCommitted(
             runtime as never,
             oversizedPrompt,
             150,
@@ -563,13 +557,7 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(
-        runtime as never,
-        "hello",
-        150,
-        undefined,
-        10,
-      );
+      const promise = verifyPromptCommitted(runtime as never, "hello", 150, undefined, 10);
       // Attach the rejection handler before timers advance to avoid unhandled-rejection warnings.
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
@@ -613,13 +601,7 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(
-        runtime as never,
-        "new prompt",
-        150,
-        undefined,
-        2,
-      );
+      const promise = verifyPromptCommitted(runtime as never, "new prompt", 150, undefined, 2);
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
@@ -656,13 +638,7 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(
-        runtime as never,
-        "hello",
-        150,
-        undefined,
-        10,
-      );
+      const promise = verifyPromptCommitted(runtime as never, "hello", 150, undefined, 10);
       const assertion = promise.then(
         () => {
           throw new Error("expected verifyPromptCommitted to reject");
@@ -775,7 +751,7 @@ describe("promptComposer", () => {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(
+      const promise = verifyPromptCommitted(
         runtime as never,
         "repeat this prompt",
         150,
@@ -844,13 +820,7 @@ describe("promptComposer", () => {
         })),
       };
 
-      const pending = promptComposer.verifyPromptCommitted(
-        runtime as never,
-        intendedPrompt,
-        150,
-        undefined,
-        0,
-      );
+      const pending = verifyPromptCommitted(runtime as never, intendedPrompt, 150, undefined, 0);
       const assertion = expect(pending).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
@@ -898,13 +868,7 @@ describe("promptComposer", () => {
     };
 
     await expect(
-      promptComposer.verifyPromptCommitted(
-        runtime as never,
-        "Exact prompt text",
-        150,
-        undefined,
-        0,
-      ),
+      verifyPromptCommitted(runtime as never, "Exact prompt text", 150, undefined, 0),
     ).rejects.toThrow(/prompt did not appear/i);
   });
 

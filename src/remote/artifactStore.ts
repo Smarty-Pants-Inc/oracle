@@ -1,11 +1,12 @@
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { open, realpath, type FileHandle } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import {
   sanitizeArtifactFilename,
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
+import type { BrowserArtifactWriteAuthority } from "../browser/types.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactDescriptor } from "./types.js";
 import type {
@@ -39,12 +40,45 @@ export class RemoteArtifactStore {
     this.#maximumArtifactBytes = options.maximumArtifactBytes ?? MAX_REMOTE_ARTIFACT_BYTES;
     this.#now = options.now ?? Date.now;
   }
+  async createArtifactWriteAuthority(params: {
+    transactionToken: string;
+    runId: string;
+  }): Promise<BrowserArtifactWriteAuthority> {
+    const record = await this.#transactionStore.read(params.transactionToken);
+    if (!record || record.runId !== params.runId) {
+      throw new Error("Remote artifact namespace is not owned by the exact transaction");
+    }
+    await mkdir(this.#sessionsRoot, { recursive: true, mode: 0o700 });
+    const namespaceDirectory = path.join(this.#sessionsRoot, record.artifactNamespace);
+    try {
+      await mkdir(namespaceDirectory, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("Remote artifact namespace was not created exclusively");
+      }
+      throw error;
+    }
+    const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
+    await mkdir(artifactsDirectory, { mode: 0o700 });
+    if (process.platform !== "win32") {
+      await chmod(namespaceDirectory, 0o700);
+      await chmod(artifactsDirectory, 0o700);
+    }
+    const canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
+      record.artifactNamespace,
+    );
+    return { artifactsDirectory: canonicalArtifactsDirectory };
+  }
 
   async prepareRequiredArtifacts(params: {
     transactionToken: string;
     runId: string;
     artifacts: SessionArtifact[];
   }): Promise<DurableRemoteArtifactRegistration[]> {
+    const record = await this.#transactionStore.read(params.transactionToken);
+    if (!record || record.runId !== params.runId) {
+      throw new Error("Remote artifact registration is not owned by the exact transaction");
+    }
     const seenCanonicalPaths = new Set<string>();
     const registrations: DurableRemoteArtifactRegistration[] = [];
     for (const artifact of params.artifacts) {
@@ -52,6 +86,7 @@ export class RemoteArtifactStore {
       const registration = await this.buildRegistration({
         transactionToken: params.transactionToken,
         runId: params.runId,
+        artifactNamespace: record.artifactNamespace,
         artifact,
       });
       if (seenCanonicalPaths.has(registration.canonicalPath)) continue;
@@ -77,6 +112,7 @@ export class RemoteArtifactStore {
 
     const currentCanonicalPath = await this.resolveContainedArtifactPath(
       registration.canonicalPath,
+      record.artifactNamespace,
     ).catch(() => null);
     if (!currentCanonicalPath || currentCanonicalPath !== registration.canonicalPath) {
       throw new RemoteArtifactUnavailableError("artifact_identity_changed");
@@ -92,11 +128,19 @@ export class RemoteArtifactStore {
         fileStat.size <= 0n ||
         fileStat.size > BigInt(this.#maximumArtifactBytes) ||
         Number(fileStat.size) !== registration.descriptor.byteSize ||
-        !sameFileIdentity(currentIdentity, registration.fileIdentity)
+        !sameStableFileIdentity(currentIdentity, registration.fileIdentity)
       ) {
         throw new RemoteArtifactUnavailableError("artifact_identity_changed");
       }
       const sha256 = await computeOpenFileSha256(handle);
+      const afterHashStat = await handle.stat({ bigint: true });
+      if (
+        !afterHashStat.isFile() ||
+        afterHashStat.size !== fileStat.size ||
+        !sameFileSnapshotIdentity(fileIdentityFromStat(afterHashStat), currentIdentity)
+      ) {
+        throw new RemoteArtifactUnavailableError("artifact_identity_changed");
+      }
       if (sha256 !== registration.descriptor.sha256) {
         throw new RemoteArtifactUnavailableError("artifact_content_changed");
       }
@@ -145,15 +189,28 @@ export class RemoteArtifactStore {
   private async buildRegistration(params: {
     transactionToken: string;
     runId: string;
+    artifactNamespace: string;
     artifact: SessionArtifact;
   }): Promise<DurableRemoteArtifactRegistration> {
     if (params.artifact.path.endsWith(".crdownload")) {
       throw new Error("Remote artifact is still a Chrome partial download");
     }
-    const canonicalPath = await this.resolveContainedArtifactPath(params.artifact.path);
+    if (
+      !Number.isSafeInteger(params.artifact.sizeBytes) ||
+      !params.artifact.sizeBytes ||
+      !/^[a-f0-9]{64}$/u.test(params.artifact.sha256 ?? "") ||
+      !params.artifact.fileIdentity
+    ) {
+      throw new Error("Remote artifact is missing exact producer byte identity");
+    }
+    const canonicalPath = await this.resolveContainedArtifactPath(
+      params.artifact.path,
+      params.artifactNamespace,
+    );
     const handle = await open(canonicalPath, "r");
     try {
       const fileStat = await handle.stat({ bigint: true });
+      const fileIdentity = fileIdentityFromStat(fileStat);
       if (
         !fileStat.isFile() ||
         fileStat.size <= 0n ||
@@ -161,22 +218,36 @@ export class RemoteArtifactStore {
       ) {
         throw new Error("Remote artifact is not a completed file within the transfer limit");
       }
+      if (
+        Number(fileStat.size) !== params.artifact.sizeBytes ||
+        !sameStableFileIdentity(fileIdentity, params.artifact.fileIdentity)
+      ) {
+        throw new Error("Remote artifact physical identity does not match producer evidence");
+      }
       const filename = sanitizeArtifactFilename(path.basename(canonicalPath), "artifact.bin");
       const mimeType = sanitizeArtifactMimeType(params.artifact.mimeType);
-      const validation = await validateArtifactFile({
-        path: canonicalPath,
-        filename,
-        mimeType,
-      });
+      const validation =
+        params.artifact.validation ??
+        (await validateArtifactFile({ path: canonicalPath, filename, mimeType }));
       const sha256 = await computeOpenFileSha256(handle);
+      const afterHashStat = await handle.stat({ bigint: true });
+      if (
+        afterHashStat.size !== fileStat.size ||
+        !sameFileSnapshotIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+      ) {
+        throw new Error("Remote artifact physical identity changed during registration");
+      }
+      if (sha256 !== params.artifact.sha256) {
+        throw new Error("Remote artifact sha256 does not match producer evidence");
+      }
       const descriptor: RemoteArtifactDescriptor & { required: boolean } = {
         artifactId: randomUUID(),
         runId: params.runId,
         kind: "file",
         filename,
         mimeType,
-        byteSize: Number(fileStat.size),
-        sha256,
+        byteSize: params.artifact.sizeBytes,
+        sha256: params.artifact.sha256,
         validation,
         sourceUrlKind: classifySourceUrlKind(params.artifact.sourceUrl),
         transferStatus: "ready",
@@ -186,28 +257,55 @@ export class RemoteArtifactStore {
         descriptor,
         transactionToken: params.transactionToken,
         canonicalPath,
-        fileIdentity: fileIdentityFromStat(fileStat),
+        fileIdentity: params.artifact.fileIdentity,
       };
     } finally {
       await handle.close();
     }
   }
 
-  private async resolveContainedArtifactPath(filePath: string): Promise<string> {
-    const [canonicalPath, canonicalSessionsRoot] = await Promise.all([
-      realpath(filePath),
+  private async resolveArtifactNamespaceDirectory(artifactNamespace: string): Promise<string> {
+    const [canonicalSessionsRoot, canonicalArtifactsDirectory] = await Promise.all([
       realpath(this.#sessionsRoot),
+      realpath(path.join(this.#sessionsRoot, artifactNamespace, "artifacts")),
     ]);
-    const relative = path.relative(canonicalSessionsRoot, canonicalPath);
-    const segments = relative.split(path.sep);
-    if (
-      !relative ||
-      relative.startsWith(`..${path.sep}`) ||
-      path.isAbsolute(relative) ||
-      segments.length < 3 ||
-      segments[1] !== "artifacts"
-    ) {
-      throw new Error("Remote artifact is outside Oracle's session artifact boundary");
+    const expectedDirectory = path.join(canonicalSessionsRoot, artifactNamespace, "artifacts");
+    if (canonicalArtifactsDirectory !== expectedDirectory) {
+      throw new Error("Remote artifact namespace is not the exact server-owned directory");
+    }
+    return canonicalArtifactsDirectory;
+  }
+
+  private async resolveContainedArtifactPath(
+    filePath: string,
+    artifactNamespace: string,
+  ): Promise<string> {
+    const lexicalArtifactsDirectory = path.resolve(
+      this.#sessionsRoot,
+      artifactNamespace,
+      "artifacts",
+    );
+    const requestedDirectory = path.dirname(path.resolve(filePath));
+    let canonicalArtifactsDirectory: string;
+    if (requestedDirectory === lexicalArtifactsDirectory) {
+      canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(artifactNamespace);
+    } else {
+      try {
+        canonicalArtifactsDirectory =
+          await this.resolveArtifactNamespaceDirectory(artifactNamespace);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error("Remote artifact is outside its exact transaction artifact namespace");
+        }
+        throw error;
+      }
+      if (requestedDirectory !== canonicalArtifactsDirectory) {
+        throw new Error("Remote artifact is outside its exact transaction artifact namespace");
+      }
+    }
+    const canonicalPath = await realpath(filePath);
+    if (path.dirname(canonicalPath) !== canonicalArtifactsDirectory) {
+      throw new Error("Remote artifact is outside its exact transaction artifact namespace");
     }
     return canonicalPath;
   }
@@ -234,16 +332,22 @@ function fileIdentityFromStat(fileStat: {
   };
 }
 
-function sameFileIdentity(
+function sameStableFileIdentity(
   left: DurableRemoteFileIdentity,
   right: DurableRemoteFileIdentity,
 ): boolean {
   return (
     left.device === right.device &&
     left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.ctimeNs === right.ctimeNs
+    left.birthtimeNs === right.birthtimeNs
   );
+}
+
+function sameFileSnapshotIdentity(
+  left: DurableRemoteFileIdentity,
+  right: DurableRemoteFileIdentity,
+): boolean {
+  return sameStableFileIdentity(left, right) && left.ctimeNs === right.ctimeNs;
 }
 
 async function computeOpenFileSha256(handle: FileHandle): Promise<string> {

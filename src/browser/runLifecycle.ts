@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserPromptEpoch, BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { promptIdentitySha256, type PromptCommitVerification } from "./actions/promptComposer.js";
+import { promptIdentitySha256 } from "./actions/committedPrompt.js";
+import type { PromptCommitVerification } from "./actions/promptCommitVerification.js";
 import type { PromptCommitEvidence } from "./providerDomFlow.js";
 import type {
   BrowserCaptureFinalizationResult,
@@ -119,6 +120,7 @@ function captureResultRuntime(
   | "tabUrl"
   | "conversationId"
   | "promptEpoch"
+  | "promptSubmitted"
   | "controllerPid"
 > {
   return {
@@ -134,6 +136,7 @@ function captureResultRuntime(
     tabUrl: runtime.tabUrl,
     conversationId: runtime.conversationId,
     promptEpoch: runtime.promptEpoch,
+    promptSubmitted: runtime.promptEpoch?.status === "committed",
     controllerPid: runtime.controllerPid,
   };
 }

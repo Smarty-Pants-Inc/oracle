@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { getOracleHomeDir } from "../oracleHome.js";
-import type { SessionArtifact } from "../sessionStore.js";
+import type { SessionArtifact, SessionArtifactFileIdentity } from "../sessionManager.js";
 import { isDeepResearchIncompleteText } from "./deepResearchResult.js";
-import type { BrowserLogger } from "./types.js";
+import type { BrowserArtifactWriteAuthority, BrowserLogger } from "./types.js";
 
 const ARTIFACTS_DIRNAME = "artifacts";
 const ZIP_EOCD_SIGNATURE = 0x06054b50;
@@ -67,26 +67,78 @@ export function resolveSessionArtifactsDir(sessionId: string): string {
   );
 }
 
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.access(targetPath);
-    return true;
-  } catch {
-    return false;
+function resolveArtifactWriteDirectory(params: {
+  sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
+}): string | null {
+  if (params.artifactWriteAuthority) {
+    const directory = params.artifactWriteAuthority.artifactsDirectory;
+    if (!path.isAbsolute(directory)) {
+      throw new Error("Browser artifact write authority must use an absolute directory");
+    }
+    return path.normalize(directory);
   }
+  return params.sessionId ? resolveSessionArtifactsDir(params.sessionId) : null;
 }
 
-export async function resolveUniqueArtifactPath(basePath: string): Promise<string> {
+async function openExclusiveArtifact(basePath: string) {
   const ext = path.extname(basePath);
   const stem = ext ? path.basename(basePath, ext) : path.basename(basePath);
   const dir = path.dirname(basePath);
-  let candidate = basePath;
-  let suffix = 2;
-  while (await pathExists(candidate)) {
-    candidate = path.join(dir, `${stem}-${suffix}${ext}`);
-    suffix += 1;
+  for (let suffix = 1; ; suffix += 1) {
+    const targetPath = suffix === 1 ? basePath : path.join(dir, `${stem}-${suffix}${ext}`);
+    try {
+      return { handle: await fs.open(targetPath, "wx+", 0o600), targetPath };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
-  return candidate;
+}
+
+function fileIdentityFromStat(fileStat: {
+  dev: bigint;
+  ino: bigint;
+  birthtimeNs: bigint;
+  ctimeNs: bigint;
+}): SessionArtifactFileIdentity {
+  return {
+    device: fileStat.dev.toString(),
+    inode: fileStat.ino.toString(),
+    birthtimeNs: fileStat.birthtimeNs.toString(),
+    ctimeNs: fileStat.ctimeNs.toString(),
+  };
+}
+
+async function writeExclusiveArtifact(basePath: string, contents: Buffer) {
+  const { handle, targetPath } = await openExclusiveArtifact(basePath);
+  let complete = false;
+  try {
+    await handle.writeFile(contents);
+    await handle.sync();
+    const fileStat = await handle.stat({ bigint: true });
+    if (!fileStat.isFile() || fileStat.size !== BigInt(contents.length)) {
+      throw new Error("Browser artifact write did not preserve exact byte size");
+    }
+    const fileIdentity = fileIdentityFromStat(fileStat);
+    const sha256 = await computeOpenFileSha256(handle);
+    const afterHashStat = await handle.stat({ bigint: true });
+    if (
+      afterHashStat.size !== fileStat.size ||
+      !sameFileIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+    ) {
+      throw new Error("Browser artifact physical identity changed during write");
+    }
+    complete = true;
+    return {
+      targetPath,
+      sizeBytes: Number(fileStat.size),
+      sha256,
+      fileIdentity,
+    };
+  } finally {
+    await handle.close().catch(() => undefined);
+    if (!complete) await fs.rm(targetPath, { force: true }).catch(() => undefined);
+  }
 }
 
 async function readSizeBytes(targetPath: string): Promise<number | undefined> {
@@ -101,15 +153,58 @@ export function computeBufferSha256(contents: Buffer): string {
   return createHash("sha256").update(contents).digest("hex");
 }
 
-export async function computeFileSha256(targetPath: string): Promise<string> {
+async function computeOpenFileSha256(handle: FileHandle): Promise<string> {
   const hash = createHash("sha256");
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(targetPath);
-    stream.on("data", (chunk: Buffer) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve());
-  });
+  for await (const chunk of handle.createReadStream({ start: 0, autoClose: false })) {
+    hash.update(chunk);
+  }
   return hash.digest("hex");
+}
+
+export async function readBrowserArtifactFileEvidence(targetPath: string): Promise<{
+  sizeBytes: number;
+  sha256: string;
+  fileIdentity: SessionArtifactFileIdentity;
+}> {
+  const handle = await fs.open(targetPath, "r");
+  try {
+    const fileStat = await handle.stat({ bigint: true });
+    if (!fileStat.isFile() || fileStat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("Browser artifact evidence requires a bounded regular file");
+    }
+    const fileIdentity = fileIdentityFromStat(fileStat);
+    const sha256 = await computeOpenFileSha256(handle);
+    const afterHashStat = await handle.stat({ bigint: true });
+    if (
+      afterHashStat.size !== fileStat.size ||
+      !sameFileIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+    ) {
+      throw new Error("Browser artifact physical identity changed while collecting evidence");
+    }
+    return {
+      sizeBytes: Number(fileStat.size),
+      sha256,
+      fileIdentity,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameFileIdentity(
+  left: SessionArtifactFileIdentity,
+  right: SessionArtifactFileIdentity,
+): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+export async function computeFileSha256(targetPath: string): Promise<string> {
+  return (await readBrowserArtifactFileEvidence(targetPath)).sha256;
 }
 
 export function isZipArtifact(filename?: string, mimeType?: string): boolean {
@@ -274,6 +369,7 @@ export async function validateArtifactFile(params: {
 
 export async function writeTextBrowserArtifact(params: {
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   kind: SessionArtifact["kind"];
   filename: string;
   contents: string;
@@ -283,23 +379,23 @@ export async function writeTextBrowserArtifact(params: {
   logger?: BrowserLogger;
 }): Promise<SessionArtifact | null> {
   const text = params.contents.trim();
-  if (!params.sessionId || text.length === 0) {
-    return null;
-  }
-  const dir = resolveSessionArtifactsDir(params.sessionId);
-  await fs.mkdir(dir, { recursive: true });
+  if (text.length === 0) return null;
+  const dir = resolveArtifactWriteDirectory(params);
+  if (!dir) return null;
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const filename = sanitizeArtifactFilename(params.filename, "artifact.md");
-  const targetPath = await resolveUniqueArtifactPath(path.join(dir, filename));
-  await fs.writeFile(targetPath, `${text}\n`, "utf8");
-  params.logger?.(`[browser] Saved ${params.kind} artifact to ${targetPath}`);
+  const contents = Buffer.from(`${text}\n`, "utf8");
+  const written = await writeExclusiveArtifact(path.join(dir, filename), contents);
+  params.logger?.(`[browser] Saved ${params.kind} artifact to ${written.targetPath}`);
   return {
     kind: params.kind,
-    path: targetPath,
+    path: written.targetPath,
     label: params.label,
     mimeType: params.mimeType ?? "text/markdown",
-    sizeBytes: await readSizeBytes(targetPath),
+    sizeBytes: written.sizeBytes,
     sourceUrl: params.sourceUrl,
-    sha256: computeBufferSha256(Buffer.from(`${text}\n`, "utf8")),
+    sha256: written.sha256,
+    fileIdentity: written.fileIdentity,
     validation: { type: "generic", ok: true },
     transfer: { status: "not-needed" },
     origin: { mode: "local" },
@@ -308,6 +404,7 @@ export async function writeTextBrowserArtifact(params: {
 
 export async function writeBinaryBrowserArtifact(params: {
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   kind: SessionArtifact["kind"];
   filename: string;
   contents: Buffer;
@@ -316,20 +413,18 @@ export async function writeBinaryBrowserArtifact(params: {
   sourceUrl?: string;
   logger?: BrowserLogger;
 }): Promise<SessionArtifact | null> {
-  if (!params.sessionId || params.contents.length === 0) {
-    return null;
-  }
-  const dir = resolveSessionArtifactsDir(params.sessionId);
-  await fs.mkdir(dir, { recursive: true });
+  if (params.contents.length === 0) return null;
+  const dir = resolveArtifactWriteDirectory(params);
+  if (!dir) return null;
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const filename = sanitizeArtifactFilename(params.filename, "artifact.bin");
-  const targetPath = await resolveUniqueArtifactPath(path.join(dir, filename));
-  await fs.writeFile(targetPath, params.contents);
+  const written = await writeExclusiveArtifact(path.join(dir, filename), params.contents);
   const validation = validateArtifactBuffer({
     filename,
     mimeType: params.mimeType,
     contents: params.contents,
   });
-  params.logger?.(`[browser] Saved ${params.kind} artifact to ${targetPath}`);
+  params.logger?.(`[browser] Saved ${params.kind} artifact to ${written.targetPath}`);
   if (validation.type === "zip" && !validation.ok) {
     params.logger?.(
       `[browser] ZIP validation failed for ${filename}: ${validation.error ?? "invalid"}`,
@@ -337,12 +432,13 @@ export async function writeBinaryBrowserArtifact(params: {
   }
   return {
     kind: params.kind,
-    path: targetPath,
+    path: written.targetPath,
     label: params.label,
     mimeType: params.mimeType,
-    sizeBytes: params.contents.length,
+    sizeBytes: written.sizeBytes,
     sourceUrl: params.sourceUrl,
-    sha256: computeBufferSha256(params.contents),
+    sha256: written.sha256,
+    fileIdentity: written.fileIdentity,
     validation,
     transfer: { status: "not-needed" },
     origin: { mode: "local" },
@@ -351,6 +447,7 @@ export async function writeBinaryBrowserArtifact(params: {
 
 export async function saveDeepResearchReportArtifact(params: {
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   reportMarkdown: string;
   conversationUrl?: string;
   logger?: BrowserLogger;
@@ -361,6 +458,7 @@ export async function saveDeepResearchReportArtifact(params: {
   }
   return writeTextBrowserArtifact({
     sessionId: params.sessionId,
+    artifactWriteAuthority: params.artifactWriteAuthority,
     kind: "deep-research-report",
     filename: "deep-research-report.md",
     contents: report,
@@ -373,6 +471,7 @@ export async function saveDeepResearchReportArtifact(params: {
 
 export async function saveBrowserTranscriptArtifact(params: {
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   prompt: string;
   answerMarkdown: string;
   conversationUrl?: string;
@@ -419,6 +518,7 @@ export async function saveBrowserTranscriptArtifact(params: {
   ].join("\n");
   return writeTextBrowserArtifact({
     sessionId: params.sessionId,
+    artifactWriteAuthority: params.artifactWriteAuthority,
     kind: "transcript",
     filename: "transcript.md",
     contents: body,

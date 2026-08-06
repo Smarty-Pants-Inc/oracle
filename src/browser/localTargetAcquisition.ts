@@ -22,17 +22,10 @@ export async function acquireExactLocalBrowserTarget({
   logger,
   publishRuntime,
 }: LocalTargetAcquisitionContext): Promise<void> {
-  const {
-    chrome,
-    chromeHost,
-    config,
-    manualLogin,
-    acquisitionTargetMarkerUrl,
-    acquisitionGenerationId,
-    settlementEndpointAuthority,
-  } = acquisition;
+  const { chrome, chromeHost, config, manualLogin, resourceAuthority } = acquisition;
+  const endpointAuthority = resourceAuthority.endpointAuthority();
   try {
-    if (!settlementEndpointAuthority) {
+    if (!endpointAuthority) {
       throw new Error("Locally owned Chrome has no retained exact endpoint authority.");
     }
     if (config.browserTabRef) {
@@ -40,7 +33,7 @@ export async function acquireExactLocalBrowserTarget({
         host: chromeHost,
         port: chrome.port,
         ref: config.browserTabRef,
-        endpointAuthority: settlementEndpointAuthority,
+        endpointAuthority,
       });
       state.client = attached.client;
       state.isolatedTargetId = attached.targetId ?? null;
@@ -52,32 +45,49 @@ export async function acquireExactLocalBrowserTarget({
       );
     } else {
       const devtoolsRetries = manualLogin ? 6 : 0;
-      const connection = await connectWithNewTabWithExactAuthority(
-        settlementEndpointAuthority,
-        logger,
-        acquisitionTargetMarkerUrl,
-        {
-          retries: devtoolsRetries,
-          retryDelayMs: 500,
+      await resourceAuthority.journalAcquisition({
+        resource: "chrome-target",
+        acquire: async () => {
+          const opened = await connectWithNewTabWithExactAuthority(
+            endpointAuthority,
+            logger,
+            resourceAuthority.targetMarkerUrl(),
+            {
+              retries: devtoolsRetries,
+              retryDelayMs: 500,
+            },
+          );
+          if (!opened.targetId) {
+            await opened.client.close().catch(() => undefined);
+            throw new Error("Locally owned Chrome did not return an exact dedicated target id.");
+          }
+          return opened;
         },
-      );
-      state.client = connection.client;
-      state.isolatedTargetId = connection.targetId ?? null;
-      state.lastTargetId = connection.targetId ?? undefined;
-      state.ownsTarget = Boolean(connection.targetId);
-      if (connection.targetId) {
-        state.targetCloseCapability = retainChromeTargetCloseCapability({
-          generationId: acquisitionGenerationId,
-          targetId: connection.targetId,
-          browserWSEndpoint: settlementEndpointAuthority.browserWSEndpoint,
-          close: (closeLogger) =>
-            closeChromeTargetWithExactAuthority({
-              authority: settlementEndpointAuthority,
-              targetId: connection.targetId as string,
-              logger: closeLogger,
-            }),
-        });
-      }
+        authority: (opened) => {
+          const targetId = opened.targetId as string;
+          const targetCloseCapability = retainChromeTargetCloseCapability({
+            generationId: resourceAuthority.generationId(),
+            targetId,
+            browserWSEndpoint: endpointAuthority.browserWSEndpoint,
+            close: (closeLogger) =>
+              closeChromeTargetWithExactAuthority({
+                authority: endpointAuthority,
+                targetId,
+                logger: closeLogger,
+              }),
+          });
+          state.client = opened.client;
+          state.isolatedTargetId = targetId;
+          state.lastTargetId = targetId;
+          state.ownsTarget = true;
+          state.targetCloseCapability = targetCloseCapability;
+          return {
+            targetId,
+            capability: targetCloseCapability,
+            disconnect: () => opened.client.close(),
+          };
+        },
+      });
     }
     await publishRuntime();
     if (state.tabLease && state.isolatedTargetId) {

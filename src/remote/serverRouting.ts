@@ -81,9 +81,10 @@ export interface RemoteRequestRouterDeps {
   admitControllerOperation: () => (() => void) | null;
   isClosing: () => boolean;
   isBrowserWorkBusy: () => boolean;
-  startBrowserWork: () => void;
-  finishBrowserWork: () => void;
+  isBrowserWorkExclusive: () => boolean;
+  startBrowserWork: (mode?: "shared-run" | "exclusive") => () => void;
   runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
+  queueBrowserSettlement: <T>(operation: () => Promise<T>) => Promise<T>;
   sweepExpiredAuthority: (waitForExisting?: boolean) => Promise<void>;
 }
 
@@ -184,7 +185,7 @@ export function attachRemoteRequestRouter(
           sendJson(res, 409, { error: "busy" });
           return;
         }
-        deps.startBrowserWork();
+        const finishBrowserWork = deps.startBrowserWork();
         try {
           await handleRemoteRunRequest({
             req,
@@ -200,7 +201,7 @@ export function attachRemoteRequestRouter(
             transactionCoordinator: deps.transactionCoordinator,
           });
         } finally {
-          deps.finishBrowserWork();
+          finishBrowserWork();
         }
         return;
       }
@@ -243,16 +244,16 @@ export function attachRemoteRequestRouter(
             sendJson(res, 503, { error: "server_closing" });
             return;
           }
-          if (deps.isBrowserWorkBusy()) {
+          if (deps.isBrowserWorkExclusive()) {
             if (deps.verbose) {
               deps.logger(
-                `[serve] Busy: rejecting new run from ${formatSocket(req)} while another run is active`,
+                `[serve] Busy: rejecting new run from ${formatSocket(req)} while exclusive browser work is active`,
               );
             }
             sendJson(res, 409, { error: "busy" });
             return;
           }
-          deps.startBrowserWork();
+          const finishBrowserWork = deps.startBrowserWork("shared-run");
           try {
             await handleRemoteRunRequest({
               req,
@@ -268,7 +269,7 @@ export function attachRemoteRequestRouter(
               transactionCoordinator: deps.transactionCoordinator,
             });
           } finally {
-            deps.finishBrowserWork();
+            finishBrowserWork();
           }
           return;
         }
@@ -304,7 +305,7 @@ export function attachRemoteRequestRouter(
           mode: transactionMatch.action,
           transactionStore: deps.transactionStore,
           transactionCoordinator: deps.transactionCoordinator,
-          runBrowserWork: deps.runBrowserWork,
+          runSettlementWork: deps.queueBrowserSettlement,
         });
         return;
       }

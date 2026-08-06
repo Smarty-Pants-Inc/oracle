@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   normalizePromptForIdentity,
   promptIdentitySha256,
-  type PromptCommitVerification,
-} from "../../src/browser/actions/promptComposer.js";
+} from "../../src/browser/actions/committedPrompt.js";
+import type { PromptCommitVerification } from "../../src/browser/actions/promptCommitVerification.js";
 import { geminiDeepThinkDomProvider } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 
 type FixtureTurn = {

@@ -748,4 +748,178 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
     await expect(authority.settle("abort")).resolves.toMatchObject({ status: "pending" });
     expect(events).toEqual(["lease", "endpoint", "endpoint"]);
   });
+
+  it("matches durable retry transitions for constructor and local runtime projection", async () => {
+    const authoritativeRuntime: BrowserRuntimeMetadata = {
+      conversationId: "shared-conversation",
+      promptEpoch: {
+        status: "committed",
+        epochId: "shared-epoch",
+        promptSha256: "a".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "turn-0",
+        verifiedUserMessageId: "message-0",
+        conversationId: "shared-conversation",
+      },
+      tabUrl: "https://chatgpt.com/c/shared-conversation",
+    };
+    const createAuthority = async (baseRuntime?: BrowserRuntimeMetadata) => {
+      const events: string[] = [];
+      let processAttempts = 0;
+      const processIdentity = {
+        pid: 9876,
+        processStartTime: "2026-08-05T00:00:00.000Z",
+        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        normalizedUserDataDir: profileDirectory.canonicalPath,
+        launchNonce: "runtime-projection",
+        profileDirectory,
+      };
+      const endpointAuthority = {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/runtime-projection",
+        kill: vi.fn(async () => ({ status: "already-stopped" as const, pid: processIdentity.pid })),
+        release: vi.fn(async () => undefined),
+      };
+      const authority = new LocalOwnedBrowserResourceAuthority({
+        purpose: "Runtime projection test",
+        targetLabel: "Runtime projection",
+        ...(baseRuntime ? { baseRuntime } : {}),
+        userDataDir: profileDirectory.canonicalPath,
+        profileDirectoryIdentity: profileDirectory,
+        profileKind: "manual-login",
+        keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
+        generationId: "runtime-projection-generation",
+        processOwnerProvenance: "manual-canonical-owner",
+        processLaunchClaim: {
+          version: 1,
+          generationId: "runtime-projection-generation",
+          nonce: "80000000-0000-4000-8000-000000000008",
+        },
+        processOwnerDisposition: "close-on-last-lease",
+        leaseId: "runtime-projection-lease",
+        targetMarkerUrl: "about:blank#runtime-projection",
+        tabUrl: "https://chatgpt.com/c/shared-conversation",
+        logger: vi.fn<(message: string) => void>(),
+        persistRuntime: async (runtime) => runtime,
+        releaseLease: async (_lease, options) => {
+          events.push("lease");
+          await options?.onRelease?.({ isLastLease: true });
+        },
+        settleManualProcess: async () => {
+          events.push("process");
+          processAttempts += 1;
+          return processAttempts === 1
+            ? { status: "pending" as const, reason: "process retry" }
+            : { status: "completed" as const, disposition: "terminated" as const };
+        },
+      });
+      authority.configureSettlementAdapters({
+        beforeProcessSettlement: async () => {
+          events.push("prepare");
+        },
+      });
+      await authority.journalAcquisition({
+        resource: "tab-lease",
+        acquire: async () => ({
+          id: "runtime-projection-lease",
+          profileDirectory,
+          update: vi.fn(async () => undefined),
+          release: vi.fn(async () => undefined),
+        }),
+        authority: (lease) => lease,
+      });
+      await authority.journalAcquisition({
+        resource: "chrome-process",
+        acquire: async () => ({
+          chrome: {
+            pid: processIdentity.pid,
+            port: 9222,
+            host: "127.0.0.1",
+            remoteDebuggingPipes: null,
+            processIdentity,
+            kill: endpointAuthority.kill,
+            endpointAuthority,
+          },
+          processIdentity,
+          source: "recorded" as const,
+          disposition: "close-on-last-lease" as const,
+          endpointAuthority,
+        }),
+        authority: (owner) => ({ kind: "manual", owner }),
+      });
+      await authority.journalAcquisition({
+        resource: "chrome-target",
+        acquire: async () => ({ targetId: "runtime-projection-target" }),
+        authority: ({ targetId }) => ({
+          targetId,
+          capability: retainChromeTargetCloseCapability({
+            generationId: "runtime-projection-generation",
+            targetId,
+            close: async () => {
+              events.push("target");
+              return { status: "completed" as const };
+            },
+          }),
+          disconnect: async () => {
+            events.push("disconnect");
+          },
+        }),
+      });
+      return { authority, events };
+    };
+
+    const constructorLane = await createAuthority(authoritativeRuntime);
+    const localLane = await createAuthority();
+    const projectedRuntime = localLane.authority.projectRuntime(authoritativeRuntime, {
+      keepBrowser: false,
+      closeOwnedTargetOnComplete: true,
+      tabUrl: "https://chatgpt.com/c/shared-conversation",
+    });
+
+    const [constructorPending, localPending] = await Promise.all([
+      constructorLane.authority.settle("abort"),
+      localLane.authority.settle("abort", projectedRuntime),
+    ]);
+    expect(localPending).toEqual(constructorPending);
+    expect(localPending).toMatchObject({
+      status: "pending",
+      error: "process retry",
+      runtime: {
+        conversationId: "shared-conversation",
+        promptEpoch: expect.objectContaining({ epochId: "shared-epoch" }),
+        recoveryCleanupResources: [
+          expect.objectContaining({ chromeTargetId: undefined, tabLease: undefined }),
+        ],
+      },
+    });
+    expect(localLane.events).toEqual(["target", "disconnect", "lease", "prepare", "process"]);
+    expect(constructorLane.events).toEqual(localLane.events);
+
+    const [constructorCompleted, localCompleted] = await Promise.all([
+      constructorLane.authority.settle("abort"),
+      localLane.authority.settle("abort"),
+    ]);
+    expect(localCompleted).toEqual(constructorCompleted);
+    expect(localCompleted).toMatchObject({
+      status: "completed",
+      runtime: {
+        conversationId: "shared-conversation",
+        promptEpoch: expect.objectContaining({ epochId: "shared-epoch" }),
+      },
+    });
+    expect(localLane.events).toEqual([
+      "target",
+      "disconnect",
+      "lease",
+      "prepare",
+      "process",
+      "lease",
+      "prepare",
+      "process",
+    ]);
+    expect(constructorLane.events).toEqual(localLane.events);
+  });
 });

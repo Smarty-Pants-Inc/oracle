@@ -7,6 +7,8 @@ import {
   captureProfileDirectoryIdentity,
   parseProfileDirectoryIdentity,
   sameProfileDirectoryIdentity,
+  sameProfileDirectoryPath,
+  samePhysicalProfileDirectoryIdentity,
   verifyProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
 } from "./profileDirectoryAuthority.js";
@@ -329,6 +331,225 @@ interface RunningChromeProcessCommand {
   commandLine: string;
 }
 
+export interface ChromeProfileDirectoryUseCandidate {
+  readonly pid: number;
+  readonly processGeneration: string;
+  readonly profileDirectory: ProfileDirectoryIdentity;
+}
+
+export interface ChromeProfileDirectoryUnusedProof {
+  readonly status: "unused";
+  readonly candidates: readonly ChromeProfileDirectoryUseCandidate[];
+}
+
+export type ChromeProfileDirectoryUseInspection =
+  | ChromeProfileDirectoryUnusedProof
+  | {
+      readonly status: "in-use";
+      readonly candidates: readonly ChromeProfileDirectoryUseCandidate[];
+    }
+  | {
+      readonly status: "unavailable";
+      readonly candidates: readonly ChromeProfileDirectoryUseCandidate[];
+      readonly reason: string;
+    };
+
+interface ChromeProfileDirectoryUseDeps {
+  platform?: NodeJS.Platform;
+  execute?: ProcessCommandExecutor;
+  listProcesses?: () => Promise<readonly RunningChromeProcessCommand[]>;
+  readProcessGeneration?: (pid: number) => Promise<string | null>;
+  captureProfileIdentity?: (userDataDir: string) => Promise<ProfileDirectoryIdentity>;
+}
+
+export function inspectChromeProfileDirectoryUse(
+  expected: ProfileDirectoryIdentity,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  return inspectChromeProfileDirectoryUseWithDeps(expected, {});
+}
+
+export function inspectChromeProfileDirectoryUseForTest(
+  expected: ProfileDirectoryIdentity,
+  deps: ChromeProfileDirectoryUseDeps,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  return inspectChromeProfileDirectoryUseWithDeps(expected, deps);
+}
+
+async function inspectChromeProfileDirectoryUseWithDeps(
+  expected: ProfileDirectoryIdentity,
+  deps: ChromeProfileDirectoryUseDeps,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  const platform = deps.platform ?? process.platform;
+  const parsedExpected = parseProfileDirectoryIdentity(expected, platform);
+  if (!parsedExpected || expected.platform !== platform) {
+    return { status: "unavailable", candidates: [], reason: "Profile identity is invalid" };
+  }
+  const execute = deps.execute ?? executeProcessCommand;
+  const processGenerationProvider = createPlatformProcessGenerationProvider({ platform, execute });
+  const readProcessGeneration =
+    deps.readProcessGeneration ?? processGenerationProvider.readProcessGeneration;
+  const captureProfileIdentity = deps.captureProfileIdentity ?? captureProfileDirectoryIdentity;
+  let processes: readonly RunningChromeProcessCommand[];
+  try {
+    processes = await (deps.listProcesses
+      ? deps.listProcesses()
+      : listRunningChromeProcessCommands(platform, execute));
+  } catch {
+    return {
+      status: "unavailable",
+      candidates: [],
+      reason: "Complete Chrome process enumeration failed",
+    };
+  }
+
+  const candidates: ChromeProfileDirectoryUseCandidate[] = [];
+  const seenPids = new Set<number>();
+  for (const processCommand of processes) {
+    if (
+      !Number.isInteger(processCommand.pid) ||
+      processCommand.pid <= 0 ||
+      typeof processCommand.commandLine !== "string" ||
+      seenPids.has(processCommand.pid)
+    ) {
+      return {
+        status: "unavailable",
+        candidates,
+        reason: "Chrome process enumeration returned an invalid or duplicate process",
+      };
+    }
+    seenPids.add(processCommand.pid);
+    if (!processCommand.commandLine.trim()) {
+      if (platform === "win32") {
+        return {
+          status: "unavailable",
+          candidates,
+          reason: `Chrome pid ${processCommand.pid} has no readable command line`,
+        };
+      }
+      continue;
+    }
+    const tokens = tokenizeCommandLine(processCommand.commandLine);
+    if (!tokens) {
+      if (platform === "win32" || /\b(?:chrome|chromium)\b/iu.test(processCommand.commandLine)) {
+        return {
+          status: "unavailable",
+          candidates,
+          reason: `Chrome pid ${processCommand.pid} has an unreadable command line`,
+        };
+      }
+      continue;
+    }
+    if (!isChromeExecutablePrefix(tokens)) continue;
+    const userDataDir = readChromeUserDataDirArgument(tokens, platform);
+    if (userDataDir === undefined) continue;
+    if (userDataDir === null) {
+      return {
+        status: "unavailable",
+        candidates,
+        reason: `Chrome pid ${processCommand.pid} has an invalid profile argument`,
+      };
+    }
+    let processGeneration: string | null;
+    try {
+      processGeneration = await readProcessGeneration(processCommand.pid);
+    } catch {
+      processGeneration = null;
+    }
+    if (!processGeneration?.trim()) {
+      return {
+        status: "unavailable",
+        candidates,
+        reason: `Chrome pid ${processCommand.pid} has no comparable process generation`,
+      };
+    }
+    let capturedProfile: ProfileDirectoryIdentity;
+    try {
+      capturedProfile = await captureProfileIdentity(userDataDir);
+    } catch {
+      return {
+        status: "unavailable",
+        candidates,
+        reason: `Chrome pid ${processCommand.pid} profile identity is unreadable`,
+      };
+    }
+    const profileDirectory = parseProfileDirectoryIdentity(capturedProfile, platform);
+    let confirmedProcessGeneration: string | null;
+    try {
+      confirmedProcessGeneration = await readProcessGeneration(processCommand.pid);
+    } catch {
+      confirmedProcessGeneration = null;
+    }
+    if (
+      !profileDirectory ||
+      !confirmedProcessGeneration?.trim() ||
+      comparePlatformProcessGenerations(processGeneration, confirmedProcessGeneration) !== "same"
+    ) {
+      return {
+        status: "unavailable",
+        candidates,
+        reason: `Chrome pid ${processCommand.pid} changed during physical profile inspection`,
+      };
+    }
+    candidates.push(
+      Object.freeze({
+        pid: processCommand.pid,
+        processGeneration,
+        profileDirectory,
+      }),
+    );
+  }
+
+  candidates.sort((left, right) => left.pid - right.pid);
+  const frozenCandidates = Object.freeze([...candidates]);
+  return frozenCandidates.some((candidate) =>
+    samePhysicalProfileDirectoryIdentity(candidate.profileDirectory, parsedExpected),
+  )
+    ? { status: "in-use", candidates: frozenCandidates }
+    : { status: "unused", candidates: frozenCandidates };
+}
+
+export function revalidateChromeProfileDirectoryUse(
+  expected: ProfileDirectoryIdentity,
+  previous: ChromeProfileDirectoryUnusedProof,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  return revalidateChromeProfileDirectoryUseWithDeps(expected, previous, {});
+}
+
+export function revalidateChromeProfileDirectoryUseForTest(
+  expected: ProfileDirectoryIdentity,
+  previous: ChromeProfileDirectoryUnusedProof,
+  deps: ChromeProfileDirectoryUseDeps,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  return revalidateChromeProfileDirectoryUseWithDeps(expected, previous, deps);
+}
+
+async function revalidateChromeProfileDirectoryUseWithDeps(
+  expected: ProfileDirectoryIdentity,
+  previous: ChromeProfileDirectoryUnusedProof,
+  deps: ChromeProfileDirectoryUseDeps,
+): Promise<ChromeProfileDirectoryUseInspection> {
+  const current = await inspectChromeProfileDirectoryUseWithDeps(expected, deps);
+  if (current.status !== "unused") return current;
+  const previousCandidates = new Map(
+    previous.candidates.map((candidate) => [candidate.pid, candidate] as const),
+  );
+  for (const candidate of current.candidates) {
+    const prior = previousCandidates.get(candidate.pid);
+    if (
+      prior &&
+      comparePlatformProcessGenerations(prior.processGeneration, candidate.processGeneration) !==
+        "same"
+    ) {
+      return {
+        status: "unavailable",
+        candidates: current.candidates,
+        reason: `Chrome pid ${candidate.pid} changed generation during profile cleanup handoff`,
+      };
+    }
+  }
+  return current;
+}
+
 export async function inspectRunningChromeProcessesForLaunchClaim(
   userDataDir: string,
   claim: ChromeProcessLaunchClaim,
@@ -489,7 +710,7 @@ async function listRunningChromeProcessCommands(
   execute: ProcessCommandExecutor,
 ): Promise<readonly RunningChromeProcessCommand[]> {
   if (platform !== "win32") {
-    const { stdout } = await execute("ps", ["-ax", "-o", "pid=", "-o", "command="]);
+    const { stdout } = await execute("ps", ["-axww", "-o", "pid=", "-o", "command="]);
     return parsePosixProcessCommands(stdout);
   }
   const { stdout } = await execute("powershell.exe", [
@@ -500,12 +721,15 @@ async function listRunningChromeProcessCommands(
   ]);
   const processes: RunningChromeProcessCommand[] = [];
   for (const line of stdout.split(/\r?\n/u)) {
-    const match = line.match(/^(\d+):([A-Za-z0-9+/=]+)$/u);
-    if (!match) continue;
+    if (!line.trim()) continue;
+    const match = line.match(/^(\d+):([A-Za-z0-9+/=]*)$/u);
+    if (!match) throw new Error("Windows Chrome process enumeration was incomplete");
     const pid = Number.parseInt(match[1] ?? "", 10);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error("Windows Chrome process enumeration returned an invalid pid");
+    }
     const commandLine = Buffer.from(match[2] ?? "", "base64").toString("utf8");
-    if (commandLine) processes.push({ pid, commandLine });
+    processes.push({ pid, commandLine });
   }
   return processes;
 }
@@ -513,10 +737,13 @@ async function listRunningChromeProcessCommands(
 function parsePosixProcessCommands(processList: string): readonly RunningChromeProcessCommand[] {
   const processes: RunningChromeProcessCommand[] = [];
   for (const line of processList.split("\n")) {
+    if (!line.trim()) continue;
     const match = line.match(/^\s*(\d+)\s+(.+)$/u);
-    if (!match) continue;
+    if (!match) throw new Error("POSIX process enumeration was incomplete");
     const pid = Number.parseInt(match[1] ?? "", 10);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error("POSIX process enumeration returned an invalid pid");
+    }
     processes.push({ pid, commandLine: match[2] ?? "" });
   }
   return processes;
@@ -719,28 +946,42 @@ function isChromeExecutablePrefix(tokens: readonly string[]): boolean {
   return executable.includes("chrome") || executable.includes("chromium");
 }
 
-function isChromeCommandTokensForUserDataDir(
+function readChromeUserDataDirArgument(
   tokens: readonly string[],
-  userDataDir: string,
   platform: NodeJS.Platform,
-): boolean {
+): string | null | undefined {
   const profileArguments: string[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] ?? "";
     const lower = token.toLowerCase();
     if (lower === "--user-data-dir") {
       const value = tokens[index + 1];
-      if (!value || value.startsWith("--")) return false;
+      if (!value || value.startsWith("--")) return null;
       profileArguments.push(value);
       index += 1;
     } else if (lower.startsWith("--user-data-dir=")) {
       profileArguments.push(token.slice(token.indexOf("=") + 1));
     }
   }
-  if (profileArguments.length !== 1 || !isChromeExecutablePrefix(tokens)) return false;
+  if (profileArguments.length === 0) return undefined;
+  if (profileArguments.length !== 1) return null;
+  return normalizeProfileArgument(profileArguments[0] ?? "", platform);
+}
+
+function isChromeCommandTokensForUserDataDir(
+  tokens: readonly string[],
+  userDataDir: string,
+  platform: NodeJS.Platform,
+): boolean {
+  if (!isChromeExecutablePrefix(tokens)) return false;
   const expected = normalizeProfileArgument(userDataDir, platform);
-  const actual = normalizeProfileArgument(profileArguments[0] ?? "", platform);
-  return expected !== null && actual === expected;
+  const actual = readChromeUserDataDirArgument(tokens, platform);
+  return (
+    expected !== null &&
+    actual !== null &&
+    actual !== undefined &&
+    sameProfileDirectoryPath(actual, expected, platform)
+  );
 }
 
 function isChromeCommandForUserDataDir(
@@ -851,82 +1092,10 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 export async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
-  if (process.platform === "win32") {
-    try {
-      const { stdout } = await executeProcessCommand("powershell.exe", [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(chrome|chromium)\\.exe$' } | ForEach-Object { $_.CommandLine }",
-      ]);
-      return stdout
-        .split(/\r?\n/)
-        .some((command) => isChromeCommandForUserDataDir(command, userDataDir));
-    } catch {
-      return true;
-    }
-  }
-
-  const commands = await listPosixChromeProcessCommands(userDataDir);
-  return (
-    commands === null ||
-    commands.some((command) => isChromeCommandForUserDataDir(command, userDataDir))
-  );
-}
-
-const POSIX_PROCESS_QUERY_BATCH_SIZE = 64;
-
-// Narrow by the exact profile argument before hydrating commands. pgrep is only a candidate
-// filter; the tokenizer below remains the authority for executable and argument equality.
-
-async function listPosixChromeProcessCommands(
-  userDataDir: string,
-): Promise<readonly string[] | null> {
-  const searchPattern = buildPosixChromeProfileSearchPattern(userDataDir);
-  if (searchPattern === null) return null;
-  let pidOutput: string;
   try {
-    ({ stdout: pidOutput } = await executeProcessCommand("/usr/bin/pgrep", [
-      "-i",
-      "-f",
-      "--",
-      searchPattern,
-    ]));
-  } catch (error) {
-    return readProcessCommandExitCode(error) === 1 ? [] : null;
+    const expected = await captureProfileDirectoryIdentity(userDataDir);
+    return (await inspectChromeProfileDirectoryUse(expected)).status !== "unused";
+  } catch {
+    return true;
   }
-
-  const pidLines = pidOutput.trim() ? pidOutput.trim().split(/\r?\n/u) : [];
-  if (pidLines.length === 0 || pidLines.some((line) => !/^[1-9]\d*$/u.test(line))) return null;
-  const pids = [...new Set(pidLines.map((line) => Number.parseInt(line, 10)))];
-  if (pids.some((pid) => !Number.isSafeInteger(pid))) return null;
-
-  const commands: string[] = [];
-  for (let offset = 0; offset < pids.length; offset += POSIX_PROCESS_QUERY_BATCH_SIZE) {
-    const batch = pids.slice(offset, offset + POSIX_PROCESS_QUERY_BATCH_SIZE);
-    try {
-      const { stdout } = await executeProcessCommand("/bin/ps", [
-        "-ww",
-        "-p",
-        batch.join(","),
-        "-o",
-        "command=",
-      ]);
-      commands.push(...stdout.split(/\r?\n/u).filter(Boolean));
-    } catch (error) {
-      if (readProcessCommandExitCode(error) !== 1) return null;
-    }
-  }
-  return commands;
-}
-
-function buildPosixChromeProfileSearchPattern(userDataDir: string): string | null {
-  const normalized = normalizeProfileArgument(userDataDir, process.platform);
-  if (normalized === null || /[\0\r\n]/u.test(normalized)) return null;
-  const escaped = normalized.replace(/[\\.^$|?*+()[\]{}]/gu, "\\$&");
-  return `--user-data-dir(=|[[:space:]]+)["']?${escaped}["']?([[:space:]]|$)`;
-}
-
-function readProcessCommandExitCode(error: unknown): unknown {
-  return error && typeof error === "object" && "code" in error ? error.code : undefined;
 }

@@ -28,6 +28,7 @@ import {
 } from "./browserRuntimeAuthority.js";
 import { sendSessionNotification, type NotificationSettings } from "./notifier.js";
 import { formatError } from "./errorUtils.js";
+import { persistBrowserSessionOutcome } from "./browserSessionOutcome.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -141,7 +142,7 @@ export async function autoReattachUntilComplete({
           sessionId: sessionMeta.id,
           recoveryLockPath,
           acquireRecoveryLock: publication.acquireRecoveryLock,
-          isRemotePublicationAcknowledged: publication.isPublished,
+          isRemotePublicationAcknowledged: publication.isRemotePublicationAcknowledged,
           runtimeHintCb: async (latestRuntime) => {
             const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
             authoritativeRuntime = persistedRuntime;
@@ -214,10 +215,22 @@ export async function autoReattachUntilComplete({
       durablyCompleted = true;
       authoritativeRuntime = publishedCapture.finalization.runtime;
       retryRuntime = authoritativeRuntime;
-      if (publishedCapture.finalization.status === "pending") {
+      if (publishedCapture.projection.status === "pending") {
+        log(
+          kleur.yellow(
+            `Auto-reattach answer is durable; terminal session/model projection remains pending: ${publishedCapture.projection.error}`,
+          ),
+        );
+      } else if (publishedCapture.finalization.status === "pending") {
         log(
           kleur.yellow(
             `Auto-reattach completed; browser cleanup remains pending: ${publishedCapture.finalization.error}`,
+          ),
+        );
+      } else if (publishedCapture.finalizationPersistence.status === "pending") {
+        log(
+          kleur.yellow(
+            `Auto-reattach answer is published; cleanup authority projection remains pending: ${publishedCapture.finalizationPersistence.error}`,
           ),
         );
       } else {
@@ -262,33 +275,45 @@ export async function autoReattachUntilComplete({
             ? { ...userError.details, runtime: failureRuntime }
             : userError?.details;
         const receipt = await verifiedDurableBrowserAnswerReceiptFromError(error);
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          errorMessage: message,
-          browser: {
-            ...browserMetadata,
-            config: browserConfig,
-            runtime: failureRuntime,
-          },
-          ...(receipt
-            ? { artifacts: appendArtifacts(sessionMeta.artifacts, [receipt.artifact]) }
-            : {}),
-          response: { status: "error", incompleteReason: "incomplete-capture" },
-          error: userError
-            ? {
-                category: userError.category,
-                message: userError.message,
-                details: failureDetails,
-              }
-            : { category: "internal", message },
-        });
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-          });
+        const journal = publication.journal ?? (await publication.refresh());
+        if (
+          receipt &&
+          journal &&
+          (journal.phase === "finalize-bound" ||
+            journal.phase === "published" ||
+            journal.phase === "cleanup-pending")
+        ) {
+          log(
+            dim(
+              `Auto-reattach answer is durable under FINALIZE authority; publication repair remains pending: ${message}`,
+            ),
+          );
+          return { outcome: "completed", runtime: retryRuntime };
         }
+        const response = { status: "error" as const, incompleteReason: "incomplete-capture" };
+        const errorMetadata = userError
+          ? {
+              category: userError.category,
+              message: userError.message,
+              details: failureDetails,
+            }
+          : { category: "internal" as const, message };
+        await persistBrowserSessionOutcome(sessionMeta.id, {
+          kind: "terminal-error",
+          browser: publicationBrowser,
+          runtime: failureRuntime,
+          response,
+          reason: message,
+          artifacts: receipt
+            ? appendArtifacts(sessionMeta.artifacts, [receipt.artifact])
+            : sessionMeta.artifacts,
+          receipt,
+          errorMetadata,
+          transportMetadata: undefined,
+          modelProjection: modelForStatus
+            ? { model: modelForStatus, updates: { response, error: errorMetadata } }
+            : undefined,
+        });
         throw error;
       }
       const capturedErrorRuntime = runtimeFromBrowserError(error);
@@ -324,26 +349,25 @@ export async function autoReattachUntilComplete({
               details: terminalDetails,
             }
           : { category: "internal" as const, message };
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          errorMessage: message,
+        const response = { status: "error" as const, incompleteReason };
+        await persistBrowserSessionOutcome(sessionMeta.id, {
+          kind: "terminal-error",
           browser: {
             ...browserMetadata,
             config: browserConfig,
             runtime: retryRuntime,
           },
-          response: { status: "error", incompleteReason },
-          error: terminalError,
+          runtime: retryRuntime,
+          response,
+          reason: message,
+          artifacts: sessionMeta.artifacts,
+          receipt: undefined,
+          errorMetadata: terminalError,
+          transportMetadata: undefined,
+          modelProjection: modelForStatus
+            ? { model: modelForStatus, updates: { response, error: terminalError } }
+            : undefined,
         });
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-            response: { status: "error", incompleteReason },
-            error: terminalError,
-          });
-        }
         log(dim(`Auto-reattach stopped on terminal browser outcome: ${message}`));
         return { outcome: "terminal", runtime: retryRuntime };
       }

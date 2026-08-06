@@ -428,6 +428,7 @@ export class RemoteTransactionStore {
       const record = await this.read(transactionToken);
       if (!record) throw new Error(`Remote transaction ${transactionToken} does not exist`);
       const originalRunId = record.runId;
+      const originalArtifactNamespace = record.artifactNamespace;
       const applied = applyRemoteTransactionTransition(record, transition, {
         controllerGeneration: this.controllerGeneration,
         leaseDurationMs: this.#leaseDurationMs,
@@ -437,7 +438,8 @@ export class RemoteTransactionStore {
       if (applied.persist) {
         if (
           applied.record.transactionToken !== transactionToken ||
-          applied.record.runId !== originalRunId
+          applied.record.runId !== originalRunId ||
+          applied.record.artifactNamespace !== originalArtifactNamespace
         ) {
           throw new Error("Remote transaction identity cannot change during a transition");
         }

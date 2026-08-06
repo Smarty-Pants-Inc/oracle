@@ -503,7 +503,7 @@ describe("openGeminiBrowserSession", () => {
       targetId: "target-1",
       logger: expect.any(Function),
     });
-    expect(leaseRelease).toHaveBeenCalledTimes(1);
+    expect(teardownState.leaseReleased).toBe(true);
     expect(settleManualChromeOwner).toHaveBeenCalledWith(
       profileDir,
       expect.objectContaining({ disposition: "preserve" }),
@@ -512,7 +512,7 @@ describe("openGeminiBrowserSession", () => {
     expect(endpointRelease).toHaveBeenCalledOnce();
     expect(ownerKill).not.toHaveBeenCalled();
     expect(cleanupStaleProfileState).not.toHaveBeenCalled();
-    expect(retainBrowserTabLeaseTeardownAuthority).not.toHaveBeenCalled();
+    expect(retainBrowserTabLeaseTeardownAuthority).toHaveBeenCalledOnce();
   });
 
   it("hands a launched owner off without killing it when another lease is already active", async () => {

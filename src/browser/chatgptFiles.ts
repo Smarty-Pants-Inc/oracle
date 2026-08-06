@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   BrowserDownloadableFile,
+  BrowserArtifactWriteAuthority,
   BrowserLogger,
   ChromeClient,
   SavedBrowserFile,
@@ -9,7 +10,7 @@ import type {
 import { ASSISTANT_ROLE_SELECTOR } from "./constants.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import {
-  computeFileSha256,
+  readBrowserArtifactFileEvidence,
   resolveSessionArtifactsDir,
   sanitizeArtifactFilename,
   validateArtifactFile,
@@ -1098,17 +1099,18 @@ async function clickGeneratedDownloadUrl(params: {
 
 async function savedBrowserFileFromPath(filePath: string): Promise<SavedBrowserFile> {
   const filename = path.basename(filePath);
-  const stat = await fs.stat(filePath);
   const mimeType = mimeTypeFromFilename(filename);
+  const evidence = await readBrowserArtifactFileEvidence(filePath);
   const validation = await validateArtifactFile({ path: filePath, filename, mimeType });
   return {
     kind: "file",
     path: filePath,
     label: filename,
     mimeType,
-    sizeBytes: stat.size,
+    sizeBytes: evidence.sizeBytes,
     sourceUrl: "browser-download",
-    sha256: await computeFileSha256(filePath),
+    sha256: evidence.sha256,
+    fileIdentity: evidence.fileIdentity,
     validation,
     transfer: { status: "not-needed" },
     origin: { mode: "local" },
@@ -1131,16 +1133,20 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   downloadWaitMs?: number;
   minTurnIndex?: number | null;
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
 }): Promise<SavedBrowserFile[]> {
+  const authorityDirectory = params.artifactWriteAuthority?.artifactsDirectory;
   if (
-    (!params.sessionId && !params.downloadPath) ||
+    (!params.sessionId && !params.downloadPath && !authorityDirectory) ||
     (!params.Client && !params.Browser && !params.Page)
   ) {
     return [];
   }
   const artifactsDir =
-    params.downloadPath ?? resolveSessionArtifactsDir(params.sessionId as string);
-  await fs.mkdir(artifactsDir, { recursive: true });
+    authorityDirectory ??
+    params.downloadPath ??
+    resolveSessionArtifactsDir(params.sessionId as string);
+  await fs.mkdir(artifactsDir, { recursive: true, mode: 0o700 });
   const before = new Set(await fs.readdir(artifactsDir).catch(() => []));
   const configured = await configureBrowserDownloadPath({
     Browser: params.Browser,
@@ -1455,6 +1461,7 @@ export async function saveChatGptDownloadableFiles(params: {
   Runtime?: ChromeClient["Runtime"];
   files: BrowserDownloadableFile[];
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
   logger?: BrowserLogger;
 }): Promise<{
   saved: boolean;
@@ -1463,7 +1470,7 @@ export async function saveChatGptDownloadableFiles(params: {
   failedFiles: BrowserDownloadableFile[];
   errors: string[];
 }> {
-  const { Network, files, sessionId, logger } = params;
+  const { Network, files, sessionId, artifactWriteAuthority, logger } = params;
   if (!files.length) {
     return { saved: false, fileCount: 0, savedFiles: [], failedFiles: [], errors: [] };
   }
@@ -1517,6 +1524,7 @@ export async function saveChatGptDownloadableFiles(params: {
       });
       const artifact = await writeBinaryBrowserArtifact({
         sessionId,
+        artifactWriteAuthority,
         kind: "file",
         filename,
         contents: downloaded.buffer,
@@ -1576,6 +1584,7 @@ export async function collectChatGptFileArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   sessionId?: string;
+  artifactWriteAuthority?: BrowserArtifactWriteAuthority;
 }): Promise<{
   files: BrowserDownloadableFile[];
   savedFiles: SavedBrowserFile[];
@@ -1616,6 +1625,7 @@ export async function collectChatGptFileArtifacts(params: {
     Runtime: params.Runtime,
     files: allFiles,
     sessionId: params.sessionId,
+    artifactWriteAuthority: params.artifactWriteAuthority,
     logger: params.logger,
   });
   const buttonSavedFiles =
@@ -1630,6 +1640,7 @@ export async function collectChatGptFileArtifacts(params: {
           allowGenericDownloadLabels: saved.savedFiles.length === 0,
           minTurnIndex: params.minTurnIndex,
           sessionId: params.sessionId,
+          artifactWriteAuthority: params.artifactWriteAuthority,
         })
       : [];
   const savedFiles = [...saved.savedFiles, ...buttonSavedFiles];

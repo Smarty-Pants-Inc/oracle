@@ -1,4 +1,5 @@
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
+import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
   DurableRemoteArtifactRegistration,
@@ -246,6 +247,7 @@ export function validateRemoteTransactionRecord(
       record.transactionToken !== options.expectedTransactionToken) ||
     typeof record.runId !== "string" ||
     !record.runId ||
+    record.artifactNamespace !== deriveRemoteArtifactNamespace(record) ||
     typeof record.createdAt !== "string" ||
     !Number.isFinite(Date.parse(record.createdAt)) ||
     typeof record.updatedAt !== "string" ||

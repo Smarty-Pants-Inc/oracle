@@ -160,6 +160,9 @@ describe("saveChatGptDownloadableFiles", () => {
     const result = await saveChatGptDownloadableFiles({
       Network: network,
       sessionId: "file-session",
+      artifactWriteAuthority: {
+        artifactsDirectory: path.join(tmpHome, "remote-owned", "artifacts"),
+      },
       files: [
         {
           url: "https://chatgpt.com/backend-api/files/file_package/download",
@@ -183,8 +186,14 @@ describe("saveChatGptDownloadableFiles", () => {
       filename: "package.zip",
     });
     expect(result.savedFiles[0]?.path).toBe(
-      path.join(tmpHome, "sessions", "file-session", "artifacts", "package.zip"),
+      path.join(tmpHome, "remote-owned", "artifacts", "package.zip"),
     );
+    expect(result.savedFiles[0]?.fileIdentity).toMatchObject({
+      device: expect.any(String),
+      inode: expect.any(String),
+      birthtimeNs: expect.any(String),
+      ctimeNs: expect.any(String),
+    });
     await expect(fs.readFile(result.savedFiles[0]!.path)).resolves.toEqual(Buffer.from([9, 8, 7]));
   });
 

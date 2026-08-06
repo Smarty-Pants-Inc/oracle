@@ -14,7 +14,7 @@ import {
 } from "../browser/modelDisplay.js";
 import { renderMarkdownAnsi } from "./markdownRenderer.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
-import { sessionStore, wait } from "../sessionStore.js";
+import { commitSessionModelProjection, sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import {
   formatSessionTableHeader,
@@ -432,20 +432,24 @@ export async function attachSession(
         category: "internal",
         message,
       } as const;
-      if (settled.model) {
-        await sessionStore.updateModelRun(settled.id, settled.model, {
+      const completedAt = new Date().toISOString();
+      const response = { status: "incomplete" as const, incompleteReason: "incomplete-capture" };
+      await commitSessionModelProjection(settled.id, {
+        session: {
           status: "error",
-          completedAt: new Date().toISOString(),
-          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+          completedAt,
+          errorMessage: message,
+          response,
           error: failure,
-        });
-      }
-      await sessionStore.updateSession(settled.id, {
-        status: "error",
-        completedAt: new Date().toISOString(),
-        errorMessage: message,
-        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-        error: failure,
+        },
+        ...(settled.model
+          ? {
+              model: {
+                model: settled.model,
+                updates: { status: "error", completedAt, response, error: failure },
+              },
+            }
+          : {}),
       });
       console.log(chalk.yellow(`${message} Reattach via: ${settled.lifecycle?.reattachCommand}`));
       if (options?.propagateFailure) {

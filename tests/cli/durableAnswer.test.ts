@@ -26,6 +26,7 @@ import type {
   SessionModelRun,
 } from "../../src/sessionStore.js";
 import { sessionStore } from "../../src/sessionStore.js";
+import * as sessionStoreModule from "../../src/sessionStore.js";
 import * as sessionManager from "../../src/sessionManager.js";
 import * as fsDurability from "../../src/fsDurability.js";
 import {
@@ -191,14 +192,37 @@ describe("browser publication phase model", () => {
     browserAudit: { runtime: {} },
   });
 
-  test.each([
-    ["preparing", false],
-    ["staged", false],
-    ["finalize-bound", false],
-    ["published", true],
-    ["cleanup-pending", true],
-  ] as const)("maps %s acknowledgement in one place", (phase, acknowledged) => {
-    expect(isBrowserPublicationAcknowledged(phase)).toBe(acknowledged);
+  test("acknowledges only bound journals backed by the matching terminal projection", () => {
+    const published = reduceBrowserPublicationEvent(finalizeBound, {
+      type: "completed-session-persisted",
+      receipt: { artifact },
+      completedSessionPersisted: true,
+    });
+    const cleanupPending = reduceBrowserPublicationEvent(published, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: {
+        status: "pending",
+        runtime: finalizeBound.runtime,
+        errorCode: "browser-cleanup-finalize-pending",
+        errorMessage: "cleanup remains pending",
+      },
+    });
+    const terminalMetadata: SessionMetadata = {
+      id: "session-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      status: "completed",
+      options: {},
+      completedAt: finalizeBound.completedAt,
+      artifacts: [artifact],
+    };
+
+    expect(isBrowserPublicationAcknowledged(preparing, terminalMetadata)).toBe(false);
+    expect(isBrowserPublicationAcknowledged(staged, terminalMetadata)).toBe(false);
+    expect(isBrowserPublicationAcknowledged(finalizeBound, terminalMetadata)).toBe(true);
+    expect(isBrowserPublicationAcknowledged(published, terminalMetadata)).toBe(true);
+    expect(isBrowserPublicationAcknowledged(cleanupPending, terminalMetadata)).toBe(true);
+    expect(isBrowserPublicationAcknowledged(published, null)).toBe(false);
   });
 
   test("reduces every legal publication edge", () => {
@@ -479,6 +503,25 @@ describe("publishCompletedBrowserCapture", () => {
     vi.spyOn(sessionStore, "updateModelRun").mockImplementation(
       async (_sessionId, model, updates) => modelRunResult(model, updates),
     );
+    vi.spyOn(sessionStoreModule, "commitSessionModelProjection").mockImplementation(
+      async (sessionId, projection) => {
+        const baseSession = await sessionStore.updateSession(sessionId, projection.session);
+        if (!projection.model) return { session: baseSession };
+        const model = await sessionStore.updateModelRun(
+          sessionId,
+          projection.model.model,
+          projection.model.updates,
+        );
+        return {
+          session: {
+            ...baseSession,
+            models: [model],
+            modelProjectionAuthority: "session",
+          },
+          model,
+        };
+      },
+    );
   }
 
   function browser(runtime: BrowserRuntimeMetadata): NonNullable<SessionMetadata["browser"]> {
@@ -600,7 +643,8 @@ describe("publishCompletedBrowserCapture", () => {
       published: true,
       receipt: persistAnswer.mock.calls[0]?.[1],
       finalization: { status: "completed", runtime: finalizedRuntime },
-      runtimeAuthority: { status: "persisted" },
+      projection: { status: "persisted" },
+      finalizationPersistence: { status: "persisted" },
     });
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
@@ -1083,7 +1127,7 @@ describe("publishCompletedBrowserCapture", () => {
     expect(finalizeResources).toHaveBeenCalledOnce();
   });
 
-  test("keeps FINALIZE authority recoverable when completed projection is interrupted", async () => {
+  test("keeps FINALIZE journal retryable until terminal session and model projection persist", async () => {
     await setupSession();
     const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
     const bindSettlement = vi.fn(async () => ({
@@ -1098,29 +1142,41 @@ describe("publishCompletedBrowserCapture", () => {
       return sessionResult(sessionId, updates);
     });
 
-    await expect(
-      publishCompletedBrowserCapture({
-        answer: { sessionId: "session-1", answer: "answer" },
-        transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
-        browser: browser(runtime),
-        persistAnswer: acceptPreparedReceipt(),
-      }),
-    ).rejects.toMatchObject({ details: { code: "finalize-bound-publication-pending" } });
+    const pending = await publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer: "answer" },
+      transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
+      browser: browser(runtime),
+      model: "gpt-5.2-pro",
+      usage: { inputTokens: 1, outputTokens: 2, reasoningTokens: 0, totalTokens: 3 },
+      persistAnswer: acceptPreparedReceipt(),
+    });
+    expect(pending).toMatchObject({
+      published: true,
+      projection: { status: "pending", error: "metadata fsync failed" },
+      finalizationPersistence: { status: "pending" },
+    });
     expect(abort).not.toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
     expect(releaseSettlementLock).toHaveBeenCalledOnce();
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "finalize-bound",
+      model: "gpt-5.2-pro",
     });
 
-    vi.mocked(sessionStore.updateSession).mockResolvedValue(sessionResult("session-1"));
+    vi.mocked(sessionStore.updateSession).mockImplementation(async (sessionId, updates) =>
+      sessionResult(sessionId, updates),
+    );
     const recovered = await publishCompletedBrowserCapture({
       answer: { sessionId: "session-1", answer: "ignored on recovery" },
       transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
       browser: browser(runtime),
       persistAnswer: vi.fn(),
+      model: "gpt-5.2-pro",
+      usage: { inputTokens: 1, outputTokens: 2, reasoningTokens: 0, totalTokens: 3 },
     });
     expect(recovered.published).toBe(true);
+    expect(recovered.projection).toMatchObject({ status: "persisted" });
+    expect(recovered.finalizationPersistence).toMatchObject({ status: "persisted" });
     expect(bindSettlement).toHaveBeenCalledTimes(1);
     expect(finalize).toHaveBeenCalledTimes(1);
     expect(abort).not.toHaveBeenCalled();
@@ -1384,7 +1440,7 @@ describe("publishCompletedBrowserCapture", () => {
 
     expect(result).toMatchObject({
       published: true,
-      runtimeAuthority: { status: "pending", error: "metadata fsync failed" },
+      finalizationPersistence: { status: "pending", error: "metadata fsync failed" },
     });
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "cleanup-pending",
@@ -1448,7 +1504,7 @@ describe("publishCompletedBrowserCapture", () => {
       persistAnswer: acceptPreparedReceipt(),
     });
 
-    expect(result.runtimeAuthority).toEqual({
+    expect(result.finalizationPersistence).toEqual({
       status: "pending",
       error: "terminal metadata fsync failed",
     });

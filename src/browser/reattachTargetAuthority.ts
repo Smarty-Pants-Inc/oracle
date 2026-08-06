@@ -20,59 +20,30 @@ interface RefreshAttachRuntimeDeps {
   }) => Promise<RetainedChromeEndpointAuthority>;
 }
 
-export type ReattachTargetAuthority =
-  | {
-      kind: "owned";
-      generationId: string;
-      capabilityId: string;
-    }
-  | { kind: "borrowed" };
-
-export interface ReconciledReattachTarget {
-  runtime: BrowserRuntimeMetadata;
-  authority: ReattachTargetAuthority;
-}
-
-export function exactOwnedTargetGeneration(
+function hasExactOwnedTargetGeneration(
   resource: BrowserRecoveryCleanupResourceMetadata,
   targetId: string,
-): Extract<ReattachTargetAuthority, { kind: "owned" }> | null {
+): boolean {
   const acquisitionGenerationId = resource.acquisition?.generationId;
   const capability = resource.targetCloseCapability;
-  if (
-    resource.recoveryCleanup.ownsTarget !== true ||
-    resource.chromeTargetId !== targetId ||
-    !acquisitionGenerationId ||
-    !isBrowserRecoveryTargetCloseCapability(capability) ||
-    capability.generationId !== acquisitionGenerationId
-  ) {
-    return null;
-  }
-  return {
-    kind: "owned",
-    generationId: acquisitionGenerationId,
-    capabilityId: capability.capabilityId,
-  };
+  return (
+    resource.recoveryCleanup.ownsTarget === true &&
+    resource.chromeTargetId === targetId &&
+    Boolean(acquisitionGenerationId) &&
+    isBrowserRecoveryTargetCloseCapability(capability) &&
+    capability.generationId === acquisitionGenerationId
+  );
 }
 
 /**
  * Bind the target used for answer capture without rewriting cleanup-resource identity. An explicit
- * borrowed target is an attachment choice, not a transfer of ownership. A saved owned target is
- * recognized only when its opaque close capability proves the exact acquisition generation.
+ * target is an attachment choice, not a transfer of ownership.
  */
-export function reconcileReattachTargetAuthority(
+export function bindReattachTarget(
   runtime: BrowserRuntimeMetadata,
   targetId: string,
-): ReconciledReattachTarget {
-  const authority =
-    runtime.recoveryCleanupResources
-      ?.map((resource) => exactOwnedTargetGeneration(resource, targetId))
-      .find((candidate) => candidate !== null) ?? null;
-  return {
-    runtime:
-      runtime.chromeTargetId === targetId ? runtime : { ...runtime, chromeTargetId: targetId },
-    authority: authority ?? { kind: "borrowed" },
-  };
+): BrowserRuntimeMetadata {
+  return runtime.chromeTargetId === targetId ? runtime : { ...runtime, chromeTargetId: targetId };
 }
 
 export async function refreshAttachRuntime(
@@ -136,7 +107,8 @@ export async function refreshAttachRuntime(
       const ownedTargetGenerationProven =
         resource.recoveryCleanup.ownsTarget !== true ||
         Boolean(
-          resource.chromeTargetId && exactOwnedTargetGeneration(resource, resource.chromeTargetId),
+          resource.chromeTargetId &&
+          hasExactOwnedTargetGeneration(resource, resource.chromeTargetId),
         );
       if (resource.remoteRecovery || !sameProcessGeneration || !ownedTargetGenerationProven) {
         return resource;

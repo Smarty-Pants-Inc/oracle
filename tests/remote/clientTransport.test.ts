@@ -14,7 +14,7 @@ import {
   type RemoteRunPayload,
 } from "../../src/remote/types.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import * as fsDurability from "../../src/fsDurability.js";
 import {

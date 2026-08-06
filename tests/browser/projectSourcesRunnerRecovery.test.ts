@@ -44,8 +44,7 @@ test("reconciles an in-flight Project Sources target then settles through the re
     };
   });
   try {
-    const { __test__: projectSourcesRunner } =
-      await import("../../src/browser/projectSourcesRunner.js");
+    const projectSourcesRecovery = await import("../../src/browser/projectSourcesRecovery.js");
     const [profileDirectory, generationId] = await Promise.all([
       captureProfileDirectoryIdentity(profileDir),
       Promise.resolve(randomUUID()),
@@ -60,7 +59,7 @@ test("reconciles an in-flight Project Sources target then settles through the re
       launchClaim,
       profileDirectory,
     };
-    await projectSourcesRunner.persistProjectSourcesCleanupRuntime({
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({
       userDataDir: profileDir,
       chromeHost: "127.0.0.1",
       chromePort: 9222,
@@ -93,7 +92,7 @@ test("reconciles an in-flight Project Sources target then settles through the re
     });
 
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(() => undefined),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(() => undefined),
     ).resolves.toBeUndefined();
     expect(persistedJournals).toContainEqual(
       expect.objectContaining({
@@ -115,7 +114,7 @@ test("reconciles an in-flight Project Sources target then settles through the re
       }),
     );
     await expect(
-      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     setOracleHomeDirOverrideForTest(null);

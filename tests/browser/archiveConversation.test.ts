@@ -10,7 +10,7 @@ import {
   isTemporaryChatgptUrl,
   resolveBrowserArchiveDecision,
 } from "../../src/browser/actions/archiveConversation.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
 
 describe("browser conversation archive policy", () => {

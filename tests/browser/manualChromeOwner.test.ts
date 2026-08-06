@@ -490,7 +490,7 @@ describe("manual Chrome owner acquisition", () => {
     }
   });
 
-  test.each(["termination-unsafe", "cleanup-unconfirmed"] as const)(
+  test.each(["termination-unsafe", "owner-removal-unconfirmed"] as const)(
     "surfaces %s during failed owner publication rollback",
     async (failureMode) => {
       const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-rollback-failure-"));
@@ -508,7 +508,7 @@ describe("manual Chrome owner acquisition", () => {
             reason: "exact endpoint teardown unavailable",
           });
         }
-        const cleanupProfileState = vi.fn(async () => false);
+        const removeOwnerIfMatches = vi.fn(async () => false);
 
         await expect(
           acquireManualChromeOwner(
@@ -517,7 +517,7 @@ describe("manual Chrome owner acquisition", () => {
             logger,
             `owner-rollback-${failureMode}`,
             {
-              cleanupProfileState,
+              removeOwnerIfMatches,
               discoverExactProfileChrome: vi.fn(async () => null),
               launch: vi.fn(async () => chrome),
               readOwner: vi.fn(async () => null),
@@ -528,8 +528,8 @@ describe("manual Chrome owner acquisition", () => {
           ),
         ).rejects.toThrow(/rollback did not settle safely/i);
         expect(chrome.kill).toHaveBeenCalledOnce();
-        expect(cleanupProfileState).toHaveBeenCalledTimes(
-          failureMode === "cleanup-unconfirmed" ? 1 : 0,
+        expect(removeOwnerIfMatches).toHaveBeenCalledTimes(
+          failureMode === "owner-removal-unconfirmed" ? 1 : 0,
         );
       } finally {
         await fs.rm(profileDir, { recursive: true, force: true });
@@ -723,6 +723,7 @@ describe("manual Chrome owner acquisition", () => {
     }
   });
 
+  // Exercises real crash-recoverable lease helpers whose Windows subprocess path exceeds Vitest's default budget under suite contention.
   test("reconciles a bootstrap preserve to close on the final direct-run lease", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-policy-cutover-"));
     try {
@@ -790,7 +791,7 @@ describe("manual Chrome owner acquisition", () => {
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("does not let a direct run overwrite service-owned preservation", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-service-owner-policy-"));
@@ -880,6 +881,7 @@ describe("manual Chrome owner settlement", () => {
         expect(endpointAuthority.kill).toHaveBeenCalledTimes(status === "terminated" ? 1 : 0);
         expect(chrome.kill).not.toHaveBeenCalled();
         expect(endpointAuthority.release).toHaveBeenCalledTimes(status === "preserved" ? 1 : 0);
+        expect((await readOracleChromeOwner(profileDir)) === null).toBe(status === "terminated");
       } finally {
         await fs.rm(profileDir, { recursive: true, force: true });
       }
@@ -918,6 +920,7 @@ describe("manual Chrome owner settlement", () => {
       expect(endpointAuthority.kill).toHaveBeenCalledOnce();
       expect(chrome.kill).not.toHaveBeenCalled();
       expect(endpointAuthority.release).not.toHaveBeenCalled();
+      await expect(readOracleChromeOwner(profileDir)).resolves.toBeNull();
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }

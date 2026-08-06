@@ -11,7 +11,7 @@ import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLifecycle.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 
 const {

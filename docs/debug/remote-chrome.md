@@ -47,8 +47,8 @@ Actions taken on VM (tmux `vmssh`):
 - When started correctly, logs show:
   ```
   Listening at 127.0.0.1:49810
-  Access token: <redacted>
   ```
+  The supplied modern v3 HMAC root key is never logged.
 - One run failed with EADDRINUSE when a stale node listener stayed on 49810; resolved by killing `node ...49810`.
 
 ### Observed blockers
@@ -71,7 +71,7 @@ Actions taken on VM (tmux `vmssh`):
 - Sign into ChatGPT in the VM’s Chrome profile used by the service so model switching succeeds. (Currently we rely on host cookies only; client cookie shipping is disabled.)
 - If cookie loading keeps failing under SSH/nohup, start `oracle serve` from a GUI macOS session or switch to Node 20 to avoid Keychain issues. The service now exits early after opening chatgpt.com when no cookies are present—log in, then restart it.
 - Retry local command above; ensure service logs show incoming /runs and that the login probe passes (no login button).
-- Optional: switch to a fresh port/token (`oracle serve` with no args) to avoid lingering listeners.
+- Optional: switch to a fresh port and explicitly supplied fresh token to avoid lingering listeners.
 - Code change (2025-11-20): `loadChromeCookies` now probes the macOS Keychain with a timeout and fails fast instead of hanging when Keychain access is denied. Remote runs should now emit a clear error instead of a socket hang up if the service can’t read Chrome cookies; re-test the SSH/nohup scenario.
 
 ## Notes

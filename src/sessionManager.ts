@@ -303,6 +303,12 @@ export interface SessionArtifactOrigin {
   mode: "local" | "bridge";
   host?: string;
 }
+export interface SessionArtifactFileIdentity {
+  device: string;
+  inode: string;
+  birthtimeNs: string;
+  ctimeNs: string;
+}
 
 export interface SessionArtifact {
   kind: "transcript" | "deep-research-report" | "image" | "file";
@@ -312,6 +318,7 @@ export interface SessionArtifact {
   sizeBytes?: number;
   sourceUrl?: string;
   sha256?: string;
+  fileIdentity?: SessionArtifactFileIdentity;
   validation?: SessionArtifactValidation;
   transfer?: SessionArtifactTransfer;
   origin?: SessionArtifactOrigin;
@@ -752,7 +759,6 @@ export async function commitSessionModelProjectionMetadata(
         existing = { ...existing, modelProjectionAuthority: "session" };
         await writeSessionMetadataFile(sessionId, existing);
       }
-      await ensureDir(modelsDir(sessionId));
       const currentModel = modelRunFromSession(existing, projection.model.model) ??
         (await readModelRunFile(sessionId, projection.model.model)) ?? {
           model: projection.model.model,
@@ -765,10 +771,15 @@ export async function commitSessionModelProjectionMetadata(
       });
       // The model file is a compatibility projection. meta.json is the commit point read by the
       // store, so a stale or unwritable projection cannot split the logical session/model commit.
-      await writeFileAtomicDurable(
-        modelJsonPath(sessionId, projection.model.model),
-        JSON.stringify(modelRun, null, 2),
-      ).catch(() => undefined);
+      try {
+        await ensureDir(modelsDir(sessionId));
+        await writeFileAtomicDurable(
+          modelJsonPath(sessionId, projection.model.model),
+          JSON.stringify(modelRun, null, 2),
+        );
+      } catch {
+        // The compatibility projection is optional.
+      }
     }
     const latest = (await readRawSessionMetadata(sessionId)) ?? existing;
     const session: SessionMetadata = {

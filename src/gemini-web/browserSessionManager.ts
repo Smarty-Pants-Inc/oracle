@@ -86,11 +86,7 @@ export async function openGeminiBrowserSession(
     ...(persistRuntime
       ? {
           persistRuntime: async (runtime) => await persistRuntime(runtime),
-          persistSettlementResult: async (runtime) => {
-            if (runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult) {
-              await persistRuntime(runtime);
-            }
-          },
+          persistSettlementResult: async (runtime) => await persistRuntime(runtime),
         }
       : {}),
   });
@@ -142,12 +138,15 @@ export async function openGeminiBrowserSession(
           generationId,
           targetId: opened.targetId as string,
           browserWSEndpoint: endpointAuthority.browserWSEndpoint,
-          close: (closeLogger) =>
-            closeChromeTargetWithExactAuthority({
+          close: async (closeLogger) => {
+            const result = await closeChromeTargetWithExactAuthority({
               authority: endpointAuthority,
               targetId: opened.targetId as string,
               logger: closeLogger,
-            }),
+            });
+            if (result.status === "unsafe") throw new Error(result.reason);
+            return result;
+          },
         }),
         disconnect: () => opened.client.close(),
       }),

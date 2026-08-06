@@ -37,13 +37,16 @@ export function browserRunResultFromTransaction(
   transaction: BrowserRunTransaction,
 ): BrowserRunResult {
   const {
-    runtime: _runtime,
+    runtime,
     bindSettlement: _bindSettlement,
     finalize: _finalize,
     abort: _abort,
     ...result
   } = transaction;
-  return result;
+  return {
+    ...result,
+    promptSubmitted: runtime.promptEpoch?.status === "committed",
+  };
 }
 
 export function browserTransactionFromRecoveredSession(
@@ -78,7 +81,8 @@ export function assertCapturedPromptIdentity(
   runtime: BrowserRuntimeMetadata,
 ): void {
   const epoch = runtime.promptEpoch;
-  const conversationId = result.conversationId?.trim();
+  // Transaction runtime is the canonical capture authority; the flattened result is optional.
+  const conversationId = result.conversationId?.trim() ?? runtime.conversationId?.trim();
   if (
     epoch?.status !== "committed" ||
     !requestIdentity.acceptedPromptSha256.includes(epoch.promptSha256) ||
@@ -157,5 +161,6 @@ export function projectRemotePublicResult(result: BrowserRunResult): RemotePubli
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerText.length,
+    promptSubmitted: result.promptSubmitted,
   });
 }

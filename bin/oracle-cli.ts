@@ -986,7 +986,7 @@ program
     "Loopback interface to bind (default 127.0.0.1; non-loopback addresses are rejected).",
   )
   .option("--port <number>", "Port to listen on (default random).", parseIntOption)
-  .option("--token <value>", "Modern v3 HMAC root key (random if omitted).")
+  .requiredOption("--token <value>", "Modern v3 HMAC root key (required; never logged).")
   .option(
     "--legacy-token <value>",
     "Distinct bearer token for opt-in predecessor text-only clients; never reuse --token.",
@@ -1004,7 +1004,8 @@ program
     const { serveRemote } = await import("../src/remote/server.js");
     const host = commandOptions.host?.trim() || "127.0.0.1";
     assertLoopbackRemoteBind(host);
-    const token = commandOptions.token?.trim() || undefined;
+    const token = commandOptions.token?.trim();
+    if (!token) throw new Error("--token must be a non-empty v3 HMAC root key.");
     const legacyToken = commandOptions.legacyToken?.trim() || undefined;
     if (token && legacyToken && token === legacyToken) {
       throw new Error(

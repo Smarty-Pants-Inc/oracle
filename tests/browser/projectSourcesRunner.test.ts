@@ -120,8 +120,8 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     };
   });
 
-  const { __test__: projectSourcesRunner, runBrowserProjectSources } =
-    await import("../../src/browser/projectSourcesRunner.js");
+  const { runBrowserProjectSources } = await import("../../src/browser/projectSourcesRunner.js");
+  const projectSourcesRecovery = await import("../../src/browser/projectSourcesRecovery.js");
   const { __test__: targetCloseAuthority } =
     await import("../../src/browser/targetCloseAuthority.js");
   try {
@@ -139,36 +139,36 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     };
 
     // Crash before mkdir: the durable intent is enough to clear the absent exact generation.
-    await projectSourcesRunner.persistProjectSourcesCleanupRuntime(
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime(
       {},
       undefined,
       profileCreateIntent,
     );
     await expect(
-      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).resolves.toContain('"profileCreate"');
-    await projectSourcesRunner.retryPendingProjectSourcesCleanup(
+    await projectSourcesRecovery.retryPendingProjectSourcesCleanup(
       vi.fn<(message: string) => void>(),
     );
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await expect(
-      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
 
     // Crash after mkdir before identity persistence: atomically quarantine the unknown occupant.
     const quarantinePath =
-      projectSourcesRunner.projectSourcesProfileQuarantinePath(profileCreateIntent);
+      projectSourcesRecovery.projectSourcesProfileQuarantinePath(profileCreateIntent);
     const recoveryLog = vi.fn<(message: string) => void>();
     await mkdir(interruptedProfile);
     await writeFile(path.join(interruptedProfile, "unknown-owner.txt"), "preserve me");
     mocks.removeProfile.mockClear();
-    await projectSourcesRunner.persistProjectSourcesCleanupRuntime(
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime(
       {},
       undefined,
       profileCreateIntent,
     );
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(recoveryLog),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(recoveryLog),
     ).resolves.toBeUndefined();
     expect(mocks.removeProfile).not.toHaveBeenCalled();
     await expect(readFile(path.join(quarantinePath, "unknown-owner.txt"), "utf8")).resolves.toBe(
@@ -179,22 +179,22 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(recoveryLog).toHaveBeenCalledWith(expect.stringContaining(quarantinePath));
     await expect(
-      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(recoveryLog),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(recoveryLog),
     ).resolves.toBeUndefined();
 
     // A changed physical parent fails closed before the child is inspected or removed.
-    await projectSourcesRunner.persistProjectSourcesCleanupRuntime({}, undefined, {
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({}, undefined, {
       ...profileCreateIntent,
       parent: { ...temporaryParent, inode: "999999" },
     });
     await expect(
-      projectSourcesRunner.retryPendingProjectSourcesCleanup(vi.fn<(message: string) => void>()),
+      projectSourcesRecovery.retryPendingProjectSourcesCleanup(vi.fn<(message: string) => void>()),
     ).rejects.toThrow(/parent authority changed/i);
     expect(mocks.removeProfile).not.toHaveBeenCalled();
-    await projectSourcesRunner.persistProjectSourcesCleanupRuntime({});
+    await projectSourcesRecovery.persistProjectSourcesCleanupRuntime({});
     mocks.resolveBrowserConfig.mockReturnValue({
       remoteChrome: null,
       manualLogin: false,
@@ -255,10 +255,12 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     expect(targetCloseAuthority.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(1);
 
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();
+    killChrome.mockClear();
     mocks.closeTarget.mockResolvedValueOnce({ status: "unsafe", reason: "target close deferred" });
     await expect(runBrowserProjectSources(request)).rejects.toThrow(/cleanup remains retryable/i);
+    expect(killChrome).not.toHaveBeenCalled();
     const pendingJournal = JSON.parse(
-      await readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      await readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     );
     expect(pendingJournal.runtime.recoveryCleanupResources[0]).toMatchObject({
       chromeTargetId: "project-sources-target",
@@ -312,7 +314,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     expect(mocks.retryCleanup).toHaveBeenCalledOnce();
     expect(mocks.retainEndpoint).toHaveBeenCalledOnce();
     await expect(
-      readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(targetCloseAuthority.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(1);
     const pendingTargetAcquisition = JSON.parse(JSON.stringify(pendingJournal.runtime));
@@ -335,7 +337,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       runExactOperation: vi.fn(async () => ({ status: "completed", value: false })),
     });
     const reconciledTargetAcquisition =
-      await projectSourcesRunner.reconcilePendingProjectSourcesTarget(
+      await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
         pendingTargetAcquisition,
         vi.fn<(message: string) => void>(),
       );
@@ -361,7 +363,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     pendingTargetResource.recoveryCleanup.closeOwnedTargetOnComplete = false;
     mocks.closeTarget.mockClear();
     const reconciledPreservedTarget =
-      await projectSourcesRunner.reconcilePendingProjectSourcesTarget(
+      await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
         pendingTargetAcquisition,
         vi.fn<(message: string) => void>(),
       );
@@ -387,10 +389,11 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       status: "completed",
       value: [{ targetId: "pre-existing-manual-target", type: "page", url: "about:blank" }],
     });
-    const reconciledAbsentTarget = await projectSourcesRunner.reconcilePendingProjectSourcesTarget(
-      pendingTargetAcquisition,
-      vi.fn<(message: string) => void>(),
-    );
+    const reconciledAbsentTarget =
+      await projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
+        pendingTargetAcquisition,
+        vi.fn<(message: string) => void>(),
+      );
     expect(reconciledAbsentTarget.recoveryCleanupResources?.[0]?.acquisition).not.toHaveProperty(
       "pendingResource",
     );
@@ -402,7 +405,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       ],
     });
     await expect(
-      projectSourcesRunner.reconcilePendingProjectSourcesTarget(
+      projectSourcesRecovery.reconcilePendingProjectSourcesTarget(
         pendingTargetAcquisition,
         vi.fn<(message: string) => void>(),
       ),
@@ -415,7 +418,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       value: [{ targetId: "project-sources-target" }],
     });
     await expect(
-      projectSourcesRunner.closeProjectSourcesTargetFromJournal({
+      projectSourcesRecovery.closeProjectSourcesTargetFromJournal({
         runtime: pendingJournal.runtime,
         capability: pendingJournal.runtime.recoveryCleanupResources[0].targetCloseCapability,
         targetId: "project-sources-target",
@@ -428,7 +431,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     mocks.removeProfile.mockResolvedValueOnce(false);
     await expect(runBrowserProjectSources(request)).rejects.toThrow(/cleanup remains retryable/i);
     const profilePendingJournal = JSON.parse(
-      await readFile(projectSourcesRunner.projectSourcesCleanupJournalPath(), "utf8"),
+      await readFile(projectSourcesRecovery.projectSourcesCleanupJournalPath(), "utf8"),
     );
     expect(profilePendingJournal.runtime.recoveryCleanupResources[0]).toMatchObject({
       recoveryCleanup: { ownsTarget: false, profileKind: "temporary" },
@@ -465,7 +468,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     expect(releaseEndpoint).toHaveBeenCalledTimes(iterations);
   } finally {
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();
-    await rm(projectSourcesRunner.projectSourcesCleanupJournalPath(), { force: true });
+    await rm(projectSourcesRecovery.projectSourcesCleanupJournalPath(), { force: true });
     await rm(temporaryBase, { recursive: true, force: true });
     vi.doUnmock("../../src/browser/config.js");
     vi.doUnmock("../../src/browser/chromeLifecycle.js");

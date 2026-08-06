@@ -106,6 +106,7 @@ export async function publishLocalBrowserResult(
       () =>
         saveDeepResearchReportArtifact({
           sessionId: options.sessionId,
+          artifactWriteAuthority: options.artifactWriteAuthority,
           reportMarkdown: captured.answerMarkdown,
           conversationUrl: state.lastUrl,
           logger,
@@ -116,6 +117,7 @@ export async function publishLocalBrowserResult(
       () =>
         saveBrowserTranscriptArtifact({
           sessionId: options.sessionId,
+          artifactWriteAuthority: options.artifactWriteAuthority,
           prompt: promptText,
           answerMarkdown: captured.answerMarkdown,
           conversationUrl: state.lastUrl,
@@ -191,6 +193,7 @@ export async function publishLocalBrowserResult(
     logger,
     minTurnIndex: artifactMinTurnIndex,
     sessionId: options.sessionId,
+    artifactWriteAuthority: options.artifactWriteAuthority,
   });
   await assertCommittedPromptEpochCurrent(Runtime, artifactPromptLocator);
   const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
@@ -199,6 +202,7 @@ export async function publishLocalBrowserResult(
     () =>
       saveBrowserTranscriptArtifact({
         sessionId: options.sessionId,
+        artifactWriteAuthority: options.artifactWriteAuthority,
         prompt: promptText,
         answerMarkdown,
         conversationUrl: state.lastUrl,

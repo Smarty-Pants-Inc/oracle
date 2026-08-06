@@ -130,20 +130,36 @@ export async function handleRemoteRunRequest(params: {
     }
     throw error;
   }
+  const artifactWriteAuthority = await params.artifactStore.createArtifactWriteAuthority({
+    transactionToken: params.transactionToken,
+    runId,
+  });
 
   params.logger(
     `[serve] Accepted run ${runId} from ${formatSocket(params.req)} (prompt ${payload.prompt.length} chars)`,
   );
   const runStartedAt = Date.now();
   let runDir: string | null = null;
+  let legacyResponseHeartbeat: NodeJS.Timeout | undefined;
   params.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
 
   const sendEvent = (event: RemoteRunEvent | RemoteLegacyRunEvent): boolean => {
     if (params.res.destroyed || params.res.writableEnded) return false;
     return params.res.write(`${JSON.stringify(event)}\n`);
   };
+  if (params.protocol === "legacy-text-v1" && payload.options.heartbeatIntervalMs) {
+    const intervalMs = Math.max(25, payload.options.heartbeatIntervalMs);
+    const heartbeat = setInterval(() => {
+      if (!sendEvent({ type: "log", message: "[serve] Legacy remote run remains active." })) {
+        clearInterval(heartbeat);
+        if (legacyResponseHeartbeat === heartbeat) legacyResponseHeartbeat = undefined;
+      }
+    }, intervalMs);
+    heartbeat.unref();
+    legacyResponseHeartbeat = heartbeat;
+  }
   const automationLogger: BrowserLogger = ((message?: string) => {
-    if (params.protocol === "transaction-v3" && typeof message === "string") {
+    if (typeof message === "string") {
       sendEvent({ type: "log", message });
     }
   }) as BrowserLogger;
@@ -281,6 +297,7 @@ export async function handleRemoteRunRequest(params: {
       heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
       verbose: payload.options.verbose,
       sessionId: payload.options.sessionId,
+      artifactWriteAuthority,
       followUpPrompts: payload.options.followUpPrompts,
       runtimeHintCb: (runtime, modelSelection) =>
         persistRemoteBrowserRuntime({
@@ -362,9 +379,18 @@ export async function handleRemoteRunRequest(params: {
         });
         return;
       }
+      if (!record.result) {
+        throw new BrowserAutomationError(
+          "Durably captured legacy result is missing its public answer.",
+          {
+            stage: "remote-publication",
+            code: "remote-result-missing",
+          },
+        );
+      }
       sendEvent({
         type: "result",
-        result: RemoteLegacyTextResultSchema.parse(record.result),
+        result: projectLegacyTextResult(record.result),
       });
       params.logger(
         `[serve] Legacy text run ${runId} finalized durably in ${Date.now() - runStartedAt}ms`,
@@ -466,9 +492,22 @@ export async function handleRemoteRunRequest(params: {
       `[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`,
     );
   } finally {
+    if (legacyResponseHeartbeat) clearInterval(legacyResponseHeartbeat);
     if (runDir) await rm(runDir, { recursive: true, force: true }).catch(() => undefined);
     if (!params.res.destroyed && !params.res.writableEnded) params.res.end();
   }
+}
+
+function projectLegacyTextResult(result: NonNullable<RemoteTransactionRecord["result"]>) {
+  return RemoteLegacyTextResultSchema.parse({
+    answerText: result.answerText,
+    answerMarkdown: result.answerMarkdown,
+    answerHtml: result.answerHtml,
+    tookMs: result.tookMs,
+    answerTokens: result.answerTokens,
+    answerChars: result.answerChars,
+    warnings: result.warnings,
+  });
 }
 
 function validateRemoteRunPayload(

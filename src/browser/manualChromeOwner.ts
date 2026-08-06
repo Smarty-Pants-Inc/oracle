@@ -15,6 +15,7 @@ import {
   isProcessAlive,
   readDevToolsPort,
   readOracleChromeOwner,
+  removeOracleChromeOwnerIfMatches,
   sameChromeProcessIdentity,
   sameProfileDirectoryIdentity,
   verifyChromeProcessIdentity,
@@ -57,6 +58,7 @@ export interface ManualChromeOwnerDeps {
   retainEndpointAuthority?: typeof retainChromeEndpointAuthority;
   probe?: typeof verifyDevToolsReachable;
   readOwner?: typeof readOracleChromeOwner;
+  removeOwnerIfMatches?: typeof removeOracleChromeOwnerIfMatches;
   readPort?: typeof readDevToolsPort;
   verifyIdentity?: typeof verifyChromeProcessIdentity;
   writeOwner?: typeof writeOracleChromeOwner;
@@ -197,22 +199,18 @@ export async function acquireManualChromeOwner(
         }));
         if (!isSafeChromeTerminationOutcome(termination)) {
           failures.push(new Error(termination.reason));
-        } else {
+        } else if (ownerRecord) {
           try {
-            const cleaned = await (deps.cleanupProfileState ?? cleanupStaleProfileState)(
+            const removed = await (deps.removeOwnerIfMatches ?? removeOracleChromeOwnerIfMatches)(
               profileDir,
-              logger,
-              {
-                lockRemovalMode: "if_oracle_pid_dead",
-                expectedProfileIdentity: chrome.processIdentity.profileDirectory,
-              },
+              ownerRecord,
             );
-            if (!cleaned) {
-              failures.push(new Error("Chrome launch rollback profile cleanup was not confirmed"));
+            if (!removed) {
+              failures.push(new Error("Chrome launch rollback owner removal was not confirmed"));
             }
-          } catch (cleanupError) {
+          } catch (removalError) {
             failures.push(
-              cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)),
+              removalError instanceof Error ? removalError : new Error(String(removalError)),
             );
           }
         }

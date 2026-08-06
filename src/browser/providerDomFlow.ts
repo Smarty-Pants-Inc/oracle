@@ -1,4 +1,4 @@
-import type { PromptCommitVerification } from "./actions/promptComposer.js";
+import type { PromptCommitVerification } from "./actions/promptCommitVerification.js";
 
 import type { BrowserLogger } from "./types.js";
 

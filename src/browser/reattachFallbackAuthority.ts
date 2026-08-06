@@ -1,9 +1,6 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
-import {
-  releaseManualChromeOwnerEndpointAuthority,
-  type ManualChromeOwner,
-} from "./manualChromeOwner.js";
+import { settleManualChromeOwner, type ManualChromeOwner } from "./manualChromeOwner.js";
 import {
   LocalOwnedBrowserResourceAuthority,
   type BrowserCaptureSettlementMode,
@@ -11,7 +8,6 @@ import {
   type LocalOwnedBrowserProcessSettlement,
 } from "./ownedBrowserResources.js";
 import {
-  cleanupStaleProfileState,
   isSafeChromeTerminationOutcome,
   type ChromeOwnerDisposition,
   type ChromeProcessLaunchClaim,
@@ -54,41 +50,21 @@ export class ReattachFallbackAuthority {
     const settleManualProcess = async (
       owner: ManualChromeOwner,
     ): Promise<LocalOwnedBrowserProcessSettlement> => {
-      if (owner.disposition === "preserve") {
-        try {
-          await releaseManualChromeOwnerEndpointAuthority(owner);
-          return { status: "completed", disposition: "preserved" };
-        } catch (error) {
-          return pendingProcess(
-            `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-      const endpointAuthority = owner.endpointAuthority ?? owner.chrome.endpointAuthority;
-      if (!endpointAuthority) {
-        return pendingProcess("Canonical Chrome owner has no retained exact endpoint authority");
-      }
-      const termination = await endpointAuthority.kill().catch((error: unknown) => ({
-        status: "unsafe" as const,
-        pid: owner.chrome.pid,
-        reason: error instanceof Error ? error.message : String(error),
-      }));
-      if (!isSafeChromeTerminationOutcome(termination)) return pendingProcess(termination.reason);
-      const cleaned = await (cleanup?.cleanupStaleProfileState ?? cleanupStaleProfileState)(
-        options.userDataDir,
-        options.logger,
-        {
-          lockRemovalMode: "never",
-          expectedProfileIdentity: owner.processIdentity.profileDirectory,
-        },
-      ).catch(() => false);
-      if (!cleaned) return pendingProcess("Manual-login profile cleanup was not confirmed");
       try {
-        await releaseManualChromeOwnerEndpointAuthority(owner);
-        return { status: "completed", disposition: "terminated" };
+        const settlement = await (cleanup?.settleManualChromeOwner ?? settleManualChromeOwner)(
+          options.userDataDir,
+          owner,
+          options.logger,
+        );
+        return settlement.status === "unsafe"
+          ? pendingProcess(settlement.reason)
+          : {
+              status: "completed",
+              disposition: settlement.status === "terminated" ? "terminated" : "preserved",
+            };
       } catch (error) {
         return pendingProcess(
-          `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Canonical Chrome owner settlement failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     };
@@ -113,7 +89,10 @@ export class ReattachFallbackAuthority {
           if (!isSafeChromeTerminationOutcome(termination)) {
             return pendingProcess(termination.reason);
           }
-          const removed = await cleanup.removeProfile!(options.userDataDir).catch(() => false);
+          const removed = await cleanup.removeProfile!(
+            options.userDataDir,
+            chrome.processIdentity.profileDirectory,
+          ).catch(() => false);
           return removed
             ? { status: "completed", disposition: "terminated" }
             : pendingProcess(`Profile removal was not confirmed: ${options.userDataDir}`);

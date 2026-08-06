@@ -55,6 +55,7 @@ interface IsolatedDirectoryCleanupCompletion extends IsolatedDirectoryCleanupJou
 
 export interface IsolatedDirectoryRemovalDeps {
   afterChildAttestation?: (rootPath: string) => void | Promise<void>;
+  verifyGenerationForRemoval?: (generationPath: string) => Promise<boolean>;
 }
 
 interface InFlightIsolatedDirectoryRemoval {
@@ -296,6 +297,14 @@ async function removeAuthorizedIsolatedDirectoryGeneration(
         `Isolated cleanup generation identity changed at ${generationPath}; cleanup remains pending`,
       );
     }
+    if (
+      deps.verifyGenerationForRemoval &&
+      !(await deps.verifyGenerationForRemoval(generationPath))
+    ) {
+      throw new Error(
+        `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
+      );
+    }
     await deleteIsolatedGenerationWithBoundHelper(journal, deps);
     await persistIsolatedDirectoryCleanupCompletion(journal, completionPath);
   }
@@ -304,6 +313,7 @@ async function removeAuthorizedIsolatedDirectoryGeneration(
 export async function replayPendingIsolatedDirectoryRemovals(
   parentPath: string,
   replayKey?: string,
+  deps: IsolatedDirectoryRemovalDeps = {},
 ): Promise<void> {
   const canonicalParentPath = path.resolve(parentPath);
   const canonicalReplayKey = replayKey === undefined ? undefined : path.resolve(replayKey);
@@ -351,7 +361,7 @@ export async function replayPendingIsolatedDirectoryRemovals(
     rootPaths.add(authority.rootPath);
   }
   for (const rootPath of [...rootPaths].sort()) {
-    await removeIsolatedDirectoryGeneration(rootPath);
+    await removeIsolatedDirectoryGeneration(rootPath, deps);
   }
 }
 
@@ -471,6 +481,15 @@ async function deleteIsolatedGenerationWithBoundHelper(
       !samePhysicalDirectoryIdentity(attestation.generationIdentity, journal.generationIdentity)
     ) {
       throw new Error(`Bound removal helper attested the wrong generation at ${journal.rootPath}`);
+    }
+    const generationPath = path.join(journal.rootPath, journal.generationName);
+    if (
+      deps.verifyGenerationForRemoval &&
+      !(await deps.verifyGenerationForRemoval(generationPath))
+    ) {
+      throw new Error(
+        `Isolated cleanup generation identity changed or is not proven safe to remove at ${generationPath}; cleanup remains pending`,
+      );
     }
     await deps.afterChildAttestation?.(journal.rootPath);
     // Arm the read before releasing the helper so a fast deletion cannot close stdout first.

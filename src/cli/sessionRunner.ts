@@ -33,7 +33,7 @@ import {
   sendSessionNotification,
   deriveNotificationSettingsFromMetadata,
 } from "./notifier.js";
-import { sessionStore } from "../sessionStore.js";
+import { commitSessionModelProjection, sessionStore } from "../sessionStore.js";
 import { runMultiModelApiSession, type MultiModelRunSummary } from "../oracle/multiModelRunner.js";
 import { MODEL_CONFIGS, DEFAULT_SYSTEM_PROMPT } from "../oracle/config.js";
 import { isKnownModel } from "../oracle/modelResolver.js";
@@ -75,6 +75,7 @@ import {
   persistBrowserSessionOutcome,
   type BrowserSessionOutcome,
 } from "./browserSessionOutcome.js";
+import { readBrowserCapturePublicationJournal } from "./browserPublicationJournal.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -132,6 +133,7 @@ export async function performSessionRun({
     notifications ?? deriveNotificationSettingsFromMetadata(sessionMeta, process.env);
   const modelForStatus = runOptions.model ?? sessionMeta.model;
   let durableAnswerReceipt: DurableBrowserAnswerReceipt | undefined;
+  let browserPublicationCompleted = false;
   try {
     const restartRuntime = restartCandidateRuntime;
     const restartControllerAlive = restartRuntime?.controllerPid
@@ -317,52 +319,22 @@ export async function performSessionRun({
         config: browserConfig,
         runtime: publication.finalization.runtime,
       };
-      const publishedModelProjection = modelForStatus
-        ? {
-            model: modelForStatus,
-            updates: {
-              usage: result.usage,
-              response: { status: "completed" },
-              transport: undefined,
-              error: undefined,
-            },
-          }
-        : undefined;
-      const publishedOutcome: BrowserSessionOutcome =
-        publication.finalization.status === "pending"
-          ? {
-              kind: "cleanup-pending",
-              publication: "published",
-              browser: currentBrowser ?? { config: browserConfig },
-              runtime: publication.finalization.runtime,
-              response: { status: "completed" },
-              reason: publication.finalization.error,
-              artifacts: publication.artifacts,
-              receipt: publication.receipt,
-              errorMetadata: undefined,
-              transportMetadata: undefined,
-              modelProjection: publishedModelProjection,
-              usage: result.usage,
-              elapsedMs: result.elapsedMs,
-            }
-          : {
-              kind: "published",
-              browser: currentBrowser ?? { config: browserConfig },
-              runtime: publication.finalization.runtime,
-              response: { status: "completed" },
-              reason: undefined,
-              artifacts: publication.artifacts,
-              receipt: publication.receipt,
-              errorMetadata: undefined,
-              transportMetadata: undefined,
-              modelProjection: publishedModelProjection,
-              usage: result.usage,
-              elapsedMs: result.elapsedMs,
-            };
-      await persistBrowserSessionOutcome(sessionMeta.id, publishedOutcome);
-      if (publication.finalization.status === "pending") {
+      browserPublicationCompleted = true;
+      if (publication.projection.status === "pending") {
+        log(
+          dim(
+            `Browser answer is durable; terminal session/model projection remains pending for retry: ${publication.projection.error}`,
+          ),
+        );
+      } else if (publication.finalization.status === "pending") {
         log(
           dim("Browser cleanup remains pending; saved the answer and cleanup authority for retry."),
+        );
+      } else if (publication.finalizationPersistence.status === "pending") {
+        log(
+          dim(
+            `Browser answer is published; cleanup authority projection remains pending for retry: ${publication.finalizationPersistence.error}`,
+          ),
         );
       }
       await writeAssistantOutput(runOptions.writeOutputPath, result.answerText, log);
@@ -678,13 +650,6 @@ export async function performSessionRun({
     if (result.mode !== "live") {
       throw new Error("Unexpected preview result while running a session.");
     }
-    if (modelForStatus && singleModelOverride == null) {
-      await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage: result.usage,
-      });
-    }
     const answerText = extractTextOutput(result.response);
     await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
     await sendSessionNotification(
@@ -700,19 +665,57 @@ export async function performSessionRun({
       log,
       answerText.slice(0, 140),
     );
-    await sessionStore.updateSession(sessionMeta.id, {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      usage: result.usage,
-      elapsedMs: result.elapsedMs,
-      errorMessage: undefined,
-      response: extractResponseMetadata(result.response),
-      transport: undefined,
-      error: undefined,
+    const completedAt = new Date().toISOString();
+    await commitSessionModelProjection(sessionMeta.id, {
+      session: {
+        status: "completed",
+        completedAt,
+        usage: result.usage,
+        elapsedMs: result.elapsedMs,
+        errorMessage: undefined,
+        response: extractResponseMetadata(result.response),
+        transport: undefined,
+        error: undefined,
+      },
+      ...(modelForStatus && singleModelOverride == null
+        ? {
+            model: {
+              model: modelForStatus,
+              updates: { status: "completed", completedAt, usage: result.usage },
+            },
+          }
+        : {}),
     });
   } catch (error: unknown) {
     durableAnswerReceipt ??= await verifiedDurableBrowserAnswerReceiptFromError(error);
     const message = formatError(error);
+    if (browserPublicationCompleted) {
+      log(dim(`Browser answer is published; post-publication work remains retryable: ${message}`));
+      return;
+    }
+    if (mode === "browser" && durableAnswerReceipt) {
+      const publicationJournal = await readBrowserCapturePublicationJournal(sessionMeta.id).catch(
+        () => null,
+      );
+      const receipt = publicationJournal?.receipt.artifact;
+      const durableArtifact = durableAnswerReceipt.artifact;
+      if (
+        publicationJournal &&
+        (publicationJournal.phase === "finalize-bound" ||
+          publicationJournal.phase === "published" ||
+          publicationJournal.phase === "cleanup-pending") &&
+        receipt?.path === durableArtifact.path &&
+        receipt.sha256 === durableArtifact.sha256 &&
+        receipt.sizeBytes === durableArtifact.sizeBytes
+      ) {
+        log(
+          dim(
+            `Browser answer is durable under FINALIZE authority; terminal projection/finalization remains retryable: ${message}`,
+          ),
+        );
+        return;
+      }
+    }
     log(`ERROR: ${message}`);
     markErrorLogged(error);
     const userError = asOracleUserError(error);
@@ -1043,36 +1046,43 @@ export async function performSessionRun({
       await persistBrowserSessionOutcome(sessionMeta.id, outcome);
     } else {
       const completedAt = new Date().toISOString();
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "error",
-        completedAt,
-        errorMessage: message,
-        mode,
-        browser: browserConfig
-          ? {
-              ...currentBrowser,
-              config: browserConfig,
-              runtime: browserRuntime,
-            }
-          : undefined,
-        ...(durableAnswerReceipt
-          ? {
-              artifacts: mergeArtifacts(sessionMeta.artifacts, [durableAnswerReceipt.artifact]),
-            }
-          : {}),
-        response: responseMetadata,
-        transport: transportMetadata,
-        error: errorMetadata,
-      });
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+      await commitSessionModelProjection(sessionMeta.id, {
+        session: {
           status: "error",
           completedAt,
-          ...(geminiResponseCaptureFailure
-            ? { response: responseMetadata, error: errorMetadata }
+          errorMessage: message,
+          mode,
+          browser: browserConfig
+            ? {
+                ...currentBrowser,
+                config: browserConfig,
+                runtime: browserRuntime,
+              }
+            : undefined,
+          ...(durableAnswerReceipt
+            ? {
+                artifacts: mergeArtifacts(sessionMeta.artifacts, [durableAnswerReceipt.artifact]),
+              }
             : {}),
-        });
-      }
+          response: responseMetadata,
+          transport: transportMetadata,
+          error: errorMetadata,
+        },
+        ...(modelForStatus
+          ? {
+              model: {
+                model: modelForStatus,
+                updates: {
+                  status: "error",
+                  completedAt,
+                  ...(geminiResponseCaptureFailure
+                    ? { response: responseMetadata, error: errorMetadata }
+                    : {}),
+                },
+              },
+            }
+          : {}),
+      });
     }
     throw error;
   }

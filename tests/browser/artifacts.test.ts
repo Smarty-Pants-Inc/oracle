@@ -121,10 +121,53 @@ describe("browser session artifacts", () => {
       origin: { mode: "local" },
     });
     expect(artifact?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(artifact?.fileIdentity).toMatchObject({
+      device: expect.any(String),
+      inode: expect.any(String),
+      birthtimeNs: expect.any(String),
+      ctimeNs: expect.any(String),
+    });
     expect(artifact?.path).toBe(
       path.join(tmpHome, "sessions", "browser-files", "artifacts", "build-output.zip"),
     );
     await expect(fs.readFile(artifact!.path)).resolves.toEqual(Buffer.from([1, 2, 3]));
+  });
+
+  test("allocates concurrent same-name writes exclusively without byte replacement", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-exclusive-artifacts-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const artifactWriteAuthority = {
+      artifactsDirectory: path.join(tmpHome, "server-owned", "artifacts"),
+    };
+    const payloads = [Buffer.from("first transaction"), Buffer.from("second transaction")];
+
+    const artifacts = await Promise.all(
+      payloads.map((contents) =>
+        writeBinaryBrowserArtifact({
+          sessionId: "shared-client-session",
+          artifactWriteAuthority,
+          kind: "file",
+          filename: "result.bin",
+          contents,
+        }),
+      ),
+    );
+
+    expect(new Set(artifacts.map((artifact) => artifact?.path))).toEqual(
+      new Set([
+        path.join(artifactWriteAuthority.artifactsDirectory, "result.bin"),
+        path.join(artifactWriteAuthority.artifactsDirectory, "result-2.bin"),
+      ]),
+    );
+    await Promise.all(
+      artifacts.map(async (artifact, index) => {
+        if (!artifact) throw new Error("Expected exclusive artifact allocation");
+        await expect(fs.readFile(artifact.path)).resolves.toEqual(payloads[index]);
+        if (process.platform !== "win32") {
+          expect((await fs.stat(artifact.path)).mode & 0o777).toBe(0o600);
+        }
+      }),
+    );
   });
 
   test("validates empty ZIP central directory metadata", () => {

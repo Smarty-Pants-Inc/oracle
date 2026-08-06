@@ -7,6 +7,7 @@ import { acquireCrashRecoverableFilesystemLock } from "../browser/filesystemLock
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
 import type {
   ChromeProcessIdentity,
+  ProfileDirectoryIdentity,
   ProfileStateLogger,
   RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";
@@ -52,6 +53,10 @@ interface RemoteServerDeps {
     identity: ChromeProcessIdentity,
     logger?: ProfileStateLogger,
   ) => Promise<RecordedChromeTerminationOutcome>;
+  removeCleanupProfile?: (
+    profileDir: string,
+    expectedIdentity: ProfileDirectoryIdentity,
+  ) => Promise<boolean>;
   controllerGeneration?: string;
   transactionLeaseDurationMs?: number;
   transactionStoreNow?: () => number;
@@ -143,6 +148,7 @@ export async function createRemoteServer(
                     identity,
                     cleanupLog,
                   ),
+                removeProfile: deps.removeCleanupProfile,
               },
             },
         mode,
@@ -150,9 +156,11 @@ export async function createRemoteServer(
     },
   });
 
-  // Each admitted controller request holds a permit through its full route dispatch. Remote Chrome
-  // and lease settlement are single-flight; per-record work is additionally serialized by the store.
-  let browserWorkBusy = false;
+  // Modern runs may share browser capacity, while legacy runs, recovery, settlement, and sweeps
+  // retain exclusive authority. Every acquisition owns an idempotent release so stale completion
+  // cannot release a newer work generation.
+  let browserWorkCount = 0;
+  let browserWorkExclusive = false;
   let browserWorkIdle: { promise: Promise<void>; resolve: () => void } | null = null;
   let sweepInFlight: Promise<void> | null = null;
   let controllerOperationCount = 0;
@@ -180,7 +188,10 @@ export async function createRemoteServer(
       await idle.promise;
     }
   };
-  const startBrowserWork = (allowDuringClose = false): void => {
+  const startBrowserWork = (
+    mode: "shared-run" | "exclusive" = "exclusive",
+    allowDuringClose = false,
+  ): (() => void) => {
     if (closing && !allowDuringClose) {
       throw new RemoteTransactionConflictError(
         503,
@@ -188,36 +199,51 @@ export async function createRemoteServer(
         "Remote server is shutting down",
       );
     }
-    if (browserWorkBusy) {
+    if (browserWorkExclusive || (mode === "exclusive" && browserWorkCount > 0)) {
       throw new RemoteTransactionConflictError(
         409,
         "busy",
         "Remote browser authority is already in use",
       );
     }
-    browserWorkBusy = true;
-    browserWorkIdle = Promise.withResolvers<void>();
-  };
-  const finishBrowserWork = (): void => {
-    const idle = browserWorkIdle;
-    browserWorkIdle = null;
-    browserWorkBusy = false;
-    idle?.resolve();
+    if (browserWorkCount === 0) browserWorkIdle = Promise.withResolvers<void>();
+    browserWorkCount += 1;
+    if (mode === "exclusive") browserWorkExclusive = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      browserWorkCount -= 1;
+      if (mode === "exclusive") browserWorkExclusive = false;
+      if (browserWorkCount === 0) {
+        const idle = browserWorkIdle;
+        browserWorkIdle = null;
+        idle?.resolve();
+      }
+    };
   };
   const waitForBrowserWorkToDrain = async (): Promise<void> => {
-    while (browserWorkBusy) {
+    while (browserWorkCount > 0) {
       const idle = browserWorkIdle;
       if (!idle) throw new Error("Remote browser work drain lost its completion signal");
       await idle.promise;
     }
   };
   const runBrowserWork = async <T>(operation: () => Promise<T>): Promise<T> => {
-    startBrowserWork();
+    const finishBrowserWork = startBrowserWork();
     try {
       return await operation();
     } finally {
       finishBrowserWork();
     }
+  };
+  const queueBrowserSettlement = async <T>(operation: () => Promise<T>): Promise<T> => {
+    while (browserWorkExclusive) {
+      const idle = browserWorkIdle;
+      if (!idle) throw new Error("Remote browser work queue lost its completion signal");
+      await idle.promise;
+    }
+    return await runBrowserWork(operation);
   };
   const sweepExpiredAuthority = async (waitForExisting = false): Promise<void> => {
     if (closing) return;
@@ -225,8 +251,8 @@ export async function createRemoteServer(
       if (waitForExisting) await sweepInFlight;
       return;
     }
-    if (browserWorkBusy) return;
-    startBrowserWork();
+    if (browserWorkCount > 0) return;
+    const finishBrowserWork = startBrowserWork();
     const sweep = sweepExpiredRemoteTransactions({
       transactionStore,
       transactionCoordinator,
@@ -284,10 +310,11 @@ export async function createRemoteServer(
     transactionCoordinator,
     admitControllerOperation,
     isClosing: () => closing,
-    isBrowserWorkBusy: () => browserWorkBusy,
+    isBrowserWorkBusy: () => browserWorkCount > 0,
+    isBrowserWorkExclusive: () => browserWorkExclusive,
     startBrowserWork,
-    finishBrowserWork,
     runBrowserWork,
+    queueBrowserSettlement,
     sweepExpiredAuthority,
   });
 
@@ -335,13 +362,12 @@ export async function createRemoteServer(
     : `${address.address}:${address.port}`;
   logger(color(chalk.cyanBright.bold, `Listening at ${boundEndpoint}`));
   logger(color(chalk.cyan, REMOTE_PLAINTEXT_TRANSPORT_GUIDANCE));
-  logger(color(chalk.yellowBright, `Access token: ${authToken}`));
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
   const closeRemoteServer = async (): Promise<void> => {
     await waitForControllerOperationsToDrain();
     await waitForBrowserWorkToDrain();
-    startBrowserWork(true);
+    const finishBrowserWork = startBrowserWork("exclusive", true);
     try {
       await settleRemoteControllerShutdown({
         transactionStore,

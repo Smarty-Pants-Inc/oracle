@@ -60,34 +60,32 @@ describe("sessionStore", () => {
     expect(fetched?.options.geminiShowThoughts).toBe(true);
   });
 
-  test("keeps meta.json authoritative across an interrupted model projection", async () => {
+  test("commits and reloads authoritative metadata when model projection directory is unavailable", async () => {
+    const model = "gpt-5.2-pro";
     const meta = await store.createSession(
-      { prompt: "Commit together", model: "gpt-5.2-pro", mode: "browser" },
+      { prompt: "Commit together", model, mode: "browser" },
       process.cwd(),
     );
     await store.updateSession(meta.id, { status: "running", mode: "browser" });
-    await store.updateModelRun(meta.id, "gpt-5.2-pro", { status: "running" });
+    await store.updateModelRun(meta.id, model, { status: "running" });
     const paths = await store.getPaths(meta.id);
-    await writeFile(
-      path.join(paths.dir, "models", "gpt-5.2-pro.json"),
-      JSON.stringify({ model: "gpt-5.2-pro", status: "error" }),
-      "utf8",
-    );
+    const modelsDirectory = path.join(paths.dir, "models");
+    await rm(modelsDirectory, { recursive: true, force: true });
+    await writeFile(modelsDirectory, "model projections unavailable", "utf8");
 
-    const interrupted = await store.readSession(meta.id);
-    expect(interrupted?.status).toBe("running");
-    expect(interrupted?.models?.find((run) => run.model === "gpt-5.2-pro")?.status).toBe("running");
-
-    await commitSessionModelProjection(meta.id, {
+    const committed = await commitSessionModelProjection(meta.id, {
       session: { status: "error", completedAt: "2026-08-05T00:00:00.000Z" },
       model: {
-        model: "gpt-5.2-pro",
+        model,
         updates: { status: "error", completedAt: "2026-08-05T00:00:00.000Z" },
       },
     });
-    const committed = await store.readSession(meta.id);
-    expect(committed?.status).toBe("error");
-    expect(committed?.models?.find((run) => run.model === "gpt-5.2-pro")?.status).toBe("error");
+
+    expect(committed.session.status).toBe("error");
+    const recovered = await store.readSession(meta.id);
+    expect(recovered?.status).toBe("error");
+    expect(recovered?.modelProjectionAuthority).toBe("session");
+    expect(recovered?.models?.find((run) => run.model === model)?.status).toBe("error");
   });
 
   test("writes per-model logs and aggregates combined log", async () => {

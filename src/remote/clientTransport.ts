@@ -41,6 +41,7 @@ export interface ResolvedRemoteTransportDeadlines {
 
 interface RequestDeadlineGuard {
   clear: () => void;
+  resetIdle: () => void;
   watchResponse: (res: http.IncomingMessage) => void;
 }
 
@@ -102,25 +103,27 @@ function attachRequestDeadlines(
   req: http.ClientRequest,
   params: { overallTimeoutMs: number; idleTimeoutMs: number; operation: string },
 ): RequestDeadlineGuard {
+  let response: http.IncomingMessage | undefined;
+  const idleTimeout = () => {
+    req.destroy(
+      new Error(`${params.operation} exceeded its ${params.idleTimeoutMs}ms idle timeout`),
+    );
+  };
+  const resetIdle = () => {
+    response?.setTimeout(params.idleTimeoutMs);
+  };
   const overallTimer = setTimeout(() => {
     req.destroy(
       new Error(`${params.operation} exceeded its ${params.overallTimeoutMs}ms overall timeout`),
     );
   }, params.overallTimeoutMs);
   overallTimer.unref();
-  req.setTimeout(params.idleTimeoutMs, () => {
-    req.destroy(
-      new Error(`${params.operation} exceeded its ${params.idleTimeoutMs}ms idle timeout`),
-    );
-  });
   return {
     clear: () => clearTimeout(overallTimer),
+    resetIdle,
     watchResponse: (res) => {
-      res.setTimeout(params.idleTimeoutMs, () => {
-        res.destroy(
-          new Error(`${params.operation} exceeded its ${params.idleTimeoutMs}ms idle timeout`),
-        );
-      });
+      response = res;
+      res.setTimeout(params.idleTimeoutMs, idleTimeout);
     },
   };
 }
@@ -478,6 +481,7 @@ export async function streamLegacyRemoteRun(params: {
           if (line) {
             try {
               const event = RemoteLegacyRunEventSchema.parse(JSON.parse(line));
+              deadlineGuard?.resetIdle();
               if (event.type === "result") result = event.result;
               else if (event.type === "error") terminalError = event.message;
               else if (event.type === "artifact-ready") hostOnlyArtifacts = true;

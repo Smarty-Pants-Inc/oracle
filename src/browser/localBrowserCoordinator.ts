@@ -34,10 +34,7 @@ import {
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,
 } from "./promptSubmissionCoordinator.js";
-import {
-  persistCompletedUnpublishedFinalization,
-  unpublishedCleanupPendingError,
-} from "./archiveSettlementCoordinator.js";
+import { unpublishedCleanupPendingError } from "./archiveSettlementCoordinator.js";
 import { detachKeptChromeProcess } from "./localExecutionContext.js";
 import { acquireLocalBrowserResources } from "./localAcquisition.js";
 import { createLocalBrowserRunState } from "./localRunState.js";
@@ -199,12 +196,6 @@ export async function runLocalBrowserMode({
     state.removeDialogHandler?.();
     removeTerminationHooks?.();
     const finalization = await lifecycle.settleIfUnpublished();
-    await persistCompletedUnpublishedFinalization(
-      finalization,
-      options.runtimeHintCb,
-      state.modelSelectionEvidence,
-      state.escapingFailure,
-    );
     if (finalization?.status === "pending") {
       // Cleanup authority deliberately supersedes the run outcome; the original failure is its cause.
       await Promise.reject(unpublishedCleanupPendingError(finalization, state.escapingFailure));

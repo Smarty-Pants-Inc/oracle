@@ -2,7 +2,11 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { readProcessStartIdentity } from "../../src/browser/filesystemLock.js";
+import {
+  acquireCrashRecoverableFilesystemLock,
+  FilesystemLockBusyError,
+  readProcessStartIdentity,
+} from "../../src/browser/filesystemLock.js";
 import { isSafeChromeTerminationOutcome } from "../../src/browser/profileState.js";
 import { createStableChildProcessChromeKill } from "../../src/browser/chromeLifecycle.js";
 import type * as FilesystemLockModule from "../../src/browser/filesystemLock.js";
@@ -18,7 +22,7 @@ import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
-import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 
 const CANONICAL_TEMP_ROOT = await realpath(os.tmpdir());
 
@@ -56,18 +60,32 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     }
   });
 
-  test("permits a default current-Windows lease with a null process generation", async () => {
+  test("permits a default current-Windows lease when both lease and lock generations are null", async () => {
     const dir = await makeTempDir("oracle-tab-leases-");
-    const readIdentity = vi.fn(async () => null);
+    const leaseReadIdentity = vi.fn(async (_pid: number, _timeoutMs?: number) => null);
+    const lockReadIdentity = vi.fn(async (_pid: number, _timeoutMs?: number) => null);
     try {
-      // Keep the host platform intact so the filesystem lock still exercises a real Darwin
-      // process generation; inject only the platform decision owned by the tab-lease layer.
+      // This test must reload the registry module so its static lock imports bind to the mocks.
       vi.resetModules();
       vi.doMock("../../src/browser/filesystemLock.js", async (importOriginal) => {
         const actual = await importOriginal<typeof FilesystemLockModule>();
-        return { ...actual, readProcessStartIdentity: readIdentity };
+        const acquireWithUnavailableCurrentIdentity: typeof actual.acquireCrashRecoverableFilesystemLock =
+          (lockPath, options, deps) =>
+            actual.acquireCrashRecoverableFilesystemLock(lockPath, options, {
+              ...deps,
+              processIdentityProvider: {
+                platform: "win32",
+                pid: process.pid,
+                readProcessLiveness: () => "alive",
+                readProcessStartIdentity: lockReadIdentity,
+              },
+            });
+        return {
+          ...actual,
+          acquireCrashRecoverableFilesystemLock: acquireWithUnavailableCurrentIdentity,
+          readProcessStartIdentity: leaseReadIdentity,
+        };
       });
-      // Reloading is required so this test binds the default identity import to the Windows timeout mock.
       const { acquireBrowserTabLease: acquireWindowsBrowserTabLease } =
         await import("../../src/browser/tabLeaseRegistry.js");
 
@@ -80,7 +98,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
       const registry = JSON.parse(
         await readFile(path.join(dir, "oracle-tab-leases.json"), "utf8"),
       ) as { leases: Array<{ id: string; processStartIdentity: string | null }> };
-      expect(readIdentity).toHaveBeenCalledWith(process.pid);
+      expect(leaseReadIdentity).toHaveBeenCalledWith(process.pid);
+      expect(lockReadIdentity).toHaveBeenCalled();
+      expect(lockReadIdentity.mock.calls.every(([pid]) => pid === process.pid)).toBe(true);
       expect(registry.leases).toEqual([
         expect.objectContaining({ id: lease.id, processStartIdentity: null }),
       ]);
@@ -88,6 +108,87 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     } finally {
       vi.doUnmock("../../src/browser/filesystemLock.js");
       vi.resetModules();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a live unknown-generation Windows registry lock busy and reclaims it only after death", async () => {
+    const dir = await makeTempDir("oracle-tab-leases-");
+    const lockPath = path.join(dir, "oracle-tab-leases.lock");
+    const contenderPid = process.pid + 100_000;
+    let ownerAlive = true;
+    const contenderIdentity = vi.fn(async (pid: number) =>
+      pid === contenderPid ? "win32:contender-generation" : "win32:replacement-generation",
+    );
+    const acquireContender = () =>
+      acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        {},
+        {
+          processIdentityProvider: {
+            platform: "win32",
+            pid: contenderPid,
+            readProcessLiveness: (pid) => (pid === process.pid && !ownerAlive ? "dead" : "alive"),
+            readProcessStartIdentity: contenderIdentity,
+          },
+        },
+      );
+    try {
+      const unavailableIdentity = async () => null;
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          {},
+          {
+            processIdentityProvider: {
+              platform: "win32",
+              pid: process.pid,
+              readProcessLiveness: () => "alive",
+              readProcessStartIdentity: unavailableIdentity,
+            },
+          },
+        ),
+      ).rejects.toThrow(/without a stable process generation/i);
+      await expect(
+        acquireCrashRecoverableFilesystemLock(
+          lockPath,
+          { processGenerationPolicy: "allow-unstable-current-win32" },
+          {
+            processIdentityProvider: {
+              platform: "win32",
+              pid: contenderPid,
+              readProcessLiveness: () => "alive",
+              readProcessStartIdentity: unavailableIdentity,
+            },
+          },
+        ),
+      ).rejects.toThrow(/without a stable process generation/i);
+      const owner = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { processGenerationPolicy: "allow-unstable-current-win32" },
+        {
+          processIdentityProvider: {
+            platform: "win32",
+            pid: process.pid,
+            readProcessLiveness: () => "alive",
+            readProcessStartIdentity: async () => null,
+          },
+        },
+      );
+      expect(owner.owner.processStartIdentity).toBeNull();
+
+      await expect(acquireContender()).rejects.toBeInstanceOf(FilesystemLockBusyError);
+      expect(contenderIdentity.mock.calls.every(([pid]) => pid === contenderPid)).toBe(true);
+
+      ownerAlive = false;
+      const replacement = await acquireContender();
+      expect(replacement.owner).toMatchObject({
+        pid: contenderPid,
+        processStartIdentity: "win32:contender-generation",
+      });
+      await replacement.release();
+      await owner.release();
+    } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
