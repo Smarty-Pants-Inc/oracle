@@ -53,7 +53,6 @@ interface GeminiDomProviderState {
 
 interface GeminiRawTurnDescriptor {
   kind: "user" | "response";
-  postBaseline: boolean;
   text: string;
   stableId: string | null;
   completionMarked?: boolean;
@@ -227,11 +226,9 @@ function parseResponseProbe(payload: string | undefined): GeminiRawTurnDescripto
         !entry ||
         typeof entry !== "object" ||
         !("kind" in entry) ||
-        !("postBaseline" in entry) ||
         !("text" in entry) ||
         !("stableId" in entry) ||
         (entry.kind !== "user" && entry.kind !== "response") ||
-        typeof entry.postBaseline !== "boolean" ||
         typeof entry.text !== "string" ||
         (typeof entry.stableId !== "string" && entry.stableId !== null)
       ) {
@@ -239,7 +236,6 @@ function parseResponseProbe(payload: string | undefined): GeminiRawTurnDescripto
       }
       entries.push({
         kind: entry.kind,
-        postBaseline: entry.postBaseline,
         text: entry.text,
         stableId: entry.stableId,
         ...(entry.kind === "response"
@@ -296,17 +292,14 @@ function findCausallyPairedResponse(
   if (submittedUserIndex < 0) return { status: "waiting" };
 
   const submittedUser = entries[submittedUserIndex];
-  if (
-    !submittedUser.postBaseline ||
-    normalizePromptForIdentity(submittedUser.text) !== baseline.normalizedPrompt
-  ) {
+  if (normalizePromptForIdentity(submittedUser.text) !== baseline.normalizedPrompt) {
     return { status: "waiting" };
   }
   const completedResponses: Array<GeminiRawTurnDescriptor & { kind: "response" }> = [];
   for (let index = submittedUserIndex + 1; index < entries.length; index += 1) {
     const entry = entries[index];
     if (entry.kind === "user") break;
-    if (entry.postBaseline && isCompletedGeminiResponse(entry)) completedResponses.push(entry);
+    if (isCompletedGeminiResponse(entry)) completedResponses.push(entry);
   }
   if (completedResponses.length === 0) return { status: "waiting" };
   if (completedResponses.length > 1) {
@@ -635,17 +628,15 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
         const userTurns = Array.from(document.querySelectorAll(${userQuerySel}));
         const responseTurns = Array.from(document.querySelectorAll(${responseTurnSel}));
         const ordered = [
-          ...userTurns.map((node, index) => ({
+          ...userTurns.map((node) => ({
             node,
             kind: 'user',
-            postBaseline: index >= ${baseline.userQueryCount},
             text: node.querySelector(${userQueryTextSel})?.textContent ?? node.textContent ?? '',
             stableId: readStableId(node),
           })),
-          ...responseTurns.map((node, index) => ({
+          ...responseTurns.map((node) => ({
             node,
             kind: 'response',
-            postBaseline: index >= ${baseline.responseCount},
             text: node.querySelector(${responseTextSel})?.textContent ?? '',
             stableId: readStableId(node),
             completionMarked: Boolean(node.querySelector(${responseCompleteSel})),
@@ -670,13 +661,11 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
         state.geminiResponseStableId = pairing.response.stableId ?? undefined;
         break;
       }
-      const postBaselineResponses = entries.filter(
-        (entry) => entry.kind === "response" && entry.postBaseline,
-      );
+      const responses = entries.filter((entry) => entry.kind === "response");
       const status =
-        postBaselineResponses.length === 0
+        responses.length === 0
           ? "waiting"
-          : postBaselineResponses[postBaselineResponses.length - 1]?.visibleSpinner
+          : responses[responses.length - 1]?.visibleSpinner
             ? "generating"
             : "streaming";
       const now = Date.now();
@@ -803,14 +792,12 @@ export async function recoverCommittedGeminiDeepThinkResponse(
           ...userTurns.map((node) => ({
             node,
             kind: 'user',
-            postBaseline: true,
             text: node.querySelector(${userQueryTextSel})?.textContent ?? node.textContent ?? '',
             stableId: readStableId(node),
           })),
           ...responseTurns.map((node) => ({
             node,
             kind: 'response',
-            postBaseline: true,
             text: node.querySelector(${responseTextSel})?.textContent ?? '',
             stableId: readStableId(node),
             completionMarked: Boolean(node.querySelector(${responseCompleteSel})),

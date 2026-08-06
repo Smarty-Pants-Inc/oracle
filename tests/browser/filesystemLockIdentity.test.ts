@@ -11,14 +11,14 @@ import type {
   ProcessLiveness,
 } from "../../src/browser/filesystemLock.js";
 import { createPlatformProcessGenerationProvider } from "../../src/browser/platformProcessGeneration.js";
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 import { createProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
-const WINDOWS_TRUSTED_PROCESS_PROBE = String.raw`\\?\GLOBALROOT\SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`;
 
 test("ignores a hostile PATH when reading an exact Windows CIM creation generation", async () => {
   const attackerPowerShell = vi.fn(async () => ({ stdout: "1900-01-01T00:00:00.0000000Z\n" }));
   const execute = vi.fn(async (file: string, _args: string[]) => {
     if (file === "powershell.exe") return attackerPowerShell();
-    if (file !== WINDOWS_TRUSTED_PROCESS_PROBE) {
+    if (file !== resolveWindowsPowerShellExecutable()) {
       throw new Error(`Unexpected process probe: ${file}`);
     }
     return { stdout: "2026-08-05T12:34:56.1234567Z\n" };
@@ -34,7 +34,7 @@ test("ignores a hostile PATH when reading an exact Windows CIM creation generati
   expect(retryIdentity).toBe(identity);
   expect(attackerPowerShell).not.toHaveBeenCalled();
   expect(execute).toHaveBeenCalledTimes(2);
-  expect(execute.mock.calls[0]?.[0]).toBe(WINDOWS_TRUSTED_PROCESS_PROBE);
+  expect(execute.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());
   expect(execute.mock.calls[0]?.[1]?.at(-1)).toContain(
     "Get-CimInstance Win32_Process -Filter 'ProcessId = 10005'",
   );
@@ -81,7 +81,7 @@ test("rejects an inherited attacker SystemRoot before the Windows process probe 
     await expect(provider.readProcessGeneration(10_005)).resolves.toBe(
       "win32:2026-08-05T12:34:56.1234567Z",
     );
-    expect(execute.mock.calls[0]?.[0]).toBe(WINDOWS_TRUSTED_PROCESS_PROBE);
+    expect(execute.mock.calls[0]?.[0]).toBe(resolveWindowsPowerShellExecutable());
     expect(execute.mock.calls[0]?.[0]).not.toContain(attackerSystemRoot);
   } finally {
     if (originalSystemRoot === undefined) delete process.env.SystemRoot;

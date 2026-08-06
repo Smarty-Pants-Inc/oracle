@@ -10,11 +10,15 @@ import {
   recoverCommittedGeminiDeepThinkResponse,
 } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 
+type FixtureStableIdAttribute = "data-message-id" | "data-query-id" | "data-turn-id";
+
 type FixtureTurn = {
   kind: "user" | "response";
   order: number;
   text: string;
   stableId?: string;
+  stableIdAttribute?: FixtureStableIdAttribute;
+  stableIdDescendant?: boolean;
   complete?: boolean;
   visibleSpinner?: boolean;
   thoughts?: string;
@@ -37,6 +41,17 @@ type GeminiState = Record<string, unknown> & {
 };
 
 class FixtureHTMLElement {}
+class FixtureStableIdNode extends FixtureHTMLElement {
+  constructor(private readonly turn: FixtureTurn) {
+    super();
+  }
+
+  getAttribute(name: string): string | null {
+    return name === (this.turn.stableIdAttribute ?? "data-message-id")
+      ? (this.turn.stableId ?? null)
+      : null;
+  }
+}
 
 class FixtureThoughts extends FixtureHTMLElement {
   constructor(private readonly turn: FixtureTurn) {
@@ -85,7 +100,9 @@ class FixtureNode extends FixtureHTMLElement {
   }
 
   getAttribute(name: string): string | null {
-    if (name === "data-message-id") return this.turn.stableId ?? null;
+    if (this.turn.stableIdDescendant) return null;
+    if (name === (this.turn.stableIdAttribute ?? "data-message-id"))
+      return this.turn.stableId ?? null;
     if (name === "aria-hidden") return null;
     return null;
   }
@@ -110,9 +127,16 @@ class FixtureNode extends FixtureHTMLElement {
     return null;
   }
 
-  querySelectorAll(selector: string): FixtureNode[] {
+  querySelectorAll(selector: string): Array<FixtureNode | FixtureStableIdNode> {
     if (selector.includes("progressbar")) return this.turn.visibleSpinner ? [this] : [];
-    if (selector.includes("data-message-id")) return this.turn.stableId ? [this] : [];
+    if (
+      this.turn.stableId &&
+      ["data-message-id", "data-query-id", "data-turn-id"].some((attribute) =>
+        selector.includes(attribute),
+      )
+    ) {
+      return this.turn.stableIdDescendant ? [new FixtureStableIdNode(this.turn)] : [this];
+    }
     return [];
   }
 }
@@ -428,6 +452,75 @@ describe("geminiDeepThinkDomProvider", () => {
       text: "current answer",
     });
   });
+  it("keeps stable-ID causality when virtualized history contracts before the answer mounts", async () => {
+    const turns: FixtureTurn[] = [
+      { kind: "user", order: 1, text: "earlier request", stableId: "user-earlier" },
+      {
+        kind: "response",
+        order: 2,
+        text: "earlier answer",
+        stableId: "response-earlier",
+        complete: true,
+      },
+      { kind: "user", order: 3, text: "new request", stableId: "user-current" },
+    ];
+    const ctx = createContext(turns, responseState({ userQueryCount: 1, responseCount: 1 }));
+    let answerMounted = false;
+    ctx.delay = async () => {
+      if (answerMounted) return;
+      answerMounted = true;
+      turns.splice(0, 2);
+      turns.push({
+        kind: "response",
+        order: 4,
+        text: "current answer",
+        stableId: "response-current",
+        complete: true,
+      });
+    };
+
+    await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).resolves.toEqual({
+      text: "current answer",
+    });
+  });
+
+  it.each([
+    ["data-message-id on the turn", "data-message-id", false],
+    ["data-query-id on the turn", "data-query-id", false],
+    ["data-turn-id on the turn", "data-turn-id", false],
+    ["data-message-id on a descendant", "data-message-id", true],
+  ] as const)(
+    "uses %s as the immutable response authority",
+    async (_placement, attribute, descendant) => {
+      const turns: FixtureTurn[] = [
+        {
+          kind: "user",
+          order: 1,
+          text: "new request",
+          stableId: "user-current",
+          stableIdAttribute: attribute,
+          stableIdDescendant: descendant,
+        },
+        {
+          kind: "response",
+          order: 2,
+          text: "exact answer",
+          stableId: "response-current",
+          stableIdAttribute: attribute,
+          stableIdDescendant: descendant,
+          complete: true,
+        },
+      ];
+      const state = responseState({ userStableId: `${attribute}:user-current` });
+
+      await expect(
+        geminiDeepThinkDomProvider.waitForResponse(createContext(turns, state)),
+      ).resolves.toEqual({
+        text: "exact answer",
+      });
+      expect(state.geminiResponseStableId).toBe(`${attribute}:response-current`);
+    },
+  );
 
   it("fails unsupported when the exact completed response has no stable provider id", async () => {
     const turns: FixtureTurn[] = [

@@ -521,6 +521,77 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
   });
 
+  it("advances local target authority only after durable progress persists", async () => {
+    const close = vi.fn(async () => ({ status: "completed" as const }));
+    const persistRuntime = vi.fn(async (runtime: BrowserRuntimeMetadata) => runtime);
+    const authority = new LocalOwnedBrowserResourceAuthority({
+      ownerId: "test-owner",
+      purpose: "Persistence-gated authority test",
+      targetLabel: "Persistence-gated target",
+      userDataDir: profileDirectory.canonicalPath,
+      profileDirectoryIdentity: profileDirectory,
+      profileKind: "temporary",
+      keepBrowser: false,
+      closeOwnedTargetOnComplete: true,
+      generationId: "persistence-gated-generation",
+      processOwnerProvenance: "temporary-launch",
+      processLaunchClaim: {
+        version: 1,
+        generationId: "persistence-gated-generation",
+        nonce: "90000000-0000-4000-8000-000000000009",
+      },
+      processOwnerDisposition: "close-on-last-lease",
+      targetMarkerUrl: "about:blank#persistence-gated-generation",
+      logger: vi.fn<(message: string) => void>(),
+      persistRuntime,
+    });
+    await authority.journalAcquisition({
+      resource: "chrome-target",
+      acquire: async () => ({ targetId: "persistence-gated-target" }),
+      authority: ({ targetId }) => ({
+        targetId,
+        capability: retainChromeTargetCloseCapability({
+          ownerId: "test-owner",
+          generationId: "persistence-gated-generation",
+          targetId,
+          close,
+        }),
+      }),
+    });
+    persistRuntime.mockRejectedValueOnce(new Error("progress store unavailable"));
+
+    await expect(authority.closeTargetForRetry()).rejects.toThrow(
+      "Browser authority progress could not be persisted: progress store unavailable",
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(
+      authority.projectRuntime(
+        {},
+        {
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
+        },
+      ),
+    ).toMatchObject({
+      chromeTargetId: "persistence-gated-target",
+      recoveryCleanupResources: [
+        expect.objectContaining({ chromeTargetId: "persistence-gated-target" }),
+      ],
+    });
+
+    await expect(authority.closeTargetForRetry()).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(
+      authority.projectRuntime(
+        {},
+        {
+          keepBrowser: false,
+          closeOwnedTargetOnComplete: true,
+        },
+      ).recoveryCleanupResources,
+    ).toBeUndefined();
+  });
+
   it("projects one owned resource and retries in target, lease, process order", async () => {
     const events: string[] = [];
     const persistedRuntimes: BrowserRuntimeMetadata[] = [];

@@ -11,6 +11,7 @@ import {
   BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES,
   runBridgeHost,
 } from "../../src/cli/bridge/host.js";
+import { startReverseTunnel } from "../../src/cli/bridge/reverseTunnel.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import type { RemoteServerLifecycle, RemoteServerOptions } from "../../src/remote/server.js";
 import {
@@ -129,6 +130,7 @@ function createFakeSshChild(io?: net.Socket, pid = 5000): FakeSshChild {
     signalCode = signal;
     io?.destroy();
     emitter.emit("exit", code, signal);
+    emitter.emit("close", code, signal);
   };
   const kill = vi.fn(() => {
     if (exited) return false;
@@ -947,9 +949,8 @@ describe.each([
         expect(harness.controlChildren).toHaveLength(platform === "win32" ? 0 : 2);
         expect(harness.probeChildren).toHaveLength(2);
         expect(harness.sshChildren).toHaveLength(platform === "win32" ? 3 : 5);
-        for (const child of [...harness.mainChildren, ...harness.probeChildren]) {
-          expect(child.kill).toHaveBeenCalledOnce();
-        }
+        expect(harness.mainChildren[0]!.kill).not.toHaveBeenCalled();
+        for (const child of harness.probeChildren) expect(child.kill).toHaveBeenCalledOnce();
         for (const child of harness.controlChildren) expect(child.kill).not.toHaveBeenCalled();
         if (backgroundChild) {
           expect(Buffer.concat(readinessWrites).toString("utf8")).toBe(
@@ -965,6 +966,80 @@ describe.each([
       }
     },
   );
+});
+
+describe("reverse tunnel shutdown drain", () => {
+  it("keeps stop pending until the live SSH child exits", async () => {
+    const healthServer = http.createServer((req, res) =>
+      writeHealthResponse(req, res, MODERN_TOKEN),
+    );
+    const healthPort = await listenLoopback(healthServer);
+    const harness = createFakeSshTunnelHarness("win32", healthPort);
+    const tunnel = startReverseTunnel({
+      sshTarget: "synthetic-host",
+      remotePort: 9473,
+      localPort: 9473,
+      token: MODERN_TOKEN,
+      log: () => undefined,
+      platform: "win32",
+      spawnSsh: harness.tunnelSpawn,
+      shutdownTimeoutMs: 1_000,
+    });
+
+    try {
+      await tunnel.ready;
+      const master = harness.mainChildren[0]!;
+      master.kill.mockImplementation(() => true);
+      const settled = vi.fn();
+      const stop = Promise.resolve(tunnel.stop()).then(settled);
+
+      await Promise.resolve();
+      expect(master.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(settled).not.toHaveBeenCalled();
+
+      master.exit(0);
+      await stop;
+      expect(settled).toHaveBeenCalledOnce();
+    } finally {
+      harness.mainChildren[0]?.exit(0);
+      await Promise.resolve(tunnel.stop()).catch(() => undefined);
+      await closeServer(healthServer);
+    }
+  });
+
+  it("force-kills an SSH child that misses the graceful shutdown deadline", async () => {
+    const healthServer = http.createServer((req, res) =>
+      writeHealthResponse(req, res, MODERN_TOKEN),
+    );
+    const healthPort = await listenLoopback(healthServer);
+    const harness = createFakeSshTunnelHarness("win32", healthPort);
+    const tunnel = startReverseTunnel({
+      sshTarget: "synthetic-host",
+      remotePort: 9473,
+      localPort: 9473,
+      token: MODERN_TOKEN,
+      log: () => undefined,
+      platform: "win32",
+      spawnSsh: harness.tunnelSpawn,
+      shutdownTimeoutMs: 5,
+    });
+
+    try {
+      await tunnel.ready;
+      const master = harness.mainChildren[0]!;
+      master.kill.mockImplementation((signal?: NodeJS.Signals | number) => {
+        if (signal === "SIGKILL") master.exit(0);
+        return true;
+      });
+
+      await tunnel.stop();
+      expect(master.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    } finally {
+      harness.mainChildren[0]?.exit(0);
+      await Promise.resolve(tunnel.stop()).catch(() => undefined);
+      await closeServer(healthServer);
+    }
+  });
 });
 
 describe("native Windows OpenSSH bridge tunnel contract", () => {
