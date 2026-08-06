@@ -56,7 +56,14 @@ import {
   refreshAttachRuntime,
 } from "./reattachTargetAuthority.js";
 import { createReattachSettlement } from "./reattachSettlement.js";
-export { retryBrowserRecoveryCleanup } from "./reattachSettlement.js";
+export {
+  retryBrowserRecoveryCleanup,
+  settleBrowserRecoveryCleanup,
+  bindCurrentBrowserRecoveryRuntime,
+  type BrowserRecoverySettlementOutcome,
+  type BrowserRecoverySettlementDeps,
+  type BrowserRecoverySettlementMode,
+} from "./reattachSettlement.js";
 
 type ReattachRecoveryClassification = "stale-runtime" | "recoverable-transport";
 
@@ -190,10 +197,13 @@ export async function resumeBrowserSession(
     if (recoveryLock) return;
     recoveryLock = await acquireRecoveryLock(lockPath);
   };
-  const releaseRecoveryLock = async (): Promise<void> => {
+  const releaseRecoveryLock = async (finalize?: () => Promise<void>): Promise<void> => {
     const heldLock = recoveryLock;
-    if (!heldLock) return;
-    await heldLock.release();
+    if (!heldLock) {
+      await finalize?.();
+      return;
+    }
+    await heldLock.release(finalize);
     if (recoveryLock === heldLock) recoveryLock = null;
   };
   const recoverSession =

@@ -99,7 +99,7 @@ export interface BrowserRecoveryCleanupMetadata {
   ownsTarget: boolean;
   profileKind: BrowserRecoveryProfileKind;
   keepBrowser: boolean;
-  /** Exact per-run finalize decision for the owned target. Abort ignores this and closes owned targets. */
+  /** Exact per-run target-close decision, honored identically by finalize and abort recovery. */
   closeOwnedTargetOnComplete?: boolean;
 }
 
@@ -109,6 +109,8 @@ export interface BrowserRecoveryCleanupResultMetadata {
   status: "pending" | "failed";
   error?: string;
   settlementMode?: "finalize" | "abort";
+  /** Cleanup effects completed, but durable recovery-lock release has not yet completed. */
+  lockReleasePending?: true;
   classification?: BrowserRecoveryCleanupFailureClassification;
 }
 

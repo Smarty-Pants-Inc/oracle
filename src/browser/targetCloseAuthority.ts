@@ -156,6 +156,27 @@ export async function closeChromeTargetWithRetainedCapability(options: {
   }
 }
 
+/** Drops a live close capability after durable intentional target preservation. */
+export async function discardChromeTargetCloseCapability(options: {
+  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
+  targetId: string;
+}): Promise<void> {
+  const { capability, targetId } = options;
+  if (!isBrowserRecoveryTargetCloseCapability(capability)) return;
+  const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
+  if (
+    !authority ||
+    authority.generationId !== capability.generationId ||
+    authority.targetId !== targetId
+  ) {
+    return;
+  }
+  await authority.release?.();
+  if (retainedTargetCloseAuthorities.get(capability.capabilityId) === authority) {
+    retainedTargetCloseAuthorities.delete(capability.capabilityId);
+  }
+}
+
 /** Releases a terminal capability only after its exact target cleanup state is durable. */
 export function acknowledgeChromeTargetCloseCapability(options: {
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;

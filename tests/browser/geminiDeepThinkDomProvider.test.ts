@@ -308,7 +308,7 @@ describe("geminiDeepThinkDomProvider", () => {
     );
   });
 
-  it("commits and captures the exact accepted Gemini turn without a provider id", async () => {
+  it("commits a provider-id-less turn but refuses live publication after history shift", async () => {
     const turns: FixtureTurn[] = [];
     const state: GeminiState = { inputTimeoutMs: 1_000, timeoutMs: 1_000 };
     const ctx = createContext(turns, state, (notify) => {
@@ -336,16 +336,34 @@ describe("geminiDeepThinkDomProvider", () => {
       userStableId: null,
     });
 
-    turns.push({
-      kind: "response",
-      order: 2,
-      text: "accepted answer",
-      stableId: "response-current",
-      complete: true,
+    turns.splice(
+      0,
+      turns.length,
+      { kind: "user", order: 1, text: "new request" },
+      {
+        kind: "response",
+        order: 2,
+        text: "wrong repeated-prompt answer",
+        stableId: "response-older",
+        complete: true,
+      },
+      { kind: "user", order: 3, text: "new request" },
+      {
+        kind: "response",
+        order: 4,
+        text: "unidentifiable original answer",
+        stableId: "response-current",
+        complete: true,
+      },
+    );
+    await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        code: "gemini-live-response-authority-unavailable",
+        reattachable: false,
+      },
     });
-    await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).resolves.toEqual({
-      text: "accepted answer",
-    });
+    expect(state.geminiResponseStableId).toBeUndefined();
   });
 
   it("rejects stale and later-turn responses while publishing only the exact current answer", async () => {

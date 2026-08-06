@@ -23,13 +23,15 @@ export interface RetainedFilesystemLockRelease {
   readonly key: string;
   readonly lockPath: string;
   readonly generation: FilesystemLockReleaseGeneration;
-  release: () => Promise<void>;
+  release: (finalize?: () => Promise<void>) => Promise<void>;
 }
 
 type RetainedReleaseEntry = RetainedFilesystemLockRelease & {
   pending: boolean;
+  released: boolean;
   attempt: () => Promise<void>;
   inFlight?: Promise<void>;
+  finalize?: () => Promise<void>;
 };
 
 const retainedReleases = new Map<string, RetainedReleaseEntry>();
@@ -49,14 +51,20 @@ export function retainFilesystemLockRelease(
     lockPath: canonicalPath,
     generation,
     pending: false,
+    released: false,
     attempt,
-    release: async () => {
+    release: async (finalize) => {
+      if (finalize) entry.finalize ??= finalize;
       if (!retainedReleases.has(key)) return;
       if (entry.inFlight) return entry.inFlight;
       let currentAttempt!: Promise<void>;
       currentAttempt = (async () => {
         try {
-          await entry.attempt();
+          if (!entry.released) {
+            await entry.attempt();
+            entry.released = true;
+          }
+          await entry.finalize?.();
           retainedReleases.delete(key);
         } catch (error) {
           entry.pending = true;

@@ -24,7 +24,7 @@ vi.mock("../../src/browser/sessionRunner.ts", () => ({
 
 vi.mock("../../src/browser/reattach.ts", () => ({
   resumeBrowserSession: vi.fn(),
-  retryBrowserRecoveryCleanup: vi.fn(),
+  settleBrowserRecoveryCleanup: vi.fn(),
 }));
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 vi.mock("../../src/cli/durableAnswer.ts", async () => {
@@ -65,6 +65,7 @@ import type {
   SessionMetadata,
   SessionModelRun,
 } from "../../src/sessionManager.ts";
+import * as sessionManager from "../../src/sessionManager.ts";
 import type { ModelName } from "../../src/oracle.ts";
 import { performSessionRun } from "../../src/cli/sessionRunner.ts";
 import {
@@ -87,8 +88,9 @@ import {
 import { sendSessionNotification } from "../../src/cli/notifier.ts";
 import { getCliVersion } from "../../src/version.ts";
 import { deriveModelOutputPath } from "../../src/cli/sessionRunner.ts";
-import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
+import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
+import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
 import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
 
 const baseSessionMeta: SessionMetadata = {
@@ -272,7 +274,7 @@ beforeEach(async () => {
   });
   vi.mocked(runMultiModelApiSession).mockReset();
   vi.mocked(resumeBrowserSession).mockReset();
-  vi.mocked(retryBrowserRecoveryCleanup).mockReset();
+  vi.mocked(settleBrowserRecoveryCleanup).mockReset();
   vi.mocked(runBrowserSessionExecution).mockReset();
   vi.mocked(ensureSessionArtifacts).mockReset();
   vi.mocked(persistDurableBrowserAnswer).mockReset();
@@ -1754,6 +1756,49 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("does not project an unreconciled browser publication intent as an artifact", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      chromeTargetId: "unreconciled-publication-target",
+      tabUrl: "https://chatgpt.com/c/unreconciled-publication",
+    };
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText: "answer that was never persisted",
+      bindSettlement: vi.fn(),
+      finalize: vi.fn(),
+      abort: vi.fn(),
+    });
+    vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal")
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("journal reconciliation read failed"));
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockRejectedValueOnce(
+      new Error("journal write failed before answer persistence"),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("publication recovery remains pending");
+
+    expect(persistDurableBrowserAnswer).not.toHaveBeenCalled();
+    const errorUpdate = sessionStoreMock.updateSession.mock.calls.find(
+      (call) => call[1]?.status === "error",
+    )?.[1];
+    expect(errorUpdate).toBeDefined();
+    expect(errorUpdate).not.toHaveProperty("artifacts");
+  });
+
   test("writes browser answers to disk when writeOutputPath provided", async () => {
     const runtime: BrowserRuntimeMetadata = {
       chromePid: 1,
@@ -2227,10 +2272,13 @@ describe("performSessionRun", () => {
         settlementMode: "abort",
       },
     };
-    vi.mocked(retryBrowserRecoveryCleanup).mockResolvedValueOnce({
-      status: "pending",
-      runtime: retainedRuntime,
-      error: "Chrome process launch discovery is temporarily unavailable",
+    vi.mocked(settleBrowserRecoveryCleanup).mockResolvedValueOnce({
+      finalization: {
+        status: "pending",
+        runtime: retainedRuntime,
+        error: "Chrome process launch discovery is temporarily unavailable",
+      },
+      persistence: { status: "persisted" },
     });
 
     await expect(
@@ -2251,7 +2299,7 @@ describe("performSessionRun", () => {
       }),
     ).rejects.toThrow(/acquisition cleanup remains pending/i);
 
-    expect(retryBrowserRecoveryCleanup).toHaveBeenCalledWith(
+    expect(settleBrowserRecoveryCleanup).toHaveBeenCalledWith(
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
@@ -2284,9 +2332,9 @@ describe("performSessionRun", () => {
       runtime: freshRuntime,
     }));
     const abort = vi.fn(async () => ({ status: "completed" as const, runtime: freshRuntime }));
-    vi.mocked(retryBrowserRecoveryCleanup).mockResolvedValueOnce({
-      status: "completed",
-      runtime: recoveredRuntime,
+    vi.mocked(settleBrowserRecoveryCleanup).mockResolvedValueOnce({
+      finalization: { status: "completed", runtime: recoveredRuntime },
+      persistence: { status: "persisted" },
     });
     vi.mocked(runBrowserSessionExecution).mockResolvedValueOnce({
       usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
@@ -2314,13 +2362,13 @@ describe("performSessionRun", () => {
       version: cliVersion,
     });
 
-    expect(retryBrowserRecoveryCleanup).toHaveBeenCalledWith(
+    expect(settleBrowserRecoveryCleanup).toHaveBeenCalledWith(
       pendingRuntime,
       expect.any(Function),
       expect.any(Object),
       "abort",
     );
-    expect(vi.mocked(retryBrowserRecoveryCleanup).mock.invocationCallOrder[0]).toBeLessThan(
+    expect(vi.mocked(settleBrowserRecoveryCleanup).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(runBrowserSessionExecution).mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
     );
     expect(finalize).toHaveBeenCalledOnce();
@@ -2363,7 +2411,7 @@ describe("performSessionRun", () => {
       }),
     ).rejects.toThrow(/authority is incomplete or malformed/i);
 
-    expect(retryBrowserRecoveryCleanup).not.toHaveBeenCalled();
+    expect(settleBrowserRecoveryCleanup).not.toHaveBeenCalled();
     expect(runBrowserSessionExecution).not.toHaveBeenCalled();
     expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
       status: "error",
@@ -2435,7 +2483,7 @@ describe("performSessionRun", () => {
       }),
     ).rejects.toThrow(/authority is incomplete or malformed/i);
 
-    expect(retryBrowserRecoveryCleanup).not.toHaveBeenCalled();
+    expect(settleBrowserRecoveryCleanup).not.toHaveBeenCalled();
     expect(runBrowserSessionExecution).not.toHaveBeenCalled();
     expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
       status: "error",
@@ -3113,6 +3161,98 @@ describe("performSessionRun", () => {
     );
   });
 
+  test("preserves provider-id-less Gemini cleanup authority without advertising reattach", async () => {
+    const runtime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "gemini-target-synthetic",
+      conversationId: "gemini-target-synthetic",
+      promptEpoch: {
+        status: "committed" as const,
+        epochId: "gemini-epoch-synthetic",
+        promptSha256: "e".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "gemini-dom-turn:0:synthetic",
+        verifiedUserMessageId: "gemini-dom-turn:0:synthetic",
+        conversationId: "gemini-target-synthetic",
+      },
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "gemini-target-synthetic",
+          conversationId: "gemini-target-synthetic",
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login" as const,
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" as const },
+    } satisfies BrowserRuntimeMetadata;
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Gemini response identity is unavailable after commit", {
+        stage: "gemini-response-capture",
+        code: "gemini-reattach-authority-unavailable",
+        reattachable: false,
+        runtime,
+      }),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          chromePath: null,
+          desiredModel: "gemini-3-pro-deep-think",
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("Gemini response identity is unavailable after commit");
+
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+    expect(vi.mocked(settleBrowserRecoveryCleanup)).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      browser: { runtime },
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+      error: {
+        category: "browser-automation",
+        details: {
+          stage: "gemini-response-capture",
+          code: "gemini-reattach-authority-unavailable",
+          reattachable: false,
+        },
+      },
+    });
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({
+        status: "error",
+        response: { status: "error", incompleteReason: "incomplete-capture" },
+      }),
+    );
+    const logLines = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logLines).toContain(
+      'run "oracle session sess-1" to retry owned browser cleanup without resubmitting',
+    );
+    expect(logLines).not.toContain("keeping session running");
+    expect(logLines).not.toContain("--render");
+    expect(logLines).not.toContain("--live");
+    expect(logLines).not.toContain("--harvest");
+  });
+
   test("records runtime and guidance when cloudflare challenge is detected", async () => {
     const automationError = new BrowserAutomationError(
       "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.",
@@ -3746,6 +3886,59 @@ describe("performSessionRun", () => {
     expect(
       vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.(),
     ).toBe(false);
+  });
+
+  test("does not project an unverified receipt after ambiguous auto journal recovery", async () => {
+    const initialRuntime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      tabUrl: "https://chatgpt.com/c/demo",
+      ...committedDemoAuthority,
+    } satisfies BrowserRuntimeMetadata;
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("assistant timed out", {
+        stage: "assistant-timeout",
+        runtime: initialRuntime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValue(
+      createReattachResult("captured answer", "captured answer", initialRuntime).value,
+    );
+    vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal")
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("journal reconciliation read failed"));
+    vi.spyOn(
+      browserPublicationJournal,
+      "writeBrowserCapturePublicationJournal",
+    ).mockRejectedValueOnce(new Error("journal write failed before answer persistence"));
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          chromePath: null,
+          autoReattachDelayMs: 0,
+          autoReattachIntervalMs: 1,
+          autoReattachTimeoutMs: 1000,
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow("publication recovery remains pending");
+
+    const failureUpdate = sessionStoreMock.updateSession.mock.calls
+      .map(([, updates]) => updates)
+      .findLast((updates) => updates.status === "error");
+    expect(failureUpdate).toMatchObject({
+      status: "error",
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+    });
+    expect(failureUpdate?.artifacts).toBeUndefined();
+    expect(vi.mocked(persistDurableBrowserAnswer)).not.toHaveBeenCalled();
   });
 
   test("auto-reattach stops after a hard cap when it cannot capture an answer", async () => {

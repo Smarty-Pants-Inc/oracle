@@ -2,15 +2,24 @@ import chalk from "chalk";
 import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
+import type {
+  BrowserCaptureFinalizationResult,
+  BrowserLogger,
+  BrowserRunTransaction,
+} from "../browser/types.js";
 import {
+  bindCurrentBrowserRecoveryRuntime,
   resumeBrowserSession,
-  retryBrowserRecoveryCleanup,
+  settleBrowserRecoveryCleanup,
   type ReattachResult,
 } from "../browser/reattach.js";
-import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
+import {
+  OwnedBrowserResourceTransaction,
+  projectBrowserCaptureFinalization,
+} from "../browser/ownedBrowserResources.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/profileState.js";
+import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "../browser/reattachLock.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
@@ -26,11 +35,12 @@ import {
 import { estimateTokenCount } from "../browser/utils.js";
 import {
   createBrowserCapturePublicationAcknowledgement,
-  durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
+  persistBrowserCaptureFinalizationState,
   publishCompletedBrowserCapture,
   readDurableBrowserAnswer,
   runtimeFromBrowserError,
+  verifiedDurableBrowserAnswerReceiptFromError,
   type BrowserCapturePublicationAcknowledgement,
   type DurableBrowserAnswerReceipt,
 } from "./durableAnswer.js";
@@ -38,8 +48,6 @@ import {
   clearBrowserCapturePublicationJournal,
   readBrowserCapturePublicationJournal,
   sanitizeBrowserPublicationMessage,
-  sanitizeBrowserPublicationRuntime,
-  writeBrowserCapturePublicationJournal,
   type BrowserCapturePublicationJournal,
 } from "./browserPublicationJournal.js";
 import {
@@ -79,12 +87,41 @@ export async function orchestrateBrowserAttachAuthority(
 ): Promise<SessionMetadata> {
   let metadata = initialMetadata;
   let publicationJournal = await readBrowserCapturePublicationJournal(sessionId);
+  let runtime = publicationJournal?.runtime ?? metadata.browser?.runtime;
+  const controllerPid = runtime?.controllerPid;
+  const workerPid = metadata.lifecycle?.workerPid;
+  const controllerAlive = typeof controllerPid === "number" && isProcessAlive(controllerPid);
+  const workerAlive = typeof workerPid === "number" && isProcessAlive(workerPid);
+  const completedRuntime = metadata.browser?.runtime;
+  if (
+    publicationJournal &&
+    metadata.status === "completed" &&
+    completedRuntime !== undefined &&
+    !completedRuntime.recoveryCleanupResources?.length &&
+    !completedRuntime.recoveryCleanupResult &&
+    hasDurableBrowserAnswerReceipt(metadata, publicationJournal.receipt)
+  ) {
+    try {
+      await clearBrowserCapturePublicationJournal(sessionId);
+      publicationJournal = null;
+    } catch (error) {
+      console.log(
+        chalk.yellow(
+          `Completed browser cleanup is durable, but its stale publication journal could not be retired: ${sanitizeBrowserPublicationMessage(formatError(error))}`,
+        ),
+      );
+      return metadata;
+    }
+  }
   if (
     publicationJournal?.phase === "preparing" &&
     metadata.browser?.runtime?.recoveryCleanupResult?.settlementMode === "abort"
   ) {
     await clearBrowserCapturePublicationJournal(sessionId);
     publicationJournal = null;
+  }
+  if (publicationJournal && (controllerAlive || workerAlive)) {
+    return metadata;
   }
   if (publicationJournal) {
     const durableAnswer = await readDurableBrowserAnswer(publicationJournal.receipt);
@@ -114,7 +151,7 @@ export async function orchestrateBrowserAttachAuthority(
       }
     }
   }
-  let runtime = publicationJournal?.runtime ?? metadata.browser?.runtime;
+  runtime = publicationJournal?.runtime ?? metadata.browser?.runtime;
   if (!publicationJournal) {
     const repairedRuntime = repairTrustedStaleConversationUrl(runtime);
     if (repairedRuntime !== runtime && repairedRuntime) {
@@ -129,12 +166,18 @@ export async function orchestrateBrowserAttachAuthority(
     }
   }
 
-  const controllerPid = runtime?.controllerPid;
-  const workerPid = metadata.lifecycle?.workerPid;
-  const controllerAlive = typeof controllerPid === "number" && isProcessAlive(controllerPid);
-  const workerAlive = typeof workerPid === "number" && isProcessAlive(workerPid);
   const persistedCleanupMode = runtime?.recoveryCleanupResult?.settlementMode;
   const publicationRecoveryPending = publicationJournal !== null;
+  const explicitlyNonReattachable = readBooleanErrorDetail(metadata, "reattachable") === false;
+  const nonReattachableCleanupOnly =
+    metadata.mode === "browser" &&
+    metadata.status === "error" &&
+    explicitlyNonReattachable &&
+    !publicationRecoveryPending &&
+    !controllerAlive &&
+    !workerAlive &&
+    Boolean(runtime?.recoveryCleanupResources?.length) &&
+    Boolean(runtime?.recoveryCleanupResult);
   const completedCleanupAcknowledged = publicationJournal
     ? publicationJournal.phase === "published" || publicationJournal.phase === "cleanup-pending"
     : metadata.status === "completed" && hasDurableBrowserAnswerReceipt(metadata);
@@ -155,7 +198,9 @@ export async function orchestrateBrowserAttachAuthority(
   const malformedAcquisitionOnlyCleanup =
     acquisitionOnlyCleanup && !exactPendingAcquisitionAuthority;
   let cleanupRetryMode: "finalize" | "abort" | null = automaticAcquisitionCleanupMode;
-  if (!cleanupRetryMode && !malformedAcquisitionOnlyCleanup) {
+  if (!cleanupRetryMode && nonReattachableCleanupOnly && persistedCleanupMode === undefined) {
+    cleanupRetryMode = "abort";
+  } else if (!cleanupRetryMode && !malformedAcquisitionOnlyCleanup) {
     if (persistedCleanupMode === "abort") {
       cleanupRetryMode = "abort";
     } else if (
@@ -175,28 +220,24 @@ export async function orchestrateBrowserAttachAuthority(
     (runtime.recoveryCleanupResult || automaticAcquisitionCleanupMode)
   ) {
     const cleanupLogger = browserLogger();
-    try {
-      const sessionPaths = await sessionStore.getPaths(sessionId);
-      const cleanup = await retryBrowserRecoveryCleanup(
-        runtime,
-        cleanupLogger,
-        {
-          recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
-          recoveryCleanup: { retainChromeEndpointAuthority },
-          isRemotePublicationAcknowledged: () =>
-            completedCleanupAcknowledged && cleanupRetryMode === "finalize",
-        },
-        cleanupRetryMode,
+    const staleRunningAcquisitionRecovered =
+      automaticAcquisitionCleanupMode !== null && metadata.status === "running";
+    const cleanupMessageFor = (result: BrowserCaptureFinalizationResult): string =>
+      sanitizeBrowserPublicationMessage(
+        nonReattachableCleanupOnly
+          ? result.status === "pending"
+            ? `Browser response recovery is unavailable; owned browser cleanup remains pending: ${result.error}`
+            : "Browser response recovery is unavailable; owned browser cleanup completed without resubmitting."
+          : result.status === "pending"
+            ? `Browser acquisition cleanup remains pending: ${result.error}`
+            : "Browser session stopped before committing a prompt; acquisition cleanup completed.",
       );
-      const staleRunningAcquisitionRecovered =
-        automaticAcquisitionCleanupMode !== null && metadata.status === "running";
-      const cleanupMessage = sanitizeBrowserPublicationMessage(
-        cleanup.status === "pending"
-          ? `Browser acquisition cleanup remains pending: ${cleanup.error}`
-          : "Browser session stopped before committing a prompt; acquisition cleanup completed.",
-      );
-      const updates: Partial<SessionMetadata> = {
-        browser: { ...metadata.browser, runtime: cleanup.runtime },
+    const persistCleanupProjection = async (
+      result: BrowserCaptureFinalizationResult,
+    ): Promise<BrowserCaptureFinalizationResult> => {
+      const cleanupMessage = cleanupMessageFor(result);
+      await sessionStore.updateSession(sessionId, {
+        browser: { ...metadata.browser, runtime: result.runtime },
         ...(staleRunningAcquisitionRecovered
           ? {
               status: "error",
@@ -209,19 +250,56 @@ export async function orchestrateBrowserAttachAuthority(
                 details: {
                   stage: "browser-acquisition-recovery",
                   code:
-                    cleanup.status === "pending"
+                    result.status === "pending"
                       ? "browser-acquisition-cleanup-pending"
                       : "browser-acquisition-cleanup-completed",
                 },
               },
             }
           : {}),
-      };
-      await sessionStore.updateSession(sessionId, updates);
-      metadata = (await sessionStore.readSession(sessionId)) ?? { ...metadata, ...updates };
+      });
+      return result;
+    };
+    try {
+      const sessionPaths = await sessionStore.getPaths(sessionId);
+      const outcome = await settleBrowserRecoveryCleanup(
+        runtime,
+        cleanupLogger,
+        {
+          recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+          recoveryCleanup: { retainChromeEndpointAuthority },
+          isRemotePublicationAcknowledged: () =>
+            completedCleanupAcknowledged && cleanupRetryMode === "finalize",
+          loadRuntimeUnderLock: async () => {
+            if (await readBrowserCapturePublicationJournal(sessionId)) {
+              throw new Error("Browser publication authority changed while cleanup was queued");
+            }
+            const latestRuntime = (await sessionStore.readSession(sessionId))?.browser?.runtime;
+            if (!latestRuntime) {
+              throw new Error("Browser recovery runtime disappeared while cleanup was queued");
+            }
+            return latestRuntime;
+          },
+          persistFinalizationResult: persistCleanupProjection,
+          completeFinalizationAfterLockRelease: persistCleanupProjection,
+        },
+        cleanupRetryMode,
+      );
+      metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
       runtime = metadata.browser?.runtime;
-      if (cleanup.status === "pending") {
+      const displayResult: BrowserCaptureFinalizationResult =
+        outcome.persistence.status === "pending"
+          ? {
+              status: "pending",
+              runtime: outcome.persistence.runtime,
+              error: outcome.persistence.error,
+            }
+          : outcome.finalization;
+      const cleanupMessage = cleanupMessageFor(displayResult);
+      if (displayResult.status === "pending") {
         console.log(chalk.yellow(cleanupMessage));
+      } else if (nonReattachableCleanupOnly) {
+        console.log(dim(cleanupMessage));
       }
     } catch (error) {
       console.log(
@@ -277,6 +355,7 @@ export async function orchestrateBrowserAttachAuthority(
     hasRecoverableConversation &&
     persistedCleanupMode !== "abort" &&
     !explicitlyNonRecoverable &&
+    !explicitlyNonReattachable &&
     disconnectRecoveryAuthorized &&
     !workerAlive &&
     (publicationJournal !== null ||
@@ -306,6 +385,59 @@ export async function orchestrateBrowserAttachAuthority(
   let authoritativeRuntime = runtime;
   let answerPublished = false;
   const acknowledgement = createBrowserCapturePublicationAcknowledgement();
+  let liveFinalizationJournal = publicationJournal;
+  let liveFinalizationPersistence: { status: "persisted" } | { status: "pending"; error: string } =
+    {
+      status: "pending",
+      error: "Browser finalization has not completed under the recovery lock",
+    };
+  const persistLiveFinalization = async (
+    result: BrowserCaptureFinalizationResult,
+    beforeRuntime: BrowserRuntimeMetadata,
+    mode: "finalize" | "abort",
+    released: boolean,
+  ): Promise<BrowserCaptureFinalizationResult> => {
+    const projectedResult = projectBrowserCaptureFinalization(beforeRuntime, result, mode);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        let persistedResult: BrowserCaptureFinalizationResult;
+        if (mode === "abort") {
+          await sessionStore.updateSession(sessionId, {
+            browser: { ...metadata.browser, runtime: projectedResult.runtime },
+          });
+          persistedResult = projectedResult;
+        } else {
+          const observedJournal = await readBrowserCapturePublicationJournal(sessionId);
+          if (observedJournal) liveFinalizationJournal = observedJournal;
+          const expectedJournal = observedJournal ?? liveFinalizationJournal;
+          if (!expectedJournal) throw new Error("Browser publication journal is unavailable");
+          persistedResult = await persistBrowserCaptureFinalizationState(
+            sessionId,
+            metadata.browser ?? expectedJournal.browserAudit,
+            expectedJournal,
+            projectedResult,
+            beforeRuntime,
+            { acknowledgeCapabilities: false },
+          );
+        }
+        liveFinalizationPersistence =
+          released || !persistedResult.runtime.recoveryCleanupResult?.lockReleasePending
+            ? { status: "persisted" }
+            : {
+                status: "pending",
+                error:
+                  persistedResult.runtime.recoveryCleanupResult.error ??
+                  "Browser recovery lock release remains pending",
+              };
+        return persistedResult;
+      } catch (error) {
+        if (attempt < 1) continue;
+        const message = sanitizeBrowserPublicationMessage(formatError(error));
+        liveFinalizationPersistence = { status: "pending", error: message };
+        throw error;
+      }
+    }
+  };
   if (
     publicationJournal?.phase === "published" ||
     publicationJournal?.phase === "cleanup-pending"
@@ -330,6 +462,14 @@ export async function orchestrateBrowserAttachAuthority(
             });
           }
         },
+        loadRuntimeUnderLock: async () =>
+          (await readBrowserCapturePublicationJournal(sessionId))?.runtime ??
+          (await sessionStore.readSession(sessionId))?.browser?.runtime ??
+          authoritativeRuntime,
+        persistFinalizationResult: (result, beforeRuntime, mode) =>
+          persistLiveFinalization(result, beforeRuntime, mode, false),
+        completeFinalizationAfterLockRelease: (result, beforeRuntime, mode) =>
+          persistLiveFinalization(result, beforeRuntime, mode, true),
       },
     );
     authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
@@ -377,6 +517,7 @@ export async function orchestrateBrowserAttachAuthority(
       },
       label: "Reattach answer",
       log: (message) => console.log(dim(message)),
+      finalizationPersistence: () => liveFinalizationPersistence,
     });
     answerPublished = true;
     authoritativeRuntime = publication.finalization.runtime;
@@ -400,7 +541,7 @@ export async function orchestrateBrowserAttachAuthority(
     authoritativeRuntime =
       runtimeAuthority.observeError(runtimeFromBrowserError(error)) ?? authoritativeRuntime;
     publicationJournal = await readBrowserCapturePublicationJournal(sessionId);
-    const receipt = durableBrowserAnswerReceiptFromError(error);
+    const receipt = await verifiedDurableBrowserAnswerReceiptFromError(error);
     let authorityPersisted = publicationJournal !== null;
     if (!publicationJournal) {
       try {
@@ -468,7 +609,7 @@ async function recoverDurableBrowserPublication(
   if (journal.phase === "published" || journal.phase === "cleanup-pending") {
     acknowledgement.acknowledge();
   }
-  const transaction = createPersistedBrowserPublicationTransaction(
+  const persistedTransaction = createPersistedBrowserPublicationTransaction(
     sessionId,
     metadata,
     journal,
@@ -481,7 +622,7 @@ async function recoverDurableBrowserPublication(
       answer,
       logHeader: "[reattach] recovered durable assistant response without browser recapture",
     },
-    transaction,
+    transaction: persistedTransaction.transaction,
     persistAnswer: persistDurableBrowserAnswer,
     browser: metadata.browser ?? journal.browserAudit,
     existingArtifacts: metadata.artifacts,
@@ -497,6 +638,7 @@ async function recoverDurableBrowserPublication(
     acknowledgement,
     label: "Recovered browser answer",
     log: (message) => console.log(dim(message)),
+    finalizationPersistence: persistedTransaction.finalizationPersistence,
   });
   if (publication.finalization.status === "pending") {
     console.log(
@@ -515,65 +657,137 @@ function createPersistedBrowserPublicationTransaction(
   metadata: SessionMetadata,
   journal: BrowserCapturePublicationJournal,
   acknowledgement: BrowserCapturePublicationAcknowledgement,
-): Pick<BrowserRunTransaction, "runtime" | "bindSettlement" | "finalize" | "abort"> {
+): {
+  transaction: Pick<BrowserRunTransaction, "runtime" | "bindSettlement" | "finalize" | "abort"> & {
+    releaseSettlementLock: () => Promise<void>;
+  };
+  finalizationPersistence: () =>
+    | { status: "persisted" }
+    | { status: "pending"; error: string }
+    | undefined;
+} {
+  let finalizationPersistence:
+    | { status: "persisted" }
+    | { status: "pending"; error: string }
+    | undefined;
+  let recoveryLock: ReattachRecoveryLock | null = null;
+  let currentJournal: BrowserCapturePublicationJournal | null = journal;
+  const ensureRecoveryLock = async (): Promise<void> => {
+    if (recoveryLock) return;
+    const sessionPaths = await sessionStore.getPaths(sessionId);
+    recoveryLock = await acquireReattachRecoveryLock(
+      path.join(sessionPaths.dir, "browser-recovery.lock"),
+    );
+  };
+  const releaseRecoveryLock = async (finalize?: () => Promise<void>): Promise<void> => {
+    const heldLock = recoveryLock;
+    if (!heldLock) {
+      await finalize?.();
+      return;
+    }
+    await heldLock.release(finalize);
+    if (recoveryLock === heldLock) recoveryLock = null;
+  };
+  const loadCurrentRuntime = async (): Promise<BrowserRuntimeMetadata> => {
+    currentJournal = await readBrowserCapturePublicationJournal(sessionId);
+    if (!currentJournal) {
+      const currentSession = await sessionStore.readSession(sessionId);
+      return currentSession?.browser?.runtime ?? journal.runtime;
+    }
+    if (
+      currentJournal.receipt.artifact.path !== journal.receipt.artifact.path ||
+      currentJournal.receipt.artifact.sha256 !== journal.receipt.artifact.sha256 ||
+      currentJournal.receipt.artifact.sizeBytes !== journal.receipt.artifact.sizeBytes
+    ) {
+      throw new Error("Browser publication authority changed while recovery was queued");
+    }
+    return currentJournal.runtime;
+  };
   const settlement = new OwnedBrowserResourceTransaction(
     {
-      persistRuntime: async (runtime) => {
-        await sessionStore.updateSession(sessionId, {
-          browser: { ...(metadata.browser ?? journal.browserAudit), runtime },
-        });
-      },
-      persistSettlementResult: async (runtime) => {
-        // A completed close may be evicted after acknowledgement, so persist its replay projection
-        // in the publication journal before OwnedBrowserResourceTransaction acknowledges it.
-        const currentJournal = await readBrowserCapturePublicationJournal(sessionId);
-        if (
-          !currentJournal ||
-          currentJournal.receipt.artifact.path !== journal.receipt.artifact.path ||
-          currentJournal.receipt.artifact.sha256 !== journal.receipt.artifact.sha256
-        ) {
-          throw new Error(
-            "Recovered browser settlement journal authority changed before persistence",
+      persistRuntime: async (proposedRuntime) => {
+        await ensureRecoveryLock();
+        try {
+          const authoritativeBoundRuntime = bindCurrentBrowserRecoveryRuntime(
+            proposedRuntime,
+            await loadCurrentRuntime(),
           );
+          await sessionStore.updateSession(sessionId, {
+            browser: {
+              ...(metadata.browser ?? journal.browserAudit),
+              runtime: authoritativeBoundRuntime,
+            },
+          });
+          return authoritativeBoundRuntime;
+        } catch (error) {
+          await releaseRecoveryLock().catch(() => undefined);
+          throw error;
         }
-        const cleanupPending = Boolean(
-          runtime.recoveryCleanupResources?.length || runtime.recoveryCleanupResult,
-        );
-        const cleanupErrorCode = cleanupPending ? "browser-cleanup-finalize-pending" : undefined;
-        const persistedRuntime = sanitizeBrowserPublicationRuntime(runtime, cleanupErrorCode);
-        await writeBrowserCapturePublicationJournal({
-          ...currentJournal,
-          phase: cleanupPending ? "cleanup-pending" : "published",
-          runtime: persistedRuntime,
-          cleanupErrorCode,
-          cleanupErrorMessage: cleanupPending
-            ? persistedRuntime.recoveryCleanupResult?.error
-            : undefined,
-        });
       },
       settleResources: async (mode, runtime) => {
-        const sessionPaths = await sessionStore.getPaths(sessionId);
-        return retryBrowserRecoveryCleanup(
+        currentJournal = journal;
+        const persistProjection = async (
+          result: BrowserCaptureFinalizationResult,
+          beforeRuntime: BrowserRuntimeMetadata,
+        ): Promise<BrowserCaptureFinalizationResult> => {
+          const expectedJournal = currentJournal;
+          if (!expectedJournal) {
+            throw new Error("Browser finalization journal is unavailable");
+          }
+          for (let attempt = 0; ; attempt += 1) {
+            try {
+              return await persistBrowserCaptureFinalizationState(
+                sessionId,
+                metadata.browser ?? expectedJournal.browserAudit,
+                expectedJournal,
+                result,
+                beforeRuntime,
+                { acknowledgeCapabilities: false },
+              );
+            } catch (error) {
+              if (attempt >= 1) throw error;
+            }
+          }
+        };
+        const outcome = await settleBrowserRecoveryCleanup(
           runtime,
           browserLogger(),
           {
-            recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
             recoveryCleanup: { retainChromeEndpointAuthority },
             isRemotePublicationAcknowledged: acknowledgement.isPublished,
+            acquireRecoveryLock: async () => {
+              await ensureRecoveryLock();
+              return { release: releaseRecoveryLock };
+            },
+            loadRuntimeUnderLock: loadCurrentRuntime,
+            persistFinalizationResult: persistProjection,
+            completeFinalizationAfterLockRelease: persistProjection,
           },
           mode,
         );
+        finalizationPersistence =
+          outcome.persistence.status === "persisted"
+            ? { status: "persisted" }
+            : {
+                status: "pending",
+                error: sanitizeBrowserPublicationMessage(outcome.persistence.error),
+              };
+        return outcome.finalization;
       },
     },
     journal.runtime,
   );
   return {
-    get runtime() {
-      return settlement.runtime();
+    transaction: {
+      get runtime() {
+        return settlement.runtime();
+      },
+      bindSettlement: (mode) => settlement.bindSettlement(mode),
+      releaseSettlementLock: () => releaseRecoveryLock(),
+      finalize: () => settlement.settle("finalize"),
+      abort: () => settlement.settle("abort"),
     },
-    bindSettlement: (mode) => settlement.bindSettlement(mode),
-    finalize: () => settlement.settle("finalize"),
-    abort: () => settlement.settle("abort"),
+    finalizationPersistence: () => finalizationPersistence,
   };
 }
 

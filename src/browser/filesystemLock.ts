@@ -74,7 +74,7 @@ export interface FilesystemLockProcessIdentityProvider {
 export interface CrashRecoverableFilesystemLock {
   path: string;
   owner: FilesystemLockOwnerRecord;
-  release: () => Promise<void>;
+  release: (finalize?: () => Promise<void>) => Promise<void>;
 }
 
 export interface CrashRecoverableFilesystemLockOptions {

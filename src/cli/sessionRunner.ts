@@ -45,19 +45,19 @@ import { formatFinishLine } from "../oracle/finishLine.js";
 import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
-import { retryBrowserRecoveryCleanup } from "../browser/reattach.js";
+import { settleBrowserRecoveryCleanup } from "../browser/reattach.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
   hasRecoverableChatGptConversation,
 } from "../browser/reattachability.js";
-import type { BrowserLogger } from "../browser/types.js";
+import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../browser/types.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/profileState.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
 import {
-  durableBrowserAnswerReceiptFromError,
+  verifiedDurableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
   runtimeFromBrowserError,
@@ -165,27 +165,53 @@ export async function performSessionRun({
       );
       const sessionPaths = await sessionStore.getPaths(sessionMeta.id);
       const recoveryMode = "abort";
-      const recovery = await retryBrowserRecoveryCleanup(
+      const persistRecovery = async (result: BrowserCaptureFinalizationResult) => {
+        await sessionStore.updateSession(sessionMeta.id, {
+          browser: {
+            ...currentBrowser,
+            ...(browserConfig ? { config: browserConfig } : {}),
+            runtime: result.runtime,
+          },
+        });
+        return result;
+      };
+      const recovery = await settleBrowserRecoveryCleanup(
         restartRuntime,
         recoveryLogger,
         {
           recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
           recoveryCleanup: { retainChromeEndpointAuthority },
           isRemotePublicationAcknowledged: () => false,
+          loadRuntimeUnderLock: async () =>
+            (await sessionStore.readSession(sessionMeta.id))?.browser?.runtime ?? restartRuntime,
+          persistFinalizationResult: persistRecovery,
+          completeFinalizationAfterLockRelease: persistRecovery,
         },
         recoveryMode,
       );
-      const recoveredRuntime =
-        runtimeAuthority.observeTerminal(recovery.runtime) ?? recovery.runtime;
+      const recoveryRuntime =
+        recovery.persistence.status === "pending"
+          ? recovery.persistence.runtime
+          : recovery.finalization.runtime;
+      const recoveredRuntime = runtimeAuthority.observeTerminal(recoveryRuntime) ?? recoveryRuntime;
       currentBrowser = {
         ...currentBrowser,
         ...(browserConfig ? { config: browserConfig } : {}),
         runtime: recoveredRuntime,
       };
-      await sessionStore.updateSession(sessionMeta.id, { browser: currentBrowser });
-      if (recovery.status === "pending") {
+      if (recovery.persistence.status === "pending") {
         throw new BrowserAutomationError(
-          `Browser acquisition cleanup remains pending: ${recovery.error}`,
+          `Browser acquisition cleanup remains pending: ${recovery.persistence.error}`,
+          {
+            stage: "browser-acquisition-recovery",
+            code: "browser-acquisition-cleanup-pending",
+            runtime: recoveredRuntime,
+          },
+        );
+      }
+      if (recovery.finalization.status === "pending") {
+        throw new BrowserAutomationError(
+          `Browser acquisition cleanup remains pending: ${recovery.finalization.error}`,
           {
             stage: "browser-acquisition-recovery",
             code: "browser-acquisition-cleanup-pending",
@@ -638,7 +664,7 @@ export async function performSessionRun({
       error: undefined,
     });
   } catch (error: unknown) {
-    durableAnswerReceipt ??= durableBrowserAnswerReceiptFromError(error);
+    durableAnswerReceipt ??= await verifiedDurableBrowserAnswerReceiptFromError(error);
     const message = formatError(error);
     log(`ERROR: ${message}`);
     markErrorLogged(error);
@@ -649,11 +675,15 @@ export async function performSessionRun({
     const assistantTimeout =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "assistant-timeout";
-    const geminiCaptureFailure =
+    const geminiResponseCaptureFailure =
       userError?.category === "browser-automation" &&
-      (userError.details as { stage?: string; reattachable?: boolean } | undefined)?.stage ===
-        "gemini-response-capture" &&
+      (userError.details as { stage?: string } | undefined)?.stage === "gemini-response-capture";
+    const geminiCaptureFailure =
+      geminiResponseCaptureFailure &&
       (userError.details as { reattachable?: boolean } | undefined)?.reattachable === true;
+    const reattachExplicitlyUnavailable =
+      userError?.category === "browser-automation" &&
+      (userError.details as { reattachable?: boolean } | undefined)?.reattachable === false;
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
@@ -675,6 +705,16 @@ export async function performSessionRun({
       runtime: BrowserRuntimeMetadata | null | undefined,
     ): void => {
       if (reattachGuidanceLogged || mode !== "browser") return;
+      if (reattachExplicitlyUnavailable) {
+        if (!runtime?.recoveryCleanupResources?.length || !runtime.recoveryCleanupResult) return;
+        reattachGuidanceLogged = true;
+        log(
+          dim(
+            `Exact browser response recovery is unavailable; run "oracle session ${sessionMeta.id}" to retry owned browser cleanup without resubmitting.`,
+          ),
+        );
+        return;
+      }
       if (!hasBrowserRecoveryAuthority(runtime)) return;
       reattachGuidanceLogged = true;
       log(formatBrowserReattachGuidance(sessionMeta.id));
@@ -898,7 +938,12 @@ export async function performSessionRun({
     if (userError) {
       log(dim(`User error (${userError.category}): ${userError.message}`));
     }
-    const responseMetadata = error instanceof OracleResponseError ? error.metadata : undefined;
+    const responseMetadata =
+      error instanceof OracleResponseError
+        ? error.metadata
+        : geminiResponseCaptureFailure
+          ? ({ status: "error", incompleteReason: "incomplete-capture" } as const)
+          : undefined;
     const metadataLine = formatResponseMetadata(responseMetadata);
     if (metadataLine) {
       log(dim(`Response metadata: ${metadataLine}`));
@@ -923,7 +968,7 @@ export async function performSessionRun({
       mode === "browser" && !clearCopiedProfileRuntime
         ? (errorBrowserRuntime ?? currentBrowser?.runtime)
         : undefined;
-    if (!cloudflareChallenge && browserCanReattach) {
+    if (!cloudflareChallenge && (browserCanReattach || reattachExplicitlyUnavailable)) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
     }
     await sessionStore.updateSession(sessionMeta.id, {
@@ -957,6 +1002,18 @@ export async function performSessionRun({
       await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
         status: "error",
         completedAt: new Date().toISOString(),
+        ...(geminiResponseCaptureFailure
+          ? {
+              response: responseMetadata,
+              error: userError
+                ? {
+                    category: userError.category,
+                    message: userError.message,
+                    details: authoritativeErrorDetails,
+                  }
+                : undefined,
+            }
+          : {}),
       });
     }
     throw error;

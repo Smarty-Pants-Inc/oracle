@@ -1,13 +1,16 @@
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserCaptureFinalizationResult } from "./types.js";
-import { acknowledgeChromeTargetCloseCapability } from "./targetCloseAuthority.js";
+import {
+  acknowledgeChromeTargetCloseCapability,
+  discardChromeTargetCloseCapability,
+} from "./targetCloseAuthority.js";
 
 export type BrowserCaptureSettlementMode = "finalize" | "abort";
 
 export interface OwnedBrowserResourceTransactionAdapters {
   /** Durable acquisition and bound-pending authority, written before effects. */
-  persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<BrowserRuntimeMetadata | void>;
   /**
    * Durable completed/failed projection, written after cleanup. Omission keeps terminal target-close
    * capabilities unacknowledged; atomic stores must acknowledge through their own durable authority.
@@ -212,21 +215,29 @@ function projectPendingBrowserCleanupAuthority(
   return markBrowserCaptureCleanupPending(runtime);
 }
 
-function acknowledgeSettledTargetCloseCapabilities(
+export async function acknowledgeSettledTargetCloseCapabilities(
   beforeSettlement: BrowserRuntimeMetadata,
   persistedSettlement: BrowserRuntimeMetadata,
-): void {
+): Promise<void> {
   for (const resource of beforeSettlement.recoveryCleanupResources ?? []) {
     const capability = resource.targetCloseCapability;
     if (
-      capability &&
-      resource.chromeTargetId &&
-      !persistedSettlement.recoveryCleanupResources?.some(
+      !capability ||
+      !resource.chromeTargetId ||
+      persistedSettlement.recoveryCleanupResources?.some(
         (persistedResource) =>
           persistedResource.targetCloseCapability?.generationId === capability.generationId &&
           persistedResource.targetCloseCapability.capabilityId === capability.capabilityId,
       )
     ) {
+      continue;
+    }
+    if (resource.recoveryCleanup.closeOwnedTargetOnComplete === false) {
+      await discardChromeTargetCloseCapability({
+        capability,
+        targetId: resource.chromeTargetId,
+      });
+    } else if (resource.recoveryCleanup.closeOwnedTargetOnComplete === true) {
       acknowledgeChromeTargetCloseCapability({
         capability,
         targetId: resource.chromeTargetId,
@@ -291,6 +302,7 @@ export function bindBrowserCaptureCleanupSettlement(
         status: cleanupResult?.status ?? "failed",
         error: cleanupResult?.error ?? result.error,
         settlementMode,
+        ...(cleanupResult?.lockReleasePending ? { lockReleasePending: true } : {}),
       },
     },
   };
@@ -553,9 +565,10 @@ export class OwnedBrowserResourceTransaction {
     const boundRuntime = markBrowserCaptureCleanupPending(runtime, mode);
     const completion = Promise.resolve()
       .then(async () => {
-        await this.adapters.persistRuntime?.(boundRuntime);
-        this.state = { kind: "bound", mode, runtime: boundRuntime };
-        return boundRuntime;
+        const persistedRuntime = await this.adapters.persistRuntime?.(boundRuntime);
+        const authoritativeBoundRuntime = persistedRuntime ?? boundRuntime;
+        this.state = { kind: "bound", mode, runtime: authoritativeBoundRuntime };
+        return authoritativeBoundRuntime;
       })
       .catch((error) => {
         if (isSettlementModeConflict(error)) {
@@ -607,7 +620,7 @@ export class OwnedBrowserResourceTransaction {
         try {
           if (this.adapters.persistSettlementResult) {
             await this.adapters.persistSettlementResult(boundResult.runtime);
-            acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
+            await acknowledgeSettledTargetCloseCapabilities(boundRuntime, boundResult.runtime);
           }
         } catch (error) {
           const retryRuntime =

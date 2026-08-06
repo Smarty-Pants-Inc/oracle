@@ -23,9 +23,15 @@ import {
   type BrowserCapturePublicationJournal,
   type BrowserPublicationPhase,
 } from "../../src/cli/browserPublicationJournal.ts";
+import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.ts";
 import chalk from "chalk";
 import path from "node:path";
 import { BrowserAutomationError } from "../../src/oracle/errors.ts";
+import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../../src/browser/types.ts";
+import {
+  settleBrowserRecoveryCleanup as settleBrowserRecoveryCleanupActual,
+  type BrowserRecoverySettlementDeps,
+} from "../../src/browser/reattachSettlement.ts";
 import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
@@ -40,6 +46,8 @@ import {
 const waitMock = vi.hoisted(() => vi.fn());
 const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
 const retryBrowserRecoveryCleanupMock = vi.hoisted(() => vi.fn());
+const settleBrowserRecoveryCleanupMock = vi.hoisted(() => vi.fn());
+const acquireReattachRecoveryLockMock = vi.hoisted(() => vi.fn());
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 const saveBrowserTranscriptArtifactMock = vi.hoisted(() => vi.fn());
 const saveDeepResearchReportArtifactMock = vi.hoisted(() => vi.fn());
@@ -67,9 +75,17 @@ vi.mock("../../src/sessionManager.ts", () => ({
   writeFileAtomicDurable: writeFileAtomicDurableMock,
   syncDirectoryIfSupported: vi.fn(),
 }));
-vi.mock("../../src/browser/reattach.ts", () => ({
-  resumeBrowserSession: resumeBrowserSessionMock,
-  retryBrowserRecoveryCleanup: retryBrowserRecoveryCleanupMock,
+vi.mock("../../src/browser/reattach.ts", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../../src/browser/reattach.ts");
+  return {
+    ...actual,
+    resumeBrowserSession: resumeBrowserSessionMock,
+    retryBrowserRecoveryCleanup: retryBrowserRecoveryCleanupMock,
+    settleBrowserRecoveryCleanup: settleBrowserRecoveryCleanupMock,
+  };
+});
+vi.mock("../../src/browser/reattachLock.ts", () => ({
+  acquireReattachRecoveryLock: acquireReattachRecoveryLockMock,
 }));
 
 vi.mock("../../src/cli/durableAnswer.ts", async () => {
@@ -205,6 +221,7 @@ function pendingChromeProcessAcquisitionRuntime(): BrowserRuntimeMetadata {
           },
           processOwnerDisposition: "close-on-last-lease",
         },
+
         recoveryCleanup: {
           ownsTarget: false,
           profileKind: "temporary",
@@ -215,6 +232,10 @@ function pendingChromeProcessAcquisitionRuntime(): BrowserRuntimeMetadata {
     ],
     recoveryCleanupResult: { status: "pending" },
   };
+}
+
+function mockRecoveredCleanupResult(result: BrowserCaptureFinalizationResult): void {
+  retryBrowserRecoveryCleanupMock.mockResolvedValue(result);
 }
 
 beforeEach(() => {
@@ -232,6 +253,8 @@ beforeEach(() => {
   for (const mock of [
     resumeBrowserSessionMock,
     retryBrowserRecoveryCleanupMock,
+    settleBrowserRecoveryCleanupMock,
+    acquireReattachRecoveryLockMock,
     persistDurableBrowserAnswerMock,
     saveBrowserTranscriptArtifactMock,
     saveDeepResearchReportArtifactMock,
@@ -239,6 +262,9 @@ beforeEach(() => {
   ]) {
     mock.mockReset();
   }
+  acquireReattachRecoveryLockMock.mockImplementation(async () => ({
+    release: async (complete?: () => Promise<void>) => complete?.(),
+  }));
   writeFileAtomicDurableMock.mockResolvedValue(undefined);
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/sessions");
   sessionStoreMock.getPaths.mockResolvedValue({
@@ -249,6 +275,73 @@ beforeEach(() => {
     if (!expectedReceipt) throw new Error("publication intent receipt missing");
     return expectedReceipt;
   });
+  settleBrowserRecoveryCleanupMock.mockImplementation(
+    async (
+      runtime: BrowserRuntimeMetadata,
+      logger: BrowserLogger,
+      deps: BrowserRecoverySettlementDeps,
+      mode?: "finalize" | "abort",
+    ) => {
+      const cleanupFinalization = (await retryBrowserRecoveryCleanupMock(
+        runtime,
+        logger,
+        deps,
+        mode,
+      )) as BrowserCaptureFinalizationResult;
+      let finalization = cleanupFinalization;
+      let durableRuntime = runtime;
+      const settlementMode = mode ?? runtime.recoveryCleanupResult?.settlementMode ?? "finalize";
+      try {
+        if (finalization.status === "completed" && deps.persistFinalizationResult) {
+          const underLock = await deps.persistFinalizationResult(
+            {
+              status: "pending",
+              runtime: {
+                ...finalization.runtime,
+                ...(runtime.recoveryCleanupResources?.length
+                  ? { recoveryCleanupResources: runtime.recoveryCleanupResources }
+                  : {}),
+                recoveryCleanupResult: {
+                  status: "pending",
+                  error: "Browser cleanup completed, but recovery lock release remains pending",
+                  settlementMode,
+                  lockReleasePending: true,
+                },
+              },
+              error: "Browser cleanup completed, but recovery lock release remains pending",
+            },
+            runtime,
+            settlementMode,
+          );
+          durableRuntime = underLock.runtime;
+          if (deps.completeFinalizationAfterLockRelease) {
+            finalization = await deps.completeFinalizationAfterLockRelease(
+              finalization,
+              runtime,
+              settlementMode,
+            );
+          }
+        } else if (deps.persistFinalizationResult) {
+          finalization = await deps.persistFinalizationResult(
+            finalization,
+            runtime,
+            settlementMode,
+          );
+          durableRuntime = finalization.runtime;
+        }
+        return { finalization, persistence: { status: "persisted" as const } };
+      } catch (error) {
+        return {
+          finalization: cleanupFinalization,
+          persistence: {
+            status: "pending" as const,
+            error: error instanceof Error ? error.message : String(error),
+            runtime: durableRuntime,
+          },
+        };
+      }
+    },
+  );
   saveBrowserTranscriptArtifactMock.mockResolvedValue(null);
   saveDeepResearchReportArtifactMock.mockResolvedValue(null);
 });
@@ -804,30 +897,36 @@ describe("attachSession rendering", () => {
     };
     const recoveredMeta = { ...completedMeta, artifacts: [journal.receipt.artifact] };
     readSessionMetadataMock.mockResolvedValue(recoveredMeta);
-    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    mockRecoveredCleanupResult({ status: "completed", runtime: {} });
     resumeBrowserSessionMock.mockRejectedValue(new Error("browser authority is unavailable"));
+    writeFileAtomicDurableMock.mockImplementation(
+      async (targetPath: string, payload: string | Uint8Array) => {
+        await writeFile(targetPath, payload);
+      },
+    );
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await orchestrateBrowserAttachAuthority("sess", completedMeta);
 
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
     expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
-    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+    expect(acquireReattachRecoveryLockMock).toHaveBeenCalled();
+    expect(settleBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
       expect.objectContaining({
         recoveryCleanupResult: expect.objectContaining({ settlementMode: "finalize" }),
       }),
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join(
-          path.dirname(path.dirname(journal.receipt.artifact.path)),
-          "browser-recovery.lock",
-        ),
+        acquireRecoveryLock: expect.any(Function),
+        loadRuntimeUnderLock: expect.any(Function),
+        persistFinalizationResult: expect.any(Function),
+        completeFinalizationAfterLockRelease: expect.any(Function),
         isRemotePublicationAcknowledged: expect.any(Function),
       }),
       "finalize",
     );
     expect(
-      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+      settleBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
     ).toBe(true);
   });
 
@@ -854,7 +953,7 @@ describe("attachSession rendering", () => {
       artifacts: [journal.receipt.artifact],
     };
     readSessionMetadataMock.mockResolvedValue(completedMeta);
-    retryBrowserRecoveryCleanupMock.mockResolvedValue({ status: "completed", runtime: {} });
+    mockRecoveredCleanupResult({ status: "completed", runtime: {} });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await orchestrateBrowserAttachAuthority("sess", completedMeta);
@@ -915,10 +1014,19 @@ describe("attachSession rendering", () => {
         await writeFile(targetPath, payload);
       },
     );
-    sessionStoreMock.updateSession
-      .mockRejectedValueOnce(new Error("final session store unavailable"))
-      .mockRejectedValueOnce(new Error("final session store still unavailable"))
-      .mockResolvedValue(undefined);
+    let terminalProjectionAttempts = 0;
+    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+      if (patch.status === "completed" && !patch.browser?.runtime?.recoveryCleanupResult) {
+        terminalProjectionAttempts += 1;
+        if (terminalProjectionAttempts <= 2) {
+          throw new Error(
+            terminalProjectionAttempts === 1
+              ? "final session store unavailable"
+              : "final session store still unavailable",
+          );
+        }
+      }
+    });
     readSessionMetadataMock.mockResolvedValue(completedMeta);
     retryBrowserRecoveryCleanupMock.mockImplementation(
       async (pendingRuntime: BrowserRuntimeMetadata) => {
@@ -946,7 +1054,7 @@ describe("attachSession rendering", () => {
       runtime: { browserTransport: "cdp" },
     });
     expect(persistedSettlement?.runtime.recoveryCleanupResources).toBeUndefined();
-    expect(sessionStoreMock.updateSession).toHaveBeenCalledTimes(2);
+    expect(terminalProjectionAttempts).toBe(2);
     expect(closeTarget).toHaveBeenCalledOnce();
 
     const churnCount = targetCloseAuthorityTest.retainedTerminalTargetCloseCapabilityLimit + 1;
@@ -973,7 +1081,7 @@ describe("attachSession rendering", () => {
         targetId,
         logger,
       }),
-    ).resolves.toMatchObject({ status: "unavailable" });
+    ).resolves.toMatchObject({ status: "completed" });
 
     await orchestrateBrowserAttachAuthority("sess", completedMeta);
 
@@ -983,6 +1091,117 @@ describe("attachSession rendering", () => {
     ).toBeUndefined();
     expect(closeTarget).toHaveBeenCalledOnce();
     await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
+  });
+
+  test("retires a matching pre-cleanup journal when completed metadata proves terminal after restart", async () => {
+    const answer = "published answer whose terminal projection survived restart";
+    const targetId = "stale-journal-target";
+    const targetCloseCapability = retainChromeTargetCloseCapability({
+      generationId: "a0000000-0000-4000-8000-00000000000a",
+      targetId,
+      close: vi.fn(async () => ({ status: "completed" as const })),
+    });
+    const staleRuntime: BrowserRuntimeMetadata = {
+      browserTransport: "cdp",
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: targetId,
+          targetCloseCapability,
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    };
+    const journal = await installBrowserPublicationJournal("published", staleRuntime, answer);
+    const completedMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "completed",
+      mode: "browser",
+      artifacts: [journal.receipt.artifact],
+      browser: { config: {}, runtime: { browserTransport: "cdp" } },
+    };
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
+    expect(retryBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
+  });
+
+  test("defers journal recovery while the live publisher commits and finalizes cleanup", async () => {
+    const answer = "answer still being finalized by the live worker";
+    const liveRuntime: BrowserRuntimeMetadata = {
+      controllerPid: process.pid,
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: "live-publisher-target",
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "none",
+            keepBrowser: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    };
+    const journal = await installBrowserPublicationJournal("published", liveRuntime, answer);
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: "oracle session sess",
+      },
+      browser: { runtime: liveRuntime },
+    };
+
+    await orchestrateBrowserAttachAuthority("sess", runningMeta);
+
+    expect(settleBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toMatchObject({
+      runtime: { recoveryCleanupResult: { status: "pending" } },
+    });
+
+    const committedPreCleanupMeta: SessionMetadata = {
+      ...runningMeta,
+      status: "completed",
+      artifacts: [journal.receipt.artifact],
+    };
+    await orchestrateBrowserAttachAuthority("sess", committedPreCleanupMeta);
+
+    expect(settleBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toMatchObject({
+      phase: "published",
+      runtime: { recoveryCleanupResult: { status: "pending" } },
+    });
+
+    const completedMeta: SessionMetadata = {
+      ...runningMeta,
+      status: "completed",
+      artifacts: [journal.receipt.artifact],
+      browser: { runtime: {} },
+    };
+    await orchestrateBrowserAttachAuthority("sess", completedMeta);
+
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
+    expect(settleBrowserRecoveryCleanupMock).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
   });
 
   test("discards a stale preparing journal when persisted ABORT authority has no receipt", async () => {
@@ -1229,6 +1448,229 @@ describe("attachSession rendering", () => {
       retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
     ).toBe(false);
     expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+  });
+
+  test("aborts owned Gemini resources when immutable response identity is unavailable", async () => {
+    const pendingRuntime: BrowserRuntimeMetadata = {
+      chromeHost: "127.0.0.1",
+      chromePort: 9222,
+      chromeTargetId: "gemini-synthetic-target",
+      conversationId: "gemini-synthetic-target",
+      promptEpoch: {
+        status: "committed",
+        epochId: "gemini-synthetic-epoch",
+        promptSha256: "f".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 0,
+        verifiedUserTurnId: "gemini-dom-turn:0:synthetic",
+        verifiedUserMessageId: "gemini-dom-turn:0:synthetic",
+        conversationId: "gemini-synthetic-target",
+      },
+      recoveryCleanupResources: [
+        {
+          chromeHost: "127.0.0.1",
+          chromePort: 9222,
+          chromeTargetId: "gemini-synthetic-target",
+          conversationId: "gemini-synthetic-target",
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const settledRuntime: BrowserRuntimeMetadata = {
+      conversationId: pendingRuntime.conversationId,
+      promptEpoch: pendingRuntime.promptEpoch,
+    };
+    const errorMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: {
+        config: { desiredModel: "gemini-3-pro-deep-think" },
+        runtime: pendingRuntime,
+      },
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+      error: {
+        category: "browser-automation",
+        message: "Gemini response identity is unavailable after commit",
+        details: {
+          stage: "gemini-response-capture",
+          code: "gemini-reattach-authority-unavailable",
+          reattachable: false,
+        },
+      },
+    };
+    const settledMeta: SessionMetadata = {
+      ...errorMeta,
+      browser: { ...errorMeta.browser, runtime: settledRuntime },
+    };
+    retryBrowserRecoveryCleanupMock.mockResolvedValue({
+      status: "completed",
+      runtime: settledRuntime,
+    });
+    readSessionMetadataMock.mockResolvedValue(settledMeta);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const recovered = await orchestrateBrowserAttachAuthority("sess", errorMeta);
+
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledWith(
+      pendingRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+      }),
+      "abort",
+    );
+    expect(
+      retryBrowserRecoveryCleanupMock.mock.calls[0]?.[2]?.isRemotePublicationAcknowledged?.(),
+    ).toBe(false);
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith("sess", {
+      browser: { ...errorMeta.browser, runtime: settledRuntime },
+    });
+    expect(recovered).toEqual(settledMeta);
+    expect(recovered.status).toBe("error");
+    expect(resumeBrowserSessionMock).not.toHaveBeenCalled();
+    expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("owned browser cleanup completed without resubmitting"),
+    );
+    expect(logSpy.mock.calls.some(([message]) => /reattach|harvest/i.test(String(message)))).toBe(
+      false,
+    );
+  });
+
+  test("serializes overlapping cleanup-only projections and acknowledges after terminal release", async () => {
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+    const targetId = "overlapping-cleanup-only-target";
+    const generationId = "b0000000-0000-4000-8000-00000000000b";
+    const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+    const targetCloseCapability = retainChromeTargetCloseCapability({
+      generationId,
+      targetId,
+      close: closeTarget,
+    });
+    const initialRuntime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: targetId,
+          targetCloseCapability,
+          acquisition: { generationId },
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" },
+    };
+    const initialMetadata: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: { runtime: initialRuntime },
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+      error: {
+        category: "browser-automation",
+        message: "response identity unavailable",
+        details: { reattachable: false },
+      },
+    };
+    let currentMetadata = initialMetadata;
+    const { promise: firstProjectionStarted, resolve: markFirstProjectionStarted } =
+      Promise.withResolvers<void>();
+    const { promise: allowFirstProjection, resolve: resumeFirstProjection } =
+      Promise.withResolvers<void>();
+    let projectionAttempt = 0;
+    sessionStoreMock.updateSession.mockImplementation(async (_sessionId, patch) => {
+      projectionAttempt += 1;
+      if (projectionAttempt === 1) {
+        markFirstProjectionStarted();
+        await allowFirstProjection;
+      }
+      currentMetadata = {
+        ...currentMetadata,
+        ...patch,
+        browser: patch.browser ?? currentMetadata.browser,
+      };
+    });
+    sessionStoreMock.readSession.mockImplementation(async () => currentMetadata);
+    let precedingRelease = Promise.resolve();
+    const acquireRecoveryLock = vi.fn(async () => {
+      const predecessor = precedingRelease;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      precedingRelease = promise;
+      await predecessor;
+      return {
+        release: async (finalize?: () => Promise<void>) => {
+          await finalize?.();
+          resolve();
+        },
+      };
+    });
+    let cleanupAttempt = 0;
+    settleBrowserRecoveryCleanupMock.mockImplementation(
+      (
+        runtime: BrowserRuntimeMetadata,
+        logger: BrowserLogger,
+        deps: BrowserRecoverySettlementDeps,
+        mode?: "finalize" | "abort",
+      ) =>
+        settleBrowserRecoveryCleanupActual(
+          runtime,
+          logger,
+          {
+            ...deps,
+            acquireRecoveryLock,
+            finalizeRuntime: async (currentRuntime, settlementMode) => {
+              cleanupAttempt += 1;
+              if (cleanupAttempt === 1) {
+                return pendingBrowserCaptureCleanup(
+                  currentRuntime,
+                  "first cleanup still pending",
+                  settlementMode,
+                );
+              }
+              const resource = currentRuntime.recoveryCleanupResources?.[0];
+              if (!resource?.targetCloseCapability || !resource.chromeTargetId) {
+                throw new Error("Current cleanup target authority is missing");
+              }
+              await closeChromeTargetWithRetainedCapability({
+                capability: resource.targetCloseCapability,
+                targetId: resource.chromeTargetId,
+                logger,
+              });
+              return completedBrowserCaptureCleanup(currentRuntime);
+            },
+          },
+          mode,
+        ),
+    );
+
+    const first = orchestrateBrowserAttachAuthority("sess", initialMetadata);
+    await firstProjectionStarted;
+    const second = orchestrateBrowserAttachAuthority("sess", initialMetadata);
+    await Promise.resolve();
+    expect(cleanupAttempt).toBe(1);
+
+    resumeFirstProjection();
+    await Promise.all([first, second]);
+
+    expect(cleanupAttempt).toBe(2);
+    expect(currentMetadata.browser?.runtime?.recoveryCleanupResources).toBeUndefined();
+    expect(currentMetadata.browser?.runtime?.recoveryCleanupResult).toBeUndefined();
+    expect(closeTarget).toHaveBeenCalledOnce();
+    expect(targetCloseAuthorityTest.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(
+      1,
+    );
   });
 
   test("retries persisted lock-only abort cleanup after browser resources completed", async () => {
@@ -1581,7 +2023,67 @@ describe("attachSession rendering", () => {
     expect(resumeBrowserSessionMock.mock.calls[0]?.[3]?.isRemotePublicationAcknowledged?.()).toBe(
       true,
     );
+    expect(resumeBrowserSessionMock.mock.calls[0]?.[3]?.persistFinalizationResult).toEqual(
+      expect.any(Function),
+    );
     expect(abort).not.toHaveBeenCalled();
+  });
+
+  test("does not project unverified receipt after manual journal ambiguity", async () => {
+    const runtime = {
+      chromePort: 9222,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "manual-recovery-target",
+      tabUrl: "https://chatgpt.com/c/manual-recovery",
+      recoveryCleanupResources: [
+        {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "manual-recovery-target",
+          recoveryCleanup: {
+            ownsTarget: false,
+            profileKind: "none" as const,
+            keepBrowser: true,
+          },
+        },
+      ],
+      recoveryCleanupResult: { status: "pending" as const },
+      ...committedPromptAuthority("manual-recovery"),
+    } satisfies BrowserRuntimeMetadata;
+    const recoverableMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+      browser: { config: {}, runtime },
+    };
+    resumeBrowserSessionMock.mockResolvedValue({
+      answerText: "captured answer",
+      answerMarkdown: "captured answer",
+      runtime,
+      bindSettlement: vi.fn(async () => runtime),
+      finalize: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
+      abort: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
+    });
+    vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("journal reconciliation read failed"))
+      .mockResolvedValue(null);
+    vi.spyOn(
+      browserPublicationJournal,
+      "writeBrowserCapturePublicationJournal",
+    ).mockRejectedValueOnce(new Error("journal write failed before answer persistence"));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await orchestrateBrowserAttachAuthority("sess", recoverableMeta);
+
+    const projectedArtifacts = sessionStoreMock.updateSession.mock.calls.flatMap(
+      ([, updates]) => updates.artifacts ?? [],
+    );
+    expect(projectedArtifacts).toEqual([]);
+    expect(persistDurableBrowserAnswerMock).not.toHaveBeenCalled();
   });
 
   test("aborts manual reattach when durable answer persistence fails", async () => {

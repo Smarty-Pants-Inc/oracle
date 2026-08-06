@@ -276,40 +276,31 @@ function findCausallyPairedResponse(
   entries: GeminiRawTurnDescriptor[],
   baseline: GeminiPromptBaseline,
 ): GeminiResponsePairing {
-  let submittedUserIndex: number;
-  if (baseline.userStableId) {
-    const boundUserIndexes: number[] = [];
-    for (const [index, entry] of entries.entries()) {
-      if (entry.kind === "user" && entry.stableId === baseline.userStableId) {
-        boundUserIndexes.push(index);
-      }
-    }
-    if (boundUserIndexes.length > 1) {
+  if (!baseline.userStableId) {
+    return {
+      status: "unsupported",
+      reason: "Gemini accepted the prompt without an immutable provider user identity.",
+    };
+  }
+  let submittedUserIndex = -1;
+  for (const [index, entry] of entries.entries()) {
+    if (entry.kind !== "user" || entry.stableId !== baseline.userStableId) continue;
+    if (submittedUserIndex >= 0) {
       return {
         status: "unsupported",
         reason: "Gemini rendered the dispatched user message identity more than once.",
       };
     }
-    if (boundUserIndexes.length === 0) return { status: "waiting" };
-    submittedUserIndex = boundUserIndexes[0];
-  } else {
-    submittedUserIndex = baseline.userQueryCount + baseline.responseCount;
+    submittedUserIndex = index;
   }
+  if (submittedUserIndex < 0) return { status: "waiting" };
 
   const submittedUser = entries[submittedUserIndex];
-  if (!submittedUser) return { status: "waiting" };
   if (
-    submittedUser.kind !== "user" ||
     !submittedUser.postBaseline ||
     normalizePromptForIdentity(submittedUser.text) !== baseline.normalizedPrompt
   ) {
-    return baseline.userStableId
-      ? { status: "waiting" }
-      : {
-          status: "unsupported",
-          reason:
-            "Gemini no longer exposes the exact accepted current turn at its committed DOM position.",
-        };
+    return { status: "waiting" };
   }
   const completedResponses: Array<GeminiRawTurnDescriptor & { kind: "response" }> = [];
   for (let index = submittedUserIndex + 1; index < entries.length; index += 1) {
@@ -613,6 +604,17 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{ text: str
   const userQuerySel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQuery);
   const userQueryTextSel = asSelectorLiteral(GEMINI_DEEP_THINK_SELECTORS.userQueryText);
   const baseline = requirePromptBaseline(ctx);
+  if (!baseline.userStableId) {
+    throw new BrowserAutomationError(
+      "Gemini accepted the prompt without an immutable provider user identity; " +
+        "refusing response publication because DOM position is not stable authority.",
+      {
+        stage: "gemini-response-capture",
+        code: "gemini-live-response-authority-unavailable",
+        reattachable: false,
+      },
+    );
+  }
   const state = requireGeminiState(ctx);
   const { responseTimeoutMs } = readTimeouts(ctx);
   const responseDeadline = Date.now() + responseTimeoutMs;

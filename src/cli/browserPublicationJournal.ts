@@ -28,6 +28,7 @@ export interface BrowserCapturePublicationJournal {
   model?: string;
   browserAudit: NonNullable<SessionMetadata["browser"]>;
   runtime: BrowserRuntimeMetadata;
+  cleanupFinalizationPersisted?: true;
   cleanupErrorCode?: string;
   cleanupErrorMessage?: string;
 }
@@ -90,6 +91,7 @@ export function projectCompletedBrowserMetadataAudit(
       ...(runtime.recoveryCleanupResult.settlementMode
         ? { settlementMode: runtime.recoveryCleanupResult.settlementMode }
         : {}),
+      ...(runtime.recoveryCleanupResult.lockReleasePending ? { lockReleasePending: true } : {}),
       ...(runtime.recoveryCleanupResult.error
         ? {
             error: `${cleanupErrorCode ?? "browser-cleanup-pending"}: ${sanitizeBrowserPublicationMessage(runtime.recoveryCleanupResult.error)}`,

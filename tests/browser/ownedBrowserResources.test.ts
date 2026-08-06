@@ -226,6 +226,95 @@ describe("OwnedBrowserResourceTransaction", () => {
     expect(closeTarget).toHaveBeenCalledOnce();
   });
 
+  it("acknowledges a terminal target after durable partial cleanup persistence", async () => {
+    const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+    const logger = vi.fn<(message: string) => void>() as BrowserLogger;
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "partial-generation",
+      targetId: "target-1",
+      close: closeTarget,
+    });
+    const runtime = acquisitionRuntime();
+    const resource = runtime.recoveryCleanupResources?.[0];
+    if (!resource) throw new Error("owned target fixture is missing");
+    runtime.recoveryCleanupResources = [{ ...resource, targetCloseCapability: capability }];
+    const persistSettlementResult = vi.fn(async (_runtime: BrowserRuntimeMetadata) => undefined);
+    const transaction = new OwnedBrowserResourceTransaction(
+      {
+        persistRuntime: async () => undefined,
+        persistSettlementResult,
+        settleResources: async (_mode, pendingRuntime) => {
+          await closeChromeTargetWithRetainedCapability({
+            capability,
+            targetId: "target-1",
+            logger,
+          });
+          const partialRuntime = projectBrowserRetryableCleanupRuntime(pendingRuntime, {
+            targetId: "target-1",
+            targetCloseCapability: capability,
+          });
+          return pendingBrowserCaptureCleanup(
+            partialRuntime,
+            "Browser lease release failed",
+            "finalize",
+          );
+        },
+      },
+      runtime,
+    );
+
+    await expect(transaction.settle("finalize")).resolves.toMatchObject({
+      status: "pending",
+      error: "Browser lease release failed",
+    });
+
+    expect(persistSettlementResult).toHaveBeenCalledOnce();
+    expect(closeTarget).toHaveBeenCalledOnce();
+    expect(targetCloseAuthorityTest.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(
+      1,
+    );
+  });
+
+  it("discards intentionally preserved target capabilities after durable completion", async () => {
+    for (let index = 0; index < 3; index += 1) {
+      const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+      const capability = retainChromeTargetCloseCapability({
+        generationId: `preserved-generation-${index}`,
+        targetId: "target-1",
+        close: closeTarget,
+      });
+      const runtime = acquisitionRuntime();
+      const resource = runtime.recoveryCleanupResources?.[0];
+      if (!resource) throw new Error("owned target fixture is missing");
+      runtime.recoveryCleanupResources = [
+        {
+          ...resource,
+          targetCloseCapability: capability,
+          recoveryCleanup: {
+            ...resource.recoveryCleanup,
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: false,
+          },
+        },
+      ];
+      const transaction = new OwnedBrowserResourceTransaction(
+        {
+          persistRuntime: async () => undefined,
+          persistSettlementResult: async () => undefined,
+          settleResources: async (_mode, pendingRuntime) =>
+            completedBrowserCaptureCleanup(pendingRuntime),
+        },
+        runtime,
+      );
+
+      await expect(transaction.settle("finalize")).resolves.toMatchObject({
+        status: "completed",
+      });
+      expect(closeTarget).not.toHaveBeenCalled();
+      expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(0);
+    }
+  });
+
   it("keeps terminal target authority unacknowledged without a durable settlement adapter", async () => {
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const logger = vi.fn<(message: string) => void>() as BrowserLogger;

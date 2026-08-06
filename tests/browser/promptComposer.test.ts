@@ -358,6 +358,95 @@ describe("promptComposer", () => {
     }
   });
 
+  test("does not fallback when stale and replacement oversized alerts transiently overlap", async () => {
+    vi.useFakeTimers();
+    try {
+      const acceptedLongPrompt = "x".repeat(50_000);
+      const staleAlert = {
+        innerText: "The message you submitted was too long. Please submit something shorter.",
+        textContent: "The message you submitted was too long. Please submit something shorter.",
+        getBoundingClientRect: () => ({ width: 320, height: 40 }),
+      };
+      let visibleAlerts = [staleAlert];
+      const acceptedTurnWithoutText = {
+        dataset: { turn: "user" },
+        getAttribute: (name: string) =>
+          name === "data-message-author-role" || name === "data-turn" ? "user" : null,
+        matches: (selector: string) => selector.includes('[data-message-author-role="user"]'),
+        querySelector: () => null,
+        querySelectorAll: () => [],
+      };
+      const document = {
+        querySelector: () => null,
+        querySelectorAll: (selector: string) => {
+          if (
+            selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
+            selector === CONVERSATION_TURN_SELECTOR
+          ) {
+            return [acceptedTurnWithoutText];
+          }
+          return selector === '[role="alert"]' ? visibleAlerts : [];
+        },
+      };
+      class FakeTextArea {}
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: Function(
+              "document",
+              "HTMLTextAreaElement",
+              "location",
+              `return ${expression};`,
+            )(document, FakeTextArea, { href: "https://chatgpt.com/c/conversation-1" }),
+          },
+        })),
+      };
+      const rejectionBaseline = await promptComposer.capturePromptTooLargeRejectionBaseline(
+        runtime as never,
+      );
+      expect(Object.values(rejectionBaseline?.fingerprintCounts ?? {})).toEqual([1]);
+      visibleAlerts = [staleAlert, { ...staleAlert }];
+      const submit = vi.fn(async () => {
+        await promptComposer.verifyPromptCommitted(
+          runtime as never,
+          acceptedLongPrompt,
+          150,
+          undefined,
+          0,
+          rejectionBaseline,
+        );
+        throw new Error("ambiguous accepted prompt unexpectedly committed");
+      });
+      const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
+      const pending = runSubmissionWithRecoveryForTest({
+        prompt: acceptedLongPrompt,
+        attachments: [],
+        fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
+        submit,
+        reloadPromptComposer: vi.fn().mockResolvedValue(undefined),
+        prepareFallbackSubmission,
+        logger: Object.assign(vi.fn(), { verbose: false }),
+      });
+      const assertion = expect(pending).rejects.toMatchObject({
+        details: {
+          code: "prompt-commit-timeout",
+          commitProbe: {
+            hasPostBaselineUserTurn: true,
+            promptTooLargeRejectedForDispatch: false,
+          },
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith(acceptedLongPrompt, []);
+      expect(prepareFallbackSubmission).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("uses the fallback after ChatGPT visibly rejects an oversized prompt", async () => {
     vi.useFakeTimers();
     try {

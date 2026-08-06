@@ -23,6 +23,8 @@ import type {
   BrowserTabLeaseTeardownAuthority,
 } from "../../src/browser/tabLeaseRegistry.js";
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -114,6 +116,123 @@ afterEach(() => {
   vi.doUnmock("../../src/browser/tabLeaseRegistry.js");
   vi.resetModules();
   logger.mockClear();
+  targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+});
+
+async function settleLocalOwnedTarget(options: {
+  mode: "finalize" | "abort";
+  keepBrowser: boolean;
+  omitDisposition?: boolean;
+}) {
+  const { createLocalRunSettlementCoordinator } =
+    await import("../../src/browser/localRunSettlement.js");
+  const { retainChromeTargetCloseCapability, __test__: localTargetCloseAuthorityTest } =
+    await import("../../src/browser/targetCloseAuthority.js");
+  const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-local-target-disposition-"));
+  const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+  const { owner, authority } = manualOwner(profileDirectory, "close-on-last-lease");
+  const generationId = "70000000-0000-4000-8000-000000000007" as const;
+  const targetId = `local-${options.mode}-${options.keepBrowser ? "preserve" : "close"}`;
+  const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+  const targetCloseCapability = retainChromeTargetCloseCapability({
+    generationId,
+    targetId,
+    close: closeTarget,
+  });
+  const state = createLocalBrowserRunState(null);
+  state.ownsTarget = true;
+  state.isolatedTargetId = targetId;
+  state.lastTargetId = targetId;
+  state.targetCloseCapability = targetCloseCapability;
+  state.runStatus = "complete";
+  const config = resolveBrowserConfig({ keepBrowser: options.keepBrowser });
+  const acquisition: LocalBrowserAcquisition = {
+    config,
+    manualLogin: false,
+    profileIsPreSigned: false,
+    userDataDir: profileDir,
+    effectiveKeepBrowser: options.keepBrowser,
+    acquisitionGenerationId: generationId,
+    acquisitionLaunchClaim: createChromeProcessLaunchClaim(generationId),
+    acquisitionOwnerDisposition: options.keepBrowser ? "preserve" : "close-on-last-lease",
+    acquisitionTargetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
+    acquisitionProfileIdentity: profileDirectory,
+    chromeOwner: owner,
+    chrome: owner.chrome,
+    chromeOwnerDisposition: "close-on-last-lease",
+    chromeHost: "127.0.0.1",
+    settlementEndpointAuthority: authority,
+    tabLease: null,
+    manualLeaseTeardownAuthority: null,
+  };
+  const coordinator = createLocalRunSettlementCoordinator({
+    acquisition,
+    state,
+    options: { prompt: "review" },
+    logger,
+    usingCopiedProfile: false,
+    timing: { startedAt: Date.now() },
+  });
+  coordinator.lifecycle.markAcquired();
+  const identity = await coordinator.lifecycle.beginPromptDispatch("review", 0, 0, 0);
+  await coordinator.lifecycle.recordPromptCommitVerification(
+    {
+      committedTurns: 1,
+      promptSha256: promptIdentitySha256("review"),
+      verifiedUserTurnIndex: 0,
+      verifiedUserTurnId: "turn-0",
+      verifiedUserMessageId: "message-0",
+      conversationId: "local-disposition",
+    },
+    identity,
+  );
+  const transaction = coordinator.lifecycle.issueCapture({
+    answerText: "answer",
+    answerMarkdown: "answer",
+    tookMs: 1,
+    answerTokens: 1,
+    answerChars: 6,
+  });
+  const cleanup = transaction.runtime.recoveryCleanupResources?.[0]?.recoveryCleanup;
+  const disposition = cleanup?.closeOwnedTargetOnComplete;
+  if (options.omitDisposition && cleanup) delete cleanup.closeOwnedTargetOnComplete;
+  try {
+    return { closeTarget, disposition, result: await transaction[options.mode]() };
+  } finally {
+    localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+    await rm(profileDir, { recursive: true, force: true });
+  }
+}
+
+describe("local owned-target disposition", () => {
+  test.each(["finalize", "abort"] as const)(
+    "%s closes the default owned target and preserves a keep-browser target",
+    async (mode) => {
+      const closed = await settleLocalOwnedTarget({ mode, keepBrowser: false });
+      expect(closed.disposition).toBe(true);
+      expect(closed.closeTarget).toHaveBeenCalledOnce();
+
+      const preserved = await settleLocalOwnedTarget({ mode, keepBrowser: true });
+      expect(preserved.disposition).toBe(false);
+      expect(preserved.closeTarget).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(["finalize", "abort"] as const)(
+    "%s fails closed when owned-target disposition metadata is missing",
+    async (mode) => {
+      const settlement = await settleLocalOwnedTarget({
+        mode,
+        keepBrowser: false,
+        omitDisposition: true,
+      });
+      expect(settlement.result).toMatchObject({
+        status: "pending",
+        error: expect.stringContaining(`Owned Chrome target ${mode} disposition is missing`),
+      });
+      expect(settlement.closeTarget).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("local manual Chrome owner settlement", () => {

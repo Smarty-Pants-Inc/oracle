@@ -9,6 +9,7 @@ import {
 import { DEFAULT_DEBUG_PORT, pickAvailableDebugPort } from "./localExecutionContext.js";
 import { runLocalBrowserMode } from "./localBrowserCoordinator.js";
 import { runRemoteBrowserMode } from "./remoteBrowserCoordinator.js";
+import { acknowledgeSettledTargetCloseCapabilities } from "./ownedBrowserResources.js";
 import { normalizeBrowserFollowUpPrompts } from "./responseCaptureCoordinator.js";
 import type {
   BrowserAttachment,
@@ -134,19 +135,48 @@ function projectPublicBrowserRunResult(transaction: BrowserRunTransaction): Brow
   return result;
 }
 
+function finalizationRetiresTargetCloseAuthority(
+  beforeFinalization: BrowserRunTransaction["runtime"],
+  finalization: BrowserCaptureFinalizationResult,
+): boolean {
+  return Boolean(
+    beforeFinalization.recoveryCleanupResources?.some(
+      ({ chromeTargetId, targetCloseCapability }) =>
+        chromeTargetId &&
+        targetCloseCapability &&
+        !finalization.runtime.recoveryCleanupResources?.some(
+          (resource) =>
+            resource.targetCloseCapability?.generationId === targetCloseCapability.generationId &&
+            resource.targetCloseCapability.capabilityId === targetCloseCapability.capabilityId,
+        ),
+    ),
+  );
+}
+
 export async function runBrowserMode(options: BrowserRunOptions): Promise<
   BrowserRunResult & {
     readonly retryCleanup?: () => Promise<BrowserCaptureFinalizationResult["status"]>;
   }
 > {
   const transaction = await runBrowserModeTransaction(options);
-  const finalization = await transaction.finalize();
+  const finalize = async (): Promise<BrowserCaptureFinalizationResult> => {
+    const runtimeBeforeFinalization = transaction.runtime;
+    const finalization = await transaction.finalize();
+    if (finalizationRetiresTargetCloseAuthority(runtimeBeforeFinalization, finalization)) {
+      await acknowledgeSettledTargetCloseCapabilities(
+        runtimeBeforeFinalization,
+        finalization.runtime,
+      );
+    }
+    return finalization;
+  };
+  const finalization = await finalize();
   const result = projectPublicBrowserRunResult(transaction);
   if (finalization.status === "pending") {
     Object.defineProperty(result, "retryCleanup", {
       configurable: false,
       enumerable: false,
-      value: async () => (await transaction.finalize()).status,
+      value: async () => (await finalize()).status,
       writable: false,
     });
     result.warnings = [

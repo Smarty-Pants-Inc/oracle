@@ -3,6 +3,7 @@ import {
   __test__,
   acknowledgeChromeTargetCloseCapability,
   closeChromeTargetWithRetainedCapability,
+  discardChromeTargetCloseCapability,
   retainChromeTargetCloseCapability,
 } from "../../src/browser/targetCloseAuthority.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
@@ -90,5 +91,43 @@ describe("retained Chrome target close capabilities", () => {
       }),
     ).resolves.toMatchObject({ status: "unavailable" });
     expect(close).toHaveBeenCalledTimes(count + 1);
+  });
+
+  test("discards intentional preservation without closing the target", async () => {
+    const close = vi.fn(async () => ({ status: "completed" as const }));
+    const release = vi.fn(async () => undefined);
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "preserved-generation",
+      targetId: "preserved-target",
+      close,
+      release,
+    });
+
+    await discardChromeTargetCloseCapability({ capability, targetId: "preserved-target" });
+
+    expect(close).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    expect(__test__.retainedTargetCloseAuthorityCount()).toBe(0);
+  });
+
+  test("retains a preserved capability when its release fails", async () => {
+    const release = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("endpoint release deferred"))
+      .mockResolvedValueOnce(undefined);
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "release-retry-generation",
+      targetId: "release-retry-target",
+      close: vi.fn(async () => ({ status: "completed" as const })),
+      release,
+    });
+
+    await expect(
+      discardChromeTargetCloseCapability({ capability, targetId: "release-retry-target" }),
+    ).rejects.toThrow(/release deferred/i);
+    expect(__test__.retainedTargetCloseAuthorityCount()).toBe(1);
+    await discardChromeTargetCloseCapability({ capability, targetId: "release-retry-target" });
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(__test__.retainedTargetCloseAuthorityCount()).toBe(0);
   });
 });

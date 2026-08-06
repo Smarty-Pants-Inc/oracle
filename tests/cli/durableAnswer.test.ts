@@ -7,10 +7,17 @@ import {
   durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
+  persistBrowserCaptureFinalizationState,
   readDurableBrowserAnswer,
+  verifiedDurableBrowserAnswerReceiptFromError,
   type DurableBrowserAnswerReceipt,
 } from "../../src/cli/durableAnswer.js";
-import { readBrowserCapturePublicationJournal } from "../../src/cli/browserPublicationJournal.js";
+import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
+import {
+  readBrowserCapturePublicationJournal,
+  writeBrowserCapturePublicationJournal,
+  type BrowserCapturePublicationJournal,
+} from "../../src/cli/browserPublicationJournal.js";
 import type {
   BrowserRuntimeMetadata,
   SessionMetadata,
@@ -18,11 +25,28 @@ import type {
 } from "../../src/sessionStore.js";
 import { sessionStore } from "../../src/sessionStore.js";
 import * as sessionManager from "../../src/sessionManager.js";
+import {
+  OwnedBrowserResourceTransaction,
+  completedBrowserCaptureCleanup,
+} from "../../src/browser/ownedBrowserResources.js";
+import { createReattachSettlement } from "../../src/browser/reattachSettlement.js";
+import type { ReattachResult } from "../../src/browser/reattachContracts.js";
+import { acquireCrashRecoverableFilesystemLock } from "../../src/browser/filesystemLock.js";
+import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
+import { __test__ as lockReleaseJournalTest } from "../../src/browser/filesystemLockReleaseJournal.js";
+import {
+  __test__ as targetCloseAuthorityTest,
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "../../src/browser/targetCloseAuthority.js";
+import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../../src/browser/types.js";
 
 const tempDirectories: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+  lockReleaseJournalTest.clearRetainedFilesystemLockReleases();
   await Promise.all(
     tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
   );
@@ -409,6 +433,37 @@ describe("publishCompletedBrowserCapture", () => {
     expect(abort).not.toHaveBeenCalled();
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
+  test("does not verify an unreconciled preparing receipt before answer persistence", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal")
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("journal reconciliation read failed"));
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockRejectedValueOnce(
+      new Error("journal write failed before answer persistence"),
+    );
+    const persistAnswer = acceptPreparedReceipt();
+    const promise = publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer: "answer never persisted" },
+      transaction: {
+        runtime,
+        bindSettlement: vi.fn(),
+        finalize: vi.fn(),
+        abort: vi.fn(),
+      },
+      browser: browser(runtime),
+      persistAnswer,
+    });
+
+    await expect(promise).rejects.toThrow("publication recovery remains pending");
+    await promise.catch(async (error: unknown) => {
+      expect(durableBrowserAnswerReceiptFromError(error)).toMatchObject({
+        artifact: { validation: { ok: true } },
+      });
+      await expect(verifiedDurableBrowserAnswerReceiptFromError(error)).resolves.toBeUndefined();
+    });
+    expect(persistAnswer).not.toHaveBeenCalled();
+  });
 
   test("clears the preparing journal when answer persistence fails before a receipt", async () => {
     await setupSession();
@@ -502,7 +557,7 @@ describe("publishCompletedBrowserCapture", () => {
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
 
-  test("binds ABORT before cleanup when pre-stage preparation fails", async () => {
+  test("retires preparing intent after ABORT binding and before cleanup effects", async () => {
     await setupSession();
     const events: string[] = [];
     const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
@@ -520,6 +575,7 @@ describe("publishCompletedBrowserCapture", () => {
         }),
         finalize: vi.fn(),
         abort: vi.fn(async () => {
+          expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
           events.push("abort");
           return { status: "completed" as const, runtime: {} };
         }),
@@ -527,13 +583,13 @@ describe("publishCompletedBrowserCapture", () => {
       browser: browser(runtime),
       persistAnswer: vi.fn(
         async (
-          _options: Parameters<typeof persistDurableBrowserAnswer>[0],
+          options: Parameters<typeof persistDurableBrowserAnswer>[0],
           expectedReceipt?: DurableBrowserAnswerReceipt,
         ) => {
           events.push("receipt");
           if (!expectedReceipt) throw new Error("publication intent receipt missing");
           preparedReceipt = expectedReceipt;
-          return expectedReceipt;
+          return persistDurableBrowserAnswer(options, expectedReceipt);
         },
       ),
       prepareArtifacts: async () => {
@@ -544,8 +600,11 @@ describe("publishCompletedBrowserCapture", () => {
 
     await expect(promise).rejects.toThrow("staging failed after the answer became durable");
     expect(events).toEqual(["receipt", "prepare", "bind:abort", "abort"]);
-    await promise.catch((error: unknown) => {
+    await promise.catch(async (error: unknown) => {
       expect(durableBrowserAnswerReceiptFromError(error)).toEqual(preparedReceipt);
+      await expect(verifiedDurableBrowserAnswerReceiptFromError(error)).resolves.toEqual(
+        preparedReceipt,
+      );
     });
     expect(sessionStore.updateSession).toHaveBeenCalledWith(
       "session-1",
@@ -561,6 +620,150 @@ describe("publishCompletedBrowserCapture", () => {
     expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
   });
 
+  test("cannot recover-publish after terminal ABORT projection crashes", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = {
+      recoveryCleanupResources: [
+        {
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    const boundRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+    };
+    let terminalProjection: BrowserRuntimeMetadata | undefined;
+    vi.mocked(sessionStore.updateSession).mockImplementation(async (sessionId, updates) => {
+      const projectedRuntime = updates.browser?.runtime;
+      if (
+        projectedRuntime &&
+        !projectedRuntime.recoveryCleanupResources?.length &&
+        !projectedRuntime.recoveryCleanupResult
+      ) {
+        terminalProjection = projectedRuntime;
+        expect(await readBrowserCapturePublicationJournal(sessionId)).toBeNull();
+        throw new Error("crash after terminal abort projection");
+      }
+      return sessionResult(sessionId, updates);
+    });
+    const finalize = vi.fn();
+
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "abandoned answer" },
+        transaction: {
+          runtime,
+          bindSettlement: vi.fn(async () => boundRuntime),
+          finalize,
+          abort: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
+        },
+        browser: browser(runtime),
+        persistAnswer: async (options, expectedReceipt) =>
+          persistDurableBrowserAnswer(options, expectedReceipt),
+        prepareArtifacts: async () => {
+          throw new Error("artifact preparation failed");
+        },
+      }),
+    ).rejects.toMatchObject({ details: { code: "abort-authority-persistence-failed" } });
+
+    expect(terminalProjection).toEqual({});
+    expect(finalize).not.toHaveBeenCalled();
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toBeNull();
+  });
+
+  test("releases a bound recovery lock after finalize journal failure and retries in process", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = {
+      conversationId: "conversation-retry",
+      promptEpoch: {
+        status: "committed",
+        epochId: "epoch-retry",
+        promptSha256: "f".repeat(64),
+        baselineTurns: 0,
+        followUpOrdinal: 0,
+        remainingFollowUps: 0,
+        verifiedUserTurnIndex: 1,
+        verifiedUserTurnId: "turn-retry",
+        verifiedUserMessageId: "message-retry",
+        conversationId: "conversation-retry",
+      },
+      recoveryCleanupResources: [
+        {
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+    };
+    let durableRuntime = runtime;
+    let lockHeld = true;
+    let reacquisitions = 0;
+    const releaseLock = vi.fn(async (finalize?: () => Promise<void>) => {
+      lockHeld = false;
+      await finalize?.();
+    });
+    let settlement!: ReattachResult;
+    const finalizeResources = vi.fn(async () => completedBrowserCaptureCleanup(settlement.runtime));
+    settlement = createReattachSettlement(
+      { answerText: "answer", answerMarkdown: "answer", finalizeResources },
+      runtime,
+      null,
+      () => undefined,
+      {
+        runtimeHintCb: async (latestRuntime) => {
+          durableRuntime = latestRuntime;
+        },
+        loadRuntimeUnderLock: async () => durableRuntime,
+      },
+      {
+        ensure: async () => {
+          if (lockHeld) return;
+          lockHeld = true;
+          reacquisitions += 1;
+        },
+        release: releaseLock,
+      },
+    );
+    const writeFileAtomicDurable = sessionManager.writeFileAtomicDurable;
+    let failFinalizeBoundJournal = true;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        if (
+          failFinalizeBoundJournal &&
+          path.basename(targetPath) === "browser-capture-publication.json" &&
+          String(data).includes('"phase": "finalize-bound"')
+        ) {
+          failFinalizeBoundJournal = false;
+          throw new Error("injected finalize-bound journal failure");
+        }
+        await writeFileAtomicDurable(targetPath, data, mode);
+      },
+    );
+    const options = {
+      answer: { sessionId: "session-1", answer: "answer" },
+      transaction: settlement,
+      browser: browser(runtime),
+      persistAnswer: acceptPreparedReceipt(),
+    };
+
+    await expect(publishCompletedBrowserCapture(options)).rejects.toMatchObject({
+      details: { code: "finalize-binding-journal-persistence-failed" },
+    });
+    expect(lockHeld).toBe(false);
+    expect(releaseLock).toHaveBeenCalledOnce();
+    expect(finalizeResources).not.toHaveBeenCalled();
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toMatchObject({
+      phase: "staged",
+    });
+
+    await expect(publishCompletedBrowserCapture(options)).resolves.toMatchObject({
+      published: true,
+      finalization: { status: "completed" },
+    });
+    expect(reacquisitions).toBe(1);
+    expect(releaseLock).toHaveBeenCalledTimes(2);
+    expect(finalizeResources).toHaveBeenCalledOnce();
+  });
+
   test("keeps FINALIZE authority recoverable when completed projection is interrupted", async () => {
     await setupSession();
     const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
@@ -570,6 +773,7 @@ describe("publishCompletedBrowserCapture", () => {
     }));
     const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
     const abort = vi.fn();
+    const releaseSettlementLock = vi.fn(async () => undefined);
     vi.mocked(sessionStore.updateSession).mockImplementation(async (sessionId, updates) => {
       if (updates.status === "completed") throw new Error("metadata fsync failed");
       return sessionResult(sessionId, updates);
@@ -578,13 +782,14 @@ describe("publishCompletedBrowserCapture", () => {
     await expect(
       publishCompletedBrowserCapture({
         answer: { sessionId: "session-1", answer: "answer" },
-        transaction: { runtime, bindSettlement, finalize, abort },
+        transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
         browser: browser(runtime),
         persistAnswer: acceptPreparedReceipt(),
       }),
     ).rejects.toMatchObject({ details: { code: "finalize-bound-publication-pending" } });
     expect(abort).not.toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
+    expect(releaseSettlementLock).toHaveBeenCalledOnce();
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "finalize-bound",
     });
@@ -592,7 +797,7 @@ describe("publishCompletedBrowserCapture", () => {
     vi.mocked(sessionStore.updateSession).mockResolvedValue(sessionResult("session-1"));
     const recovered = await publishCompletedBrowserCapture({
       answer: { sessionId: "session-1", answer: "ignored on recovery" },
-      transaction: { runtime, bindSettlement, finalize, abort },
+      transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
       browser: browser(runtime),
       persistAnswer: vi.fn(),
     });
@@ -600,6 +805,7 @@ describe("publishCompletedBrowserCapture", () => {
     expect(bindSettlement).toHaveBeenCalledTimes(1);
     expect(finalize).toHaveBeenCalledTimes(1);
     expect(abort).not.toHaveBeenCalled();
+    expect(releaseSettlementLock).toHaveBeenCalledOnce();
   });
 
   test("retries the local FINALIZE projection before completed publication", async () => {
@@ -612,6 +818,7 @@ describe("publishCompletedBrowserCapture", () => {
     const bindSettlement = vi.fn(async () => boundRuntime);
     const finalize = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
     const abort = vi.fn();
+    const releaseSettlementLock = vi.fn(async () => undefined);
     vi.mocked(sessionStore.updateSession).mockImplementation(async (sessionId, updates) => {
       if (
         updates.status !== "completed" &&
@@ -625,13 +832,14 @@ describe("publishCompletedBrowserCapture", () => {
     await expect(
       publishCompletedBrowserCapture({
         answer: { sessionId: "session-1", answer: "answer" },
-        transaction: { runtime, bindSettlement, finalize, abort },
+        transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
         browser: browser(runtime),
         persistAnswer: acceptPreparedReceipt(),
       }),
     ).rejects.toMatchObject({ details: { code: "finalize-local-binding-persistence-failed" } });
     expect(finalize).not.toHaveBeenCalled();
     expect(abort).not.toHaveBeenCalled();
+    expect(releaseSettlementLock).toHaveBeenCalledOnce();
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "finalize-bound",
       runtime: { recoveryCleanupResult: { settlementMode: "finalize" } },
@@ -643,7 +851,7 @@ describe("publishCompletedBrowserCapture", () => {
     await expect(
       publishCompletedBrowserCapture({
         answer: { sessionId: "session-1", answer: "ignored on recovery" },
-        transaction: { runtime, bindSettlement, finalize, abort },
+        transaction: { runtime, bindSettlement, releaseSettlementLock, finalize, abort },
         browser: browser(runtime),
         persistAnswer: vi.fn(),
       }),
@@ -651,6 +859,7 @@ describe("publishCompletedBrowserCapture", () => {
     expect(bindSettlement).toHaveBeenCalledTimes(1);
     expect(finalize).toHaveBeenCalledTimes(1);
     expect(abort).not.toHaveBeenCalled();
+    expect(releaseSettlementLock).toHaveBeenCalledOnce();
   });
 
   test("retains pending cleanup authority while completed metadata is audit-only", async () => {
@@ -787,5 +996,216 @@ describe("publishCompletedBrowserCapture", () => {
     expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
       phase: "cleanup-pending",
     });
+  });
+
+  test("journals terminal cleanup before a failing completed-session projection", async () => {
+    await setupSession();
+    const targetId = "original-lifecycle-target";
+    const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+    const logger = vi.fn<(message: string) => void>() as BrowserLogger;
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "b0000000-0000-4000-8000-00000000000b",
+      targetId,
+      close: closeTarget,
+    });
+    const runtime: BrowserRuntimeMetadata = {
+      conversationId: "conversation-1",
+      recoveryCleanupResources: [
+        {
+          chromeTargetId: targetId,
+          targetCloseCapability: capability,
+          recoveryCleanup: {
+            ownsTarget: true,
+            profileKind: "manual-login",
+            keepBrowser: false,
+            closeOwnedTargetOnComplete: true,
+          },
+        },
+      ],
+    };
+    const transaction = new OwnedBrowserResourceTransaction(
+      {
+        settleResources: async (_mode, pendingRuntime) => {
+          await closeChromeTargetWithRetainedCapability({ capability, targetId, logger });
+          return completedBrowserCaptureCleanup(pendingRuntime);
+        },
+      },
+      runtime,
+    );
+    let completedWrites = 0;
+    vi.mocked(sessionStore.updateSession).mockImplementation(async (sessionId, updates) => {
+      if (updates.status === "completed") {
+        completedWrites += 1;
+        if (completedWrites > 1) throw new Error("terminal metadata fsync failed");
+      }
+      return sessionResult(sessionId, updates);
+    });
+
+    const result = await publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer: "answer" },
+      transaction: {
+        get runtime() {
+          return transaction.runtime();
+        },
+        bindSettlement: (mode) => transaction.bindSettlement(mode),
+        finalize: () => transaction.settle("finalize"),
+        abort: () => transaction.settle("abort"),
+      },
+      browser: browser(runtime),
+      persistAnswer: acceptPreparedReceipt(),
+    });
+
+    expect(result.runtimeAuthority).toEqual({
+      status: "pending",
+      error: "terminal metadata fsync failed",
+    });
+    expect(await readBrowserCapturePublicationJournal("session-1")).toMatchObject({
+      phase: "published",
+      runtime: { conversationId: "conversation-1" },
+    });
+    expect(
+      (await readBrowserCapturePublicationJournal("session-1"))?.runtime.recoveryCleanupResources,
+    ).toBeUndefined();
+    expect(targetCloseAuthorityTest.retainedAcknowledgedTerminalTargetCloseAuthorityCount()).toBe(
+      1,
+    );
+    expect(closeTarget).toHaveBeenCalledOnce();
+  });
+
+  test("keeps terminal publication authoritative when journal removal durability is unknown", async () => {
+    await setupSession();
+    const paths = await sessionStore.getPaths("session-1");
+    const artifact = {
+      kind: "transcript" as const,
+      path: path.join(paths.dir, "artifacts", "browser-answer.md"),
+      sha256: "a".repeat(64),
+      sizeBytes: 6,
+    };
+    const runtime: BrowserRuntimeMetadata = { conversationId: "conversation-1" };
+    const journal: BrowserCapturePublicationJournal = {
+      version: 1,
+      sessionId: "session-1",
+      phase: "published",
+      receipt: { artifact },
+      artifacts: [artifact],
+      completedAt: "2026-01-01T00:00:01.000Z",
+      browserAudit: browser(runtime),
+      runtime,
+    };
+    await writeBrowserCapturePublicationJournal(journal);
+    vi.spyOn(sessionManager, "syncDirectoryIfSupported").mockRejectedValueOnce(
+      new Error("journal directory sync outcome unknown"),
+    );
+
+    const result = await persistBrowserCaptureFinalizationState(
+      "session-1",
+      browser(runtime),
+      journal,
+      { status: "completed", runtime },
+      runtime,
+    );
+
+    expect(result).toEqual({ status: "completed", runtime });
+    expect(sessionStore.updateSession).toHaveBeenLastCalledWith(
+      "session-1",
+      expect.objectContaining({
+        status: "completed",
+        browser: expect.objectContaining({ runtime: expect.objectContaining(runtime) }),
+      }),
+    );
+    expect(await readBrowserCapturePublicationJournal("session-1")).toBeNull();
+  });
+
+  test("retires paused retained completion after a peer clears the journal", async () => {
+    await setupSession();
+    const paths = await sessionStore.getPaths("session-1");
+    const lockPath = path.join(paths.dir, "browser-recovery.lock");
+    const artifact = {
+      kind: "transcript" as const,
+      path: path.join(paths.dir, "artifacts", "browser-answer-cross-process.md"),
+      sha256: "b".repeat(64),
+      sizeBytes: 6,
+    };
+    const pendingRuntime: BrowserRuntimeMetadata = {
+      conversationId: "conversation-cross-process",
+      recoveryCleanupResources: [
+        {
+          recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: true },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "pending",
+        error: "lock release completion pending",
+        settlementMode: "finalize",
+        lockReleasePending: true,
+      },
+    };
+    const journal: BrowserCapturePublicationJournal = {
+      version: 1,
+      sessionId: "session-1",
+      phase: "cleanup-pending",
+      receipt: { artifact },
+      artifacts: [artifact],
+      completedAt: "2026-01-01T00:00:02.000Z",
+      browserAudit: browser(pendingRuntime),
+      runtime: pendingRuntime,
+      cleanupFinalizationPersisted: true,
+      cleanupErrorCode: "browser-cleanup-finalize-pending",
+    };
+    await writeBrowserCapturePublicationJournal(journal);
+    let currentSession = sessionResult("session-1", {
+      mode: "browser",
+      browser: browser(pendingRuntime),
+      artifacts: [artifact],
+    });
+    vi.mocked(sessionStore.readSession).mockImplementation(async () => currentSession);
+    vi.mocked(sessionStore.updateSession).mockImplementation(async (_sessionId, updates) => {
+      currentSession = {
+        ...currentSession,
+        ...updates,
+        browser: updates.browser ?? currentSession.browser,
+      };
+      return currentSession;
+    });
+    const controllerA = await acquireReattachRecoveryLock(lockPath);
+    const { promise: callbackPaused, resolve: markCallbackPaused } = Promise.withResolvers<void>();
+    const { promise: resumeCallback, resolve: resumeControllerA } = Promise.withResolvers<void>();
+    let controllerAFinalization: BrowserCaptureFinalizationResult | undefined;
+    const controllerARelease = controllerA.release(async () => {
+      markCallbackPaused();
+      await resumeCallback;
+      controllerAFinalization = await persistBrowserCaptureFinalizationState(
+        "session-1",
+        browser(pendingRuntime),
+        journal,
+        { status: "completed", runtime: { conversationId: "conversation-cross-process" } },
+        pendingRuntime,
+      );
+    });
+    await callbackPaused;
+
+    const controllerB = await acquireCrashRecoverableFilesystemLock(lockPath, {
+      timeoutMs: 5_000,
+      pollMs: 10,
+    });
+    await persistBrowserCaptureFinalizationState(
+      "session-1",
+      browser(pendingRuntime),
+      journal,
+      { status: "completed", runtime: { conversationId: "conversation-cross-process" } },
+      pendingRuntime,
+    );
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toBeNull();
+    await controllerB.release();
+
+    resumeControllerA();
+    await controllerARelease;
+    expect(controllerAFinalization).toEqual({
+      status: "completed",
+      runtime: expect.objectContaining({ conversationId: "conversation-cross-process" }),
+    });
+
+    const reacquired = await acquireReattachRecoveryLock(lockPath);
+    await reacquired.release();
   });
 });

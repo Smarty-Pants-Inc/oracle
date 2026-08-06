@@ -1053,8 +1053,8 @@ export async function verifyPromptCommitted(
     }
     const baselineRejectionFingerprintCounts = rejectionBaseline?.fingerprintCounts ?? {};
     const promptTooLargeRejectedForDispatch = Boolean(
-      rejectionBaseline && Object.entries(currentRejectionFingerprintCounts).some(
-        ([fingerprint, count]) => count > (baselineRejectionFingerprintCounts[fingerprint] ?? 0),
+      rejectionBaseline && Object.keys(currentRejectionFingerprintCounts).some(
+        (fingerprint) => baselineRejectionFingerprintCounts[fingerprint] === undefined,
       ),
     );
     return {

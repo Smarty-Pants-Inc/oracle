@@ -10,6 +10,8 @@
 - Browser: submit uploaded prompts whenever ChatGPT exposes an enabled send button even if secondary attachment evidence is stale, and close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 - Browser: serialize manual-login Chrome ownership across normal runs, Project Sources, and recovery, reusing only exact-profile owners while keeping PID authority stable and tab leases independent.
 - Browser: bind deferred tab cleanup to opaque, generation-scoped live close capabilities instead of reconstructing destructive authority from saved DevTools addresses, target ids, or marker URLs. Pre-upgrade browser sessions without this capability now stay cleanup-pending and preserve the tab; complete them with the original running controller or restart them under the current version.
+- Browser/Gemini: require immutable provider user-message identity for live and recovered response publication. Provider-id-less accepted turns retain committed audit and cleanup state, but cannot publish or reattach; owned resources can still be cleaned without resubmitting.
+- CLI/Browser follow-up: accept pre-prompt-epoch completed browser follow-ups only with unambiguous GPT/ChatGPT provenance and one exact ChatGPT conversation locator, rejecting Gemini, non-GPT, and conflicting metadata.
 
 ## 0.17.0 — 2026-08-02
 

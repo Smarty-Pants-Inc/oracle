@@ -11,6 +11,7 @@ import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
 import {
   OwnedBrowserResourceTransaction,
+  acknowledgeSettledTargetCloseCapabilities,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureCleanupRuntime,
@@ -157,7 +158,7 @@ export async function openGeminiBrowserSession(
             ownsTarget: targetCleanupPending,
             profileKind: "manual-login",
             keepBrowser: owner ? owner.disposition === "preserve" : ownerDisposition === "preserve",
-            closeOwnedTargetOnComplete: targetCleanupPending,
+            closeOwnedTargetOnComplete: targetCleanupPending ? !resolvedConfig.keepBrowser : false,
           },
         },
       ],
@@ -171,20 +172,15 @@ export async function openGeminiBrowserSession(
   ): Promise<BrowserCaptureFinalizationResult> => {
     const errors: string[] = [];
     const cleanup = pendingRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
-    const shouldCloseTarget =
-      cleanup?.ownsTarget === true &&
-      (mode === "abort" || cleanup.closeOwnedTargetOnComplete === true);
-    if (
-      mode === "finalize" &&
-      cleanup?.ownsTarget === true &&
-      typeof cleanup.closeOwnedTargetOnComplete !== "boolean"
-    ) {
+    if (cleanup?.ownsTarget === true && typeof cleanup.closeOwnedTargetOnComplete !== "boolean") {
       return pendingBrowserCaptureCleanup(
         pendingRuntime,
-        "Owned Gemini target finalize disposition is missing",
+        `Owned Gemini target ${mode} disposition is missing`,
         mode,
       );
     }
+    const shouldCloseTarget =
+      cleanup?.ownsTarget === true && cleanup.closeOwnedTargetOnComplete === true;
     if (shouldCloseTarget && targetId && !targetClosed) {
       if (!targetCloseCapability) {
         errors.push("Owned Gemini target has no retained exact close capability");
@@ -385,7 +381,10 @@ export async function openGeminiBrowserSession(
     ) {
       resources.replaceRuntime(projectBrowserCaptureCleanupRuntime(pendingRuntime, runtime()));
     }
-    return resources.settle(mode);
+    const runtimeBeforeSettlement = resources.runtime();
+    const result = await resources.settle(mode);
+    await acknowledgeSettledTargetCloseCapabilities(runtimeBeforeSettlement, result.runtime);
+    return result;
   };
 
   return {

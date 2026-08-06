@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { openGeminiBrowserSession } from "../../src/gemini-web/browserSessionManager.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "../../src/browser/profileState.js";
+import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 
 type Teardown = () => Promise<boolean>;
 
@@ -124,6 +125,7 @@ describe("openGeminiBrowserSession", () => {
     tempRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-profile-"));
     delete process.env.ORACLE_BROWSER_PROFILE_DIR;
 
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     ownerKill.mockReset();
     ownerKill.mockResolvedValue({ status: "stopped", pid: processIdentity.pid });
     leaseUpdate.mockReset();
@@ -397,6 +399,59 @@ describe("openGeminiBrowserSession", () => {
     expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
     expect(ownerKill).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { mode: "finalize" as const, keepBrowser: false, closesTarget: true },
+    { mode: "abort" as const, keepBrowser: false, closesTarget: true },
+    { mode: "finalize" as const, keepBrowser: true, closesTarget: false },
+    { mode: "abort" as const, keepBrowser: true, closesTarget: false },
+  ])(
+    "$mode uses the explicit keepBrowser=$keepBrowser target disposition",
+    async ({ mode, keepBrowser, closesTarget }) => {
+      const session = await openGeminiBrowserSession({
+        browserConfig: {
+          manualLoginProfileDir: path.join(tempRoot, `${mode}-${keepBrowser}-profile`),
+          keepBrowser,
+        },
+        keepBrowserDefault: false,
+        purpose: "Gemini target disposition",
+        persistRuntime: async () => undefined,
+      });
+
+      expect(
+        session.runtime().recoveryCleanupResources?.[0]?.recoveryCleanup.closeOwnedTargetOnComplete,
+      ).toBe(closesTarget);
+      await expect(session.settle(mode)).resolves.toMatchObject({ status: "completed" });
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(closesTarget ? 1 : 0);
+      expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(
+        closesTarget ? 1 : 0,
+      );
+    },
+  );
+
+  it.each(["finalize", "abort"] as const)(
+    "%s fails closed when owned-target disposition metadata is missing",
+    async (mode) => {
+      const session = await openGeminiBrowserSession({
+        browserConfig: {
+          manualLoginProfileDir: path.join(tempRoot, `missing-${mode}-profile`),
+        },
+        keepBrowserDefault: false,
+        purpose: "Gemini missing target disposition",
+        persistRuntime: async () => undefined,
+      });
+      const currentRuntime = session.runtime();
+      const cleanup = currentRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
+      if (!cleanup) throw new Error("Gemini target cleanup fixture is missing");
+      delete cleanup.closeOwnedTargetOnComplete;
+
+      await expect(session.settle(mode)).resolves.toMatchObject({
+        status: "pending",
+        error: expect.stringContaining(`Owned Gemini target ${mode} disposition is missing`),
+      });
+      expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+    },
+  );
 
   it("replays completed settlement without replacing runtime authority", async () => {
     const session = await openGeminiBrowserSession({

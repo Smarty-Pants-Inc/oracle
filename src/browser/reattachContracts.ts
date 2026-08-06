@@ -12,6 +12,7 @@ import type { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import type { acquireBrowserTabLease } from "./tabLeaseRegistry.js";
 import type { ReattachRecoveryLock } from "./reattachLock.js";
 import type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
+import type { ReattachSettlementMode } from "./reattachCleanupTypes.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
 import type { ChromeClient } from "./types.js";
 
@@ -45,6 +46,17 @@ export interface ReattachDeps {
   isRemotePublicationAcknowledged?: () => boolean;
   resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
   runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
+  loadRuntimeUnderLock?: () => Promise<BrowserRuntimeMetadata>;
+  persistFinalizationResult?: (
+    result: ReattachFinalizationResult,
+    beforeRuntime: BrowserRuntimeMetadata,
+    mode: ReattachSettlementMode,
+  ) => Promise<ReattachFinalizationResult>;
+  completeFinalizationAfterLockRelease?: (
+    result: ReattachFinalizationResult,
+    beforeRuntime: BrowserRuntimeMetadata,
+    mode: ReattachSettlementMode,
+  ) => Promise<ReattachFinalizationResult>;
 }
 
 export interface ReattachResult {

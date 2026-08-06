@@ -7,15 +7,13 @@ import { once } from "node:events";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
 
-vi.mock("../../src/browser/reattach.js", () => ({
-  resumeBrowserSession: vi.fn(),
-  retryBrowserRecoveryCleanup: vi.fn(async (runtime: BrowserRuntimeMetadata) => {
-    const completedRuntime = { ...runtime };
-    delete completedRuntime.recoveryCleanupResources;
-    delete completedRuntime.recoveryCleanupResult;
-    return { status: "completed", runtime: completedRuntime };
-  }),
-}));
+vi.mock("../../src/browser/reattach.js", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../../src/browser/reattach.js");
+  return {
+    ...actual,
+    resumeBrowserSession: vi.fn(),
+  };
+});
 function committedRuntime(
   conversationId: string,
   runtime: BrowserRuntimeMetadata = {},
@@ -117,9 +115,8 @@ describe("browser reattach end-to-end (simulated)", () => {
     setOracleHomeDirOverrideForTest(tmpHome);
 
     try {
-      const { retryBrowserRecoveryCleanup } = await import("../../src/browser/reattach.js");
-      const retryMock = vi.mocked(retryBrowserRecoveryCleanup);
       const { sessionStore } = await import("../../src/sessionStore.js");
+      const updateSession = vi.spyOn(sessionStore, "updateSession");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
       // Dynamic import preserves the per-test module graph after vi.resetModules and home override.
       const { persistDurableBrowserAnswer } = await import("../../src/cli/durableAnswer.js");
@@ -160,21 +157,28 @@ describe("browser reattach end-to-end (simulated)", () => {
 
       await attachSession(sessionMeta.id, { suppressMetadata: true, renderPrompt: false });
 
-      expect(retryMock).toHaveBeenCalledTimes(1);
-      expect(retryMock).toHaveBeenCalledWith(
-        expect.objectContaining({ recoveryCleanupResources: expect.any(Array) }),
-        expect.any(Function),
+      expect(updateSession).toHaveBeenCalledWith(
+        sessionMeta.id,
         expect.objectContaining({
-          recoveryLockPath: path.join(
-            (await sessionStore.getPaths(sessionMeta.id)).dir,
-            "browser-recovery.lock",
-          ),
+          browser: expect.objectContaining({
+            runtime: expect.objectContaining({
+              recoveryCleanupResult: expect.objectContaining({
+                status: "pending",
+                settlementMode: "finalize",
+                lockReleasePending: true,
+              }),
+            }),
+          }),
         }),
-        "finalize",
       );
       const persisted = await sessionStore.readSession(sessionMeta.id);
       expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResources");
       expect(persisted?.browser?.runtime).not.toHaveProperty("recoveryCleanupResult");
+      await expect(
+        fs.stat(
+          path.join((await sessionStore.getPaths(sessionMeta.id)).dir, "browser-recovery.lock"),
+        ),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);

@@ -28,7 +28,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
   group: RecoveryCleanupGroup,
   logger: BrowserLogger,
   deps: ReattachCleanupDeps,
-  mode: ReattachSettlementMode,
+  _mode: ReattachSettlementMode,
 ): Promise<RecoveryCleanupPhaseResult> {
   const pending: RecoveryCleanupEntry[] = [];
   const errors: string[] = [];
@@ -82,13 +82,11 @@ export async function finalizeLocalRecoveryCleanupGroup(
       const { resource } = entry;
       const cleanup = resource.recoveryCleanup;
       if (!cleanup.ownsTarget) continue;
-      if (mode === "finalize") {
-        if (typeof cleanup.closeOwnedTargetOnComplete !== "boolean") {
-          addPending(entry, "Owned Chrome target finalize disposition is missing");
-          continue;
-        }
-        if (!cleanup.closeOwnedTargetOnComplete) continue;
+      if (typeof cleanup.closeOwnedTargetOnComplete !== "boolean") {
+        addPending(entry, "Owned Chrome target close disposition is missing");
+        continue;
       }
+      if (!cleanup.closeOwnedTargetOnComplete) continue;
       const targetKey =
         resource.targetCloseCapability?.capabilityId ??
         `missing:${recoveryCleanupResourceKey(resource)}`;

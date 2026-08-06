@@ -12,6 +12,7 @@ import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLifecycle.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/promptComposer.js";
+import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 
 const {
   launchChrome,
@@ -178,6 +179,7 @@ let runtimeEvaluate: Mock<(input: { expression?: string }) => Promise<unknown>>;
 
 describe("gemini-web executor", () => {
   beforeEach(() => {
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     runGeminiWebWithFallback.mockClear();
     saveFirstGeminiImageFromOutput.mockClear();
     getCookies.mockClear();
@@ -869,6 +871,11 @@ describe("gemini-web executor", () => {
         },
       },
     });
+    expect(
+      runtimeEvaluate.mock.calls.some(([input]) =>
+        String(input.expression ?? "").includes("const ordered ="),
+      ),
+    ).toBe(false);
     expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
   });
@@ -1022,15 +1029,8 @@ describe("gemini-web executor", () => {
       expect.objectContaining({ disposition: "preserve" }),
       expect.any(Function),
     );
-    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
-      expect.objectContaining({
-        authority: expect.objectContaining({
-          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/executor-test-owner",
-        }),
-        targetId: "target-1",
-        logger: expect.any(Function),
-      }),
-    );
+    expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
+    expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(0);
     expect(killChrome).not.toHaveBeenCalled();
   });
 });

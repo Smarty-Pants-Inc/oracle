@@ -152,19 +152,18 @@ export function createLocalRunSettlementCoordinator({
     const pendingResource = pendingRuntime.recoveryCleanupResources?.[0];
     const pendingCleanup = pendingResource?.recoveryCleanup;
     const pendingOwnsTarget = pendingCleanup?.ownsTarget === true;
-    const finalizeTargetCloseDecision = pendingCleanup?.closeOwnedTargetOnComplete;
-    if (!aborting && pendingOwnsTarget && typeof finalizeTargetCloseDecision !== "boolean") {
+    const targetCloseDecision = pendingCleanup?.closeOwnedTargetOnComplete;
+    if (pendingOwnsTarget && typeof targetCloseDecision !== "boolean") {
       return pendingBrowserCaptureCleanup(
         pendingRuntime,
-        "Owned Chrome target finalize disposition is missing",
+        `Owned Chrome target ${mode} disposition is missing`,
+        mode,
       );
     }
     const targetId = pendingResource?.chromeTargetId ?? null;
     const targetCleanupCompleted = Boolean(targetId && closedOwnedTargetId === targetId);
     const shouldCloseOwnedRunTarget =
-      !targetCleanupCompleted &&
-      pendingOwnsTarget &&
-      (aborting || finalizeTargetCloseDecision === true);
+      !targetCleanupCompleted && pendingOwnsTarget && targetCloseDecision === true;
     let keepBrowserOpen = aborting
       ? manualLogin && (effectiveKeepBrowser || chromeOwnerDisposition === "preserve")
       : shouldKeepLocalBrowserOpen({

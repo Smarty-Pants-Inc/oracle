@@ -17,10 +17,10 @@ import { wait } from "../sessionManager.js";
 import { formatElapsed } from "../oracle/format.js";
 import {
   createBrowserCapturePublicationAcknowledgement,
-  durableBrowserAnswerReceiptFromError,
   persistDurableBrowserAnswer,
   publishCompletedBrowserCapture,
   runtimeFromBrowserError,
+  verifiedDurableBrowserAnswerReceiptFromError,
 } from "./durableAnswer.js";
 import {
   hasResumableBrowserAuthority,
@@ -246,7 +246,7 @@ export async function autoReattachUntilComplete({
           userError?.details && capturedFailureRuntime
             ? { ...userError.details, runtime: failureRuntime }
             : userError?.details;
-        const receipt = durableBrowserAnswerReceiptFromError(error);
+        const receipt = await verifiedDurableBrowserAnswerReceiptFromError(error);
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
