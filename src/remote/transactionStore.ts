@@ -3,6 +3,7 @@ import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "n
 import path from "node:path";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
+import { syncDirectory } from "../fsDurability.js";
 import {
   applyRemoteTransactionTransition,
   createRemoteTransactionRecord,
@@ -613,16 +614,6 @@ export class RemoteTransactionCapacityError extends Error {
 
 function serializeRecord(record: RemoteTransactionRecord): Buffer {
   return Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return;
-  const handle = await open(directory, "r");
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
 }
 
 function readErrorCode(error: unknown): string | undefined {

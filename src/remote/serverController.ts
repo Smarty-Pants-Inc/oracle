@@ -381,6 +381,7 @@ export async function createRemoteServer(
       let retainedClose: Promise<void>;
       retainedClose = closeRemoteServer().catch((error) => {
         if (closeInFlight === retainedClose) closeInFlight = null;
+        if (!listenerClosed) closing = false;
         throw error;
       });
       closeInFlight = retainedClose;

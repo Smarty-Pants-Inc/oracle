@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
+import { hasRestartDurableChromeTargetCleanupAuthority } from "../browser/targetCloseAuthority.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import type {
   AppliedRemoteTransactionTransition,
@@ -513,11 +514,28 @@ const reducers: RemoteTransactionReducers = {
       throw new Error("Cannot shut down while a remote transaction is still running");
     }
     if (!record.runtime) throw new Error("Nonterminal transaction lacks runtime authority");
+    const restartDurableCleanup = hasRestartDurableChromeTargetCleanupAuthority(record.runtime);
     if (!record.settlementMode) {
-      return { persist: false, outcome: { action: "preserve" } };
+      if (restartDurableCleanup) {
+        return { persist: false, outcome: { action: "preserve" } };
+      }
+      if (record.result || record.stagedCapture) {
+        throw new Error(
+          "Cannot shut down while a durable capture depends on non-restart-durable browser cleanup authority",
+        );
+      }
+      return {
+        persist: false,
+        outcome: { action: "settle", mode: "abort", durablePublication: false },
+      };
     }
     if (record.settlementMode === "finalize" && !record.publicationAcknowledgedAt) {
-      return { persist: false, outcome: { action: "preserve" } };
+      if (restartDurableCleanup) {
+        return { persist: false, outcome: { action: "preserve" } };
+      }
+      throw new Error(
+        "Cannot shut down while an unacknowledged durable capture depends on non-restart-durable browser cleanup authority",
+      );
     }
     return {
       persist: false,

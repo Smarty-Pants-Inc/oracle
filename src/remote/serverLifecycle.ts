@@ -57,6 +57,7 @@ export async function bootstrapRemoteManualChromeOwner(
     }),
     logger,
     "remote-serve-bootstrap",
+    { ownerPolicy: "service-persistent" },
   );
   try {
     logger(

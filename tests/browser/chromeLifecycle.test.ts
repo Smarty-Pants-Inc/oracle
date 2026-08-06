@@ -11,7 +11,10 @@ import {
   type ChromeLaunchResult,
   type StableChromeProcessHandle,
 } from "../../src/browser/chromeLifecycle.js";
-import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
+import {
+  captureProfileDirectoryIdentity,
+  inspectChromeProcessIdentityForTest,
+} from "../../src/browser/profileState.js";
 import type {
   ChromeProcessIdentity,
   ChromeProcessLaunchClaim,
@@ -390,6 +393,89 @@ describe("hidden macOS Chrome launch", () => {
     await expect(
       verifyListeningPortOwnedByProcessForTest(4321, 64305, differentOwner),
     ).resolves.toBe(false);
+  });
+
+  test("blocks endpoint automation and close for a claimless possible Darwin PID recycle", async () => {
+    // Dynamic import keeps this endpoint assertion bound to Vitest's hoisted CDP mock.
+    const { retainChromeEndpointAuthority } = await import("../../src/browser/chromeLifecycle.js");
+    const userDataDir = "/tmp/oracle-claimless-recycled-profile";
+    const executablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    const identity: ChromeProcessIdentity = {
+      pid: 4321,
+      processStartTime: "darwin-sample-launch:2026-08-05T11:57:07.287-0400",
+      executablePath,
+      normalizedUserDataDir: userDataDir,
+      launchNonce: "00000000-0000-4000-8000-000000007004",
+      profileDirectory: {
+        version: 1,
+        platform: "darwin",
+        canonicalPath: userDataDir,
+        device: "1",
+        inode: "2",
+      },
+    };
+    const commandTokens = [
+      executablePath,
+      `--user-data-dir=${userDataDir}`,
+      "--remote-debugging-port=64305",
+    ];
+    let observedStartTime = identity.processStartTime;
+    const inspectProcessIdentity = vi.fn(
+      async (profileDir: string, durableIdentity: ChromeProcessIdentity) =>
+        inspectChromeProcessIdentityForTest(profileDir, durableIdentity, {
+          platform: "darwin",
+          verifyProfileIdentity: async () => true,
+          isProcessAlive: () => true,
+          readProcessSnapshot: async () => ({
+            pid: identity.pid,
+            processStartTime: observedStartTime,
+            executablePath,
+            commandLine: commandTokens.join(" "),
+            commandTokens,
+          }),
+        }),
+    );
+    const browserClose = vi.fn(async () => undefined);
+    const endpointClose = vi.fn(async () => undefined);
+    const getProcessInfo = vi.fn(async () => ({
+      processInfo: [{ id: identity.pid, type: "browser" }],
+    }));
+    const client = {
+      Browser: { getVersion: vi.fn(async () => ({})), close: browserClose },
+      SystemInfo: { getProcessInfo },
+      close: endpointClose,
+    };
+    const authority = await retainChromeEndpointAuthority(
+      {
+        host: "127.0.0.1",
+        port: 64305,
+        browserWSEndpoint: "ws://127.0.0.1:64305/devtools/browser/claimless-recycled",
+        userDataDir,
+        processIdentity: identity,
+      },
+      {
+        connectBrowser: vi.fn(async () => client as never),
+        inspectProcessIdentity,
+        resolveListeningPid: vi.fn(async () => identity.pid),
+      },
+    );
+
+    observedStartTime = "darwin-audit-pidversion:7001";
+    const operation = vi.fn(async () => "must-not-run");
+    await expect(authority.runExactOperation?.(operation)).resolves.toMatchObject({
+      status: "unsafe",
+      reason: expect.stringMatching(/could not be reverified/i),
+    });
+    await expect(authority.kill()).resolves.toMatchObject({
+      status: "unsafe",
+      pid: identity.pid,
+      reason: expect.stringMatching(/could not be reverified/i),
+    });
+    expect(operation).not.toHaveBeenCalled();
+    expect(browserClose).not.toHaveBeenCalled();
+    expect(getProcessInfo).toHaveBeenCalledOnce();
+    await authority.release();
+    expect(endpointClose).toHaveBeenCalledOnce();
   });
 
   test("binds a reusable endpoint to the exact browser process generation", async () => {
@@ -1807,6 +1893,44 @@ describe("closeChromeTarget", () => {
     expect(browserClient.Target.createTarget).toHaveBeenCalledWith({ url: "about:blank" });
     expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "owned" });
     expect(browserClient.close).toHaveBeenCalledOnce();
+  });
+
+  test("retains a replacement page while closing through retained endpoint authority", async () => {
+    vi.useFakeTimers();
+    const exactClient = {
+      Target: {
+        getTargets: vi
+          .fn()
+          .mockResolvedValueOnce({
+            targetInfos: [{ targetId: "owned", type: "page", url: "https://chatgpt.com/c/1" }],
+          })
+          .mockResolvedValueOnce({
+            targetInfos: [{ targetId: "replacement", type: "page", url: "about:blank" }],
+          }),
+        createTarget: vi.fn(async () => ({ targetId: "replacement" })),
+        closeTarget: vi.fn(async () => ({ success: true })),
+      },
+    };
+    const authority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/generation-a",
+      kill: vi.fn(),
+      release: vi.fn(),
+      runExactOperation: vi.fn(async (operation: (client: never) => Promise<unknown>) => ({
+        status: "completed" as const,
+        value: await operation(exactClient as never),
+      })),
+    };
+
+    const closing = closeChromeTargetWithExactAuthority({
+      authority: authority as never,
+      targetId: "owned",
+      logger: createBrowserLogger(),
+    });
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(closing).resolves.toEqual({ status: "completed" });
+    expect(exactClient.Target.createTarget).toHaveBeenCalledWith({ url: "about:blank" });
+    expect(exactClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "owned" });
   });
 });
 describe("ensureChromePageTargetAfterClose", () => {

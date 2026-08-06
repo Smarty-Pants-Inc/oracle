@@ -40,6 +40,8 @@ vi.mock("../../src/cli/notifier.ts", () => ({
   deriveNotificationSettingsFromMetadata: vi.fn(() => ({ enabled: true, sound: false })),
 }));
 
+const commitSessionModelProjectionMock = vi.hoisted(() => vi.fn());
+
 const sessionStoreMock = vi.hoisted(() => ({
   updateSession: vi.fn(),
   createLogWriter: vi.fn(),
@@ -57,6 +59,7 @@ const sessionStoreMock = vi.hoisted(() => ({
 
 vi.mock("../../src/sessionStore.ts", () => ({
   sessionStore: sessionStoreMock,
+  commitSessionModelProjection: commitSessionModelProjectionMock,
 }));
 
 import type {
@@ -65,9 +68,11 @@ import type {
   SessionMetadata,
   SessionModelRun,
 } from "../../src/sessionManager.ts";
+import type { BrowserRunResult } from "../../src/browser/types.ts";
 import * as sessionManager from "../../src/sessionManager.ts";
 import type { ModelName } from "../../src/oracle.ts";
 import { performSessionRun } from "../../src/cli/sessionRunner.ts";
+import { persistBrowserSessionOutcome } from "../../src/cli/browserSessionOutcome.ts";
 import {
   BrowserAutomationError,
   FileValidationError,
@@ -129,6 +134,7 @@ function createReattachResult(
   answerText: string,
   answerMarkdown: string,
   runtime: BrowserRuntimeMetadata,
+  fields: Partial<BrowserRunResult> = {},
 ) {
   const preSettlementCleanupResult = runtime.recoveryCleanupResult;
   const capturedRuntime = runtime.recoveryCleanupResources?.length
@@ -145,6 +151,7 @@ function createReattachResult(
   const abort = vi.fn(async () => ({ status: "completed" as const, runtime: finalizedRuntime }));
   return {
     value: {
+      ...fields,
       answerText,
       answerMarkdown,
       runtime: capturedRuntime,
@@ -272,6 +279,7 @@ beforeEach(async () => {
       fn.mockReset();
     }
   });
+  commitSessionModelProjectionMock.mockReset();
   vi.mocked(runMultiModelApiSession).mockReset();
   vi.mocked(resumeBrowserSession).mockReset();
   vi.mocked(settleBrowserRecoveryCleanup).mockReset();
@@ -300,6 +308,26 @@ beforeEach(async () => {
     status: "running",
     ...updates,
   }));
+  commitSessionModelProjectionMock.mockImplementation(async (sessionId, projection) => {
+    const session = await sessionStoreMock.updateSession(sessionId, projection.session);
+    let model;
+    if (projection.model) {
+      try {
+        model = await sessionStoreMock.updateModelRun(
+          sessionId,
+          projection.model.model,
+          projection.model.updates,
+        );
+      } catch {
+        model = {
+          model: projection.model.model,
+          status: projection.model.updates.status,
+          ...projection.model.updates,
+        };
+      }
+    }
+    return { session, ...(model ? { model } : {}) };
+  });
   sessionStoreMock.readSession.mockResolvedValue(null);
   sessionStoreMock.createLogWriter.mockReturnValue({
     logLine: vi.fn(),
@@ -316,6 +344,98 @@ beforeEach(async () => {
   });
   vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
   vi.spyOn(fsPromises, "writeFile").mockResolvedValue(undefined);
+});
+
+describe("persistBrowserSessionOutcome", () => {
+  test("retries an ambiguous commit when session and model branches disagree", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      tabUrl: "https://chatgpt.com/c/demo",
+      ...committedDemoAuthority,
+    };
+    commitSessionModelProjectionMock
+      .mockRejectedValueOnce(new Error("ambiguous metadata rename"))
+      .mockResolvedValueOnce({ session: baseSessionMeta });
+    sessionStoreMock.readSession.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      ...baseSessionMeta,
+      status: "running",
+      mode: "browser",
+      completedAt: undefined,
+      errorMessage: "Chrome disconnected",
+      browser: { config: {}, runtime },
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      models: [{ model: "gpt-5.2-pro", status: "error" }],
+    });
+
+    await persistBrowserSessionOutcome(baseSessionMeta.id, {
+      kind: "recovery-running",
+      browser: { config: {} },
+      runtime,
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      reason: "Chrome disconnected",
+      artifacts: undefined,
+      receipt: undefined,
+      errorMetadata: undefined,
+      transportMetadata: undefined,
+      modelProjection: { model: "gpt-5.2-pro", updates: {} },
+    });
+
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledTimes(2);
+    for (const [, projection] of commitSessionModelProjectionMock.mock.calls) {
+      expect(projection.session).toMatchObject({
+        status: "running",
+        response: { status: "running", incompleteReason: "chrome-disconnected" },
+      });
+      expect(projection.model).toMatchObject({
+        model: "gpt-5.2-pro",
+        updates: { status: "running", completedAt: undefined },
+      });
+    }
+  });
+
+  test("accepts an ambiguous commit only when both branches match", async () => {
+    const runtime: BrowserRuntimeMetadata = {
+      chromePort: 9222,
+      tabUrl: "https://chatgpt.com/c/demo",
+      ...committedDemoAuthority,
+    };
+    commitSessionModelProjectionMock.mockRejectedValueOnce(
+      new Error("metadata rename result unknown"),
+    );
+    sessionStoreMock.readSession.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      ...baseSessionMeta,
+      status: "running",
+      mode: "browser",
+      completedAt: undefined,
+      errorMessage: "Chrome disconnected",
+      browser: { config: {}, runtime },
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      transport: undefined,
+      error: undefined,
+      models: [
+        {
+          model: "gpt-5.2-pro",
+          status: "running",
+          completedAt: undefined,
+        },
+      ],
+    });
+
+    await persistBrowserSessionOutcome(baseSessionMeta.id, {
+      kind: "recovery-running",
+      browser: { config: {} },
+      runtime,
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      reason: "Chrome disconnected",
+      artifacts: undefined,
+      receipt: undefined,
+      errorMetadata: undefined,
+      transportMetadata: undefined,
+      modelProjection: { model: "gpt-5.2-pro", updates: {} },
+    });
+
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("performSessionRun", () => {
@@ -1260,6 +1380,16 @@ describe("performSessionRun", () => {
     });
 
     expect(vi.mocked(runBrowserSessionExecution)).toHaveBeenCalled();
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({
+        session: expect.objectContaining({ status: "completed" }),
+        model: expect.objectContaining({
+          model: "gpt-5.2-pro",
+          updates: expect.objectContaining({ status: "completed" }),
+        }),
+      }),
+    );
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();
     const completedCallIndex = sessionStoreMock.updateSession.mock.calls.findIndex(
       (call) => call[1]?.status === "completed",
@@ -2240,6 +2370,19 @@ describe("performSessionRun", () => {
     });
 
     expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({
+        session: expect.objectContaining({
+          status: "running",
+          response: { status: "running", incompleteReason: "chrome-disconnected" },
+        }),
+        model: expect.objectContaining({
+          model: "gpt-5.2-pro",
+          updates: expect.objectContaining({ status: "running" }),
+        }),
+      }),
+    );
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
       status: "running",
@@ -2666,6 +2809,19 @@ describe("performSessionRun", () => {
       "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
     );
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(commitSessionModelProjectionMock).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({
+        session: expect.objectContaining({
+          status: "error",
+          response: { status: "error", incompleteReason: "chrome-disconnected" },
+        }),
+        model: expect.objectContaining({
+          model: "gpt-5.2-pro",
+          updates: expect.objectContaining({ status: "error" }),
+        }),
+      }),
+    );
     expect(finalUpdate).toMatchObject({
       status: "error",
       response: { status: "error", incompleteReason: "chrome-disconnected" },
@@ -2772,13 +2928,39 @@ describe("performSessionRun", () => {
       ],
       recoveryCleanupResult: { status: "pending" as const },
     } satisfies BrowserRuntimeMetadata;
+    const recoveredArtifact = {
+      kind: "file" as const,
+      path: "/tmp/recovering-session/artifacts/remote-result.zip",
+      url: "bridge-artifact",
+      filename: "remote-result.zip",
+    };
+    const recoveredModel = {
+      requestedModel: "Pro",
+      resolvedLabel: "Pro",
+      strategy: "select" as const,
+      status: "already-selected" as const,
+      verified: true,
+      source: "chatgpt-model-picker" as const,
+      capturedAt: "2026-08-05T00:00:00.000Z",
+    };
     const reattach = createReattachResult(
       "recovered answer",
       "recovered **answer**",
       recoveredRuntime,
+      {
+        answerHtml: "<p>recovered answer</p>",
+        savedFiles: [recoveredArtifact],
+        archive: { mode: "auto", attempted: true, archived: true },
+        modelSelection: recoveredModel,
+        warnings: [{ code: "remote-warning", severity: "warning", message: "Recovered warning" }],
+        tookMs: 42,
+        answerTokens: 2,
+        answerChars: 16,
+      },
     );
     vi.mocked(resumeBrowserSession).mockResolvedValueOnce(reattach.value);
     vi.mocked(ensureSessionArtifacts).mockResolvedValueOnce([
+      recoveredArtifact,
       { kind: "transcript", path: "/tmp/transcript.md" },
     ]);
 
@@ -2794,13 +2976,29 @@ describe("performSessionRun", () => {
     });
 
     expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resumeBrowserSession).mock.calls[0]?.[3]).toEqual(
+      expect.objectContaining({ sessionId: baseSessionMeta.id }),
+    );
+    expect(vi.mocked(ensureSessionArtifacts)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingArtifacts: [recoveredArtifact],
+      }),
+    );
     const completedUpdate = sessionStoreMock.updateSession.mock.calls.find(
       ([, updates]) => updates.status === "completed",
     )?.[1];
     expect(completedUpdate).toMatchObject({
       status: "completed",
+      elapsedMs: 42,
       response: { status: "completed" },
+      artifacts: expect.arrayContaining([
+        expect.objectContaining({ kind: "file", path: recoveredArtifact.path }),
+        expect.objectContaining({ kind: "transcript", path: "/tmp/transcript.md" }),
+      ]),
       browser: {
+        archive: { mode: "auto", attempted: true, archived: true },
+        modelSelection: recoveredModel,
+        warnings: [{ code: "remote-warning", severity: "warning", message: "Recovered warning" }],
         runtime: {
           conversationId: "demo",
           promptEpoch: committedDemoAuthority.promptEpoch,
@@ -3907,10 +4105,9 @@ describe("performSessionRun", () => {
     vi.spyOn(browserPublicationJournal, "readBrowserCapturePublicationJournal")
       .mockResolvedValueOnce(null)
       .mockRejectedValueOnce(new Error("journal reconciliation read failed"));
-    vi.spyOn(
-      browserPublicationJournal,
-      "writeBrowserCapturePublicationJournal",
-    ).mockRejectedValueOnce(new Error("journal write failed before answer persistence"));
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockRejectedValueOnce(
+      new Error("journal write failed before answer persistence"),
+    );
 
     await expect(
       performSessionRun({

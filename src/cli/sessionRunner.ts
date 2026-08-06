@@ -71,6 +71,10 @@ import {
   retryableInitialBrowserRuntime,
 } from "./browserRuntimeAuthority.js";
 import { autoReattachUntilComplete } from "./autoReattachController.js";
+import {
+  persistBrowserSessionOutcome,
+  type BrowserSessionOutcome,
+} from "./browserSessionOutcome.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -313,6 +317,49 @@ export async function performSessionRun({
         config: browserConfig,
         runtime: publication.finalization.runtime,
       };
+      const publishedModelProjection = modelForStatus
+        ? {
+            model: modelForStatus,
+            updates: {
+              usage: result.usage,
+              response: { status: "completed" },
+              transport: undefined,
+              error: undefined,
+            },
+          }
+        : undefined;
+      const publishedOutcome: BrowserSessionOutcome =
+        publication.finalization.status === "pending"
+          ? {
+              kind: "cleanup-pending",
+              publication: "published",
+              browser: currentBrowser ?? { config: browserConfig },
+              runtime: publication.finalization.runtime,
+              response: { status: "completed" },
+              reason: publication.finalization.error,
+              artifacts: publication.artifacts,
+              receipt: publication.receipt,
+              errorMetadata: undefined,
+              transportMetadata: undefined,
+              modelProjection: publishedModelProjection,
+              usage: result.usage,
+              elapsedMs: result.elapsedMs,
+            }
+          : {
+              kind: "published",
+              browser: currentBrowser ?? { config: browserConfig },
+              runtime: publication.finalization.runtime,
+              response: { status: "completed" },
+              reason: undefined,
+              artifacts: publication.artifacts,
+              receipt: publication.receipt,
+              errorMetadata: undefined,
+              transportMetadata: undefined,
+              modelProjection: publishedModelProjection,
+              usage: result.usage,
+              elapsedMs: result.elapsedMs,
+            };
+      await persistBrowserSessionOutcome(sessionMeta.id, publishedOutcome);
       if (publication.finalization.status === "pending") {
         log(
           dim("Browser cleanup remains pending; saved the answer and cleanup authority for retry."),
@@ -735,40 +782,28 @@ export async function performSessionRun({
               : "Chrome disconnected without recoverable current-prompt commit authority; marking session error.",
           ),
         );
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "error",
-            completedAt: new Date().toISOString(),
-            response: {
-              status: "error",
-              incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
-            },
-            error: {
-              category: userError.category,
-              message: userError.message,
-              details: authoritativeErrorDetails,
-            },
-          });
-        }
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          errorMessage: message,
-          mode,
-          browser: {
-            ...currentBrowser,
-            config: browserConfig,
-            runtime: recoverableRuntime,
-          },
-          response: {
-            status: "error",
-            incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
-          },
-          error: {
-            category: userError.category,
-            message: userError.message,
-            details: authoritativeErrorDetails,
-          },
+        const incompleteReason = geminiCaptureFailure
+          ? "incomplete-capture"
+          : "chrome-disconnected";
+        const response = { status: "error", incompleteReason };
+        const errorMetadata = {
+          category: userError.category,
+          message: userError.message,
+          details: authoritativeErrorDetails,
+        };
+        await persistBrowserSessionOutcome(sessionMeta.id, {
+          kind: "terminal-error",
+          browser: { ...currentBrowser, config: browserConfig },
+          runtime: recoverableRuntime,
+          response,
+          reason: message,
+          artifacts: sessionMeta.artifacts,
+          receipt: durableAnswerReceipt,
+          errorMetadata,
+          transportMetadata: undefined,
+          modelProjection: modelForStatus
+            ? { model: modelForStatus, updates: { response, error: errorMetadata } }
+            : undefined,
         });
         throw error;
       }
@@ -779,25 +814,22 @@ export async function performSessionRun({
             : "Chrome disconnected before completion; keeping session running for reattach.",
         ),
       );
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-          status: "running",
-          completedAt: undefined,
-        });
-      }
-      await sessionStore.updateSession(sessionMeta.id, {
+      const recoveryRuntime = recoverableRuntime as BrowserRuntimeMetadata;
+      const recoveryResponse = {
         status: "running",
-        errorMessage: message,
-        mode,
-        browser: {
-          ...currentBrowser,
-          config: browserConfig,
-          runtime: recoverableRuntime,
-        },
-        response: {
-          status: "running",
-          incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
-        },
+        incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
+      };
+      await persistBrowserSessionOutcome(sessionMeta.id, {
+        kind: "recovery-running",
+        browser: { ...currentBrowser, config: browserConfig },
+        runtime: recoveryRuntime,
+        response: recoveryResponse,
+        reason: message,
+        artifacts: sessionMeta.artifacts,
+        receipt: durableAnswerReceipt,
+        errorMetadata: undefined,
+        transportMetadata: undefined,
+        modelProjection: modelForStatus ? { model: modelForStatus, updates: {} } : undefined,
       });
       logBrowserReattachGuidance(recoverableRuntime);
       // A live committed target gets one immediate harvest attempt even without a configured loop.
@@ -808,7 +840,7 @@ export async function performSessionRun({
           : Math.max(1_000, Math.min(browserConfig?.timeoutMs ?? 30_000, 30_000));
       const reattach = await autoReattachUntilComplete({
         sessionMeta,
-        runtime: recoverableRuntime ?? undefined,
+        runtime: recoveryRuntime,
         browserConfig: {
           ...browserConfig,
           autoReattachIntervalMs: recoveryIntervalMs,
@@ -825,21 +857,23 @@ export async function performSessionRun({
         maxAttempts: configuredIntervalMs > 0 ? undefined : 1,
       });
       if (reattach.outcome === "exhausted") {
+        const exhaustedRuntime = reattach.runtime ?? recoveryRuntime;
         currentBrowser = {
           ...currentBrowser,
           config: browserConfig,
-          runtime: reattach.runtime ?? recoverableRuntime,
+          runtime: exhaustedRuntime,
         };
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "running",
-          completedAt: undefined,
-          errorMessage: message,
-          mode,
+        await persistBrowserSessionOutcome(sessionMeta.id, {
+          kind: "recovery-running",
           browser: currentBrowser,
-          response: {
-            status: "running",
-            incompleteReason: geminiCaptureFailure ? "incomplete-capture" : "chrome-disconnected",
-          },
+          runtime: exhaustedRuntime,
+          response: recoveryResponse,
+          reason: message,
+          artifacts: sessionMeta.artifacts,
+          receipt: durableAnswerReceipt,
+          errorMetadata: undefined,
+          transportMetadata: undefined,
+          modelProjection: modelForStatus ? { model: modelForStatus, updates: {} } : undefined,
         });
       }
       return;
@@ -861,30 +895,27 @@ export async function performSessionRun({
       const willAutoReattach =
         autoReattachIntervalMs > 0 && hasResumableBrowserAuthority(autoRuntime);
       if (willAutoReattach) {
-        if (modelForStatus) {
-          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-            status: "running",
-            completedAt: undefined,
-            response: timeoutResponse,
-            error: timeoutError,
-          });
-        }
-        await sessionStore.updateSession(sessionMeta.id, {
-          status: "running",
-          completedAt: undefined,
-          errorMessage: message,
-          mode,
-          browser: {
-            ...currentBrowser,
-            config: browserConfig,
-            runtime: autoRuntime,
-          },
+        const timeoutRecoveryRuntime = autoRuntime as BrowserRuntimeMetadata;
+        await persistBrowserSessionOutcome(sessionMeta.id, {
+          kind: "recovery-running",
+          browser: { ...currentBrowser, config: browserConfig },
+          runtime: timeoutRecoveryRuntime,
           response: timeoutResponse,
-          error: timeoutError,
+          reason: message,
+          artifacts: sessionMeta.artifacts,
+          receipt: durableAnswerReceipt,
+          errorMetadata: timeoutError,
+          transportMetadata: undefined,
+          modelProjection: modelForStatus
+            ? {
+                model: modelForStatus,
+                updates: { response: timeoutResponse, error: timeoutError },
+              }
+            : undefined,
         });
         const reattach = await autoReattachUntilComplete({
           sessionMeta,
-          runtime: autoRuntime,
+          runtime: timeoutRecoveryRuntime,
           browserConfig,
           browserMetadata: currentBrowser,
           runOptions,
@@ -898,26 +929,22 @@ export async function performSessionRun({
         }
         autoRuntime = reattach.runtime ?? autoRuntime;
       }
-      if (modelForStatus) {
-        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
-          status: "error",
-          completedAt: new Date().toISOString(),
-          response: timeoutResponse,
-          error: timeoutError,
-        });
-      }
-      await sessionStore.updateSession(sessionMeta.id, {
-        status: "error",
-        completedAt: new Date().toISOString(),
-        errorMessage: message,
-        mode,
-        browser: {
-          ...currentBrowser,
-          config: browserConfig,
-          runtime: autoRuntime,
-        },
+      await persistBrowserSessionOutcome(sessionMeta.id, {
+        kind: "terminal-error",
+        browser: { ...currentBrowser, config: browserConfig },
+        runtime: autoRuntime,
         response: timeoutResponse,
-        error: timeoutError,
+        reason: message,
+        artifacts: sessionMeta.artifacts,
+        receipt: durableAnswerReceipt,
+        errorMetadata: timeoutError,
+        transportMetadata: undefined,
+        modelProjection: modelForStatus
+          ? {
+              model: modelForStatus,
+              updates: { response: timeoutResponse, error: timeoutError },
+            }
+          : undefined,
       });
       logBrowserReattachGuidance(autoRuntime);
       return;
@@ -971,50 +998,81 @@ export async function performSessionRun({
     if (!cloudflareChallenge && (browserCanReattach || reattachExplicitlyUnavailable)) {
       logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
     }
-    await sessionStore.updateSession(sessionMeta.id, {
-      status: "error",
-      completedAt: new Date().toISOString(),
-      errorMessage: message,
-      mode,
-      browser: browserConfig
+    const errorMetadata = userError
+      ? {
+          category: userError.category,
+          message: userError.message,
+          details: authoritativeErrorDetails,
+        }
+      : undefined;
+    const modelProjection = modelForStatus
+      ? {
+          model: modelForStatus,
+          updates: geminiResponseCaptureFailure
+            ? { response: responseMetadata, error: errorMetadata }
+            : {},
+        }
+      : undefined;
+    if (mode === "browser") {
+      const outcome: BrowserSessionOutcome = cleanupErrorRuntime
         ? {
-            ...currentBrowser,
-            config: browserConfig,
+            kind: "cleanup-pending",
+            publication: "unpublished",
+            browser: { ...currentBrowser, config: browserConfig },
+            runtime: cleanupErrorRuntime,
+            response: responseMetadata,
+            reason: message,
+            artifacts: sessionMeta.artifacts,
+            receipt: durableAnswerReceipt,
+            errorMetadata,
+            transportMetadata,
+            modelProjection,
+          }
+        : {
+            kind: "terminal-error",
+            browser: { ...currentBrowser, config: browserConfig },
             runtime: browserRuntime,
-          }
-        : undefined,
-      ...(durableAnswerReceipt
-        ? {
-            artifacts: mergeArtifacts(sessionMeta.artifacts, [durableAnswerReceipt.artifact]),
-          }
-        : {}),
-      response: responseMetadata,
-      transport: transportMetadata,
-      error: userError
-        ? {
-            category: userError.category,
-            message: userError.message,
-            details: authoritativeErrorDetails,
-          }
-        : undefined,
-    });
-    if (modelForStatus) {
-      await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            response: responseMetadata,
+            reason: message,
+            artifacts: sessionMeta.artifacts,
+            receipt: durableAnswerReceipt,
+            errorMetadata,
+            transportMetadata,
+            modelProjection,
+          };
+      await persistBrowserSessionOutcome(sessionMeta.id, outcome);
+    } else {
+      const completedAt = new Date().toISOString();
+      await sessionStore.updateSession(sessionMeta.id, {
         status: "error",
-        completedAt: new Date().toISOString(),
-        ...(geminiResponseCaptureFailure
+        completedAt,
+        errorMessage: message,
+        mode,
+        browser: browserConfig
           ? {
-              response: responseMetadata,
-              error: userError
-                ? {
-                    category: userError.category,
-                    message: userError.message,
-                    details: authoritativeErrorDetails,
-                  }
-                : undefined,
+              ...currentBrowser,
+              config: browserConfig,
+              runtime: browserRuntime,
+            }
+          : undefined,
+        ...(durableAnswerReceipt
+          ? {
+              artifacts: mergeArtifacts(sessionMeta.artifacts, [durableAnswerReceipt.artifact]),
             }
           : {}),
+        response: responseMetadata,
+        transport: transportMetadata,
+        error: errorMetadata,
       });
+      if (modelForStatus) {
+        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+          status: "error",
+          completedAt,
+          ...(geminiResponseCaptureFailure
+            ? { response: responseMetadata, error: errorMetadata }
+            : {}),
+        });
+      }
     }
     throw error;
   }

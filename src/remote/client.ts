@@ -608,6 +608,19 @@ async function buildRemoteBrowserTransaction(params: {
       error,
     );
   }
+  const artifactSessionId = params.options.sessionId?.trim();
+  if (params.receipt.artifacts.length > 0 && !artifactSessionId) {
+    throw new BrowserAutomationError(
+      "Remote artifact delivery requires the recovering local session identity.",
+      {
+        stage: "remote-artifact-transfer",
+        code: "recovering-session-id-missing",
+        recoverableDisconnect: true,
+        transactionToken: params.receipt.transactionToken,
+        runtime,
+      },
+    );
+  }
 
   const transferredFiles: SavedBrowserFile[] = [];
   const transferFailures: string[] = [];
@@ -619,7 +632,7 @@ async function buildRemoteBrowserTransaction(params: {
         token: params.token,
         descriptor,
         transactionToken: params.receipt.transactionToken,
-        sessionId: params.options.sessionId,
+        sessionId: artifactSessionId as string,
         log: params.options.log,
         deadlines: params.deadlines,
       });

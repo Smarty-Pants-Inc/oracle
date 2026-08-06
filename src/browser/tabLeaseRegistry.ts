@@ -1,6 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { open, readFile, rename, rm } from "node:fs/promises";
+import { syncDirectory } from "../fsDurability.js";
 import type { BrowserLogger } from "./types.js";
 import { delay } from "./utils.js";
 import {
@@ -695,16 +696,6 @@ async function replaceRegistryFile(sourcePath: string, destinationPath: string):
       if (!retryable || Date.now() >= deadline) throw error;
     }
     await delay(Math.min(WINDOWS_REGISTRY_MUTATION_RETRY_MS, Math.max(1, deadline - Date.now())));
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return;
-  const handle = await open(directory, "r");
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
   }
 }
 

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type {
+  BrowserRecoveryCleanupResourceMetadata,
   BrowserRecoveryProfileKind,
   BrowserRecoveryTargetCloseCapabilityMetadata,
+  BrowserRuntimeMetadata,
 } from "../sessionManager.js";
 import type { ExactChromeTargetCleanupResult } from "./chromeTargetConnection.js";
 import type { BrowserLogger } from "./types.js";
@@ -23,6 +25,114 @@ export function canExactOwnedProcessTeardownSubsumeTargetClose(options: {
     !options.keepBrowserOpen &&
     options.profileKind !== "manual-login" &&
     options.profileKind !== "none"
+  );
+}
+function normalizeExactBrowserWSEndpoint(value: string | undefined): string | null {
+  if (!value?.trim()) return null;
+  try {
+    const endpoint = new URL(value);
+    const port = Number.parseInt(endpoint.port, 10);
+    if (
+      endpoint.protocol !== "ws:" ||
+      !endpoint.hostname ||
+      !Number.isInteger(port) ||
+      port <= 0 ||
+      port > 65_535 ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash ||
+      !/^\/devtools\/browser\/[^/]+$/u.test(endpoint.pathname)
+    ) {
+      return null;
+    }
+    return endpoint.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function isRestartDurableChromeTargetCloseCapability(options: {
+  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
+  targetId: string;
+  browserWSEndpoint: string | undefined;
+}): boolean {
+  const endpoint = normalizeExactBrowserWSEndpoint(options.browserWSEndpoint);
+  return (
+    isBrowserRecoveryTargetCloseCapability(options.capability) &&
+    options.capability.targetId === options.targetId &&
+    endpoint !== null &&
+    options.capability.browserWSEndpoint === endpoint
+  );
+}
+
+function resourceEndpointMatchesDurableCapability(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+): boolean {
+  const normalized = normalizeExactBrowserWSEndpoint(resource.chromeBrowserWSEndpoint);
+  if (!normalized) return false;
+  const endpoint = new URL(normalized);
+  return (
+    (resource.chromeHost === undefined || endpoint.hostname === resource.chromeHost) &&
+    (resource.chromePort === undefined ||
+      Number.parseInt(endpoint.port, 10) === resource.chromePort)
+  );
+}
+
+function hasRestartDurableTargetResourceAuthority(
+  resource: BrowserRecoveryCleanupResourceMetadata,
+): boolean {
+  const cleanup = resource.recoveryCleanup;
+  if (
+    cleanup.profileKind !== "none" &&
+    !cleanup.keepBrowser &&
+    !resource.chromeProcessIdentity &&
+    !resource.acquisition?.processLaunchClaim
+  ) {
+    return false;
+  }
+  if (!cleanup.ownsTarget || cleanup.closeOwnedTargetOnComplete === false) return true;
+  if (cleanup.closeOwnedTargetOnComplete !== true) return false;
+  const processTeardownIsExact = canExactOwnedProcessTeardownSubsumeTargetClose({
+    profileKind: cleanup.profileKind,
+    keepBrowserOpen: cleanup.keepBrowser,
+    hasExactProcessAuthority: Boolean(resource.chromeProcessIdentity),
+  });
+  if (processTeardownIsExact) return true;
+  if (!resource.chromeTargetId || !resource.targetCloseCapability) return false;
+  if (
+    resource.acquisition?.generationId &&
+    resource.acquisition.generationId !== resource.targetCloseCapability.generationId
+  ) {
+    return false;
+  }
+  if (
+    !isRestartDurableChromeTargetCloseCapability({
+      capability: resource.targetCloseCapability,
+      targetId: resource.chromeTargetId,
+      browserWSEndpoint: resource.chromeBrowserWSEndpoint,
+    }) ||
+    !resourceEndpointMatchesDurableCapability(resource)
+  ) {
+    return false;
+  }
+  return Boolean(resource.chromeProcessIdentity) || cleanup.profileKind === "none";
+}
+
+export function hasRestartDurableChromeTargetCleanupAuthority(
+  runtime: BrowserRuntimeMetadata,
+): boolean {
+  const resources = runtime.recoveryCleanupResources ?? [];
+  if (resources.length > 0) return resources.every(hasRestartDurableTargetResourceAuthority);
+  return !(
+    runtime.chromeTargetId ||
+    runtime.chromeProcessIdentity ||
+    runtime.chromePid ||
+    runtime.chromeBrowserWSEndpoint ||
+    runtime.chromePort ||
+    runtime.chromeProfileRoot ||
+    runtime.userDataDir ||
+    runtime.recoveryCleanupResult
   );
 }
 
@@ -67,13 +177,17 @@ function retainTerminalTargetCloseCapability(
 export function retainChromeTargetCloseCapability(options: {
   generationId: string;
   targetId: string;
+  browserWSEndpoint?: string;
   close: (logger: BrowserLogger) => Promise<ExactChromeTargetCleanupResult>;
   release?: () => Promise<void>;
 }): BrowserRecoveryTargetCloseCapabilityMetadata {
   const generationId = options.generationId.trim();
   const targetId = options.targetId.trim();
-  if (!generationId || !targetId) {
-    throw new Error("Exact Chrome target close authority requires generation and target identity.");
+  const browserWSEndpoint = normalizeExactBrowserWSEndpoint(options.browserWSEndpoint);
+  if (!generationId || !targetId || (options.browserWSEndpoint && !browserWSEndpoint)) {
+    throw new Error(
+      "Exact Chrome target close authority requires valid generation, target, and endpoint identity.",
+    );
   }
   const capabilityId = randomUUID();
   retainedTargetCloseAuthorities.set(capabilityId, {
@@ -82,7 +196,13 @@ export function retainChromeTargetCloseCapability(options: {
     close: options.close,
     release: options.release,
   });
-  return Object.freeze({ version: 1, generationId, capabilityId });
+  return Object.freeze({
+    version: 1,
+    generationId,
+    capabilityId,
+    targetId,
+    ...(browserWSEndpoint ? { browserWSEndpoint } : {}),
+  });
 }
 
 export function isBrowserRecoveryTargetCloseCapability(
@@ -95,7 +215,13 @@ export function isBrowserRecoveryTargetCloseCapability(
     typeof candidate.generationId === "string" &&
     candidate.generationId.trim().length > 0 &&
     typeof candidate.capabilityId === "string" &&
-    candidate.capabilityId.trim().length > 0
+    candidate.capabilityId.trim().length > 0 &&
+    (candidate.targetId === undefined ||
+      (typeof candidate.targetId === "string" && candidate.targetId.trim().length > 0)) &&
+    (candidate.browserWSEndpoint === undefined ||
+      (typeof candidate.browserWSEndpoint === "string" &&
+        normalizeExactBrowserWSEndpoint(candidate.browserWSEndpoint) ===
+          candidate.browserWSEndpoint))
   );
 }
 
@@ -119,7 +245,11 @@ export async function closeChromeTargetWithRetainedCapability(options: {
         "Retained exact Chrome target close capability is no longer live (for example after a controller restart); the target was preserved",
     };
   }
-  if (authority.generationId !== capability.generationId || authority.targetId !== targetId) {
+  if (
+    authority.generationId !== capability.generationId ||
+    authority.targetId !== targetId ||
+    (capability.targetId !== undefined && capability.targetId !== targetId)
+  ) {
     return {
       status: "unavailable",
       reason:

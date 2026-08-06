@@ -1,5 +1,7 @@
 import type {
+  CommittedSessionModelProjection,
   SessionMetadata,
+  SessionModelProjectionCommit,
   SessionNotifications,
   StoredRunOptions,
   SessionModelRun,
@@ -17,6 +19,7 @@ import {
   filterSessionsByRange,
   deleteSessionsOlderThan,
   updateModelRunMetadata,
+  commitSessionModelProjectionMetadata,
   getSessionPaths,
   getSessionsDir,
 } from "./sessionManager.js";
@@ -132,6 +135,13 @@ class FileSessionStore implements SessionStore {
 }
 
 export const sessionStore: SessionStore = new FileSessionStore();
+export function commitSessionModelProjection(
+  sessionId: string,
+  projection: SessionModelProjectionCommit,
+): Promise<CommittedSessionModelProjection> {
+  return commitSessionModelProjectionMetadata(sessionId, projection);
+}
+
 export { wait } from "./sessionManager.js";
 export type {
   SessionMetadata,

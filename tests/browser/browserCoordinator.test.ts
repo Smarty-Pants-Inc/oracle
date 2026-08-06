@@ -33,9 +33,16 @@ const capture: BrowserRunResult = {
   answerTokens: 2,
   answerChars: 14,
   browserTransport: "cdp",
+  chromePid: 54321,
   chromeHost: "remote.example",
   chromePort: 9333,
+  chromeBrowserWSEndpoint: "ws://remote.example:9333/devtools/browser/test",
+  chromeProfileRoot: "/profiles/root",
+  userDataDir: "/profiles/run",
   chromeTargetId: "owned-target",
+  tabUrl: "https://chatgpt.com/c/released-contract",
+  conversationId: "released-contract",
+  controllerPid: 12345,
 };
 
 function browserTransaction(
@@ -61,7 +68,7 @@ describe("browser coordinator public settlement", () => {
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
   });
 
-  test("finalizes a successful direct run before returning an audit-safe result", async () => {
+  test("preserves released BrowserRunResult metadata while removing transaction authority", async () => {
     const runtime: BrowserRunTransaction["runtime"] = {
       recoveryCleanupResources: [
         {
@@ -107,11 +114,18 @@ describe("browser coordinator public settlement", () => {
       answerTokens: 2,
       answerChars: 14,
       browserTransport: "cdp",
+      chromePid: 54321,
+      chromeHost: "remote.example",
+      chromePort: 9333,
+      chromeBrowserWSEndpoint: "ws://remote.example:9333/devtools/browser/test",
+      chromeProfileRoot: "/profiles/root",
+      userDataDir: "/profiles/run",
+      chromeTargetId: "owned-target",
+      tabUrl: "https://chatgpt.com/c/released-contract",
+      conversationId: "released-contract",
+      controllerPid: 12345,
     });
     expect(result).not.toHaveProperty("runtime");
-    expect(result).not.toHaveProperty("chromeHost");
-    expect(result).not.toHaveProperty("chromePort");
-    expect(result).not.toHaveProperty("chromeTargetId");
     expect(result).not.toHaveProperty("finalize");
     expect(result).not.toHaveProperty("bindSettlement");
     expect(result).not.toHaveProperty("abort");
@@ -338,9 +352,6 @@ describe("browser coordinator public settlement", () => {
       ],
     });
     expect(result).not.toHaveProperty("runtime");
-    expect(result).not.toHaveProperty("chromeHost");
-    expect(result).not.toHaveProperty("chromePort");
-    expect(result).not.toHaveProperty("chromeTargetId");
     expect(result).not.toHaveProperty("recoveryCleanupResources");
     expect(result.retryCleanup).toEqual(expect.any(Function));
     expect(acknowledgeSettledTargetCloseCapabilities).not.toHaveBeenCalled();

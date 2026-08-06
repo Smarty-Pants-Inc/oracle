@@ -8,14 +8,15 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import {
+  physicalDirectoryIdentityFromStats,
+  samePhysicalDirectoryIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
+import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+import {
   encodeDirectoryRemovalMessage,
   parseDirectoryRemovalMessage,
-  sameDirectoryRemovalIdentity,
 } from "./filesystemLockDirectoryRemovalProtocol.js";
-import type {
-  DirectoryRemovalIdentity,
-  DirectoryRemovalMessage,
-} from "./filesystemLockDirectoryRemovalProtocol.js";
+import type { DirectoryRemovalMessage } from "./filesystemLockDirectoryRemovalProtocol.js";
 
 const descriptorRoot = process.platform === "linux" ? "/proc/self/fd" : null;
 const hasDirectoryCapabilityFlags =
@@ -25,14 +26,6 @@ const hasDirectoryCapabilityFlags =
 const directoryOpenFlags = hasDirectoryCapabilityFlags
   ? constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
   : 0;
-
-function identity(entry: BigIntStats): DirectoryRemovalIdentity {
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
-}
 
 function descriptorPath(handle: FileHandle | undefined): string {
   if (descriptorRoot === null || handle === undefined) {
@@ -100,7 +93,7 @@ async function readGo(token: string): Promise<void> {
 // and waits for go before mutating it.
 async function runBoundCwdDirectoryChild(
   entryPath: string,
-  expectedIdentity: DirectoryRemovalIdentity,
+  expectedIdentity: PhysicalDirectoryIdentity,
   expectedDevice: string,
 ): Promise<void> {
   const token = randomUUID();
@@ -162,7 +155,7 @@ async function runBoundCwdDirectoryChild(
     if (
       attestation.type !== "attested-directory" ||
       attestation.token !== token ||
-      !sameDirectoryRemovalIdentity(attestation.directoryIdentity, expectedIdentity) ||
+      !samePhysicalDirectoryIdentity(attestation.directoryIdentity, expectedIdentity) ||
       attestation.directoryIdentity.device !== expectedDevice
     ) {
       throw new Error("Bound removal directory child attested the wrong generation");
@@ -190,14 +183,19 @@ async function runBoundCwdDirectoryChild(
 
 async function deleteBoundDirectoryContents(
   directoryHandle: FileHandle | undefined,
-  expectedIdentity: DirectoryRemovalIdentity,
+  expectedIdentity: PhysicalDirectoryIdentity,
   expectedMountId: string | null,
 ): Promise<void> {
   const directoryEntry =
     process.platform === "win32"
       ? await lstat(".", { bigint: true })
       : await directoryHandle!.stat({ bigint: true });
-  if (!sameDirectoryRemovalIdentity(identity(directoryEntry), expectedIdentity)) {
+  if (
+    !samePhysicalDirectoryIdentity(
+      physicalDirectoryIdentityFromStats(directoryEntry),
+      expectedIdentity,
+    )
+  ) {
     throw new Error("Bound removal directory generation changed before traversal");
   }
   assertSameDevice(directoryEntry, expectedIdentity.device, ".");
@@ -213,7 +211,12 @@ async function deleteBoundDirectoryContents(
     assertSameDevice(before, expectedIdentity.device, entryPath);
     if (!before.isDirectory()) {
       const current = await lstat(entryPath, { bigint: true });
-      if (!sameDirectoryRemovalIdentity(identity(before), identity(current))) {
+      if (
+        !samePhysicalDirectoryIdentity(
+          physicalDirectoryIdentityFromStats(before),
+          physicalDirectoryIdentityFromStats(current),
+        )
+      ) {
         throw new Error(`Bound removal file generation changed at ${entryPath}`);
       }
       await unlink(entryPath);
@@ -231,11 +234,14 @@ async function deleteBoundDirectoryContents(
       }
       if (
         !childEntry.isDirectory() ||
-        !sameDirectoryRemovalIdentity(identity(before), identity(childEntry))
+        !samePhysicalDirectoryIdentity(
+          physicalDirectoryIdentityFromStats(before),
+          physicalDirectoryIdentityFromStats(childEntry),
+        )
       ) {
         throw new Error(`Bound removal directory generation changed at ${entryPath}`);
       }
-      const childIdentity = identity(childEntry);
+      const childIdentity = physicalDirectoryIdentityFromStats(childEntry);
       assertSameDevice(childEntry, expectedIdentity.device, entryPath);
       const childMountId = await readMountId(childHandle);
       if (expectedMountId !== null && childMountId !== expectedMountId) {
@@ -251,7 +257,12 @@ async function deleteBoundDirectoryContents(
     }
 
     const current = await lstat(entryPath, { bigint: true });
-    if (!sameDirectoryRemovalIdentity(identity(before), identity(current))) {
+    if (
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(before),
+        physicalDirectoryIdentityFromStats(current),
+      )
+    ) {
       throw new Error(`Bound removal directory generation changed before removal at ${entryPath}`);
     }
     await rmdir(entryPath);
@@ -272,13 +283,16 @@ async function runDirectoryWorker(token: string): Promise<void> {
     }
     if (
       !directoryEntry.isDirectory() ||
-      !sameDirectoryRemovalIdentity(identity(pathEntry), identity(directoryEntry))
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(pathEntry),
+        physicalDirectoryIdentityFromStats(directoryEntry),
+      )
     ) {
       throw new Error("Bound removal directory generation changed while opening capability");
     }
     await readdir(".");
     assertSameDevice(directoryEntry, directoryEntry.dev.toString(), ".");
-    const directoryIdentity = identity(directoryEntry);
+    const directoryIdentity = physicalDirectoryIdentityFromStats(directoryEntry);
     await writeMessage({
       type: "attested-directory",
       token,
@@ -293,8 +307,14 @@ async function runDirectoryWorker(token: string): Promise<void> {
         ? currentPathEntry
         : await directoryHandle!.stat({ bigint: true });
     if (
-      !sameDirectoryRemovalIdentity(identity(currentPathEntry), directoryIdentity) ||
-      !sameDirectoryRemovalIdentity(identity(currentEntry), directoryIdentity)
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentPathEntry),
+        directoryIdentity,
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentEntry),
+        directoryIdentity,
+      )
     ) {
       throw new Error("Bound removal directory generation changed after attestation");
     }
@@ -331,8 +351,14 @@ async function runRootWorker(token: string): Promise<void> {
           bigint: true,
         });
         if (
-          !sameDirectoryRemovalIdentity(identity(rootedRootEntry), identity(rootEntry)) ||
-          !sameDirectoryRemovalIdentity(identity(rootedGenerationEntry), identity(generationEntry))
+          !samePhysicalDirectoryIdentity(
+            physicalDirectoryIdentityFromStats(rootedRootEntry),
+            physicalDirectoryIdentityFromStats(rootEntry),
+          ) ||
+          !samePhysicalDirectoryIdentity(
+            physicalDirectoryIdentityFromStats(rootedGenerationEntry),
+            physicalDirectoryIdentityFromStats(generationEntry),
+          )
         ) {
           throw new Error("descriptor paths resolved to different generations");
         }
@@ -358,8 +384,14 @@ async function runRootWorker(token: string): Promise<void> {
     if (
       !rootEntry.isDirectory() ||
       !generationEntry.isDirectory() ||
-      !sameDirectoryRemovalIdentity(identity(rootPathEntry), identity(rootEntry)) ||
-      !sameDirectoryRemovalIdentity(identity(generationPathEntry), identity(generationEntry))
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(rootPathEntry),
+        physicalDirectoryIdentityFromStats(rootEntry),
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(generationPathEntry),
+        physicalDirectoryIdentityFromStats(generationEntry),
+      )
     ) {
       throw new Error("Bound removal generation changed while opening directory capabilities");
     }
@@ -371,8 +403,8 @@ async function runRootWorker(token: string): Promise<void> {
       throw new Error("Bound removal generation crosses a mount boundary");
     }
 
-    const rootIdentity = identity(rootEntry);
-    const generationIdentity = identity(generationEntry);
+    const rootIdentity = physicalDirectoryIdentityFromStats(rootEntry);
+    const generationIdentity = physicalDirectoryIdentityFromStats(generationEntry);
     await writeMessage({
       type: "attested",
       token,
@@ -397,9 +429,18 @@ async function runRootWorker(token: string): Promise<void> {
         : await generationHandle!.stat({ bigint: true });
     const currentGenerationPath = await lstat("generation", { bigint: true });
     if (
-      !sameDirectoryRemovalIdentity(identity(currentRoot), rootIdentity) ||
-      !sameDirectoryRemovalIdentity(identity(currentGeneration), generationIdentity) ||
-      !sameDirectoryRemovalIdentity(identity(currentGenerationPath), generationIdentity)
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentRoot),
+        rootIdentity,
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentGeneration),
+        generationIdentity,
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentGenerationPath),
+        generationIdentity,
+      )
     ) {
       throw new Error("Bound removal generation changed after attestation");
     }
@@ -412,7 +453,12 @@ async function runRootWorker(token: string): Promise<void> {
     await generationHandle?.close();
     generationHandle = undefined;
     const generationBeforeRemoval = await lstat("generation", { bigint: true });
-    if (!sameDirectoryRemovalIdentity(identity(generationBeforeRemoval), generationIdentity)) {
+    if (
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(generationBeforeRemoval),
+        generationIdentity,
+      )
+    ) {
       throw new Error("Bound removal generation changed before root removal");
     }
     await rmdir("generation");

@@ -367,22 +367,25 @@ export async function orchestrateBrowserAttachAuthority(
   let answerPublished = false;
 
   try {
-    const publicationBrowser = metadata.browser ?? publication.journal?.browserAudit;
-    if (!publicationBrowser) throw new Error("Browser publication metadata is unavailable");
+    const existingPublicationBrowser = metadata.browser ?? publication.journal?.browserAudit;
+    if (!existingPublicationBrowser) throw new Error("Browser publication metadata is unavailable");
+    let publicationBrowser = existingPublicationBrowser;
     const sessionPaths = await sessionStore.getPaths(sessionId);
     const reattachResult: ReattachResult = await resumeBrowserSession(
       authoritativeRuntime,
       metadata.browser?.config,
       browserLogger(),
       {
+        sessionId,
         recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
         acquireRecoveryLock: publication.acquireRecoveryLock,
         isRemotePublicationAcknowledged: publication.isPublished,
         runtimeHintCb: async (latestRuntime) => {
           authoritativeRuntime = runtimeAuthority.observeHint(latestRuntime);
           if (!publication.hasJournal) {
+            publicationBrowser = { ...publicationBrowser, runtime: authoritativeRuntime };
             await sessionStore.updateSession(sessionId, {
-              browser: { ...metadata.browser, runtime: authoritativeRuntime },
+              browser: publicationBrowser,
             });
           }
         },
@@ -398,9 +401,22 @@ export async function orchestrateBrowserAttachAuthority(
       },
     );
     authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
+    publicationBrowser = {
+      ...publicationBrowser,
+      runtime: authoritativeRuntime,
+      ...(reattachResult.archive ? { archive: reattachResult.archive } : {}),
+      ...(reattachResult.modelSelection ? { modelSelection: reattachResult.modelSelection } : {}),
+      ...(reattachResult.warnings ? { warnings: reattachResult.warnings } : {}),
+    };
+    const recoveredArtifacts = appendArtifacts(
+      appendArtifacts(metadata.artifacts, reattachResult.artifacts ?? []),
+      [...(reattachResult.savedImages ?? []), ...(reattachResult.savedFiles ?? [])],
+    );
     const capturedAnswer = reattachResult.answerMarkdown || reattachResult.answerText;
     const answerText = await publication.preferDurablePreparingAnswer(capturedAnswer);
-    const outputTokens = estimateTokenCount(answerText);
+    const outputTokens = Number.isSafeInteger(reattachResult.answerTokens)
+      ? (reattachResult.answerTokens as number)
+      : estimateTokenCount(answerText);
     const usage = publicationJournal?.usage ?? {
       inputTokens: 0,
       outputTokens,
@@ -422,12 +438,16 @@ export async function orchestrateBrowserAttachAuthority(
       },
       transaction: reattachResult,
       persistAnswer: persistDurableBrowserAnswer,
-      browser: {
-        ...metadata.browser,
-        runtime: authoritativeRuntime,
-      },
-      existingArtifacts: metadata.artifacts,
-      prepareArtifacts: async () => saveReattachBrowserArtifacts(sessionId, metadata, answerText),
+      browser: publicationBrowser,
+      existingArtifacts: recoveredArtifacts,
+      prepareArtifacts: async () =>
+        saveReattachBrowserArtifacts(
+          sessionId,
+          { ...metadata, browser: publicationBrowser },
+          answerText,
+          recoveredArtifacts,
+        ),
+      elapsedMs: reattachResult.tookMs,
       usage,
       response: { status: "completed" },
       model: metadata.model,
@@ -543,7 +563,8 @@ async function recoverDurableBrowserPublication(
     persistAnswer: persistDurableBrowserAnswer,
     browser,
     existingArtifacts: metadata.artifacts,
-    prepareArtifacts: async () => saveReattachBrowserArtifacts(sessionId, metadata, answer),
+    prepareArtifacts: async () =>
+      saveReattachBrowserArtifacts(sessionId, metadata, answer, metadata.artifacts),
     usage: journal.usage ?? {
       inputTokens: 0,
       outputTokens,
@@ -626,27 +647,34 @@ async function saveReattachBrowserArtifacts(
   sessionId: string,
   metadata: SessionMetadata,
   body: string,
+  existingArtifacts: SessionMetadata["artifacts"],
 ): Promise<SessionMetadata["artifacts"]> {
   const conversationUrl = metadata.browser?.runtime?.tabUrl;
   const logger = browserLogger();
-  const reportArtifact = isDeepResearchBrowserSession(metadata)
-    ? await saveDeepResearchReportArtifact({
-        sessionId,
-        reportMarkdown: body,
-        conversationUrl,
-        logger,
-      }).catch(() => null)
-    : null;
+  const hasReport = existingArtifacts?.some((artifact) => artifact.kind === "deep-research-report");
+  const reportArtifact =
+    isDeepResearchBrowserSession(metadata) && !hasReport
+      ? await saveDeepResearchReportArtifact({
+          sessionId,
+          reportMarkdown: body,
+          conversationUrl,
+          logger,
+        }).catch(() => null)
+      : null;
   const prompt = (await readStoredPrompt(sessionId)) ?? metadata.promptPreview ?? "";
-  const transcriptArtifact = await saveBrowserTranscriptArtifact({
-    sessionId,
-    prompt,
-    answerMarkdown: body,
-    conversationUrl,
-    artifacts: appendArtifacts(undefined, [reportArtifact]),
-    logger,
-  }).catch(() => null);
-  return appendArtifacts(metadata.artifacts, [reportArtifact, transcriptArtifact]);
+  const artifactsWithReport = appendArtifacts(existingArtifacts, [reportArtifact]);
+  const hasTranscript = artifactsWithReport?.some((artifact) => artifact.kind === "transcript");
+  const transcriptArtifact = hasTranscript
+    ? null
+    : await saveBrowserTranscriptArtifact({
+        sessionId,
+        prompt,
+        answerMarkdown: body,
+        conversationUrl,
+        artifacts: artifactsWithReport,
+        logger,
+      }).catch(() => null);
+  return appendArtifacts(artifactsWithReport, [transcriptArtifact]);
 }
 
 function hasDurableBrowserAnswerReceipt(

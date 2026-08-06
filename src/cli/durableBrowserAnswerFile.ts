@@ -4,7 +4,8 @@ import { lstat, mkdir, open } from "node:fs/promises";
 import path from "node:path";
 import type { SessionArtifact } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
-import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
+import { syncDirectory } from "../fsDurability.js";
+import { writeFileAtomicDurable } from "../sessionManager.js";
 
 export interface DurableBrowserAnswerReceipt {
   artifact: SessionArtifact;
@@ -25,7 +26,7 @@ export async function persistDurableBrowserAnswer(
   if (expectedReceipt) assertDurableBrowserAnswerReceipt(prepared.receipt, expectedReceipt);
 
   await mkdir(path.dirname(prepared.receipt.artifact.path), { recursive: true });
-  await syncDirectoryIfSupported(prepared.paths.dir);
+  await syncDirectory(prepared.paths.dir);
   await ensureDurableBrowserAnswerFile(prepared.receipt.artifact.path, prepared.payload);
 
   if (options.logHeader) {
@@ -153,7 +154,7 @@ export async function ensureDurableBrowserAnswerFile(
     if (!isUnchangedFile(before, afterSync)) {
       throw new Error(`Durable browser answer changed during verification: ${targetPath}`);
     }
-    await syncDirectoryIfSupported(path.dirname(targetPath));
+    await syncDirectory(path.dirname(targetPath));
     const named = await lstat(targetPath);
     if (!isUnchangedFile(afterSync, named)) {
       throw new Error(`Durable browser answer path changed during verification: ${targetPath}`);

@@ -62,12 +62,3 @@ export function selectTarget(
     ? selected(exactTarget)
     : { status: "missing" };
 }
-
-export function pickTarget(
-  targets: TargetInfoLite[],
-  runtime: Pick<BrowserRuntimeMetadata, "chromeTargetId" | "tabUrl" | "conversationId">,
-  browserTabRef?: string,
-): TargetInfoLite | undefined {
-  const selection = selectTarget(targets, runtime, browserTabRef);
-  return selection.status === "selected" ? selection.target : undefined;
-}

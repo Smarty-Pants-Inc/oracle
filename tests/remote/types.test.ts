@@ -1,13 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  REMOTE_IDENTIFIER_PATTERN,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteBrowserAutomationErrorSchema,
+  RemoteBrowserRunConfigSchema,
+  RemoteRunOptionsSchema,
   RemoteRunPayloadSchema,
   RemoteRunTransactionPayloadSchema,
   RemoteSettlementAuthoritySchema,
   RemoteTransactionSettlementResponseSchema,
   RemoteTransactionRetryResponseSchema,
+  isTrustedChatGptUrl,
 } from "../../src/remote/types.js";
+import {
+  RemoteLegacyBrowserRunConfigSchema,
+  RemoteLegacyRunPayloadSchema,
+} from "../../src/remote/legacyProtocol.js";
 
 const transactionToken = "a".repeat(64);
 const promptEpoch = {
@@ -244,5 +252,40 @@ describe("remote public protocol schemas", () => {
         options: {},
       }).success,
     ).toBe(false);
+  });
+
+  it("shares trusted URL and identifier policies with the legacy protocol", () => {
+    for (const [value, accepted] of [
+      ["https://chatgpt.com/", true],
+      ["https://chat.openai.com/c/example", true],
+      ["http://chatgpt.com/", false],
+      ["https://chatgpt.com.evil.invalid/", false],
+      ["https://user@chatgpt.com/", false],
+    ] as const) {
+      expect(isTrustedChatGptUrl(value)).toBe(accepted);
+      expect(RemoteBrowserRunConfigSchema.safeParse({ chatgptUrl: value }).success).toBe(accepted);
+      expect(RemoteLegacyBrowserRunConfigSchema.safeParse({ chatgptUrl: value }).success).toBe(
+        accepted,
+      );
+    }
+
+    for (const [value, accepted] of [
+      ["session-1", true],
+      ["a".repeat(256), true],
+      ["a".repeat(257), false],
+      ["-session", false],
+      ["session/id", false],
+    ] as const) {
+      expect(REMOTE_IDENTIFIER_PATTERN.test(value)).toBe(accepted);
+      expect(RemoteRunOptionsSchema.safeParse({ sessionId: value }).success).toBe(accepted);
+      expect(
+        RemoteLegacyRunPayloadSchema.safeParse({
+          prompt: "hello",
+          attachments: [],
+          browserConfig: {},
+          options: { sessionId: value },
+        }).success,
+      ).toBe(accepted);
+    }
   });
 });

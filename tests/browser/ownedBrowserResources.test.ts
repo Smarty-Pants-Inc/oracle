@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import {
+  LocalOwnedBrowserResourceAuthority,
   OwnedBrowserResourceTransaction,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
@@ -491,5 +492,260 @@ describe("OwnedBrowserResourceTransaction", () => {
         },
       }),
     ).toEqual(runtime);
+  });
+});
+
+describe("LocalOwnedBrowserResourceAuthority", () => {
+  afterEach(() => {
+    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+  });
+
+  it("projects one owned resource and retries in target, lease, process order", async () => {
+    const events: string[] = [];
+    const persistedRuntimes: BrowserRuntimeMetadata[] = [];
+    let leaseAttempts = 0;
+    const processIdentity = {
+      pid: 4321,
+      processStartTime: "2026-08-05T00:00:00.000Z",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: profileDirectory.canonicalPath,
+      launchNonce: "shared-owner",
+      profileDirectory,
+    };
+    const authority = new LocalOwnedBrowserResourceAuthority({
+      purpose: "Shared owner test",
+      targetLabel: "Shared owner",
+      userDataDir: profileDirectory.canonicalPath,
+      profileDirectoryIdentity: profileDirectory,
+      profileKind: "temporary",
+      keepBrowser: true,
+      closeOwnedTargetOnComplete: true,
+      generationId: "shared-generation",
+      processOwnerProvenance: "temporary-launch",
+      processLaunchClaim: {
+        version: 1,
+        generationId: "shared-generation",
+        nonce: "60000000-0000-4000-8000-000000000006",
+      },
+      processOwnerDisposition: "preserve",
+      leaseId: "shared-lease",
+      targetMarkerUrl: "about:blank#shared-owner",
+      logger: vi.fn<(message: string) => void>(),
+      persistRuntime: async (runtime) => {
+        persistedRuntimes.push(runtime);
+        return runtime;
+      },
+    });
+    await authority.journalAcquisition({
+      resource: "tab-lease",
+      acquire: async () => ({
+        id: "shared-lease",
+        profileDirectory,
+        update: vi.fn(async () => undefined),
+        release: vi.fn(async () => {
+          events.push("lease");
+          leaseAttempts += 1;
+          if (leaseAttempts === 1) throw new Error("lease busy");
+        }),
+      }),
+      authority: (lease) => lease,
+    });
+    await authority.journalAcquisition({
+      resource: "chrome-process",
+      acquire: async () => ({
+        pid: processIdentity.pid,
+        port: 9222,
+        host: "127.0.0.1",
+        remoteDebuggingPipes: null,
+        processIdentity,
+        kill: vi.fn(async () => ({
+          status: "stopped" as const,
+          pid: processIdentity.pid,
+          signal: "SIGTERM" as const,
+        })),
+        endpointAuthority: {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/shared-owner",
+          kill: vi.fn(async () => ({
+            status: "stopped" as const,
+            pid: processIdentity.pid,
+            signal: "SIGTERM" as const,
+          })),
+          release: vi.fn(async () => {
+            events.push("process");
+          }),
+        },
+      }),
+      authority: (chrome) => ({ kind: "temporary", chrome }),
+    });
+    await authority.journalAcquisition({
+      resource: "chrome-target",
+      acquire: async () => ({ targetId: "shared-target" }),
+      authority: ({ targetId }) => ({
+        targetId,
+        capability: retainChromeTargetCloseCapability({
+          generationId: "shared-generation",
+          targetId,
+          close: async () => {
+            events.push("target");
+            return { status: "completed" as const };
+          },
+        }),
+        disconnect: async () => {
+          events.push("disconnect");
+        },
+      }),
+    });
+
+    await expect(authority.settle("abort")).resolves.toMatchObject({
+      status: "pending",
+      runtime: {
+        chromeTargetId: undefined,
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            chromeTargetId: undefined,
+            targetCloseCapability: undefined,
+            tabLease: expect.objectContaining({ id: "shared-lease" }),
+            chromeProcessIdentity: processIdentity,
+          }),
+        ],
+      },
+    });
+    expect(events).toEqual(["target", "disconnect", "lease"]);
+    expect(persistedRuntimes).toContainEqual(
+      expect.objectContaining({
+        recoveryCleanupResult: { status: "pending", settlementMode: "abort" },
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            chromeTargetId: undefined,
+            targetCloseCapability: undefined,
+            tabLease: expect.objectContaining({ id: "shared-lease" }),
+            chromeProcessIdentity: processIdentity,
+          }),
+        ],
+      }),
+    );
+
+    await expect(authority.settle("abort")).resolves.toMatchObject({ status: "completed" });
+    expect(events).toEqual(["target", "disconnect", "lease", "lease", "process"]);
+    expect(authority.runtime().recoveryCleanupResources).toBeUndefined();
+  });
+
+  it("keeps an unretained target pending when active leases preserve its process", async () => {
+    const events: string[] = [];
+    let endpointAttempts = 0;
+    const processIdentity = {
+      pid: 4322,
+      processStartTime: "2026-08-05T00:00:00.000Z",
+      executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      normalizedUserDataDir: profileDirectory.canonicalPath,
+      launchNonce: "active-lease-handoff",
+      profileDirectory,
+    };
+    const endpointAuthority = {
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/active-handoff",
+      kill: vi.fn(async () => {
+        events.push("kill");
+        return {
+          status: "stopped" as const,
+          pid: processIdentity.pid,
+          signal: "SIGTERM" as const,
+        };
+      }),
+      release: vi.fn(async () => {
+        events.push("endpoint");
+        endpointAttempts += 1;
+        if (endpointAttempts === 1) throw new Error("handoff unavailable");
+      }),
+    };
+    const authority = new LocalOwnedBrowserResourceAuthority({
+      purpose: "Active handoff test",
+      targetLabel: "Active handoff",
+      userDataDir: profileDirectory.canonicalPath,
+      profileDirectoryIdentity: profileDirectory,
+      profileKind: "manual-login",
+      keepBrowser: false,
+      closeOwnedTargetOnComplete: true,
+      generationId: "active-handoff-generation",
+      processOwnerProvenance: "manual-canonical-owner",
+      processLaunchClaim: {
+        version: 1,
+        generationId: "active-handoff-generation",
+        nonce: "70000000-0000-4000-8000-000000000007",
+      },
+      processOwnerDisposition: "close-on-last-lease",
+      leaseId: "active-handoff-lease",
+      targetMarkerUrl: "about:blank#active-handoff",
+      logger: vi.fn<(message: string) => void>(),
+      persistRuntime: async (runtime) => runtime,
+      releaseLease: async (_lease, options) => {
+        events.push("lease");
+        await options?.onRelease?.({ isLastLease: false });
+      },
+    });
+    await authority.journalAcquisition({
+      resource: "tab-lease",
+      acquire: async () => ({
+        id: "active-handoff-lease",
+        profileDirectory,
+        update: vi.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
+      }),
+      authority: (lease) => lease,
+    });
+    await authority.journalAcquisition({
+      resource: "chrome-process",
+      acquire: async () => ({
+        chrome: {
+          pid: processIdentity.pid,
+          port: 9222,
+          host: "127.0.0.1",
+          remoteDebuggingPipes: null,
+          processIdentity,
+          kill: endpointAuthority.kill,
+          endpointAuthority,
+        },
+        processIdentity,
+        source: "recorded" as const,
+        disposition: "close-on-last-lease" as const,
+        endpointAuthority,
+      }),
+      authority: (owner) => ({ kind: "manual", owner }),
+    });
+    await expect(
+      authority.journalAcquisition({
+        resource: "chrome-target",
+        acquire: async () => {
+          throw new Error("target authority interrupted");
+        },
+        authority: () => {
+          throw new Error("unreachable target authority");
+        },
+      }),
+    ).rejects.toThrow("target authority interrupted");
+
+    await expect(authority.settle("abort")).resolves.toMatchObject({
+      status: "pending",
+      error: expect.stringContaining("handoff unavailable"),
+      runtime: {
+        recoveryCleanupResources: [
+          expect.objectContaining({
+            chromeProcessIdentity: processIdentity,
+            chromeTargetId: undefined,
+            tabLease: undefined,
+            acquisition: expect.objectContaining({ pendingResource: "chrome-target" }),
+          }),
+        ],
+      },
+    });
+    expect(events).toEqual(["lease", "endpoint"]);
+
+    await expect(authority.settle("abort")).resolves.toMatchObject({
+      status: "pending",
+      error: expect.stringContaining("active-lease handoff"),
+    });
+    expect(events).toEqual(["lease", "endpoint", "endpoint"]);
+
+    await expect(authority.settle("abort")).resolves.toMatchObject({ status: "pending" });
+    expect(events).toEqual(["lease", "endpoint", "endpoint"]);
   });
 });

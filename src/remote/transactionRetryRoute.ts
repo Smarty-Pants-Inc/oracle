@@ -86,19 +86,16 @@ export async function serveRemoteTransactionRetry(
       return;
     }
     if (record.settlementMode) {
-      const settled =
-        record.settlementMode === "abort" && record.error?.recoverableDisconnect === false
-          ? (
-              await params.runBrowserWork(
-                async () =>
-                  await params.transactionCoordinator.settle({
-                    transactionToken: record.transactionToken,
-                    mode: "abort",
-                    durablePublication: false,
-                  }),
-              )
-            ).record
-          : record;
+      const settled = (
+        await params.runBrowserWork(
+          async () =>
+            await params.transactionCoordinator.settle({
+              transactionToken: record.transactionToken,
+              mode: record.settlementMode!,
+              durablePublication: record.settlementMode === "finalize",
+            }),
+        )
+      ).record;
       sendJson(params.res, 200, retryFailureResponse(settled));
       return;
     }

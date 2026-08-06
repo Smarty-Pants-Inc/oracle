@@ -461,6 +461,7 @@ export async function recoverConversationTab(
         let targetId: string;
         let closeAuthority: Parameters<typeof closeChromeTargetWithExactAuthority>[0]["authority"];
         let releaseCloseAuthority: (() => Promise<void>) | undefined;
+        let browserWSEndpoint = endpointAuthority?.browserWSEndpoint;
         if (endpointAuthority) {
           const connection = await connectWithNewTabWithExactAuthority(
             endpointAuthority,
@@ -491,10 +492,12 @@ export async function recoverConversationTab(
           targetId = connection.targetId;
           closeAuthority = connection.targetCloseAuthority;
           releaseCloseAuthority = connection.close;
+          browserWSEndpoint = connection.browserWSEndpoint;
         }
         const capability = retainChromeTargetCloseCapability({
           generationId,
           targetId,
+          browserWSEndpoint,
           close: (closeLogger) =>
             closeChromeTargetWithExactAuthority({
               authority: closeAuthority,

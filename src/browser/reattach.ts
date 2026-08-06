@@ -45,7 +45,6 @@ import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachCo
 export type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
 import {
   extractRecoverableConversationId,
-  pickTarget,
   selectTarget,
   type ExplicitTargetSelectionFailure,
   type TargetSelection,
@@ -270,14 +269,13 @@ export async function resumeBrowserSession(
         runtime,
         configuredHost: configured.host ?? "",
         authToken: configured.token,
+        sessionId: deps.sessionId,
         log: logger,
         runtimeHintCb: deps.runtimeHintCb,
       });
       return buildResult(
         {
-          answerText: transaction.answerText,
-          answerMarkdown: transaction.answerMarkdown,
-          runtime: transaction.runtime,
+          ...transaction,
           finalizeResources: transaction.finalize,
           abortResources: transaction.abort,
         },
@@ -618,7 +616,6 @@ export async function resumeBrowserSession(
 
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
-  pickTarget,
   extractConversationIdFromUrl,
   buildConversationUrl,
   openConversationFromSidebar,

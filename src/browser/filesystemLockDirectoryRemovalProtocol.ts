@@ -1,8 +1,11 @@
-export interface DirectoryRemovalIdentity {
-  readonly device: string;
-  readonly inode: string;
-  readonly birthtimeNs: string;
-}
+import { parsePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+
+export type DirectoryRemovalIdentity = PhysicalDirectoryIdentity;
+export {
+  parsePhysicalDirectoryIdentity as parseDirectoryRemovalIdentity,
+  samePhysicalDirectoryIdentity as sameDirectoryRemovalIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
 
 export interface DirectoryRemovalGoMessage {
   readonly type: "go";
@@ -60,8 +63,8 @@ export function parseDirectoryRemovalMessage(raw: string): DirectoryRemovalMessa
     if (!hasExactKeys(value, "generationIdentity,rootIdentity,token,type")) {
       throw new Error("Bound removal worker returned an invalid root attestation");
     }
-    const rootIdentity = parseDirectoryRemovalIdentity(value.rootIdentity);
-    const generationIdentity = parseDirectoryRemovalIdentity(value.generationIdentity);
+    const rootIdentity = parsePhysicalDirectoryIdentity(value.rootIdentity);
+    const generationIdentity = parsePhysicalDirectoryIdentity(value.generationIdentity);
     if (rootIdentity === null || generationIdentity === null) {
       throw new Error("Bound removal worker returned an invalid root attestation");
     }
@@ -77,7 +80,7 @@ export function parseDirectoryRemovalMessage(raw: string): DirectoryRemovalMessa
     if (!hasExactKeys(value, "directoryIdentity,mountId,token,type") || value.mountId !== null) {
       throw new Error("Bound removal worker returned an invalid directory attestation");
     }
-    const directoryIdentity = parseDirectoryRemovalIdentity(value.directoryIdentity);
+    const directoryIdentity = parsePhysicalDirectoryIdentity(value.directoryIdentity);
     if (directoryIdentity === null) {
       throw new Error("Bound removal worker returned an invalid directory attestation");
     }
@@ -90,37 +93,6 @@ export function parseDirectoryRemovalMessage(raw: string): DirectoryRemovalMessa
   }
 
   throw new Error("Bound removal worker returned an invalid protocol message");
-}
-
-export function parseDirectoryRemovalIdentity(value: unknown): DirectoryRemovalIdentity | null {
-  if (
-    !isPlainRecord(value) ||
-    !hasExactKeys(value, "birthtimeNs,device,inode") ||
-    typeof value.device !== "string" ||
-    typeof value.inode !== "string" ||
-    typeof value.birthtimeNs !== "string" ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.device) ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.inode) ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.birthtimeNs)
-  ) {
-    return null;
-  }
-  return {
-    device: value.device,
-    inode: value.inode,
-    birthtimeNs: value.birthtimeNs,
-  };
-}
-
-export function sameDirectoryRemovalIdentity(
-  left: DirectoryRemovalIdentity,
-  right: DirectoryRemovalIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: string): boolean {

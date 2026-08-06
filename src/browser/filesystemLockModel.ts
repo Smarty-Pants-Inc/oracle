@@ -3,6 +3,12 @@ import { lstat, open, readFile, stat } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
 import { readErrorCode, syncDirectory } from "./filesystemLockIo.js";
 import { arePlatformProcessGenerationsDefinitelyDifferent } from "./platformProcessGeneration.js";
+import {
+  capturePhysicalDirectoryIdentity,
+  physicalDirectoryIdentityFromStats,
+  samePhysicalDirectoryIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
+import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 
 export const LOCK_OWNER_FILENAME = "owner.json";
 export const LOCK_MUTATION_DIRECTORY_SUFFIX = ".mutations";
@@ -18,11 +24,7 @@ export interface FilesystemLockOwnerRecord {
   sessionId?: string;
 }
 
-export interface FilesystemLockDirectoryIdentity {
-  readonly device: string;
-  readonly inode: string;
-  readonly birthtimeNs: string;
-}
+export type FilesystemLockDirectoryIdentity = PhysicalDirectoryIdentity;
 
 export interface FilesystemLockGeneration {
   ownerRaw: string | null;
@@ -88,18 +90,18 @@ export async function inspectExistingLock(
     return inspectLegacyFilesystemLockFile(lockPath, lockEntry, options.readLiveness);
   }
 
-  const directoryIdentity = filesystemLockDirectoryIdentity(lockEntry);
+  const directoryIdentity = physicalDirectoryIdentityFromStats(lockEntry);
   const verifiedStaleGeneration = async (
     ownerRaw: string | null,
     lastMutationMs?: number,
   ): Promise<FilesystemLockInspection> => {
     let currentIdentity: FilesystemLockDirectoryIdentity;
     try {
-      currentIdentity = await captureFilesystemLockDirectoryIdentity(lockPath);
+      currentIdentity = await capturePhysicalDirectoryIdentity(lockPath);
     } catch {
       return { status: "active" };
     }
-    return sameFilesystemLockDirectoryIdentity(currentIdentity, directoryIdentity)
+    return samePhysicalDirectoryIdentity(currentIdentity, directoryIdentity)
       ? {
           status: "stale",
           generation: {
@@ -270,20 +272,20 @@ export async function lockGenerationMatches(
   let ownerRaw: string | null = null;
   let after: FilesystemLockDirectoryIdentity;
   try {
-    before = await captureFilesystemLockDirectoryIdentity(lockPath);
+    before = await capturePhysicalDirectoryIdentity(lockPath);
     try {
       ownerRaw = await readFile(path.join(lockPath, LOCK_OWNER_FILENAME), "utf8");
     } catch (error) {
       if (readErrorCode(error) !== "ENOENT") throw error;
     }
-    after = await captureFilesystemLockDirectoryIdentity(lockPath);
+    after = await capturePhysicalDirectoryIdentity(lockPath);
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return false;
     throw error;
   }
   if (
-    !sameFilesystemLockDirectoryIdentity(before, expectedGeneration.directoryIdentity) ||
-    !sameFilesystemLockDirectoryIdentity(after, expectedGeneration.directoryIdentity)
+    !samePhysicalDirectoryIdentity(before, expectedGeneration.directoryIdentity) ||
+    !samePhysicalDirectoryIdentity(after, expectedGeneration.directoryIdentity)
   ) {
     return false;
   }
@@ -484,45 +486,16 @@ export async function captureFilesystemLockDirectoryGeneration(
   };
 }
 
-async function captureFilesystemLockDirectoryIdentity(
-  lockPath: string,
-): Promise<FilesystemLockDirectoryIdentity> {
-  const entry = await lstat(lockPath, { bigint: true });
-  if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`Filesystem lock generation is not a physical directory: ${lockPath}`);
-  }
-  return filesystemLockDirectoryIdentity(entry);
-}
-
 async function readStableFilesystemLockDirectoryOwner(
   lockPath: string,
 ): Promise<{ ownerRaw: string; directoryIdentity: FilesystemLockDirectoryIdentity }> {
-  const before = await captureFilesystemLockDirectoryIdentity(lockPath);
+  const before = await capturePhysicalDirectoryIdentity(lockPath);
   const ownerRaw = await readFile(path.join(lockPath, LOCK_OWNER_FILENAME), "utf8");
-  const after = await captureFilesystemLockDirectoryIdentity(lockPath);
-  if (!sameFilesystemLockDirectoryIdentity(before, after)) {
+  const after = await capturePhysicalDirectoryIdentity(lockPath);
+  if (!samePhysicalDirectoryIdentity(before, after)) {
     throw new Error(`Filesystem lock generation changed while reading its owner at ${lockPath}`);
   }
   return { ownerRaw, directoryIdentity: after };
-}
-
-function filesystemLockDirectoryIdentity(entry: BigIntStats): FilesystemLockDirectoryIdentity {
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
-}
-
-function sameFilesystemLockDirectoryIdentity(
-  left: FilesystemLockDirectoryIdentity,
-  right: FilesystemLockDirectoryIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

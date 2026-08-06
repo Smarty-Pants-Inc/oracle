@@ -4,12 +4,12 @@ import type { RunOracleOptions } from "../oracle.js";
 import { asOracleUserError } from "../oracle.js";
 import { ensureSessionArtifacts } from "../browser/sessionRunner.js";
 import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.js";
+import { appendArtifacts } from "../browser/artifacts.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import type {
   BrowserRuntimeMetadata,
   BrowserSessionConfig,
-  SessionArtifact,
   SessionMetadata,
 } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
@@ -126,6 +126,11 @@ export async function autoReattachUntilComplete({
     let captureSucceeded = false;
     let durablyCompleted = false;
     let authoritativeRuntime = retryRuntime;
+    let publicationBrowser = {
+      ...browserMetadata,
+      config: browserConfig,
+      runtime: authoritativeRuntime,
+    };
     try {
       const reattachConfig: BrowserSessionConfig = { ...browserConfig, timeoutMs };
       const reattachResult: ReattachResult = await resumeBrowserSession(
@@ -133,6 +138,7 @@ export async function autoReattachUntilComplete({
         reattachConfig,
         logger,
         {
+          sessionId: sessionMeta.id,
           recoveryLockPath,
           acquireRecoveryLock: publication.acquireRecoveryLock,
           isRemotePublicationAcknowledged: publication.isPublished,
@@ -140,12 +146,9 @@ export async function autoReattachUntilComplete({
             const persistedRuntime = runtimeAuthority.observeHint(latestRuntime);
             authoritativeRuntime = persistedRuntime;
             retryRuntime = persistedRuntime;
+            publicationBrowser = { ...publicationBrowser, runtime: persistedRuntime };
             await sessionStore.updateSession(sessionMeta.id, {
-              browser: {
-                ...browserMetadata,
-                config: browserConfig,
-                runtime: persistedRuntime,
-              },
+              browser: publicationBrowser,
             });
           },
         },
@@ -153,13 +156,26 @@ export async function autoReattachUntilComplete({
       captureSucceeded = true;
       authoritativeRuntime = runtimeAuthority.observeHint(reattachResult.runtime);
       retryRuntime = authoritativeRuntime;
+      const recoveredArtifacts = appendArtifacts(
+        appendArtifacts(sessionMeta.artifacts, reattachResult.artifacts ?? []),
+        [...(reattachResult.savedImages ?? []), ...(reattachResult.savedFiles ?? [])],
+      );
       const answerText = reattachResult.answerMarkdown || reattachResult.answerText || "";
-      const outputTokens = estimateTokenCount(answerText);
+      const outputTokens = Number.isSafeInteger(reattachResult.answerTokens)
+        ? (reattachResult.answerTokens as number)
+        : estimateTokenCount(answerText);
       const usage = {
         inputTokens: 0,
         outputTokens,
         reasoningTokens: 0,
         totalTokens: outputTokens,
+      };
+      publicationBrowser = {
+        ...publicationBrowser,
+        runtime: authoritativeRuntime,
+        ...(reattachResult.archive ? { archive: reattachResult.archive } : {}),
+        ...(reattachResult.modelSelection ? { modelSelection: reattachResult.modelSelection } : {}),
+        ...(reattachResult.warnings ? { warnings: reattachResult.warnings } : {}),
       };
       const publishedCapture = await publishCompletedBrowserCapture({
         answer: {
@@ -168,12 +184,8 @@ export async function autoReattachUntilComplete({
           logHeader: `[auto-reattach] captured assistant response on attempt ${attempt}`,
         },
         transaction: reattachResult,
-        browser: {
-          ...browserMetadata,
-          config: browserConfig,
-          runtime: authoritativeRuntime,
-        },
-        existingArtifacts: sessionMeta.artifacts,
+        browser: publicationBrowser,
+        existingArtifacts: recoveredArtifacts,
         prepareArtifacts: async () =>
           ensureSessionArtifacts({
             sessionId: sessionMeta.id,
@@ -181,9 +193,10 @@ export async function autoReattachUntilComplete({
             answerMarkdown: answerText,
             conversationUrl: reattachResult.runtime.tabUrl,
             browserConfig,
-            existingArtifacts: sessionMeta.artifacts,
+            existingArtifacts: recoveredArtifacts,
             logger,
           }),
+        elapsedMs: reattachResult.tookMs,
         usage,
         response: { status: "completed" },
         model: modelForStatus,
@@ -259,7 +272,7 @@ export async function autoReattachUntilComplete({
             runtime: failureRuntime,
           },
           ...(receipt
-            ? { artifacts: mergeArtifacts(sessionMeta.artifacts, [receipt.artifact]) }
+            ? { artifacts: appendArtifacts(sessionMeta.artifacts, [receipt.artifact]) }
             : {}),
           response: { status: "error", incompleteReason: "incomplete-capture" },
           error: userError
@@ -379,14 +392,4 @@ function isTerminalAutoReattachError(error: unknown): boolean {
     details?.reattachClassification === "explicit-selector-terminal" ||
     details?.code === "committed-prompt-identity-mismatch"
   );
-}
-
-function mergeArtifacts(
-  existing: SessionArtifact[] | undefined,
-  additions: SessionArtifact[],
-): SessionArtifact[] {
-  const merged = new Map<string, SessionArtifact>();
-  for (const artifact of existing ?? []) merged.set(`${artifact.kind}:${artifact.path}`, artifact);
-  for (const artifact of additions) merged.set(`${artifact.kind}:${artifact.path}`, artifact);
-  return Array.from(merged.values());
 }

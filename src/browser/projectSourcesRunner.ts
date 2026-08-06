@@ -10,63 +10,32 @@ import {
   registerTerminationHooks,
   retainChromeEndpointAuthority,
   type RetainedChromeEndpointAuthority,
-  type ChromeLaunchResult,
 } from "./chromeLifecycle.js";
-import {
-  acquireManualChromeOwner,
-  releaseManualChromeOwnerEndpointAuthority,
-  settleManualChromeOwner,
-  type ManualChromeOwner,
-} from "./manualChromeOwner.js";
+import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
-import {
-  installJavaScriptDialogAutoDismissal,
-  navigateToChatGPT,
-  ensureLoggedIn,
-} from "./pageActions.js";
-import type {
-  BrowserCaptureFinalizationResult,
-  BrowserLogger,
-  ChromeClient,
-  ResolvedBrowserConfig,
-} from "./types.js";
+import { installJavaScriptDialogAutoDismissal, navigateToChatGPT } from "./pageActions.js";
+import type { BrowserLogger, ChromeClient, ResolvedBrowserConfig } from "./types.js";
 import type {
   BrowserRecoveryTargetCloseCapabilityMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import {
-  OwnedBrowserResourceTransaction,
-  completedBrowserCaptureCleanup,
-  pendingBrowserCaptureCleanup,
-  type BrowserCaptureSettlementMode,
-} from "./ownedBrowserResources.js";
-import {
-  acquireBrowserTabLease,
-  retainBrowserTabLeaseTeardownAuthority,
-  type BrowserTabLease,
-  type BrowserTabLeaseTeardownAuthority,
-} from "./tabLeaseRegistry.js";
+import { LocalOwnedBrowserResourceAuthority } from "./ownedBrowserResources.js";
+import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   captureProfileDirectoryIdentity,
   createChromeProcessLaunchClaim,
-  isSafeChromeTerminationOutcome,
   parseChromeProcessLaunchClaim,
   parseProfileDirectoryIdentity,
-  removeProfileDirectoryIfIdentityMatches,
   sameChromeProcessLaunchClaim,
   sameProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
-  type RecordedChromeTerminationOutcome,
 } from "./profileState.js";
 import { CHATGPT_URL } from "./constants.js";
-import { delay } from "./utils.js";
 import {
   assertManualLoginProfileReadyForRun,
   defaultManualLoginProfileDir,
-  formatManualLoginSetupCommand,
-  resolveManualLoginWaitMs,
 } from "./manualLoginProfile.js";
 import {
   openProjectSourcesTab,
@@ -78,10 +47,11 @@ import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
 import { getOracleHomeDir } from "../oracleHome.js";
-import { syncDirectoryIfSupported, writeFileAtomicDurable } from "../sessionManager.js";
+import { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
+import { writeFileAtomicDurable } from "../sessionManager.js";
 import { retryBrowserRecoveryCleanup } from "./reattach.js";
 import { acquireReattachRecoveryLock } from "./reattachLock.js";
-import { resolveUserDataBaseDir } from "./localExecutionContext.js";
+import { resolveUserDataBaseDir, waitForLogin } from "./localExecutionContext.js";
 import { listChromeTargetsWithExactAuthority } from "./chromeTargetConnection.js";
 import {
   closeChromeTargetWithRetainedCapability,
@@ -316,11 +286,7 @@ async function persistProjectSourcesCleanupRuntime(
     return;
   }
   await rm(resolvedStorage.journalPath, { force: true });
-  await syncDirectoryIfSupported(path.dirname(resolvedStorage.journalPath)).catch(
-    (error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    },
-  );
+  await syncDirectoryIfPresent(path.dirname(resolvedStorage.journalPath));
 }
 
 function ownedProjectSourcesTarget(
@@ -495,7 +461,7 @@ async function recoverPendingProjectSourcesProfileCreate(
       return true;
     }
   }
-  await syncDirectoryIfSupported(intent.parent.canonicalPath);
+  await syncDirectory(intent.parent.canonicalPath);
   const quarantinedOccupant = await lstatProjectSourcesEntry(quarantinePath);
   await assertProjectSourcesProfileParent(intent);
   if (!quarantinedOccupant || !sameProjectSourcesEntryIdentity(occupant, quarantinedOccupant)) {
@@ -775,310 +741,86 @@ async function runBrowserProjectSourcesUnlocked(
     await assertProjectSourcesProfileParent(profileCreateIntent);
   }
 
-  let acquisitionPendingResource: "tab-lease" | "chrome-process" | "chrome-target" | undefined =
-    manualLogin ? "tab-lease" : "chrome-process";
-  let tabLease: BrowserTabLease | null = null;
-  let owner: ManualChromeOwner | null = null;
-  let chrome: ChromeLaunchResult | null = null;
-  let endpointAuthority: RetainedChromeEndpointAuthority | null = null;
-  let manualLeaseTeardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
-  let isolatedTargetId: string | null = null;
-  let targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
-  let client: ChromeClient | null = null;
+  const leaseId = manualLogin ? randomUUID() : undefined;
+  const persistOwnedResources = async (
+    runtimeToPersist: BrowserRuntimeMetadata,
+  ): Promise<BrowserRuntimeMetadata> => {
+    await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage);
+    return runtimeToPersist;
+  };
+  const resources = new LocalOwnedBrowserResourceAuthority({
+    purpose: "Project Sources",
+    targetLabel: "Project Sources",
+    userDataDir,
+    profileDirectoryIdentity,
+    profileKind: manualLogin ? "manual-login" : "temporary",
+    keepBrowser: effectiveKeepBrowser,
+    closeOwnedTargetOnComplete: !effectiveKeepBrowser,
+    generationId: targetGenerationId,
+    processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
+    processLaunchClaim,
+    processOwnerDisposition: effectiveKeepBrowser ? "preserve" : "close-on-last-lease",
+    ...(leaseId ? { leaseId } : {}),
+    targetMarkerUrl,
+    tabUrl: projectUrl,
+    logger,
+    disconnectBeforeTarget: true,
+    persistRuntime: persistOwnedResources,
+    persistSettlementResult: async (runtimeToPersist) => {
+      await persistOwnedResources(runtimeToPersist);
+    },
+  });
   let removeTerminationHooks: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let completed = false;
-  let targetClosed = false;
-  let leaseReleased = false;
-  let ownerSettled = false;
-
-  const runtime = (): BrowserRuntimeMetadata => {
-    const chromeHost = chrome?.host ?? "127.0.0.1";
-    const targetCleanupPending = Boolean(
-      acquisitionPendingResource === "chrome-target" || (isolatedTargetId && !targetClosed),
-    );
-    const cleanupPending = Boolean(
-      acquisitionPendingResource ||
-      targetCleanupPending ||
-      (tabLease && !leaseReleased) ||
-      (owner && !ownerSettled),
-    );
-    const base: BrowserRuntimeMetadata = {
-      browserTransport: "cdp",
-      chromePid: chrome?.pid,
-      chromeProcessIdentity: owner?.processIdentity,
-      chromePort: chrome?.port,
-      chromeHost,
-      chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
-      chromeProfileRoot: userDataDir,
-      userDataDir,
-      chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
-      tabUrl: projectUrl,
-      controllerPid: process.pid,
-    };
-    if (!cleanupPending) return base;
-    return {
-      ...base,
-      recoveryCleanupResources: [
-        {
-          chromePid: chrome?.pid,
-          chromeProcessIdentity: owner?.processIdentity,
-          profileDirectoryIdentity:
-            owner?.processIdentity.profileDirectory ??
-            tabLease?.profileDirectory ??
-            profileDirectoryIdentity,
-          chromePort: chrome?.port,
-          chromeHost,
-          chromeBrowserWSEndpoint: endpointAuthority?.browserWSEndpoint,
-          chromeProfileRoot: userDataDir,
-          userDataDir,
-          chromeTargetId: targetCleanupPending ? (isolatedTargetId ?? undefined) : undefined,
-          targetCloseCapability: targetCleanupPending ? targetCloseCapability : undefined,
-          acquisition: {
-            generationId: targetGenerationId,
-            processOwnerProvenance: manualLogin ? "manual-canonical-owner" : "temporary-launch",
-            processLaunchClaim,
-            processOwnerDisposition: effectiveKeepBrowser ? "preserve" : "close-on-last-lease",
-            targetMarkerUrl,
-            ...(acquisitionPendingResource ? { pendingResource: acquisitionPendingResource } : {}),
-          },
-          tabLease:
-            tabLease && !leaseReleased
-              ? { id: tabLease.id, profileDirectory: tabLease.profileDirectory }
-              : undefined,
-          recoveryCleanup: {
-            ownsTarget: targetCleanupPending,
-            profileKind: manualLogin ? "manual-login" : "temporary",
-            keepBrowser: effectiveKeepBrowser || (manualLogin && owner?.disposition === "preserve"),
-            closeOwnedTargetOnComplete: !effectiveKeepBrowser,
-          },
-        },
-      ],
-      recoveryCleanupResult: { status: "pending" },
-    };
-  };
-  await persistProjectSourcesCleanupRuntime(runtime(), cleanupStorage);
-
-  const settleProjectSourcesResources = async (
-    mode: BrowserCaptureSettlementMode,
-    pendingRuntime: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> => {
-    const errors: string[] = [];
-    const cleanup = pendingRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
-    const shouldCloseTarget =
-      cleanup?.ownsTarget === true && cleanup.closeOwnedTargetOnComplete === true;
-    if (cleanup?.ownsTarget === true && typeof cleanup.closeOwnedTargetOnComplete !== "boolean") {
-      return pendingBrowserCaptureCleanup(
-        pendingRuntime,
-        "Project Sources target close disposition is missing",
-        mode,
-      );
-    }
-    await client?.close().catch(() => undefined);
-    if (shouldCloseTarget && isolatedTargetId && chrome && !targetClosed) {
-      if (!targetCloseCapability) {
-        errors.push("Project Sources target has no retained exact close capability");
-      } else {
-        try {
-          const closed = await closeChromeTargetWithRetainedCapability({
-            capability: targetCloseCapability,
-            targetId: isolatedTargetId,
-            logger,
-          });
-          if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
-          else errors.push(closed.reason);
-        } catch (error) {
-          errors.push(
-            `Project Sources target close failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-    }
-    if (errors.length > 0) {
-      return pendingBrowserCaptureCleanup(runtime(), errors.join("; "), mode);
-    }
-
-    let keepBrowserOpen =
-      effectiveKeepBrowser || (manualLogin && owner?.disposition === "preserve");
-    if (manualLeaseTeardownAuthority && owner) {
-      let teardownError: string | null = null;
-      const ownerForSettlement = owner;
-      const outcome = await manualLeaseTeardownAuthority.settle(async () => {
-        const settlement = await settleManualChromeOwner(userDataDir, ownerForSettlement, logger);
-        if (settlement.status === "unsafe") {
-          teardownError = settlement.reason;
-          return false;
-        }
-        ownerSettled = true;
-        return true;
-      });
-      leaseReleased = manualLeaseTeardownAuthority.leaseReleased;
-      if (outcome.status === "completed" && outcome.disposition === "active-lease-handoff") {
-        keepBrowserOpen = true;
-        ownerSettled = true;
-        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-      } else if (outcome.status === "preserved") {
-        keepBrowserOpen = true;
-        errors.push(teardownError ?? outcome.error ?? outcome.reason);
-      }
-    } else if (tabLease && !leaseReleased) {
-      try {
-        await tabLease.release();
-        leaseReleased = true;
-      } catch (error) {
-        keepBrowserOpen = true;
-        errors.push(
-          `Project Sources browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      if (leaseReleased && manualLogin && owner && !ownerSettled) {
-        const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
-        if (settlement.status === "unsafe") {
-          keepBrowserOpen = true;
-          errors.push(settlement.reason);
-        } else {
-          ownerSettled = true;
-          keepBrowserOpen = true;
-        }
-      }
-    }
-    if (
-      errors.length === 0 &&
-      manualLogin &&
-      !manualLeaseTeardownAuthority &&
-      leaseReleased &&
-      owner &&
-      !ownerSettled
-    ) {
-      const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
-      if (settlement.status === "unsafe") {
-        keepBrowserOpen = true;
-        errors.push(settlement.reason);
-      } else {
-        ownerSettled = true;
-        keepBrowserOpen = true;
-      }
-    }
-    if (!keepBrowserOpen && !manualLogin && chrome && !ownerSettled) {
-      const termination = await chrome.kill().catch(
-        (error: unknown): RecordedChromeTerminationOutcome => ({
-          status: "unsafe",
-          pid: chrome?.pid ?? -1,
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      if (!isSafeChromeTerminationOutcome(termination)) {
-        keepBrowserOpen = true;
-        errors.push(termination.reason);
-      } else {
-        const removed = await removeProfileDirectoryIfIdentityMatches(
-          userDataDir,
-          chrome.processIdentity.profileDirectory,
-        ).catch(() => false);
-        if (!removed) errors.push(`Profile removal was not confirmed: ${userDataDir}`);
-        else ownerSettled = true;
-      }
-    }
-    if (keepBrowserOpen && chrome) {
-      try {
-        chrome.process?.unref?.();
-      } catch {
-        // Best effort only; retained Chrome ownership is recorded independently.
-      }
-      logger(`Chrome left running on port ${chrome.port} with profile ${userDataDir}`);
-    }
-    const projectedRuntime = runtime();
-    return errors.length > 0
-      ? pendingBrowserCaptureCleanup(projectedRuntime, [...new Set(errors)].join("; "), mode)
-      : completedBrowserCaptureCleanup(projectedRuntime);
-  };
-
-  const resources = new OwnedBrowserResourceTransaction(
-    {
-      persistRuntime: async (runtimeToPersist) => {
-        await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage);
-        return runtimeToPersist;
-      },
-      persistSettlementResult: async (settledRuntime) => {
-        await persistProjectSourcesCleanupRuntime(settledRuntime, cleanupStorage);
-      },
-      settleResources: settleProjectSourcesResources,
-    },
-    runtime(),
-  );
   let result: ProjectSourcesResult | undefined;
   let primaryError: unknown;
   try {
     let acquiredTabLease: BrowserTabLease | undefined;
     if (manualLogin) {
       acquiredTabLease = await resources.journalAcquisition({
-        intentRuntime: runtime(),
+        resource: "tab-lease",
         acquire: () =>
           acquireBrowserTabLease(userDataDir, {
             maxConcurrentTabs: config.maxConcurrentTabs,
             timeoutMs: config.timeoutMs,
             logger,
             sessionId: "project-sources",
+            leaseId,
           }),
-        acquiredRuntime: (lease) => {
-          tabLease = lease;
-          acquisitionPendingResource = undefined;
-          return runtime();
-        },
+        authority: (lease) => lease,
       });
     }
-    acquisitionPendingResource = "chrome-process";
-    const acquired = await resources.journalAcquisition<ManualChromeOwner>({
-      intentRuntime: runtime(),
+    const acquiredProcess = await resources.journalAcquisition({
+      resource: "chrome-process",
       acquire: async () => {
         if (manualLogin) {
-          return await acquireManualChromeOwner(userDataDir, config, logger, "project-sources", {
-            launchClaim: processLaunchClaim,
-          });
+          const owner = await acquireManualChromeOwner(
+            userDataDir,
+            config,
+            logger,
+            "project-sources",
+            { launchClaim: processLaunchClaim },
+          );
+          return { kind: "manual" as const, owner };
         }
-        const launchedChrome = await launchChrome(
-          { ...config, remoteChrome: null },
-          userDataDir,
-          logger,
-          { launchClaim: processLaunchClaim },
-        );
-        return {
-          chrome: launchedChrome,
-          processIdentity: launchedChrome.processIdentity,
-          source: "launched" as const,
-          disposition: "close-on-last-lease" as const,
-        };
+        const chrome = await launchChrome({ ...config, remoteChrome: null }, userDataDir, logger, {
+          launchClaim: processLaunchClaim,
+        });
+        return { kind: "temporary" as const, chrome };
       },
-      acquiredRuntime: (acquiredOwner) => {
-        owner = acquiredOwner;
-        chrome = acquiredOwner.chrome;
-        endpointAuthority =
-          acquiredOwner.endpointAuthority ?? acquiredOwner.chrome.endpointAuthority ?? null;
-        acquisitionPendingResource = undefined;
-        return runtime();
-      },
+      authority: (authority) => authority,
     });
-    const acquiredChrome = acquired.chrome;
+    const acquiredChrome =
+      acquiredProcess.kind === "manual" ? acquiredProcess.owner.chrome : acquiredProcess.chrome;
     const acquiredEndpointAuthority =
-      acquired.endpointAuthority ?? acquiredChrome.endpointAuthority;
+      acquiredProcess.kind === "manual"
+        ? (acquiredProcess.owner.endpointAuthority ?? acquiredChrome.endpointAuthority)
+        : acquiredChrome.endpointAuthority;
     if (!acquiredEndpointAuthority) {
       throw new Error("Project Sources Chrome has no retained exact endpoint authority.");
     }
-    owner = acquired;
-    chrome = acquiredChrome;
-    endpointAuthority = acquiredEndpointAuthority;
     const chromeHost = acquiredChrome.host ?? "127.0.0.1";
-    if (manualLogin && acquiredTabLease && acquired.disposition === "close-on-last-lease") {
-      const ownerForHandoff = acquired;
-      manualLeaseTeardownAuthority = retainBrowserTabLeaseTeardownAuthority(
-        userDataDir,
-        acquiredTabLease,
-        {
-          logger,
-          onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerForHandoff),
-        },
-      );
-    }
     if (acquiredTabLease) {
       await acquiredTabLease.update({ chromeHost, chromePort: acquiredChrome.port });
     }
@@ -1086,7 +828,8 @@ async function runBrowserProjectSourcesUnlocked(
     removeTerminationHooks = registerTerminationHooks(
       acquiredChrome,
       userDataDir,
-      effectiveKeepBrowser || (manualLogin && acquired.disposition === "preserve"),
+      effectiveKeepBrowser ||
+        (acquiredProcess.kind === "manual" && acquiredProcess.owner.disposition === "preserve"),
       logger,
       {
         isInFlight: () => !completed,
@@ -1094,13 +837,9 @@ async function runBrowserProjectSourcesUnlocked(
       },
     );
 
-    acquisitionPendingResource = "chrome-target";
     const devtoolsRetries = manualLogin ? 6 : 0;
-    const connection = await resources.journalAcquisition<{
-      client: ChromeClient;
-      targetId: string;
-    }>({
-      intentRuntime: runtime(),
+    const connection = await resources.journalAcquisition({
+      resource: "chrome-target",
       acquire: async () => {
         const opened = await connectOwnedProjectSourcesTarget(
           acquiredEndpointAuthority,
@@ -1115,25 +854,25 @@ async function runBrowserProjectSourcesUnlocked(
         await opened.client.Runtime.evaluate({
           expression: `window.name = ${JSON.stringify(targetMarkerUrl)}`,
         });
-        return { client: opened.client, targetId: opened.targetId };
+        return opened;
       },
-      acquiredRuntime: (connected) => {
-        client = connected.client;
-        isolatedTargetId = connected.targetId;
-        targetCloseCapability = retainChromeTargetCloseCapability({
+      authority: (opened) => ({
+        targetId: opened.targetId as string,
+        releasesProcessEndpointOnSettle: effectiveKeepBrowser,
+        capability: retainChromeTargetCloseCapability({
           generationId: targetGenerationId,
-          targetId: connected.targetId,
+          targetId: opened.targetId as string,
+          browserWSEndpoint: acquiredEndpointAuthority.browserWSEndpoint,
           close: (closeLogger) =>
             closeChromeTargetWithExactAuthority({
               authority: acquiredEndpointAuthority,
-              targetId: connected.targetId,
+              targetId: opened.targetId as string,
               logger: closeLogger,
             }),
           ...(effectiveKeepBrowser ? { release: () => acquiredEndpointAuthority.release() } : {}),
-        });
-        acquisitionPendingResource = undefined;
-        return runtime();
-      },
+        }),
+        disconnect: () => opened.client.close().catch(() => undefined),
+      }),
     });
     const projectClient = connection.client;
     if (acquiredTabLease) {
@@ -1144,7 +883,6 @@ async function runBrowserProjectSourcesUnlocked(
         tabUrl: projectUrl,
       });
     }
-
     const disconnectPromise = new Promise<never>((_, reject) => {
       projectClient.on("disconnect", () => {
         reject(new Error("Chrome window closed before Project Sources finished."));
@@ -1177,7 +915,7 @@ async function runBrowserProjectSourcesUnlocked(
 
     await raceWithDisconnect(navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger));
     await raceWithDisconnect(
-      waitForProjectSourcesLogin({
+      waitForLogin({
         runtime: Runtime,
         logger,
         appliedCookies,
@@ -1225,24 +963,8 @@ async function runBrowserProjectSourcesUnlocked(
 
   removeDialogHandler?.();
   removeTerminationHooks?.();
-  resources.replaceRuntime(runtime());
   const finalization = await resources.settle(completed ? "finalize" : "abort");
   if (finalization.status === "pending") {
-    try {
-      await persistProjectSourcesCleanupRuntime(finalization.runtime, cleanupStorage);
-    } catch (persistenceError) {
-      const cleanupError = new BrowserAutomationError(
-        `Project Sources browser cleanup could not be durably recorded: ${persistenceError instanceof Error ? persistenceError.message : String(persistenceError)}`,
-        { stage: "project-sources-cleanup", runtime: finalization.runtime },
-      );
-      if (primaryError !== undefined) {
-        throw new AggregateError(
-          [primaryError, cleanupError],
-          "Project Sources operation failed and browser cleanup authority could not be durably recorded.",
-        );
-      }
-      throw cleanupError;
-    }
     const cleanupError = new BrowserAutomationError(
       `Project Sources browser cleanup remains retryable and is durably journaled for the next Project Sources run: ${finalization.error}`,
       { stage: "project-sources-cleanup", runtime: finalization.runtime },
@@ -1296,58 +1018,4 @@ async function applyProjectSourcesCookies({
       : "No Chrome cookies found; continuing without session reuse",
   );
   return cookieCount;
-}
-
-async function waitForProjectSourcesLogin({
-  runtime,
-  logger,
-  appliedCookies,
-  manualLogin,
-  timeoutMs,
-  profileDir,
-  keepBrowser,
-}: {
-  runtime: ChromeClient["Runtime"];
-  logger: BrowserLogger;
-  appliedCookies: number;
-  manualLogin: boolean;
-  timeoutMs: number;
-  profileDir?: string;
-  keepBrowser?: boolean;
-}): Promise<void> {
-  if (!manualLogin) {
-    await ensureLoggedIn(runtime, logger, { appliedCookies });
-    return;
-  }
-  const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
-  const deadline = Date.now() + waitMs;
-  let lastNotice = 0;
-  while (Date.now() < deadline) {
-    try {
-      await ensureLoggedIn(runtime, logger, { appliedCookies });
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const retryable =
-        message.toLowerCase().includes("login button") ||
-        message.toLowerCase().includes("session not detected");
-      if (!retryable) {
-        throw error;
-      }
-      const now = Date.now();
-      if (now - lastNotice > 5000) {
-        logger(
-          "Manual login mode: please sign into chatgpt.com in the opened Chrome window; waiting for session to appear...",
-        );
-        lastNotice = now;
-      }
-      await delay(1000);
-    }
-  }
-  const setupCommand = formatManualLoginSetupCommand(profileDir ?? defaultManualLoginProfileDir());
-  throw new Error(
-    "Manual login mode timed out waiting for ChatGPT session. " +
-      `Browser mode is using Oracle's private Chrome profile at ${profileDir ?? "(default profile)"}, not your normal Chrome profile. ` +
-      `Run first-time setup, sign in there, then retry: ${setupCommand}`,
-  );
 }

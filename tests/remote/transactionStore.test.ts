@@ -31,17 +31,31 @@ const committedPromptEpoch = {
 };
 
 const runtime = {
+  chromeHost: "service.example",
+  chromePort: 9222,
+  chromeBrowserWSEndpoint: "ws://service.example:9222/devtools/browser/store-generation",
   chromeTargetId: "target-1",
   conversationId: committedPromptEpoch.conversationId,
   promptEpoch: committedPromptEpoch,
   recoveryCleanupResources: [
     {
+      chromeHost: "service.example",
+      chromePort: 9222,
+      chromeBrowserWSEndpoint: "ws://service.example:9222/devtools/browser/store-generation",
       chromeTargetId: "target-1",
+      targetCloseCapability: {
+        version: 1 as const,
+        generationId: "store-generation",
+        capabilityId: "store-capability",
+        targetId: "target-1",
+        browserWSEndpoint: "ws://service.example:9222/devtools/browser/store-generation",
+      },
+      acquisition: { generationId: "store-generation" },
       conversationId: committedPromptEpoch.conversationId,
       promptEpoch: committedPromptEpoch,
       recoveryCleanup: {
         ownsTarget: true,
-        profileKind: "temporary" as const,
+        profileKind: "none" as const,
         keepBrowser: false,
         closeOwnedTargetOnComplete: true,
       },
@@ -566,6 +580,40 @@ describe("RemoteTransactionStore", () => {
           durablePublication: false,
         }),
       ).rejects.toMatchObject({ code: "transaction_settlement_conflict" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks shutdown instead of aborting a durable capture with non-reconstructible target authority", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-block-store-"));
+    const transactionToken = "9".repeat(64);
+    const nonReconstructibleRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      chromeBrowserWSEndpoint: undefined,
+      recoveryCleanupResources: runtime.recoveryCleanupResources.map((resource) => ({
+        ...resource,
+        chromeBrowserWSEndpoint: undefined,
+        targetCloseCapability: undefined,
+      })),
+    };
+    try {
+      const store = await RemoteTransactionStore.open({ directory: root });
+      await begin(store, transactionToken);
+      await store.publishCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime: nonReconstructibleRuntime,
+        artifacts: [],
+      });
+      const beforeShutdown = await readFile(store.recordPath(transactionToken), "utf8");
+      await expect(store.prepareControllerShutdown(transactionToken)).rejects.toThrow(
+        "durable capture depends on non-restart-durable browser cleanup authority",
+      );
+      await expect(readFile(store.recordPath(transactionToken), "utf8")).resolves.toBe(
+        beforeShutdown,
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

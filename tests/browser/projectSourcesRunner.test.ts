@@ -80,6 +80,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
   }));
   vi.doMock("../../src/browser/localExecutionContext.js", () => ({
     resolveUserDataBaseDir: vi.fn(async () => temporaryBase),
+    waitForLogin: vi.fn(async () => undefined),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
     clearStaleChatGptConversationCookies: vi.fn(),

@@ -26,11 +26,11 @@ export const MAX_REMOTE_TRANSACTION_STORE_BYTES = 256 * 1024 * 1024;
 export const REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES = MAX_REMOTE_EVENT_BYTES;
 
 export const REMOTE_TRANSACTION_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
-const REMOTE_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+export const REMOTE_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
 const REMOTE_ARTIFACT_IDENTIFIER_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
-function isTrustedChatGptUrl(value: string): boolean {
+export function isTrustedChatGptUrl(value: string): boolean {
   try {
     const url = new URL(value);
     return (

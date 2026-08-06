@@ -31,9 +31,22 @@ export function groupRecoveryCleanupResources(
 export function recoveryCleanupGroupKey(resource: BrowserRecoveryCleanupResourceMetadata): string {
   if (!resource.remoteRecovery) {
     const processIdentity = resource.chromeProcessIdentity;
-    const profileIdentity = profileDirectoryIdentityKey(
+    const persistedProfileIdentity = profileDirectoryIdentityKey(
       processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
-    ) ?? ["missing-physical-profile", resource.chromeProfileRoot ?? resource.userDataDir ?? null];
+    );
+    const profilePath = resource.chromeProfileRoot ?? resource.userDataDir;
+    const profileIdentity =
+      persistedProfileIdentity ??
+      (profilePath
+        ? ["missing-physical-profile", profilePath]
+        : !processIdentity && resource.recoveryCleanup.profileKind === "none"
+          ? [
+              "processless-browser-endpoint",
+              resource.chromeBrowserWSEndpoint ?? null,
+              resource.chromeHost ?? null,
+              resource.chromePort ?? null,
+            ]
+          : ["missing-physical-profile", null]);
     return JSON.stringify(["local", chromeProcessIdentityKey(processIdentity), profileIdentity]);
   }
   const remoteIdentity = remoteRecoveryIdentityKey(resource.remoteRecovery);

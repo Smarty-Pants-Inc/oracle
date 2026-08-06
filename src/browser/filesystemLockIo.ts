@@ -1,7 +1,16 @@
 import path from "node:path";
-import { lstat, open, readdir, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, rename, rmdir, stat, unlink } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
+import {
+  physicalDirectoryIdentityFromStats,
+  samePhysicalDirectoryIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
+import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 import { delay } from "./utils.js";
+export { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
+
+export { capturePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+export type { PhysicalDirectoryIdentity };
 
 export const WINDOWS_LOCK_MUTATION_RETRY_MS = 10;
 export const WINDOWS_LOCK_MUTATION_TIMEOUT_MS = 1_000;
@@ -19,22 +28,6 @@ export async function renameLockPath(sourcePath: string, destinationPath: string
   }
 }
 
-export interface PhysicalDirectoryIdentity {
-  readonly device: string;
-  readonly inode: string;
-  readonly birthtimeNs: string;
-}
-
-export async function capturePhysicalDirectoryIdentity(
-  directoryPath: string,
-): Promise<PhysicalDirectoryIdentity> {
-  const entry = await lstat(directoryPath, { bigint: true });
-  if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`Filesystem path is not a physical directory: ${directoryPath}`);
-  }
-  return physicalEntryIdentity(entry);
-}
-
 export async function removePreparedLockDirectory(
   directoryPath: string,
   expectedIdentity: PhysicalDirectoryIdentity,
@@ -50,7 +43,10 @@ export async function removePreparedLockDirectory(
   if (
     !directoryEntry.isDirectory() ||
     directoryEntry.isSymbolicLink() ||
-    !samePhysicalEntryIdentity(physicalEntryIdentity(directoryEntry), expectedIdentity)
+    !samePhysicalDirectoryIdentity(
+      physicalDirectoryIdentityFromStats(directoryEntry),
+      expectedIdentity,
+    )
   ) {
     throw new Error(`Prepared filesystem lock directory changed at ${directoryPath}`);
   }
@@ -70,8 +66,14 @@ export async function removePreparedLockDirectory(
     const currentDirectory = await lstat(directoryPath, { bigint: true });
     const current = await lstat(entryPath, { bigint: true });
     if (
-      !samePhysicalEntryIdentity(physicalEntryIdentity(currentDirectory), expectedIdentity) ||
-      !samePhysicalEntryIdentity(physicalEntryIdentity(before), physicalEntryIdentity(current))
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(currentDirectory),
+        expectedIdentity,
+      ) ||
+      !samePhysicalDirectoryIdentity(
+        physicalDirectoryIdentityFromStats(before),
+        physicalDirectoryIdentityFromStats(current),
+      )
     ) {
       throw new Error(`Prepared filesystem lock generation changed at ${directoryPath}`);
     }
@@ -80,7 +82,7 @@ export async function removePreparedLockDirectory(
 
   const after = await lstat(directoryPath, { bigint: true });
   if (
-    !samePhysicalEntryIdentity(physicalEntryIdentity(after), expectedIdentity) ||
+    !samePhysicalDirectoryIdentity(physicalDirectoryIdentityFromStats(after), expectedIdentity) ||
     (await readdir(directoryPath)).length !== 0
   ) {
     throw new Error(
@@ -88,25 +90,6 @@ export async function removePreparedLockDirectory(
     );
   }
   await rmdir(directoryPath);
-}
-
-function physicalEntryIdentity(entry: BigIntStats): PhysicalDirectoryIdentity {
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
-}
-
-function samePhysicalEntryIdentity(
-  left: PhysicalDirectoryIdentity,
-  right: PhysicalDirectoryIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
 }
 
 export function isRetryableWindowsLockMutationError(error: unknown): boolean {
@@ -122,24 +105,6 @@ export async function lockPathExists(lockPath: string): Promise<boolean> {
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return false;
     throw error;
-  }
-}
-
-export async function syncDirectoryIfPresent(directory: string): Promise<void> {
-  try {
-    await syncDirectory(directory);
-  } catch (error) {
-    if (readErrorCode(error) !== "ENOENT") throw error;
-  }
-}
-
-export async function syncDirectory(directory: string): Promise<void> {
-  if (process.platform === "win32") return;
-  const handle = await open(directory, "r");
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
   }
 }
 

@@ -146,6 +146,7 @@ export async function createOwnedRecoveryTargetConnection(
     targetCloseCapability = retainChromeTargetCloseCapability({
       generationId,
       targetId,
+      browserWSEndpoint: endpointAuthority.browserWSEndpoint,
       close: (closeLogger) =>
         (
           deps.recoveryCleanup?.closeChromeTargetWithExactAuthority ??
@@ -234,55 +235,74 @@ export async function resumeBrowserSessionViaNewChrome(
     recoveryCleanup: deps.recoveryCleanup,
   });
 
-  await fallbackAuthority.persist(manualLogin ? "tab-lease" : "chrome-process");
   try {
     if (manualLogin) {
-      const lease = await (deps.acquireBrowserTabLease ?? acquireBrowserTabLease)(userDataDir, {
-        maxConcurrentTabs: resolved.maxConcurrentTabs,
-        timeoutMs: resolved.timeoutMs,
-        logger,
-        sessionId: `reattach-${process.pid}`,
-        leaseId: fallbackLeaseId,
+      await fallbackAuthority.journalAcquisition({
+        resource: "tab-lease",
+        acquire: () =>
+          (deps.acquireBrowserTabLease ?? acquireBrowserTabLease)(userDataDir, {
+            maxConcurrentTabs: resolved.maxConcurrentTabs,
+            timeoutMs: resolved.timeoutMs,
+            logger,
+            sessionId: `reattach-${process.pid}`,
+            leaseId: fallbackLeaseId,
+          }),
+        authority: (lease) => lease,
       });
-      fallbackAuthority.setLease(lease);
-      await fallbackAuthority.persist("chrome-process");
     }
-    if (manualLogin) {
-      const owner = await (deps.acquireManualChromeOwner ?? acquireManualChromeOwner)(
-        userDataDir,
-        resolved,
-        logger,
-        `reattach-${process.pid}`,
-        { launchClaim: acquisitionLaunchClaim },
-      );
-      fallbackAuthority.setManualChromeOwner(owner);
-    } else {
-      const launchedChrome = await (deps.launchChrome ?? launchChrome)(
-        resolved,
-        userDataDir,
-        logger,
-        { launchClaim: acquisitionLaunchClaim },
-      );
-      fallbackAuthority.setLaunchedChrome(launchedChrome);
-    }
+    await fallbackAuthority.journalAcquisition({
+      resource: "chrome-process",
+      acquire: async () => {
+        if (manualLogin) {
+          const owner = await (deps.acquireManualChromeOwner ?? acquireManualChromeOwner)(
+            userDataDir,
+            resolved,
+            logger,
+            `reattach-${process.pid}`,
+            { launchClaim: acquisitionLaunchClaim },
+          );
+          return { kind: "manual" as const, owner };
+        }
+        const chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger, {
+          launchClaim: acquisitionLaunchClaim,
+        });
+        return { kind: "temporary" as const, chrome };
+      },
+      authority: (authority) => authority,
+    });
     const chrome = fallbackAuthority.acquiredChrome();
-    await fallbackAuthority.persist("chrome-target");
     const chromeHost = chrome.host ?? "127.0.0.1";
     const recoveryEndpointAuthority = fallbackAuthority.endpointAuthority();
     if (!recoveryEndpointAuthority) {
       throw new Error("Local recovery Chrome has no retained exact endpoint authority.");
     }
-    const recoveryConnection = await createOwnedRecoveryTargetConnection(
-      recoveryEndpointAuthority,
-      acquisitionGenerationId,
-      logger,
-      deps,
-      fallbackTargetMarkerUrl,
-      (targetId, capability) => fallbackAuthority.recordOwnedTarget(targetId, capability),
-      (targetId) => fallbackAuthority.clearOwnedTarget(targetId),
-    );
+    let targetCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
+    const recoveryConnection = await fallbackAuthority.journalAcquisition({
+      resource: "chrome-target",
+      acquire: () =>
+        createOwnedRecoveryTargetConnection(
+          recoveryEndpointAuthority,
+          acquisitionGenerationId,
+          logger,
+          deps,
+          fallbackTargetMarkerUrl,
+          (_targetId, capability) => {
+            targetCapability = capability;
+          },
+        ),
+      authority: (connection) => {
+        if (!targetCapability) {
+          throw new Error("Recovery target acquisition did not retain exact close capability.");
+        }
+        return {
+          targetId: connection.targetId,
+          capability: targetCapability,
+          disconnect: () => connection.close().catch(() => undefined),
+        };
+      },
+    });
     const recoveryTargetId = recoveryConnection.targetId;
-    const client = fallbackAuthority.attachConnection(recoveryConnection);
+    const client = recoveryConnection.client;
     await fallbackAuthority.lease()?.update({
       chromeHost,
       chromePort: chrome.port,

@@ -8,27 +8,12 @@ import {
   MAX_REMOTE_PROMPT_CHARS,
   MAX_REMOTE_PUBLIC_RESULT_BYTES,
   MAX_REMOTE_TOTAL_ATTACHMENT_BYTES,
+  REMOTE_IDENTIFIER_PATTERN,
   RemoteArtifactDescriptorSchema,
+  isTrustedChatGptUrl,
 } from "./types.js";
 
 export const REMOTE_LEGACY_TEXT_PROTOCOL_VERSION = 1;
-
-const LEGACY_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
-
-function isTrustedChatGptUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      !url.port &&
-      !url.username &&
-      !url.password &&
-      (url.hostname === "chatgpt.com" || url.hostname === "chat.openai.com")
-    );
-  } catch {
-    return false;
-  }
-}
 
 export const RemoteLegacyAttachmentPayloadSchema = z
   .object({
@@ -167,7 +152,7 @@ export const RemoteLegacyRunPayloadSchema = z
       .object({
         heartbeatIntervalMs: z.number().int().positive().max(3_600_000).optional(),
         verbose: z.boolean().optional(),
-        sessionId: z.string().regex(LEGACY_IDENTIFIER_PATTERN).optional(),
+        sessionId: z.string().regex(REMOTE_IDENTIFIER_PATTERN).optional(),
         followUpPrompts: z.array(z.string().min(1).max(MAX_REMOTE_PROMPT_CHARS)).max(32).optional(),
       })
       .strict(),

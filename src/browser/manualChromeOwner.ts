@@ -22,6 +22,7 @@ import {
   verifyProfileDirectoryIdentity,
   writeOracleChromeOwner,
   type ChromeOwnerDisposition,
+  type ChromeOwnerPreservationPolicy,
   type ChromeProcessIdentity,
   type ChromeProcessLaunchClaim,
   type OracleChromeOwnerRecord,
@@ -59,6 +60,8 @@ export interface ManualChromeOwnerDeps {
   readPort?: typeof readDevToolsPort;
   verifyIdentity?: typeof verifyChromeProcessIdentity;
   writeOwner?: typeof writeOracleChromeOwner;
+  /** Service bootstrap establishes a durable preserve policy direct runs cannot replace. */
+  ownerPolicy?: ChromeOwnerPreservationPolicy;
 }
 
 interface ManualLoginReusableChrome extends BrowserChrome {
@@ -129,7 +132,7 @@ export async function acquireManualChromeOwner(
         )
       : await findExistingManualChromeOwner(
           profileDir,
-          config.reuseChromeWaitMs,
+          config,
           logger,
           launchLock.profileDirectory,
           deps,
@@ -177,19 +180,13 @@ export async function acquireManualChromeOwner(
       let pid: number;
       let port: number;
       let processIdentity: ChromeProcessIdentity;
+      let ownerRecord: OracleChromeOwnerRecord | null = null;
       try {
         pid = requirePositiveInteger(chrome.pid, "pid", profileDir);
         port = requirePositiveInteger(chrome.port, "DevTools port", profileDir);
         processIdentity = requireProcessIdentity(chrome.processIdentity, pid, profileDir);
-        await persistCanonicalOwner(
-          profileDir,
-          {
-            port,
-            processIdentity,
-            disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
-          },
-          deps,
-        );
+        ownerRecord = ownerRecordForCurrentRun(profileDir, port, processIdentity, config, deps);
+        await persistCanonicalOwner(profileDir, ownerRecord, deps);
       } catch (error) {
         const failures = [error instanceof Error ? error : new Error(String(error))];
         const termination = await chrome.kill().catch((terminationError: unknown) => ({
@@ -228,6 +225,10 @@ export async function acquireManualChromeOwner(
         throw error;
       }
 
+      if (!ownerRecord) {
+        throw new Error(`Canonical Chrome owner policy was not resolved for ${profileDir}`);
+      }
+
       logger(
         `Launched canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`,
       );
@@ -235,7 +236,7 @@ export async function acquireManualChromeOwner(
         chrome,
         processIdentity,
         source: "launched",
-        disposition: config.keepBrowser ? "preserve" : "close-on-last-lease",
+        disposition: ownerRecord.disposition,
         endpointAuthority: chrome.endpointAuthority,
       };
     }
@@ -320,7 +321,6 @@ export async function acquireManualLoginChromeForRun(
   }
   return { chrome, reusedChrome };
 }
-
 async function acquireCompatibilityManualChromeOwner(
   profileDir: string,
   config: ResolvedBrowserConfig,
@@ -340,15 +340,22 @@ async function acquireCompatibilityManualChromeOwner(
     expectedProfileDirectory,
   );
   const { pid, port, processIdentity, endpointAuthority, chrome } = authority;
-  const disposition = config.keepBrowser ? "preserve" : "close-on-last-lease";
-  await persistCanonicalOwner(profileDir, { port, processIdentity, disposition }, deps);
+  const ownerRecord = ownerRecordForCurrentRun(
+    profileDir,
+    port,
+    processIdentity,
+    config,
+    deps,
+    await (deps.readOwner ?? readOracleChromeOwner)(profileDir),
+  );
+  await persistCanonicalOwner(profileDir, ownerRecord, deps);
   logger(`Reusing canonical Chrome owner for ${profileDir} (DevTools port ${port}, pid ${pid})`);
   return {
     compatibilityChrome: reusable,
     chrome,
     processIdentity,
     source: "rediscovered",
-    disposition,
+    disposition: ownerRecord.disposition,
     endpointAuthority,
   };
 }
@@ -431,10 +438,9 @@ async function retainCompatibilityChromeAuthority(
     } as unknown as ChromeLaunchResult,
   };
 }
-
 async function findExistingManualChromeOwner(
   profileDir: string,
-  waitForPortMs: number | undefined,
+  config: ResolvedBrowserConfig,
   logger: BrowserLogger,
   expectedProfileDirectory: ProfileDirectoryIdentity,
   deps: ManualChromeOwnerDeps,
@@ -480,6 +486,15 @@ async function findExistingManualChromeOwner(
         { cause: error },
       );
     }
+    const ownerRecord = ownerRecordForCurrentRun(
+      profileDir,
+      recordedPort,
+      recordedIdentity,
+      config,
+      deps,
+      recordedOwner,
+    );
+    await persistCanonicalOwner(profileDir, ownerRecord, deps);
     logger(
       `Reusing canonical Chrome owner for ${profileDir} (DevTools port ${recordedPort}, pid ${recordedPid})`,
     );
@@ -487,13 +502,12 @@ async function findExistingManualChromeOwner(
       chrome: reusableChrome(recordedPort, recordedPid, recordedIdentity, endpointAuthority),
       processIdentity: recordedIdentity,
       source: "recorded",
-      disposition: recordedOwner.disposition,
+      disposition: ownerRecord.disposition,
       endpointAuthority,
     };
   }
-
   let activePort = await readPort(profileDir);
-  const waitMs = Math.max(0, waitForPortMs ?? 0);
+  const waitMs = Math.max(0, config.reuseChromeWaitMs ?? 0);
   if (!activePort && waitMs > 0) {
     const deadline = Date.now() + waitMs;
     logger(`Waiting up to ${formatElapsed(waitMs)} for canonical Chrome owner to appear...`);
@@ -543,6 +557,38 @@ async function findExistingManualChromeOwner(
   return null;
 }
 
+function ownerRecordForCurrentRun(
+  profileDir: string,
+  port: number,
+  processIdentity: ChromeProcessIdentity,
+  config: ResolvedBrowserConfig,
+  deps: ManualChromeOwnerDeps,
+  current?: OracleChromeOwnerRecord | null,
+): OracleChromeOwnerRecord {
+  if (current?.preservationPolicy === "service-persistent") {
+    if (
+      current.port !== port ||
+      !sameChromeProcessIdentity(current.processIdentity, processIdentity)
+    ) {
+      throw new Error(
+        `Service-owned Chrome authority for ${profileDir} does not match the exact reused process`,
+      );
+    }
+    return current;
+  }
+  const preservationPolicy = deps.ownerPolicy;
+  return {
+    port,
+    processIdentity,
+    disposition: preservationPolicy
+      ? "preserve"
+      : config.keepBrowser
+        ? "preserve"
+        : "close-on-last-lease",
+    ...(preservationPolicy ? { preservationPolicy } : {}),
+  };
+}
+
 async function persistCanonicalOwner(
   profileDir: string,
   owner: OracleChromeOwnerRecord,
@@ -560,6 +606,7 @@ async function persistCanonicalOwner(
     !persistedOwner ||
     persistedOwner.port !== owner.port ||
     persistedOwner.disposition !== owner.disposition ||
+    persistedOwner.preservationPolicy !== owner.preservationPolicy ||
     !sameChromeProcessIdentity(persistedOwner.processIdentity, owner.processIdentity)
   ) {
     await writeOwner(profileDir, owner);
@@ -570,6 +617,7 @@ async function persistCanonicalOwner(
     !verifiedOwner ||
     verifiedOwner.port !== owner.port ||
     verifiedOwner.disposition !== owner.disposition ||
+    verifiedOwner.preservationPolicy !== owner.preservationPolicy ||
     !sameChromeProcessIdentity(verifiedOwner.processIdentity, owner.processIdentity) ||
     !identityVerified
   ) {

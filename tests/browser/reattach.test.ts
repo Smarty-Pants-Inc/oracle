@@ -11,6 +11,7 @@ import {
   type ReattachCleanupDeps,
   type ReattachResult,
 } from "../../src/browser/reattach.js";
+import { selectTarget } from "../../src/browser/reattachTargetSelection.js";
 import { createReattachSettlement } from "../../src/browser/reattachSettlement.js";
 import type {
   BrowserRecoveryCleanupMetadata,
@@ -114,6 +115,10 @@ function withRetainedTargetCapability(
       version: 1,
       generationId,
       capabilityId: `test-target-capability:${generationId}:${targetId}`,
+      targetId,
+      ...(resource.chromeBrowserWSEndpoint
+        ? { browserWSEndpoint: resource.chromeBrowserWSEndpoint }
+        : {}),
     },
     acquisition: { ...resource.acquisition, generationId },
   };
@@ -1330,15 +1335,17 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       expect(acquisitionOrder).toEqual([
         "persist:tab-lease",
         "acquire:tab-lease",
+        "persist:acquired",
         "persist:chrome-process",
         "acquire:chrome-process",
+        "persist:acquired",
         "persist:chrome-target",
         "acquire:chrome-target",
         "persist:acquired",
       ]);
       const leaseIntent = runtimeHints[0]?.recoveryCleanupResources?.at(-1);
-      const targetIntent = runtimeHints[2]?.recoveryCleanupResources?.at(-1);
-      const acquired = runtimeHints[3]?.recoveryCleanupResources?.at(-1);
+      const targetIntent = runtimeHints[4]?.recoveryCleanupResources?.at(-1);
+      const acquired = runtimeHints[5]?.recoveryCleanupResources?.at(-1);
       expect(leaseIntent).toMatchObject({
         tabLease: { id: expect.any(String) },
         acquisition: {
@@ -2822,12 +2829,48 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       return { status: "completed" as const, runtime: {} };
     });
     const abort = vi.fn(async () => ({ status: "completed" as const, runtime: {} }));
+    const recoveredFile = {
+      kind: "file" as const,
+      path: "/tmp/recovering-session/artifacts/result.zip",
+      label: "Recovered file",
+      url: "bridge-artifact",
+      filename: "result.zip",
+    };
+    const recoveredArtifacts = [
+      recoveredFile,
+      {
+        kind: "deep-research-report" as const,
+        path: "/tmp/recovering-session/artifacts/deep-research-report.md",
+      },
+      {
+        kind: "transcript" as const,
+        path: "/tmp/recovering-session/artifacts/transcript.md",
+      },
+    ];
+    const recoveredModel = {
+      requestedModel: "Pro",
+      resolvedLabel: "Pro",
+      strategy: "select" as const,
+      status: "already-selected" as const,
+      verified: true,
+      source: "chatgpt-model-picker" as const,
+      capturedAt: "2026-08-05T00:00:00.000Z",
+    };
     const transaction = {
       answerText: "remote answer",
       answerMarkdown: "remote markdown",
+      answerHtml: "<p>remote answer</p>",
+      artifacts: recoveredArtifacts,
+      savedFiles: [recoveredFile],
+      archive: { mode: "auto" as const, attempted: true, archived: true },
+      modelSelection: recoveredModel,
+      warnings: [
+        { code: "remote-warning", severity: "warning" as const, message: "Recovered warning" },
+      ],
       tookMs: 1,
       answerTokens: 2,
       answerChars: 13,
+      browserTransport: "cdp" as const,
       runtime: capturedRuntime,
       bindSettlement: vi.fn(async (mode: "finalize" | "abort") => ({
         ...capturedRuntime,
@@ -2850,6 +2893,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     const release = vi.fn(async () => undefined);
 
     const result = await resumeBrowserSession(runtime, {}, createBrowserLogger(), {
+      sessionId: "recovering-session",
       resumeRemoteBrowserTransaction,
       listTargets,
       recoverSession,
@@ -2863,12 +2907,25 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
       },
     });
 
-    expect(result.answerMarkdown).toBe("remote markdown");
+    expect(result).toMatchObject({
+      answerMarkdown: "remote markdown",
+      answerHtml: "<p>remote answer</p>",
+      artifacts: recoveredArtifacts,
+      savedFiles: [recoveredFile],
+      archive: { mode: "auto", attempted: true, archived: true },
+      modelSelection: recoveredModel,
+      warnings: [{ code: "remote-warning", severity: "warning", message: "Recovered warning" }],
+      tookMs: 1,
+      answerTokens: 2,
+      answerChars: 13,
+      browserTransport: "cdp",
+    });
     expect(resumeRemoteBrowserTransaction).toHaveBeenCalledWith(
       expect.objectContaining({
         runtime,
         configuredHost: remoteRecovery.host,
         authToken: "remote-auth-token",
+        sessionId: "recovering-session",
         runtimeHintCb,
       }),
     );
@@ -3042,19 +3099,85 @@ describe("recovery resource finalization", { timeout: 15_000 }, () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  test("preserves a restarted replacement endpoint exposing the same target id and marker", async () => {
-    const profileDir = path.join(os.tmpdir(), "oracle-browser-replacement-process");
-    const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_103);
-    const retainChromeEndpointAuthority = vi.fn();
-    const result = await finalizeRecoveredRuntime(
-      withRecoveryCleanup(
+  test.each(["finalize", "abort"] as const)(
+    "%s reconstructs exact current-process target authority after controller restart",
+    async (mode) => {
+      const profileDir = path.join(os.tmpdir(), "oracle-browser-rebound-process");
+      const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_103);
+      const browserWSEndpoint = "ws://127.0.0.1:63334/devtools/browser/rebound";
+      const release = vi.fn(async () => undefined);
+      const authority = {
+        browserWSEndpoint,
+        kill: vi.fn(),
+        runExactOperation: vi.fn(),
+        release,
+      };
+      const retainChromeEndpointAuthority = vi.fn(async () => authority);
+      const closeChromeTargetWithExactAuthority = vi.fn(async () => ({
+        status: "completed" as const,
+      }));
+      const result = await finalizeRecoveredRuntime(
+        withRecoveryCleanup(
+          {
+            chromeProcessIdentity: processIdentity,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            chromePort: 63334,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeTargetId: "rebound-target",
+          },
+          {
+            ownsTarget: true,
+            profileKind: "none",
+            keepBrowser: true,
+            closeOwnedTargetOnComplete: true,
+          },
+          undefined,
+          {
+            targetCloseCapability: {
+              version: 1,
+              generationId: "generation-a",
+              capabilityId: "lost-after-server-restart",
+              targetId: "rebound-target",
+              browserWSEndpoint,
+            },
+            acquisition: {
+              generationId: "generation-a",
+              targetMarkerUrl: "about:blank#oracle-acquisition=generation-a",
+            },
+          },
+        ),
+        createBrowserLogger(),
         {
-          chromeProcessIdentity: processIdentity,
-          chromeProfileRoot: profileDir,
-          userDataDir: profileDir,
-          chromePort: 63334,
-          chromeBrowserWSEndpoint: "ws://127.0.0.1:63334/devtools/browser/replacement",
-          chromeTargetId: "reused-target",
+          verifyProfileDirectoryIdentity: vi.fn(async () => true),
+          inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
+          retainChromeEndpointAuthority,
+          closeChromeTargetWithExactAuthority,
+        },
+        mode,
+      );
+
+      expect(result.status).toBe("completed");
+      expect(retainChromeEndpointAuthority).toHaveBeenCalledOnce();
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith({
+        authority,
+        targetId: "rebound-target",
+        logger: expect.any(Function),
+      });
+      expect(release).toHaveBeenCalledOnce();
+    },
+  );
+
+  test.each(["finalize", "abort"] as const)(
+    "%s converges after a crash between exact target close and durable completion",
+    async (mode) => {
+      const browserWSEndpoint = "ws://service.example:63335/devtools/browser/service-generation";
+      const runtime = withRecoveryCleanup(
+        {
+          chromeHost: "service.example",
+          chromePort: 63335,
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chromeTargetId: "service-target",
         },
         {
           ownsTarget: true,
@@ -3066,29 +3189,194 @@ describe("recovery resource finalization", { timeout: 15_000 }, () => {
         {
           targetCloseCapability: {
             version: 1,
-            generationId: "generation-a",
-            capabilityId: "lost-after-server-restart",
+            generationId: "service-acquisition",
+            capabilityId: "service-capability",
+            targetId: "service-target",
+            browserWSEndpoint,
           },
-          acquisition: {
-            generationId: "generation-a",
-            targetMarkerUrl: "about:blank#oracle-acquisition=generation-a",
-          },
+          acquisition: { generationId: "service-acquisition" },
         },
-      ),
-      createBrowserLogger(),
-      {
-        verifyProfileDirectoryIdentity: vi.fn(async () => true),
-        inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
-        retainChromeEndpointAuthority,
-      },
-    );
+      );
+      const release = vi.fn(async () => undefined);
+      const retainChromeBrowserWebSocketAuthority = vi
+        .fn()
+        .mockResolvedValueOnce({
+          status: "bound" as const,
+          authority: {
+            browserWSEndpoint,
+            runExactOperation: vi.fn(),
+            release,
+          },
+        })
+        .mockResolvedValueOnce({ status: "gone" as const });
+      const closeChromeTargetWithExactAuthority = vi
+        .fn()
+        .mockResolvedValue({ status: "completed" as const });
+      const deps = {
+        retainChromeBrowserWebSocketAuthority,
+        closeChromeTargetWithExactAuthority,
+      };
 
-    expect(result).toMatchObject({
-      status: "pending",
-      error: expect.stringContaining("no longer live"),
-    });
-    expect(retainChromeEndpointAuthority).not.toHaveBeenCalled();
-  });
+      await expect(
+        finalizeRecoveredRuntime(runtime, createBrowserLogger(), deps, mode),
+      ).resolves.toMatchObject({ status: "completed" });
+      // Replay the stale pre-close record as if the controller crashed before storing completion.
+      await expect(
+        finalizeRecoveredRuntime(runtime, createBrowserLogger(), deps, mode),
+      ).resolves.toMatchObject({ status: "completed" });
+
+      expect(retainChromeBrowserWebSocketAuthority).toHaveBeenCalledTimes(2);
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
+        expect.objectContaining({ targetId: "service-target" }),
+      );
+      expect(release).toHaveBeenCalledOnce();
+    },
+  );
+
+  test.each(["finalize", "abort"] as const)(
+    "%s retries a failed reconstructed browser endpoint release before completing",
+    async (mode) => {
+      const browserWSEndpoint =
+        "ws://release-retry.example:63336/devtools/browser/release-generation";
+      const runtime = withRecoveryCleanup(
+        {
+          chromeHost: "release-retry.example",
+          chromePort: 63336,
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chromeTargetId: "release-target",
+        },
+        {
+          ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: true,
+          closeOwnedTargetOnComplete: true,
+        },
+        undefined,
+        {
+          targetCloseCapability: {
+            version: 1,
+            generationId: "release-generation",
+            capabilityId: "release-capability",
+            targetId: "release-target",
+            browserWSEndpoint,
+          },
+          acquisition: { generationId: "release-generation" },
+        },
+      );
+      const release = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("simulated endpoint release interruption"))
+        .mockResolvedValueOnce(undefined);
+      const retainChromeBrowserWebSocketAuthority = vi.fn(async () => ({
+        status: "bound" as const,
+        authority: { browserWSEndpoint, runExactOperation: vi.fn(), release },
+      }));
+      const closeChromeTargetWithExactAuthority = vi.fn(async () => ({
+        status: "completed" as const,
+      }));
+      const deps = {
+        retainChromeBrowserWebSocketAuthority,
+        closeChromeTargetWithExactAuthority,
+      };
+
+      const first = await finalizeRecoveredRuntime(runtime, createBrowserLogger(), deps, mode);
+      expect(first).toMatchObject({
+        status: "pending",
+        runtime: {
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              chromeTargetId: undefined,
+              targetCloseCapability: undefined,
+            }),
+          ],
+        },
+      });
+      if (first.status !== "pending")
+        throw new Error("expected endpoint release to remain pending");
+      await expect(
+        finalizeRecoveredRuntime(first.runtime, createBrowserLogger(), deps, mode),
+      ).resolves.toMatchObject({ status: "completed" });
+
+      expect(retainChromeBrowserWebSocketAuthority).toHaveBeenCalledOnce();
+      expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  test.each(["finalize", "abort"] as const)(
+    "%s keeps reconstructed processless target authority scoped to its exact browser endpoint",
+    async (mode) => {
+      const endpointA = "ws://service-a.example:63336/devtools/browser/generation-a";
+      const endpointB = "ws://service-b.example:63337/devtools/browser/generation-b";
+      const serviceResource = (
+        host: string,
+        port: number,
+        browserWSEndpoint: string,
+        generationId: string,
+        targetId: string,
+      ): BrowserRecoveryCleanupResourceMetadata => ({
+        chromeHost: host,
+        chromePort: port,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeTargetId: targetId,
+        targetCloseCapability: {
+          version: 1,
+          generationId,
+          capabilityId: `capability:${generationId}`,
+          targetId,
+          browserWSEndpoint,
+        },
+        acquisition: { generationId },
+        recoveryCleanup: {
+          ownsTarget: true,
+          profileKind: "none",
+          keepBrowser: true,
+          closeOwnedTargetOnComplete: true,
+        },
+      });
+      const endpointByAuthority = new Map<object, string>();
+      const releases = [vi.fn(async () => undefined), vi.fn(async () => undefined)];
+      let retainedCount = 0;
+      const retainChromeBrowserWebSocketAuthority = vi.fn(
+        async (options: { browserWSEndpoint: string }) => {
+          const authority = {
+            browserWSEndpoint: options.browserWSEndpoint,
+            runExactOperation: vi.fn(),
+            release: releases[retainedCount++]!,
+          };
+          endpointByAuthority.set(authority, options.browserWSEndpoint);
+          return { status: "bound" as const, authority };
+        },
+      );
+      const closedPairs: string[] = [];
+      const closeChromeTargetWithExactAuthority = vi.fn(
+        async (options: { authority: object; targetId: string }) => {
+          closedPairs.push(`${endpointByAuthority.get(options.authority)}|${options.targetId}`);
+          return { status: "completed" as const };
+        },
+      );
+      const runtime: BrowserRuntimeMetadata = {
+        recoveryCleanupResources: [
+          serviceResource("service-a.example", 63336, endpointA, "generation-a", "target-a"),
+          serviceResource("service-b.example", 63337, endpointB, "generation-b", "target-b"),
+        ],
+      };
+
+      await expect(
+        finalizeRecoveredRuntime(
+          runtime,
+          createBrowserLogger(),
+          { retainChromeBrowserWebSocketAuthority, closeChromeTargetWithExactAuthority },
+          mode,
+        ),
+      ).resolves.toMatchObject({ status: "completed" });
+
+      expect(closedPairs).toEqual([`${endpointA}|target-a`, `${endpointB}|target-b`]);
+      expect(releases[0]).toHaveBeenCalledOnce();
+      expect(releases[1]).toHaveBeenCalledOnce();
+    },
+  );
 
   test("does not mutate a replacement process, endpoint, or profile during deferred teardown", async () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-replacement-owner-"));
@@ -5619,7 +5907,6 @@ describe("recovery resource finalization", { timeout: 15_000 }, () => {
 
 describe("reattach helpers", () => {
   const {
-    pickTarget,
     extractConversationIdFromUrl,
     buildConversationUrl,
     openConversationFromSidebar,
@@ -5758,81 +6045,97 @@ describe("reattach helpers", () => {
     expect(generationBAttachTarget).not.toHaveBeenCalled();
   });
 
-  test("pickTarget requires the stored target and committed conversation to match", () => {
+  test("selectTarget requires the stored target and committed conversation to match", () => {
     const targets = [
       { targetId: "t-1", type: "page", url: "https://chatgpt.com/c/first" },
       { targetId: "t-2", type: "page", url: "https://chatgpt.com/c/second" },
       { targetId: "t-3", type: "page", url: "about:blank" },
     ];
     expect(
-      pickTarget(targets, {
+      selectTarget(targets, {
         chromeTargetId: "t-1",
         tabUrl: "https://chatgpt.com/c/first",
         conversationId: "first",
       }),
-    ).toEqual(targets[0]);
+    ).toEqual({ status: "selected", target: targets[0], targetId: "t-1" });
     expect(
-      pickTarget(targets, {
+      selectTarget(targets, {
         chromeTargetId: "t-2",
         tabUrl: "https://chatgpt.com/c/first",
         conversationId: "first",
       }),
-    ).toBeUndefined();
-    expect(pickTarget(targets, { tabUrl: "https://chatgpt.com/c/first" })).toBeUndefined();
-    expect(pickTarget(targets, {})).toBeUndefined();
+    ).toEqual({ status: "missing" });
+    expect(selectTarget(targets, { tabUrl: "https://chatgpt.com/c/first" })).toEqual({
+      status: "missing",
+    });
+    expect(selectTarget(targets, {})).toEqual({ status: "mismatched" });
     expect(
-      pickTarget([{ targetId: "external", type: "page", url: "https://example.com/c/first" }], {
+      selectTarget([{ targetId: "external", type: "page", url: "https://example.com/c/first" }], {
         chromeTargetId: "external",
         conversationId: "first",
       }),
-    ).toBeUndefined();
+    ).toEqual({ status: "missing" });
   });
 
-  test("pickTarget permits only an explicitly referenced borrowed target", () => {
+  test("selectTarget permits only an explicitly referenced borrowed target", () => {
     const targets = [
       { targetId: "t-1", type: "page", url: "https://chatgpt.com/c/first" },
       { targetId: "t-2", type: "page", url: "https://chatgpt.com/c/second" },
     ];
-    expect(pickTarget(targets, { conversationId: "second" }, "t-2")).toEqual(targets[1]);
-    expect(pickTarget(targets, { conversationId: "second" }, "second")).toEqual(targets[1]);
-    expect(pickTarget(targets, { conversationId: "second" }, "missing")).toBeUndefined();
-    expect(pickTarget(targets, { conversationId: "second" }, "current")).toBeUndefined();
+    expect(selectTarget(targets, { conversationId: "second" }, "t-2")).toEqual({
+      status: "selected",
+      target: targets[1],
+      targetId: "t-2",
+    });
+    expect(selectTarget(targets, { conversationId: "second" }, "second")).toEqual({
+      status: "selected",
+      target: targets[1],
+      targetId: "t-2",
+    });
+    expect(selectTarget(targets, { conversationId: "second" }, "missing")).toEqual({
+      status: "missing",
+    });
+    expect(selectTarget(targets, { conversationId: "second" }, "current")).toEqual({
+      status: "unsupported",
+    });
     const ambiguous = [
       { targetId: "same-1", type: "page", url: "https://chatgpt.com/c/same" },
       { targetId: "same-2", type: "page", url: "https://chatgpt.com/c/same" },
     ];
-    expect(pickTarget(ambiguous, { conversationId: "same" }, "same")).toBeUndefined();
+    expect(selectTarget(ambiguous, { conversationId: "same" }, "same")).toEqual({
+      status: "ambiguous",
+    });
     expect(
-      pickTarget(ambiguous, { conversationId: "same" }, "https://chatgpt.com/c/same"),
-    ).toBeUndefined();
+      selectTarget(ambiguous, { conversationId: "same" }, "https://chatgpt.com/c/same"),
+    ).toEqual({ status: "ambiguous" });
   });
 
-  test("pickTarget keeps the saved target among duplicate conversation tabs", () => {
+  test("selectTarget keeps the saved target among duplicate conversation tabs", () => {
     const targets = [
       { targetId: "duplicate", type: "page", url: "https://chatgpt.com/c/same" },
       { targetId: "submitted", type: "page", url: "https://chatgpt.com/c/same" },
     ];
 
     expect(
-      pickTarget(targets, {
+      selectTarget(targets, {
         chromeTargetId: "submitted",
         conversationId: "same",
       }),
-    ).toEqual(targets[1]);
+    ).toEqual({ status: "selected", target: targets[1], targetId: "submitted" });
   });
 
-  test("pickTarget understands CDP list ids when conversation identity agrees", () => {
+  test("selectTarget understands CDP list ids when conversation identity agrees", () => {
     const targets = [
       { id: "page-1", type: "page", url: "https://chatgpt.com/c/first" },
       { id: "page-2", type: "page", url: "about:blank" },
     ];
 
     expect(
-      pickTarget(targets, {
+      selectTarget(targets, {
         chromeTargetId: "page-1",
         conversationId: "first",
       }),
-    ).toEqual(targets[0]);
+    ).toEqual({ status: "selected", target: targets[0], targetId: "page-1" });
   });
 
   test("openConversationFromSidebar passes conversationId and projects preference", async () => {

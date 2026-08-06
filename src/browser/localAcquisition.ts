@@ -101,7 +101,7 @@ export async function acquireLocalBrowserResources({
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const acquisitionGenerationId = randomUUID();
   const acquisitionLaunchClaim = createChromeProcessLaunchClaim(acquisitionGenerationId);
-  const acquisitionOwnerDisposition: ChromeOwnerDisposition = effectiveKeepBrowser
+  let acquisitionOwnerDisposition: ChromeOwnerDisposition = effectiveKeepBrowser
     ? "preserve"
     : "close-on-last-lease";
   const acquisitionLeaseId = manualLogin ? randomUUID() : undefined;
@@ -244,6 +244,7 @@ export async function acquireLocalBrowserResources({
         disposition: acquisitionOwnerDisposition,
       };
     }
+    if (manualLogin && acquiredChrome) acquisitionOwnerDisposition = acquiredChrome.disposition;
     await persistLocalAcquisition(
       config.browserTabRef ? undefined : "chrome-target",
       acquiredChrome,

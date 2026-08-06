@@ -5,6 +5,7 @@ import {
   closeChromeTargetWithRetainedCapability,
   discardChromeTargetCloseCapability,
   retainChromeTargetCloseCapability,
+  hasRestartDurableChromeTargetCleanupAuthority,
 } from "../../src/browser/targetCloseAuthority.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
 
@@ -129,5 +130,76 @@ describe("retained Chrome target close capabilities", () => {
     await discardChromeTargetCloseCapability({ capability, targetId: "release-retry-target" });
     expect(release).toHaveBeenCalledTimes(2);
     expect(__test__.retainedTargetCloseAuthorityCount()).toBe(0);
+  });
+
+  test("treats cleanup-free captures as restart durable", () => {
+    expect(hasRestartDurableChromeTargetCleanupAuthority({})).toBe(true);
+    expect(
+      hasRestartDurableChromeTargetCleanupAuthority({ chromeTargetId: "orphaned-target" }),
+    ).toBe(false);
+  });
+
+  test("binds durable endpoint and target identity without permitting another target", async () => {
+    const browserWSEndpoint = "ws://service.example:9222/devtools/browser/exact-generation";
+    const close = vi.fn(async () => ({ status: "completed" as const }));
+    const capability = retainChromeTargetCloseCapability({
+      generationId: "durable-generation",
+      targetId: "owned-target",
+      browserWSEndpoint,
+      close,
+    });
+
+    expect(capability).toMatchObject({
+      targetId: "owned-target",
+      browserWSEndpoint,
+    });
+    expect(
+      hasRestartDurableChromeTargetCleanupAuthority({
+        recoveryCleanupResources: [
+          {
+            chromeHost: "service.example",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeTargetId: "owned-target",
+            targetCloseCapability: capability,
+            acquisition: { generationId: "durable-generation" },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: true,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      hasRestartDurableChromeTargetCleanupAuthority({
+        recoveryCleanupResources: [
+          {
+            chromeHost: "replacement.example",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeTargetId: "owned-target",
+            targetCloseCapability: capability,
+            acquisition: { generationId: "durable-generation" },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: true,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+    await expect(
+      closeChromeTargetWithRetainedCapability({
+        capability,
+        targetId: "unrelated-target",
+        logger: vi.fn<(message: string) => void>() as BrowserLogger,
+      }),
+    ).resolves.toMatchObject({ status: "unavailable" });
+    expect(close).not.toHaveBeenCalled();
   });
 });

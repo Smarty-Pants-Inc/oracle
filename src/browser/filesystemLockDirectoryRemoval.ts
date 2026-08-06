@@ -16,12 +16,15 @@ import {
   WINDOWS_LOCK_MUTATION_TIMEOUT_MS,
 } from "./filesystemLockIo.js";
 import {
+  capturePhysicalDirectoryIdentity,
+  parsePhysicalDirectoryIdentity,
+  samePhysicalDirectoryIdentity,
+} from "./filesystemLockDirectoryIdentity.js";
+import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+import {
   encodeDirectoryRemovalMessage,
-  parseDirectoryRemovalIdentity,
   parseDirectoryRemovalMessage,
-  sameDirectoryRemovalIdentity,
 } from "./filesystemLockDirectoryRemovalProtocol.js";
-import type { DirectoryRemovalIdentity } from "./filesystemLockDirectoryRemovalProtocol.js";
 
 const ISOLATED_REMOVAL_ROOT_PREFIX = ".oracle-remove-";
 const ISOLATED_REMOVAL_GENERATION_NAME = "generation";
@@ -34,7 +37,7 @@ function isolatedDirectoryRemovalRootPrefix(replayKey: string): string {
   return `${ISOLATED_REMOVAL_ROOT_PREFIX}${digest}-`;
 }
 
-type IsolatedDirectoryIdentity = DirectoryRemovalIdentity;
+type IsolatedDirectoryIdentity = PhysicalDirectoryIdentity;
 
 interface IsolatedDirectoryCleanupJournal {
   readonly version: 1;
@@ -90,10 +93,10 @@ export async function isolateDirectoryGenerationForRemoval(
     throw error;
   }
 
-  const rootIdentity = await captureIsolatedDirectoryIdentity(rootPath);
+  const rootIdentity = await capturePhysicalDirectoryIdentity(rootPath);
   let generationIdentity: IsolatedDirectoryIdentity;
   try {
-    generationIdentity = await captureIsolatedDirectoryIdentity(canonicalCandidatePath);
+    generationIdentity = await capturePhysicalDirectoryIdentity(canonicalCandidatePath);
   } catch (error) {
     await removeFreshEmptyIsolationRoot(rootPath);
     if (readErrorCode(error) === "ENOENT") return { status: "missing" };
@@ -464,8 +467,8 @@ async function deleteIsolatedGenerationWithBoundHelper(
     if (
       attestation.type !== "attested" ||
       attestation.token !== token ||
-      !sameDirectoryRemovalIdentity(attestation.rootIdentity, journal.rootIdentity) ||
-      !sameDirectoryRemovalIdentity(attestation.generationIdentity, journal.generationIdentity)
+      !samePhysicalDirectoryIdentity(attestation.rootIdentity, journal.rootIdentity) ||
+      !samePhysicalDirectoryIdentity(attestation.generationIdentity, journal.generationIdentity)
     ) {
       throw new Error(`Bound removal helper attested the wrong generation at ${journal.rootPath}`);
     }
@@ -577,8 +580,8 @@ async function readIsolatedDirectoryCleanupJournal(
   ) {
     throw new Error(`Malformed isolated cleanup journal: ${journalPath}`);
   }
-  const rootIdentity = parseDirectoryRemovalIdentity(value.rootIdentity);
-  const generationIdentity = parseDirectoryRemovalIdentity(value.generationIdentity);
+  const rootIdentity = parsePhysicalDirectoryIdentity(value.rootIdentity);
+  const generationIdentity = parsePhysicalDirectoryIdentity(value.generationIdentity);
   if (
     rootIdentity === null ||
     generationIdentity === null ||
@@ -632,8 +635,8 @@ async function readIsolatedDirectoryCleanupCompletion(
   ) {
     throw new Error(`Malformed isolated cleanup completion receipt: ${completionPath}`);
   }
-  const rootIdentity = parseDirectoryRemovalIdentity(value.rootIdentity);
-  const generationIdentity = parseDirectoryRemovalIdentity(value.generationIdentity);
+  const rootIdentity = parsePhysicalDirectoryIdentity(value.rootIdentity);
+  const generationIdentity = parsePhysicalDirectoryIdentity(value.generationIdentity);
   if (rootIdentity === null || generationIdentity === null) {
     throw new Error(`Malformed isolated cleanup completion receipt: ${completionPath}`);
   }
@@ -732,32 +735,18 @@ async function removeFreshEmptyIsolationRoot(rootPath: string): Promise<void> {
   await syncDirectoryIfPresent(path.dirname(rootPath));
 }
 
-async function captureIsolatedDirectoryIdentity(
-  directoryPath: string,
-): Promise<IsolatedDirectoryIdentity> {
-  const entry = await lstat(directoryPath, { bigint: true });
-  if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`Cleanup authority is not a physical directory: ${directoryPath}`);
-  }
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
-}
-
 async function inspectIsolatedDirectoryIdentity(
   directoryPath: string,
   expected: IsolatedDirectoryIdentity,
 ): Promise<"matches" | "missing" | "changed"> {
   let current: IsolatedDirectoryIdentity;
   try {
-    current = await captureIsolatedDirectoryIdentity(directoryPath);
+    current = await capturePhysicalDirectoryIdentity(directoryPath);
   } catch (error) {
     if (readErrorCode(error) === "ENOENT") return "missing";
     return "changed";
   }
-  return sameDirectoryRemovalIdentity(current, expected) ? "matches" : "changed";
+  return samePhysicalDirectoryIdentity(current, expected) ? "matches" : "changed";
 }
 
 function assertCleanupCompletionMatchesJournal(
@@ -768,8 +757,8 @@ function assertCleanupCompletionMatchesJournal(
     completion.journalNonce !== journal.journalNonce ||
     completion.rootPath !== journal.rootPath ||
     completion.platform !== journal.platform ||
-    !sameDirectoryRemovalIdentity(completion.rootIdentity, journal.rootIdentity) ||
-    !sameDirectoryRemovalIdentity(completion.generationIdentity, journal.generationIdentity)
+    !samePhysicalDirectoryIdentity(completion.rootIdentity, journal.rootIdentity) ||
+    !samePhysicalDirectoryIdentity(completion.generationIdentity, journal.generationIdentity)
   ) {
     throw new Error(
       `Isolated cleanup completion does not match its journal at ${journal.rootPath}`,

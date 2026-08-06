@@ -12,7 +12,7 @@ import {
 } from "./profileDirectoryAuthority.js";
 import { readDevToolsPort } from "./profileDevToolsState.js";
 import {
-  arePlatformProcessGenerationsDefinitelyDifferent,
+  comparePlatformProcessGenerations,
   createPlatformProcessGenerationProvider,
   type ProcessGenerationCommandExecutor,
 } from "./platformProcessGeneration.js";
@@ -217,19 +217,20 @@ export async function inspectChromeProcessIdentityWithDeps(
     : readChromeProcessSnapshot(identity.pid, platform, deps.execute ?? executeProcessCommand));
   if (!snapshot) return processAlive(identity.pid) ? "unavailable" : "exited";
   if (snapshot.pid !== identity.pid) return "unavailable";
-  if (
-    arePlatformProcessGenerationsDefinitelyDifferent(
-      identity.processStartTime,
-      snapshot.processStartTime.trim(),
-    )
-  ) {
-    return "exited";
-  }
+  const generationComparison = comparePlatformProcessGenerations(
+    identity.processStartTime,
+    snapshot.processStartTime.trim(),
+  );
+  if (generationComparison === "different") return "exited";
+  const launchClaimMatches = identity.launchClaim
+    ? isChromeSnapshotForLaunchClaim(snapshot, identity.launchClaim)
+    : false;
   const executablePath = normalizeExecutablePath(snapshot.executablePath, platform);
   if (
     executablePath !== identity.executablePath ||
     !isChromeSnapshotForUserDataDir(snapshot, identity.profileDirectory.canonicalPath, platform) ||
-    (identity.launchClaim && !isChromeSnapshotForLaunchClaim(snapshot, identity.launchClaim))
+    (generationComparison === "incomparable" && !launchClaimMatches) ||
+    (identity.launchClaim && !launchClaimMatches)
   ) {
     return "unavailable";
   }

@@ -1,3 +1,4 @@
+import type { BrowserRunResult } from "../browserMode.js";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { resumeRemoteBrowserTransaction } from "../remote/client.js";
 import type {
@@ -16,7 +17,9 @@ import type { ReattachSettlementMode } from "./reattachCleanupTypes.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
 import type { ChromeClient } from "./types.js";
 
-export interface ReattachCapture {
+export interface ReattachCapture extends Partial<
+  Omit<BrowserRunResult, "answerText" | "answerMarkdown">
+> {
   answerText: string;
   answerMarkdown: string;
   runtime?: BrowserRuntimeMetadata;
@@ -43,6 +46,7 @@ export interface ReattachDeps {
   recoveryCleanup?: ReattachCleanupDeps;
   recoveryLockPath?: string;
   acquireRecoveryLock?: (lockPath: string) => Promise<ReattachRecoveryLock>;
+  sessionId?: string;
   isRemotePublicationAcknowledged?: () => boolean;
   resumeRemoteBrowserTransaction?: typeof resumeRemoteBrowserTransaction;
   runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
@@ -59,7 +63,9 @@ export interface ReattachDeps {
   ) => Promise<ReattachFinalizationResult>;
 }
 
-export interface ReattachResult {
+export interface ReattachResult extends Partial<
+  Omit<BrowserRunResult, "answerText" | "answerMarkdown">
+> {
   answerText: string;
   answerMarkdown: string;
   runtime: BrowserRuntimeMetadata;

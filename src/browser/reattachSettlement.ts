@@ -124,8 +124,9 @@ export function createReattachSettlement(
   deps: ReattachDeps,
   lockAuthority: ReattachSettlementLockAuthority,
 ): ReattachResult {
+  const { runtime: captureRuntime, finalizeResources, abortResources, ...capturedResult } = capture;
   const runtimeForCapture = markBrowserCaptureCleanupPending(
-    capture.runtime ?? authoritativeRuntime,
+    captureRuntime ?? authoritativeRuntime,
   );
   const captureLocator = requireCommittedPromptEpochLocator(runtimeForCapture);
   if (expectedPromptLocator) assertSameCommittedPromptEpoch(expectedPromptLocator, captureLocator);
@@ -176,8 +177,8 @@ export function createReattachSettlement(
             finalizeRuntime: async (runtime, settlementMode) => {
               const captureSettler =
                 settlementMode === "abort"
-                  ? (capture.abortResources ?? capture.finalizeResources)
-                  : capture.finalizeResources;
+                  ? (abortResources ?? finalizeResources)
+                  : finalizeResources;
               if (
                 captureSettler &&
                 recoveryCleanupAuthoritiesMatch(captureCleanupRuntime, runtime)
@@ -206,6 +207,7 @@ export function createReattachSettlement(
   );
 
   const result = {
+    ...capturedResult,
     answerText: capture.answerText,
     answerMarkdown: capture.answerMarkdown,
     get runtime() {

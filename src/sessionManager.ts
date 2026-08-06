@@ -33,6 +33,7 @@ import { DEFAULT_MODEL } from "./oracle/config.js";
 import { formatElapsed } from "./oracle/format.js";
 import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
+import { syncDirectory } from "./fsDurability.js";
 
 export type SessionMode = "api" | "browser";
 
@@ -132,12 +133,16 @@ export interface BrowserRecoveryTabLeaseMetadata {
   profileDirectory: ProfileDirectoryIdentity;
 }
 export interface BrowserRecoveryTargetCloseCapabilityMetadata {
-  /** Schema version for the lookup-only capability reference. */
+  /** Schema version for the target-close capability reference. */
   version: 1;
-  /** Browser acquisition generation that retained the live target authority. */
+  /** Browser acquisition generation that retained the target authority. */
   generationId: string;
-  /** Opaque in-process lookup id; never sufficient to reconstruct CDP authority. */
+  /** Opaque in-process lookup id used while the originating controller remains live. */
   capabilityId: string;
+  /** Exact target identity. Absent only on legacy lookup-only records. */
+  targetId?: string;
+  /** Exact browser endpoint generation. Absent only on legacy lookup-only records. */
+  browserWSEndpoint?: string;
 }
 
 export type BrowserProcessAcquisitionProvenance = "temporary-launch" | "manual-canonical-owner";
@@ -386,6 +391,8 @@ export interface StoredRunOptions {
 export interface SessionMetadata {
   id: string;
   createdAt: string;
+  /** meta.json is the atomic authority for coupled session/model status projection. */
+  modelProjectionAuthority?: "session";
   status: string;
   promptPreview?: string;
   model?: string;
@@ -479,6 +486,21 @@ const DEFAULT_SLUG = "session";
 const MAX_SLUG_WORDS = 5;
 const MIN_CUSTOM_SLUG_WORDS = 3;
 const MAX_SLUG_WORD_LENGTH = 10;
+const sessionMetadataMutations = new Map<string, Promise<unknown>>();
+
+function serializeSessionMetadataMutation<T>(
+  sessionId: string,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const pending = sessionMetadataMutations.get(sessionId) ?? Promise.resolve();
+  const current = pending.catch(() => undefined).then(mutation);
+  sessionMetadataMutations.set(sessionId, current);
+  return current.finally(() => {
+    if (sessionMetadataMutations.get(sessionId) === current) {
+      sessionMetadataMutations.delete(sessionId);
+    }
+  });
+}
 
 async function ensureDir(dirPath: string): Promise<void> {
   await fs.mkdir(dirPath, { recursive: true });
@@ -549,19 +571,9 @@ export async function writeFileAtomicDurable(
       await handle.close();
     }
     await fs.rename(temporaryPath, targetPath);
-    await syncDirectoryIfSupported(directory);
+    await syncDirectory(directory);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
-  }
-}
-
-export async function syncDirectoryIfSupported(directory: string): Promise<void> {
-  if (process.platform === "win32") return;
-  const handle = await fs.open(directory, "r");
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
   }
 }
 
@@ -662,30 +674,121 @@ async function readModelRunFile(sessionId: string, model: string): Promise<Sessi
   }
 }
 
+function upsertModelRun(
+  runs: SessionModelRun[] | undefined,
+  next: SessionModelRun,
+): SessionModelRun[] {
+  const existing = runs ?? [];
+  const index = existing.findIndex((run) => run.model === next.model);
+  if (index < 0) return [...existing, next];
+  return existing.map((run, runIndex) => (runIndex === index ? next : run));
+}
+
+function modelRunFromSession(
+  session: SessionMetadata | null,
+  model: string,
+): SessionModelRun | undefined {
+  return session?.models?.find((run) => run.model === model);
+}
+
+export interface SessionModelProjectionCommit {
+  session: Partial<SessionMetadata>;
+  model?: {
+    model: string;
+    updates: Partial<SessionModelRun>;
+  };
+}
+
+export interface CommittedSessionModelProjection {
+  session: SessionMetadata;
+  model?: SessionModelRun;
+}
+
 export async function updateModelRunMetadata(
   sessionId: string,
   model: string,
   updates: Partial<SessionModelRun>,
 ): Promise<SessionModelRun> {
-  await ensureDir(modelsDir(sessionId));
-  const existing = (await readModelRunFile(sessionId, model)) ?? {
-    model,
-    status: "pending",
-  };
-  const next: SessionModelRun = ensureModelLogReference(sessionId, {
-    ...existing,
-    ...updates,
-    model,
+  return serializeSessionMetadataMutation(sessionId, async () => {
+    await ensureDir(modelsDir(sessionId));
+    let session = await readRawSessionMetadata(sessionId);
+    const existing = modelRunFromSession(session, model) ??
+      (await readModelRunFile(sessionId, model)) ?? {
+        model,
+        status: "pending",
+      };
+    if (session && session.modelProjectionAuthority !== "session") {
+      session = { ...session, modelProjectionAuthority: "session" };
+      await writeSessionMetadataFile(sessionId, session);
+    }
+    const next: SessionModelRun = ensureModelLogReference(sessionId, {
+      ...existing,
+      ...updates,
+      model,
+    });
+    await writeFileAtomicDurable(modelJsonPath(sessionId, model), JSON.stringify(next, null, 2));
+    if (session) {
+      const latest = (await readRawSessionMetadata(sessionId)) ?? session;
+      await writeSessionMetadataFile(sessionId, {
+        ...latest,
+        models: upsertModelRun(latest.models, next),
+        modelProjectionAuthority: "session",
+      });
+    }
+    return next;
   });
-  await fs.writeFile(modelJsonPath(sessionId, model), JSON.stringify(next, null, 2), "utf8");
-  return next;
+}
+
+export async function commitSessionModelProjectionMetadata(
+  sessionId: string,
+  projection: SessionModelProjectionCommit,
+): Promise<CommittedSessionModelProjection> {
+  return serializeSessionMetadataMutation(sessionId, async () => {
+    let existing =
+      (await readRawSessionMetadata(sessionId)) ?? ({ id: sessionId } as SessionMetadata);
+    let modelRun: SessionModelRun | undefined;
+    if (projection.model) {
+      if (existing.modelProjectionAuthority !== "session") {
+        existing = { ...existing, modelProjectionAuthority: "session" };
+        await writeSessionMetadataFile(sessionId, existing);
+      }
+      await ensureDir(modelsDir(sessionId));
+      const currentModel = modelRunFromSession(existing, projection.model.model) ??
+        (await readModelRunFile(sessionId, projection.model.model)) ?? {
+          model: projection.model.model,
+          status: "pending",
+        };
+      modelRun = ensureModelLogReference(sessionId, {
+        ...currentModel,
+        ...projection.model.updates,
+        model: projection.model.model,
+      });
+      // The model file is a compatibility projection. meta.json is the commit point read by the
+      // store, so a stale or unwritable projection cannot split the logical session/model commit.
+      await writeFileAtomicDurable(
+        modelJsonPath(sessionId, projection.model.model),
+        JSON.stringify(modelRun, null, 2),
+      ).catch(() => undefined);
+    }
+    const latest = (await readRawSessionMetadata(sessionId)) ?? existing;
+    const session: SessionMetadata = {
+      ...latest,
+      ...projection.session,
+      ...(modelRun
+        ? { models: upsertModelRun(latest.models, modelRun), modelProjectionAuthority: "session" }
+        : {}),
+    };
+    await writeSessionMetadataFile(sessionId, session);
+    return { session, ...(modelRun ? { model: modelRun } : {}) };
+  });
 }
 
 export async function readModelRunMetadata(
   sessionId: string,
   model: string,
 ): Promise<SessionModelRun | null> {
-  return readModelRunFile(sessionId, model);
+  const session = await readRawSessionMetadata(sessionId);
+  return modelRunFromSession(session, model) ?? readModelRunFile(sessionId, model);
 }
 
 export async function initializeSession(
@@ -807,13 +910,13 @@ export async function updateSessionMetadata(
   sessionId: string,
   updates: Partial<SessionMetadata>,
 ): Promise<SessionMetadata> {
-  const existing =
-    (await readModernSessionMetadata(sessionId, { reconcile: false, persist: false })) ??
-    (await readLegacySessionMetadata(sessionId, { reconcile: false, persist: false })) ??
-    ({ id: sessionId } as SessionMetadata);
-  const next = { ...existing, ...updates };
-  await writeSessionMetadataFile(sessionId, next);
-  return next;
+  return serializeSessionMetadataMutation(sessionId, async () => {
+    const existing =
+      (await readRawSessionMetadata(sessionId)) ?? ({ id: sessionId } as SessionMetadata);
+    const next = { ...existing, ...updates };
+    await writeSessionMetadataFile(sessionId, next);
+    return next;
+  });
 }
 
 interface ReadSessionMetadataOptions {
@@ -880,7 +983,9 @@ async function reconcileSessionMetadata(
   const runtimeChecked = await markDeadBrowser(current);
   const reconciled = await markZombie(runtimeChecked);
   if (persist && reconciled !== current) {
-    await writeSessionMetadataFile(current.id, reconciled);
+    await serializeSessionMetadataMutation(current.id, () =>
+      writeSessionMetadataFile(current.id, reconciled),
+    );
   }
   return reconciled;
 }
@@ -892,11 +997,26 @@ function isSessionMetadataRecord(value: unknown): value is SessionMetadata {
 }
 
 async function attachModelRuns(meta: SessionMetadata, sessionId: string): Promise<SessionMetadata> {
-  const runs = await listModelRunFiles(sessionId);
-  if (runs.length === 0) {
+  const fileRuns = await listModelRunFiles(sessionId);
+  if (meta.modelProjectionAuthority !== "session") {
+    return fileRuns.length > 0 ? { ...meta, models: fileRuns } : meta;
+  }
+  if (!meta.models?.length) {
     return meta;
   }
-  return { ...meta, models: runs };
+  const canonicalModels = meta.models.map((run) => {
+    const fileRun = fileRuns.find((candidate) => candidate.model === run.model);
+    return ensureModelLogReference(sessionId, {
+      ...fileRun,
+      ...run,
+      log: run.log ?? fileRun?.log,
+    });
+  });
+  const canonicalNames = new Set(canonicalModels.map((run) => run.model));
+  return {
+    ...meta,
+    models: [...canonicalModels, ...fileRuns.filter((run) => !canonicalNames.has(run.model))],
+  };
 }
 
 export function createSessionLogWriter(sessionId: string, model?: string): SessionLogWriter {

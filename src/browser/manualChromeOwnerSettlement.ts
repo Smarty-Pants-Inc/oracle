@@ -35,6 +35,13 @@ export async function settleManualChromeOwner(
   }
 
   if (!current) {
+    if (owner.disposition === "close-on-last-lease") {
+      return {
+        status: "unsafe",
+        reason:
+          "Canonical Chrome owner policy is missing; refusing to report requested close as complete",
+      };
+    }
     try {
       await releaseManualChromeOwnerEndpointAuthority(owner);
       return { status: "preserved" };

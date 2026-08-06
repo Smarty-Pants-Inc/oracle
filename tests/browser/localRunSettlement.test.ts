@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { createLocalBrowserRunState } from "../../src/browser/localRunState.js";
+import { createLocalRunSettlementCoordinator } from "../../src/browser/localRunSettlement.js";
 import {
   captureProfileDirectoryIdentity,
   createChromeProcessLaunchClaim,
@@ -437,6 +438,68 @@ describe("local manual Chrome owner settlement", () => {
       expect(ownerMocks.settleManualChromeOwner).not.toHaveBeenCalled();
       expect(authority.release).toHaveBeenCalledOnce();
       expect(authority.kill).not.toHaveBeenCalled();
+    } finally {
+      await rm(profileDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("local manual close durability", () => {
+  test("keeps cleanup pending when canonical close policy is unavailable", async () => {
+    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-local-missing-owner-policy-"));
+    try {
+      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const { owner, authority } = manualOwner(profileDirectory, "close-on-last-lease");
+      const lease: BrowserTabLease = {
+        id: "missing-owner-policy-lease",
+        profileDirectory,
+        release: vi.fn(async () => undefined),
+        update: vi.fn(async () => undefined),
+      };
+      const state = createLocalBrowserRunState(lease);
+      state.runStatus = "complete";
+      state.ownsTarget = false;
+      const config = resolveBrowserConfig({
+        manualLogin: true,
+        manualLoginProfileDir: profileDir,
+        keepBrowser: false,
+      });
+      const acquisition: LocalBrowserAcquisition = {
+        config,
+        manualLogin: true,
+        profileIsPreSigned: true,
+        userDataDir: profileDir,
+        effectiveKeepBrowser: false,
+        acquisitionGenerationId: "20000000-0000-4000-8000-000000000002",
+        acquisitionLaunchClaim: createChromeProcessLaunchClaim(
+          "20000000-0000-4000-8000-000000000002",
+        ),
+        acquisitionOwnerDisposition: "close-on-last-lease",
+        acquisitionTargetMarkerUrl: "about:blank#oracle-acquisition=missing-owner-policy",
+        acquisitionProfileIdentity: profileDirectory,
+        chromeOwner: owner,
+        chrome: owner.chrome,
+        chromeOwnerDisposition: "close-on-last-lease",
+        chromeHost: "127.0.0.1",
+        settlementEndpointAuthority: authority,
+        tabLease: lease,
+        manualLeaseTeardownAuthority: lastLeaseTeardownAuthority(lease),
+      };
+      const coordinator = createLocalRunSettlementCoordinator({
+        acquisition,
+        state,
+        options: { prompt: "test" },
+        logger,
+        usingCopiedProfile: false,
+        timing: { startedAt: Date.now() },
+      });
+
+      await expect(coordinator.lifecycle.settleIfUnpublished()).resolves.toMatchObject({
+        status: "pending",
+        error: expect.stringMatching(/requested close/i),
+      });
+      expect(authority.kill).not.toHaveBeenCalled();
+      expect(authority.release).not.toHaveBeenCalled();
     } finally {
       await rm(profileDir, { recursive: true, force: true });
     }

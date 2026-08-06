@@ -137,7 +137,10 @@ describe("browser automation expressions", () => {
       }
 
       matches(selector: string): boolean {
-        return selector === "[data-message-id]";
+        return (
+          selector === "[data-message-id]" ||
+          (this.role === "user" && selector.includes('[data-message-author-role="user"]'))
+        );
       }
 
       querySelector(selector: string): FakeElement | null {
@@ -147,8 +150,22 @@ describe("browser automation expressions", () => {
         return null;
       }
 
-      querySelectorAll(): FakeElement[] {
-        return [];
+      querySelectorAll(selector: string): Array<{
+        innerText: string;
+        textContent: string;
+        closest: () => null;
+        contains: () => boolean;
+      }> {
+        return this.role === "user" && selector.includes("[data-message-content]")
+          ? [
+              {
+                innerText: this.innerText,
+                textContent: this.innerText,
+                closest: () => null,
+                contains: () => false,
+              },
+            ]
+          : [];
       }
     }
 
@@ -177,6 +194,7 @@ describe("browser automation expressions", () => {
       Function(
         "document",
         "HTMLElement",
+        "location",
         `${expression}; return capture();`,
       )(
         {
@@ -184,6 +202,7 @@ describe("browser automation expressions", () => {
             selector === CONVERSATION_TURN_CONTAINER_SELECTOR ? turns : [],
         },
         FakeElement,
+        { href: "https://chatgpt.com/c/conversation-1" },
       ) as { text?: string; turnIndex?: number } | null;
 
     expect(

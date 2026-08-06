@@ -120,16 +120,6 @@ function projectPublicBrowserRunResult(transaction: BrowserRunTransaction): Brow
     bindSettlement: _bindSettlement,
     finalize: _finalize,
     abort: _abort,
-    chromePid: _chromePid,
-    chromeProcessIdentity: _chromeProcessIdentity,
-    chromePort: _chromePort,
-    chromeHost: _chromeHost,
-    chromeBrowserWSEndpoint: _chromeBrowserWSEndpoint,
-    chromeProfileRoot: _chromeProfileRoot,
-    userDataDir: _userDataDir,
-    chromeTargetId: _chromeTargetId,
-    tabUrl: _tabUrl,
-    controllerPid: _controllerPid,
     ...result
   } = transaction;
   return result;

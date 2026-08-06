@@ -7,9 +7,26 @@ import {
   parseDirectoryRemovalMessage,
 } from "../../src/browser/filesystemLockDirectoryRemovalProtocol.js";
 import type { DirectoryRemovalMessage } from "../../src/browser/filesystemLockDirectoryRemovalProtocol.js";
+import {
+  parsePhysicalDirectoryIdentity,
+  samePhysicalDirectoryIdentity,
+} from "../../src/browser/filesystemLockDirectoryIdentity.js";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const identity = { device: "1", inode: "2", birthtimeNs: "3" } as const;
+
+describe("physical directory identity", () => {
+  test("parses compatible serialized records and rejects malformed or changed identities", () => {
+    const parsed = parsePhysicalDirectoryIdentity(JSON.parse(JSON.stringify(identity)));
+
+    expect(parsed).toEqual(identity);
+    expect(parsed).not.toBeNull();
+    expect(samePhysicalDirectoryIdentity(parsed!, { ...identity, birthtimeNs: "4" })).toBe(false);
+    expect(parsePhysicalDirectoryIdentity({ ...identity, device: "01" })).toBeNull();
+    expect(parsePhysicalDirectoryIdentity({ device: "1", inode: "2" })).toBeNull();
+    expect(parsePhysicalDirectoryIdentity({ ...identity, extra: true })).toBeNull();
+  });
+});
 
 describe("filesystem lock directory removal protocol", () => {
   test.each<DirectoryRemovalMessage>([

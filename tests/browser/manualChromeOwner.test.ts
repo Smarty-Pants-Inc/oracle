@@ -97,6 +97,7 @@ function retainedEndpointAuthority(
 }
 
 describe("manual Chrome owner acquisition", () => {
+  // Exercises real crash-recoverable lease helpers whose Windows subprocess path exceeds Vitest's default budget under suite contention.
   test("serializes concurrent normal and fallback acquisition without conflating tab leases", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-manual-owner-"));
     const sentinelPath = path.join(profileDir, "Default", "Login Data");
@@ -297,9 +298,9 @@ describe("manual Chrome owner acquisition", () => {
       await fallbackLease?.release().catch(() => undefined);
       await fs.rm(profileDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
-  test("reuses the verified atomic owner without mixing in native discovery state", async () => {
+  test("reconciles the verified atomic owner without mixing in native discovery state", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-active-owner-"));
     try {
       const identity = await chromeIdentity(
@@ -336,11 +337,11 @@ describe("manual Chrome owner acquisition", () => {
       );
 
       expect(owner.source).toBe("recorded");
-      expect(owner.disposition).toBe("preserve");
+      expect(owner.disposition).toBe("close-on-last-lease");
       expect(owner.chrome.port).toBe(45_679);
       expect(owner.chrome.pid).toBe(43_211);
       expect(owner.processIdentity).toEqual(identity);
-      expect(writeOwner).not.toHaveBeenCalled();
+      expect(writeOwner).toHaveBeenCalledOnce();
       expect(launch).not.toHaveBeenCalled();
       expect(discoverExactProfileChrome).not.toHaveBeenCalled();
       expect(verifyIdentity).toHaveBeenCalledWith(profileDir, identity);
@@ -356,7 +357,7 @@ describe("manual Chrome owner acquisition", () => {
       expect(await readOracleChromeOwner(profileDir)).toEqual({
         port: 45_679,
         processIdentity: identity,
-        disposition: "preserve",
+        disposition: "close-on-last-lease",
       });
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
@@ -721,6 +722,126 @@ describe("manual Chrome owner acquisition", () => {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
   });
+
+  test("reconciles a bootstrap preserve to close on the final direct-run lease", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-policy-cutover-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_225,
+        "00000000-0000-4000-8000-000000000017",
+      );
+      const bootstrapAuthority = retainedEndpointAuthority(identity, 45_693);
+      const normalAuthority = retainedEndpointAuthority(identity, 45_693);
+      const bootstrap = await acquireManualChromeOwner(
+        profileDir,
+        resolveBrowserConfig({ manualLogin: true, keepBrowser: true, reuseChromeWaitMs: 0 }),
+        logger,
+        "bootstrap",
+        {
+          discoverExactProfileChrome: vi.fn(async () => null),
+          launch: vi.fn(async () =>
+            launchedChrome(identity.pid, 45_693, identity, bootstrapAuthority),
+          ),
+          verifyIdentity: vi.fn(async () => true),
+        },
+      );
+      const normal = await acquireManualChromeOwner(
+        profileDir,
+        resolveBrowserConfig({ manualLogin: true, keepBrowser: false, reuseChromeWaitMs: 0 }),
+        logger,
+        "normal",
+        {
+          retainEndpointAuthority: vi.fn(async () => normalAuthority),
+          verifyIdentity: vi.fn(async () => true),
+        },
+      );
+
+      expect(bootstrap.disposition).toBe("preserve");
+      expect(normal.disposition).toBe("close-on-last-lease");
+      const reconciledOwner = await readOracleChromeOwner(profileDir);
+      expect(reconciledOwner?.disposition).toBe("close-on-last-lease");
+      expect(reconciledOwner?.preservationPolicy).toBeUndefined();
+
+      const firstLease = await acquireBrowserTabLease(profileDir, {
+        maxConcurrentTabs: 2,
+        sessionId: "bootstrap",
+      });
+      const finalLease = await acquireBrowserTabLease(profileDir, {
+        maxConcurrentTabs: 2,
+        sessionId: "normal",
+      });
+      const firstTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease, {
+        onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(bootstrap),
+      });
+      await expect(firstTeardown.settle(async () => true)).resolves.toMatchObject({
+        disposition: "active-lease-handoff",
+      });
+      expect(normalAuthority.kill).not.toHaveBeenCalled();
+
+      const finalTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, finalLease);
+      await expect(
+        finalTeardown.settle(async () => {
+          const settlement = await settleManualChromeOwner(profileDir, normal, logger);
+          return settlement.status === "terminated";
+        }),
+      ).resolves.toMatchObject({ disposition: "teardown-completed" });
+      expect(normalAuthority.kill).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("does not let a direct run overwrite service-owned preservation", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-service-owner-policy-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_226,
+        "00000000-0000-4000-8000-000000000018",
+      );
+      const serviceAuthority = retainedEndpointAuthority(identity, 45_694);
+      const directAuthority = retainedEndpointAuthority(identity, 45_694);
+      const serviceOwner = await acquireManualChromeOwner(
+        profileDir,
+        resolveBrowserConfig({ manualLogin: true, keepBrowser: false, reuseChromeWaitMs: 0 }),
+        logger,
+        "remote-serve-bootstrap",
+        {
+          ownerPolicy: "service-persistent",
+          discoverExactProfileChrome: vi.fn(async () => null),
+          launch: vi.fn(async () =>
+            launchedChrome(identity.pid, 45_694, identity, serviceAuthority),
+          ),
+          verifyIdentity: vi.fn(async () => true),
+        },
+      );
+      const directOwner = await acquireManualChromeOwner(
+        profileDir,
+        resolveBrowserConfig({ manualLogin: true, keepBrowser: false, reuseChromeWaitMs: 0 }),
+        logger,
+        "direct-no-keep",
+        {
+          retainEndpointAuthority: vi.fn(async () => directAuthority),
+          verifyIdentity: vi.fn(async () => true),
+        },
+      );
+
+      expect(serviceOwner.disposition).toBe("preserve");
+      expect(directOwner.disposition).toBe("preserve");
+      await expect(readOracleChromeOwner(profileDir)).resolves.toMatchObject({
+        disposition: "preserve",
+        preservationPolicy: "service-persistent",
+      });
+      await expect(settleManualChromeOwner(profileDir, directOwner, logger)).resolves.toEqual({
+        status: "preserved",
+      });
+      expect(directAuthority.kill).not.toHaveBeenCalled();
+      expect(directAuthority.release).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("manual Chrome owner settlement", () => {
@@ -842,7 +963,7 @@ describe("manual Chrome owner settlement", () => {
     }
   });
 
-  test.each(["missing", "legacy", "current-preserve"] as const)(
+  test.each(["legacy", "current-preserve"] as const)(
     "never closes through a stale retained policy when canonical authority is %s",
     async (canonicalState) => {
       const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-policy-"));
@@ -885,6 +1006,39 @@ describe("manual Chrome owner settlement", () => {
       }
     },
   );
+
+  test("does not report a requested close complete when canonical owner policy is missing", async () => {
+    const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-missing-policy-"));
+    try {
+      const identity = await chromeIdentity(
+        profileDir,
+        43_227,
+        "00000000-0000-4000-8000-000000000019",
+      );
+      const chrome = launchedChrome(identity.pid, 45_695, identity);
+      const endpointAuthority = retainedEndpointAuthority(identity, chrome.port);
+      await expect(
+        settleManualChromeOwner(
+          profileDir,
+          {
+            chrome,
+            processIdentity: identity,
+            source: "recorded",
+            disposition: "close-on-last-lease",
+            endpointAuthority,
+          },
+          logger,
+        ),
+      ).resolves.toMatchObject({
+        status: "unsafe",
+        reason: expect.stringMatching(/requested close/i),
+      });
+      expect(endpointAuthority.kill).not.toHaveBeenCalled();
+      expect(endpointAuthority.release).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    }
+  });
 
   test.each(["mismatch", "unreadable"] as const)(
     "keeps exact close authority pending when canonical owner state is %s",
@@ -929,6 +1083,7 @@ describe("manual Chrome owner settlement", () => {
     },
   );
 
+  // Exercises real crash-recoverable lease helpers whose Windows subprocess path exceeds Vitest's default budget under suite contention.
   test("hands a close-on-last-lease owner from launch to exact reuse before one final kill", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-handoff-"));
     try {
@@ -1006,7 +1161,7 @@ describe("manual Chrome owner settlement", () => {
     } finally {
       await fs.rm(profileDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("preserves a launched owner when exact termination is unsafe", async () => {
     const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-owner-unsafe-settlement-"));

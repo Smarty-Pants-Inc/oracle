@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   INPUT_SELECTORS,
@@ -16,6 +15,19 @@ import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import {
+  buildPromptIdentityNormalizationExpression,
+  buildReadUserPromptTextExpression,
+  normalizePromptForIdentity,
+  promptIdentitySha256,
+} from "./committedPrompt.js";
+
+export {
+  buildPromptIdentityNormalizationExpression,
+  buildReadUserPromptTextExpression,
+  normalizePromptForIdentity,
+  promptIdentitySha256,
+} from "./committedPrompt.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -59,82 +71,6 @@ function buildPromptTooLargeRejectionReaderExpression(): string {
     }
     return matches;
   };`;
-}
-export function normalizePromptForIdentity(prompt: string): string {
-  return prompt
-    .toLowerCase()
-    .replace(/```[^\n]*\n([\s\S]*?)```/g, " $1 ")
-    .replace(/```/g, " ")
-    .replace(/`([^`]*)`/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/** Build the browser-context counterpart of normalizePromptForIdentity. */
-export function buildPromptIdentityNormalizationExpression(): string {
-  return `const normalizePromptIdentity = (value) => {
-    let text = value?.toLowerCase?.() ?? '';
-    text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-    text = text.replace(/\`\`\`/g, ' ');
-    text = text.replace(/\`([^\`]*)\`/g, '$1');
-    return text.replace(/\\s+/g, ' ').trim();
-  };`;
-}
-
-/**
- * Build the browser-side reader for the authored portion of a user turn.
- *
- * Turn containers also carry presentation chrome (for example, “You said:”),
- * action controls, and attachment tiles. They are deliberately not prompt
- * identity authority. A missing or ambiguous content root fails closed.
- */
-export function buildReadUserPromptTextExpression(): string {
-  return `const readUserPromptText = (turn) => {
-    if (!turn || typeof turn.querySelectorAll !== 'function') return null;
-    const USER_SCOPE_SELECTOR = '[data-message-author-role="user"], [data-turn="user"]';
-    const CONTENT_SELECTOR = [
-      '[data-message-content]',
-      '[data-testid="user-message"]',
-      '[data-testid*="user-message"]',
-      '[data-testid="user-turn-content"]',
-      '[data-testid*="user-turn-content"]',
-      '[class*="whitespace-pre-wrap"]',
-      '.whitespace-pre-wrap',
-      '.markdown',
-    ].join(', ');
-    const EXCLUDED_SELECTOR = [
-      'button',
-      '[role="button"]',
-      '[data-testid*="action"]',
-      '[data-testid*="attachment"]',
-      '[data-testid*="upload"]',
-      '[data-testid*="file"]',
-      '[aria-label*="attachment"]',
-      '[aria-label*="file"]',
-    ].join(', ');
-    const isUserScope = (node) => node?.matches?.(USER_SCOPE_SELECTOR);
-    const scopes = isUserScope(turn)
-      ? [turn]
-      : Array.from(turn.querySelectorAll(USER_SCOPE_SELECTOR));
-    if (scopes.length !== 1) return null;
-    const scope = scopes[0];
-    if (!scope || typeof scope.querySelectorAll !== 'function') return null;
-    const isExcluded = (node) => Boolean(node?.closest?.(EXCLUDED_SELECTOR));
-    const candidates = [
-      ...(scope.matches?.(CONTENT_SELECTOR) ? [scope] : []),
-      ...Array.from(scope.querySelectorAll(CONTENT_SELECTOR)),
-    ].filter((node) => !isExcluded(node));
-    const leaves = candidates.filter(
-      (candidate) => !candidates.some((other) => other !== candidate && candidate.contains?.(other)),
-    );
-    if (leaves.length !== 1) return null;
-    const text = leaves[0]?.innerText ?? leaves[0]?.textContent;
-    return typeof text === 'string' ? text : null;
-  };`;
-}
-
-export function promptIdentitySha256(prompt: string): string {
-  return createHash("sha256").update(normalizePromptForIdentity(prompt), "utf8").digest("hex");
 }
 
 export interface AttachmentReadyExpectation {

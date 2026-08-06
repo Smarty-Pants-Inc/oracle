@@ -133,6 +133,23 @@ export interface RetainedChromeEndpointAuthority {
   ): Promise<ExactChromeEndpointOperationResult<T>>;
   release(): Promise<void>;
 }
+export interface RetainedChromeBrowserWebSocketAuthority {
+  readonly browserWSEndpoint: string;
+  runExactOperation<T>(
+    operation: (client: ChromeClient) => Promise<T>,
+  ): Promise<ExactChromeEndpointOperationResult<T>>;
+  release(): Promise<void>;
+}
+
+export type RetainChromeBrowserWebSocketAuthorityResult =
+  | { status: "bound"; authority: RetainedChromeBrowserWebSocketAuthority }
+  | { status: "gone" }
+  | { status: "unsafe"; reason: string };
+
+export interface ChromeBrowserWebSocketAuthorityDeps {
+  discoverEndpoint?: typeof discoverBrowserWebSocketEndpoint;
+  connectBrowser?: (browserWSEndpoint: string) => Promise<ChromeClient>;
+}
 
 export function createEndpointBoundChildProcessChromeKill(
   child: StableChromeProcessHandle,
@@ -297,7 +314,7 @@ export async function createLaunchedChromeControlKillForTest(
   return (await createLaunchedChromeEndpointControl(options, deps)).kill;
 }
 
-interface VerifiedDevToolsEndpoint {
+export interface VerifiedDevToolsEndpoint {
   port: number;
   browserWSEndpoint: string;
 }
@@ -306,7 +323,7 @@ export async function discoverBrowserWebSocketEndpoint(
   host: string,
   port: number,
 ): Promise<VerifiedDevToolsEndpoint> {
-  await waitForDebugPort(port);
+  await waitForDebugPort(port, 30_000, host);
   const response = await fetch(`http://${host}:${port}/json/version`);
   if (!response.ok) {
     throw new Error(`Chrome control-channel discovery failed with HTTP ${response.status}`);
@@ -325,6 +342,120 @@ export async function discoverBrowserWebSocketEndpoint(
     throw new Error("Chrome returned an invalid exact browser control channel");
   }
   return { port, browserWSEndpoint: endpoint.toString() };
+}
+export async function retainChromeBrowserWebSocketAuthority(
+  options: VerifiedDevToolsEndpoint & { host: string },
+  deps: ChromeBrowserWebSocketAuthorityDeps = {},
+): Promise<RetainChromeBrowserWebSocketAuthorityResult> {
+  let expectedEndpoint: URL;
+  try {
+    expectedEndpoint = new URL(options.browserWSEndpoint);
+  } catch {
+    return { status: "unsafe", reason: "Persisted Chrome browser endpoint is malformed" };
+  }
+  if (
+    !Number.isInteger(options.port) ||
+    options.port <= 0 ||
+    options.port > 65_535 ||
+    expectedEndpoint.protocol !== "ws:" ||
+    expectedEndpoint.hostname !== options.host ||
+    Number.parseInt(expectedEndpoint.port, 10) !== options.port ||
+    expectedEndpoint.username ||
+    expectedEndpoint.password ||
+    expectedEndpoint.search ||
+    expectedEndpoint.hash ||
+    !/^\/devtools\/browser\/[^/]+$/u.test(expectedEndpoint.pathname)
+  ) {
+    return {
+      status: "unsafe",
+      reason: "Persisted Chrome browser endpoint does not match its exact host and port authority",
+    };
+  }
+  const expected = expectedEndpoint.toString();
+  const inspectExactEndpoint = async (): Promise<
+    { status: "current" } | { status: "gone" } | { status: "unsafe"; reason: string }
+  > => {
+    try {
+      const current = await (deps.discoverEndpoint ?? discoverBrowserWebSocketEndpoint)(
+        options.host,
+        options.port,
+      );
+      return current.browserWSEndpoint === expected ? { status: "current" } : { status: "gone" };
+    } catch (error) {
+      return {
+        status: "unsafe",
+        reason: `Exact Chrome browser endpoint generation is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+  const initial = await inspectExactEndpoint();
+  if (initial.status !== "current") return initial;
+
+  let client: ChromeClient;
+  try {
+    const connected = await (deps.connectBrowser
+      ? deps.connectBrowser(expected)
+      : (CDP({ target: expected, local: true }) as Promise<ChromeClient>));
+    try {
+      await connected.Browser.getVersion();
+      client = connected;
+    } catch (error) {
+      await connected.close().catch(() => undefined);
+      throw error;
+    }
+  } catch (error) {
+    return {
+      status: "unsafe",
+      reason: `Exact Chrome browser endpoint could not be retained: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const rebound = await inspectExactEndpoint();
+  if (rebound.status !== "current") {
+    await client.close().catch(() => undefined);
+    return rebound;
+  }
+
+  let released = false;
+  let pending: Promise<unknown> | undefined;
+  const runExactOperation = async <T>(
+    operation: (exactClient: ChromeClient) => Promise<T>,
+  ): Promise<ExactChromeEndpointOperationResult<T>> => {
+    while (pending) await pending.catch(() => undefined);
+    if (released) {
+      return { status: "unsafe", reason: "Exact Chrome browser endpoint was already released" };
+    }
+    const attempt = (async (): Promise<ExactChromeEndpointOperationResult<T>> => {
+      const binding = await inspectExactEndpoint();
+      if (binding.status !== "current") return binding;
+      try {
+        return { status: "completed", value: await operation(client) };
+      } catch (error) {
+        return {
+          status: "unsafe",
+          reason: `Exact Chrome browser endpoint operation failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    })();
+    pending = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (pending === attempt) pending = undefined;
+    }
+  };
+  return {
+    status: "bound",
+    authority: Object.freeze({
+      browserWSEndpoint: expected,
+      runExactOperation,
+      async release(): Promise<void> {
+        while (pending) await pending.catch(() => undefined);
+        if (released) return;
+        await client.close();
+        released = true;
+      },
+    }),
+  };
 }
 
 export async function resolveListeningPortOwnerPid(
@@ -769,11 +900,15 @@ async function waitForExactChromeProcessExit(
   } while (Date.now() <= deadline);
   return latest;
 }
-export async function waitForDebugPort(port: number, timeoutMs = 30_000): Promise<void> {
+export async function waitForDebugPort(
+  port: number,
+  timeoutMs = 30_000,
+  host = "127.0.0.1",
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const connected = await new Promise<boolean>((resolve) => {
-      const socket = net.createConnection({ host: "127.0.0.1", port });
+      const socket = net.createConnection({ host, port });
       socket.once("connect", () => {
         socket.destroy();
         resolve(true);
@@ -786,5 +921,5 @@ export async function waitForDebugPort(port: number, timeoutMs = 30_000): Promis
     if (connected) return;
     await delay(250);
   }
-  throw new Error(`Timed out waiting for hidden Chrome on port ${port}.`);
+  throw new Error(`Timed out waiting for Chrome at ${host}:${port}.`);
 }

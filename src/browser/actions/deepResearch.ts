@@ -23,6 +23,10 @@ import {
 } from "./assistantResponse.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import type { CommittedPromptEpochLocator } from "../reattachability.js";
+import {
+  buildCommittedPromptProbeDefinition,
+  serializeCommittedPromptAuthority,
+} from "./committedPrompt.js";
 
 type ActivateOutcome =
   | { status: "activated" }
@@ -1112,51 +1116,44 @@ function buildDeepResearchCompletionPollExpression(
 ): string {
   const finishedSelector = JSON.stringify(FINISHED_ACTIONS_SELECTOR);
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
-  const expectedPromptLiteral = expectedPromptTurn
-    ? JSON.stringify({
-        conversationId: expectedConversationId ?? expectedPromptTurn.conversationId,
-        userTurnIndex: expectedPromptTurn.verifiedUserTurnIndex,
-        userTurnId: expectedPromptTurn.verifiedUserTurnId,
-        userMessageId: expectedPromptTurn.verifiedUserMessageId,
-      })
-    : "null";
+  const promptAuthority = expectedPromptTurn
+    ? serializeCommittedPromptAuthority(
+        expectedConversationId ?? expectedPromptTurn.conversationId,
+        expectedPromptTurn,
+      )
+    : null;
+  const promptProbeDefinition = promptAuthority
+    ? buildCommittedPromptProbeDefinition(promptAuthority)
+    : buildConversationTurnIdentityExpression();
+  const committedPromptRead = promptAuthority ? "readCommittedPromptAuthority()" : "null";
   return `(() => {
     const MIN_TURN_INDEX = ${minTurnIndex};
-    const EXPECTED_PROMPT = ${expectedPromptLiteral};
+    const HAS_COMMITTED_PROMPT = ${Boolean(promptAuthority)};
     const stopVisible = Boolean(document.querySelector(${stopSelector}));
     const scopedToNewTurns = MIN_TURN_INDEX >= 0;
     const pageText = String(document.body?.innerText || '').toLowerCase().replace(/\\s+/g, ' ');
     const accountBlocked = pageText.includes('suspicious activity detected') &&
       pageText.includes('secure your account') &&
       pageText.includes('regain access');
-    ${buildConversationTurnIdentityExpression()}
+    ${promptProbeDefinition}
     const conversationTurns = ${buildConversationTurnListExpression()};
     let exactAssistantTurn = null;
-    if (EXPECTED_PROMPT) {
-      const currentConversationId = String(location?.href || '').match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] || null;
-      const expectedUserTurn = conversationTurns[EXPECTED_PROMPT.userTurnIndex];
-      if (
-        currentConversationId !== EXPECTED_PROMPT.conversationId ||
-        !isUserTurn(expectedUserTurn) ||
-        readTurnId(expectedUserTurn) !== EXPECTED_PROMPT.userTurnId ||
-        readMessageId(expectedUserTurn) !== EXPECTED_PROMPT.userMessageId
-      ) {
-        return { identityMismatch: true, accountBlocked };
-      }
-      for (let index = EXPECTED_PROMPT.userTurnIndex + 1; index < conversationTurns.length; index += 1) {
+    if (HAS_COMMITTED_PROMPT) {
+      const committedPrompt = ${committedPromptRead};
+      if (!committedPrompt) return { identityMismatch: true, accountBlocked };
+      for (let index = committedPrompt.userTurnIndex + 1; index < conversationTurns.length; index += 1) {
         const turn = conversationTurns[index];
-        if (isUserTurn(turn)) return { identityMismatch: true, accountBlocked };
         if (!exactAssistantTurn && isAssistantTurn(turn)) exactAssistantTurn = turn;
       }
     }
     const allAssistantTurns = Array.from(document.querySelectorAll(ASSISTANT_TURN_SELECTOR));
-    const scopedTurns = EXPECTED_PROMPT
+    const scopedTurns = HAS_COMMITTED_PROMPT
       ? (exactAssistantTurn ? [exactAssistantTurn] : [])
       : scopedToNewTurns
         ? conversationTurns.slice(MIN_TURN_INDEX).filter(isAssistantTurn)
         : allAssistantTurns;
     const lastTurn = scopedTurns[scopedTurns.length - 1] ||
-      (scopedToNewTurns || EXPECTED_PROMPT ? null : allAssistantTurns[allAssistantTurns.length - 1]);
+      (scopedToNewTurns || HAS_COMMITTED_PROMPT ? null : allAssistantTurns[allAssistantTurns.length - 1]);
     const text = (lastTurn?.textContent || '').trim();
     const normalized = text.toLowerCase().replace(/\\s+/g, ' ').trim();
     const textLength = text.length;

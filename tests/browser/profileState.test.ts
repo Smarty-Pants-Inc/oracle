@@ -388,7 +388,7 @@ describe("profileState", () => {
     ).toBe(false);
   });
 
-  test("keeps Darwin inspection current across providers while still verifying process authority", async () => {
+  test("requires an exact launch claim to bridge incomparable Darwin generation providers", async () => {
     const userDataDir = "/tmp/oracle-mac-provider-generation";
     const executablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
     const launchClaim = {
@@ -411,18 +411,27 @@ describe("profileState", () => {
         inode: "2",
       },
     } satisfies ChromeProcessIdentity;
+    const claimlessIdentity: ChromeProcessIdentity = {
+      ...identity,
+      launchNonce: "00000000-0000-4000-8000-000000007004",
+      launchClaim: undefined,
+    };
     const validCommandTokens = [
       executablePath,
       `--user-data-dir=${userDataDir}`,
       `--oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}`,
     ];
-    const inspect = (processStartTime: string, commandTokens = validCommandTokens) =>
-      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+    const inspect = (
+      durableIdentity: ChromeProcessIdentity,
+      processStartTime: string,
+      commandTokens = validCommandTokens,
+    ) =>
+      profileState.inspectChromeProcessIdentityForTest(userDataDir, durableIdentity, {
         platform: "darwin",
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
         readProcessSnapshot: async () => ({
-          pid: identity.pid,
+          pid: durableIdentity.pid,
           processStartTime,
           executablePath,
           commandLine: commandTokens.join(" "),
@@ -430,22 +439,25 @@ describe("profileState", () => {
         }),
       });
 
+    await expect(inspect(claimlessIdentity, "darwin-audit-pidversion:7001")).resolves.toBe(
+      "unavailable",
+    );
     for (const observedIdentity of [
       "darwin-kernel-start:1785945427:287123",
       "darwin-audit-pidversion:7001",
     ]) {
-      await expect(inspect(observedIdentity)).resolves.toBe("current");
+      await expect(inspect(identity, observedIdentity)).resolves.toBe("current");
     }
     await expect(
-      inspect("darwin-audit-pidversion:7001", [
+      inspect(identity, "darwin-audit-pidversion:7001", [
         executablePath,
         `--user-data-dir=${userDataDir}`,
         `--oracle-launch-claim=${launchClaim.generationId}:00000000-0000-4000-8000-000000007003`,
       ]),
     ).resolves.toBe("unavailable");
-    await expect(inspect("darwin-sample-launch:2026-08-05T11:57:07.288-0400")).resolves.toBe(
-      "exited",
-    );
+    await expect(
+      inspect(identity, "darwin-sample-launch:2026-08-05T11:57:07.288-0400"),
+    ).resolves.toBe("exited");
   });
 
   test("crash recovery without stable authority remains pending and never taskkills", async () => {

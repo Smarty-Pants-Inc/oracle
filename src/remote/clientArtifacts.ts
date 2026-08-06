@@ -10,7 +10,7 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
-import { syncDirectoryIfSupported } from "../sessionManager.js";
+import { syncDirectory } from "../fsDurability.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   RemoteArtifactDeliveryReceiptRequestSchema,
@@ -44,15 +44,14 @@ export async function transferRemoteArtifact(params: {
   token?: string;
   descriptor: RemoteArtifactDescriptor;
   transactionToken: string;
-  sessionId?: string;
+  sessionId: string;
   log?: BrowserRunOptions["log"];
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<SavedBrowserFile> {
   RemoteArtifactDescriptorSchema.parse(params.descriptor);
-  const sessionId = params.sessionId ?? params.descriptor.runId;
-  const artifactsDir = resolveSessionArtifactsDir(sessionId);
+  const artifactsDir = resolveSessionArtifactsDir(params.sessionId);
   await mkdir(artifactsDir, { recursive: true });
-  await syncDirectoryIfSupported(path.dirname(artifactsDir));
+  await syncDirectory(path.dirname(artifactsDir));
   const sourceFilename = sanitizeArtifactFilename(
     params.descriptor.filename,
     `artifact-${params.descriptor.artifactId}.bin`,
@@ -79,7 +78,7 @@ export async function transferRemoteArtifact(params: {
     }
   }
   if (verified) {
-    await syncDirectoryIfSupported(artifactsDir);
+    await syncDirectory(artifactsDir);
     params.log?.(`[browser] Reusing verified artifact ${sourceFilename}.`);
   } else {
     await rm(partPath, { force: true }).catch(() => undefined);
@@ -99,7 +98,7 @@ export async function transferRemoteArtifact(params: {
     try {
       await verifyAndSyncArtifactFile(partPath, params.descriptor);
       await rename(partPath, finalPath);
-      await syncDirectoryIfSupported(artifactsDir);
+      await syncDirectory(artifactsDir);
       verified = await verifyAndSyncArtifactFile(finalPath, params.descriptor);
     } catch (error) {
       await rm(partPath, { force: true }).catch(() => undefined);
@@ -313,7 +312,7 @@ async function quarantineStaleArtifactFile(
     throw new Error("local artifact cache path changed during stale replacement");
   }
   await unlink(quarantinePath);
-  await syncDirectoryIfSupported(path.dirname(artifactPath));
+  await syncDirectory(path.dirname(artifactPath));
 }
 
 function readErrorCode(error: unknown): string | undefined {

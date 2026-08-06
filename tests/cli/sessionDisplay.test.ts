@@ -19,6 +19,7 @@ import {
 } from "../../src/cli/sessionDisplay.ts";
 import { orchestrateBrowserAttachAuthority } from "../../src/cli/browserAttachController.ts";
 import {
+  BrowserPublicationJournalStore,
   readBrowserCapturePublicationJournal,
   type BrowserCapturePublicationJournal,
   type BrowserPublicationPhase,
@@ -73,7 +74,6 @@ vi.mock("../../src/sessionStore.ts", () => ({
 vi.mock("../../src/sessionManager.ts", () => ({
   wait: vi.fn(),
   writeFileAtomicDurable: writeFileAtomicDurableMock,
-  syncDirectoryIfSupported: vi.fn(),
 }));
 vi.mock("../../src/browser/reattach.ts", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../../src/browser/reattach.ts");
@@ -147,26 +147,86 @@ async function installBrowserPublicationJournal(
     origin: { mode: "local" },
   };
   await writeFile(artifact.path, answer);
-  const journal: BrowserCapturePublicationJournal = {
-    version: 1,
-    sessionId: "sess",
-    phase,
-    receipt: { artifact },
-    artifacts: phase === "preparing" ? [] : [artifact],
-    completedAt: "2026-08-05T00:00:00.000Z",
-    response: { status: "completed" },
-    browserAudit: { runtime },
-    runtime,
-  };
-  await writeFile(
-    path.join(directory, "browser-capture-publication.json"),
-    `${JSON.stringify(journal, null, 2)}\n`,
-  );
   sessionStoreMock.getPaths.mockResolvedValue({
     dir: directory,
     log: path.join(directory, "session.log"),
   });
-  return journal;
+  writeFileAtomicDurableMock.mockImplementationOnce(
+    async (targetPath: string, payload: string | Uint8Array) => {
+      await writeFile(targetPath, payload);
+    },
+  );
+  const store = new BrowserPublicationJournalStore("sess");
+  const preparing = store.reduce(null, {
+    type: "prepare",
+    journal: {
+      sessionId: "sess",
+      receipt: { artifact },
+      artifacts: [],
+      completedAt: "2026-08-05T00:00:00.000Z",
+      response: { status: "completed" },
+      browserAudit: { runtime },
+      runtime,
+    },
+  });
+  if (phase === "preparing") {
+    return store.transition(null, {
+      type: "prepare",
+      journal: {
+        sessionId: "sess",
+        receipt: { artifact },
+        artifacts: [],
+        completedAt: "2026-08-05T00:00:00.000Z",
+        response: { status: "completed" },
+        browserAudit: { runtime },
+        runtime,
+      },
+    });
+  }
+  const staged = store.reduce(preparing, {
+    type: "answer-staged",
+    receipt: { artifact },
+    artifacts: [artifact],
+  });
+  if (phase === "staged") {
+    return store.transition(preparing, {
+      type: "answer-staged",
+      receipt: { artifact },
+      artifacts: [artifact],
+    });
+  }
+  const finalizeBound = store.reduce(staged, {
+    type: "finalize-bound",
+    receipt: { artifact },
+    settlementMode: "finalize",
+    runtime,
+    browserAudit: { runtime },
+  });
+  if (phase === "finalize-bound") {
+    return store.transition(staged, {
+      type: "finalize-bound",
+      receipt: { artifact },
+      settlementMode: "finalize",
+      runtime,
+      browserAudit: { runtime },
+    });
+  }
+  return phase === "published"
+    ? store.transition(finalizeBound, {
+        type: "completed-session-persisted",
+        receipt: { artifact },
+        completedSessionPersisted: true,
+      })
+    : store.transition(finalizeBound, {
+        type: "cleanup-finalization-persisted",
+        completedSessionPersisted: true,
+        finalization: {
+          status: "pending",
+          runtime,
+          errorCode: "browser-cleanup-finalize-pending",
+          errorMessage: runtime.recoveryCleanupResult?.error ?? "cleanup remains pending",
+        },
+      });
 }
 const originalChalkLevel = chalk.level;
 
@@ -2071,10 +2131,9 @@ describe("attachSession rendering", () => {
       .mockResolvedValueOnce(null)
       .mockRejectedValueOnce(new Error("journal reconciliation read failed"))
       .mockResolvedValue(null);
-    vi.spyOn(
-      browserPublicationJournal,
-      "writeBrowserCapturePublicationJournal",
-    ).mockRejectedValueOnce(new Error("journal write failed before answer persistence"));
+    writeFileAtomicDurableMock.mockRejectedValueOnce(
+      new Error("journal write failed before answer persistence"),
+    );
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await orchestrateBrowserAttachAuthority("sess", recoverableMeta);

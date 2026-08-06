@@ -20,7 +20,14 @@ import {
   buildConversationDebugExpression,
 } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
-import { buildReadUserPromptTextExpression, promptIdentitySha256 } from "./promptComposer.js";
+import {
+  buildCommittedPromptProbeDefinition,
+  buildCommittedPromptProbeExpression,
+  buildReadUserPromptTextExpression,
+  parseCommittedPromptProbe,
+  promptIdentitySha256,
+  serializeCommittedPromptAuthority,
+} from "./committedPrompt.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -188,45 +195,13 @@ export async function verifyCommittedPromptTurn(
   Runtime: ChromeClient["Runtime"],
   locator: CommittedPromptEpochLocator,
 ): Promise<void> {
-  const expected = {
-    conversationId: locator.conversationId,
-    userTurnIndex: locator.verifiedUserTurnIndex,
-    userTurnId: locator.verifiedUserTurnId,
-    userMessageId: locator.verifiedUserMessageId,
-  };
+  const authority = serializeCommittedPromptAuthority(locator.conversationId, locator);
   const { result } = await Runtime.evaluate({
-    expression: `(() => {
-      const expected = ${JSON.stringify(expected)};
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      const conversationId = href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
-      if (conversationId !== expected.conversationId) return null;
-      const turns = ${buildConversationTurnListExpression()};
-      ${buildConversationTurnIdentityExpression()}
-      ${buildReadUserPromptTextExpression()}
-      const turn = turns[expected.userTurnIndex];
-      if (!turn) return null;
-      if (!isUserTurn(turn)) return null;
-      const turnId = readTurnId(turn);
-      const messageId = readMessageId(turn);
-      if (turnId !== expected.userTurnId) return null;
-      if (messageId !== expected.userMessageId) return null;
-      for (let index = expected.userTurnIndex + 1; index < turns.length; index += 1) {
-        if (isUserTurn(turns[index])) return null;
-      }
-      const text = readUserPromptText(turn);
-      return text === null ? null : { text, turnId, messageId };
-    })()`,
+    expression: buildCommittedPromptProbeExpression(authority),
     returnByValue: true,
   });
-  const observed = result?.value as
-    | { text?: unknown; turnId?: unknown; messageId?: unknown }
-    | null
-    | undefined;
-  if (
-    !observed ||
-    typeof observed.text !== "string" ||
-    promptIdentitySha256(observed.text) !== locator.promptSha256
-  ) {
+  const observed = parseCommittedPromptProbe(result?.value, authority);
+  if (!observed || promptIdentitySha256(observed.promptText ?? "") !== locator.promptSha256) {
     throw new BrowserAutomationError(
       "Recovered ChatGPT turn does not match the committed prompt epoch.",
       { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
@@ -1341,17 +1316,19 @@ function buildAssistantExtractor(
   functionName: string,
   expectedPromptTurn?: CommittedPromptEpochLocator,
 ): string {
-  const expectedUserLiteral = expectedPromptTurn
-    ? JSON.stringify({
-        index: expectedPromptTurn.verifiedUserTurnIndex,
-        turnId: expectedPromptTurn.verifiedUserTurnId,
-        messageId: expectedPromptTurn.verifiedUserMessageId,
-      })
-    : "null";
+  const promptAuthority = expectedPromptTurn
+    ? serializeCommittedPromptAuthority(expectedPromptTurn.conversationId, expectedPromptTurn)
+    : null;
+  const promptProbeDefinition = promptAuthority
+    ? buildCommittedPromptProbeDefinition(promptAuthority)
+    : buildConversationTurnIdentityExpression();
+  const committedPromptRead = promptAuthority ? "readCommittedPromptAuthority()" : "null";
   return `const ${functionName} = () => {
     ${buildClickDispatcher()}
-    ${buildConversationTurnIdentityExpression()}
-    const EXPECTED_USER = ${expectedUserLiteral};
+    ${promptProbeDefinition}
+    const HAS_COMMITTED_PROMPT = ${Boolean(promptAuthority)};
+    const committedPrompt = ${committedPromptRead};
+    if (HAS_COMMITTED_PROMPT && !committedPrompt) return null;
 
     const expandCollapsibles = (root) => {
       const buttons = Array.from(root.querySelectorAll('button'));
@@ -1372,20 +1349,10 @@ function buildAssistantExtractor(
 
     const turns = ${buildConversationTurnListExpression()};
     const candidateIndexes = [];
-    if (EXPECTED_USER) {
-      const expectedUserTurn = turns[EXPECTED_USER.index];
-      if (
-        !isUserTurn(expectedUserTurn) ||
-        readTurnId(expectedUserTurn) !== EXPECTED_USER.turnId ||
-        readMessageId(expectedUserTurn) !== EXPECTED_USER.messageId
-      ) {
-        return null;
-      }
+    if (HAS_COMMITTED_PROMPT) {
       let exactAssistantIndex = null;
-      for (let index = EXPECTED_USER.index + 1; index < turns.length; index += 1) {
-        const turn = turns[index];
-        if (isUserTurn(turn)) return null;
-        if (exactAssistantIndex === null && isAssistantTurn(turn)) {
+      for (let index = committedPrompt.userTurnIndex + 1; index < turns.length; index += 1) {
+        if (exactAssistantIndex === null && isAssistantTurn(turns[index])) {
           exactAssistantIndex = index;
         }
       }
@@ -1397,7 +1364,7 @@ function buildAssistantExtractor(
     for (const index of candidateIndexes) {
       const turn = turns[index];
       if (!isAssistantTurn(turn)) continue;
-        const messageRoot = turn.querySelector(ASSISTANT_TURN_SELECTOR) ?? turn;
+      const messageRoot = turn.querySelector(ASSISTANT_TURN_SELECTOR) ?? turn;
       expandCollapsibles(messageRoot);
       const preferred =
         (messageRoot.matches?.('.markdown') || messageRoot.matches?.('[data-message-content]') ? messageRoot : null) ||

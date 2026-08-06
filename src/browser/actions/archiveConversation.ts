@@ -5,16 +5,12 @@ import type {
   BrowserResearchMode,
   ChromeClient,
 } from "../types.js";
-import {
-  buildConversationTurnIdentityExpression,
-  buildConversationTurnListExpression,
-} from "../conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "../conversationUrl.js";
 import type { CommittedPromptEpochLocator } from "../reattachability.js";
 import {
-  buildPromptIdentityNormalizationExpression,
-  buildReadUserPromptTextExpression,
-} from "./promptComposer.js";
+  buildCommittedPromptProbeDefinition,
+  serializeCommittedPromptAuthority,
+} from "./committedPrompt.js";
 
 export interface BrowserArchiveDecision {
   mode: BrowserArchiveMode;
@@ -205,6 +201,7 @@ function buildArchiveConversationExpression(
         }
       : null,
   };
+  const promptAuthority = serializeCommittedPromptAuthority(conversationId, promptLocator);
   return `(() => {
     const expectedArchiveAuthority = ${JSON.stringify(authority)};
     const conversationUrl = typeof location === 'object' ? location.href : null;
@@ -262,16 +259,8 @@ function buildArchiveConversationExpression(
       element.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
       element.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
     };
-    ${buildConversationTurnIdentityExpression()}
-    ${buildReadUserPromptTextExpression()}
-    ${buildPromptIdentityNormalizationExpression()}
-    const sha256 = async (value) => {
-      if (!globalThis.crypto?.subtle || typeof TextEncoder !== 'function') return null;
-      const bytes = new TextEncoder().encode(normalizePromptIdentity(value));
-      const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
-      return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-    };
-    const readArchiveAuthoritySnapshot = () => {
+    ${buildCommittedPromptProbeDefinition(promptAuthority, { verifySha256: true })}
+    const readArchiveAuthoritySnapshot = async () => {
       try {
         const href = typeof location === 'object' && location.href ? location.href : '';
         const currentUrl = new URL(href);
@@ -280,38 +269,23 @@ function buildArchiveConversationExpression(
           currentUrl.port ||
           (currentUrl.hostname !== 'chatgpt.com' && currentUrl.hostname !== 'chat.openai.com')
         ) return null;
-        const conversationId = currentUrl.pathname.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
-        if (conversationId !== expectedArchiveAuthority.conversationId) return null;
-        const promptEpoch = expectedArchiveAuthority.promptEpoch;
-        if (!promptEpoch) return { conversationId, promptText: null };
-        const turns = ${buildConversationTurnListExpression()};
-        const turn = turns[promptEpoch.userTurnIndex];
-        if (!turn || !isUserTurn(turn)) return null;
-        if (readTurnId(turn) !== promptEpoch.userTurnId) return null;
-        if (readMessageId(turn) !== promptEpoch.userMessageId) return null;
-        for (let index = promptEpoch.userTurnIndex + 1; index < turns.length; index += 1) {
-          if (isUserTurn(turns[index])) return null;
-        }
-        const promptText = readUserPromptText(turn);
-        return typeof promptText === 'string' ? { conversationId, promptText } : null;
+        return await readCommittedPromptAuthority();
       } catch {
         return null;
       }
     };
     const runWithArchiveAuthority = async (effect) => {
-      const beforeDigest = readArchiveAuthoritySnapshot();
-      if (!beforeDigest) return false;
-      const promptEpoch = expectedArchiveAuthority.promptEpoch;
-      if (!promptEpoch) {
-        effect();
-        return true;
-      }
-      if (await sha256(beforeDigest.promptText) !== promptEpoch.promptSha256) return false;
-      const immediatelyBeforeEffect = readArchiveAuthoritySnapshot();
+      const beforeEffect = await readArchiveAuthoritySnapshot();
+      if (!beforeEffect) return false;
+      const immediatelyBeforeEffect = await readArchiveAuthoritySnapshot();
       if (
         !immediatelyBeforeEffect ||
-        immediatelyBeforeEffect.conversationId !== beforeDigest.conversationId ||
-        immediatelyBeforeEffect.promptText !== beforeDigest.promptText
+        immediatelyBeforeEffect.conversationId !== beforeEffect.conversationId ||
+        immediatelyBeforeEffect.promptText !== beforeEffect.promptText ||
+        immediatelyBeforeEffect.userTurnIndex !== beforeEffect.userTurnIndex ||
+        immediatelyBeforeEffect.userTurnId !== beforeEffect.userTurnId ||
+        immediatelyBeforeEffect.userMessageId !== beforeEffect.userMessageId ||
+        immediatelyBeforeEffect.promptSha256 !== beforeEffect.promptSha256
       ) return false;
       effect();
       return true;

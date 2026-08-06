@@ -69,6 +69,7 @@ export async function acquireExactLocalBrowserTarget({
         state.targetCloseCapability = retainChromeTargetCloseCapability({
           generationId: acquisitionGenerationId,
           targetId: connection.targetId,
+          browserWSEndpoint: settlementEndpointAuthority.browserWSEndpoint,
           close: (closeLogger) =>
             closeChromeTargetWithExactAuthority({
               authority: settlementEndpointAuthority,

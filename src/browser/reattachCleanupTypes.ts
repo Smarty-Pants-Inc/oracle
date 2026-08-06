@@ -6,6 +6,7 @@ import type {
   listChromeTargetsWithExactAuthority,
   retainChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
+import type { retainChromeBrowserWebSocketAuthority } from "./chromeEndpointAuthority.js";
 import type { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 import type {
   acquireProfileRunLock,
@@ -30,6 +31,7 @@ export interface ReattachCleanupDeps {
   listChromeTargetsWithExactAuthority?: typeof listChromeTargetsWithExactAuthority;
   closeChromeTargetWithRetainedCapability?: typeof closeChromeTargetWithRetainedCapability;
   retainChromeEndpointAuthority?: typeof retainChromeEndpointAuthority;
+  retainChromeBrowserWebSocketAuthority?: typeof retainChromeBrowserWebSocketAuthority;
   captureChromeProcessIdentity?: typeof captureChromeProcessIdentity;
   inspectRunningChromeProcessesForLaunchClaim?: typeof inspectRunningChromeProcessesForLaunchClaim;
   acquireProfileRunLock?: typeof acquireProfileRunLock;

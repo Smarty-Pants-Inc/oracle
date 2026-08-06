@@ -114,6 +114,7 @@ export async function acquireRemoteBrowserTarget(
       context.targetCloseCapability = retainChromeTargetCloseCapability({
         generationId: context.acquisitionGenerationId,
         targetId,
+        browserWSEndpoint: context.connection.browserWSEndpoint,
         close: (closeLogger) =>
           closeChromeTargetWithExactAuthority({
             authority: targetCloseAuthority,

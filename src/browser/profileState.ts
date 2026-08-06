@@ -49,11 +49,14 @@ async function canonicalProfileRemovalPath(userDataDir: string): Promise<string 
   return path.join(canonicalParentPath, path.basename(resolvedPath));
 }
 export type ChromeOwnerDisposition = "preserve" | "close-on-last-lease";
+export type ChromeOwnerPreservationPolicy = "service-persistent";
 
 export interface OracleChromeOwnerRecord {
   readonly port: number;
   readonly processIdentity: ChromeProcessIdentity;
   readonly disposition: ChromeOwnerDisposition;
+  /** Only the remote service may establish a preservation policy direct runs cannot replace. */
+  readonly preservationPolicy?: ChromeOwnerPreservationPolicy;
 }
 
 interface RemoveProfileDirectoryDeps {
@@ -276,7 +279,11 @@ function parseOracleChromeOwnerRecord(
     !Object.hasOwn(record, "port") ||
     !Object.hasOwn(record, "processIdentity") ||
     Object.keys(record).some(
-      (key) => key !== "port" && key !== "processIdentity" && key !== "disposition",
+      (key) =>
+        key !== "port" &&
+        key !== "processIdentity" &&
+        key !== "disposition" &&
+        key !== "preservationPolicy",
     )
   ) {
     return null;
@@ -294,12 +301,19 @@ function parseOracleChromeOwnerRecord(
       : record.disposition === "preserve" || record.disposition === "close-on-last-lease"
         ? record.disposition
         : null;
+  const preservationPolicy =
+    record.preservationPolicy === undefined
+      ? undefined
+      : record.preservationPolicy === "service-persistent"
+        ? record.preservationPolicy
+        : null;
   const processIdentity = parseChromeProcessIdentity(record.processIdentity, platform);
-  if (!processIdentity || !disposition) return null;
+  if (!processIdentity || !disposition || preservationPolicy === null) return null;
   return Object.freeze({
     port: record.port as number,
     processIdentity,
     disposition,
+    ...(preservationPolicy ? { preservationPolicy } : {}),
   });
 }
 

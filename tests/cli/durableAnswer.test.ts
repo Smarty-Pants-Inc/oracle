@@ -14,9 +14,10 @@ import {
 } from "../../src/cli/durableAnswer.js";
 import * as browserPublicationJournal from "../../src/cli/browserPublicationJournal.js";
 import {
+  BrowserPublicationJournalStore,
   isBrowserPublicationAcknowledged,
   readBrowserCapturePublicationJournal,
-  writeBrowserCapturePublicationJournal,
+  reduceBrowserPublicationEvent,
   type BrowserCapturePublicationJournal,
 } from "../../src/cli/browserPublicationJournal.js";
 import type {
@@ -26,6 +27,7 @@ import type {
 } from "../../src/sessionStore.js";
 import { sessionStore } from "../../src/sessionStore.js";
 import * as sessionManager from "../../src/sessionManager.js";
+import * as fsDurability from "../../src/fsDurability.js";
 import {
   OwnedBrowserResourceTransaction,
   completedBrowserCaptureCleanup,
@@ -100,7 +102,7 @@ describe("persistDurableBrowserAnswer", () => {
     const artifactsDirectory = path.join(directory, "artifacts");
     await mkdir(artifactsDirectory, { recursive: true });
     await writeFile(path.join(artifactsDirectory, `browser-answer-${hash}.md`), answer);
-    const syncDirectory = vi.spyOn(sessionManager, "syncDirectoryIfSupported");
+    const syncDirectory = vi.spyOn(fsDurability, "syncDirectory");
 
     const receipt = await persistDurableBrowserAnswer({ sessionId: "session-1", answer });
 
@@ -159,6 +161,36 @@ describe("persistDurableBrowserAnswer", () => {
 });
 
 describe("browser publication phase model", () => {
+  const artifact = {
+    kind: "transcript" as const,
+    path: "/tmp/browser-answer.md",
+    sha256: "a".repeat(64),
+    sizeBytes: 6,
+  };
+  const preparing = reduceBrowserPublicationEvent(null, {
+    type: "prepare",
+    journal: {
+      sessionId: "session-1",
+      receipt: { artifact },
+      artifacts: [],
+      completedAt: "2026-01-01T00:00:00.000Z",
+      browserAudit: { runtime: {} },
+      runtime: {},
+    },
+  });
+  const staged = reduceBrowserPublicationEvent(preparing, {
+    type: "answer-staged",
+    receipt: { artifact },
+    artifacts: [artifact],
+  });
+  const finalizeBound = reduceBrowserPublicationEvent(staged, {
+    type: "finalize-bound",
+    receipt: { artifact },
+    settlementMode: "finalize",
+    runtime: { recoveryCleanupResult: { status: "pending", settlementMode: "finalize" } },
+    browserAudit: { runtime: {} },
+  });
+
   test.each([
     ["preparing", false],
     ["staged", false],
@@ -167,6 +199,232 @@ describe("browser publication phase model", () => {
     ["cleanup-pending", true],
   ] as const)("maps %s acknowledgement in one place", (phase, acknowledged) => {
     expect(isBrowserPublicationAcknowledged(phase)).toBe(acknowledged);
+  });
+
+  test("reduces every legal publication edge", () => {
+    const published = reduceBrowserPublicationEvent(finalizeBound, {
+      type: "completed-session-persisted",
+      receipt: { artifact },
+      completedSessionPersisted: true,
+    });
+    const pendingFromBound = reduceBrowserPublicationEvent(finalizeBound, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: {
+        status: "pending",
+        runtime: finalizeBound.runtime,
+        errorCode: "browser-cleanup-finalize-pending",
+        errorMessage: "cleanup remains pending",
+      },
+    });
+    const pendingFromPublished = reduceBrowserPublicationEvent(published, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: {
+        status: "pending",
+        runtime: finalizeBound.runtime,
+        errorCode: "browser-cleanup-finalize-pending",
+        errorMessage: "cleanup remains pending",
+      },
+    });
+    const retriedPending = reduceBrowserPublicationEvent(pendingFromPublished, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: {
+        status: "pending",
+        runtime: finalizeBound.runtime,
+        errorCode: "browser-cleanup-finalize-pending",
+        errorMessage: "cleanup remains pending",
+      },
+    });
+    const completed = reduceBrowserPublicationEvent(retriedPending, {
+      type: "cleanup-finalization-persisted",
+      completedSessionPersisted: true,
+      finalization: { status: "completed", runtime: {} },
+    });
+
+    expect([preparing.phase, staged.phase, finalizeBound.phase]).toEqual([
+      "preparing",
+      "staged",
+      "finalize-bound",
+    ]);
+    expect(published.phase).toBe("published");
+    expect(pendingFromBound.phase).toBe("cleanup-pending");
+    expect(retriedPending.phase).toBe("cleanup-pending");
+    expect(completed).toMatchObject({ phase: "published", cleanupFinalizationPersisted: true });
+  });
+
+  test("allows abort-clear only from preparing", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-abort-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    const store = new BrowserPublicationJournalStore("session-1");
+    const persisted = await store.transition(null, {
+      type: "prepare",
+      journal: {
+        sessionId: "session-1",
+        receipt: { artifact },
+        artifacts: [],
+        completedAt: "2026-01-01T00:00:00.000Z",
+        browserAudit: { runtime: {} },
+        runtime: {},
+      },
+    });
+
+    await expect(
+      store.remove(persisted, {
+        type: "retire-completed-publication",
+        receipt: persisted.receipt,
+        completedSessionPersisted: true,
+      }),
+    ).rejects.toThrow("preparing -> retire-completed-publication");
+    await store.remove(persisted, { type: "abort-preparation", receipt: persisted.receipt });
+    await expect(store.read()).resolves.toBeNull();
+  });
+  test("rejects illegal edges and missing phase payloads", () => {
+    expect(() =>
+      reduceBrowserPublicationEvent(null, {
+        type: "answer-staged",
+        receipt: { artifact },
+        artifacts: [artifact],
+      }),
+    ).toThrow("null -> answer-staged");
+    expect(() =>
+      reduceBrowserPublicationEvent(preparing, {
+        type: "completed-session-persisted",
+        receipt: { artifact },
+        completedSessionPersisted: true,
+      }),
+    ).toThrow("preparing -> completed-session-persisted");
+    expect(() =>
+      reduceBrowserPublicationEvent(preparing, {
+        type: "answer-staged",
+        receipt: { artifact },
+        artifacts: [],
+      }),
+    ).toThrow("staged requires its durable answer artifact");
+    expect(() =>
+      reduceBrowserPublicationEvent(preparing, {
+        type: "answer-staged",
+        receipt: { artifact: { ...artifact, sha256: "b".repeat(64) } },
+        artifacts: [artifact],
+      }),
+    ).toThrow("does not match its publication intent");
+    expect(() =>
+      reduceBrowserPublicationEvent(staged, {
+        type: "finalize-bound",
+        receipt: { artifact },
+        runtime: {},
+        browserAudit: { runtime: {} },
+      } as never),
+    ).toThrow("finalize-bound requires FINALIZE settlement proof");
+    expect(() =>
+      reduceBrowserPublicationEvent(staged, {
+        type: "finalize-bound",
+        receipt: { artifact },
+        settlementMode: "finalize",
+        runtime: { recoveryCleanupResult: { status: "pending", settlementMode: "abort" } },
+        browserAudit: { runtime: {} },
+      }),
+    ).toThrow("cannot carry ABORT settlement authority");
+    expect(() =>
+      reduceBrowserPublicationEvent(finalizeBound, {
+        type: "completed-session-persisted",
+        receipt: { artifact },
+      } as never),
+    ).toThrow("published requires completed session proof");
+    expect(() =>
+      reduceBrowserPublicationEvent(finalizeBound, {
+        type: "cleanup-finalization-persisted",
+        completedSessionPersisted: true,
+        finalization: {
+          status: "pending",
+          runtime: finalizeBound.runtime,
+          errorCode: "browser-cleanup-finalize-pending",
+        },
+      } as never),
+    ).toThrow("cleanup-pending requires an error message");
+  });
+
+  test("restart rejects finalize-bound journals without settlement proof", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-unbound-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    const malformed: Record<string, unknown> = { ...finalizeBound };
+    delete malformed.finalizeSettlementMode;
+    await writeFile(
+      path.join(directory, "browser-capture-publication.json"),
+      JSON.stringify(malformed),
+    );
+
+    await expect(readBrowserCapturePublicationJournal("session-1")).rejects.toThrow(
+      "finalize-bound requires FINALIZE settlement proof",
+    );
+  });
+
+  test("restart rejects cleanup-pending journals without required failure metadata", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-invalid-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    await writeFile(
+      path.join(directory, "browser-capture-publication.json"),
+      JSON.stringify({
+        ...finalizeBound,
+        phase: "cleanup-pending",
+        cleanupFinalizationPersisted: true,
+        completedSessionPersisted: true,
+        cleanupErrorCode: "browser-cleanup-finalize-pending",
+      }),
+    );
+
+    await expect(readBrowserCapturePublicationJournal("session-1")).rejects.toThrow(
+      "cleanup-pending requires an error message",
+    );
+  });
+
+  test("restart upgrades legacy publication proofs before validation", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-publication-legacy-"));
+    tempDirectories.push(directory);
+    vi.spyOn(sessionStore, "getPaths").mockResolvedValue({
+      dir: directory,
+      metadata: path.join(directory, "metadata.json"),
+      log: path.join(directory, "session.log"),
+      request: path.join(directory, "request.json"),
+    });
+    const published = reduceBrowserPublicationEvent(finalizeBound, {
+      type: "completed-session-persisted",
+      receipt: { artifact },
+      completedSessionPersisted: true,
+    });
+    const legacy: Record<string, unknown> = { ...published, version: 1 };
+    delete legacy.finalizeSettlementMode;
+    delete legacy.completedSessionPersisted;
+    await writeFile(
+      path.join(directory, "browser-capture-publication.json"),
+      JSON.stringify(legacy),
+    );
+
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toMatchObject({
+      version: 2,
+      phase: "published",
+      finalizeSettlementMode: "finalize",
+      completedSessionPersisted: true,
+    });
   });
 });
 
@@ -232,6 +490,54 @@ describe("publishCompletedBrowserCapture", () => {
       },
       runtime,
     };
+  }
+
+  async function installPublicationJournal(
+    phase: "published" | "cleanup-pending",
+    artifact: DurableBrowserAnswerReceipt["artifact"],
+    runtime: BrowserRuntimeMetadata,
+    completedAt: string,
+  ): Promise<BrowserCapturePublicationJournal> {
+    const store = new BrowserPublicationJournalStore("session-1");
+    const preparing = store.reduce(null, {
+      type: "prepare",
+      journal: {
+        sessionId: "session-1",
+        receipt: { artifact },
+        artifacts: [],
+        completedAt,
+        browserAudit: browser(runtime),
+        runtime,
+      },
+    });
+    const staged = store.reduce(preparing, {
+      type: "answer-staged",
+      receipt: { artifact },
+      artifacts: [artifact],
+    });
+    const finalizeBound = store.reduce(staged, {
+      type: "finalize-bound",
+      receipt: { artifact },
+      settlementMode: "finalize",
+      runtime,
+      browserAudit: browser(runtime),
+    });
+    return phase === "published"
+      ? store.transition(finalizeBound, {
+          type: "completed-session-persisted",
+          receipt: { artifact },
+          completedSessionPersisted: true,
+        })
+      : store.transition(finalizeBound, {
+          type: "cleanup-finalization-persisted",
+          completedSessionPersisted: true,
+          finalization: {
+            status: "pending",
+            runtime,
+            errorCode: "browser-cleanup-finalize-pending",
+            errorMessage: runtime.recoveryCleanupResult?.error ?? "cleanup remains pending",
+          },
+        });
   }
 
   test("stages, binds FINALIZE, publishes, and only then executes finalize effects", async () => {
@@ -821,6 +1127,80 @@ describe("publishCompletedBrowserCapture", () => {
     expect(releaseSettlementLock).toHaveBeenCalledOnce();
   });
 
+  test("recovers when completed session is durable but disk journal remains finalize-bound", async () => {
+    await setupSession();
+    const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
+    const boundRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+    };
+    const bindSettlement = vi.fn(async () => boundRuntime);
+    let currentSession = sessionResult("session-1");
+    vi.mocked(sessionStore.readSession).mockImplementation(async () => currentSession);
+    vi.mocked(sessionStore.updateSession).mockImplementation(async (_sessionId, updates) => {
+      currentSession = {
+        ...currentSession,
+        ...updates,
+        browser: updates.browser ?? currentSession.browser,
+      };
+      return currentSession;
+    });
+    const durableWrite = sessionManager.writeFileAtomicDurable;
+    let rejectPublishedPhase = true;
+    vi.spyOn(sessionManager, "writeFileAtomicDurable").mockImplementation(
+      async (targetPath, data, mode) => {
+        if (
+          rejectPublishedPhase &&
+          path.basename(targetPath) === "browser-capture-publication.json" &&
+          String(data).includes('"phase": "published"')
+        ) {
+          rejectPublishedPhase = false;
+          throw new Error("crash before published journal replacement");
+        }
+        await durableWrite(targetPath, data, mode);
+      },
+    );
+    const { promise: finalizeStarted, resolve: markFinalizeStarted } =
+      Promise.withResolvers<void>();
+    const interrupted = publishCompletedBrowserCapture({
+      answer: { sessionId: "session-1", answer: "answer" },
+      transaction: {
+        runtime,
+        bindSettlement,
+        finalize: vi.fn(() => {
+          markFinalizeStarted();
+          return new Promise<BrowserCaptureFinalizationResult>(() => undefined);
+        }),
+        abort: vi.fn(),
+      },
+      browser: browser(runtime),
+      persistAnswer: acceptPreparedReceipt(),
+    });
+    void interrupted.catch(() => undefined);
+    await finalizeStarted;
+
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toMatchObject({
+      phase: "finalize-bound",
+    });
+    expect(currentSession.status).toBe("completed");
+
+    await expect(
+      publishCompletedBrowserCapture({
+        answer: { sessionId: "session-1", answer: "ignored on recovery" },
+        transaction: {
+          runtime,
+          bindSettlement,
+          finalize: vi.fn(async () => ({ status: "completed" as const, runtime: {} })),
+          abort: vi.fn(),
+        },
+        browser: browser(runtime),
+        persistAnswer: vi.fn(),
+      }),
+    ).resolves.toMatchObject({ published: true, finalization: { status: "completed" } });
+    expect(bindSettlement).toHaveBeenCalledOnce();
+    await expect(readBrowserCapturePublicationJournal("session-1")).resolves.toBeNull();
+  });
+
   test("retries the local FINALIZE projection before completed publication", async () => {
     await setupSession();
     const runtime: BrowserRuntimeMetadata = { chromeTargetId: "captured" };
@@ -1095,18 +1475,13 @@ describe("publishCompletedBrowserCapture", () => {
       sizeBytes: 6,
     };
     const runtime: BrowserRuntimeMetadata = { conversationId: "conversation-1" };
-    const journal: BrowserCapturePublicationJournal = {
-      version: 1,
-      sessionId: "session-1",
-      phase: "published",
-      receipt: { artifact },
-      artifacts: [artifact],
-      completedAt: "2026-01-01T00:00:01.000Z",
-      browserAudit: browser(runtime),
+    const journal = await installPublicationJournal(
+      "published",
+      artifact,
       runtime,
-    };
-    await writeBrowserCapturePublicationJournal(journal);
-    vi.spyOn(sessionManager, "syncDirectoryIfSupported").mockRejectedValueOnce(
+      "2026-01-01T00:00:01.000Z",
+    );
+    vi.spyOn(fsDurability, "syncDirectory").mockRejectedValueOnce(
       new Error("journal directory sync outcome unknown"),
     );
 
@@ -1153,19 +1528,12 @@ describe("publishCompletedBrowserCapture", () => {
         lockReleasePending: true,
       },
     };
-    const journal: BrowserCapturePublicationJournal = {
-      version: 1,
-      sessionId: "session-1",
-      phase: "cleanup-pending",
-      receipt: { artifact },
-      artifacts: [artifact],
-      completedAt: "2026-01-01T00:00:02.000Z",
-      browserAudit: browser(pendingRuntime),
-      runtime: pendingRuntime,
-      cleanupFinalizationPersisted: true,
-      cleanupErrorCode: "browser-cleanup-finalize-pending",
-    };
-    await writeBrowserCapturePublicationJournal(journal);
+    const journal = await installPublicationJournal(
+      "cleanup-pending",
+      artifact,
+      pendingRuntime,
+      "2026-01-01T00:00:02.000Z",
+    );
     let currentSession = sessionResult("session-1", {
       mode: "browser",
       browser: browser(pendingRuntime),

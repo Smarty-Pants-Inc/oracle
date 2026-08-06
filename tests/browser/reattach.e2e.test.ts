@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import type { ChromeLaunchResult } from "../../src/browser/chromeLifecycle.js";
+import type { BrowserRunResult } from "../../src/browser/types.js";
 
 vi.mock("../../src/browser/reattach.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../../src/browser/reattach.js");
@@ -72,6 +73,7 @@ function createReattachResult(
   answerMarkdown: string,
   runtime: BrowserRuntimeMetadata,
   onFinalize?: () => Promise<void> | void,
+  fields: Partial<BrowserRunResult> = {},
 ) {
   const capturedRuntime = runtime.recoveryCleanupResources?.length
     ? { ...runtime, recoveryCleanupResult: { status: "pending" as const } }
@@ -80,6 +82,7 @@ function createReattachResult(
   delete finalizedRuntime.recoveryCleanupResources;
   delete finalizedRuntime.recoveryCleanupResult;
   return {
+    ...fields,
     answerText,
     answerMarkdown,
     runtime: capturedRuntime,
@@ -232,12 +235,56 @@ describe("browser reattach end-to-end (simulated)", () => {
           details: { stage: "connection-lost", recoverableDisconnect: true },
         },
       });
+      const paths = await sessionStore.getPaths(sessionMeta.id);
+      const recoveredFilePath = path.join(paths.dir, "artifacts", "remote-result.zip");
+      const recoveredReportPath = path.join(paths.dir, "artifacts", "deep-research-report.md");
+      const recoveredTranscriptPath = path.join(paths.dir, "artifacts", "transcript.md");
+      await fs.mkdir(path.dirname(recoveredFilePath), { recursive: true });
+      await Promise.all([
+        fs.writeFile(recoveredFilePath, "remote file"),
+        fs.writeFile(recoveredReportPath, "# Recovered report"),
+        fs.writeFile(recoveredTranscriptPath, "# Recovered transcript"),
+      ]);
+      const recoveredFile = {
+        kind: "file" as const,
+        path: recoveredFilePath,
+        url: "bridge-artifact",
+        filename: "remote-result.zip",
+      };
+      const recoveredModel = {
+        requestedModel: "gpt-5.2-pro",
+        resolvedLabel: "Pro",
+        strategy: "select" as const,
+        status: "already-selected" as const,
+        verified: true,
+        source: "chatgpt-model-picker" as const,
+        capturedAt: "2026-08-05T00:00:00.000Z",
+      };
       let durableCompletionObserved = false;
-      const reattachResult = createReattachResult("ok text", "ok markdown", runtime, async () => {
-        const durable = await sessionStore.readSession(sessionMeta.id);
-        durableCompletionObserved =
-          durable?.status === "completed" && durable.response?.status === "completed";
-      });
+      const reattachResult = createReattachResult(
+        "ok text",
+        "ok markdown",
+        runtime,
+        async () => {
+          const durable = await sessionStore.readSession(sessionMeta.id);
+          durableCompletionObserved =
+            durable?.status === "completed" && durable.response?.status === "completed";
+        },
+        {
+          answerHtml: "<p>ok html</p>",
+          artifacts: [
+            { kind: "deep-research-report", path: recoveredReportPath },
+            { kind: "transcript", path: recoveredTranscriptPath },
+          ],
+          savedFiles: [recoveredFile],
+          archive: { mode: "auto", attempted: true, archived: true },
+          modelSelection: recoveredModel,
+          warnings: [{ code: "remote-warning", severity: "warning", message: "Recovered warning" }],
+          tookMs: 42,
+          answerTokens: 7,
+          answerChars: 7,
+        },
+      );
       resumeMock.mockResolvedValue(reattachResult);
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -250,9 +297,25 @@ describe("browser reattach end-to-end (simulated)", () => {
       expect(updated?.status).toBe("completed");
       expect(updated?.response?.status).toBe("completed");
       expect(resumeMock).toHaveBeenCalledTimes(1);
+      expect(resumeMock.mock.calls[0]?.[3]).toEqual(
+        expect.objectContaining({ sessionId: sessionMeta.id }),
+      );
       const runs = updated?.models ?? [];
       expect(runs.some((r) => r.status === "completed")).toBe(true);
       expect(durableCompletionObserved).toBe(true);
+      expect(updated?.elapsedMs).toBe(42);
+      expect(updated?.artifacts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "file", path: recoveredFilePath }),
+          expect.objectContaining({ kind: "deep-research-report", path: recoveredReportPath }),
+          expect.objectContaining({ kind: "transcript", path: recoveredTranscriptPath }),
+        ]),
+      );
+      expect(updated?.browser).toMatchObject({
+        archive: { mode: "auto", attempted: true, archived: true },
+        modelSelection: recoveredModel,
+        warnings: [{ code: "remote-warning", severity: "warning", message: "Recovered warning" }],
+      });
       expect(reattachResult.finalize).toHaveBeenCalledOnce();
       expect(reattachResult.abort).not.toHaveBeenCalled();
     } finally {

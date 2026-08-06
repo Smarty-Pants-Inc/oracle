@@ -1,8 +1,35 @@
-import type { BrowserRuntimeMetadata } from "../sessionManager.js";
+import type {
+  BrowserProcessAcquisitionProvenance,
+  BrowserRecoveryCleanupResourceMetadata,
+  BrowserRecoveryProfileKind,
+  BrowserRecoveryTargetCloseCapabilityMetadata,
+  BrowserRuntimeMetadata,
+} from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserCaptureFinalizationResult } from "./types.js";
+import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
+import {
+  releaseManualChromeOwnerEndpointAuthority,
+  settleManualChromeOwner,
+  type ManualChromeOwner,
+} from "./manualChromeOwner.js";
+import {
+  isSafeChromeTerminationOutcome,
+  removeProfileDirectoryIfIdentityMatches,
+  type ChromeOwnerDisposition,
+  type ChromeProcessLaunchClaim,
+  type ProfileDirectoryIdentity,
+} from "./profileState.js";
+import {
+  releaseBrowserTabLease,
+  retainBrowserTabLeaseTeardownAuthority,
+  type BrowserTabLease,
+  type BrowserTabLeaseReleaseOptions,
+  type BrowserTabLeaseTeardownAuthority,
+} from "./tabLeaseRegistry.js";
+import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js";
 import {
   acknowledgeChromeTargetCloseCapability,
+  closeChromeTargetWithRetainedCapability,
   discardChromeTargetCloseCapability,
 } from "./targetCloseAuthority.js";
 
@@ -650,5 +677,695 @@ export class OwnedBrowserResourceTransaction {
       });
     this.state = { kind: "settling", mode, runtime: boundRuntime, completion };
     return completion;
+  }
+}
+
+export type LocalOwnedBrowserPendingResource = "tab-lease" | "chrome-process" | "chrome-target";
+
+export type LocalOwnedBrowserProcessAuthority =
+  | { kind: "manual"; owner: ManualChromeOwner }
+  | { kind: "temporary"; chrome: ChromeLaunchResult };
+
+export type LocalOwnedBrowserProcessSettlement =
+  | { status: "completed"; disposition: "terminated" | "preserved" }
+  | { status: "pending"; reason: string };
+
+export interface LocalOwnedBrowserTargetAuthority {
+  targetId: string;
+  releasesProcessEndpointOnSettle?: boolean;
+  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
+  disconnect?: () => Promise<void>;
+}
+
+export type LocalOwnedBrowserAcquisitionStep<T> =
+  | {
+      resource: "tab-lease";
+      acquire: () => Promise<T>;
+      authority: (resource: T) => BrowserTabLease;
+    }
+  | {
+      resource: "chrome-process";
+      acquire: () => Promise<T>;
+      authority: (resource: T) => LocalOwnedBrowserProcessAuthority;
+    }
+  | {
+      resource: "chrome-target";
+      acquire: () => Promise<T>;
+      authority: (resource: T) => LocalOwnedBrowserTargetAuthority;
+    };
+
+export interface LocalOwnedBrowserResourceAuthorityOptions {
+  purpose: string;
+  targetLabel: string;
+  baseRuntime?: BrowserRuntimeMetadata;
+  userDataDir: string;
+  profileDirectoryIdentity: ProfileDirectoryIdentity;
+  profileKind: BrowserRecoveryProfileKind;
+  keepBrowser: boolean;
+  closeOwnedTargetOnComplete: boolean;
+  generationId: string;
+  processOwnerProvenance: BrowserProcessAcquisitionProvenance;
+  processLaunchClaim: ChromeProcessLaunchClaim;
+  processOwnerDisposition: ChromeOwnerDisposition;
+  leaseId?: string;
+  targetMarkerUrl: string;
+  tabUrl?: string;
+  logger: BrowserLogger;
+  disconnectBeforeTarget?: boolean;
+  disconnectErrorPrefix?: string;
+  manualProcessErrorPrefix?: string;
+  persistRuntime?: (runtime: BrowserRuntimeMetadata) => Promise<BrowserRuntimeMetadata | void>;
+  persistSettlementResult?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
+  releaseLease?: (lease: BrowserTabLease, options?: BrowserTabLeaseReleaseOptions) => Promise<void>;
+  settleManualProcess?: (owner: ManualChromeOwner) => Promise<LocalOwnedBrowserProcessSettlement>;
+  settleTemporaryProcess?: (
+    chrome: ChromeLaunchResult,
+  ) => Promise<LocalOwnedBrowserProcessSettlement>;
+  settleRemainingResources?: (
+    mode: BrowserCaptureSettlementMode,
+    runtime: BrowserRuntimeMetadata,
+  ) => Promise<BrowserCaptureFinalizationResult>;
+}
+
+/**
+ * Local target, lease, and process authority shared by every owned-browser feature lane.
+ * Acquisition effects stay with callers; this owner alone projects their durable authority and
+ * settles it in target -> lease -> process order.
+ */
+export class LocalOwnedBrowserResourceAuthority {
+  private readonly transaction: OwnedBrowserResourceTransaction;
+  private baseRuntime: BrowserRuntimeMetadata;
+  private inheritedResources: BrowserRecoveryCleanupResourceMetadata[];
+  private pendingResource: LocalOwnedBrowserPendingResource | undefined;
+  private lease: BrowserTabLease | null = null;
+  private process: LocalOwnedBrowserProcessAuthority | null = null;
+  private target: LocalOwnedBrowserTargetAuthority | null = null;
+  private leaseTeardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
+  private leaseProcessSettlement: LocalOwnedBrowserProcessSettlement | null = null;
+  private targetSettled = false;
+  private leaseSettled = false;
+  private processSettled = false;
+  private connectionDisconnected = false;
+  private pendingAcquisitionEffectStarted = false;
+  private settlementMode: BrowserCaptureSettlementMode | undefined;
+
+  constructor(private readonly options: LocalOwnedBrowserResourceAuthorityOptions) {
+    this.baseRuntime = options.baseRuntime ?? {};
+    this.inheritedResources = [...(this.baseRuntime.recoveryCleanupResources ?? [])];
+    this.transaction = new OwnedBrowserResourceTransaction(
+      {
+        ...(options.persistRuntime ? { persistRuntime: options.persistRuntime } : {}),
+        ...(options.persistSettlementResult
+          ? { persistSettlementResult: options.persistSettlementResult }
+          : {}),
+        settleResources: (mode, runtime) => this.settleResources(mode, runtime),
+      },
+      this.projectRuntime(),
+    );
+  }
+
+  runtime(): BrowserRuntimeMetadata {
+    return this.transaction.runtime();
+  }
+
+  acquiredLease(): BrowserTabLease | null {
+    return this.lease;
+  }
+
+  acquiredChrome(): ChromeLaunchResult {
+    const chrome = this.chrome();
+    if (!chrome) throw new Error(`${this.options.purpose} Chrome acquisition is incomplete.`);
+    return chrome;
+  }
+
+  endpointAuthority(): RetainedChromeEndpointAuthority | undefined {
+    if (this.process?.kind === "manual") {
+      return this.process.owner.endpointAuthority ?? this.process.owner.chrome.endpointAuthority;
+    }
+    return this.process?.chrome.endpointAuthority;
+  }
+
+  async journalAcquisition<T>(step: LocalOwnedBrowserAcquisitionStep<T>): Promise<T> {
+    this.pendingResource = step.resource;
+    this.pendingAcquisitionEffectStarted = false;
+    return await this.transaction.journalAcquisition({
+      intentRuntime: this.projectRuntime(),
+      acquire: async () => {
+        this.pendingAcquisitionEffectStarted = true;
+        return await step.acquire();
+      },
+      acquiredRuntime: (resource) => {
+        if (step.resource === "tab-lease") {
+          this.lease = step.authority(resource);
+          this.leaseSettled = false;
+        } else if (step.resource === "chrome-process") {
+          this.process = step.authority(resource);
+          this.processSettled = false;
+          this.leaseProcessSettlement = null;
+          this.retainLeaseTeardownAuthority();
+        } else {
+          this.target = step.authority(resource);
+          this.targetSettled = false;
+          this.connectionDisconnected = false;
+        }
+        this.pendingResource = undefined;
+        return this.projectRuntime();
+      },
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.connectionDisconnected || !this.target?.disconnect) return;
+    try {
+      await this.target.disconnect();
+      this.connectionDisconnected = true;
+    } catch (error) {
+      if (this.options.disconnectErrorPrefix) {
+        throw new Error(
+          `${this.options.disconnectErrorPrefix}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      this.connectionDisconnected = true;
+    }
+  }
+
+  settle(
+    mode: BrowserCaptureSettlementMode,
+    authoritativeRuntime?: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> {
+    const current = this.transaction.runtime();
+    if (
+      authoritativeRuntime &&
+      current.recoveryCleanupResources?.length &&
+      !current.recoveryCleanupResult?.settlementMode
+    ) {
+      this.baseRuntime = authoritativeRuntime;
+      this.transaction.replaceRuntime(
+        projectBrowserCaptureCleanupRuntime(authoritativeRuntime, this.projectRuntime()),
+      );
+    }
+    return this.transaction.settle(mode);
+  }
+
+  private chrome(): ChromeLaunchResult | null {
+    if (!this.process) return null;
+    return this.process.kind === "manual" ? this.process.owner.chrome : this.process.chrome;
+  }
+
+  private processIdentity() {
+    if (!this.process) return undefined;
+    return this.process.kind === "manual"
+      ? this.process.owner.processIdentity
+      : this.process.chrome.processIdentity;
+  }
+
+  private processDisposition(): ChromeOwnerDisposition {
+    if (this.process?.kind === "manual") return this.process.owner.disposition;
+    return this.options.processOwnerDisposition;
+  }
+
+  private keepBrowser(): boolean {
+    return this.options.keepBrowser || this.processDisposition() === "preserve";
+  }
+
+  private retainLeaseTeardownAuthority(): void {
+    if (
+      !this.lease ||
+      this.process?.kind !== "manual" ||
+      this.process.owner.disposition !== "close-on-last-lease"
+    ) {
+      return;
+    }
+    const owner = this.process.owner;
+    const onActiveLeaseHandoff = () => releaseManualChromeOwnerEndpointAuthority(owner);
+    this.leaseTeardownAuthority = this.options.releaseLease
+      ? this.createLeaseTeardownAuthority(this.lease, onActiveLeaseHandoff)
+      : retainBrowserTabLeaseTeardownAuthority(this.options.userDataDir, this.lease, {
+          logger: this.options.logger,
+          onActiveLeaseHandoff,
+        });
+  }
+
+  private createLeaseTeardownAuthority(
+    lease: BrowserTabLease,
+    onActiveLeaseHandoff: () => Promise<void>,
+  ): BrowserTabLeaseTeardownAuthority {
+    let leaseReleased = false;
+    let lastLeaseConfirmed = false;
+    let handoffPending = false;
+    let terminalDisposition: "teardown-completed" | "active-lease-handoff" | null = null;
+    return {
+      get leaseReleased() {
+        return leaseReleased;
+      },
+      settle: async (teardown) => {
+        if (terminalDisposition) {
+          return { status: "completed", disposition: terminalDisposition };
+        }
+        if (handoffPending) {
+          try {
+            await onActiveLeaseHandoff();
+            handoffPending = false;
+            terminalDisposition = "active-lease-handoff";
+            return { status: "completed", disposition: terminalDisposition };
+          } catch (error) {
+            return {
+              status: "preserved",
+              reason: "teardown-unsafe",
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }
+        let teardownAttempted = false;
+        let teardownCompleted = false;
+        let activeLeaseHandoff = false;
+        try {
+          await this.options.releaseLease!(lease, {
+            onRelease: async ({ isLastLease }) => {
+              leaseReleased = true;
+              if (!isLastLease) {
+                handoffPending = true;
+                await onActiveLeaseHandoff();
+                handoffPending = false;
+                activeLeaseHandoff = true;
+                return;
+              }
+              lastLeaseConfirmed = true;
+              teardownAttempted = true;
+              teardownCompleted = await teardown();
+            },
+          });
+        } catch (error) {
+          return {
+            status: "preserved",
+            reason: handoffPending ? "teardown-unsafe" : "registry-unavailable",
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (activeLeaseHandoff) {
+          terminalDisposition = "active-lease-handoff";
+          return { status: "completed", disposition: terminalDisposition };
+        }
+        if (!teardownAttempted) {
+          if (!leaseReleased || !lastLeaseConfirmed) {
+            return { status: "preserved", reason: "registry-unavailable" };
+          }
+          teardownCompleted = await teardown();
+        }
+        if (!teardownCompleted) return { status: "preserved", reason: "teardown-unsafe" };
+        terminalDisposition = "teardown-completed";
+        return { status: "completed", disposition: terminalDisposition };
+      },
+    };
+  }
+
+  private projectRuntime(mode = this.settlementMode): BrowserRuntimeMetadata {
+    const chrome = this.chrome();
+    const processIdentity = this.processIdentity();
+    const targetPending =
+      this.pendingResource === "chrome-target" || Boolean(this.target && !this.targetSettled);
+    const leasePending =
+      this.pendingResource === "tab-lease" || Boolean(this.lease && !this.leaseSettled);
+    const processPending =
+      this.pendingResource === "chrome-process" || Boolean(this.process && !this.processSettled);
+    const ownsLocalResources = targetPending || leasePending || processPending;
+    const next: BrowserRuntimeMetadata = {
+      ...this.baseRuntime,
+      browserTransport: "cdp",
+      chromePid: chrome?.pid,
+      chromeProcessIdentity: processIdentity,
+      chromePort: chrome?.port,
+      chromeHost: chrome?.host ?? "127.0.0.1",
+      chromeBrowserWSEndpoint: this.endpointAuthority()?.browserWSEndpoint,
+      chromeProfileRoot: this.options.userDataDir,
+      userDataDir: this.options.userDataDir,
+      chromeTargetId: targetPending ? (this.target?.targetId ?? undefined) : undefined,
+      ...(this.options.tabUrl ? { tabUrl: this.options.tabUrl } : {}),
+      controllerPid: process.pid,
+    };
+    const resources = [...this.inheritedResources];
+    if (ownsLocalResources) {
+      resources.push({
+        chromePid: chrome?.pid,
+        chromeProcessIdentity: processIdentity,
+        profileDirectoryIdentity:
+          processIdentity?.profileDirectory ??
+          this.lease?.profileDirectory ??
+          this.options.profileDirectoryIdentity,
+        chromePort: chrome?.port,
+        chromeHost: chrome?.host ?? "127.0.0.1",
+        chromeBrowserWSEndpoint: this.endpointAuthority()?.browserWSEndpoint,
+        chromeProfileRoot: this.options.userDataDir,
+        userDataDir: this.options.userDataDir,
+        chromeTargetId: targetPending ? (this.target?.targetId ?? undefined) : undefined,
+        targetCloseCapability: targetPending ? this.target?.capability : undefined,
+        conversationId: next.conversationId,
+        promptEpoch: next.promptEpoch,
+        tabLease: leasePending
+          ? {
+              id: this.lease?.id ?? this.options.leaseId ?? "",
+              profileDirectory:
+                this.lease?.profileDirectory ?? this.options.profileDirectoryIdentity,
+            }
+          : undefined,
+        acquisition: {
+          generationId: this.options.generationId,
+          processOwnerProvenance: this.options.processOwnerProvenance,
+          processLaunchClaim: this.options.processLaunchClaim,
+          processOwnerDisposition: this.processDisposition(),
+          ...(this.pendingResource ? { pendingResource: this.pendingResource } : {}),
+          targetMarkerUrl: this.options.targetMarkerUrl,
+        },
+        recoveryCleanup: {
+          ownsTarget: targetPending,
+          profileKind: this.options.profileKind,
+          keepBrowser: this.keepBrowser(),
+          ...(targetPending
+            ? { closeOwnedTargetOnComplete: this.options.closeOwnedTargetOnComplete }
+            : {}),
+        },
+      });
+    }
+    if (resources.length > 0) {
+      next.recoveryCleanupResources = resources;
+      next.recoveryCleanupResult = {
+        status: "pending",
+        ...(mode ? { settlementMode: mode } : {}),
+      };
+    } else {
+      delete next.recoveryCleanupResources;
+      delete next.recoveryCleanupResult;
+    }
+    return next;
+  }
+
+  private async settleResources(
+    mode: BrowserCaptureSettlementMode,
+    pendingRuntime: BrowserRuntimeMetadata,
+  ): Promise<BrowserCaptureFinalizationResult> {
+    this.settlementMode = mode;
+    this.baseRuntime = pendingRuntime;
+    let deferredTargetToProcess = false;
+
+    if (this.options.disconnectBeforeTarget) {
+      const error = await this.disconnectError();
+      if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+    }
+
+    if (this.pendingResource === "chrome-target" || (this.target && !this.targetSettled)) {
+      const resource = pendingRuntime.recoveryCleanupResources?.find(
+        (candidate) => candidate.acquisition?.generationId === this.options.generationId,
+      );
+      const closeTarget = resource?.recoveryCleanup.closeOwnedTargetOnComplete;
+      if (typeof closeTarget !== "boolean") {
+        return pendingBrowserCaptureCleanup(
+          this.projectRuntime(mode),
+          `${this.options.targetLabel} target ${mode} disposition is missing`,
+          mode,
+        );
+      }
+      if (closeTarget && !this.target) {
+        if (
+          this.pendingAcquisitionEffectStarted &&
+          this.process &&
+          !this.processSettled &&
+          !this.keepBrowser()
+        ) {
+          deferredTargetToProcess = true;
+        } else {
+          return pendingBrowserCaptureCleanup(
+            this.projectRuntime(mode),
+            `${this.options.targetLabel} target has no retained exact close capability`,
+            mode,
+          );
+        }
+      } else {
+        if (closeTarget && this.target) {
+          try {
+            const closed = await closeChromeTargetWithRetainedCapability({
+              capability: this.target.capability,
+              targetId: this.target.targetId,
+              logger: this.options.logger,
+            });
+            if (closed.status === "unsafe" || closed.status === "unavailable") {
+              return pendingBrowserCaptureCleanup(this.projectRuntime(mode), closed.reason, mode);
+            }
+          } catch (error) {
+            return pendingBrowserCaptureCleanup(
+              this.projectRuntime(mode),
+              `${this.options.targetLabel} target close failed: ${error instanceof Error ? error.message : String(error)}`,
+              mode,
+            );
+          }
+        }
+        const error = await this.commitAuthorityChange({
+          targetSettled: true,
+          clearPending: "chrome-target",
+        });
+        if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+      }
+    }
+
+    if (!this.options.disconnectBeforeTarget) {
+      const error = await this.disconnectError();
+      if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+    }
+
+    if (this.leaseTeardownAuthority && this.process && !this.processSettled) {
+      let processEffectAttempted = false;
+      const outcome = await this.leaseTeardownAuthority.settle(async () => {
+        processEffectAttempted = true;
+        this.leaseProcessSettlement = await this.settleProcessEffect();
+        return this.leaseProcessSettlement.status === "completed";
+      });
+      const processSettlement = this.leaseProcessSettlement;
+      if (outcome.status === "completed") {
+        const processWasTerminated =
+          processSettlement?.status === "completed" &&
+          processSettlement.disposition === "terminated";
+        const error = await this.commitAuthorityChange({
+          leaseSettled: true,
+          processSettled: true,
+          ...(deferredTargetToProcess && processWasTerminated
+            ? { targetSettled: true, clearPending: "chrome-target" as const }
+            : {}),
+        });
+        if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+        if (deferredTargetToProcess && !processWasTerminated) {
+          const preservationReason =
+            outcome.disposition === "active-lease-handoff"
+              ? "active-lease handoff"
+              : "process preservation";
+          return pendingBrowserCaptureCleanup(
+            this.projectRuntime(mode),
+            `${this.options.targetLabel} target has no retained exact close capability after ${preservationReason}`,
+            mode,
+          );
+        }
+      } else {
+        if (this.leaseTeardownAuthority.leaseReleased && !this.leaseSettled) {
+          const error = await this.commitAuthorityChange({ leaseSettled: true });
+          if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+        }
+        return pendingBrowserCaptureCleanup(
+          this.projectRuntime(mode),
+          processEffectAttempted && processSettlement?.status === "pending"
+            ? processSettlement.reason
+            : (outcome.error ?? outcome.reason),
+          mode,
+        );
+      }
+    } else {
+      if (this.pendingResource === "tab-lease" || (this.lease && !this.leaseSettled)) {
+        try {
+          if (this.lease) {
+            if (this.options.releaseLease) await this.options.releaseLease(this.lease);
+            else await this.lease.release();
+          } else if (this.options.leaseId) {
+            await releaseBrowserTabLease(
+              this.options.userDataDir,
+              this.options.leaseId,
+              this.options.logger,
+              { expectedProfileIdentity: this.options.profileDirectoryIdentity },
+            );
+          } else {
+            throw new Error("lease id is missing");
+          }
+        } catch (error) {
+          return pendingBrowserCaptureCleanup(
+            this.projectRuntime(mode),
+            `${this.options.purpose} browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
+            mode,
+          );
+        }
+        const error = await this.commitAuthorityChange({
+          leaseSettled: true,
+          clearPending: "tab-lease",
+        });
+        if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+      }
+
+      if (this.pendingResource === "chrome-process" && !this.process) {
+        return pendingBrowserCaptureCleanup(
+          this.projectRuntime(mode),
+          `${this.options.purpose} Chrome process acquisition has no exact live owner authority`,
+          mode,
+        );
+      }
+      if (this.process && !this.processSettled) {
+        const processSettlement = await this.settleProcessEffect();
+        if (processSettlement.status === "pending") {
+          return pendingBrowserCaptureCleanup(
+            this.projectRuntime(mode),
+            processSettlement.reason,
+            mode,
+          );
+        }
+        const processWasTerminated = processSettlement.disposition === "terminated";
+        const error = await this.commitAuthorityChange({
+          processSettled: true,
+          clearPending: "chrome-process",
+          ...(deferredTargetToProcess && processWasTerminated
+            ? { targetSettled: true, clearPending: "chrome-target" as const }
+            : {}),
+        });
+        if (error) return pendingBrowserCaptureCleanup(this.projectRuntime(mode), error, mode);
+        if (deferredTargetToProcess && !processWasTerminated) {
+          return pendingBrowserCaptureCleanup(
+            this.projectRuntime(mode),
+            `${this.options.targetLabel} target has no retained exact close capability after process preservation`,
+            mode,
+          );
+        }
+      }
+    }
+
+    const ownedRuntime = this.projectRuntime(mode);
+    if (this.inheritedResources.length > 0 && this.options.settleRemainingResources) {
+      const result = await this.options.settleRemainingResources(mode, ownedRuntime);
+      this.baseRuntime = result.runtime;
+      this.inheritedResources = [...(result.runtime.recoveryCleanupResources ?? [])];
+      return result;
+    }
+    return completedBrowserCaptureCleanup(ownedRuntime);
+  }
+
+  private async disconnectError(): Promise<string | null> {
+    try {
+      await this.disconnect();
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private async settleProcessEffect(): Promise<LocalOwnedBrowserProcessSettlement> {
+    if (!this.process) return { status: "completed", disposition: "preserved" };
+    if (this.process.kind === "manual") {
+      if (this.options.settleManualProcess) {
+        return await this.options.settleManualProcess(this.process.owner);
+      }
+      const settlement = await settleManualChromeOwner(
+        this.options.userDataDir,
+        this.process.owner,
+        this.options.logger,
+      );
+      if (settlement.status === "unsafe") {
+        return {
+          status: "pending",
+          reason: this.options.manualProcessErrorPrefix
+            ? `${this.options.manualProcessErrorPrefix}: ${settlement.reason}`
+            : settlement.reason,
+        };
+      }
+      return {
+        status: "completed",
+        disposition: settlement.status === "terminated" ? "terminated" : "preserved",
+      };
+    }
+    const chrome = this.process.chrome;
+    if (this.options.settleTemporaryProcess) {
+      return await this.options.settleTemporaryProcess(chrome);
+    }
+    if (this.keepBrowser()) {
+      if (!this.target?.releasesProcessEndpointOnSettle) {
+        try {
+          await chrome.endpointAuthority?.release();
+        } catch (error) {
+          return {
+            status: "pending",
+            reason: `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      }
+      try {
+        chrome.process?.unref?.();
+      } catch {
+        // Best effort only; retained process ownership is already explicit in runtime metadata.
+      }
+      this.options.logger(
+        `Chrome left running on port ${chrome.port} with profile ${this.options.userDataDir}`,
+      );
+      return { status: "completed", disposition: "preserved" };
+    }
+    const termination = await chrome.kill().catch((error: unknown) => ({
+      status: "unsafe" as const,
+      pid: chrome.pid,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
+    if (!isSafeChromeTerminationOutcome(termination)) {
+      return { status: "pending", reason: termination.reason };
+    }
+    const removed = await removeProfileDirectoryIfIdentityMatches(
+      this.options.userDataDir,
+      chrome.processIdentity.profileDirectory,
+    ).catch(() => false);
+    return removed
+      ? { status: "completed", disposition: "terminated" }
+      : {
+          status: "pending",
+          reason: `Profile removal was not confirmed: ${this.options.userDataDir}`,
+        };
+  }
+
+  private async commitAuthorityChange(changes: {
+    targetSettled?: boolean;
+    leaseSettled?: boolean;
+    processSettled?: boolean;
+    clearPending?: LocalOwnedBrowserPendingResource;
+  }): Promise<string | null> {
+    const before = this.projectRuntime(this.settlementMode);
+    const previous = {
+      targetSettled: this.targetSettled,
+      leaseSettled: this.leaseSettled,
+      processSettled: this.processSettled,
+      pendingResource: this.pendingResource,
+    };
+    this.applyAuthorityChange(changes);
+    const after = this.projectRuntime(this.settlementMode);
+    this.targetSettled = previous.targetSettled;
+    this.leaseSettled = previous.leaseSettled;
+    this.processSettled = previous.processSettled;
+    this.pendingResource = previous.pendingResource;
+    try {
+      await this.options.persistRuntime?.(after);
+      await acknowledgeSettledTargetCloseCapabilities(before, after);
+    } catch (error) {
+      return `Browser authority progress could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    this.applyAuthorityChange(changes);
+    return null;
+  }
+
+  private applyAuthorityChange(changes: {
+    targetSettled?: boolean;
+    leaseSettled?: boolean;
+    processSettled?: boolean;
+    clearPending?: LocalOwnedBrowserPendingResource;
+  }): void {
+    if (changes.targetSettled !== undefined) this.targetSettled = changes.targetSettled;
+    if (changes.leaseSettled !== undefined) this.leaseSettled = changes.leaseSettled;
+    if (changes.processSettled !== undefined) this.processSettled = changes.processSettled;
+    if (changes.clearPending === this.pendingResource) this.pendingResource = undefined;
   }
 }

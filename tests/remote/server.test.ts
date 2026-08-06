@@ -993,6 +993,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       expect.objectContaining({ manualLogin: true, keepBrowser: true }),
       logger,
       "remote-serve-bootstrap",
+      { ownerPolicy: "service-persistent" },
     );
     expect(release).toHaveBeenCalledOnce();
     expect(kill).not.toHaveBeenCalled();
@@ -1609,9 +1610,34 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionToken = "5".repeat(64);
       const rejectedTransactionToken = "6".repeat(64);
       const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
+      const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/graceful-drain-generation";
       const runtime: BrowserRunTransaction["runtime"] = {
+        chromeHost: "127.0.0.1",
         chromePort: 9222,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
         chromeTargetId: "graceful-drain-target",
+        recoveryCleanupResources: [
+          {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeTargetId: "graceful-drain-target",
+            targetCloseCapability: {
+              version: 1,
+              generationId: "graceful-drain-generation",
+              capabilityId: "graceful-drain-capability",
+              targetId: "graceful-drain-target",
+              browserWSEndpoint,
+            },
+            acquisition: { generationId: "graceful-drain-generation" },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "none",
+              keepBrowser: false,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
       };
       const server = await createRemoteServer(
         { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
@@ -1790,16 +1816,27 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionToken = "4".repeat(64);
       const runtime: BrowserRunTransaction["runtime"] = {
         chromeHost: "127.0.0.1",
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
         chromePort: 9222,
         chromeTargetId: "shutdown-handoff-target",
         recoveryCleanupResources: [
           {
             chromeHost: "127.0.0.1",
+            chromeBrowserWSEndpoint:
+              "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
             chromePort: 9222,
+            targetCloseCapability: {
+              version: 1,
+              generationId: "shutdown-handoff-generation",
+              capabilityId: "shutdown-handoff-capability",
+              targetId: "shutdown-handoff-target",
+              browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
+            },
+            acquisition: { generationId: "shutdown-handoff-generation" },
             chromeTargetId: "shutdown-handoff-target",
             recoveryCleanup: {
               ownsTarget: true,
-              profileKind: "temporary",
+              profileKind: "none",
               keepBrowser: false,
               closeOwnedTargetOnComplete: true,
             },
@@ -2069,13 +2106,17 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           finalization: { status: "pending" },
         });
 
-        await expect(
-          settleRemoteBrowserRecovery({
-            runtime: firstFinalization.runtime,
-            configuredHost: `127.0.0.1:${server.port}`,
-            authToken: "secret",
-          }),
-        ).resolves.toMatchObject({ status: "completed" });
+        const retry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${recordName.slice(0, -".json".length)}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(retry).toMatchObject({
+          statusCode: 200,
+          json: { status: "terminal", outcome: { state: "finalized" } },
+        });
         expect(cleanupAttempts).toBe(2);
         expect(existsSync(secondCleanupMarker)).toBe(false);
         await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
@@ -2949,6 +2990,18 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         await expect(server.close()).rejects.toThrow("cleanup remains pending");
         expect(abort).toHaveBeenCalledTimes(2);
+        const cleanupRetry = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/retry`,
+          token: "secret",
+          body: {},
+        });
+        expect(cleanupRetry).toMatchObject({
+          statusCode: 200,
+          json: { status: "terminal", outcome: { state: "aborted" } },
+        });
+        expect(abort).toHaveBeenCalledTimes(3);
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
@@ -3763,6 +3816,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         expect(published).not.toHaveProperty("stagedCapture");
         expect(publishCapture).toHaveBeenCalledOnce();
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${"1".repeat(64)}/finalize`,
+          token: "secret",
+          body: { durablePublication: true },
+        });
+        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
       } finally {
         publishCapture.mockRestore();
         await server.close();

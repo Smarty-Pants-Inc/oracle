@@ -37,21 +37,29 @@ export interface PlatformProcessGenerationProviderDeps {
 }
 
 type DarwinProcessGenerationNamespace = "audit-pidversion" | "kernel-start" | "sample-launch";
-// A namespace switch is not evidence of PID reuse. Only an exact match or a mismatch within one
-// authenticated provider namespace is comparable.
+export type PlatformProcessGenerationComparison = "same" | "different" | "incomparable";
+
+// A namespace switch is not evidence of PID reuse or continuity. Chrome may bridge it only with
+// an independent launch claim; filesystem locks continue treating it as not definitely different.
+export function comparePlatformProcessGenerations(
+  persistedIdentity: string,
+  observedIdentity: string,
+): PlatformProcessGenerationComparison {
+  if (persistedIdentity === observedIdentity) return "same";
+  const persistedDarwinNamespace = readDarwinProcessGenerationNamespace(persistedIdentity);
+  const observedDarwinNamespace = readDarwinProcessGenerationNamespace(observedIdentity);
+  return persistedDarwinNamespace !== null &&
+    observedDarwinNamespace !== null &&
+    persistedDarwinNamespace !== observedDarwinNamespace
+    ? "incomparable"
+    : "different";
+}
 
 export function arePlatformProcessGenerationsDefinitelyDifferent(
   persistedIdentity: string,
   observedIdentity: string,
 ): boolean {
-  if (persistedIdentity === observedIdentity) return false;
-  const persistedDarwinNamespace = readDarwinProcessGenerationNamespace(persistedIdentity);
-  const observedDarwinNamespace = readDarwinProcessGenerationNamespace(observedIdentity);
-  return (
-    persistedDarwinNamespace === null ||
-    observedDarwinNamespace === null ||
-    persistedDarwinNamespace === observedDarwinNamespace
-  );
+  return comparePlatformProcessGenerations(persistedIdentity, observedIdentity) === "different";
 }
 
 function readDarwinProcessGenerationNamespace(
