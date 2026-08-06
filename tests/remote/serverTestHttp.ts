@@ -36,6 +36,7 @@ export async function prepareTestAuthentication({
       method,
       path,
       body,
+      issuedAt: Date.now(),
     }),
   };
 }

@@ -698,6 +698,9 @@ export type LocalOwnedBrowserProcessSettlement =
 
 export interface LocalOwnedBrowserTargetAuthority {
   targetId: string;
+  chromeHost?: string;
+  chromePort?: number;
+  browserWSEndpoint?: string;
   releasesProcessEndpointOnSettle?: boolean;
   capability: BrowserRecoveryTargetCloseCapabilityMetadata;
   disconnect?: () => Promise<void>;
@@ -887,6 +890,46 @@ export class LocalOwnedBrowserResourceAuthority {
     });
   }
 
+  async persistProjection(projection: LocalOwnedBrowserRuntimeProjection): Promise<void> {
+    this.keepBrowserDisposition = projection.keepBrowser;
+    this.closeOwnedTargetOnComplete = projection.closeOwnedTargetOnComplete;
+    this.tabUrl = projection.tabUrl;
+    await this.transaction.persist(this.buildRuntime());
+  }
+
+  async closeTargetForRetry(): Promise<void> {
+    if (this.pendingResource !== "chrome-target" && (!this.target || this.targetSettled)) {
+      return;
+    }
+    if (!this.target) {
+      if (this.pendingAcquisitionEffectStarted) {
+        throw new Error(
+          `${this.options.targetLabel} target has no retained exact close capability`,
+        );
+      }
+    } else {
+      try {
+        const closed = await closeChromeTargetWithRetainedCapability({
+          capability: this.target.capability,
+          targetId: this.target.targetId,
+          logger: this.options.logger,
+        });
+        if (closed.status === "unsafe" || closed.status === "unavailable") {
+          throw new Error(closed.reason);
+        }
+      } catch (error) {
+        throw new Error(
+          `${this.options.targetLabel} target close failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    const error = await this.commitAuthorityChange({
+      targetSettled: true,
+      clearPending: "chrome-target",
+    });
+    if (error) throw new Error(error);
+  }
+
   async disconnect(): Promise<void> {
     if (this.connectionDisconnected || !this.target?.disconnect) return;
     try {
@@ -1054,6 +1097,8 @@ export class LocalOwnedBrowserResourceAuthority {
     const processIdentity = this.processIdentity();
     const targetPending =
       this.pendingResource === "chrome-target" || Boolean(this.target && !this.targetSettled);
+    const targetEndpoint =
+      this.target && (targetPending || !this.closeOwnedTargetOnComplete) ? this.target : null;
     const leasePending =
       this.pendingResource === "tab-lease" || Boolean(this.lease && !this.leaseSettled);
     const processPending =
@@ -1064,9 +1109,10 @@ export class LocalOwnedBrowserResourceAuthority {
       browserTransport: "cdp",
       chromePid: chrome?.pid,
       chromeProcessIdentity: processIdentity,
-      chromePort: chrome?.port,
-      chromeHost: chrome?.host ?? "127.0.0.1",
-      chromeBrowserWSEndpoint: this.endpointAuthority()?.browserWSEndpoint,
+      chromePort: targetEndpoint?.chromePort ?? chrome?.port,
+      chromeHost: targetEndpoint?.chromeHost ?? chrome?.host ?? "127.0.0.1",
+      chromeBrowserWSEndpoint:
+        targetEndpoint?.browserWSEndpoint ?? this.endpointAuthority()?.browserWSEndpoint,
       chromeProfileRoot: this.options.userDataDir,
       userDataDir: this.options.userDataDir,
       chromeTargetId: targetPending
@@ -1088,9 +1134,10 @@ export class LocalOwnedBrowserResourceAuthority {
           processIdentity?.profileDirectory ??
           this.lease?.profileDirectory ??
           this.options.profileDirectoryIdentity,
-        chromePort: chrome?.port,
-        chromeHost: chrome?.host ?? "127.0.0.1",
-        chromeBrowserWSEndpoint: this.endpointAuthority()?.browserWSEndpoint,
+        chromePort: targetEndpoint?.chromePort ?? chrome?.port,
+        chromeHost: targetEndpoint?.chromeHost ?? chrome?.host ?? "127.0.0.1",
+        chromeBrowserWSEndpoint:
+          targetEndpoint?.browserWSEndpoint ?? this.endpointAuthority()?.browserWSEndpoint,
         chromeProfileRoot: this.options.userDataDir,
         userDataDir: this.options.userDataDir,
         chromeTargetId: targetPending

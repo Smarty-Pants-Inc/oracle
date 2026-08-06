@@ -58,6 +58,7 @@ import {
   unresolvedRemoteTransactionRuntime,
 } from "./clientRecovery.js";
 import { mergeTransferredArtifacts, transferRemoteArtifact } from "./clientArtifacts.js";
+import { assertRemoteTransactionToken } from "./transactionToken.js";
 
 export { settleRemoteBrowserRecovery } from "./clientRecovery.js";
 
@@ -125,6 +126,7 @@ export function createRemoteBrowserExecutor({
       ? await serializeAttachments(options.fallbackSubmission.attachments ?? [], attachmentBudget)
       : undefined;
     const transactionToken = randomBytes(32).toString("hex");
+    assertRemoteTransactionToken(transactionToken);
     const payload = RemoteRunPayloadSchema.parse({
       protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
       prompt: options.prompt,
@@ -384,6 +386,7 @@ export async function resumeRemoteBrowserTransaction(params: {
       { stage: "remote-resume", recoverableDisconnect: true, runtime: params.runtime },
     );
   }
+  assertRemoteTransactionToken(authority.transactionToken);
   if (!params.authToken) {
     throw new BrowserAutomationError(
       "Remote transaction authentication is unavailable; configure ORACLE_REMOTE_TOKEN.",
@@ -468,9 +471,6 @@ async function buildRemoteBrowserTransaction(params: {
   let selectedSettlementMode = params.settlementMode;
   if (selectedSettlementMode) runtime = bindRemoteSettlementMode(runtime, selectedSettlementMode);
   let settlementBindingPersisted = selectedSettlementMode !== undefined;
-  let requiredArtifactDeliveryComplete = !params.receipt.artifacts.some(
-    (descriptor) => descriptor.required,
-  );
   let transaction!: BrowserRunTransaction;
   let settlementInFlight: {
     mode: "finalize" | "abort";
@@ -597,16 +597,6 @@ async function buildRemoteBrowserTransaction(params: {
         throw settlementModeConflict("finalize", authoritativeMode, runtime);
       }
       if (completedSettlement) return completedSettlement;
-      if (!requiredArtifactDeliveryComplete) {
-        try {
-          await persistSettlementBinding("finalize");
-        } catch (error) {
-          return retryableBindingFailure(error, "finalize");
-        }
-        const error =
-          "Remote finalize remains retryable until every required artifact is delivered.";
-        return pendingBrowserCaptureCleanup(runtime, error, "finalize");
-      }
       return await settle("finalize");
     },
     abort: () => settle("abort"),
@@ -626,55 +616,42 @@ async function buildRemoteBrowserTransaction(params: {
     );
   }
   const artifactSessionId = params.options.sessionId?.trim();
-  if (params.receipt.artifacts.length > 0 && !artifactSessionId) {
-    throw new BrowserAutomationError(
-      "Remote artifact delivery requires the recovering local session identity.",
-      {
-        stage: "remote-artifact-transfer",
-        code: "recovering-session-id-missing",
-        recoverableDisconnect: true,
-        transactionToken: params.receipt.transactionToken,
-        runtime,
-      },
-    );
-  }
-
   const transferredFiles: SavedBrowserFile[] = [];
   const transferFailures: string[] = [];
   for (const descriptor of params.receipt.artifacts) {
     try {
+      if (!artifactSessionId) {
+        throw new Error("the recovering local session identity is unavailable");
+      }
       const transferred = await transferRemoteArtifact({
         hostname: params.hostname,
         port: params.port,
         token: params.token,
         descriptor,
         transactionToken: params.receipt.transactionToken,
-        sessionId: artifactSessionId as string,
+        sessionId: artifactSessionId,
         log: params.options.log,
         deadlines: params.deadlines,
       });
       transferredFiles.push(transferred);
     } catch (error) {
       const filename = sanitizeArtifactFilename(descriptor.filename, "artifact.bin");
-      const message = `Oracle captured the browser text response, but bridge artifact transfer failed for ${filename}. Reason: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
-      params.options.log?.(`[browser] ${message}`);
-      if (descriptor.required) {
-        throw new BrowserAutomationError(message, {
-          stage: "remote-artifact-transfer",
-          recoverableDisconnect: true,
-          transactionToken: params.receipt.transactionToken,
-          runtime,
-        });
-      }
-      transferFailures.push(message);
+      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 1024);
+      const failure = `${filename}: ${reason}`;
+      params.options.log?.(
+        `[browser] Oracle captured the browser text response, but bridge artifact transfer failed for ${failure}`,
+      );
+      transferFailures.push(failure);
     }
   }
-  requiredArtifactDeliveryComplete = true;
   Object.assign(
     transaction,
-    mergeTransferredArtifacts(params.receipt.result, transferredFiles, transferFailures),
+    mergeTransferredArtifacts(
+      params.receipt.result,
+      transferredFiles,
+      transferFailures,
+      params.host,
+    ),
   );
   return transaction;
 }

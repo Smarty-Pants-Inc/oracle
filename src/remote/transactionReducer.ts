@@ -90,6 +90,28 @@ const reducers: RemoteTransactionReducers = {
     record.artifactNamespaceIdentity = transition.identity;
     return { persist: true, outcome: undefined };
   },
+  "rollback-artifact-namespace-initialization": (record, transition, context) => {
+    if (
+      record.state !== "running" ||
+      record.runId !== transition.runId ||
+      record.artifactNamespaceState !== "initializing"
+    ) {
+      throw new Error("Remote artifact namespace rollback is not owned by the initializing run");
+    }
+    assertCurrentController(record, context, "roll back artifact namespace initialization");
+    if (
+      record.artifactNamespaceIdentity &&
+      (!transition.identity ||
+        !isDeepStrictEqual(record.artifactNamespaceIdentity, transition.identity))
+    ) {
+      throw new Error(
+        "Remote artifact namespace rollback identity does not match durable authority",
+      );
+    }
+    record.artifactNamespaceState = "uninitialized";
+    delete record.artifactNamespaceIdentity;
+    return { persist: true, outcome: undefined };
+  },
   "complete-artifact-namespace-initialization": (record, transition, context) => {
     if (
       record.state !== "running" ||

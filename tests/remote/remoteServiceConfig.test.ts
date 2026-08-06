@@ -4,6 +4,7 @@ import {
   isLoopbackRemoteHostname,
   parsePlaintextRemoteEndpoint,
   resolveRemoteServiceConfig,
+  validateResolvedRemoteServiceConfig,
 } from "../../src/remote/remoteServiceConfig.js";
 
 const CLI_TOKEN = "a".repeat(64);
@@ -130,6 +131,35 @@ describe("resolveRemoteServiceConfig", () => {
         );
       }
     }
+  });
+
+  it("defers dormant predecessor credential validation until remote use", () => {
+    const predecessorToken = "a".repeat(32);
+    const resolved = resolveRemoteServiceConfig({
+      userConfig: {
+        browser: { remoteHost: "127.0.0.1:9473", remoteToken: predecessorToken },
+      },
+      env: {} as NodeJS.ProcessEnv,
+      validate: false,
+    });
+
+    expect(resolved.token).toBe(predecessorToken);
+    expect(() => validateResolvedRemoteServiceConfig(resolved)).toThrow(
+      /immediately preceding base-generated.*32 lowercase.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
+    );
+  });
+
+  it("defers dormant remote endpoint validation until remote use", () => {
+    const resolved = resolveRemoteServiceConfig({
+      userConfig: { browser: { remoteHost: "bridge.example.com:9473" } },
+      env: {} as NodeJS.ProcessEnv,
+      validate: false,
+    });
+
+    expect(resolved.host).toBe("bridge.example.com:9473");
+    expect(() => validateResolvedRemoteServiceConfig(resolved)).toThrow(
+      /loopback-only.*SSH tunnel.*verified TLS/i,
+    );
   });
 
   it("does not enable legacy fallback merely because a legacy token exists", () => {

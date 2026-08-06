@@ -1,6 +1,5 @@
 import net from "node:net";
-import { parseHostPort } from "../bridge/connection.js";
-import { assertRemoteCredential } from "./auth.js";
+import { assertCurrentRemoteCredential, parseHostPort } from "../bridge/connection.js";
 
 import type { UserConfig } from "../config.js";
 
@@ -85,6 +84,35 @@ function resolveSource(
   return "unset";
 }
 
+export function validateResolvedRemoteServiceConfig(
+  resolved: ResolvedRemoteServiceConfig,
+): ResolvedRemoteServiceConfig {
+  if (resolved.host) parsePlaintextRemoteEndpoint(resolved.host);
+  if (resolved.token !== undefined) {
+    assertCurrentRemoteCredential(
+      resolved.token,
+      `Remote v3 HMAC root key from ${resolved.sources.token}`,
+    );
+  }
+  if (resolved.legacyToken !== undefined) {
+    assertCurrentRemoteCredential(
+      resolved.legacyToken,
+      `Remote legacy bearer credential from ${resolved.sources.legacyToken}`,
+    );
+  }
+  if (
+    resolved.allowLegacyTextProtocol &&
+    resolved.token &&
+    resolved.legacyToken &&
+    resolved.token === resolved.legacyToken
+  ) {
+    throw new Error(
+      "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
+    );
+  }
+  return resolved;
+}
+
 export function resolveRemoteServiceConfig({
   cliHost,
   cliToken,
@@ -92,6 +120,7 @@ export function resolveRemoteServiceConfig({
   cliAllowLegacyTextProtocol,
   userConfig,
   env = process.env,
+  validate = true,
 }: {
   cliHost?: string;
   cliToken?: string;
@@ -99,6 +128,7 @@ export function resolveRemoteServiceConfig({
   cliAllowLegacyTextProtocol?: boolean;
   userConfig?: UserConfig;
   env?: NodeJS.ProcessEnv;
+  validate?: boolean;
 }): ResolvedRemoteServiceConfig {
   const configBrowserHost = normalizeString(userConfig?.browser?.remoteHost);
   const configBrowserToken = normalizeCredential(userConfig?.browser?.remoteToken);
@@ -131,23 +161,8 @@ export function resolveRemoteServiceConfig({
     configBrowserLegacyToken,
     envLegacyToken,
   );
-  if (host) parsePlaintextRemoteEndpoint(host);
-  if (token !== undefined) {
-    assertRemoteCredential(token, `Remote v3 HMAC root key from ${tokenSource}`);
-  }
-  if (legacyToken !== undefined) {
-    assertRemoteCredential(
-      legacyToken,
-      `Remote legacy bearer credential from ${legacyTokenSource}`,
-    );
-  }
-  if (allowLegacyTextProtocol && token && legacyToken && token === legacyToken) {
-    throw new Error(
-      "Legacy text protocol requires a bearer credential distinct from the v3 HMAC root key.",
-    );
-  }
 
-  return {
+  const resolved: ResolvedRemoteServiceConfig = {
     host,
     token,
     legacyToken,
@@ -163,4 +178,5 @@ export function resolveRemoteServiceConfig({
       ),
     },
   };
+  return validate ? validateResolvedRemoteServiceConfig(resolved) : resolved;
 }

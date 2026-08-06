@@ -1,14 +1,6 @@
 import { randomUUID } from "node:crypto";
-import {
-  acquireManualChromeOwner,
-  releaseManualChromeOwnerEndpointAuthority,
-  settleManualChromeOwner,
-  type ManualChromeOwner,
-} from "./manualChromeOwner.js";
-import type {
-  BrowserRecoveryCleanupResourceMetadata,
-  BrowserRuntimeMetadata,
-} from "../sessionManager.js";
+import { acquireManualChromeOwner } from "./manualChromeOwner.js";
+import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { SessionMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger, ChromeClient } from "./types.js";
@@ -22,18 +14,10 @@ import {
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { CHATGPT_URL } from "./constants.js";
-import {
-  acquireBrowserTabLease,
-  retainBrowserTabLeaseTeardownAuthority,
-  type BrowserTabLease,
-  type BrowserTabLeaseTeardownAuthority,
-} from "./tabLeaseRegistry.js";
+import { acquireBrowserTabLease } from "./tabLeaseRegistry.js";
 import { captureProfileDirectoryIdentity, createChromeProcessLaunchClaim } from "./profileState.js";
 import {
-  OwnedBrowserResourceTransaction,
-  completedBrowserCaptureCleanup,
-  pendingBrowserCaptureCleanup,
-  projectBrowserCaptureCleanupRuntime,
+  LocalOwnedBrowserResourceAuthority,
   type BrowserCaptureSettlementMode,
 } from "./ownedBrowserResources.js";
 import {
@@ -44,10 +28,7 @@ import {
 import { isImageOnlyUiChromeText } from "./index.js";
 import { harvestChatGptTab } from "./liveTabs.js";
 import { buildConversationUrl } from "./reattachHelpers.js";
-import {
-  closeChromeTargetWithRetainedCapability,
-  retainChromeTargetCloseCapability,
-} from "./targetCloseAuthority.js";
+import { retainChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
 
@@ -244,207 +225,49 @@ export async function recoverConversationTab(
   const ownerDisposition = config.keepBrowser ? "preserve" : "close-on-last-lease";
   const leaseId = randomUUID();
   const targetMarkerUrl = `about:blank#oracle-recovery=${generationId}`;
-  let profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
-  let lease: BrowserTabLease | null = null;
-  let owner: ManualChromeOwner | null = null;
-  let teardownAuthority: BrowserTabLeaseTeardownAuthority | null = null;
-  let target: { host: string; port: number; targetId: string } | null = null;
-  const readTarget = (): { host: string; port: number; targetId: string } | null => target;
-  let targetEndpointAuthority: RetainedChromeEndpointAuthority | null = null;
-  let targetCloseCapability: BrowserRecoveryCleanupResourceMetadata["targetCloseCapability"];
-  let targetUrl: string | undefined;
-  let targetClosed = false;
-  let leaseReleased = false;
-  let ownerSettled = false;
-
-  const runtime = (
-    pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
-  ): BrowserRuntimeMetadata => {
-    const chrome = owner?.chrome;
-    const targetCleanupPending = Boolean(
-      (target && !targetClosed) || pendingResource === "chrome-target",
-    );
-    const cleanupPending = Boolean(
-      pendingResource || targetCleanupPending || !leaseReleased || (owner && !ownerSettled),
-    );
-    const base: BrowserRuntimeMetadata = {
-      ...(meta.browser?.runtime ?? {}),
-      browserTransport: "cdp",
-      chromePid: chrome?.pid,
-      chromeProcessIdentity: owner?.processIdentity,
-      chromePort: target?.port ?? chrome?.port,
-      chromeBrowserWSEndpoint:
-        targetEndpointAuthority?.browserWSEndpoint ??
-        owner?.endpointAuthority?.browserWSEndpoint ??
-        chrome?.endpointAuthority?.browserWSEndpoint,
-      chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
-      chromeProfileRoot: userDataDir,
-      userDataDir,
-      chromeTargetId: targetCleanupPending ? (target?.targetId ?? undefined) : undefined,
-      tabUrl: targetUrl ?? url,
-      conversationId: locator.conversationId,
-      promptEpoch: locator.epoch,
-      controllerPid: process.pid,
-    };
-    if (!cleanupPending) {
-      delete base.recoveryCleanupResources;
-      delete base.recoveryCleanupResult;
-      return base;
-    }
-    const resource: BrowserRecoveryCleanupResourceMetadata = {
-      chromePid: chrome?.pid,
-      chromeProcessIdentity: owner?.processIdentity,
-      profileDirectoryIdentity: owner?.processIdentity.profileDirectory ?? profileDirectory,
-      chromePort: target?.port ?? chrome?.port,
-      chromeBrowserWSEndpoint:
-        targetEndpointAuthority?.browserWSEndpoint ??
-        owner?.endpointAuthority?.browserWSEndpoint ??
-        chrome?.endpointAuthority?.browserWSEndpoint,
-      chromeHost: target?.host ?? chrome?.host ?? "127.0.0.1",
-      chromeProfileRoot: userDataDir,
-      userDataDir,
-      chromeTargetId: targetCleanupPending ? (target?.targetId ?? undefined) : undefined,
-      targetCloseCapability: targetCleanupPending ? targetCloseCapability : undefined,
-      conversationId: locator.conversationId,
-      promptEpoch: locator.epoch,
-      tabLease: !leaseReleased
-        ? {
-            id: lease?.id ?? leaseId,
-            profileDirectory: lease?.profileDirectory ?? profileDirectory,
-          }
-        : undefined,
-      acquisition: {
-        generationId,
-        processOwnerProvenance: "manual-canonical-owner",
-        processLaunchClaim: launchClaim,
-        processOwnerDisposition: ownerDisposition,
-        ...(pendingResource ? { pendingResource } : {}),
-        targetMarkerUrl,
-      },
-      recoveryCleanup: {
-        ownsTarget: targetCleanupPending,
-        profileKind: "manual-login",
-        keepBrowser: owner ? owner.disposition === "preserve" : ownerDisposition === "preserve",
-        closeOwnedTargetOnComplete: targetCleanupPending,
-      },
-    };
-    return {
-      ...base,
-      recoveryCleanupResources: [resource],
-      recoveryCleanupResult: { status: "pending" },
-    };
+  const profileDirectory = await captureProfileDirectoryIdentity(userDataDir);
+  const baseRuntime: BrowserRuntimeMetadata = {
+    ...(meta.browser?.runtime ?? {}),
+    browserTransport: "cdp",
+    chromeTargetId: undefined,
+    chromeProfileRoot: userDataDir,
+    userDataDir,
+    tabUrl: url,
+    conversationId: locator.conversationId,
+    promptEpoch: locator.epoch,
+    controllerPid: process.pid,
   };
-
-  const settleResources = async (
-    mode: BrowserCaptureSettlementMode,
-    pendingRuntime: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> => {
-    const errors: string[] = [];
-    const cleanup = pendingRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
-    if (
-      mode === "finalize" &&
-      cleanup?.ownsTarget === true &&
-      typeof cleanup.closeOwnedTargetOnComplete !== "boolean"
-    ) {
-      return pendingBrowserCaptureCleanup(
-        pendingRuntime,
-        "Recovered target finalize disposition is missing",
-        mode,
-      );
-    }
-    if (target && !targetClosed && cleanup?.ownsTarget === true) {
-      try {
-        if (!targetCloseCapability) {
-          errors.push("Recovered target has no retained exact close capability");
-        } else {
-          const closed = await closeChromeTargetWithRetainedCapability({
-            capability: targetCloseCapability,
-            targetId: target.targetId,
-            logger,
-          });
-          if (closed.status === "completed" || closed.status === "gone") targetClosed = true;
-          else errors.push(closed.reason);
+  delete baseRuntime.recoveryCleanupResources;
+  delete baseRuntime.recoveryCleanupResult;
+  const resources = new LocalOwnedBrowserResourceAuthority({
+    purpose: "Recovered ChatGPT",
+    targetLabel: "Recovered",
+    baseRuntime,
+    userDataDir,
+    profileDirectoryIdentity: profileDirectory,
+    profileKind: "manual-login",
+    keepBrowser: config.keepBrowser,
+    closeOwnedTargetOnComplete: true,
+    generationId,
+    processOwnerProvenance: "manual-canonical-owner",
+    processLaunchClaim: launchClaim,
+    processOwnerDisposition: ownerDisposition,
+    leaseId,
+    targetMarkerUrl,
+    tabUrl: url,
+    logger,
+    ...(options.persistRuntime
+      ? {
+          persistRuntime: async (nextRuntime) => {
+            await options.persistRuntime?.(nextRuntime);
+            return nextRuntime;
+          },
+          persistSettlementResult: async (nextRuntime) => options.persistRuntime?.(nextRuntime),
         }
-      } catch (error) {
-        errors.push(
-          `Recovered target close failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    if (
-      errors.length === 0 &&
-      lease &&
-      (!leaseReleased || Boolean(teardownAuthority && owner && !ownerSettled))
-    ) {
-      if (teardownAuthority && owner) {
-        let ownerError: string | null = null;
-        const ownerForSettlement = owner;
-        const outcome = await teardownAuthority.settle(async () => {
-          const settlement = await settleManualChromeOwner(userDataDir, ownerForSettlement, logger);
-          if (settlement.status === "unsafe") {
-            ownerError = settlement.reason;
-            return false;
-          }
-          ownerSettled = true;
-          return true;
-        });
-        leaseReleased = teardownAuthority.leaseReleased;
-        if (outcome.status === "preserved") {
-          errors.push(ownerError ?? outcome.error ?? outcome.reason);
-        } else if (outcome.disposition === "active-lease-handoff") {
-          ownerSettled = true;
-        }
-      } else {
-        try {
-          await lease.release();
-          leaseReleased = true;
-        } catch (error) {
-          errors.push(
-            `Recovered browser lease release failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        if (leaseReleased && owner && !ownerSettled) {
-          const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
-          if (settlement.status === "unsafe") errors.push(settlement.reason);
-          else ownerSettled = true;
-        }
-      }
-    }
-    if (errors.length === 0 && !teardownAuthority && leaseReleased && owner && !ownerSettled) {
-      const settlement = await settleManualChromeOwner(userDataDir, owner, logger);
-      if (settlement.status === "unsafe") errors.push(settlement.reason);
-      else ownerSettled = true;
-    }
-    const resourceRuntime = runtime();
-    return errors.length > 0
-      ? pendingBrowserCaptureCleanup(resourceRuntime, [...new Set(errors)].join("; "), mode)
-      : completedBrowserCaptureCleanup(resourceRuntime);
-  };
-
-  const resources = new OwnedBrowserResourceTransaction(
-    {
-      ...(options.persistRuntime
-        ? {
-            persistRuntime: async (nextRuntime) => options.persistRuntime?.(nextRuntime),
-            persistSettlementResult: async (nextRuntime) => options.persistRuntime?.(nextRuntime),
-          }
-        : {}),
-      settleResources,
-    },
-    runtime(),
-  );
-
-  const settle: RecoveredConversationCleanup = async (mode, pendingRuntime) => {
-    const currentRuntime = resources.runtime();
-    if (
-      pendingRuntime &&
-      currentRuntime.recoveryCleanupResources?.length &&
-      !currentRuntime.recoveryCleanupResult?.settlementMode
-    ) {
-      resources.replaceRuntime(projectBrowserCaptureCleanupRuntime(pendingRuntime, runtime()));
-    }
-    return resources.settle(mode);
-  };
+      : {}),
+  });
+  const settle: RecoveredConversationCleanup = (mode, pendingRuntime) =>
+    resources.settle(mode, pendingRuntime);
 
   const openRecoveredTarget = async (
     endpoint: RecoveryEndpoint,
@@ -455,7 +278,7 @@ export async function recoverConversationTab(
       throw new Error("Owned recovered target acquisition requires exact endpoint authority.");
     }
     const opened = await resources.journalAcquisition({
-      intentRuntime: runtime("chrome-target"),
+      resource: "chrome-target",
       acquire: async () => {
         let client: ChromeClient;
         let targetId: string;
@@ -506,23 +329,27 @@ export async function recoverConversationTab(
             }),
           ...(releaseCloseAuthority ? { release: releaseCloseAuthority } : {}),
         });
-        return { client, targetId, capability };
+        return { client, targetId, capability, browserWSEndpoint };
       },
-      acquiredRuntime: (connection) => {
-        target = { ...endpoint, targetId: connection.targetId };
-        targetEndpointAuthority = endpointAuthority ?? null;
-        targetCloseCapability = connection.capability;
-        targetClosed = false;
-        targetUrl = targetMarkerUrl;
-        return runtime();
-      },
+      authority: (connection) => ({
+        targetId: connection.targetId,
+        chromeHost: endpoint.host,
+        chromePort: endpoint.port,
+        ...(connection.browserWSEndpoint
+          ? { browserWSEndpoint: connection.browserWSEndpoint }
+          : {}),
+        capability: connection.capability,
+      }),
     });
     try {
       const Page = opened.client.Page;
       await Page.enable();
       await Page.navigate({ url });
-      targetUrl = url;
-      await resources.persist(runtime());
+      await resources.persistProjection({
+        keepBrowser: config.keepBrowser,
+        closeOwnedTargetOnComplete: true,
+        tabUrl: url,
+      });
     } finally {
       await opened.client.close().catch(() => undefined);
     }
@@ -530,8 +357,8 @@ export async function recoverConversationTab(
   };
 
   try {
-    lease = await resources.journalAcquisition({
-      intentRuntime: runtime("tab-lease"),
+    const lease = await resources.journalAcquisition({
+      resource: "tab-lease",
       acquire: () =>
         acquireBrowserTabLease(userDataDir, {
           maxConcurrentTabs: config.maxConcurrentTabs,
@@ -540,11 +367,7 @@ export async function recoverConversationTab(
           sessionId: meta.id,
           leaseId,
         }),
-      acquiredRuntime: (acquiredLease) => {
-        lease = acquiredLease;
-        profileDirectory = acquiredLease.profileDirectory;
-        return runtime();
-      },
+      authority: (acquiredLease) => acquiredLease,
     });
 
     if (options.existingEndpoint) {
@@ -576,20 +399,10 @@ export async function recoverConversationTab(
           cleanup: settle,
         };
       } catch (error) {
-        const failedTarget = readTarget();
-        if (failedTarget && !targetClosed) {
-          if (!targetCloseCapability) throw error;
-          const closed = await closeChromeTargetWithRetainedCapability({
-            capability: targetCloseCapability,
-            targetId: failedTarget.targetId,
-            logger,
-          }).catch(() => ({ status: "unsafe" as const, reason: "target cleanup failed" }));
-          if (closed.status !== "completed" && closed.status !== "gone") throw error;
-          targetClosed = true;
-          target = null;
-          targetEndpointAuthority = null;
-          targetCloseCapability = undefined;
-          await resources.persist(runtime());
+        try {
+          await resources.closeTargetForRetry();
+        } catch {
+          throw error;
         }
         const message = error instanceof Error ? error.message : String(error);
         logger(
@@ -601,22 +414,12 @@ export async function recoverConversationTab(
     logger(
       `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
     );
-    owner = await resources.journalAcquisition({
-      intentRuntime: runtime("chrome-process"),
+    const owner = await resources.journalAcquisition({
+      resource: "chrome-process",
       acquire: () =>
         acquireManualChromeOwner(userDataDir, config, logger, meta.id, { launchClaim }),
-      acquiredRuntime: (acquiredOwner) => {
-        owner = acquiredOwner;
-        return runtime();
-      },
+      authority: (acquiredOwner) => ({ kind: "manual", owner: acquiredOwner }),
     });
-    if (owner.disposition === "close-on-last-lease") {
-      const ownerForHandoff = owner;
-      teardownAuthority = retainBrowserTabLeaseTeardownAuthority(userDataDir, lease, {
-        logger,
-        onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerForHandoff),
-      });
-    }
     const host = owner.chrome.host ?? "127.0.0.1";
     const port = owner.chrome.port;
     const endpointAuthority = owner.endpointAuthority ?? owner.chrome.endpointAuthority;

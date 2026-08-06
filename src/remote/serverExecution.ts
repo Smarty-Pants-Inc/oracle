@@ -79,12 +79,14 @@ export async function handleRemoteRunRequest(params: {
   transactionStore: RemoteTransactionStore;
   artifactStore: RemoteArtifactStore;
   transactionCoordinator: RemoteTransactionCoordinator;
+  releaseTransactionAdmission?: () => void;
 }): Promise<void> {
   let payload: RemoteRunPayload;
   try {
     const body = await readRequestBody(params.req, MAX_REMOTE_REQUEST_BYTES);
     payload = validateRemoteRunPayload(JSON.parse(body), params.protocol);
   } catch (error) {
+    params.releaseTransactionAdmission?.();
     const requestError =
       error instanceof RemoteRequestError
         ? error
@@ -103,6 +105,7 @@ export async function handleRemoteRunRequest(params: {
 
   const existing = await params.transactionStore.read(params.transactionToken);
   if (existing) {
+    params.releaseTransactionAdmission?.();
     sendJson(params.res, 409, {
       error: "transaction_exists",
       state: existing.state,
@@ -123,6 +126,7 @@ export async function handleRemoteRunRequest(params: {
       browserConfig: effectiveBrowserConfig,
     });
   } catch (error) {
+    params.releaseTransactionAdmission?.();
     if (error instanceof RemoteTransactionCapacityError) {
       sendJson(params.res, 503, {
         error: error.code,
@@ -132,6 +136,7 @@ export async function handleRemoteRunRequest(params: {
     }
     throw error;
   }
+  params.releaseTransactionAdmission?.();
   let artifactWriteAuthority: BrowserArtifactWriteAuthority;
   try {
     artifactWriteAuthority = await params.artifactStore.createArtifactWriteAuthority({

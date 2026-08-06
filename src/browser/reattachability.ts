@@ -1,6 +1,12 @@
 import path from "node:path";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import type { BrowserRemoteRecoveryMetadata } from "../sessionManager.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../remote/types.js";
+import {
+  assertRemoteTransactionToken,
+  isRemoteTransactionToken,
+} from "../remote/transactionToken.js";
 import { extractStableConversationIdFromUrl, isStableConversationUrl } from "./conversationUrl.js";
 import {
   parseChromeProcessIdentity,
@@ -16,11 +22,59 @@ export type CommittedBrowserPromptEpoch = Extract<
   { status: "committed" }
 >;
 
+export function isRemoteRecoveryAuthority(value: unknown): value is BrowserRemoteRecoveryMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const authority = value as Partial<BrowserRemoteRecoveryMetadata>;
+  if (
+    authority.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
+    typeof authority.host !== "string" ||
+    authority.host.length === 0 ||
+    authority.host !== authority.host.trim() ||
+    !isRemoteTransactionToken(authority.transactionToken) ||
+    !["pre-receipt", "pending", "recoverable-error"].includes(authority.state ?? "")
+  ) {
+    return false;
+  }
+  const requestIdentity = authority.requestIdentity;
+  return (
+    requestIdentity === undefined ||
+    (Array.isArray(requestIdentity.acceptedPromptSha256) &&
+      requestIdentity.acceptedPromptSha256.length > 0 &&
+      requestIdentity.acceptedPromptSha256.length <= 2 &&
+      new Set(requestIdentity.acceptedPromptSha256).size ===
+        requestIdentity.acceptedPromptSha256.length &&
+      requestIdentity.acceptedPromptSha256.every((digest) => /^[a-f0-9]{64}$/.test(digest)) &&
+      Number.isInteger(requestIdentity.followUpOrdinal) &&
+      requestIdentity.followUpOrdinal >= 0 &&
+      requestIdentity.followUpOrdinal <= 32 &&
+      requestIdentity.remainingFollowUps === 0)
+  );
+}
+
+export function assertRemoteRecoveryAuthority(
+  value: unknown,
+): asserts value is BrowserRemoteRecoveryMetadata {
+  if (isRemoteRecoveryAuthority(value)) return;
+  const transactionToken =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Partial<BrowserRemoteRecoveryMetadata>).transactionToken
+      : undefined;
+  assertRemoteTransactionToken(transactionToken);
+  throw new BrowserAutomationError("Persisted remote recovery authority is invalid.", {
+    stage: "remote-resume",
+    code: "invalid-remote-recovery-authority",
+  });
+}
+
 export function findRemoteRecoveryAuthority(
   runtime: BrowserRuntimeMetadata,
 ): BrowserRemoteRecoveryMetadata | undefined {
-  return runtime.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
-    ?.remoteRecovery;
+  const authority = runtime.recoveryCleanupResources?.find(
+    (resource) => resource?.remoteRecovery,
+  )?.remoteRecovery;
+  if (!authority) return undefined;
+  assertRemoteRecoveryAuthority(authority);
+  return authority;
 }
 
 export interface CommittedPromptEpochLocator {

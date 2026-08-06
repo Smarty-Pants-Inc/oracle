@@ -526,7 +526,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "stops chunked artifact downloads that exceed the declared size",
+    "preserves captured text when a chunked artifact exceeds its declared size",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-oversize-artifact-"));
       setOracleHomeDirOverrideForTest(tmpDir);
@@ -535,32 +535,31 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         descriptor: createArtifactDescriptor(declared),
         payload: Buffer.from("zip plus undeclared bytes"),
       });
+      const host = `127.0.0.1:${bridge.port}`;
 
       try {
-        await expect(
-          createRemoteBrowserExecutor({
-            host: `127.0.0.1:${bridge.port}`,
-            token: "a".repeat(64),
-          })({ prompt: "remote", config: {}, sessionId: "oversize-artifact-session" }),
-        ).rejects.toMatchObject({
-          name: "BrowserAutomationError",
-          message: expect.stringContaining("artifact exceeded declared size"),
-          details: {
-            stage: "remote-artifact-transfer",
-            recoverableDisconnect: true,
-            runtime: {
-              recoveryCleanupResources: [
-                {
-                  recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
-                  remoteRecovery: { state: "pending" },
-                },
-              ],
+        const captured = await createRemoteBrowserExecutor({
+          host,
+          token: "a".repeat(64),
+        })({ prompt: "remote", config: {}, sessionId: "oversize-artifact-session" });
+        expect(captured).toMatchObject({
+          answerText: "done",
+          warnings: [
+            {
+              code: "remote-artifact-manual-copy-required",
+              severity: "warning",
+              message: expect.stringContaining("artifact exceeded declared size"),
             },
-          },
+          ],
         });
+        expect(captured.warnings?.[0]?.message).toContain(`remote browser host ${host}`);
+        expect(captured.warnings?.[0]?.message.length).toBeLessThanOrEqual(32_768);
+        expect(captured).not.toHaveProperty("artifacts");
+        expect(captured).not.toHaveProperty("savedFiles");
         expect(bridge.artifactRequests()).toBe(1);
         const artifactDir = path.join(tmpDir, "sessions", "oversize-artifact-session", "artifacts");
         expect(await readdir(artifactDir).catch(() => [])).toEqual([]);
+        await expect(captured.finalize()).resolves.toMatchObject({ status: "completed" });
       } finally {
         await bridge.close();
         await rm(tmpDir, { recursive: true, force: true });

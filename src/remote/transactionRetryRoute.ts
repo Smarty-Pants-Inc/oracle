@@ -51,6 +51,7 @@ export interface RemoteTransactionRetryRouteParams {
   artifactStore: RemoteArtifactStore;
   transactionCoordinator: RemoteTransactionCoordinator;
   transactionToken: string;
+  isTransactionAdmitted: (transactionToken: string) => boolean;
   resumeBrowser: typeof resumeBrowserSession;
   runBrowserWork: <T>(operation: () => Promise<T>) => Promise<T>;
   logger: BrowserLogger;
@@ -69,6 +70,10 @@ export async function serveRemoteTransactionRetry(
     } else {
       sendJson(params.res, 400, { error: "invalid_retry_request" });
     }
+    return;
+  }
+  if (params.isTransactionAdmitted(params.transactionToken)) {
+    sendJson(params.res, 202, { status: "running" });
     return;
   }
 

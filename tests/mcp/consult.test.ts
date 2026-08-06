@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -386,6 +386,59 @@ describe("summarizeModelRunsForConsult", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0]?.text).toMatch(/generated output directory/);
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores dormant predecessor remote credentials for API consults but rejects remote use", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "oracle-home-"));
+    setOracleHomeDirOverrideForTest(home);
+    writeFileSync(
+      path.join(home, "config.json"),
+      JSON.stringify({
+        browser: {
+          remoteHost: "127.0.0.1:9473",
+          remoteToken: "a".repeat(32),
+        },
+      }),
+    );
+    try {
+      const handlers: Array<(input: unknown) => Promise<unknown>> = [];
+      registerConsultTool({
+        registerTool: (_name: string, _def: unknown, fn: (input: unknown) => Promise<unknown>) => {
+          handlers.push(fn);
+        },
+        server: { sendLoggingMessage: async () => undefined },
+      } as unknown as Parameters<typeof registerConsultTool>[0]);
+      const handler = handlers[0];
+      if (!handler) throw new Error("handler not registered");
+
+      const apiResult = (await handler({
+        dryRun: true,
+        engine: "api",
+        model: "gpt-5.5",
+        prompt: "API path must ignore dormant remote state",
+        files: [],
+      })) as {
+        isError?: boolean;
+        structuredContent?: { status?: string };
+      };
+      expect(apiResult.isError).not.toBe(true);
+      expect(apiResult.structuredContent?.status).toBe("dry-run");
+
+      const remoteResult = (await handler({
+        dryRun: true,
+        engine: "browser",
+        model: "gpt-5.5",
+        prompt: "Remote path must rotate predecessor state",
+        files: [],
+      })) as { isError?: boolean; content: Array<{ type: "text"; text: string }> };
+      expect(remoteResult.isError).toBe(true);
+      expect(remoteResult.content[0]?.text).toMatch(
+        /immediately preceding base-generated.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
+      );
     } finally {
       setOracleHomeDirOverrideForTest(null);
       rmSync(home, { recursive: true, force: true });

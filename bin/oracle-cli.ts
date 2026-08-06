@@ -81,6 +81,7 @@ import { shouldBlockDuplicatePrompt } from "../src/cli/duplicatePromptGuard.js";
 import {
   assertLoopbackRemoteBind,
   resolveRemoteServiceConfig,
+  validateResolvedRemoteServiceConfig,
 } from "../src/remote/remoteServiceConfig.js";
 import { assertRemoteCredential } from "../src/remote/auth.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
@@ -1921,14 +1922,12 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
     userConfig,
     env: process.env,
+    validate: false,
   });
   const remoteHost = remoteConfig.host;
   const remoteToken = remoteConfig.token;
   const remoteLegacyToken = remoteConfig.legacyToken;
   const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
-  if (remoteHost) {
-    console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
-  }
 
   if (routingCliArgs.length === 0) {
     console.log(
@@ -2062,7 +2061,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const browserEngineRequested =
     options.browser ||
     options.engine === "browser" ||
-    Boolean(remoteHost) ||
+    Boolean(remoteHost && engine === "browser") ||
     configBrowserEngineRequested ||
     (!options.engine && !explicitApiProviderRequested && envEnginePreference === "browser");
   if (azureAutoApiRequested && engine === "browser" && !browserEngineRequested) {
@@ -2072,10 +2071,10 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     console.log(chalk.yellow("`--browser` is deprecated; use `--engine browser` instead."));
   }
 
-  if (remoteHost && engine !== "browser") {
+  if (options.remoteHost?.trim() && engine !== "browser") {
     throw new Error("--remote-host requires --engine browser.");
   }
-  if (remoteHost && options.remoteChrome) {
+  if (engine === "browser" && remoteHost && options.remoteChrome) {
     throw new Error("--remote-host cannot be combined with --remote-chrome.");
   }
   if (options.browserTab && engine !== "browser") {
@@ -2128,8 +2127,12 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   if (normalizedMultiModels.length > 0) {
     engine = "api";
   }
-  if (remoteHost && normalizedMultiModels.length > 0) {
+  if (options.remoteHost?.trim() && normalizedMultiModels.length > 0) {
     throw new Error("--remote-host does not support --models yet. Use API engine locally instead.");
+  }
+  if (engine === "browser" && remoteHost) {
+    validateResolvedRemoteServiceConfig(remoteConfig);
+    console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
   }
   const resolvedModel: ModelName =
     normalizedMultiModels[0] ?? (isGemini ? resolveApiModel(cliModelArg) : resolvedModelCandidate);
@@ -2466,7 +2469,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     engine,
     reasoningMode: resolvedOptions.reasoningMode,
   });
-  if (remoteHost && waitPreference === false) {
+  if (sessionMode === "browser" && remoteHost && waitPreference === false) {
     console.log(chalk.dim("Remote browser runs require --wait; ignoring --no-wait."));
     waitPreference = true;
   }
@@ -2792,15 +2795,18 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     cliAllowLegacyTextProtocol: options.allowLegacyTextProtocol,
     userConfig,
     env: process.env,
+    validate: false,
   });
-  const remoteHost = remoteConfig.host;
-  const remoteToken = remoteConfig.token;
-  const remoteLegacyToken = remoteConfig.legacyToken;
-  const allowLegacyTextProtocol = remoteConfig.allowLegacyTextProtocol;
-  if (remoteHost && engine !== "browser") {
+  const remoteHost = engine === "browser" ? remoteConfig.host : undefined;
+  const remoteToken = engine === "browser" ? remoteConfig.token : undefined;
+  const remoteLegacyToken = engine === "browser" ? remoteConfig.legacyToken : undefined;
+  const allowLegacyTextProtocol =
+    engine === "browser" ? remoteConfig.allowLegacyTextProtocol : false;
+  if (options.remoteHost?.trim() && engine !== "browser") {
     throw new Error("--remote-host requires a browser session.");
   }
   if (remoteHost) {
+    validateResolvedRemoteServiceConfig(remoteConfig);
     console.log(chalk.dim(`Remote browser host detected: ${remoteHost}`));
   }
   if (remoteHost && waitPreference === false) {

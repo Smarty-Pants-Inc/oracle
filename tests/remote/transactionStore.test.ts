@@ -16,6 +16,7 @@ import {
   RemoteTransactionCapacityError,
   RemoteTransactionStore,
 } from "../../src/remote/transactionStore.js";
+import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 const committedPromptEpoch = {
   status: "committed" as const,
@@ -526,13 +527,55 @@ describe("RemoteTransactionStore", () => {
   test("preserves an unbound capture for restart and exposes only a durably bound shutdown mode", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-store-"));
     const transactionToken = "0".repeat(64);
+    const baseChromeProcessIdentity = processIdentity(
+      path.join(root, "temporary-profile"),
+      4323,
+      "10000000-0000-4000-8000-000000000003",
+    );
+    const chromeProcessIdentity = {
+      ...baseChromeProcessIdentity,
+      launchClaim: {
+        ...baseChromeProcessIdentity.launchClaim,
+        generationId: "store-generation",
+      },
+    };
+    const restartDurableRuntime: BrowserRuntimeMetadata = {
+      ...runtime,
+      chromeProcessIdentity,
+      chromePid: chromeProcessIdentity.pid,
+      chromeProfileRoot: path.join(root, "temporary-profile"),
+      userDataDir: path.join(root, "temporary-profile"),
+      recoveryCleanupResources: runtime.recoveryCleanupResources.map((resource) => ({
+        ...resource,
+        chromeProcessIdentity,
+        chromePid: chromeProcessIdentity.pid,
+        profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
+        chromeProfileRoot: path.join(root, "temporary-profile"),
+        userDataDir: path.join(root, "temporary-profile"),
+        acquisition: {
+          generationId: chromeProcessIdentity.launchClaim.generationId,
+          processLaunchClaim: chromeProcessIdentity.launchClaim,
+        },
+        recoveryCleanup: {
+          ...resource.recoveryCleanup,
+          profileKind: "temporary",
+          keepBrowser: false,
+        },
+      })),
+    };
     try {
       const store = await RemoteTransactionStore.open({
         directory: root,
         controllerGeneration: "controller-before-shutdown",
       });
       await begin(store, transactionToken);
-      await publish(store, transactionToken, [registration(transactionToken)]);
+      await store.publishCapture({
+        transactionToken,
+        runId: "run-1",
+        result: capturedResult,
+        runtime: restartDurableRuntime,
+        artifacts: [registration(transactionToken)],
+      });
       const beforeShutdown = await readFile(store.recordPath(transactionToken), "utf8");
 
       await expect(store.prepareControllerShutdown(transactionToken)).resolves.toMatchObject({
@@ -540,7 +583,7 @@ describe("RemoteTransactionStore", () => {
         record: {
           state: "pending",
           result: capturedResult,
-          runtime,
+          runtime: restartDurableRuntime,
           artifacts: [{ descriptor: { artifactId: "artifact-1" } }],
         },
       });
@@ -585,16 +628,39 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
-  test("blocks shutdown instead of aborting a durable capture with non-reconstructible target authority", async () => {
+  test("blocks shutdown while a manual kept target depends on live-only close authority", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-block-store-"));
     const transactionToken = "9".repeat(64);
-    const nonReconstructibleRuntime: BrowserRuntimeMetadata = {
+    const baseChromeProcessIdentity = processIdentity(
+      path.join(root, "manual-profile"),
+      4324,
+      "10000000-0000-4000-8000-000000000004",
+    );
+    const chromeProcessIdentity = {
+      ...baseChromeProcessIdentity,
+      launchClaim: {
+        ...baseChromeProcessIdentity.launchClaim,
+        generationId: "store-generation",
+      },
+    };
+    const liveOnlyRuntime: BrowserRuntimeMetadata = {
       ...runtime,
-      chromeBrowserWSEndpoint: undefined,
+      chromeProcessIdentity,
+      chromePid: chromeProcessIdentity.pid,
+      chromeProfileRoot: path.join(root, "manual-profile"),
+      userDataDir: path.join(root, "manual-profile"),
       recoveryCleanupResources: runtime.recoveryCleanupResources.map((resource) => ({
         ...resource,
-        chromeBrowserWSEndpoint: undefined,
-        targetCloseCapability: undefined,
+        chromeProcessIdentity,
+        chromePid: chromeProcessIdentity.pid,
+        profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
+        chromeProfileRoot: path.join(root, "manual-profile"),
+        userDataDir: path.join(root, "manual-profile"),
+        recoveryCleanup: {
+          ...resource.recoveryCleanup,
+          profileKind: "manual-login",
+          keepBrowser: true,
+        },
       })),
     };
     try {
@@ -604,7 +670,7 @@ describe("RemoteTransactionStore", () => {
         transactionToken,
         runId: "run-1",
         result: capturedResult,
-        runtime: nonReconstructibleRuntime,
+        runtime: liveOnlyRuntime,
         artifacts: [],
       });
       const beforeShutdown = await readFile(store.recordPath(transactionToken), "utf8");

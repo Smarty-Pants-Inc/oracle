@@ -10,7 +10,10 @@ import type { RunOracleOptions } from "../../oracle.js";
 import type { EngineMode } from "../../cli/engine.js";
 import type { BrowserSessionConfig, SessionArtifact, SessionModelRun } from "../../sessionStore.js";
 import { sessionStore } from "../../sessionStore.js";
-import { resolveRemoteServiceConfig } from "../../remote/remoteServiceConfig.js";
+import {
+  resolveRemoteServiceConfig,
+  validateResolvedRemoteServiceConfig,
+} from "../../remote/remoteServiceConfig.js";
 import { createRemoteBrowserExecutor } from "../../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../../browser/sessionRunner.js";
 import {
@@ -604,7 +607,22 @@ export async function runConsultTool(
       )
       .catch(() => {});
 
-  const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
+  const resolvedRemote = resolveRemoteServiceConfig({
+    userConfig,
+    env: process.env,
+    validate: false,
+  });
+
+  if (resolvedEngine === "browser" && resolvedRemote.host) {
+    try {
+      validateResolvedRemoteServiceConfig(resolvedRemote);
+    } catch (error) {
+      return {
+        isError: true,
+        content: textContent(error instanceof Error ? error.message : String(error)),
+      };
+    }
+  }
   const imageOutputPath = runOptions.generateImage ?? runOptions.outputPath;
   if (resolvedEngine === "browser" && resolvedRemote.host && imageOutputPath) {
     return {

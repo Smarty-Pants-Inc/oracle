@@ -172,6 +172,20 @@ export class RemoteTransactionStore {
     ).record;
   }
 
+  async rollbackArtifactNamespaceInitialization(params: {
+    transactionToken: string;
+    runId: string;
+    identity?: NonNullable<RemoteTransactionRecord["artifactNamespaceIdentity"]>;
+  }): Promise<RemoteTransactionRecord> {
+    return (
+      await this.transition(params.transactionToken, {
+        type: "rollback-artifact-namespace-initialization",
+        runId: params.runId,
+        identity: params.identity,
+      })
+    ).record;
+  }
+
   async completeArtifactNamespaceInitialization(params: {
     transactionToken: string;
     runId: string;

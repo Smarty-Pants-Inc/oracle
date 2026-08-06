@@ -22,6 +22,7 @@ import {
   postRemoteJson,
   type ResolvedRemoteTransportDeadlines,
 } from "./clientTransport.js";
+import { assertRemoteTransactionToken } from "./transactionToken.js";
 
 interface ArtifactFileIdentity {
   dev: number;
@@ -49,6 +50,7 @@ export async function transferRemoteArtifact(params: {
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<SavedBrowserFile> {
   RemoteArtifactDescriptorSchema.parse(params.descriptor);
+  assertRemoteTransactionToken(params.transactionToken);
   const artifactsDir = resolveSessionArtifactsDir(params.sessionId);
   await mkdir(artifactsDir, { recursive: true });
   await syncDirectory(path.dirname(artifactsDir));
@@ -325,23 +327,32 @@ export function mergeTransferredArtifacts(
   result: BrowserRunResult,
   transferredFiles: SavedBrowserFile[],
   transferFailures: string[],
+  host: string,
 ): BrowserRunResult {
   const artifacts = appendArtifacts(result.artifacts, transferredFiles);
   const savedFiles = appendSavedFiles(result.savedFiles, transferredFiles);
-  const warnings = [
-    ...(result.warnings ?? []),
-    ...transferFailures.map((message) => ({
-      code: "remote-artifact-transfer-failed",
-      severity: "warning" as const,
-      message,
-    })),
-  ];
-  return {
+  const warning =
+    transferFailures.length > 0
+      ? {
+          code: "remote-artifact-manual-copy-required",
+          severity: "warning" as const,
+          message:
+            `Oracle captured the browser text response, but automatic local artifact publication failed. Connect to remote browser host ${host}, open the ChatGPT conversation, and copy the generated file(s) manually. No local artifact delivery is claimed for: ${transferFailures.join("; ")}`.slice(
+              0,
+              32_768,
+            ),
+        }
+      : undefined;
+  const merged: BrowserRunResult = {
     ...result,
-    artifacts,
-    savedFiles,
-    warnings: warnings.length > 0 ? warnings : undefined,
+    warnings: [...(result.warnings ?? []), ...(warning ? [warning] : [])].slice(-64),
   };
+  if (artifacts) merged.artifacts = artifacts;
+  else delete merged.artifacts;
+  if (savedFiles) merged.savedFiles = savedFiles;
+  else delete merged.savedFiles;
+  if (merged.warnings?.length === 0) delete merged.warnings;
+  return merged;
 }
 
 function appendSavedFiles(

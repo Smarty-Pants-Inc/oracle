@@ -130,6 +130,7 @@ export async function createRemoteServer(
     sessionsRoot: path.join(getOracleHomeDir(), "sessions"),
   });
   const activeTransactions = new Map<string, BrowserRunTransaction>();
+  const admittedTransactions = new Map<string, { controllerGeneration: string }>();
   let closing = false;
   let closed = false;
   let closeInFlight: Promise<void> | null = null;
@@ -175,6 +176,18 @@ export async function createRemoteServer(
   let sweepInFlight: Promise<void> | null = null;
   let controllerOperationCount = 0;
   let controllerOperationsIdle: { promise: Promise<void>; resolve: () => void } | null = null;
+  const admitRemoteTransaction = (transactionToken: string): (() => void) | null => {
+    if (admittedTransactions.has(transactionToken)) return null;
+    const admission = { controllerGeneration };
+    admittedTransactions.set(transactionToken, admission);
+    return () => {
+      if (admittedTransactions.get(transactionToken) === admission) {
+        admittedTransactions.delete(transactionToken);
+      }
+    };
+  };
+  const isRemoteTransactionAdmitted = (transactionToken: string): boolean =>
+    admittedTransactions.get(transactionToken)?.controllerGeneration === controllerGeneration;
   const admitControllerOperation = (): (() => void) | null => {
     if (closing) return null;
     if (controllerOperationCount === 0) controllerOperationsIdle = Promise.withResolvers<void>();
@@ -319,6 +332,8 @@ export async function createRemoteServer(
     artifactStore,
     transactionCoordinator,
     admitControllerOperation,
+    admitRemoteTransaction,
+    isRemoteTransactionAdmitted,
     isClosing: () => closing,
     isBrowserWorkBusy: () => browserWorkCount > 0,
     isBrowserWorkExclusive: () => browserWorkExclusive,

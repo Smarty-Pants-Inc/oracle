@@ -1,6 +1,7 @@
 import { projectBrowserCaptureCleanupRuntime } from "../browser/runLifecycle.js";
 import type { BrowserRemoteRecoveryMetadata, BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { RemotePublicRuntime } from "./types.js";
+import { assertRemoteRecoveryAuthority } from "../browser/reattachability.js";
 export { findRemoteRecoveryAuthority } from "../browser/reattachability.js";
 
 export function projectRemoteRecoveryRuntime(
@@ -8,6 +9,7 @@ export function projectRemoteRecoveryRuntime(
   remoteRecovery: BrowserRemoteRecoveryMetadata | null,
   authoritativeRuntime: BrowserRuntimeMetadata = {},
 ): BrowserRuntimeMetadata {
+  if (remoteRecovery) assertRemoteRecoveryAuthority(remoteRecovery);
   const promptEpoch = runtime.promptEpoch;
   const resourceRuntime: BrowserRuntimeMetadata = {
     conversationId: promptEpoch?.conversationId,

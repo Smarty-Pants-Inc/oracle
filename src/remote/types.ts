@@ -6,6 +6,9 @@ import type {
 import { promptIdentitySha256 } from "../browser/actions/committedPrompt.js";
 
 export const REMOTE_TRANSACTION_PROTOCOL_VERSION = 3;
+export const REMOTE_REQUEST_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
+export const REMOTE_REQUEST_FUTURE_CLOCK_SKEW_MS = 30 * 1000;
+export const MAX_REMOTE_AUTHENTICATED_NONCES = 8_192;
 export const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const MAX_REMOTE_REQUEST_BYTES = 96 * 1024 * 1024;
 export const MAX_REMOTE_ATTACHMENT_BYTES = 32 * 1024 * 1024;
@@ -549,7 +552,7 @@ export const RemoteArtifactDeliveryReceiptRequestSchema = z
 
 export const RemoteHealthAuthenticationSchema = z
   .object({
-    scheme: z.literal("oracle-hmac-sha256-v1"),
+    scheme: z.literal("oracle-hmac-sha256-v2"),
     serverGeneration: z.string().min(1).max(128),
     clientNonce: z.string().regex(SHA256_PATTERN),
     serverNonce: z.string().regex(SHA256_PATTERN),

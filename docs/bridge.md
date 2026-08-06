@@ -72,6 +72,27 @@ Now browser runs automatically route through the host:
 oracle --engine browser -p "hello" --file README.md
 ```
 
+### Upgrade from the immediately preceding 32-hex default
+
+The immediately preceding base release generated 16-byte bridge credentials encoded as 32 lowercase hexadecimal characters. Current remote transport requires 32-byte credentials encoded as 64 lowercase hexadecimal characters. The old value is never sent or accepted as a modern or legacy credential.
+
+Use this rotate/clear/re-import sequence:
+
+1. On the browser host, stop the predecessor bridge, upgrade Oracle, and rotate the credential by starting the current host with `oracle bridge host --token auto` (plus the same `--ssh` options you normally use). This writes a new 64-character credential to `~/.oracle/bridge-connection.json`.
+2. On the client, remove `browser.remoteHost` and `browser.remoteToken` from `~/.oracle/config.json`, then clear any shell overrides:
+
+   ```bash
+   unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN
+   ```
+
+3. Copy the newly generated host artifact to the client again, then re-import it:
+
+   ```bash
+   oracle bridge client --connect ~/bridge-connection.json
+   ```
+
+Until this migration is complete, remote browser use fails closed with rotation guidance. Dormant remote settings do not block local commands, explicit API CLI runs, or MCP consults explicitly using `engine: "api"`.
+
 ### Explicit mixed-version text bridge
 
 There is no silent downgrade.

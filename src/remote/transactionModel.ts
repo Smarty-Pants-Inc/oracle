@@ -211,6 +211,10 @@ interface RemoteTransactionTransitionDefinitions {
     params: { runId: string; identity: DurableRemoteArtifactNamespaceIdentity };
     outcome: undefined;
   };
+  "rollback-artifact-namespace-initialization": {
+    params: { runId: string; identity?: DurableRemoteArtifactNamespaceIdentity };
+    outcome: undefined;
+  };
   "complete-artifact-namespace-initialization": {
     params: { runId: string };
     outcome: undefined;

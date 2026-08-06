@@ -37,6 +37,7 @@ import {
   type RemoteTransportInterruption,
   type ResolvedRemoteTransportDeadlines,
 } from "./clientTransport.js";
+import { assertRemoteTransactionToken } from "./transactionToken.js";
 
 export async function settleRemoteBrowserRecovery(
   params: RemoteRecoverySettlementOptions,
@@ -49,6 +50,7 @@ export async function settleRemoteBrowserRecovery(
   if (!authority || authority.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION) {
     return pending("Remote cleanup authority is missing or uses an unsupported protocol version.");
   }
+  assertRemoteTransactionToken(authority.transactionToken);
   const persistedMode = params.runtime.recoveryCleanupResult?.settlementMode;
   const mode =
     params.mode ??
@@ -120,6 +122,7 @@ export async function recoverRemoteRunTransaction(params: {
   interruption: RemoteTransportInterruption;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<RemoteRunTransactionPayload> {
+  assertRemoteTransactionToken(params.transactionToken);
   const recoveryAuthority = (state: "pre-receipt" | "recoverable-error") =>
     ({
       protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -139,7 +142,7 @@ export async function recoverRemoteRunTransaction(params: {
       const response = await postRemoteJson({
         hostname: params.hostname,
         port: params.port,
-        path: `/transactions/${params.transactionToken}/retry`,
+        path: `/transactions/${encodeURIComponent(params.transactionToken)}/retry`,
         token: params.token,
         body: {},
         overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
@@ -354,6 +357,7 @@ export function unresolvedRemoteTransactionRuntime(
   settlementMode?: "finalize" | "abort",
   authoritativeRuntime?: BrowserRuntimeMetadata,
 ): BrowserRuntimeMetadata {
+  assertRemoteTransactionToken(authority.transactionToken);
   const runtime = projectRemoteRecoveryRuntime(
     { cleanup: { status: "pending" } },
     { ...authority, state: "recoverable-error" },
@@ -461,10 +465,11 @@ export async function bindRemoteBrowserSettlement(params: {
   runtime: BrowserRuntimeMetadata;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<BrowserRuntimeMetadata> {
+  assertRemoteTransactionToken(params.transactionToken);
   const response = await postRemoteJson({
     hostname: params.hostname,
     port: params.port,
-    path: `/transactions/${params.transactionToken}/bind`,
+    path: `/transactions/${encodeURIComponent(params.transactionToken)}/bind`,
     token: params.token,
     body: { mode: params.mode, durablePublication: params.mode === "finalize" },
     overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
@@ -576,11 +581,12 @@ export async function settleRemoteBrowserTransaction(params: {
   runtime: BrowserRuntimeMetadata;
   deadlines: ResolvedRemoteTransportDeadlines;
 }): Promise<BrowserCaptureFinalizationResult> {
+  assertRemoteTransactionToken(params.transactionToken);
   let transportError: unknown;
   const response = await postRemoteJson({
     hostname: params.hostname,
     port: params.port,
-    path: `/transactions/${params.transactionToken}/${params.mode}`,
+    path: `/transactions/${encodeURIComponent(params.transactionToken)}/${params.mode}`,
     token: params.token,
     body: params.mode === "finalize" ? { durablePublication: true } : {},
     overallTimeoutMs: params.deadlines.controlOverallTimeoutMs,
@@ -719,6 +725,7 @@ export function assertRemoteTransactionOwnership(
   transaction: RemoteRunTransactionPayload,
   expectedTransactionToken: string,
 ): void {
+  assertRemoteTransactionToken(expectedTransactionToken);
   if (transaction.transactionToken !== expectedTransactionToken) {
     throw new BrowserAutomationError("Remote transaction token did not match the request.", {
       stage: "remote-protocol",
@@ -751,6 +758,7 @@ export function rehydrateRemoteBrowserError(
     });
   }
   const transactionToken = expectedTransactionToken ?? error.recoveryToken;
+  assertRemoteTransactionToken(transactionToken);
   const remoteRecovery: BrowserRemoteRecoveryMetadata = {
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     host,

@@ -11,6 +11,7 @@ import {
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
 
 const MODERN_TOKEN = "a".repeat(64);
+const PREDECESSOR_TOKEN = "b".repeat(32);
 
 describe("bridge connection parsing", () => {
   it("parses host:port?token=...", () => {
@@ -59,6 +60,9 @@ describe("bridge connection parsing", () => {
         /exactly 64 lowercase hexadecimal characters/i,
       );
     }
+    expect(() => parseBridgeConnectionString(`127.0.0.1:9473?token=${PREDECESSOR_TOKEN}`)).toThrow(
+      /immediately preceding base-generated.*32 lowercase.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
+    );
     expect(() => parseBridgeConnectionString(`127.0.0.1:9473?token=${MODERN_TOKEN} `)).toThrow(
       /surrounding whitespace/i,
     );
@@ -72,6 +76,13 @@ describe("bridge connection parsing", () => {
       );
       await expect(readBridgeConnectionArtifact(artifactPath)).rejects.toThrow(
         /exactly 64 lowercase hexadecimal characters/i,
+      );
+      await fs.writeFile(
+        artifactPath,
+        JSON.stringify({ remoteHost: "127.0.0.1:9473", remoteToken: PREDECESSOR_TOKEN }),
+      );
+      await expect(readBridgeConnectionArtifact(artifactPath)).rejects.toThrow(
+        /immediately preceding base-generated.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
       );
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });

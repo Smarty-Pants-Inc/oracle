@@ -18,6 +18,20 @@ export interface BridgeConnectionArtifact {
   tunnel?: BridgeTunnelInfo;
 }
 
+const PREDECESSOR_BASE_CREDENTIAL_PATTERN = /^[a-f0-9]{32}$/u;
+
+export const PREDECESSOR_REMOTE_CREDENTIAL_MIGRATION =
+  "This is an immediately preceding base-generated Oracle bridge credential (32 lowercase hexadecimal characters / 16 bytes), which is no longer accepted for remote transport. " +
+  "Rotate on the browser host with `oracle bridge host --token auto`. Clear stale client state by removing browser.remoteHost/browser.remoteToken from ~/.oracle/config.json and running `unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN`; " +
+  "copy the newly generated ~/.oracle/bridge-connection.json from the host; then re-import it with `oracle bridge client --connect ~/bridge-connection.json`.";
+
+export function assertCurrentRemoteCredential(value: string, label: string): string {
+  if (PREDECESSOR_BASE_CREDENTIAL_PATTERN.test(value)) {
+    throw new Error(`${label} is invalid. ${PREDECESSOR_REMOTE_CREDENTIAL_MIGRATION}`);
+  }
+  return assertRemoteCredential(value, label);
+}
+
 export function normalizeHostPort(hostname: string, port: number): string {
   const trimmed = hostname.trim();
   const unwrapped =
@@ -98,7 +112,7 @@ export function parseBridgeConnectionString(input: string): {
   if (token === null) {
     throw new Error('Connection string is missing token. Expected "?token=...".');
   }
-  assertRemoteCredential(token, "Bridge connection token");
+  assertCurrentRemoteCredential(token, "Bridge connection token");
 
   const remoteHost = normalizeHostPort(hostname, port);
   return { remoteHost, remoteToken: token };
@@ -108,7 +122,7 @@ export function formatBridgeConnectionString(
   connection: { remoteHost: string; remoteToken: string },
   options: { includeToken?: boolean } = {},
 ): string {
-  assertRemoteCredential(connection.remoteToken, "Bridge connection token");
+  assertCurrentRemoteCredential(connection.remoteToken, "Bridge connection token");
   const { hostname, port } = parseHostPort(connection.remoteHost);
   const base = `oracle+tcp://${normalizeHostPort(hostname, port)}`;
   if (!options.includeToken) {
@@ -146,7 +160,7 @@ export async function readBridgeConnectionArtifact(
   if (typeof remoteToken !== "string") {
     throw new Error(`Invalid connection artifact at ${resolved}: remoteToken is missing.`);
   }
-  assertRemoteCredential(remoteToken, `Connection artifact remoteToken at ${resolved}`);
+  assertCurrentRemoteCredential(remoteToken, `Connection artifact remoteToken at ${resolved}`);
   // Validate host formatting early so downstream checks don't crash.
   parseHostPort(remoteHost);
   return parsed as BridgeConnectionArtifact;

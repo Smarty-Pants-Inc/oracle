@@ -28,6 +28,11 @@ import {
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
 import {
+  __test__ as targetCloseAuthorityTest,
+  closeChromeTargetWithRetainedCapability,
+  retainChromeTargetCloseCapability,
+} from "../../src/browser/targetCloseAuthority.js";
+import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
   lifecycleBrowserTransaction,
@@ -40,6 +45,7 @@ import {
   prepareTestAuthentication,
   sendTestRequestBody,
 } from "./serverTestHttp.js";
+import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST).each(["finalize", "abort"] as const)(
@@ -377,16 +383,38 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const rejectedTransactionToken = "6".repeat(64);
       const recordPath = path.join(transactionStoreDir, `${transactionToken}.json`);
       const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/graceful-drain-generation";
+      const profileDir = path.join(tmpDir, "graceful-drain-profile");
+      const baseChromeProcessIdentity = processIdentity(
+        profileDir,
+        4325,
+        "10000000-0000-4000-8000-000000000005",
+      );
+      const chromeProcessIdentity = {
+        ...baseChromeProcessIdentity,
+        launchClaim: {
+          ...baseChromeProcessIdentity.launchClaim,
+          generationId: "graceful-drain-generation",
+        },
+      };
       const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: chromeProcessIdentity.pid,
+        chromeProcessIdentity,
         chromeHost: "127.0.0.1",
         chromePort: 9222,
         chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
         chromeTargetId: "graceful-drain-target",
         recoveryCleanupResources: [
           {
+            chromePid: chromeProcessIdentity.pid,
+            chromeProcessIdentity,
+            profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
             chromeHost: "127.0.0.1",
             chromePort: 9222,
             chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
             chromeTargetId: "graceful-drain-target",
             targetCloseCapability: {
               version: 1,
@@ -395,10 +423,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
               targetId: "graceful-drain-target",
               browserWSEndpoint,
             },
-            acquisition: { generationId: "graceful-drain-generation" },
+            acquisition: {
+              generationId: chromeProcessIdentity.launchClaim.generationId,
+              processLaunchClaim: chromeProcessIdentity.launchClaim,
+            },
             recoveryCleanup: {
               ownsTarget: true,
-              profileKind: "none",
+              profileKind: "temporary",
               keepBrowser: false,
               closeOwnedTargetOnComplete: true,
             },
@@ -561,6 +592,206 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "keeps live manual kept target-close authority until graceful shutdown can settle it",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-live-close-drain-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const controllerLockPath = path.join(transactionStoreDir, ".controller.lock");
+      const transactionToken = "8".repeat(64);
+      const targetId = "manual-kept-target";
+      const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/manual-kept-generation";
+      const profileDir = path.join(tmpDir, "manual-profile");
+      const chromeProcessIdentity = processIdentity(
+        profileDir,
+        4327,
+        "10000000-0000-4000-8000-000000000007",
+      );
+      const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
+      targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+      const targetCloseCapability = retainChromeTargetCloseCapability({
+        generationId: "manual-kept-generation",
+        targetId,
+        browserWSEndpoint,
+        close: closeTarget,
+      });
+      const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: chromeProcessIdentity.pid,
+        chromeProcessIdentity,
+        chromeHost: "127.0.0.1",
+        chromePort: 9222,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
+        chromeTargetId: targetId,
+        recoveryCleanupResources: [
+          {
+            chromePid: chromeProcessIdentity.pid,
+            chromeProcessIdentity,
+            profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            chromeTargetId: targetId,
+            targetCloseCapability,
+            acquisition: { generationId: "manual-kept-generation" },
+            recoveryCleanup: {
+              ownsTarget: true,
+              profileKind: "manual-login",
+              keepBrowser: true,
+              closeOwnedTargetOnComplete: true,
+            },
+          },
+        ],
+      };
+      const finalize = vi.fn(async () => {
+        const closeResult = await closeChromeTargetWithRetainedCapability({
+          capability: targetCloseCapability,
+          targetId,
+          logger: () => {},
+        });
+        if (closeResult.status !== "completed" && closeResult.status !== "gone") {
+          return pendingBrowserCaptureCleanup(runtime, closeResult.reason, "finalize");
+        }
+        const settledRuntime = { ...runtime };
+        delete settledRuntime.chromeTargetId;
+        return completedBrowserCaptureCleanup(settledRuntime);
+      });
+      const shutdownRequested = Promise.withResolvers<void>();
+      const shutdownErrors: string[] = [];
+      let server: RemoteServerInstance | undefined;
+      let drain: Promise<void> | undefined;
+
+      try {
+        server = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+          {
+            transactionStoreDir,
+            runBrowser: async (options) =>
+              browserTransaction(
+                options.prompt,
+                {
+                  answerText: "manual kept answer",
+                  answerMarkdown: "manual kept answer",
+                  tookMs: 1,
+                  answerTokens: 3,
+                  answerChars: 18,
+                },
+                runtime,
+                { finalize },
+              ),
+          },
+        );
+        const initial = await httpPostNdjson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/run`,
+          token: "a".repeat(64),
+          body: remoteRunPayload(),
+        });
+        expect(initial.statusCode).toBe(200);
+
+        let drainSettled = false;
+        drain = drainRemoteServerShutdown(server, shutdownRequested.promise, {
+          logger: (message) => shutdownErrors.push(message),
+          retryDelayMs: 250,
+        });
+        void drain.then(
+          () => {
+            drainSettled = true;
+          },
+          () => {
+            drainSettled = true;
+          },
+        );
+        shutdownRequested.resolve();
+        await vi.waitFor(() => {
+          expect(shutdownErrors.some((message) => message.includes("non-restart-durable"))).toBe(
+            true,
+          );
+        });
+
+        expect(drainSettled).toBe(false);
+        expect(existsSync(controllerLockPath)).toBe(true);
+        expect(closeTarget).not.toHaveBeenCalled();
+        expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
+        const pendingRecord = JSON.parse(
+          await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+        );
+        expect(pendingRecord).toMatchObject({
+          state: "pending",
+          runtime: {
+            chromeTargetId: targetId,
+            recoveryCleanupResources: [{ targetCloseCapability }],
+          },
+        });
+
+        await vi.waitFor(async () => {
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server!.port,
+              path: `/transactions/${transactionToken}/retry`,
+              token: "a".repeat(64),
+              body: {},
+            }),
+          ).resolves.toMatchObject({
+            statusCode: 200,
+            json: { status: "transaction", transaction: { state: "pending" } },
+          });
+        });
+        await vi.waitFor(async () => {
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server!.port,
+              path: `/transactions/${transactionToken}/finalize`,
+              token: "a".repeat(64),
+              body: { durablePublication: true },
+            }),
+          ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        });
+
+        expect(finalize).toHaveBeenCalledOnce();
+        expect(closeTarget).toHaveBeenCalledOnce();
+        const liveFinalization = await finalize.mock.results[0]?.value;
+        if (!liveFinalization) throw new Error("Missing live target finalization result");
+        expect(liveFinalization.runtime).not.toHaveProperty("chromeTargetId");
+        expect(liveFinalization.runtime).not.toHaveProperty("recoveryCleanupResources");
+        await drain;
+        expect(existsSync(controllerLockPath)).toBe(false);
+        const finalizedRecord = JSON.parse(
+          await readFile(path.join(transactionStoreDir, `${transactionToken}.json`), "utf8"),
+        );
+        expect(finalizedRecord).toMatchObject({
+          state: "finalized",
+          finalization: { status: "completed" },
+        });
+        expect(finalizedRecord).not.toHaveProperty("runtime");
+        expect(finalizedRecord.finalization.runtime).not.toHaveProperty("chromeTargetId");
+        expect(finalizedRecord.finalization.runtime).not.toHaveProperty("recoveryCleanupResources");
+      } finally {
+        shutdownRequested.resolve();
+        if (server) {
+          await httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            token: "a".repeat(64),
+            body: { durablePublication: true },
+          }).catch(() => undefined);
+          await drain?.catch(() => undefined);
+          await server.close().catch(() => undefined);
+        }
+        targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "preserves an unacknowledged artifact capture across graceful restart and resumes delivery",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-shutdown-handoff-"));
@@ -574,29 +805,54 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const payload = remoteRunPayload();
       const requestIdentity = buildRemotePromptRequestIdentity(payload);
       const transactionToken = "4".repeat(64);
+      const profileDir = path.join(tmpDir, "shutdown-handoff-profile");
+      const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation";
+      const baseChromeProcessIdentity = processIdentity(
+        profileDir,
+        4326,
+        "10000000-0000-4000-8000-000000000006",
+      );
+      const chromeProcessIdentity = {
+        ...baseChromeProcessIdentity,
+        launchClaim: {
+          ...baseChromeProcessIdentity.launchClaim,
+          generationId: "shutdown-handoff-generation",
+        },
+      };
       const runtime: BrowserRunTransaction["runtime"] = {
+        chromePid: chromeProcessIdentity.pid,
+        chromeProcessIdentity,
         chromeHost: "127.0.0.1",
-        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
+        chromeBrowserWSEndpoint: browserWSEndpoint,
         chromePort: 9222,
+        chromeProfileRoot: profileDir,
+        userDataDir: profileDir,
         chromeTargetId: "shutdown-handoff-target",
         recoveryCleanupResources: [
           {
+            chromePid: chromeProcessIdentity.pid,
+            chromeProcessIdentity,
+            profileDirectoryIdentity: chromeProcessIdentity.profileDirectory,
             chromeHost: "127.0.0.1",
-            chromeBrowserWSEndpoint:
-              "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
+            chromeBrowserWSEndpoint: browserWSEndpoint,
             chromePort: 9222,
+            chromeProfileRoot: profileDir,
+            userDataDir: profileDir,
+            acquisition: {
+              generationId: chromeProcessIdentity.launchClaim.generationId,
+              processLaunchClaim: chromeProcessIdentity.launchClaim,
+            },
+            chromeTargetId: "shutdown-handoff-target",
             targetCloseCapability: {
               version: 1,
               generationId: "shutdown-handoff-generation",
               capabilityId: "shutdown-handoff-capability",
               targetId: "shutdown-handoff-target",
-              browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/shutdown-handoff-generation",
+              browserWSEndpoint,
             },
-            acquisition: { generationId: "shutdown-handoff-generation" },
-            chromeTargetId: "shutdown-handoff-target",
             recoveryCleanup: {
               ownsTarget: true,
-              profileKind: "none",
+              profileKind: "temporary",
               keepBrowser: false,
               closeOwnedTargetOnComplete: true,
             },

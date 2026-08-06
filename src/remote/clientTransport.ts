@@ -24,6 +24,7 @@ import {
   type RemoteRunTransactionPayload,
   type RemoteTransportDeadlines,
 } from "./types.js";
+import { assertRemoteTransactionToken } from "./transactionToken.js";
 import {
   RemoteLegacyRunEventSchema,
   RemoteLegacyRunPayloadSchema,
@@ -185,6 +186,7 @@ async function prepareAuthenticatedRequest(params: {
       method: params.method,
       path: params.path,
       body: params.body,
+      issuedAt: Date.now(),
     }),
   };
 }
@@ -246,6 +248,7 @@ export async function streamRemoteRun(params: {
   assertTransactionOwnership: (transaction: RemoteRunTransactionPayload) => void;
   rehydrateError: (error: RemoteBrowserAutomationErrorPayload) => BrowserAutomationError;
 }): Promise<RemoteRunTransactionPayload> {
+  assertRemoteTransactionToken(params.transactionToken);
   const body = Buffer.from(JSON.stringify(RemoteRunPayloadSchema.parse(params.payload)));
   const requestPath = `/transactions/${encodeURIComponent(params.transactionToken)}/run`;
   if (body.byteLength > MAX_REMOTE_REQUEST_BYTES) {

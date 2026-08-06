@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
@@ -714,8 +714,10 @@ describe("crash-recoverable filesystem lock", () => {
           (entry) => entry.startsWith("request-") && !entry.includes(".stale-"),
         ),
       ).toHaveLength(2);
-      await rm(cleanupCollisionPath!, { recursive: true, force: true });
+      const clearedCollisionPath = `${cleanupCollisionPath}.cleared`;
+      await rename(cleanupCollisionPath!, clearedCollisionPath);
       cleanupCollisionPath = undefined;
+      await rm(clearedCollisionPath, { recursive: true, force: true });
       await vi.waitFor(async () => {
         expect(
           (await readdir(mutationRootPath)).filter(

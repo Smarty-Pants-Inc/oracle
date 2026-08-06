@@ -7,7 +7,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createRemoteBrowserExecutor,
   resumeRemoteBrowserTransaction,
+  settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
+import {
+  bindRemoteBrowserSettlement,
+  settleRemoteBrowserTransaction,
+} from "../../src/remote/clientRecovery.js";
+import { findRemoteRecoveryAuthority } from "../../src/browser/reattachability.js";
 import {
   buildRemotePromptRequestIdentity,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -188,6 +194,25 @@ function transactionEvent(transactionToken: string, prompt: string, artifacts: u
     },
   };
 }
+
+function finalizedSettlement(transactionToken: string, prompt: string) {
+  return {
+    transactionToken,
+    state: "finalized" as const,
+    settlementAuthority: {
+      mode: "finalize" as const,
+      outcome: "completed" as const,
+      state: "finalized" as const,
+    },
+    finalization: {
+      status: "completed" as const,
+      runtime: {
+        promptEpoch: committedPromptEpoch(prompt),
+        cleanup: { status: "completed" as const },
+      },
+    },
+  };
+}
 function remoteRecovery(runtime: BrowserRuntimeMetadata | undefined) {
   return runtime?.recoveryCleanupResources?.find((resource) => resource.remoteRecovery)
     ?.remoteRecovery;
@@ -323,7 +348,7 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("times out a held artifact download without allowing terminal settlement", async () => {
+  it("preserves text and normal settlement when an artifact download times out", async () => {
     const artifact = Buffer.from("artifact");
     const descriptor = {
       artifactId: "artifact-1",
@@ -349,32 +374,44 @@ describe("remote client transport deadlines", () => {
         return;
       }
       if (req.url?.includes("/artifacts/") && req.method === "GET") return;
-      if (req.url?.endsWith("/finalize")) settlementRequests += 1;
+      const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
+      if (req.method === "POST" && finalize) {
+        settlementRequests += 1;
+        expect(await readJson(req)).toEqual({ durablePublication: true });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(finalizedSettlement(finalize[1]!, "artifact")));
+        return;
+      }
       res.statusCode = 404;
       res.end();
     });
     const port = await listen(server);
+    const host = `127.0.0.1:${port}`;
     const oracleHome = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-transport-"));
     setOracleHomeDirOverrideForTest(oracleHome);
     try {
-      const error = await createRemoteBrowserExecutor({
-        host: `127.0.0.1:${port}`,
+      const transaction = await createRemoteBrowserExecutor({
+        host,
         token: "a".repeat(64),
         deadlines,
-      })({ prompt: "artifact", config: {}, sessionId: "held-artifact" }).then(
-        () => null,
-        (caught: unknown) => caught,
-      );
-      expect(error).toMatchObject({
-        name: "BrowserAutomationError",
-        details: {
-          stage: "remote-artifact-transfer",
-          recoverableDisconnect: true,
-          runtime: { recoveryCleanupResources: [{ remoteRecovery: { state: "pending" } }] },
-        },
+      })({ prompt: "artifact", config: {}, sessionId: "held-artifact" });
+      expect(transaction).toMatchObject({
+        answerText: "answer",
+        answerMarkdown: "answer",
+        warnings: [
+          {
+            code: "remote-artifact-manual-copy-required",
+            severity: "warning",
+            message: expect.stringContaining(`remote browser host ${host}`),
+          },
+        ],
       });
-      expect(error).not.toHaveProperty("details.runtime.remoteRecovery");
-      expect(settlementRequests).toBe(0);
+      expect(transaction.warnings?.[0]?.message).toMatch(/copy the generated file\(s\) manually/i);
+      expect(transaction.warnings?.[0]?.message).toContain("result.bin");
+      expect(transaction).not.toHaveProperty("artifacts");
+      expect(transaction).not.toHaveProperty("savedFiles");
+      await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(settlementRequests).toBe(1);
     } finally {
       setOracleHomeDirOverrideForTest(null);
       await close(server);
@@ -1670,7 +1707,17 @@ describe("remote client transport deadlines", () => {
           socketIdleTimeoutMs: 500,
         },
       });
-      await executor({ prompt: "artifact durable", config: {}, sessionId: "durable-artifact" });
+      const transaction = await executor({
+        prompt: "artifact durable",
+        config: {},
+        sessionId: "durable-artifact",
+      });
+      expect(transaction).toMatchObject({
+        answerText: "answer",
+        artifacts: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
+        savedFiles: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
+      });
+      expect(transaction.warnings).toBeUndefined();
       expect(observedAtReceipt?.contents).toEqual(payload);
       expect(observedAtReceipt?.partExists).toBe(false);
       const receiptIndex = durabilityEvents.indexOf("receipt");
@@ -1693,7 +1740,7 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("propagates unrelated cached-artifact I/O failures without downloading", async () => {
+  it("preserves text when local artifact publication fails before downloading", async () => {
     const oracleHome = await fsPromises.mkdtemp(
       path.join(os.tmpdir(), "oracle-remote-artifact-io-"),
     );
@@ -1721,6 +1768,7 @@ describe("remote client transport deadlines", () => {
     await fsPromises.mkdir(artifactsDirectory, { recursive: true });
     await fsPromises.writeFile(finalPath, "corrupt!");
     let artifactGets = 0;
+    let settlementRequests = 0;
     const server = createAuthenticatedServer(async (req, res) => {
       const transactionToken = runTransactionToken(req);
       if (transactionToken) {
@@ -1737,10 +1785,19 @@ describe("remote client transport deadlines", () => {
         res.end(payload);
         return;
       }
+      const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
+      if (req.method === "POST" && finalize) {
+        settlementRequests += 1;
+        expect(await readJson(req)).toEqual({ durablePublication: true });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(finalizedSettlement(finalize[1]!, "artifact I/O")));
+        return;
+      }
       res.statusCode = 404;
       res.end();
     });
     const port = await listen(server);
+    const host = `127.0.0.1:${port}`;
     const originalSyncDirectory = fsDurability.syncDirectory;
     let injectedFailure = false;
     const syncDirectory = vi
@@ -1753,24 +1810,99 @@ describe("remote client transport deadlines", () => {
         }
       });
     try {
-      const error = await createRemoteBrowserExecutor({
-        host: `127.0.0.1:${port}`,
+      const transaction = await createRemoteBrowserExecutor({
+        host,
         token: "a".repeat(64),
         deadlines,
-      })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" }).then(
-        () => null,
-        (caught: unknown) => caught,
-      );
-      expect(error).toMatchObject({
-        name: "BrowserAutomationError",
-        details: { stage: "remote-artifact-transfer" },
+      })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" });
+      expect(transaction).toMatchObject({
+        answerText: "answer",
+        warnings: [
+          {
+            code: "remote-artifact-manual-copy-required",
+            severity: "warning",
+            message: expect.stringContaining("injected artifact cache I/O failure"),
+          },
+        ],
       });
+      expect(transaction.warnings?.[0]?.message).toContain(`remote browser host ${host}`);
+      expect(transaction).not.toHaveProperty("artifacts");
+      expect(transaction).not.toHaveProperty("savedFiles");
       expect(artifactGets).toBe(0);
+      await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(settlementRequests).toBe(1);
     } finally {
       syncDirectory.mockRestore();
       setOracleHomeDirOverrideForTest(null);
       await close(server);
       await fsPromises.rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+  it("rejects route-confusion transaction tokens before remote transport", async () => {
+    const validToken = "d".repeat(64);
+    const confusedToken = `${validToken}/bind?ignored=`;
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests += 1;
+      res.statusCode = 500;
+      res.end();
+    });
+    const port = await listen(server);
+    const host = `127.0.0.1:${port}`;
+    const invalidRuntime = recoveryRuntime(host, confusedToken);
+    try {
+      expect(() => findRemoteRecoveryAuthority(invalidRuntime)).toThrow(
+        /exactly 64 lowercase hexadecimal characters/i,
+      );
+      expect(findRemoteRecoveryAuthority(recoveryRuntime(host, validToken))).toMatchObject({
+        transactionToken: validToken,
+      });
+      await expect(
+        resumeRemoteBrowserTransaction({
+          runtime: invalidRuntime,
+          configuredHost: host,
+          authToken: "a".repeat(64),
+        }),
+      ).rejects.toMatchObject({ details: { code: "invalid-remote-transaction-token" } });
+      await expect(
+        bindRemoteBrowserSettlement({
+          hostname: "127.0.0.1",
+          port,
+          token: "a".repeat(64),
+          host,
+          transactionToken: confusedToken,
+          recoveryState: "recoverable-error",
+          mode: "finalize",
+          runtime: invalidRuntime,
+          deadlines,
+        }),
+      ).rejects.toMatchObject({ details: { code: "invalid-remote-transaction-token" } });
+      for (const mode of ["finalize", "abort"] as const) {
+        await expect(
+          settleRemoteBrowserTransaction({
+            hostname: "127.0.0.1",
+            port,
+            token: "a".repeat(64),
+            host,
+            transactionToken: confusedToken,
+            recoveryState: "recoverable-error",
+            mode,
+            runtime: invalidRuntime,
+            deadlines,
+          }),
+        ).rejects.toMatchObject({ details: { code: "invalid-remote-transaction-token" } });
+      }
+      await expect(
+        settleRemoteBrowserRecovery({
+          runtime: invalidRuntime,
+          configuredHost: host,
+          authToken: "a".repeat(64),
+          deadlines,
+        }),
+      ).rejects.toMatchObject({ details: { code: "invalid-remote-transaction-token" } });
+      expect(requests).toBe(0);
+    } finally {
+      await close(server);
     }
   });
 });

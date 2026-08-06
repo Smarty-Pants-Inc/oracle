@@ -52,33 +52,6 @@ function normalizeExactBrowserWSEndpoint(value: string | undefined): string | nu
   }
 }
 
-export function isRestartDurableChromeTargetCloseCapability(options: {
-  capability: BrowserRecoveryTargetCloseCapabilityMetadata;
-  targetId: string;
-  browserWSEndpoint: string | undefined;
-}): boolean {
-  const endpoint = normalizeExactBrowserWSEndpoint(options.browserWSEndpoint);
-  return (
-    isBrowserRecoveryTargetCloseCapability(options.capability) &&
-    options.capability.targetId === options.targetId &&
-    endpoint !== null &&
-    options.capability.browserWSEndpoint === endpoint
-  );
-}
-
-function resourceEndpointMatchesDurableCapability(
-  resource: BrowserRecoveryCleanupResourceMetadata,
-): boolean {
-  const normalized = normalizeExactBrowserWSEndpoint(resource.chromeBrowserWSEndpoint);
-  if (!normalized) return false;
-  const endpoint = new URL(normalized);
-  return (
-    (resource.chromeHost === undefined || endpoint.hostname === resource.chromeHost) &&
-    (resource.chromePort === undefined ||
-      Number.parseInt(endpoint.port, 10) === resource.chromePort)
-  );
-}
-
 function hasRestartDurableTargetResourceAuthority(
   resource: BrowserRecoveryCleanupResourceMetadata,
 ): boolean {
@@ -93,30 +66,11 @@ function hasRestartDurableTargetResourceAuthority(
   }
   if (!cleanup.ownsTarget || cleanup.closeOwnedTargetOnComplete === false) return true;
   if (cleanup.closeOwnedTargetOnComplete !== true) return false;
-  const processTeardownIsExact = canExactOwnedProcessTeardownSubsumeTargetClose({
+  return canExactOwnedProcessTeardownSubsumeTargetClose({
     profileKind: cleanup.profileKind,
     keepBrowserOpen: cleanup.keepBrowser,
     hasExactProcessAuthority: Boolean(resource.chromeProcessIdentity),
   });
-  if (processTeardownIsExact) return true;
-  if (!resource.chromeTargetId || !resource.targetCloseCapability) return false;
-  if (
-    resource.acquisition?.generationId &&
-    resource.acquisition.generationId !== resource.targetCloseCapability.generationId
-  ) {
-    return false;
-  }
-  if (
-    !isRestartDurableChromeTargetCloseCapability({
-      capability: resource.targetCloseCapability,
-      targetId: resource.chromeTargetId,
-      browserWSEndpoint: resource.chromeBrowserWSEndpoint,
-    }) ||
-    !resourceEndpointMatchesDurableCapability(resource)
-  ) {
-    return false;
-  }
-  return Boolean(resource.chromeProcessIdentity) || cleanup.profileKind === "none";
 }
 
 export function hasRestartDurableChromeTargetCleanupAuthority(

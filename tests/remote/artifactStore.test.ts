@@ -360,6 +360,112 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
+  test("rolls back an empty fresh namespace when physical identity capture fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-capture-failure-"));
+    const transactionToken = "5".repeat(64);
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    const captureFailure = Object.assign(new Error("simulated namespace identity failure"), {
+      code: "EIO",
+    });
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const mockedLstat = vi.fn(async (...args: unknown[]) => {
+      const [candidatePath] = args;
+      if (path.basename(String(candidatePath)).startsWith("remote-")) throw captureFailure;
+      return await Reflect.apply(actualFs.lstat, actualFs, args);
+    });
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, lstat: mockedLstat }));
+    const { RemoteArtifactStore: IsolatedRemoteArtifactStore } =
+      await import("../../src/remote/artifactStore.js");
+    try {
+      const sessionsRoot = path.join(root, "sessions");
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "transactions"),
+        terminalRetentionMs: 1_000,
+        now: () => now,
+      });
+      const begun = await begin(store, transactionToken, "run-capture-failure");
+      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+
+      await expect(
+        artifacts.createArtifactWriteAuthority({
+          transactionToken,
+          runId: "run-capture-failure",
+        }),
+      ).rejects.toBe(captureFailure);
+      const failed = await store.read(transactionToken);
+      expect(failed).toMatchObject({
+        state: "failed",
+        artifactNamespaceState: "uninitialized",
+        terminalAudit: {
+          errorCode: "remote-artifact-namespace-initialization-failed",
+          errorStage: "remote-artifact-namespace-initialization",
+        },
+      });
+      expect(failed).not.toHaveProperty("artifactNamespaceIdentity");
+      await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      now += 1_001;
+      await expect(store.list()).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rolls back exact authority when durable identity binding reports failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-bind-failure-"));
+    const transactionToken = "6".repeat(64);
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    const sessionsRoot = path.join(root, "sessions");
+    const store = await RemoteTransactionStore.open({
+      directory: path.join(root, "transactions"),
+      terminalRetentionMs: 1_000,
+      now: () => now,
+    });
+    const durableBind = store.bindArtifactNamespaceIdentity.bind(store);
+    const bindFailure = new Error("simulated durable namespace identity bind failure");
+    const bindSpy = vi
+      .spyOn(store, "bindArtifactNamespaceIdentity")
+      .mockImplementationOnce(async (params) => {
+        await durableBind(params);
+        throw bindFailure;
+      });
+    try {
+      const begun = await begin(store, transactionToken, "run-bind-failure");
+      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+
+      await expect(
+        artifacts.createArtifactWriteAuthority({
+          transactionToken,
+          runId: "run-bind-failure",
+        }),
+      ).rejects.toBe(bindFailure);
+      const failed = await store.read(transactionToken);
+      expect(failed).toMatchObject({
+        state: "failed",
+        artifactNamespaceState: "uninitialized",
+        terminalAudit: {
+          errorCode: "remote-artifact-namespace-initialization-failed",
+          errorStage: "remote-artifact-namespace-initialization",
+        },
+      });
+      expect(failed).not.toHaveProperty("artifactNamespaceIdentity");
+      await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      now += 1_001;
+      await expect(store.list()).resolves.toEqual([]);
+    } finally {
+      bindSpy.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("settles namespace initialization failure and removes only its exact fresh directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-init-failure-"));
     const transactionToken = "2".repeat(64);
@@ -393,15 +499,16 @@ describe("RemoteArtifactStore", () => {
           runId: "run-init-failure",
         }),
       ).rejects.toBe(mkdirFailure);
-      await expect(store.read(transactionToken)).resolves.toMatchObject({
+      const failed = await store.read(transactionToken);
+      expect(failed).toMatchObject({
         state: "failed",
-        artifactNamespaceState: "initializing",
-        artifactNamespaceIdentity: expect.objectContaining({ device: expect.any(String) }),
+        artifactNamespaceState: "uninitialized",
         terminalAudit: {
           errorCode: "remote-artifact-namespace-initialization-failed",
           errorStage: "remote-artifact-namespace-initialization",
         },
       });
+      expect(failed).not.toHaveProperty("artifactNamespaceIdentity");
       await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
         code: "ENOENT",
       });

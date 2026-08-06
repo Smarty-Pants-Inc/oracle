@@ -79,6 +79,8 @@ export interface RemoteRequestRouterDeps {
   transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
   admitControllerOperation: () => (() => void) | null;
+  admitRemoteTransaction: (transactionToken: string) => (() => void) | null;
+  isRemoteTransactionAdmitted: (transactionToken: string) => boolean;
   isClosing: () => boolean;
   isBrowserWorkBusy: () => boolean;
   isBrowserWorkExclusive: () => boolean;
@@ -239,37 +241,53 @@ export function attachRemoteRequestRouter(
       if (transactionMatch) {
         if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         if (transactionMatch.action === "run") {
-          await deps.sweepExpiredAuthority(true);
-          if (deps.isClosing()) {
-            sendJson(res, 503, { error: "server_closing" });
-            return;
-          }
-          if (deps.isBrowserWorkExclusive()) {
-            if (deps.verbose) {
-              deps.logger(
-                `[serve] Busy: rejecting new run from ${formatSocket(req)} while exclusive browser work is active`,
-              );
-            }
-            sendJson(res, 409, { error: "busy" });
-            return;
-          }
-          const finishBrowserWork = deps.startBrowserWork("shared-run");
-          try {
-            await handleRemoteRunRequest({
-              req,
-              res,
-              options: deps.options,
-              protocol: "transaction-v3",
-              runBrowser: deps.runBrowser,
-              logger: deps.logger,
-              verbose: deps.verbose,
+          const releaseTransactionAdmission = deps.admitRemoteTransaction(
+            transactionMatch.transactionToken,
+          );
+          if (!releaseTransactionAdmission) {
+            sendJson(res, 409, {
+              error: "transaction_exists",
+              state: "running",
               transactionToken: transactionMatch.transactionToken,
-              transactionStore: deps.transactionStore,
-              artifactStore: deps.artifactStore,
-              transactionCoordinator: deps.transactionCoordinator,
             });
+            return;
+          }
+          try {
+            await deps.sweepExpiredAuthority(true);
+            if (deps.isClosing()) {
+              sendJson(res, 503, { error: "server_closing" });
+              return;
+            }
+            if (deps.isBrowserWorkExclusive()) {
+              if (deps.verbose) {
+                deps.logger(
+                  `[serve] Busy: rejecting new run from ${formatSocket(req)} while exclusive browser work is active`,
+                );
+              }
+              sendJson(res, 409, { error: "busy" });
+              return;
+            }
+            const finishBrowserWork = deps.startBrowserWork("shared-run");
+            try {
+              await handleRemoteRunRequest({
+                req,
+                res,
+                options: deps.options,
+                protocol: "transaction-v3",
+                runBrowser: deps.runBrowser,
+                logger: deps.logger,
+                verbose: deps.verbose,
+                transactionToken: transactionMatch.transactionToken,
+                transactionStore: deps.transactionStore,
+                artifactStore: deps.artifactStore,
+                transactionCoordinator: deps.transactionCoordinator,
+                releaseTransactionAdmission,
+              });
+            } finally {
+              finishBrowserWork();
+            }
           } finally {
-            finishBrowserWork();
+            releaseTransactionAdmission();
           }
           return;
         }
@@ -295,6 +313,7 @@ export function attachRemoteRequestRouter(
             runBrowserWork: deps.runBrowserWork,
             logger: deps.cleanupLogger,
             serverLogger: deps.logger,
+            isTransactionAdmitted: deps.isRemoteTransactionAdmitted,
           });
           return;
         }

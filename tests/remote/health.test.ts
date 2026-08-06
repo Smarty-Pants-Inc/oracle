@@ -1,9 +1,15 @@
 import http from "node:http";
 import { describe, expect, it } from "vitest";
 import { checkRemoteHealth } from "../../src/remote/health.js";
-import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+import {
+  REMOTE_REQUEST_FRESHNESS_WINDOW_MS,
+  REMOTE_REQUEST_FUTURE_CLOCK_SKEW_MS,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+} from "../../src/remote/types.js";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
+  REMOTE_REQUEST_ISSUED_AT_HEADER,
+  REMOTE_REQUEST_MAC_HEADER,
   RemoteRequestAuthenticator,
   assertRemoteCredential,
   createRemoteAuthenticatedRequest,
@@ -11,6 +17,7 @@ import {
   generateRemoteCredential,
   verifyRemoteHealthAuthenticationProof,
   verifyRemoteRequestProof,
+  type RemoteAuthenticatedRequest,
 } from "../../src/remote/auth.js";
 
 async function listen(server: http.Server): Promise<number> {
@@ -65,6 +72,7 @@ describe("remote HMAC authentication", () => {
   });
 
   it("verifies request MACs and rejects nonce replay", () => {
+    const now = 1_700_000_000_000;
     const path = `/transactions/${"a".repeat(64)}/bind`;
     const body = Buffer.from(JSON.stringify({ mode: "finalize" }));
     const authentication = createRemoteAuthenticatedRequest({
@@ -73,10 +81,12 @@ describe("remote HMAC authentication", () => {
       method: "POST",
       path,
       body,
+      issuedAt: now,
     });
     const authenticator = new RemoteRequestAuthenticator({
       rootKey: "a".repeat(64),
       serverGeneration: "generation-1",
+      now: () => now,
     });
     const request = {
       method: "POST",
@@ -95,11 +105,181 @@ describe("remote HMAC authentication", () => {
         proof: verified.requestProof,
       }),
     ).toBe(true);
+    expect(authenticator.authenticate({ ...request } as http.IncomingMessage)).toEqual({
+      statusCode: 409,
+      code: "request_replayed",
+    });
+  });
+
+  it("cryptographically binds the issued-at timestamp and MAC", () => {
+    const now = 1_700_000_000_000;
+    const path = `/transactions/${"b".repeat(64)}/retry`;
+    const body = Buffer.from("{}");
+    const authenticator = new RemoteRequestAuthenticator({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      now: () => now,
+    });
+    const authenticate = (headers: Record<string, string>) =>
+      authenticator.authenticate({ method: "POST", url: path, headers } as http.IncomingMessage);
+    const timestampAuthentication = createRemoteAuthenticatedRequest({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      method: "POST",
+      path,
+      body,
+      issuedAt: now,
+    });
+    const missingTimestampHeaders = { ...timestampAuthentication.headers };
+    delete missingTimestampHeaders[REMOTE_REQUEST_ISSUED_AT_HEADER];
+    expect(authenticate(missingTimestampHeaders)).toEqual({
+      statusCode: 401,
+      code: "invalid_request_authentication",
+    });
+    expect(
+      authenticate({
+        ...timestampAuthentication.headers,
+        [REMOTE_REQUEST_ISSUED_AT_HEADER]: String(now - 1),
+      }),
+    ).toEqual({ statusCode: 401, code: "invalid_request_authentication" });
+
+    const macAuthentication = createRemoteAuthenticatedRequest({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      method: "POST",
+      path,
+      body,
+      issuedAt: now,
+    });
+    expect(
+      authenticate({
+        ...macAuthentication.headers,
+        [REMOTE_REQUEST_MAC_HEADER]: "b".repeat(64),
+      }),
+    ).toEqual({ statusCode: 401, code: "invalid_request_authentication" });
+  });
+
+  it("rejects expired and future request timestamps before nonce admission", () => {
+    const now = 1_700_000_000_000;
+    const path = `/transactions/${"c".repeat(64)}/abort`;
+    const body = Buffer.from("{}");
+    const authenticator = new RemoteRequestAuthenticator({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      now: () => now,
+      maximumNonces: 1,
+    });
+    const authenticateAt = (issuedAt: number) => {
+      const authentication = createRemoteAuthenticatedRequest({
+        rootKey: "a".repeat(64),
+        serverGeneration: "generation-1",
+        method: "POST",
+        path,
+        body,
+        issuedAt,
+      });
+      return authenticator.authenticate({
+        method: "POST",
+        url: path,
+        headers: authentication.headers,
+      } as http.IncomingMessage);
+    };
+    expect(authenticateAt(now - REMOTE_REQUEST_FRESHNESS_WINDOW_MS - 1)).toEqual({
+      statusCode: 401,
+      code: "invalid_request_authentication",
+    });
+    expect(authenticateAt(now + REMOTE_REQUEST_FUTURE_CLOCK_SKEW_MS + 1)).toEqual({
+      statusCode: 401,
+      code: "invalid_request_authentication",
+    });
+    expect(authenticateAt(now)).not.toHaveProperty("statusCode");
+  });
+
+  it("retains a captured nonce through freshness and rejects it after predecessor aging", () => {
+    let now = 1_700_000_000_000;
+    const path = `/transactions/${"d".repeat(64)}/finalize`;
+    const body = Buffer.from(JSON.stringify({ durablePublication: true }));
+    const authentication = createRemoteAuthenticatedRequest({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      method: "POST",
+      path,
+      body,
+      issuedAt: now,
+    });
+    const authenticator = new RemoteRequestAuthenticator({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      now: () => now,
+    });
+    const request = {
+      method: "POST",
+      url: path,
+      headers: authentication.headers,
+    } as http.IncomingMessage;
+    expect(authenticator.authenticate(request)).not.toHaveProperty("statusCode");
+    now += REMOTE_REQUEST_FRESHNESS_WINDOW_MS;
+    expect(authenticator.authenticate({ ...request } as http.IncomingMessage)).toEqual({
+      statusCode: 409,
+      code: "request_replayed",
+    });
+    now += 30 * 60 * 1000 + 1;
+    expect(authenticator.authenticate({ ...request } as http.IncomingMessage)).toEqual({
+      statusCode: 401,
+      code: "invalid_request_authentication",
+    });
+  });
+
+  it("rejects new authentication at nonce capacity without evicting live nonces", () => {
+    const now = 1_700_000_000_000;
+    const path = `/transactions/${"e".repeat(64)}/retry`;
+    const body = Buffer.from("{}");
+    const authenticator = new RemoteRequestAuthenticator({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      now: () => now,
+      maximumNonces: 2,
+    });
+    let captured: RemoteAuthenticatedRequest | undefined;
+    for (let index = 0; index < 2; index += 1) {
+      const authentication = createRemoteAuthenticatedRequest({
+        rootKey: "a".repeat(64),
+        serverGeneration: "generation-1",
+        method: "POST",
+        path,
+        body,
+        issuedAt: now,
+      });
+      captured ??= authentication;
+      expect(
+        authenticator.authenticate({
+          method: "POST",
+          url: path,
+          headers: authentication.headers,
+        } as http.IncomingMessage),
+      ).not.toHaveProperty("statusCode");
+    }
+    if (!captured) throw new Error("nonce capacity fixture did not capture a request");
+    const overflow = createRemoteAuthenticatedRequest({
+      rootKey: "a".repeat(64),
+      serverGeneration: "generation-1",
+      method: "POST",
+      path,
+      body,
+      issuedAt: now,
+    });
     expect(
       authenticator.authenticate({
         method: "POST",
         url: path,
-        headers: authentication.headers,
+        headers: overflow.headers,
+      } as http.IncomingMessage),
+    ).toEqual({ statusCode: 429, code: "authentication_capacity_exhausted" });
+    expect(
+      authenticator.authenticate({
+        method: "POST",
+        url: path,
+        headers: captured.headers,
       } as http.IncomingMessage),
     ).toEqual({ statusCode: 409, code: "request_replayed" });
   });

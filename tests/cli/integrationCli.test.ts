@@ -630,6 +630,67 @@ module.exports = () => ({
   );
 
   test(
+    "keeps predecessor remote credentials dormant for local and explicit API commands",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-dormant-remote-home-"));
+      await writeFile(
+        path.join(oracleHome, "config.json"),
+        JSON.stringify({
+          engine: "browser",
+          browser: {
+            remoteHost: "127.0.0.1:9473",
+            remoteToken: "a".repeat(32),
+          },
+        }),
+      );
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        ORACLE_HOME_DIR: oracleHome,
+        ORACLE_DISABLE_KEYTAR: "1",
+        DOTENV_CONFIG_PATH: "/tmp/nonexistent-oracle-env",
+      };
+
+      const local = await execCli(["status"], { env, timeout: INTEGRATION_TIMEOUT });
+      expect(local.code).toBe(0);
+      expect(`${local.stdout}\n${local.stderr}`).not.toMatch(/base-generated|remote credential/i);
+
+      const api = await execCli(
+        [
+          "--dry-run",
+          "--engine",
+          "api",
+          "--model",
+          "claude-4.6-sonnet",
+          "--prompt",
+          "Dormant remote upgrade state must not affect API routing",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(api.code).toBe(0);
+      expect(api.stdout).toContain("would call claude-4.6-sonnet");
+      expect(`${api.stdout}\n${api.stderr}`).not.toMatch(/base-generated|remote credential/i);
+
+      const remote = await execCli(
+        [
+          "--dry-run",
+          "--engine",
+          "browser",
+          "--prompt",
+          "Remote browser use must rotate predecessor state",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(remote.code).toBe(1);
+      expect(`${remote.stdout}\n${remote.stderr}`).toMatch(
+        /immediately preceding base-generated.*oracle bridge host --token auto.*unset ORACLE_REMOTE_HOST ORACLE_REMOTE_TOKEN.*oracle bridge client --connect/is,
+      );
+
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
     "persists explicit Azure provider mode for custom deployment sessions",
     async () => {
       const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-provider-azure-"));

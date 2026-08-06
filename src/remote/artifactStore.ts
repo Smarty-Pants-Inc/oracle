@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, rmdir, type FileHandle } from "node:fs/promises";
 import {
   sanitizeArtifactFilename,
   sanitizeArtifactMimeType,
@@ -68,20 +68,26 @@ export class RemoteArtifactStore {
       throw new Error("Remote artifact namespace is not owned by the exact fresh transaction");
     }
 
+    const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
+    let namespaceCreated = false;
+    let namespaceIdentity: DurableRemoteArtifactNamespaceIdentity | undefined;
     try {
       await this.#transactionStore.beginArtifactNamespaceInitialization(params);
       await mkdir(this.#sessionsRoot, { recursive: true, mode: 0o700 });
-      const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
       try {
         await mkdir(namespaceDirectory, { mode: 0o700 });
+        namespaceCreated = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") {
           throw new Error("Remote artifact namespace was not created exclusively");
         }
         throw error;
       }
-      const identity = await capturePhysicalDirectoryIdentity(namespaceDirectory);
-      await this.#transactionStore.bindArtifactNamespaceIdentity({ ...params, identity });
+      namespaceIdentity = await capturePhysicalDirectoryIdentity(namespaceDirectory);
+      await this.#transactionStore.bindArtifactNamespaceIdentity({
+        ...params,
+        identity: namespaceIdentity,
+      });
       const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
       await mkdir(artifactsDirectory, { mode: 0o700 });
       if (process.platform !== "win32") {
@@ -90,11 +96,29 @@ export class RemoteArtifactStore {
       }
       const canonicalArtifactsDirectory = await this.resolveArtifactNamespaceDirectory(
         record.artifactNamespace,
-        identity,
+        namespaceIdentity,
       );
       await this.#transactionStore.completeArtifactNamespaceInitialization(params);
       return { artifactsDirectory: canonicalArtifactsDirectory };
     } catch (error) {
+      if (namespaceCreated) {
+        try {
+          const removed = await this.cleanupArtifactNamespace({
+            ...record,
+            artifactNamespaceState: "initializing",
+            artifactNamespaceIdentity: namespaceIdentity,
+          });
+          if (removed) {
+            await this.#transactionStore.rollbackArtifactNamespaceInitialization({
+              ...params,
+              identity: namespaceIdentity,
+            });
+          }
+        } catch {
+          // Retain durable namespace authority below when immediate exact or empty-only rollback fails.
+        }
+      }
+
       let failed: RemoteTransactionRecord;
       try {
         failed = await this.#transactionStore.recordRecoverableFailure({
@@ -262,10 +286,12 @@ export class RemoteArtifactStore {
     const identity = record.artifactNamespaceIdentity;
     if (!identity) {
       try {
-        await capturePhysicalDirectoryIdentity(namespaceDirectory);
-        return false;
+        await rmdir(namespaceDirectory);
+        return true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return true;
+        if (code === "ENOTEMPTY" || code === "EEXIST") return false;
         throw error;
       }
     }

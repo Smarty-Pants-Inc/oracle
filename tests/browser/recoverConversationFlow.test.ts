@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 
 const meta = {
   id: "sess-recover",
@@ -171,6 +172,162 @@ describe("recoverConversationTab lease ownership", () => {
         nonce: "a0000000-0000-4000-8000-00000000000a",
       }),
     }));
+  });
+
+  test("releases the persisted exact lease when acquisition throws after installing it", async () => {
+    const persisted: BrowserRuntimeMetadata[] = [];
+    let installedLeaseId: string | undefined;
+    const acquireBrowserTabLease = vi.fn(
+      async (_profileDir: string, options: { leaseId?: string }) => {
+        installedLeaseId = options.leaseId;
+        throw new Error("post-effect lease fsync failed");
+      },
+    );
+    const releaseBrowserTabLease = vi.fn(
+      async (
+        _profileDir: string,
+        leaseId: string,
+        _logger: typeof logger,
+        options: { expectedProfileIdentity?: typeof profileDirectory },
+      ) => {
+        expect(leaseId).toBe(installedLeaseId);
+        expect(options.expectedProfileIdentity).toEqual(profileDirectory);
+        installedLeaseId = undefined;
+      },
+    );
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: vi.fn(),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+      acquireManualChromeOwner: vi.fn(),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
+      releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeChromeTargetWithExactAuthority: vi.fn(),
+      connectWithNewTabWithRetainedLiveAuthority: vi.fn(),
+      connectWithNewTabWithExactAuthority: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
+      DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
+      normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
+      acquireBrowserTabLease,
+      releaseBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
+
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(
+      recoverConversationTab(meta, logger, {
+        persistRuntime: async (runtime) => {
+          persisted.push(runtime);
+        },
+      }),
+    ).rejects.toThrow("post-effect lease fsync failed");
+
+    expect(releaseBrowserTabLease).toHaveBeenCalledWith(
+      "/tmp/recover-profile",
+      expect.any(String),
+      logger,
+      { expectedProfileIdentity: profileDirectory },
+    );
+    expect(installedLeaseId).toBeUndefined();
+    expect(persisted[0]).toMatchObject({
+      recoveryCleanupResources: [
+        {
+          tabLease: { id: expect.any(String), profileDirectory },
+          acquisition: { pendingResource: "tab-lease" },
+        },
+      ],
+    });
+    expect(persisted.at(-1)?.recoveryCleanupResources).toBeUndefined();
+  });
+
+  test("keeps the persisted lease intent pending when exact post-effect release fails", async () => {
+    const persisted: BrowserRuntimeMetadata[] = [];
+    let installedLeaseId: string | undefined;
+    const acquireBrowserTabLease = vi.fn(
+      async (_profileDir: string, options: { leaseId?: string }) => {
+        installedLeaseId = options.leaseId;
+        throw new Error("post-effect lease identity check failed");
+      },
+    );
+    const releaseBrowserTabLease = vi.fn(async () => {
+      throw new Error("registry release fsync failed");
+    });
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: vi.fn(),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/manualChromeOwner.js", () => ({
+      acquireManualChromeOwner: vi.fn(),
+      settleManualChromeOwner: settleManualChromeOwnerForTest,
+      releaseManualChromeOwnerEndpointAuthority: releaseManualChromeOwnerEndpointAuthorityForTest,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeChromeTargetWithExactAuthority: vi.fn(),
+      connectWithNewTabWithRetainedLiveAuthority: vi.fn(),
+      connectWithNewTabWithExactAuthority: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/tabLeaseRegistry.js", () => ({
+      DEFAULT_MAX_CONCURRENT_CHATGPT_TABS: 3,
+      normalizeMaxConcurrentTabs: (value: unknown) => Number(value ?? 3),
+      acquireBrowserTabLease,
+      releaseBrowserTabLease,
+      retainBrowserTabLeaseTeardownAuthority: retainBrowserTabLeaseTeardownAuthorityForTest,
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({ isImageOnlyUiChromeText: () => false }));
+
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(
+      recoverConversationTab(meta, logger, {
+        persistRuntime: async (runtime) => {
+          persisted.push(runtime);
+        },
+      }),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("cleanup remains pending"),
+      details: {
+        stage: "recovered-conversation-cleanup",
+        runtime: {
+          recoveryCleanupResources: [
+            {
+              tabLease: { id: expect.any(String), profileDirectory },
+              acquisition: { pendingResource: "tab-lease" },
+            },
+          ],
+          recoveryCleanupResult: {
+            status: "failed",
+            settlementMode: "abort",
+            error: expect.stringContaining("registry release fsync failed"),
+          },
+        },
+      },
+    });
+
+    expect(releaseBrowserTabLease).toHaveBeenCalledWith(
+      "/tmp/recover-profile",
+      installedLeaseId,
+      logger,
+      { expectedProfileIdentity: profileDirectory },
+    );
+    expect(installedLeaseId).toEqual(expect.any(String));
+    expect(persisted.at(-1)).toMatchObject({
+      recoveryCleanupResources: [
+        {
+          tabLease: { id: installedLeaseId, profileDirectory },
+          acquisition: { pendingResource: "tab-lease" },
+        },
+      ],
+      recoveryCleanupResult: {
+        status: "failed",
+        settlementMode: "abort",
+      },
+    });
   });
 
   test("leases before reusing a process-less canonical Chrome owner and cleans the owned target once", async () => {
