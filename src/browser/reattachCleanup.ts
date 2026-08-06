@@ -18,7 +18,7 @@ import type {
 import {
   projectBrowserCaptureCleanupRuntime,
   projectBrowserCaptureFinalization,
-} from "./runLifecycle.js";
+} from "./ownedBrowserResources.js";
 import type { BrowserLogger } from "./types.js";
 
 export {

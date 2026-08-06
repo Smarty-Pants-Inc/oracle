@@ -18,6 +18,24 @@ const { cdpMock, cdpNewMock, cdpCloseMock, cdpListMock } = vi.hoisted(() => {
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
 
+function sessionDomains() {
+  return {
+    Network: { enable: vi.fn(async () => ({})) },
+    Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+    Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
+    Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
+    DOM: { enable: vi.fn(async () => ({})) },
+    Emulation: { setFocusEmulationEnabled: vi.fn(async () => ({})) },
+  };
+}
+
+function browserDomain() {
+  return {
+    getWindowForTarget: vi.fn(async () => ({ windowId: 1, bounds: {} })),
+    setWindowBounds: vi.fn(async () => ({})),
+  };
+}
+
 describe("connectToRemoteChrome", () => {
   beforeEach(() => {
     cdpMock.mockReset();
@@ -33,17 +51,17 @@ describe("connectToRemoteChrome", () => {
     const send = vi.fn(async () => ({}));
     const browserClient = {
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "target-9", url: "https://chatgpt.com/" },
+        })),
         createTarget: vi.fn(async () => ({ targetId: "target-9" })),
         attachToTarget: vi.fn(async () => ({ sessionId: "session-9" })),
         detachFromTarget: vi.fn(async () => ({})),
         closeTarget: vi.fn(async () => ({ success: true })),
       },
-      Network: { enable: vi.fn(async () => ({})) },
-      Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
-      Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
-      Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
-      DOM: { enable: vi.fn(async () => ({})) },
-      Emulation: { setFocusEmulationEnabled: vi.fn(async () => ({})) },
+      Browser: browserDomain(),
+      ...sessionDomains(),
       on: vi.fn(),
       once: vi.fn(),
       removeListener: vi.fn(),
@@ -79,11 +97,13 @@ describe("connectToRemoteChrome", () => {
       { enabled: true },
       "session-9",
     );
-    await (
-      connection.client as typeof connection.client & {
-        send: (method: string, params: unknown, sessionId: string) => Promise<unknown>;
-      }
-    ).send("Target.setAutoAttach", { autoAttach: true }, "session-9");
+    expect("Browser" in connection.client).toBe(false);
+    expect("Target" in connection.client).toBe(false);
+    expect("send" in connection.client).toBe(false);
+    const onAttached = vi.fn();
+    connection.client.on("Target.attachedToTarget", onAttached);
+    expect(browserClient.on).toHaveBeenCalledWith("Target.attachedToTarget.session-9", onAttached);
+    await connection.client.sendSession("Target.setAutoAttach", { autoAttach: true });
     expect(send).toHaveBeenCalledWith("Target.setAutoAttach", { autoAttach: true }, "session-9");
     await connection.close();
     expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({ sessionId: "session-9" });
@@ -93,6 +113,11 @@ describe("connectToRemoteChrome", () => {
     const cleanupOrder: string[] = [];
     const browserClient = {
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "created-target", url: "https://chatgpt.com/" },
+        })),
+        detachFromTarget: vi.fn(async () => ({})),
         createTarget: vi.fn(async () => ({ targetId: "created-target" })),
         attachToTarget: vi.fn(async () => {
           throw new Error("attach failed");
@@ -102,6 +127,12 @@ describe("connectToRemoteChrome", () => {
           return { success: true };
         }),
       },
+      Browser: browserDomain(),
+      ...sessionDomains(),
+      on: vi.fn(),
+      once: vi.fn(),
+      off: vi.fn(),
+      removeListener: vi.fn(),
       close: vi.fn(async () => {
         cleanupOrder.push("browser");
       }),
@@ -125,12 +156,23 @@ describe("connectToRemoteChrome", () => {
   test("does not close a caller-supplied websocket target when attachment fails", async () => {
     const browserClient = {
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "borrowed-target", url: "https://chatgpt.com/" },
+        })),
+        detachFromTarget: vi.fn(async () => ({})),
         createTarget: vi.fn(async () => ({ targetId: "unused" })),
         attachToTarget: vi.fn(async () => {
           throw new Error("attach failed");
         }),
         closeTarget: vi.fn(async () => ({ success: true })),
       },
+      Browser: browserDomain(),
+      ...sessionDomains(),
+      on: vi.fn(),
+      once: vi.fn(),
+      off: vi.fn(),
+      removeListener: vi.fn(),
       close: vi.fn(async () => undefined),
     };
     cdpMock.mockResolvedValue(browserClient);
@@ -150,7 +192,21 @@ describe("connectToRemoteChrome", () => {
     expect(browserClient.close).toHaveBeenCalledOnce();
   });
   test("reports explicit attached ownership for the HTTP fallback target", async () => {
-    const fallbackClient = { close: vi.fn(async () => undefined) };
+    const fallbackClient = {
+      Browser: browserDomain(),
+      Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "borrowed-target", url: "https://chatgpt.com/" },
+        })),
+      },
+      ...sessionDomains(),
+      on: vi.fn(),
+      once: vi.fn(),
+      off: vi.fn(),
+      removeListener: vi.fn(),
+      close: vi.fn(async () => undefined),
+    };
     cdpListMock.mockResolvedValue([
       { id: "borrowed-target", type: "page", url: "https://chatgpt.com/" },
     ]);
@@ -178,16 +234,17 @@ describe("connectToRemoteChrome", () => {
     vi.useFakeTimers();
     const browserClient = {
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "target-10", url: "https://chatgpt.com/" },
+        })),
         createTarget: vi.fn(async () => ({ targetId: "target-10" })),
         attachToTarget: vi.fn(async () => ({ sessionId: "session-10" })),
         detachFromTarget: vi.fn(async () => ({})),
         closeTarget: vi.fn(async () => ({ success: true })),
       },
-      Network: { enable: vi.fn(async () => ({})) },
-      Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
-      Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
-      Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
-      DOM: { enable: vi.fn(async () => ({})) },
+      Browser: browserDomain(),
+      ...sessionDomains(),
       on: vi.fn(),
       once: vi.fn(),
       removeListener: vi.fn(),
@@ -251,9 +308,17 @@ describe("connectToRemoteChrome", () => {
     vi.useFakeTimers();
     const browserClient = {
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "target-20", url: "https://chatgpt.com/" },
+        })),
+        detachFromTarget: vi.fn(async () => ({})),
+        closeTarget: vi.fn(async () => ({ success: true })),
         createTarget: vi.fn(async () => ({ targetId: "target-20" })),
         attachToTarget: vi.fn(async () => ({ sessionId: "session-20" })),
       },
+      Browser: browserDomain(),
+      ...sessionDomains(),
       close: vi.fn(async () => {}),
       on: vi.fn(),
       once: vi.fn(),

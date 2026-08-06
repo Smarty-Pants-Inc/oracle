@@ -7,10 +7,10 @@ import {
   type LocalOwnedBrowserAcquisitionStep,
   type LocalOwnedBrowserProcessSettlement,
 } from "./ownedBrowserResources.js";
+import type { ChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
 import {
   isSafeChromeTerminationOutcome,
   type ChromeOwnerDisposition,
-  type ChromeProcessLaunchClaim,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
 import {

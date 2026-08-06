@@ -13,11 +13,8 @@ import {
   LocalOwnedBrowserResourceAuthority,
   type LocalOwnedBrowserProcessAuthority,
 } from "./ownedBrowserResources.js";
-import {
-  captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
-  type ChromeOwnerDisposition,
-} from "./profileState.js";
+import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity, type ChromeOwnerDisposition } from "./profileState.js";
 import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import { copyChromeProfile } from "./profileCopy.js";
 import { finalizeRecoveredRuntime } from "./reattachCleanup.js";

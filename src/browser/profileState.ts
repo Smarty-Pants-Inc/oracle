@@ -22,22 +22,23 @@ import {
 } from "./profileDirectoryAuthority.js";
 import { getDevToolsActivePortPaths } from "./profileDevToolsState.js";
 import {
-  inspectChromeProfileDirectoryUse,
   inspectChromeProcessIdentityWithDeps,
-  isChromeUsingUserDataDir,
   isProcessAlive,
   parseChromeProcessIdentity,
-  revalidateChromeProfileDirectoryUse,
   sameChromeProcessIdentity,
   type ChromeProcessIdentity,
   type ChromeProcessIdentityDeps,
+} from "./chromeProcessIdentity.js";
+import {
+  inspectChromeProfileDirectoryUse,
+  isChromeUsingUserDataDir,
+  revalidateChromeProfileDirectoryUse,
   type ChromeProfileDirectoryUnusedProof,
   type ChromeProfileDirectoryUseInspection,
-} from "./chromeProcessIdentity.js";
+} from "./chromeProfileDirectoryUse.js";
 
 export * from "./profileDirectoryAuthority.js";
 export * from "./profileDevToolsState.js";
-export * from "./chromeProcessIdentity.js";
 
 const ORACLE_CHROME_OWNER_FILENAME = "oracle-chrome-owner.json";
 const ORACLE_PROFILE_LOCK_FILENAME = "oracle-automation.lock";
@@ -62,6 +63,12 @@ export interface OracleChromeOwnerRecord {
   readonly disposition: ChromeOwnerDisposition;
   /** Only the remote service may establish a preservation policy direct runs cannot replace. */
   readonly preservationPolicy?: ChromeOwnerPreservationPolicy;
+}
+
+interface ChromeOwnerProcessIdentityDeps extends ChromeProcessIdentityDeps {
+  readonly readOwner?: (
+    userDataDir: string,
+  ) => Promise<{ processIdentity: ChromeProcessIdentity } | null>;
 }
 
 export interface ProfileDirectoryUseDeps {
@@ -393,7 +400,7 @@ export async function verifyChromeProcessIdentity(
 export async function verifyChromeProcessIdentityForTest(
   userDataDir: string,
   identity: ChromeProcessIdentity,
-  deps: ChromeProcessIdentityDeps,
+  deps: ChromeOwnerProcessIdentityDeps,
 ): Promise<boolean> {
   return verifyChromeProcessIdentityWithDeps(userDataDir, identity, deps);
 }
@@ -401,7 +408,7 @@ export async function verifyChromeProcessIdentityForTest(
 async function verifyChromeProcessIdentityWithDeps(
   userDataDir: string,
   identity: ChromeProcessIdentity,
-  deps: ChromeProcessIdentityDeps,
+  deps: ChromeOwnerProcessIdentityDeps,
 ): Promise<boolean> {
   let persistedOwner: { processIdentity: ChromeProcessIdentity } | null;
   try {
@@ -495,7 +502,7 @@ export function isSafeChromeTerminationOutcome(
   return outcome.status === "stopped" || outcome.status === "already-stopped";
 }
 
-interface RecordedChromeTerminationDeps extends ChromeProcessIdentityDeps {
+interface RecordedChromeTerminationDeps extends ChromeOwnerProcessIdentityDeps {
   isChromeUsingUserDataDir?: (userDataDir: string) => Promise<boolean>;
 }
 

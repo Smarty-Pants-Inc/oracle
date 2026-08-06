@@ -127,16 +127,18 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => ({
 vi.mock("../../src/browser/config.js", () => ({
   resolveBrowserConfig,
 }));
-vi.mock("../../src/browser/profileState.js", () => ({
-  parseProfileDirectoryIdentity: (identity: unknown) => identity,
-  verifyProfileDirectoryIdentity: vi.fn(async () => true),
-  captureProfileDirectoryIdentity,
-  cleanupStaleProfileState,
+vi.mock("../../src/browser/chromeProcessLaunchClaim.js", () => ({
   createChromeProcessLaunchClaim: (generationId: string) => ({
     version: 1 as const,
     generationId,
     nonce: "70000000-0000-4000-8000-000000000007",
   }),
+}));
+vi.mock("../../src/browser/profileState.js", () => ({
+  parseProfileDirectoryIdentity: (identity: unknown) => identity,
+  verifyProfileDirectoryIdentity: vi.fn(async () => true),
+  captureProfileDirectoryIdentity,
+  cleanupStaleProfileState,
   isSafeChromeTerminationOutcome: (outcome: { status?: string }) =>
     outcome.status === "stopped" || outcome.status === "already-stopped",
   readDevToolsPort,
@@ -411,6 +413,18 @@ describe("gemini-web executor", () => {
           navigate: vi.fn(async () => ({ frameId: "f-1" })),
         },
         close: vi.fn(async () => undefined),
+      },
+      browserClient: {
+        Browser: {
+          getWindowForTarget: vi.fn(),
+          setWindowBounds: vi.fn(),
+        },
+        Target: {
+          getTargets: vi.fn(async () => ({ targetInfos: [] })),
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: { targetId: "target-1", url: "https://gemini.google.com/app" },
+          })),
+        },
       },
     });
     closeChromeTargetWithExactAuthority.mockResolvedValue({ status: "completed" });

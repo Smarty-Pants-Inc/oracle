@@ -9,14 +9,12 @@ import {
   syntheticProfileIdentity,
 } from "./chromeLifecycleTestHelpers.js";
 import {
-  inspectChromeProfileDirectoryUseForTest,
-  revalidateChromeProfileDirectoryUseForTest,
-  type ProfileDirectoryIdentity,
-} from "../../src/browser/profileState.js";
-import {
-  __test__ as chromeProcessIdentityTest,
-  inspectChromeProcessesForLaunchClaimFromProcessListForTest,
-} from "../../src/browser/chromeProcessIdentity.js";
+  inspectChromeProfileDirectoryUse,
+  revalidateChromeProfileDirectoryUse,
+} from "../../src/browser/chromeProfileDirectoryUse.js";
+import { inspectChromeProcessesForLaunchClaimFromProcessList } from "../../src/browser/chromeProcessDiscovery.js";
+import { readChromeProcessSnapshot } from "../../src/browser/chromeProcessProbe.js";
+import type { ProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 
 describe("stable Chrome process authority", () => {
@@ -432,7 +430,7 @@ describe("Darwin Chrome process command parsing", () => {
     };
 
     expect(
-      inspectChromeProcessesForLaunchClaimFromProcessListForTest(
+      inspectChromeProcessesForLaunchClaimFromProcessList(
         `4321 ${executable} --remote-debugging-port=9222 "quoted --user-data-dir=/private/decoy" --oracle-launch-claim=${claim.generationId}:${claim.nonce} --user-data-dir=${userDataDir}\n`,
         userDataDir,
         claim,
@@ -489,37 +487,37 @@ describe("Linux Chrome procfs snapshot", () => {
   test("captures a stable exact Linux generation and NUL-delimited spaced argv", async () => {
     const procfs = syntheticProcfs();
 
-    await expect(
-      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(pid, procfs),
-    ).resolves.toEqual({
-      pid,
-      processStartTime: `linux:${bootId}:987654`,
-      executablePath,
-      commandLine:
-        '"/opt/Google Chrome/chrome" "--user-data-dir=/tmp/profile with spaces" "--enable-features=Value With Spaces"',
-      commandTokens,
-    });
+    await expect(readChromeProcessSnapshot(pid, "linux", { linuxProcfs: procfs })).resolves.toEqual(
+      {
+        pid,
+        processStartTime: `linux:${bootId}:987654`,
+        executablePath,
+        commandLine:
+          '"/opt/Google Chrome/chrome" "--user-data-dir=/tmp/profile with spaces" "--enable-features=Value With Spaces"',
+        commandTokens,
+      },
+    );
     expect(procfs.readlink).toHaveBeenCalledTimes(2);
     expect(procfs.readFile).toHaveBeenCalledTimes(6);
   });
 
   test("fails closed when the process start ticks change during capture", async () => {
     await expect(
-      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
-        pid,
-        syntheticProcfs({ statReads: [procStat("987654"), procStat("987655")] }),
-      ),
+      readChromeProcessSnapshot(pid, "linux", {
+        linuxProcfs: syntheticProcfs({
+          statReads: [procStat("987654"), procStat("987655")],
+        }),
+      }),
     ).resolves.toBeNull();
   });
 
   test("fails closed when the system boot identity changes during capture", async () => {
     await expect(
-      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
-        pid,
-        syntheticProcfs({
+      readChromeProcessSnapshot(pid, "linux", {
+        linuxProcfs: syntheticProcfs({
           bootIdReads: [bootId, "22222222-2222-4222-8222-222222222222"],
         }),
-      ),
+      }),
     ).resolves.toBeNull();
   });
 
@@ -536,16 +534,17 @@ describe("Linux Chrome procfs snapshot", () => {
     ],
   ])("fails closed when the procfs %s changes during capture", async (_name, mutation) => {
     await expect(
-      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(pid, syntheticProcfs(mutation)),
+      readChromeProcessSnapshot(pid, "linux", { linuxProcfs: syntheticProcfs(mutation) }),
     ).resolves.toBeNull();
   });
 
   test("fails closed for a malformed procfs stat record", async () => {
     await expect(
-      chromeProcessIdentityTest.readLinuxChromeProcessSnapshot(
-        pid,
-        syntheticProcfs({ statReads: ["4321 (chrome) S 1", procStat("987654")] }),
-      ),
+      readChromeProcessSnapshot(pid, "linux", {
+        linuxProcfs: syntheticProcfs({
+          statReads: ["4321 (chrome) S 1", procStat("987654")],
+        }),
+      }),
     ).resolves.toBeNull();
   });
 });
@@ -570,7 +569,7 @@ describe("physical Chrome profile use authority", () => {
       return expected;
     });
 
-    const inspection = await inspectChromeProfileDirectoryUseForTest(expected, {
+    const inspection = await inspectChromeProfileDirectoryUse(expected, {
       platform: "darwin",
       listProcesses: async () => [
         {
@@ -629,12 +628,12 @@ describe("physical Chrome profile use authority", () => {
       readProcessGeneration: async () => generations.shift() ?? null,
       captureProfileIdentity: async () => unrelated,
     };
-    const initial = await inspectChromeProfileDirectoryUseForTest(expected, deps);
+    const initial = await inspectChromeProfileDirectoryUse(expected, deps);
     expect(initial.status).toBe("unused");
     if (initial.status !== "unused") throw new Error("Expected an unused profile proof");
 
     await expect(
-      revalidateChromeProfileDirectoryUseForTest(expected, initial, deps),
+      revalidateChromeProfileDirectoryUse(expected, initial, deps),
     ).resolves.toMatchObject({
       status: "unavailable",
       reason: expect.stringMatching(/changed generation/i),
@@ -658,7 +657,7 @@ describe("physical Chrome profile use authority", () => {
     });
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, { platform: "darwin", execute }),
+      inspectChromeProfileDirectoryUse(expected, { platform: "darwin", execute }),
     ).resolves.toEqual({ status: "unused", candidates: [] });
     expect(attackerPs).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledOnce();
@@ -683,7 +682,7 @@ describe("physical Chrome profile use authority", () => {
     });
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, {
+      inspectChromeProfileDirectoryUse(expected, {
         platform: "win32",
         execute,
       }),
@@ -732,7 +731,7 @@ describe("physical Chrome profile use authority", () => {
     });
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, {
+      inspectChromeProfileDirectoryUse(expected, {
         platform: "win32",
         execute,
         readProcessGeneration: async () => "win32:2026-08-06T12:00:00.0000000Z",
@@ -764,7 +763,7 @@ describe("physical Chrome profile use authority", () => {
     const execute = vi.fn(async () => ({ stdout: "123 /usr/bin/node server.js\n" }));
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, {
+      inspectChromeProfileDirectoryUse(expected, {
         platform: "darwin",
         execute,
         trustedProcessProbe: null,
@@ -788,7 +787,7 @@ describe("physical Chrome profile use authority", () => {
     }) satisfies ProfileDirectoryIdentity;
 
     await expect(
-      inspectChromeProfileDirectoryUseForTest(expected, {
+      inspectChromeProfileDirectoryUse(expected, {
         platform: "darwin",
         listProcesses: async () => [
           {

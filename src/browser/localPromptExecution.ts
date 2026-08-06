@@ -48,7 +48,8 @@ import type { LocalBrowserAcquisition } from "./localAcquisition.js";
 import type { LocalDisconnectCoordinator } from "./localDisconnectRecovery.js";
 import type { LocalBrowserRunState } from "./localRunState.js";
 import type { BrowserRunLifecycleController } from "./runLifecycle.js";
-import type { BrowserAttachment, BrowserLogger, BrowserRunOptions, ChromeClient } from "./types.js";
+import type { BrowserAttachment, BrowserLogger, BrowserRunOptions } from "./types.js";
+import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
 
 export type LocalDisconnectRace = <T>(promise: Promise<T>) => Promise<T>;
 
@@ -73,12 +74,12 @@ export interface LocalPromptExecutionContext {
 }
 
 export interface LocalPromptExecutionResult {
-  client: ChromeClient;
-  Network: ChromeClient["Network"];
-  Page: ChromeClient["Page"];
-  Runtime: ChromeClient["Runtime"];
-  Input: ChromeClient["Input"];
-  DOM: ChromeClient["DOM"];
+  client: SessionBoundChromeClient;
+  Network: SessionBoundChromeClient["Network"];
+  Page: SessionBoundChromeClient["Page"];
+  Runtime: SessionBoundChromeClient["Runtime"];
+  Input: SessionBoundChromeClient["Input"];
+  DOM: SessionBoundChromeClient["DOM"];
   raceWithDisconnect: LocalDisconnectRace;
   captureRuntimeSnapshot: () => Promise<void>;
   updateConversationHint: (label: string, timeoutMs?: number) => Promise<boolean>;
@@ -121,11 +122,12 @@ export async function executeLocalPrompt({
     effectiveKeepBrowser,
   } = acquisition;
   const client = state.client;
-  if (!client) {
-    throw new Error("Local Chrome target acquisition completed without a CDP client.");
+  const browserClient = state.browserClient;
+  if (!client || !browserClient) {
+    throw new Error("Local Chrome target acquisition completed without its CDP clients.");
   }
   const raceWithDisconnect = disconnect.race;
-  const { Network, Page, Runtime, Input, DOM, Target } = client;
+  const { Network, Page, Runtime, Input, DOM } = client;
 
   const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
   if (DOM && typeof DOM.enable === "function") {
@@ -134,7 +136,7 @@ export async function executeLocalPrompt({
   await raceWithDisconnect(Promise.all(domainEnablers));
   lifecycle.markAcquired();
   if (!config.headless && config.hideWindow) {
-    await positionChromeWindowOffscreen(client, logger);
+    await positionChromeWindowOffscreen(browserClient, logger);
   }
   // Trusted CDP input is ignored by ChatGPT when the window is hidden or occluded.
   await enableFocusEmulation(client, logger, "local target");
@@ -185,7 +187,7 @@ export async function executeLocalPrompt({
         : "Skipping Chrome cookie sync (--browser-no-cookie-sync)",
     );
   }
-  await clearStaleChatGptConversationCookies(Network, Target, logger, {
+  await clearStaleChatGptConversationCookies(Network, browserClient.Target, logger, {
     preserveConversationIds: [
       extractConversationIdFromUrl(config.resumeConversationUrl ?? ""),
       extractConversationIdFromUrl(state.lastUrl ?? ""),
@@ -292,11 +294,9 @@ export async function executeLocalPrompt({
 
   const captureRuntimeSnapshot = async () => {
     try {
-      if (client.Target?.getTargetInfo) {
-        const info = await client.Target.getTargetInfo({});
-        state.lastTargetId = info?.targetInfo?.targetId ?? state.lastTargetId;
-        state.lastUrl = info?.targetInfo?.url ?? state.lastUrl;
-      }
+      const info = await browserClient.Target.getTargetInfo({});
+      state.lastTargetId = info?.targetInfo?.targetId ?? state.lastTargetId;
+      state.lastUrl = info?.targetInfo?.url ?? state.lastUrl;
     } catch {
       // ignore
     }

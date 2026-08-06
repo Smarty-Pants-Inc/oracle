@@ -6,6 +6,8 @@ import type * as ManualLoginProfileModule from "../../src/browser/manualLoginPro
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
 import type * as ChromeLifecycleModule from "../../src/browser/chromeLifecycle.js";
 import type * as ProfileStateModule from "../../src/browser/profileState.js";
+import type * as ChromeProcessDiscoveryModule from "../../src/browser/chromeProcessDiscovery.js";
+import type * as ChromeProcessIdentityModule from "../../src/browser/chromeProcessIdentity.js";
 import type * as ProfileCopyModule from "../../src/browser/profileCopy.js";
 import {
   __test__,
@@ -25,11 +27,9 @@ import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import type { ChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
-import type {
-  ChromeProcessIdentity,
-  ChromeProcessLaunchClaim,
-} from "../../src/browser/profileState.js";
 
 describe("background-only browser policy", () => {
   test("rejects attach-running before browser discovery can touch the primary browser", async () => {
@@ -104,6 +104,9 @@ describe("local acquisition durability", () => {
       ...(await importOriginal<typeof ProfileStateModule>()),
       verifyProfileDirectoryIdentity: vi.fn(async () => true),
       readOracleChromeOwner: vi.fn(async () => null),
+    }));
+    vi.doMock("../../src/browser/chromeProcessDiscovery.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeProcessDiscoveryModule>()),
       inspectRunningChromeProcessesForLaunchClaim: vi.fn(async () => ({
         exactMatches: [],
         conflictingProfilePids: [],
@@ -197,11 +200,14 @@ describe("local acquisition durability", () => {
       ...(await importOriginal<typeof ProfileStateModule>()),
       verifyProfileDirectoryIdentity: vi.fn(async () => true),
       readOracleChromeOwner: vi.fn(async () => null),
+      removeProfileDirectoryIfIdentityMatches: removeProfile,
+    }));
+    vi.doMock("../../src/browser/chromeProcessDiscovery.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeProcessDiscoveryModule>()),
       inspectRunningChromeProcessesForLaunchClaim: vi.fn(async () => ({
         exactMatches: [],
         conflictingProfilePids: [],
       })),
-      removeProfileDirectoryIfIdentityMatches: removeProfile,
     }));
 
     try {
@@ -465,6 +471,12 @@ describe("local acquisition durability", () => {
       ...(await importOriginal<typeof ProfileStateModule>()),
       verifyProfileDirectoryIdentity: vi.fn(async () => true),
       readOracleChromeOwner: vi.fn(async () => null),
+      writeOracleChromeOwner,
+      verifyChromeProcessIdentity: vi.fn(async () => true),
+      removeProfileDirectoryIfIdentityMatches: removeProfile,
+    }));
+    vi.doMock("../../src/browser/chromeProcessDiscovery.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeProcessDiscoveryModule>()),
       inspectRunningChromeProcessesForLaunchClaim: vi.fn(
         async (_candidateDir: string, claim: ChromeProcessLaunchClaim) => {
           expect(claim).toEqual(launchClaim);
@@ -474,6 +486,9 @@ describe("local acquisition durability", () => {
           };
         },
       ),
+    }));
+    vi.doMock("../../src/browser/chromeProcessIdentity.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof ChromeProcessIdentityModule>()),
       captureChromeProcessIdentity: vi.fn(
         async (candidateDir: string, pid: number, claim: ChromeProcessLaunchClaim) => {
           expect(candidateDir).toBe(profileDir);
@@ -484,9 +499,6 @@ describe("local acquisition durability", () => {
         },
       ),
       inspectChromeProcessIdentity: vi.fn(async () => "current" as const),
-      writeOracleChromeOwner,
-      verifyChromeProcessIdentity: vi.fn(async () => true),
-      removeProfileDirectoryIfIdentityMatches: removeProfile,
     }));
 
     try {

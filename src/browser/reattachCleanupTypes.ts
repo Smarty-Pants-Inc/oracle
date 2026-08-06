@@ -10,11 +10,13 @@ import type { retainChromeBrowserWebSocketAuthority } from "./chromeEndpointAuth
 import type { closeChromeTargetWithRetainedCapability } from "./targetCloseAuthority.js";
 import type { settleManualChromeOwner } from "./manualChromeOwnerSettlement.js";
 import type {
-  acquireProfileRunLock,
   captureChromeProcessIdentity,
-  cleanupStaleProfileState,
   inspectChromeProcessIdentity,
-  inspectRunningChromeProcessesForLaunchClaim,
+} from "./chromeProcessIdentity.js";
+import type { inspectRunningChromeProcessesForLaunchClaim } from "./chromeProcessDiscovery.js";
+import type {
+  acquireProfileRunLock,
+  cleanupStaleProfileState,
   readOracleChromeOwner,
   terminateRecordedChromeForProfile,
   verifyChromeProcessIdentity,

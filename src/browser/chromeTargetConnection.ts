@@ -5,16 +5,58 @@ import {
   type ExactChromeEndpointOperationResult,
   type RetainedChromeEndpointAuthority,
 } from "./chromeEndpointAuthority.js";
+import {
+  adaptDirectTargetChromeClient,
+  type ChromeTargetAttachment,
+  type BrowserLevelChromeClient,
+  type SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
+import {
+  browserChromeTargetOperations,
+  closeBlankChromeTargets,
+  closeChromeTargetWithOperations,
+  confirmChromeTargetClosed,
+  connectToNewTarget,
+  ensureChromePageTarget,
+  exactChromeTargetOperations,
+  exactTargetResult,
+  openChromeTarget,
+  rawChromeTargetOperations,
+  requireExactChromeEndpointOperation,
+  ExactTargetOperationFailure,
+  TargetOpenFailure,
+  type ExactChromeTargetCleanupResult,
+  type ExactChromeTargetOperationAuthority,
+  type RemoteTargetInfo,
+} from "./chromeTargetLifecycle.js";
 import { delay } from "./utils.js";
+
+export type {
+  BrowserLevelChromeClient,
+  SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
+export {
+  ExactChromeEndpointAuthorityError,
+  requireExactChromeEndpointOperation,
+} from "./chromeTargetLifecycle.js";
+export type {
+  ExactChromeTargetCleanupResult,
+  ExactChromeTargetOperationAuthority,
+  RemoteTargetInfo,
+} from "./chromeTargetLifecycle.js";
+
+async function connectToDirectChromeTarget(port: number, logger: BrowserLogger, host?: string) {
+  const attachment = adaptDirectTargetChromeClient(await CDP({ port, host }));
+  logger("Connected to Chrome DevTools protocol");
+  return attachment;
+}
 
 export async function connectToChrome(
   port: number,
   logger: BrowserLogger,
   host?: string,
-): Promise<ChromeClient> {
-  const client = await CDP({ port, host });
-  logger("Connected to Chrome DevTools protocol");
-  return client;
+): Promise<SessionBoundChromeClient> {
+  return (await connectToDirectChromeTarget(port, logger, host)).client;
 }
 
 class ExactTargetCleanupUnconfirmedError extends Error {
@@ -64,6 +106,7 @@ export async function connectToRemoteChrome(
 }
 
 export type RemoteTargetOwnership = "created" | "attached";
+
 function shouldCloseTargetOnDispose(
   ownership: RemoteTargetOwnership,
   requested: boolean | undefined,
@@ -77,13 +120,10 @@ export interface RetainedLiveChromeTargetAuthority {
   ): Promise<ExactChromeEndpointOperationResult<T>>;
   release(): Promise<void>;
 }
-export type ExactChromeTargetOperationAuthority = Pick<
-  RetainedChromeEndpointAuthority,
-  "runExactOperation"
->;
 
 export interface RemoteChromeConnection {
-  client: ChromeClient;
+  client: SessionBoundChromeClient;
+  browserClient: BrowserLevelChromeClient;
   targetId: string;
   ownership: RemoteTargetOwnership;
   targetCloseAuthority?: RetainedLiveChromeTargetAuthority;
@@ -92,58 +132,10 @@ export interface RemoteChromeConnection {
 }
 
 export interface IsolatedTabConnection {
-  client: ChromeClient;
+  client: SessionBoundChromeClient;
+  browserClient: BrowserLevelChromeClient;
   targetId?: string;
   targetCloseAuthority?: RetainedLiveChromeTargetAuthority;
-}
-
-interface TargetConnectMessages {
-  opened?: (targetId: string) => string;
-  openFailed: (message: string) => string;
-  attachFailed: (targetId: string, message: string) => string;
-  closeFailed: (targetId: string, message: string) => string;
-}
-
-export interface RemoteTargetInfo {
-  targetId?: string;
-  type?: string;
-  title?: string;
-  url?: string;
-}
-
-interface ChromeTargetOperations {
-  list(): Promise<RemoteTargetInfo[]>;
-  create(url: string): Promise<string>;
-  attach(targetId: string): Promise<ChromeClient>;
-  close(targetId: string): Promise<boolean>;
-}
-
-class ExactTargetOperationFailure extends Error {
-  constructor(
-    readonly result: Exclude<ExactChromeEndpointOperationResult<never>, { status: "completed" }>,
-  ) {
-    super(result.status === "gone" ? "Exact Chrome process generation exited" : result.reason);
-    this.name = "ExactTargetOperationFailure";
-  }
-}
-
-class TargetOpenFailure extends Error {
-  constructor(
-    readonly stage: "create" | "attach",
-    readonly targetId: string | undefined,
-    readonly cause: unknown,
-    readonly cleanupError?: unknown,
-  ) {
-    super(cause instanceof Error ? cause.message : String(cause), { cause });
-    this.name = "TargetOpenFailure";
-  }
-}
-
-function findExactTargetOperationFailure(error: unknown): ExactTargetOperationFailure | undefined {
-  if (error instanceof ExactTargetOperationFailure) return error;
-  if (!(error instanceof TargetOpenFailure)) return undefined;
-  if (error.cause instanceof ExactTargetOperationFailure) return error.cause;
-  return error.cleanupError instanceof ExactTargetOperationFailure ? error.cleanupError : undefined;
 }
 
 export async function listRemoteChromeTargets(options: {
@@ -178,13 +170,13 @@ export async function connectToRemoteChromeTarget(
     if (!options.targetId) {
       throw new Error("A target id is required to attach to remote Chrome over HTTP.");
     }
-    const client = await rawChromeTargetOperations(host, port).attach(options.targetId);
+    const attachment = await rawChromeTargetOperations(host, port).attach(options.targetId);
     return {
-      client,
+      ...attachment,
       targetId: options.targetId,
       ownership: "attached",
       close: async () => {
-        await client.close().catch(() => undefined);
+        await attachment.client.close().catch(() => undefined);
       },
     };
   }
@@ -199,7 +191,8 @@ export async function connectToRemoteChromeTarget(
   const operations = browserChromeTargetOperations(browser);
   const ownership: RemoteTargetOwnership = options.targetId ? "attached" : "created";
   let targetId = options.targetId;
-  let client: ChromeClient | undefined;
+  let client: SessionBoundChromeClient | undefined;
+  let browserClient: BrowserLevelChromeClient | undefined;
   let browserReleased = false;
   let closeTargetOnRelease = shouldCloseTargetOnDispose(ownership, options.closeTargetOnDispose);
   const releaseBrowser = async (): Promise<void> => {
@@ -234,17 +227,22 @@ export async function connectToRemoteChromeTarget(
     release: releaseBrowser,
   };
   try {
+    let attachment: ChromeTargetAttachment;
     if (targetId) {
-      client = await operations.attach(targetId);
+      attachment = await operations.attach(targetId);
     } else {
-      const connection = await openChromeTarget(operations, options.targetUrl ?? "about:blank");
-      targetId = connection.targetId;
-      client = connection.client;
+      const opened = await openChromeTarget(operations, options.targetUrl ?? "about:blank");
+      attachment = opened;
+      targetId = opened.targetId;
       logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
     }
+    client = attachment.client;
+    browserClient = attachment.browserClient;
+    if (!targetId) throw new Error("Chrome target attachment returned no target id");
     return {
-      client: client as ChromeClient,
-      targetId: targetId as string,
+      client,
+      browserClient,
+      targetId,
       browserWSEndpoint: options.browserWSEndpoint,
       ownership,
       targetCloseAuthority,
@@ -278,18 +276,17 @@ async function connectToBrowserWebSocket(
   approvalWaitMs?: number,
 ): Promise<ChromeClient> {
   if (!approvalWaitMs || approvalWaitMs <= 0) {
-    return (await CDP({ target: browserWSEndpoint, local: true })) as ChromeClient;
+    return await CDP({ target: browserWSEndpoint, local: true });
   }
 
   logger(`Waiting for Chrome remote debugging approval for ${host}:${port}...`);
-
   const deadline = Date.now() + approvalWaitMs;
   let lastApprovalError: unknown;
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     try {
       return await Promise.race([
-        CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>,
+        CDP({ target: browserWSEndpoint, local: true }),
         new Promise<never>((_, reject) => {
           setTimeout(() => {
             reject(new Error("__oracle_remote_debugging_approval_timeout__"));
@@ -303,7 +300,8 @@ async function connectToBrowserWebSocket(
       ) {
         break;
       }
-      if (!isRemoteDebuggingApprovalError(error)) {
+      const message = error instanceof Error ? error.message : String(error ?? "");
+      if (!/unexpected server response:\s*403|remote debugging|forbidden/i.test(message)) {
         throw error;
       }
       lastApprovalError = error;
@@ -314,224 +312,10 @@ async function connectToBrowserWebSocket(
     lastApprovalError instanceof Error && lastApprovalError.message
       ? ` Last Chrome response: ${lastApprovalError.message}`
       : "";
+  const wait = approvalWaitMs % 1000 === 0 ? `${approvalWaitMs / 1000}s` : `${approvalWaitMs}ms`;
   throw new Error(
-    `Oracle waited ${formatApprovalWait(approvalWaitMs)} for Chrome remote debugging approval at ${host}:${port}. Allow the Chrome prompt or retry after toggling remote debugging.${suffix}`,
+    `Oracle waited ${wait} for Chrome remote debugging approval at ${host}:${port}. Allow the Chrome prompt or retry after toggling remote debugging.${suffix}`,
   );
-}
-
-function isRemoteDebuggingApprovalError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return /unexpected server response:\s*403|remote debugging|forbidden/i.test(message);
-}
-
-function formatApprovalWait(waitMs: number): string {
-  if (waitMs % 1000 === 0) {
-    return `${waitMs / 1000}s`;
-  }
-  return `${waitMs}ms`;
-}
-
-const CLOSE_CONFIRM_ATTEMPTS = 40;
-const CLOSE_CONFIRM_DELAY_MS = 25;
-
-function mapRemoteTarget(target: {
-  id?: string;
-  targetId?: string;
-  type?: string;
-  title?: string;
-  url?: string;
-}): RemoteTargetInfo {
-  return {
-    targetId: target.targetId ?? target.id,
-    type: target.type,
-    title: target.title,
-    url: target.url,
-  };
-}
-
-function rawChromeTargetOperations(host: string, port: number): ChromeTargetOperations {
-  return {
-    list: async () =>
-      (
-        (await CDP.List({ host, port })) as Array<{
-          id?: string;
-          targetId?: string;
-          type?: string;
-          title?: string;
-          url?: string;
-        }>
-      ).map(mapRemoteTarget),
-    create: async (url) => {
-      const created = (await CDP.New({ host, port, url })) as { id?: string; targetId?: string };
-      const targetId = created.targetId ?? created.id;
-      if (!targetId) throw new Error("Chrome target creation returned no target id");
-      return targetId;
-    },
-    attach: async (targetId) => await CDP({ host, port, target: targetId }),
-    close: async (targetId) => {
-      await CDP.Close({ host, port, id: targetId });
-      return true;
-    },
-  };
-}
-
-function browserChromeTargetOperations(browser: ChromeClient): ChromeTargetOperations {
-  return {
-    list: async () => ((await browser.Target.getTargets()).targetInfos ?? []).map(mapRemoteTarget),
-    create: async (url) => {
-      const created = await browser.Target.createTarget({ url });
-      if (!created.targetId) throw new Error("Chrome target creation returned no target id");
-      return created.targetId;
-    },
-    attach: async (targetId) => {
-      const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
-      return createSessionBoundChromeClient(browser, attached.sessionId);
-    },
-    close: async (targetId) => (await browser.Target.closeTarget({ targetId })).success !== false,
-  };
-}
-
-async function openChromeTarget(
-  operations: ChromeTargetOperations,
-  url: string,
-): Promise<{ client: ChromeClient; targetId: string }> {
-  let targetId: string;
-  try {
-    targetId = await operations.create(url);
-  } catch (error) {
-    throw new TargetOpenFailure("create", undefined, error);
-  }
-  try {
-    return { client: await operations.attach(targetId), targetId };
-  } catch (error) {
-    try {
-      if (!(await operations.close(targetId))) {
-        throw new Error(`Chrome rejected cleanup of unused target ${targetId}`);
-      }
-    } catch (cleanupError) {
-      throw new TargetOpenFailure("attach", targetId, error, cleanupError);
-    }
-    throw new TargetOpenFailure("attach", targetId, error);
-  }
-}
-
-function describeTargetOpenFailure(error: unknown, messages: TargetConnectMessages): string[] {
-  if (!(error instanceof TargetOpenFailure)) {
-    return [messages.openFailed(error instanceof Error ? error.message : String(error))];
-  }
-  const message = error.cause instanceof Error ? error.cause.message : String(error.cause);
-  const lines =
-    error.stage === "create" || !error.targetId
-      ? [messages.openFailed(message)]
-      : [messages.attachFailed(error.targetId, message)];
-  if (error.cleanupError && error.targetId) {
-    lines.push(
-      messages.closeFailed(
-        error.targetId,
-        error.cleanupError instanceof Error
-          ? error.cleanupError.message
-          : String(error.cleanupError),
-      ),
-    );
-  }
-  return lines;
-}
-
-async function connectToNewTarget(
-  operations: ChromeTargetOperations,
-  url: string,
-  logger: BrowserLogger,
-  messages: TargetConnectMessages,
-  options?: { retries?: number; retryDelayMs?: number },
-): Promise<{ client: ChromeClient; targetId: string }> {
-  const retries = Math.max(0, options?.retries ?? 0);
-  const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 250);
-  let attempt = 0;
-  while (true) {
-    try {
-      const connection = await openChromeTarget(operations, url);
-      if (messages.opened) logger(messages.opened(connection.targetId));
-      return connection;
-    } catch (error) {
-      for (const message of describeTargetOpenFailure(error, messages)) logger(message);
-      const exactFailure = findExactTargetOperationFailure(error);
-      if (exactFailure || attempt >= retries) throw exactFailure ?? error;
-      attempt += 1;
-      await delay(retryDelayMs * attempt);
-    }
-  }
-}
-
-function createSessionBoundChromeClient(browser: ChromeClient, sessionId: string): ChromeClient {
-  const browserWithEvents = browser as ChromeClient & {
-    on: (event: string, listener: (...args: unknown[]) => void) => void;
-    once: (event: string, listener: (...args: unknown[]) => void) => void;
-    off?: (event: string, listener: (...args: unknown[]) => void) => void;
-    removeListener: (event: string, listener: (...args: unknown[]) => void) => void;
-  };
-  const bindDomain = <T extends object>(domainName: string): T => {
-    const candidate: unknown = browser;
-    const domain =
-      candidate && typeof candidate === "object"
-        ? (candidate as Record<string, unknown>)[domainName]
-        : undefined;
-    const domainRecord =
-      domain && typeof domain === "object" ? (domain as Record<string, unknown>) : undefined;
-    const eventName = (name: string) => `${domainName}.${name}.${sessionId}`;
-    return new Proxy((domainRecord ?? {}) as T, {
-      get(target, prop, receiver) {
-        if (prop === "on") {
-          return (name: string, listener: (...args: unknown[]) => void) => {
-            const domainEvent = (target as Record<string, unknown>)[name];
-            if (typeof domainEvent === "function") {
-              return (domainEvent as (...args: unknown[]) => unknown)(sessionId, listener);
-            }
-            browserWithEvents.on(eventName(name), listener);
-            return () => browserWithEvents.removeListener(eventName(name), listener);
-          };
-        }
-        if (prop === "off" || prop === "removeListener") {
-          return (name: string, listener: (...args: unknown[]) => void) => {
-            const off =
-              browserWithEvents.off ?? browserWithEvents.removeListener.bind(browserWithEvents);
-            off(eventName(name), listener);
-          };
-        }
-        const value = Reflect.get(target, prop, receiver);
-        if (typeof value !== "function") {
-          return value;
-        }
-        return (...args: unknown[]) =>
-          (value as (...callArgs: unknown[]) => unknown)(...args, sessionId);
-      },
-    });
-  };
-
-  return {
-    ...browser,
-    // Raw `send` here is the browser-level send (not session-bound), so callers
-    // that issue Target.* via `send` must pass this page session id explicitly to
-    // stay scoped to this tab (e.g. Deep Research OOPIF auto-attach).
-    // chrome-remote-interface defines `send` on the client prototype, so object
-    // spread does not preserve it. Bind it explicitly for raw session commands.
-    send: typeof browser.send === "function" ? browser.send.bind(browser) : undefined,
-    oraclePageSessionId: sessionId,
-    Network: bindDomain("Network"),
-    Page: bindDomain("Page"),
-    Runtime: bindDomain("Runtime"),
-    Input: bindDomain("Input"),
-    DOM: bindDomain("DOM"),
-    Emulation: bindDomain("Emulation"),
-    on: browserWithEvents.on.bind(browserWithEvents),
-    once: browserWithEvents.once.bind(browserWithEvents),
-    off:
-      browserWithEvents.off?.bind(browserWithEvents) ??
-      browserWithEvents.removeListener.bind(browserWithEvents),
-    removeListener: browserWithEvents.removeListener.bind(browserWithEvents),
-    close: async () => {
-      await browser.Target.detachFromTarget({ sessionId }).catch(() => undefined);
-    },
-  } as ChromeClient;
 }
 
 export async function connectWithNewTab(
@@ -566,7 +350,7 @@ export async function connectWithNewTab(
     if (!fallbackToDefault) {
       throw new Error("Failed to open isolated browser tab; refusing to attach to default target.");
     }
-    return { client: await connectToChrome(port, logger, effectiveHost) };
+    return await connectToDirectChromeTarget(port, logger, effectiveHost);
   }
 }
 
@@ -604,151 +388,6 @@ export async function connectWithNewTabWithRetainedLiveAuthority(
     }
   }
   throw new Error("Failed to open isolated browser tab with retained live authority");
-}
-
-async function confirmChromeTargetClosed(
-  operations: ChromeTargetOperations,
-  targetId: string,
-  logger: BrowserLogger,
-): Promise<boolean> {
-  for (let attempt = 0; attempt < CLOSE_CONFIRM_ATTEMPTS; attempt += 1) {
-    await delay(CLOSE_CONFIRM_DELAY_MS);
-    try {
-      if (!(await operations.list()).some((target) => target.targetId === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
-        return true;
-      }
-    } catch (error) {
-      if (error instanceof ExactTargetOperationFailure) throw error;
-    }
-  }
-  logger(`Browser tab close was not confirmed (target=${targetId})`);
-  return false;
-}
-
-async function ensureChromePageTarget(
-  operations: ChromeTargetOperations,
-  closingTargetId: string,
-  logger: BrowserLogger,
-  knownTargets?: RemoteTargetInfo[],
-): Promise<string | undefined> {
-  let targets = knownTargets;
-  if (!targets) {
-    try {
-      targets = await operations.list();
-    } catch (error) {
-      if (error instanceof ExactTargetOperationFailure) throw error;
-      logger(
-        `Failed to inspect Chrome tabs before closing ${closingTargetId}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      targets = [];
-    }
-  }
-  const existingPageTargetId = targets
-    .filter((target) => target.type === "page")
-    .map((target) => target.targetId)
-    .find((targetId): targetId is string => Boolean(targetId) && targetId !== closingTargetId);
-  if (existingPageTargetId) return existingPageTargetId;
-  const replacementTargetId = await operations.create("about:blank");
-  logger(`Opened replacement Chrome tab (target=${replacementTargetId})`);
-  return replacementTargetId;
-}
-
-async function closeChromeTargetWithOperations(
-  operations: ChromeTargetOperations,
-  targetId: string,
-  logger: BrowserLogger,
-): Promise<boolean> {
-  let targets: RemoteTargetInfo[];
-  let listed = true;
-  try {
-    targets = await operations.list();
-  } catch (error) {
-    if (error instanceof ExactTargetOperationFailure) throw error;
-    logger(
-      `Failed to inspect Chrome tabs before closing ${targetId}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    listed = false;
-    targets = [];
-  }
-  if (listed && targets.some((target) => target.targetId === targetId) === false) {
-    logger(`Closed isolated browser tab (target=${targetId})`);
-    return true;
-  }
-  try {
-    const replacement = await ensureChromePageTarget(operations, targetId, logger, targets);
-    if (!replacement) {
-      logger(
-        `[browser] Leaving browser tab ${targetId} open because Chrome has no replacement page target.`,
-      );
-      return false;
-    }
-    if (!(await operations.close(targetId))) {
-      logger(`Browser tab close was rejected (target=${targetId})`);
-      return false;
-    }
-  } catch (error) {
-    try {
-      if (!(await operations.list()).some((target) => target.targetId === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
-        return true;
-      }
-    } catch (confirmationError) {
-      if (confirmationError instanceof ExactTargetOperationFailure) throw confirmationError;
-    }
-    throw error;
-  }
-  return await confirmChromeTargetClosed(operations, targetId, logger);
-}
-
-type BlankChromeTargetCleanup = {
-  closed: number;
-  failures: Array<{ targetId: string; reason: string }>;
-};
-
-async function closeBlankChromeTargets(
-  operations: ChromeTargetOperations,
-  options?: {
-    excludeTargetIds?: Iterable<string | null | undefined>;
-    preserveOneBlank?: boolean;
-  },
-): Promise<BlankChromeTargetCleanup> {
-  const excluded = new Set(
-    [...(options?.excludeTargetIds ?? [])].filter(
-      (targetId): targetId is string => typeof targetId === "string" && targetId.length > 0,
-    ),
-  );
-  const targets = await operations.list();
-  const preservedBlankTargetId = options?.preserveOneBlank
-    ? targets
-        .filter(isBlankPageTarget)
-        .map((target) => target.targetId)
-        .filter((targetId): targetId is string => Boolean(targetId))
-        .sort()[0]
-    : undefined;
-  const failures: BlankChromeTargetCleanup["failures"] = [];
-  let closed = 0;
-  for (const target of targets) {
-    const targetId = target.targetId;
-    if (
-      !targetId ||
-      targetId === preservedBlankTargetId ||
-      excluded.has(targetId) ||
-      !isBlankPageTarget(target)
-    ) {
-      continue;
-    }
-    try {
-      if (!(await operations.close(targetId))) {
-        throw new Error(`Chrome rejected blank target close for ${targetId}`);
-      }
-      closed += 1;
-    } catch (error) {
-      if (error instanceof ExactTargetOperationFailure) throw error;
-      failures.push({ targetId, reason: error instanceof Error ? error.message : String(error) });
-    }
-  }
-  return { closed, failures };
 }
 
 export async function closeTab(
@@ -803,91 +442,6 @@ export async function closeChromeTarget(options: {
   }
 }
 
-export type ExactChromeTargetCleanupResult =
-  | { status: "completed" }
-  | { status: "gone" }
-  | { status: "unsafe"; reason: string };
-
-async function runExactEndpointOperation<T>(
-  authority: ExactChromeTargetOperationAuthority,
-  operation: (client: ChromeClient) => Promise<T>,
-): Promise<ExactChromeEndpointOperationResult<T>> {
-  if (!authority.runExactOperation) {
-    return {
-      status: "unsafe",
-      reason: "Retained Chrome endpoint authority cannot authenticate deferred target effects",
-    };
-  }
-  return await authority.runExactOperation(operation);
-}
-
-function exactChromeTargetOperations(
-  authority: ExactChromeTargetOperationAuthority,
-): ChromeTargetOperations {
-  const run = async <T>(operation: (client: ChromeClient) => Promise<T>): Promise<T> => {
-    const result = await runExactEndpointOperation(authority, operation);
-    if (result.status === "completed") return result.value;
-    throw new ExactTargetOperationFailure(result);
-  };
-  return {
-    list: async () =>
-      await run(async (client) =>
-        ((await client.Target.getTargets()).targetInfos ?? []).map(mapRemoteTarget),
-      ),
-    create: async (url) =>
-      await run(async (client) => {
-        const created = await client.Target.createTarget({ url });
-        if (!created.targetId)
-          throw new Error("Exact Chrome target creation returned no target id");
-        return created.targetId;
-      }),
-    attach: async (targetId) =>
-      await run(async (client) => {
-        const attached = await client.Target.attachToTarget({ targetId, flatten: true });
-        return createSessionBoundChromeClient(client, attached.sessionId);
-      }),
-    close: async (targetId) =>
-      await run(
-        async (client) => (await client.Target.closeTarget({ targetId })).success !== false,
-      ),
-  };
-}
-
-async function exactTargetResult<T>(
-  operation: () => Promise<T>,
-): Promise<ExactChromeEndpointOperationResult<T>> {
-  try {
-    return { status: "completed", value: await operation() };
-  } catch (error) {
-    const exactFailure = findExactTargetOperationFailure(error);
-    if (exactFailure) return exactFailure.result;
-    return {
-      status: "unsafe",
-      reason: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-export class ExactChromeEndpointAuthorityError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ExactChromeEndpointAuthorityError";
-  }
-}
-
-export function requireExactChromeEndpointOperation<T>(
-  result: ExactChromeEndpointOperationResult<T>,
-  operation: string,
-): T {
-  if (result.status === "completed") return result.value;
-  if (result.status === "gone") {
-    throw new ExactChromeEndpointAuthorityError(
-      `${operation}: exact Chrome process generation exited`,
-    );
-  }
-  throw new ExactChromeEndpointAuthorityError(`${operation}: ${result.reason}`);
-}
-
 export async function connectToChromeTargetWithExactAuthority(options: {
   authority: RetainedChromeEndpointAuthority;
   targetId?: string;
@@ -898,7 +452,7 @@ export async function connectToChromeTargetWithExactAuthority(options: {
   const operations = exactChromeTargetOperations(options.authority);
   return await exactTargetResult(async () => {
     const connection = options.targetId
-      ? { client: await operations.attach(options.targetId), targetId: options.targetId }
+      ? { ...(await operations.attach(options.targetId)), targetId: options.targetId }
       : await openChromeTarget(operations, options.targetUrl ?? "about:blank");
     return {
       ...connection,
@@ -1068,10 +622,4 @@ export async function closeBlankChromeTabs(
       `Failed to inspect blank Chrome tabs: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-}
-
-function isBlankPageTarget(target: { type?: string; url?: string }): boolean {
-  if (target.type && target.type !== "page") return false;
-  const url = (target.url ?? "").trim().toLowerCase();
-  return url === "about:blank" || url === "chrome://newtab/" || url === "chrome://new-tab-page/";
 }

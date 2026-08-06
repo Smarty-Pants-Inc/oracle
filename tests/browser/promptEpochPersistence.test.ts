@@ -184,14 +184,21 @@ async function runTwoTurnResetFailure(transport: Transport) {
     Runtime,
     Input,
     DOM: { enable: vi.fn().mockResolvedValue(undefined) },
+    Emulation: { setFocusEmulationEnabled: vi.fn().mockResolvedValue(undefined) },
+    on: vi.fn(),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+  const browserClient = {
+    Browser: {
+      getWindowForTarget: vi.fn(),
+      setWindowBounds: vi.fn(),
+    },
     Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
       getTargetInfo: vi.fn().mockResolvedValue({
         targetInfo: { targetId: "epoch-target", url: conversationUrl },
       }),
     },
-    Emulation: { setFocusEmulationEnabled: vi.fn().mockResolvedValue(undefined) },
-    on: vi.fn(),
-    close: vi.fn().mockResolvedValue(undefined),
   };
 
   vi.resetModules();
@@ -231,9 +238,10 @@ async function runTwoTurnResetFailure(transport: Transport) {
     positionChromeWindowOffscreen: vi.fn().mockResolvedValue(undefined),
     connectWithNewTabWithExactAuthority: vi
       .fn()
-      .mockResolvedValue({ client, targetId: "epoch-target" }),
+      .mockResolvedValue({ client, browserClient, targetId: "epoch-target" }),
     connectToRemoteChrome: vi.fn().mockResolvedValue({
       client,
+      browserClient,
       targetId: "epoch-target",
       ownership: "created",
       targetCloseAuthority: {
@@ -251,13 +259,15 @@ async function runTwoTurnResetFailure(transport: Transport) {
     }),
     closeBlankChromeTabs: vi.fn().mockResolvedValue(undefined),
   }));
-  vi.doMock("../../src/browser/profileState.js", () => ({
-    captureProfileDirectoryIdentity,
+  vi.doMock("../../src/browser/chromeProcessLaunchClaim.js", () => ({
     createChromeProcessLaunchClaim: (generationId: string) => ({
       version: 1 as const,
       generationId,
       nonce: "b0000000-0000-4000-8000-00000000000b",
     }),
+  }));
+  vi.doMock("../../src/browser/profileState.js", () => ({
+    captureProfileDirectoryIdentity,
     cleanupStaleProfileState: vi.fn().mockResolvedValue(undefined),
     acquireProfileRunLock: vi.fn(),
     isSafeChromeTerminationOutcome: vi.fn(() => true),

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
-import type { ChromeClient } from "../../src/browser/types.js";
+import type { SessionBoundChromeClient } from "../../src/browser/chromeSessionTransport.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
@@ -61,13 +61,21 @@ describe("resumeBrowserSession fallback acquisition", { timeout: 15_000 }, () =>
       DOM: { enable: vi.fn(async () => undefined) },
       Page: { enable: vi.fn(async () => undefined), navigate: vi.fn(async () => undefined) },
       Network: { getAllCookies: vi.fn(async () => ({ cookies: [] })) },
-      Target: { getTargets: vi.fn(async () => ({ targetInfos: [] })) },
       close: vi.fn(async () => undefined),
-    } as unknown as ChromeClient;
+    } as unknown as SessionBoundChromeClient;
     const connectRecoveryTargetWithExactAuthority = vi.fn(async () => ({
       status: "completed" as const,
       value: {
         client,
+        browserClient: {
+          Browser: { getWindowForTarget: vi.fn(), setWindowBounds: vi.fn() },
+          Target: {
+            getTargets: vi.fn(async () => ({ targetInfos: [] })),
+            getTargetInfo: vi.fn(async () => ({
+              targetInfo: { targetId: "fallback-owned-target", url: "about:blank" },
+            })),
+          },
+        },
         targetId: "fallback-owned-target",
         ownership: "created" as const,
         close: vi.fn(async () => undefined),

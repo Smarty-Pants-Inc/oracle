@@ -33,7 +33,7 @@ import {
 import { RemoteLegacyRunPayloadSchema, type RemoteLegacyTextResult } from "./legacyProtocol.js";
 import { checkRemoteHealth } from "./health.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { pendingBrowserCaptureCleanup } from "../browser/runLifecycle.js";
+import { pendingBrowserCaptureCleanup } from "../browser/ownedBrowserResources.js";
 import {
   findRemoteRecoveryAuthority,
   projectRemoteRecoveryRuntime,

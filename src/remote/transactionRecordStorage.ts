@@ -145,7 +145,10 @@ export async function loadRemoteTransactionIntegrityKey(
     await handle.close();
   }
   if (options.platform === "win32") {
-    await options.windowsPrivateTreeAuthority?.(options.windowsPrivateTreeScope);
+    await options.windowsPrivateTreeAuthority?.({
+      ...options.windowsPrivateTreeScope,
+      initializeIntegrityKey: true,
+    });
   }
   const directoryAfterWrite = await capturePhysicalDirectoryIdentity(directory);
   if (!samePhysicalDirectoryIdentity(directoryAfterWrite, directoryIdentity)) {

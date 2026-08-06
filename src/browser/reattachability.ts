@@ -10,14 +10,12 @@ import {
 import { resolveGeminiWebModel } from "../gemini-web/models.js";
 import { extractStableConversationIdFromUrl, isStableConversationUrl } from "./conversationUrl.js";
 import { hasImmutableGeminiPromptIdentity } from "./providers/geminiDeepThinkDomProvider.js";
+import { parseChromeProcessIdentity, sameChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import {
-  parseChromeProcessIdentity,
   parseChromeProcessLaunchClaim,
-  parseProfileDirectoryIdentity,
-  sameChromeProcessIdentity,
   sameChromeProcessLaunchClaim,
-  sameProfileDirectoryIdentity,
-} from "./profileState.js";
+} from "./chromeProcessLaunchClaim.js";
+import { parseProfileDirectoryIdentity, sameProfileDirectoryIdentity } from "./profileState.js";
 
 export type CommittedBrowserPromptEpoch = Extract<
   NonNullable<BrowserRuntimeMetadata["promptEpoch"]>,

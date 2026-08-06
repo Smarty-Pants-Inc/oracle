@@ -9,7 +9,7 @@ import {
   type ReattachResult,
 } from "../browser/reattach.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
-import { isProcessAlive } from "../browser/profileState.js";
+import { isProcessAlive } from "../browser/chromeProcessIdentity.js";
 import { acquireReattachRecoveryLock } from "../browser/reattachLock.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,

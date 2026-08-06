@@ -17,12 +17,16 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import * as chromeProcessIdentity from "../../src/browser/chromeProcessIdentity.js";
+import { isChromeCommandForUserDataDir } from "../../src/browser/chromeProcessCommandParsing.js";
+import {
+  findChromeDebugTargetForProfileFromProcessList,
+  inspectChromeProcessesForLaunchClaimFromProcessList,
+} from "../../src/browser/chromeProcessDiscovery.js";
 import * as profileState from "../../src/browser/profileState.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
-import type {
-  ChromeProcessIdentity,
-  OracleChromeOwnerRecord,
-} from "../../src/browser/profileState.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
 
@@ -290,11 +294,9 @@ describe("profileState", () => {
   test("reads and validates a Windows Chrome command line without case-sensitive path assumptions", async () => {
     const profileDir = String.raw`C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session`;
     const command = String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="c:\users\oracle\appdata\local\temp\oracle-browser-session"`;
-    expect(profileState.isChromeCommandForUserDataDirForTest(command, profileDir, "win32")).toBe(
-      true,
-    );
+    expect(isChromeCommandForUserDataDir(command, profileDir, "win32")).toBe(true);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\.\oracle-browser-session"`,
         profileDir,
         "win32",
@@ -302,21 +304,21 @@ describe("profileState", () => {
     ).toBe(true);
 
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         String.raw`"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\Users\Oracle\AppData\Local\Temp\oracle-browser-session-other"`,
         profileDir,
         "win32",
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `${command} --user-data-dir="${profileDir}-other"`,
         profileDir,
         "win32",
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" "https://example.test/${profileDir}" --user-data-dir="${profileDir}-other"`,
         profileDir,
         "win32",
@@ -381,14 +383,14 @@ describe("profileState", () => {
     ).toBeNull();
 
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/var/folders/oracle/profile",
         canonicalIdentity.canonicalPath,
         "darwin",
       ),
     ).toBe(true);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/private/var/folders/oracle/profile",
         "/var/folders/oracle/profile",
         "darwin",
@@ -432,7 +434,7 @@ describe("profileState", () => {
     });
 
     await expect(
-      profileState.captureChromeProcessIdentityForTest(userDataDir, 4321, {
+      chromeProcessIdentity.captureChromeProcessIdentityForTest(userDataDir, 4321, {
         platform: "darwin",
         execute,
         captureProfileIdentity: async () => profileDirectory,
@@ -481,16 +483,20 @@ describe("profileState", () => {
         `${executablePath} --user-data-dir=${userDataDir} ` +
         `--oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}`,
     };
-    const identity = await profileState.captureChromeProcessIdentityForTest(userDataDir, 4321, {
-      platform: "darwin",
-      captureProfileIdentity: async () => profileDirectory,
-      readProcessSnapshot: async () => snapshot,
-      launchClaim,
-    });
+    const identity = await chromeProcessIdentity.captureChromeProcessIdentityForTest(
+      userDataDir,
+      4321,
+      {
+        platform: "darwin",
+        captureProfileIdentity: async () => profileDirectory,
+        readProcessSnapshot: async () => snapshot,
+        launchClaim,
+      },
+    );
 
     expect(identity.executablePath).toBe(executablePath);
     await expect(
-      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+      chromeProcessIdentity.inspectChromeProcessIdentityForTest(userDataDir, identity, {
         platform: "darwin",
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
@@ -498,7 +504,7 @@ describe("profileState", () => {
       }),
     ).resolves.toBe("current");
     await expect(
-      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+      chromeProcessIdentity.inspectChromeProcessIdentityForTest(userDataDir, identity, {
         platform: "darwin",
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
@@ -621,7 +627,7 @@ describe("profileState", () => {
       processStartTime: string,
       commandTokens = validCommandTokens,
     ) =>
-      profileState.inspectChromeProcessIdentityForTest(userDataDir, durableIdentity, {
+      chromeProcessIdentity.inspectChromeProcessIdentityForTest(userDataDir, durableIdentity, {
         platform: "darwin",
         verifyProfileIdentity: async () => true,
         isProcessAlive: () => true,
@@ -702,11 +708,12 @@ describe("profileState", () => {
     try {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({ execFile }));
-      // A static import already binds the real executor; reload to bind this test's timed-out boundary.
+      // Static imports bind the real executor; reload both modules to exercise the mocked boundary.
+      const timedChromeProcessIdentity = await import("../../src/browser/chromeProcessIdentity.js");
       const timedProfileState = await import("../../src/browser/profileState.js");
 
       await expect(
-        timedProfileState.inspectChromeProcessIdentityForTest(profileDir, identity, {
+        timedChromeProcessIdentity.inspectChromeProcessIdentityForTest(profileDir, identity, {
           platform: "win32",
           verifyProfileIdentity: async () => true,
           isProcessAlive: () => true,
@@ -802,7 +809,10 @@ describe("profileState", () => {
       try {
         await once(child, "spawn");
         if (!child.pid) throw new Error("Linux Chrome fixture did not expose a pid");
-        const identity = await profileState.captureChromeProcessIdentity(profileDir, child.pid);
+        const identity = await chromeProcessIdentity.captureChromeProcessIdentity(
+          profileDir,
+          child.pid,
+        );
         expect(identity.executablePath).toBe(chromeExecutable);
         expect(identity.processStartTime).toMatch(
           /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/u,
@@ -1432,63 +1442,59 @@ describe("profileState", () => {
   test("matches recorded Chrome commands to the expected profile", () => {
     const dir = "/Users/example/.oracle/browser-profile";
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}`,
         dir,
       ),
     ).toBe(true);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}/./`,
         dir,
       ),
     ).toBe(true);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/other",
         dir,
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}-other`,
         dir,
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir} with attacker suffix --no-first-run`,
         dir,
         "darwin",
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 "https://example.test/?q= --user-data-dir=${dir} --no-first-run about:blank"`,
         dir,
         "darwin",
       ),
     ).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 "https://example.test/?q= --user-data-dir=/tmp/decoy --no-first-run about:blank" --user-data-dir=${dir} --no-first-run`,
         dir,
         "darwin",
       ),
     ).toBe(true);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
+      isChromeCommandForUserDataDir(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome https://example.test/${dir} --user-data-dir=/tmp/other`,
         dir,
       ),
     ).toBe(false);
-    expect(profileState.isChromeCommandForUserDataDirForTest("node worker.js", dir)).toBe(false);
+    expect(isChromeCommandForUserDataDir("node worker.js", dir)).toBe(false);
     expect(
-      profileState.isChromeCommandForUserDataDirForTest(
-        `/tmp/notbrave-worker --user-data-dir=${dir}`,
-        dir,
-        "darwin",
-      ),
+      isChromeCommandForUserDataDir(`/tmp/notbrave-worker --user-data-dir=${dir}`, dir, "darwin"),
     ).toBe(false);
   });
 
@@ -1501,12 +1507,7 @@ describe("profileState", () => {
     `;
 
     expect(
-      profileState.findChromeDebugTargetForProfileFromProcessListForTest(
-        processList,
-        dir,
-        null,
-        "darwin",
-      ),
+      findChromeDebugTargetForProfileFromProcessList(processList, dir, null, "darwin"),
     ).toEqual({
       pid: 456,
       port: 64305,
@@ -1520,12 +1521,7 @@ describe("profileState", () => {
     `;
 
     expect(
-      profileState.findChromeDebugTargetForProfileFromProcessListForTest(
-        processList,
-        dir,
-        64305,
-        "darwin",
-      ),
+      findChromeDebugTargetForProfileFromProcessList(processList, dir, 64305, "darwin"),
     ).toEqual({ pid: 456, port: 64305 });
   });
 
@@ -1544,25 +1540,14 @@ describe("profileState", () => {
     `;
 
     expect(
-      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
-        processList,
-        dir,
-        claim,
-        null,
-        "darwin",
-      ),
+      inspectChromeProcessesForLaunchClaimFromProcessList(processList, dir, claim, null, "darwin"),
     ).toEqual({
       exactMatches: [{ pid: 456, port: null }],
       conflictingProfilePids: [457],
     });
     expect(
-      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
-        processList,
-        dir,
-        claim,
-        64_305,
-        "darwin",
-      ).exactMatches,
+      inspectChromeProcessesForLaunchClaimFromProcessList(processList, dir, claim, 64_305, "darwin")
+        .exactMatches,
     ).toEqual([{ pid: 456, port: 64_305 }]);
   });
 
@@ -1579,13 +1564,7 @@ describe("profileState", () => {
     `;
 
     expect(
-      profileState.inspectChromeProcessesForLaunchClaimFromProcessListForTest(
-        processList,
-        dir,
-        claim,
-        61_234,
-        "win32",
-      ),
+      inspectChromeProcessesForLaunchClaimFromProcessList(processList, dir, claim, 61_234, "win32"),
     ).toEqual({
       exactMatches: [{ pid: 567, port: 61_234 }],
       conflictingProfilePids: [568],

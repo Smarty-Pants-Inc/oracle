@@ -8,11 +8,13 @@ import type {
   BrowserRecoveryCleanupResourceMetadata,
   BrowserRuntimeMetadata,
 } from "../../src/sessionManager.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import {
+  createChromeProcessLaunchClaim,
+  type ChromeProcessLaunchClaim,
+} from "../../src/browser/chromeProcessLaunchClaim.js";
 import {
   captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
-  type ChromeProcessIdentity,
-  type ChromeProcessLaunchClaim,
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";

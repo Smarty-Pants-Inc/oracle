@@ -7,7 +7,7 @@ import type {
   BrowserPromptEpoch,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
-import type { ChromeProcessIdentity } from "./profileState.js";
+import type { ChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
 
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;

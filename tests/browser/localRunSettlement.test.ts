@@ -4,11 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { createLocalBrowserRunState } from "../../src/browser/localRunState.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import { createChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
 import {
   captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
   type ChromeOwnerDisposition,
-  type ChromeProcessIdentity,
   type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
 import type {

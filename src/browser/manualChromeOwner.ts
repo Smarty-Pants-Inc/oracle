@@ -7,16 +7,20 @@ import {
   type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
 import {
-  acquireProfileRunLock,
   captureChromeProcessIdentity,
-  cleanupStaleProfileState,
-  findRunningChromeDebugTargetForProfile,
-  isSafeChromeTerminationOutcome,
   isProcessAlive,
+  sameChromeProcessIdentity,
+  type ChromeProcessIdentity,
+} from "./chromeProcessIdentity.js";
+import { findRunningChromeDebugTargetForProfile } from "./chromeProcessDiscovery.js";
+import type { ChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
+import {
+  acquireProfileRunLock,
+  cleanupStaleProfileState,
+  isSafeChromeTerminationOutcome,
   readDevToolsPort,
   readOracleChromeOwner,
   removeOracleChromeOwnerIfMatches,
-  sameChromeProcessIdentity,
   sameProfileDirectoryIdentity,
   verifyChromeProcessIdentity,
   verifyDevToolsReachable,
@@ -24,8 +28,6 @@ import {
   writeOracleChromeOwner,
   type ChromeOwnerDisposition,
   type ChromeOwnerPreservationPolicy,
-  type ChromeProcessIdentity,
-  type ChromeProcessLaunchClaim,
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";

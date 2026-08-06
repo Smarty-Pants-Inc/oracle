@@ -6,12 +6,12 @@ import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionModel.js";
 import { RemoteTransactionCoordinator } from "../../src/remote/transactionCoordinator.js";
 import { settlementResponse } from "../../src/remote/transactionProtocol.js";
+import { createBrowserRunTransaction } from "../../src/browser/runLifecycle.js";
 import {
   completedBrowserCaptureCleanup,
-  createBrowserRunTransaction,
-  type BrowserCaptureSettlementAdapters,
-} from "../../src/browser/runLifecycle.js";
-import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
+  OwnedBrowserResourceTransaction,
+  type OwnedBrowserResourceTransactionAdapters,
+} from "../../src/browser/ownedBrowserResources.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
@@ -379,7 +379,7 @@ describe("RemoteTransactionCoordinator", () => {
         },
       });
 
-      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+      const settleResources = vi.fn<OwnedBrowserResourceTransactionAdapters["settleResources"]>(
         async (mode, pendingRuntime) => {
           expect(mode).toBe("abort");
           await expect(store.read(transactionToken)).resolves.toMatchObject({

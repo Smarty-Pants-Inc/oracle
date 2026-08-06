@@ -4,19 +4,15 @@ import { promisify } from "node:util";
 import { resolveWindowsPowerShellExecutable } from "../windowsSystemExecutable.js";
 
 const WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS = 12_000;
-const WINDOWS_PRIVATE_TREE_ACL_MARKER = "oracle.remote-transaction.private-tree.v1";
-const WINDOWS_PRIVATE_TREE_ACL_NOT_REPAIRED_MARKER = `${WINDOWS_PRIVATE_TREE_ACL_MARKER}:integrity-key-acl-repaired=false`;
-const WINDOWS_PRIVATE_TREE_ACL_REPAIRED_MARKER = `${WINDOWS_PRIVATE_TREE_ACL_MARKER}:integrity-key-acl-repaired=true`;
+const WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER =
+  "oracle.remote-transaction.private-tree.v1:complete";
 const WINDOWS_PRIVATE_TREE_MAX_ENTRIES = 4_096;
 
 export interface WindowsPrivateTreeScope {
   readonly storeDirectory: string;
   readonly integrityKeyDirectory: string;
   readonly integrityKeyPath: string;
-}
-
-export interface WindowsPrivateTreeAuthorityResult {
-  readonly integrityKeyAclRepaired: boolean;
+  readonly initializeIntegrityKey?: boolean;
 }
 
 export interface WindowsAclCommandOptions {
@@ -29,9 +25,7 @@ export type WindowsAclCommandExecutor = (
   options: WindowsAclCommandOptions,
 ) => Promise<{ stdout: string }>;
 
-export type WindowsPrivateTreeAuthority = (
-  scope: WindowsPrivateTreeScope,
-) => Promise<WindowsPrivateTreeAuthorityResult>;
+export type WindowsPrivateTreeAuthority = (scope: WindowsPrivateTreeScope) => Promise<void>;
 
 const WINDOWS_PRIVATE_TREE_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -141,14 +135,11 @@ function Protect-Directory([string]$DirectoryPath) {
 
 function Protect-File([string]$FilePath) {
   $Item = Get-PhysicalItem $FilePath $false
-  $Repaired = $false
   if (-not (Test-PrivateAcl $Item $false)) {
     $Item.SetAccessControl((New-PrivateAcl $false))
     $Item = Get-PhysicalItem $FilePath $false
     Assert-PrivateAcl $Item $false
-    $Repaired = $true
   }
-  return $Repaired
 }
 
 Protect-Directory $KeyDirectoryPath
@@ -163,21 +154,22 @@ while ($PendingDirectories.Count -gt 0) {
     if ($EntryCount -gt ${WINDOWS_PRIVATE_TREE_MAX_ENTRIES}) { throw 'Remote transaction tree exceeds the ACL verification bound.' }
     $Attributes = [System.IO.File]::GetAttributes($EntryPath)
     if (($Attributes -band $ReparsePoint) -ne 0) { throw "Remote transaction tree contains a reparse point: $EntryPath" }
+    if ($Comparer.Equals($EntryPath, $KeyPath)) {
+      continue
+    }
     if (($Attributes -band $DirectoryAttribute) -ne 0) {
       $PendingDirectories.Enqueue($EntryPath)
     } else {
-      $null = Protect-File $EntryPath
+      Protect-File $EntryPath
     }
   }
 }
 if ([System.IO.Directory]::Exists($KeyPath)) { throw 'Remote transaction integrity-key path is a directory.' }
-$IntegrityKeyAclRepaired = $false
-if ([System.IO.File]::Exists($KeyPath)) { $IntegrityKeyAclRepaired = Protect-File $KeyPath }
-if ($IntegrityKeyAclRepaired) {
-  [Console]::Out.Write('${WINDOWS_PRIVATE_TREE_ACL_REPAIRED_MARKER}')
-} else {
-  [Console]::Out.Write('${WINDOWS_PRIVATE_TREE_ACL_NOT_REPAIRED_MARKER}')
+if ([System.IO.File]::Exists($KeyPath)) {
+  if ($InitializeIntegrityKey) { Protect-File $KeyPath }
+  Assert-PrivateAcl (Get-PhysicalItem $KeyPath $false) $false
 }
+[Console]::Out.Write('${WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER}')
 `;
 
 function encodeWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope): string {
@@ -190,6 +182,7 @@ function encodeWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope): str
 $StorePath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[0]}')))
 $KeyDirectoryPath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[1]}')))
 $KeyPath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPaths[2]}')))
+$InitializeIntegrityKey = ${scope.initializeIntegrityKey ? "$true" : "$false"}
 ${WINDOWS_PRIVATE_TREE_ACL_SCRIPT}`;
   return Buffer.from(command, "utf16le").toString("base64");
 }
@@ -236,7 +229,7 @@ export function buildWindowsPrivateTreeAclCommand(scope: WindowsPrivateTreeScope
 export async function protectWindowsPrivateTreeAcl(
   scope: WindowsPrivateTreeScope,
   execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
-): Promise<WindowsPrivateTreeAuthorityResult> {
+): Promise<void> {
   const command = buildWindowsPrivateTreeAclCommand(scope);
   let stdout: string;
   try {
@@ -244,11 +237,7 @@ export async function protectWindowsPrivateTreeAcl(
   } catch (error) {
     throw new Error("Windows remote transaction private ACL protection failed", { cause: error });
   }
-  if (stdout === WINDOWS_PRIVATE_TREE_ACL_NOT_REPAIRED_MARKER) {
-    return { integrityKeyAclRepaired: false };
+  if (stdout !== WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER) {
+    throw new Error("Windows remote transaction private ACL verification did not complete");
   }
-  if (stdout === WINDOWS_PRIVATE_TREE_ACL_REPAIRED_MARKER) {
-    return { integrityKeyAclRepaired: true };
-  }
-  throw new Error("Windows remote transaction private ACL verification did not complete");
 }

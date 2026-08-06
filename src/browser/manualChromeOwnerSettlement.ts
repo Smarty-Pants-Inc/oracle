@@ -1,8 +1,8 @@
+import { sameChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import {
   isSafeChromeTerminationOutcome,
   readOracleChromeOwner,
   removeOracleChromeOwnerIfMatches,
-  sameChromeProcessIdentity,
   type OracleChromeOwnerRecord,
 } from "./profileState.js";
 import type { BrowserLogger } from "./types.js";

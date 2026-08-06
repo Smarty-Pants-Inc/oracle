@@ -1939,14 +1939,14 @@ describe("RemoteTransactionStore", () => {
       const displacedPath = `${replacedPath}.displaced`;
       let replace = true;
       const windowsPrivateTreeAuthority = vi.fn(async () => {
-        if (!replace) return { integrityKeyAclRepaired: false };
+        if (!replace) return;
         replace = false;
         await fs.rename(replacedPath, displacedPath);
         await fs.mkdir(replacedPath, { recursive: true });
         if (replacedRoot === "integrity-key-directory") {
           await fs.writeFile(integrityKeyPath, Buffer.alloc(32, 0x41));
         }
-        return { integrityKeyAclRepaired: false };
+        return;
       });
       try {
         await fs.mkdir(directory, { recursive: true });
@@ -1980,7 +1980,7 @@ describe("RemoteTransactionStore", () => {
 
   test("protects and verifies a Windows transaction tree once for a bounded list operation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-acl-bounded-"));
-    const windowsPrivateTreeAuthority = vi.fn(async () => ({ integrityKeyAclRepaired: false }));
+    const windowsPrivateTreeAuthority = vi.fn(async () => {});
     try {
       const store = await openTransactionStore({
         directory: root,
@@ -2030,9 +2030,7 @@ describe("RemoteTransactionStore", () => {
         let blockPublication = false;
         let active: Promise<unknown> | undefined;
         let competingRead: Promise<unknown> | undefined;
-        const windowsPrivateTreeAuthority = vi.fn(async () => ({
-          integrityKeyAclRepaired: false,
-        }));
+        const windowsPrivateTreeAuthority = vi.fn(async () => {});
         try {
           observeAuthorityPrepass = false;
           const store = await IsolatedRemoteTransactionStore.open({
@@ -2131,7 +2129,7 @@ describe("RemoteTransactionStore", () => {
         const replacement = replaceKey;
         replaceKey = undefined;
         await replacement?.();
-        return { integrityKeyAclRepaired: false };
+        return;
       });
       try {
         const store = await openTestRemoteTransactionStore({
@@ -2177,7 +2175,7 @@ describe("RemoteTransactionStore", () => {
       const replacement = replaceDirectory;
       replaceDirectory = undefined;
       await replacement?.();
-      return { integrityKeyAclRepaired: false };
+      return;
     });
     try {
       const store = await openTestRemoteTransactionStore({
@@ -2213,7 +2211,7 @@ describe("RemoteTransactionStore", () => {
     const directory = path.join(root, "transactions");
     const transactionToken = "6".repeat(64);
     const mutationToken = "7".repeat(64);
-    const windowsPrivateTreeAuthority = vi.fn(async () => ({ integrityKeyAclRepaired: false }));
+    const windowsPrivateTreeAuthority = vi.fn(async () => {});
     try {
       const store = await openTransactionStore({
         directory,

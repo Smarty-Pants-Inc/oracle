@@ -65,7 +65,16 @@ function exactBrowserForTabs() {
     },
   }));
   return {
+    Browser: {
+      getWindowForTarget: vi.fn(async () => ({ windowId: 1, bounds: {} })),
+      setWindowBounds: vi.fn(async () => ({})),
+    },
     Target: {
+      getTargetInfo: vi.fn(async () => ({
+        targetInfo: { targetId: "target-a", url: "https://chatgpt.com/c/a" },
+      })),
+      createTarget: vi.fn(async () => ({ targetId: "created-target" })),
+      closeTarget: vi.fn(async () => ({ success: true })),
       getTargets: vi.fn(async () => ({
         targetInfos: [
           {
@@ -79,11 +88,18 @@ function exactBrowserForTabs() {
       attachToTarget: vi.fn(async () => ({ sessionId: "session-a" })),
       detachFromTarget: vi.fn(async () => undefined),
     },
+    Network: { enable: vi.fn(async () => undefined) },
+    Page: { enable: vi.fn(async () => undefined) },
     Runtime: { enable: vi.fn(async () => undefined), evaluate },
     DOM: { enable: vi.fn(async () => undefined) },
+    Input: { dispatchKeyEvent: vi.fn(async () => undefined) },
+    Emulation: { setFocusEmulationEnabled: vi.fn(async () => undefined) },
     on: vi.fn(),
     once: vi.fn(),
+    off: vi.fn(),
     removeListener: vi.fn(),
+    send: vi.fn(async () => ({})),
+    close: vi.fn(async () => undefined),
   };
 }
 

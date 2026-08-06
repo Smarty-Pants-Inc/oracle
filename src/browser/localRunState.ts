@@ -3,7 +3,11 @@ import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
 import type { ConversationUrlMonitor } from "./conversationUrlMonitor.js";
 import type { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserTabLease } from "./tabLeaseRegistry.js";
-import type { BrowserRunResult, ChromeClient } from "./types.js";
+import type { BrowserRunResult } from "./types.js";
+import type {
+  BrowserLevelChromeClient,
+  SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
 import type { PostCapturePendingWork } from "./publicationSettlementCoordinator.js";
 
 export interface LocalBrowserRunState {
@@ -12,8 +16,9 @@ export interface LocalBrowserRunState {
   ownsTarget: boolean;
   isolatedTargetId: string | null;
   targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | undefined;
-  client: ChromeClient | null;
-  browserRuntime: ChromeClient["Runtime"] | null;
+  client: SessionBoundChromeClient | null;
+  browserClient: BrowserLevelChromeClient | null;
+  browserRuntime: SessionBoundChromeClient["Runtime"] | null;
   modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   tabLease: BrowserTabLease | null;
   conversationUrlMonitor: ConversationUrlMonitor | null;
@@ -35,6 +40,7 @@ export function createLocalBrowserRunState(tabLease: BrowserTabLease | null): Lo
     isolatedTargetId: null,
     targetCloseCapability: undefined,
     client: null,
+    browserClient: null,
     browserRuntime: null,
     modelSelectionEvidence: undefined,
     tabLease,

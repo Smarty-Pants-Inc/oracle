@@ -5,11 +5,12 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import { captureDeepResearchTargetKeys } from "./actions/deepResearch.js";
 import { resolveBrowserConfig } from "./config.js";
 import type { BrowserAttachment, BrowserLogger, ChromeClient } from "./types.js";
+import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
 import type { BrowserSubmissionResult } from "./archiveSettlementCoordinator.js";
 import { hasBrowserErrorCode } from "./coordinatorPolicy.js";
 // Browser prompt submission, target baseline, and lane policy helpers.
 export async function captureDeepResearchTargetBaseline(
-  client: ChromeClient,
+  client: SessionBoundChromeClient,
   logger: BrowserLogger,
 ): Promise<{ targetKeys: string[]; captured: boolean }> {
   try {

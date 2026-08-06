@@ -9,13 +9,13 @@ import {
   settleManualChromeOwner,
   type ManualChromeOwner,
 } from "../../src/browser/manualChromeOwner.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
 import {
   acquireProfileRunLock,
   captureProfileDirectoryIdentity,
   readDevToolsPort,
   readOracleChromeOwner,
   writeOracleChromeOwner,
-  type ChromeProcessIdentity,
 } from "../../src/browser/profileState.js";
 import {
   acquireBrowserTabLease,

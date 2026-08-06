@@ -1,5 +1,6 @@
 import { COOKIE_URLS } from "./constants.js";
 import type { BrowserLogger, ChromeClient, CookieParam } from "./types.js";
+import type { BrowserLevelChromeClient } from "./chromeSessionTransport.js";
 import { delay } from "./utils.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 
@@ -7,7 +8,7 @@ export class ChromeCookieSyncError extends Error {}
 
 export async function clearStaleChatGptConversationCookies(
   Network: ChromeClient["Network"],
-  Target: ChromeClient["Target"],
+  Target: BrowserLevelChromeClient["Target"],
   logger: BrowserLogger,
   options: { preserveConversationIds?: readonly (string | null | undefined)[] } = {},
 ): Promise<number> {

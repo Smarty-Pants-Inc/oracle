@@ -98,17 +98,14 @@ vi.mock("../../src/cli/durableAnswer.ts", async () => {
   };
 });
 
-vi.mock("../../src/browser/artifacts.ts", () => ({
-  appendArtifacts: (
-    existing: SessionArtifact[] | undefined,
-    additions: Array<SessionArtifact | null | undefined>,
-  ): SessionArtifact[] | undefined => {
-    const artifacts = [...(existing ?? []), ...additions.filter((value) => value != null)];
-    return artifacts.length > 0 ? (artifacts as SessionArtifact[]) : undefined;
-  },
-  saveBrowserTranscriptArtifact: saveBrowserTranscriptArtifactMock,
-  saveDeepResearchReportArtifact: saveDeepResearchReportArtifactMock,
-}));
+vi.mock("../../src/browser/artifacts.ts", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../../src/browser/artifacts.ts");
+  return {
+    ...actual,
+    saveBrowserTranscriptArtifact: saveBrowserTranscriptArtifactMock,
+    saveDeepResearchReportArtifact: saveDeepResearchReportArtifactMock,
+  };
+});
 
 vi.mock("../../src/cli/markdownRenderer.ts", () => {
   return {

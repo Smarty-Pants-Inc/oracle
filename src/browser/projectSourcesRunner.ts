@@ -22,11 +22,8 @@ import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { LocalOwnedBrowserResourceAuthority } from "./ownedBrowserResources.js";
 import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
-import {
-  captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
-  type ProfileDirectoryIdentity,
-} from "./profileState.js";
+import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity, type ProfileDirectoryIdentity } from "./profileState.js";
 import { CHATGPT_URL } from "./constants.js";
 import {
   openProjectSourcesTab,
@@ -339,6 +336,7 @@ async function runBrowserProjectSourcesUnlocked(
       }),
     });
     const projectClient = connection.client;
+    const projectBrowserClient = connection.browserClient;
     if (acquiredTabLease) {
       await acquiredTabLease.update({
         chromeHost,
@@ -355,14 +353,14 @@ async function runBrowserProjectSourcesUnlocked(
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
 
-    const { Network, Page, Runtime, Input, DOM, Target } = projectClient;
+    const { Network, Page, Runtime, Input, DOM } = projectClient;
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
     if (!config.headless && config.hideWindow) {
-      await positionChromeWindowOffscreen(projectClient, logger);
+      await positionChromeWindowOffscreen(projectBrowserClient, logger);
     }
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     if (!manualLogin) {
@@ -375,7 +373,7 @@ async function runBrowserProjectSourcesUnlocked(
       manualLogin,
       logger,
     });
-    await clearStaleChatGptConversationCookies(Network, Target, logger);
+    await clearStaleChatGptConversationCookies(Network, projectBrowserClient.Target, logger);
 
     await raceWithDisconnect(navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger));
     await raceWithDisconnect(

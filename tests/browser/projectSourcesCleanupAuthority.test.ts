@@ -12,9 +12,9 @@ import {
   type ProjectSourcesManualCleanupProof,
 } from "../../src/browser/projectSourcesCleanupAuthority.js";
 import { establishProjectSourcesCleanupStorage } from "../../src/browser/projectSourcesRecovery.js";
+import { createChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
 import {
   captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
   parseOracleChromeOwnerRecord,
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";

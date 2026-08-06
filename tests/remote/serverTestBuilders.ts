@@ -3,11 +3,11 @@ import { createHash } from "node:crypto";
 import type { BrowserRunOptions, BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
+import { createBrowserRunTransaction } from "../../src/browser/runLifecycle.js";
 import {
-  createBrowserRunTransaction,
-  type BrowserCaptureSettlementAdapters,
-} from "../../src/browser/runLifecycle.js";
-import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
+  OwnedBrowserResourceTransaction,
+  type OwnedBrowserResourceTransactionAdapters,
+} from "../../src/browser/ownedBrowserResources.js";
 import { createRemoteServer } from "../../src/remote/server.js";
 import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -92,7 +92,7 @@ export function lifecycleBrowserTransaction(
   result: BrowserRunResult,
   runtime: BrowserRunTransaction["runtime"],
   runtimeHintCb: BrowserRunOptions["runtimeHintCb"],
-  settleResources: BrowserCaptureSettlementAdapters["settleResources"],
+  settleResources: OwnedBrowserResourceTransactionAdapters["settleResources"],
   followUpOrdinal = 0,
 ): BrowserRunTransaction {
   const conversationId = result.conversationId?.trim() || "remote-conversation";

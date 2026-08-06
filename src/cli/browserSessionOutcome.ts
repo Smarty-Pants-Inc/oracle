@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { appendArtifacts } from "../browser/artifacts.js";
 import type {
   BrowserRuntimeMetadata,
   SessionArtifact,
@@ -10,6 +11,7 @@ import type {
 import { commitSessionModelProjection, sessionStore } from "../sessionStore.js";
 import type { DurableBrowserAnswerReceipt } from "./durableAnswer.js";
 import { projectCompletedBrowserMetadataAudit } from "./browserPublicationJournal.js";
+import { formatError } from "./errorUtils.js";
 
 type ModelProjectionUpdates = Omit<Partial<SessionModelRun>, "model" | "status" | "completedAt">;
 
@@ -146,10 +148,7 @@ function buildBrowserSessionOutcomeProjection(
   outcome: BrowserSessionOutcome,
   current: SessionMetadata | null,
 ): Parameters<typeof commitSessionModelProjection>[1] {
-  const artifacts = mergeArtifacts(
-    outcome.artifacts,
-    outcome.receipt ? [outcome.receipt.artifact] : undefined,
-  );
+  const artifacts = appendArtifacts(outcome.artifacts, [outcome.receipt?.artifact]);
   const browser = {
     ...outcome.browser,
     runtime: outcome.runtime,
@@ -178,7 +177,7 @@ function buildBrowserSessionOutcomeProjection(
       auditRuntime,
       cleanupErrorCode,
     );
-    const publishedArtifacts = mergeArtifacts(current?.artifacts, artifacts);
+    const publishedArtifacts = appendArtifacts(current?.artifacts, artifacts ?? []);
     return {
       session: {
         status: "completed",
@@ -264,24 +263,6 @@ function buildBrowserSessionOutcomeProjection(
   };
 }
 
-function mergeArtifacts(
-  existing: SessionArtifact[] | undefined,
-  additions: SessionArtifact[] | undefined,
-): SessionArtifact[] | undefined {
-  if (!existing?.length && !additions?.length) return undefined;
-  const merged = [...(existing ?? [])];
-  for (const artifact of additions ?? []) {
-    if (
-      !merged.some(
-        (candidate) => candidate.kind === artifact.kind && candidate.path === artifact.path,
-      )
-    ) {
-      merged.push(artifact);
-    }
-  }
-  return merged;
-}
-
 function matchesProjection(
   current: SessionMetadata | null,
   projection: Parameters<typeof commitSessionModelProjection>[1],
@@ -298,8 +279,4 @@ function matchesProjection(
     if (!isDeepStrictEqual(model[key as keyof SessionModelRun], expected)) return false;
   }
   return true;
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

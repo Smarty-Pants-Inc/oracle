@@ -22,7 +22,7 @@ import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.
 import {
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
-} from "../../src/browser/runLifecycle.js";
+} from "../../src/browser/ownedBrowserResources.js";
 import {
   __test__ as targetCloseAuthorityTest,
   closeChromeTargetWithRetainedCapability,

@@ -1,4 +1,4 @@
-import { projectBrowserCaptureCleanupRuntime } from "../browser/runLifecycle.js";
+import { projectBrowserCaptureCleanupRuntime } from "../browser/ownedBrowserResources.js";
 import type { BrowserRemoteRecoveryMetadata, BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { RemotePublicRuntime } from "./types.js";
 import { assertRemoteRecoveryAuthority } from "../browser/reattachability.js";

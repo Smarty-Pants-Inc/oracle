@@ -12,11 +12,9 @@ import {
   captureProfileDirectoryIdentity,
   readOracleChromeOwner,
 } from "../../src/browser/profileState.js";
-import type {
-  ChromeProcessIdentity,
-  ChromeProcessLaunchClaim,
-  OracleChromeOwnerRecord,
-} from "../../src/browser/profileState.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import type { ChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
+import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserArchiveEffectReceipt } from "../../src/browser/actions/archiveConversation.js";
 
@@ -176,15 +174,25 @@ function createClient(options: {
     },
     Page: { enable: vi.fn().mockResolvedValue(undefined) },
     Runtime: { enable: vi.fn().mockResolvedValue(undefined), evaluate },
-    Target: {
-      getTargetInfo: vi.fn().mockResolvedValue({
-        targetInfo: { targetId, url: conversationUrl },
-      }),
-    },
     Emulation: { setFocusEmulationEnabled: vi.fn().mockResolvedValue(undefined) },
     on: vi.fn((event: string, handler: () => void) => {
       if (event === "disconnect") options.onDisconnect?.(handler);
     }),
+  };
+}
+
+function createBrowserClient(currentUrl: () => string = () => conversationUrl) {
+  return {
+    Browser: {
+      getWindowForTarget: vi.fn(),
+      setWindowBounds: vi.fn(),
+    },
+    Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      getTargetInfo: vi.fn().mockImplementation(async () => ({
+        targetInfo: { targetId, url: currentUrl() },
+      })),
+    },
   };
 }
 
@@ -233,8 +241,11 @@ async function withRemoteLateDisconnectFixture(
     },
   });
   const recoveryClient = createClient({ currentUrl: () => currentUrl });
+  const browserClient = createBrowserClient(() => currentUrl);
+  const recoveryBrowserClient = createBrowserClient(() => currentUrl);
   const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
     client: recoveryClient,
+    browserClient: recoveryBrowserClient,
     targetId,
     ownership: "attached",
     close: vi.fn().mockResolvedValue(undefined),
@@ -282,6 +293,7 @@ async function withRemoteLateDisconnectFixture(
   vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
     connectToRemoteChrome: vi.fn().mockResolvedValue({
       client,
+      browserClient,
       targetId,
       ownership,
       targetCloseAuthority: {
@@ -600,8 +612,11 @@ async function withDisconnectFixture(
     },
   });
   const recoveryClient = createClient({ currentUrl: () => currentUrl });
+  const primaryBrowserClient = createBrowserClient(() => currentUrl);
+  const recoveryBrowserClient = createBrowserClient(() => currentUrl);
   const connectToRemoteChromeTarget = vi.fn().mockResolvedValue({
     client: recoveryClient,
+    browserClient: recoveryBrowserClient,
     targetId,
     ownership: "attached",
     close: vi.fn().mockResolvedValue(undefined),
@@ -663,7 +678,7 @@ async function withDisconnectFixture(
     registerTerminationHooks: vi.fn(() => vi.fn()),
     connectWithNewTabWithExactAuthority: vi
       .fn()
-      .mockResolvedValue({ client: primaryClient, targetId }),
+      .mockResolvedValue({ client: primaryClient, browserClient: primaryBrowserClient, targetId }),
     connectToRemoteChromeTarget,
     closeChromeTarget,
     closeChromeTargetWithExactAuthority,

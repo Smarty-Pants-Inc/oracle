@@ -5,7 +5,10 @@ import {
   type RetainedChromeEndpointAuthority,
 } from "./chromeLifecycle.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
-import { inspectChromeProcessIdentity, sameChromeProcessIdentity } from "./profileState.js";
+import {
+  inspectChromeProcessIdentity,
+  sameChromeProcessIdentity,
+} from "./chromeProcessIdentity.js";
 import { isBrowserRecoveryTargetCloseCapability } from "./targetCloseAuthority.js";
 
 interface RefreshAttachRuntimeDeps {

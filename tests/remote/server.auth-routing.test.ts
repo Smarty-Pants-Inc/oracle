@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
@@ -606,6 +606,80 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const restarted = await createTestRemoteServer(options, { transactionStoreDir });
       await restarted.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "does not invoke Windows tree authority for a controller that loses lock contention",
+    async () => {
+      const tmpDir = await mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-controller-windows-lock-"),
+      );
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const integrityKeyPath = path.join(tmpDir, ".remote-transaction-integrity.key");
+      const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+      const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
+      const first = await createTestRemoteServer(options, {
+        transactionStoreDir,
+        transactionIntegrityKeyPath: integrityKeyPath,
+        transactionStorePlatform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      try {
+        const keyBefore = await readFile(integrityKeyPath);
+        const recordNamesBefore = (await readdir(transactionStoreDir)).filter((name) =>
+          name.endsWith(".json"),
+        );
+        windowsPrivateTreeAuthority.mockClear();
+
+        await expect(
+          createTestRemoteServer(options, {
+            transactionStoreDir,
+            transactionIntegrityKeyPath: integrityKeyPath,
+            transactionStorePlatform: "win32",
+            windowsPrivateTreeAuthority,
+          }),
+        ).rejects.toThrow(/lock|owner|active/i);
+
+        expect(windowsPrivateTreeAuthority).not.toHaveBeenCalled();
+        await expect(readFile(integrityKeyPath)).resolves.toEqual(keyBefore);
+        expect(
+          (await readdir(transactionStoreDir)).filter((name) => name.endsWith(".json")),
+        ).toEqual(recordNamesBefore);
+      } finally {
+        await first.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "releases the controller lock when Windows tree authority fails after acquisition",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-controller-windows-acl-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const failingAuthority = vi.fn(async () => {
+        throw new Error("simulated Windows tree authority failure");
+      });
+      const options = { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} };
+      let recovered: RemoteServerInstance | undefined;
+      try {
+        await expect(
+          createTestRemoteServer(options, {
+            transactionStoreDir,
+            transactionStorePlatform: "win32",
+            windowsPrivateTreeAuthority: failingAuthority,
+          }),
+        ).rejects.toThrow("simulated Windows tree authority failure");
+        expect(failingAuthority).toHaveBeenCalledOnce();
+        expect(await readdir(transactionStoreDir)).not.toContain(".controller.lock");
+
+        recovered = await createTestRemoteServer(options, {
+          transactionStoreDir,
+          transactionStorePlatform: "win32",
+        });
+      } finally {
+        await recovered?.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     },
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(

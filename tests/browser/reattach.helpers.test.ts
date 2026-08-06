@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import type { SessionBoundChromeClient } from "../../src/browser/chromeSessionTransport.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { selectTarget } from "../../src/browser/reattachTargetSelection.js";
 import { __test__ } from "../../src/browser/reattach.js";
@@ -47,7 +48,11 @@ describe("reattach helpers", () => {
     const connectRecoveryTargetWithExactAuthority = vi.fn(async () => ({
       status: "completed" as const,
       value: {
-        client: { close: vi.fn(async () => undefined) } as unknown as ChromeClient,
+        client: { close: vi.fn(async () => undefined) } as unknown as SessionBoundChromeClient,
+        browserClient: {
+          Browser: { getWindowForTarget: vi.fn(), setWindowBounds: vi.fn() },
+          Target: { getTargets: vi.fn(), getTargetInfo: vi.fn() },
+        },
         targetId: "created-target",
         ownership: "created" as const,
         close: closeConnection,
@@ -96,7 +101,13 @@ describe("reattach helpers", () => {
           connectRecoveryTargetWithExactAuthority: vi.fn(async () => ({
             status: "completed" as const,
             value: {
-              client: { close: vi.fn(async () => undefined) } as unknown as ChromeClient,
+              client: {
+                close: vi.fn(async () => undefined),
+              } as unknown as SessionBoundChromeClient,
+              browserClient: {
+                Browser: { getWindowForTarget: vi.fn(), setWindowBounds: vi.fn() },
+                Target: { getTargets: vi.fn(), getTargetInfo: vi.fn() },
+              },
               targetId: "created-target",
               ownership: "created" as const,
               close: closeConnection,

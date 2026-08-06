@@ -5,14 +5,16 @@ import path from "node:path";
 import { syncDirectory } from "../fsDurability.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { resolveUserDataBaseDir } from "./localExecutionContext.js";
+import { sameChromeProcessIdentity } from "./chromeProcessIdentity.js";
+import {
+  parseChromeProcessLaunchClaim,
+  sameChromeProcessLaunchClaim,
+} from "./chromeProcessLaunchClaim.js";
 import {
   captureProfileDirectoryIdentity,
-  parseChromeProcessLaunchClaim,
   parseOracleChromeOwnerRecord,
   parseProfileDirectoryIdentity,
   readOracleChromeOwner,
-  sameChromeProcessIdentity,
-  sameChromeProcessLaunchClaim,
   sameProfileDirectoryIdentity,
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,

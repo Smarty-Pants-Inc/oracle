@@ -10,7 +10,11 @@ import {
   verifyCommittedPromptTurn,
 } from "./pageActions.js";
 import { recoverCommittedGeminiDeepThinkResponse } from "./providers/geminiDeepThinkDomProvider.js";
-import type { BrowserLogger, ChromeClient } from "./types.js";
+import type { BrowserLogger } from "./types.js";
+import {
+  adaptDirectTargetChromeClient,
+  type SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
 import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
 import { resolveGeminiWebModel } from "../gemini-web/models.js";
@@ -408,7 +412,8 @@ export async function resumeBrowserSession(
                     : { host, port, target: targetId },
                 );
                 if (!client) throw new Error("Chrome target connection returned no client.");
-                return { client, close: () => client.close() };
+                const attachment = adaptDirectTargetChromeClient(client);
+                return { ...attachment, close: () => attachment.client.close() };
               })()
             : await connectToRemoteChromeTarget(host, port ?? 9222, logger, {
                 browserWSEndpoint,
@@ -418,7 +423,7 @@ export async function resumeBrowserSession(
       );
       closeAttachedConnection = () => connection.close();
 
-      const client: ChromeClient = connection.client;
+      const client: SessionBoundChromeClient = connection.client;
       const { Runtime, DOM, Page } = client;
       await classifyReattachFailure(
         "recoverable-transport",

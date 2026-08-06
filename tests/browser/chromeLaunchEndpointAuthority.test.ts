@@ -1,9 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { inspectChromeProcessIdentityForTest } from "../../src/browser/profileState.js";
-import type { ChromeProcessIdentity } from "../../src/browser/profileState.js";
-import type { ChromeProcessIdentityInspection } from "../../src/browser/chromeProcessIdentity.js";
+import {
+  inspectChromeProcessIdentityForTest,
+  type ChromeProcessIdentity,
+  type ChromeProcessIdentityInspection,
+} from "../../src/browser/chromeProcessIdentity.js";
 import {
   chromeLaunchResult,
   processIdentity,

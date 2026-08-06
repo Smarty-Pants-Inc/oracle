@@ -29,7 +29,8 @@ import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
-import { captureProfileDirectoryIdentity, createChromeProcessLaunchClaim } from "./profileState.js";
+import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity } from "./profileState.js";
 import { acquireBrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   extractConversationIdFromUrl,
@@ -309,17 +310,18 @@ export async function resumeBrowserSessionViaNewChrome(
     });
     const recoveryTargetId = recoveryConnection.targetId;
     const client = recoveryConnection.client;
+    const browserClient = recoveryConnection.browserClient;
     await fallbackAuthority.lease()?.update({
       chromeHost,
       chromePort: chrome.port,
       chromeTargetId: recoveryTargetId,
     });
-    const { Network, Page, Runtime, DOM, Target } = client;
+    const { Network, Page, Runtime, DOM } = client;
 
     if (Runtime?.enable) await Runtime.enable();
     if (DOM && typeof DOM.enable === "function") await DOM.enable();
     if (!resolved.headless && resolved.hideWindow) {
-      await positionChromeWindowOffscreen(client, logger);
+      await positionChromeWindowOffscreen(browserClient, logger);
     }
     let appliedCookies = 0;
     if (!manualLogin && resolved.cookieSync) {
@@ -332,7 +334,7 @@ export async function resumeBrowserSessionViaNewChrome(
       });
     }
 
-    await clearStaleChatGptConversationCookies(Network, Target, logger, {
+    await clearStaleChatGptConversationCookies(Network, browserClient.Target, logger, {
       preserveConversationIds: [
         promptEpoch.conversationId,
         extractConversationIdFromUrl(resolved.url),

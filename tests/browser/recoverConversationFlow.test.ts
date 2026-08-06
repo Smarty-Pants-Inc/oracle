@@ -74,6 +74,21 @@ function processIdentity(port: number) {
   };
 }
 
+function browserClientForTarget(targetId: string) {
+  return {
+    Browser: {
+      getWindowForTarget: vi.fn(),
+      setWindowBounds: vi.fn(),
+    },
+    Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      getTargetInfo: vi.fn(async () => ({
+        targetInfo: { targetId, url: `https://chatgpt.com/c/${targetId}` },
+      })),
+    },
+  };
+}
+
 function connectWithExactTarget(targetId: string, events?: string[]) {
   return vi.fn(async () => {
     events?.push("target");
@@ -86,6 +101,7 @@ function connectWithExactTarget(targetId: string, events?: string[]) {
         },
         close: vi.fn(async () => undefined),
       },
+      browserClient: browserClientForTarget(targetId),
     };
   });
 }
@@ -171,13 +187,15 @@ describe("recoverConversationTab lease ownership", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../../src/browser/reattachSettlement.js");
-    vi.doMock("../../src/browser/profileState.js", () => ({
-      captureProfileDirectoryIdentity: vi.fn(async () => profileDirectory),
+    vi.doMock("../../src/browser/chromeProcessLaunchClaim.js", () => ({
       createChromeProcessLaunchClaim: (generationId: string) => ({
         version: 1 as const,
         generationId,
         nonce: "a0000000-0000-4000-8000-00000000000a",
       }),
+    }));
+    vi.doMock("../../src/browser/profileState.js", () => ({
+      captureProfileDirectoryIdentity: vi.fn(async () => profileDirectory),
     }));
   });
 
@@ -1081,6 +1099,7 @@ describe("recoverConversationTab lease ownership", () => {
             },
             close: vi.fn(async () => undefined),
           },
+          browserClient: browserClientForTarget(targetId),
         };
       }),
     }));

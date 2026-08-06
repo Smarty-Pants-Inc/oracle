@@ -9,14 +9,14 @@ import type {
 } from "../browser/types.js";
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
-import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
 import {
-  BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
+  OwnedBrowserResourceTransaction,
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureCleanupRuntime,
   type BrowserCaptureSettlementMode,
-} from "../browser/runLifecycle.js";
+} from "../browser/ownedBrowserResources.js";
+import { BrowserRunLifecycleController } from "../browser/runLifecycle.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { delay } from "../browser/utils.js";

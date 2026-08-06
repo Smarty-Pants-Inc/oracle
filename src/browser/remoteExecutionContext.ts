@@ -8,10 +8,8 @@ import type { BrowserAutomationError } from "../oracle/errors.js";
 import type { ProfileDirectoryIdentity } from "./profileState.js";
 import type { BrowserTabLease } from "./tabLeaseRegistry.js";
 import type { ConversationUrlMonitor } from "./conversationUrlMonitor.js";
-import {
-  BrowserRunLifecycleController,
-  type BrowserCaptureSettlementMode,
-} from "./runLifecycle.js";
+import { BrowserRunLifecycleController } from "./runLifecycle.js";
+import type { BrowserCaptureSettlementMode } from "./ownedBrowserResources.js";
 import type { ChromeDisconnectAssessment } from "./coordinatorPolicy.js";
 import type { RemoteChromeConnection } from "./chromeLifecycle.js";
 import {
@@ -28,9 +26,12 @@ import type {
   BrowserLogger,
   BrowserRunOptions,
   BrowserRunResult,
-  ChromeClient,
   ResolvedBrowserConfig,
 } from "./types.js";
+import type {
+  BrowserLevelChromeClient,
+  SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
 
 export type RemoteResourceSettler = (
   context: RemoteBrowserExecutionContext,
@@ -57,8 +58,9 @@ export interface RemoteBrowserExecutionContext {
   readonly startedAt: number;
   readonly lifecycle: BrowserRunLifecycleController;
   readonly disconnectPromise: Promise<never>;
-  client: ChromeClient | null;
-  browserRuntime: ChromeClient["Runtime"] | null;
+  client: SessionBoundChromeClient | null;
+  browserClient: BrowserLevelChromeClient | null;
+  browserRuntime: SessionBoundChromeClient["Runtime"] | null;
   remoteTargetId: string | null;
   targetCloseCapability: BrowserRecoveryTargetCloseCapabilityMetadata | null;
   tabLease: BrowserTabLease | null;
@@ -160,6 +162,7 @@ export function createRemoteBrowserExecutionContext(
     lifecycle,
     disconnectPromise,
     client: null,
+    browserClient: null,
     browserRuntime: null,
     remoteTargetId: null,
     targetCloseCapability: null,

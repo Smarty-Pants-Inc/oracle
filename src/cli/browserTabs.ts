@@ -26,7 +26,7 @@ import {
   type CommittedPromptEpochLocator,
 } from "../browser/reattachability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserCaptureSettlementMode } from "../browser/runLifecycle.js";
+import type { BrowserCaptureSettlementMode } from "../browser/ownedBrowserResources.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 
 const LIVE_POLL_MS = 2000;

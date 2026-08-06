@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { projectRuntimeAfterChromeTargetLoss } from "../browser/publicationSettlementCoordinator.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
-import { markBrowserCaptureCleanupPending } from "../browser/runLifecycle.js";
+import { markBrowserCaptureCleanupPending } from "../browser/ownedBrowserResources.js";
 import { hasRestartDurableChromeTargetCleanupAuthority } from "../browser/targetCloseAuthority.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import { deriveRemoteArtifactNamespace } from "./transactionModel.js";

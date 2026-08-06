@@ -14,19 +14,6 @@ import {
   type OwnedBrowserResourceTransactionAdapters,
 } from "./ownedBrowserResources.js";
 
-export type { BrowserCaptureSettlementMode } from "./ownedBrowserResources.js";
-export {
-  bindBrowserCaptureCleanupSettlement,
-  completedBrowserCaptureCleanup,
-  markBrowserCaptureCleanupPending,
-  pendingBrowserCaptureCleanup,
-  projectBrowserCaptureCleanupRuntime,
-  projectBrowserCaptureFinalization,
-  projectBrowserRetryableCleanupRuntime,
-} from "./ownedBrowserResources.js";
-
-export type BrowserCaptureSettlementAdapters = OwnedBrowserResourceTransactionAdapters;
-
 export interface PromptEpochIdentity {
   epochId: string;
   promptSha256: string;

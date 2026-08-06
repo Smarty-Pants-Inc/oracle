@@ -6,10 +6,12 @@ import type { LaunchedChrome } from "chrome-launcher";
 import type { ChromeClient } from "./types.js";
 import {
   inspectChromeProcessIdentity,
-  isSafeChromeTerminationOutcome,
-  writeOracleChromeOwner,
   type ChromeProcessIdentity,
   type ChromeProcessIdentityInspection,
+} from "./chromeProcessIdentity.js";
+import {
+  isSafeChromeTerminationOutcome,
+  writeOracleChromeOwner,
   type OracleChromeOwnerRecord,
   type RecordedChromeTerminationOutcome,
 } from "./profileState.js";

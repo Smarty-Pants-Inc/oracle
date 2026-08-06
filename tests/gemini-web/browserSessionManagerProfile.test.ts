@@ -101,6 +101,18 @@ describe("openGeminiBrowserSession fresh profile", () => {
     connectWithNewTabWithExactAuthority.mockResolvedValueOnce({
       targetId: "fresh-profile-target",
       client: { close: vi.fn(async () => undefined) },
+      browserClient: {
+        Browser: {
+          getWindowForTarget: vi.fn(),
+          setWindowBounds: vi.fn(),
+        },
+        Target: {
+          getTargets: vi.fn(async () => ({ targetInfos: [] })),
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: { targetId: "fresh-profile-target", url: "about:blank" },
+          })),
+        },
+      },
     });
 
     await expect(access(profileDir)).rejects.toMatchObject({ code: "ENOENT" });

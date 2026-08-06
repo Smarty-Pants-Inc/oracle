@@ -3,7 +3,8 @@ import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import type { SessionMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserCaptureFinalizationResult, BrowserLogger, ChromeClient } from "./types.js";
+import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js";
+import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
 import { isAnswerNowPlaceholderText } from "./actions/assistantResponse.js";
 import { promptIdentitySha256 } from "./actions/committedPrompt.js";
 import {
@@ -15,7 +16,8 @@ import {
 import { resolveBrowserConfig } from "./config.js";
 import { CHATGPT_URL } from "./constants.js";
 import { acquireBrowserTabLease } from "./tabLeaseRegistry.js";
-import { captureProfileDirectoryIdentity, createChromeProcessLaunchClaim } from "./profileState.js";
+import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity } from "./profileState.js";
 import {
   LocalOwnedBrowserResourceAuthority,
   type BrowserCaptureSettlementMode,
@@ -361,7 +363,7 @@ export async function recoverConversationTab(
     const opened = await resources.journalAcquisition({
       resource: "chrome-target",
       acquire: async () => {
-        let client: ChromeClient;
+        let client: SessionBoundChromeClient;
         let targetId: string;
         let closeAuthority: Parameters<typeof closeChromeTargetWithExactAuthority>[0]["authority"];
         let releaseCloseAuthority: (() => Promise<void>) | undefined;

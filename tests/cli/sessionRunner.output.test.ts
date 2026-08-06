@@ -77,7 +77,7 @@ import {
   runBrowserSessionExecution,
 } from "../../src/browser/sessionRunner.ts";
 import { getCliVersion } from "../../src/version.ts";
-import { deriveModelOutputPath } from "../../src/cli/sessionRunner.ts";
+import { deriveModelOutputPath } from "../../src/cli/multiModelSessionRun.ts";
 import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/browser/reattach.ts";
 import { persistDurableBrowserAnswer } from "../../src/cli/durableAnswer.ts";
 

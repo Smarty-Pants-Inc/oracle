@@ -36,6 +36,7 @@ export async function acquireExactLocalBrowserTarget({
         endpointAuthority,
       });
       state.client = attached.client;
+      state.browserClient = attached.browserClient;
       state.isolatedTargetId = attached.targetId ?? null;
       state.lastTargetId = attached.targetId ?? undefined;
       state.lastUrl = attached.tab.url || state.lastUrl;
@@ -78,6 +79,7 @@ export async function acquireExactLocalBrowserTarget({
               }),
           });
           state.client = opened.client;
+          state.browserClient = opened.browserClient;
           state.isolatedTargetId = targetId;
           state.lastTargetId = targetId;
           state.ownsTarget = true;

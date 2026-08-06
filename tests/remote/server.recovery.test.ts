@@ -22,7 +22,7 @@ import {
   sameProfileDirectoryIdentity,
   writeOracleChromeOwner,
 } from "../../src/browser/profileState.js";
-import { completedBrowserCaptureCleanup } from "../../src/browser/runLifecycle.js";
+import { completedBrowserCaptureCleanup } from "../../src/browser/ownedBrowserResources.js";
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,

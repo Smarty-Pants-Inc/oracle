@@ -10,7 +10,8 @@ import {
   probeChromeTargetLiveness,
 } from "./cdpLiveness.js";
 import { BrowserRunLifecycleController } from "./runLifecycle.js";
-import type { BrowserLogger, ChromeClient, ResolvedBrowserConfig } from "./types.js";
+import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
+import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
 // Browser coordinator error, warning, and connection policy.
 export function redactBrowserConfigForDebugLog(
   config: Record<string, unknown>,
@@ -240,7 +241,7 @@ export function classifyPreservedBrowserErrorForTest(
  * Soft-fails: focus emulation is an optimization, never a hard requirement.
  */
 export async function enableFocusEmulation(
-  client: ChromeClient,
+  client: Pick<SessionBoundChromeClient, "Emulation">,
   logger: BrowserLogger,
   label: string,
 ): Promise<void> {

@@ -5,10 +5,8 @@ import path from "node:path";
 import { expect, test, vi } from "vitest";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
-import {
-  captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
-} from "../../src/browser/profileState.js";
+import { createChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
 import type * as ProjectSourcesRecovery from "../../src/browser/projectSourcesRecovery.js";
 

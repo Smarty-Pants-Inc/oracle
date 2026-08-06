@@ -49,7 +49,7 @@ function createFrameOwnerClient(
   return {
     on: vi.fn(),
     removeListener: vi.fn(),
-    send: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+    sendSession: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === "DOM.getFrameOwner") {
         currentFrameId = String(params?.frameId ?? "");
         return { backendNodeId: 7 };
@@ -449,20 +449,12 @@ describe("waitForDeepResearchCompletion", () => {
     const deepResearchUrl =
       "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
     const mockClient = {
-      oraclePageSessionId: "page-session",
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
-          listeners.get("Target.attachedToTarget")?.(
-            {
-              sessionId: "foreign-session",
-              targetInfo: { targetId: "foreign-target", type: "iframe", url: deepResearchUrl },
-            },
-            "foreign-page-session",
-          );
           listeners.get("Target.attachedToTarget")?.(
             {
               sessionId: "existing-session",
@@ -503,7 +495,7 @@ describe("waitForDeepResearchCompletion", () => {
     const mockClient = {
       on: vi.fn(),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string) => {
+      sendSession: vi.fn(async (method: string) => {
         if (method === "Target.setAutoAttach") {
           throw new Error("auto-attach unavailable");
         }
@@ -742,7 +734,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach") {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "deep-session",
@@ -793,7 +785,7 @@ describe("waitForDeepResearchCompletion", () => {
     );
 
     expect(result.text).toBe("CHECK_DEEP_OK https://example.com/report");
-    expect(mockClient.send).toHaveBeenCalledWith(
+    expect(mockClient.sendSession).toHaveBeenCalledWith(
       "Runtime.evaluate",
       expect.objectContaining({ returnByValue: true }),
       "deep-session",
@@ -829,7 +821,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           // Page-scoped auto-attach surfaces only THIS page's OOPIF — still in progress.
           listeners.get("Target.attachedToTarget")?.({
@@ -905,13 +897,9 @@ describe("waitForDeepResearchCompletion", () => {
     }
   });
 
-  it("binds Target.setAutoAttach to the page session on a session-bound wrapper client", async () => {
-    // On the browser-WSEndpoint path, `client` is a session-bound wrapper whose
-    // raw `send` is browser-level (only domain methods are session-bound). If
-    // auto-attach is issued without the page session id, it attaches browser-wide
-    // and a foreign completed Deep Research tab leaks into this session. The fix
-    // passes `oraclePageSessionId`; this test asserts every setAutoAttach call is
-    // bound to that page session.
+  it("uses the bound page session for Target.setAutoAttach", async () => {
+    // The narrow session client owns page scoping. Deep Research must use the
+    // default bound session rather than supplying a browser or child session.
     mockRuntime.evaluate.mockResolvedValue({
       result: {
         value: {
@@ -931,22 +919,19 @@ describe("waitForDeepResearchCompletion", () => {
 
     const mockClient = {
       // Marks the session-bound wrapper (createSessionBoundChromeClient).
-      oraclePageSessionId: "page-session",
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           setAutoAttachSessions.push(sessionId);
-          // Page-session-scoped: only this page's OOPIF (in progress). If the call
-          // were browser-wide (sessionId !== page-session), a foreign completed
-          // report would also attach — which the assertions below forbid.
+          // A supplied session id would redirect the command away from the bound page.
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "current-session",
             targetInfo: { type: "iframe", url: deepResearchUrl },
           });
-          if (sessionId !== "page-session") {
+          if (sessionId !== undefined) {
             listeners.get("Target.attachedToTarget")?.({
               sessionId: "foreign-session",
               targetInfo: { type: "iframe", url: deepResearchUrl },
@@ -997,110 +982,8 @@ describe("waitForDeepResearchCompletion", () => {
           mockClient as never,
         ),
       ).rejects.toThrow(/did not complete/);
-      // Every auto-attach was bound to the page session — never browser-wide.
       expect(setAutoAttachSessions.length).toBeGreaterThan(0);
-      expect(setAutoAttachSessions.every((s) => s === "page-session")).toBe(true);
-    } finally {
-      dateNowSpy.mockRestore();
-    }
-  });
-
-  it("ignores target events from another page session on the shared browser client", async () => {
-    mockRuntime.evaluate.mockResolvedValue({
-      result: {
-        value: {
-          finished: false,
-          stopVisible: false,
-          textLength: 0,
-          hasIframe: true,
-          hasActiveScopedResearch: false,
-        },
-      },
-    });
-
-    const evaluatedSessions: string[] = [];
-    const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
-    const deepResearchUrl =
-      "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
-
-    const mockClient = {
-      oraclePageSessionId: "page-session",
-      on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
-        listeners.set(event, listener);
-      }),
-      removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
-        if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
-          // chrome-remote-interface emits every flattened session event to the
-          // base listener. Its second callback argument identifies the parent
-          // page session that produced the child target event.
-          listeners.get("Target.attachedToTarget")?.(
-            {
-              sessionId: "foreign-child-session",
-              targetInfo: { type: "iframe", url: deepResearchUrl },
-            },
-            "foreign-page-session",
-          );
-          listeners.get("Target.attachedToTarget")?.(
-            {
-              sessionId: "current-child-session",
-              targetInfo: { type: "iframe", url: deepResearchUrl },
-            },
-            "page-session",
-          );
-          return {};
-        }
-        if (method === "Page.getFrameTree") {
-          return {
-            frameTree: { frame: { id: `${sessionId}-frame`, name: "root", url: deepResearchUrl } },
-          };
-        }
-        if (method === "Page.createIsolatedWorld") {
-          return { executionContextId: sessionId === "foreign-child-session" ? 99 : 50 };
-        }
-        if (method === "Runtime.evaluate" && sessionId) {
-          evaluatedSessions.push(sessionId);
-          if (sessionId === "foreign-child-session") {
-            return {
-              result: {
-                value: {
-                  completed: true,
-                  inProgress: false,
-                  textLength: 80,
-                  text: "FOREIGN_REPORT https://example.com/foreign",
-                },
-              },
-            };
-          }
-          return {
-            result: {
-              value: { completed: false, inProgress: true, textLength: 10, text: undefined },
-            },
-          };
-        }
-        return {};
-      }),
-    };
-
-    let nowCalls = 0;
-    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
-      nowCalls += 1;
-      return nowCalls < 8 ? 1_000 : 2_000;
-    });
-
-    try {
-      await expect(
-        waitForDeepResearchCompletion(
-          mockRuntime as never,
-          mockLogger,
-          100,
-          1,
-          undefined,
-          mockClient as never,
-        ),
-      ).rejects.toThrow(/did not complete/);
-      expect(evaluatedSessions).not.toContain("foreign-child-session");
-      expect(evaluatedSessions).toContain("current-child-session");
+      expect(setAutoAttachSessions.every((sessionId) => sessionId === undefined)).toBe(true);
     } finally {
       dateNowSpy.mockRestore();
     }
@@ -1124,12 +1007,11 @@ describe("waitForDeepResearchCompletion", () => {
     const deepResearchUrl =
       "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
     const mockClient = {
-      oraclePageSessionId: "page-session",
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           listeners.get("Target.attachedToTarget")?.(
             {
@@ -1202,11 +1084,6 @@ describe("waitForDeepResearchCompletion", () => {
     expect(result.text).toBe("CURRENT_REPORT https://example.com/current");
     expect(evaluatedSessions).toContain("old-session");
     expect(evaluatedSessions).toContain("current-session");
-    expect(mockClient.send).not.toHaveBeenCalledWith(
-      "DOM.getFrameOwner",
-      expect.anything(),
-      "page-session",
-    );
   });
 
   it("scopes reattached OOPIF reports to their owning conversation turn", async () => {
@@ -1226,12 +1103,11 @@ describe("waitForDeepResearchCompletion", () => {
     const deepResearchUrl =
       "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
     const mockClient = {
-      oraclePageSessionId: "page-session",
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           // Emit the current report first so target order alone would incorrectly
           // let the later stale completion win.
@@ -1264,7 +1140,7 @@ describe("waitForDeepResearchCompletion", () => {
           const backendNodeId = (params as { backendNodeId?: number }).backendNodeId;
           return { object: { objectId: backendNodeId === 20 ? "current-owner" : "old-owner" } };
         }
-        if (method === "Runtime.callFunctionOn" && sessionId === "page-session") {
+        if (method === "Runtime.callFunctionOn" && sessionId === undefined) {
           const objectId = (params as { objectId?: string }).objectId;
           return { result: { value: objectId === "current-owner" ? 2 : 0 } };
         }
@@ -1298,11 +1174,9 @@ describe("waitForDeepResearchCompletion", () => {
     );
 
     expect(result.text).toBe("CURRENT_REPORT https://example.com/current");
-    expect(mockClient.send).toHaveBeenCalledWith(
-      "DOM.getFrameOwner",
-      { frameId: "current-session-frame" },
-      "page-session",
-    );
+    expect(mockClient.sendSession).toHaveBeenCalledWith("DOM.getFrameOwner", {
+      frameId: "current-session-frame",
+    });
   });
 
   it("prefers a completed page target over an earlier in-progress one", async () => {
@@ -1330,7 +1204,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           // In-progress target attaches FIRST, completed target SECOND.
           listeners.get("Target.attachedToTarget")?.({
@@ -1423,7 +1297,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "complete-session",
@@ -1508,7 +1382,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach" && (params as { autoAttach?: boolean })?.autoAttach) {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "t-session",
@@ -1597,7 +1471,7 @@ describe("waitForDeepResearchCompletion", () => {
         listeners.set(event, listener);
       }),
       removeListener: vi.fn(),
-      send: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
+      sendSession: vi.fn(async (method: string, params?: unknown, sessionId?: string) => {
         if (method === "Target.setAutoAttach") {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "deep-session",
@@ -1681,11 +1555,9 @@ describe("waitForDeepResearchCompletion", () => {
     );
 
     expect(result.text).toBe("OOPIF_REPORT https://example.com/report");
-    expect(mockClient.send).not.toHaveBeenCalledWith(
-      "DOM.getFrameOwner",
-      { frameId: "sandbox" },
-      undefined,
-    );
+    expect(mockClient.sendSession).not.toHaveBeenCalledWith("DOM.getFrameOwner", {
+      frameId: "sandbox",
+    });
   });
 
   it("does not complete from an unscoped frame result during a scoped run", async () => {

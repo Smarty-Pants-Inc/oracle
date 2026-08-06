@@ -1,10 +1,10 @@
 import path from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
-import type {
-  ChromeProcessIdentity,
-  ChromeProcessLaunchClaim,
-  ProfileDirectoryIdentity,
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import type { ChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
+import {
+  captureProfileDirectoryIdentity,
+  type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
 import type {
   ChromeLaunchResult,

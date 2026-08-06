@@ -4,24 +4,29 @@ import { lstat, readFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { promisify } from "node:util";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
-import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
+import type { BrowserLogger, ResolvedBrowserConfig } from "./types.js";
+import type { BrowserLevelChromeClient } from "./chromeSessionTransport.js";
+import {
+  captureChromeProcessIdentity,
+  inspectChromeProcessIdentity,
+  type ChromeProcessIdentity,
+} from "./chromeProcessIdentity.js";
+import { findRunningChromeProcessForProfile } from "./chromeProcessDiscovery.js";
+import {
+  buildChromeProcessLaunchClaimFlag,
+  createChromeProcessLaunchClaim,
+  sameChromeProcessLaunchClaim,
+  type ChromeProcessLaunchClaim,
+} from "./chromeProcessLaunchClaim.js";
 import {
   assertProfileDirectoryIdentity,
-  buildChromeProcessLaunchClaimFlag,
-  captureChromeProcessIdentity,
-  createChromeProcessLaunchClaim,
   captureProfileDirectoryIdentity,
   cleanupStaleProfileState,
-  findRunningChromeProcessForProfile,
   getDevToolsActivePortPaths,
-  inspectChromeProcessIdentity,
   isSafeChromeTerminationOutcome,
   removeProfileDirectoryIfIdentityMatches,
   sameProfileDirectoryIdentity,
-  sameChromeProcessLaunchClaim,
   writeOracleChromeOwner,
-  type ChromeProcessIdentity,
-  type ChromeProcessLaunchClaim,
   type ProfileDirectoryIdentity,
   type ProfileDirectoryUseDeps,
   type RecordedChromeTerminationOutcome,
@@ -353,7 +358,7 @@ async function captureLaunchedChromeProcessIdentity(
 }
 
 export async function positionChromeWindowOffscreen(
-  client: ChromeClient,
+  client: BrowserLevelChromeClient,
   logger: BrowserLogger,
 ): Promise<void> {
   if (process.platform !== "darwin") {

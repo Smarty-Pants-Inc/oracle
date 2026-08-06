@@ -1,9 +1,9 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserLogger } from "./types.js";
-import { markBrowserCaptureCleanupPending } from "./runLifecycle.js";
 import {
   acknowledgeSettledTargetCloseCapabilities,
+  markBrowserCaptureCleanupPending,
   OwnedBrowserResourceTransaction,
 } from "./ownedBrowserResources.js";
 import {

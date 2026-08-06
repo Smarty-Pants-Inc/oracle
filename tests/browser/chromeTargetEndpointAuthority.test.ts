@@ -19,6 +19,37 @@ const { cdpMock, cdpNewMock, cdpCloseMock, cdpListMock } = vi.hoisted(() => {
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
 
+function sessionDomains() {
+  return {
+    Network: { enable: vi.fn(async () => ({})) },
+    Page: { enable: vi.fn(async () => ({})) },
+    Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
+    Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
+    DOM: { enable: vi.fn(async () => ({})) },
+    Emulation: { setFocusEmulationEnabled: vi.fn(async () => ({})) },
+  };
+}
+
+function directTargetClient() {
+  return {
+    Browser: {
+      getWindowForTarget: vi.fn(async () => ({ windowId: 1, bounds: {} })),
+      setWindowBounds: vi.fn(async () => ({})),
+    },
+    Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      getTargetInfo: vi.fn(async () => ({ targetInfo: { targetId: "target-1" } })),
+    },
+    ...sessionDomains(),
+    send: vi.fn(async () => ({})),
+    on: vi.fn(),
+    once: vi.fn(),
+    off: vi.fn(),
+    removeListener: vi.fn(),
+    close: vi.fn(async () => undefined),
+  };
+}
+
 describe("connectWithNewTab", () => {
   beforeEach(() => {
     cdpMock.mockReset();
@@ -33,7 +64,7 @@ describe("connectWithNewTab", () => {
 
   test("falls back to default target when new tab cannot be opened", async () => {
     cdpNewMock.mockRejectedValue(new Error("boom"));
-    cdpMock.mockResolvedValue({});
+    cdpMock.mockResolvedValue(directTargetClient());
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
     const logger = createBrowserLogger();
@@ -50,7 +81,9 @@ describe("connectWithNewTab", () => {
 
   test("closes unused tab when attach fails", async () => {
     cdpNewMock.mockResolvedValue({ id: "target-1" });
-    cdpMock.mockRejectedValueOnce(new Error("attach fail")).mockResolvedValueOnce({});
+    cdpMock
+      .mockRejectedValueOnce(new Error("attach fail"))
+      .mockResolvedValueOnce(directTargetClient());
     cdpCloseMock.mockResolvedValue(undefined);
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
@@ -81,7 +114,7 @@ describe("connectWithNewTab", () => {
 
   test("returns isolated target when attach succeeds", async () => {
     cdpNewMock.mockResolvedValue({ id: "target-2" });
-    cdpMock.mockResolvedValue({});
+    cdpMock.mockResolvedValue(directTargetClient());
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
     const logger = createBrowserLogger();
@@ -98,7 +131,7 @@ describe("connectWithNewTab", () => {
     cdpNewMock
       .mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:9222"))
       .mockResolvedValueOnce({ id: "target-3" });
-    cdpMock.mockResolvedValue({});
+    cdpMock.mockResolvedValue(directTargetClient());
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
     const logger = createBrowserLogger();
@@ -117,7 +150,12 @@ describe("connectWithNewTab", () => {
 
   test("creates and attaches a new tab through the retained exact browser session", async () => {
     const exactBrowser = {
+      ...directTargetClient(),
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "generation-a-target", url: "about:blank#generation-a" },
+        })),
         createTarget: vi.fn(async () => ({ targetId: "generation-a-target" })),
         attachToTarget: vi.fn(async () => ({ sessionId: "generation-a-session" })),
         detachFromTarget: vi.fn(async () => undefined),
@@ -180,12 +218,18 @@ describe("connectWithNewTab", () => {
 
   test("failure-closes a created target on generation A without a port fallback", async () => {
     const exactBrowser = {
+      ...directTargetClient(),
       Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "generation-a-target", url: "about:blank" },
+        })),
         createTarget: vi.fn(async () => ({ targetId: "generation-a-target" })),
         attachToTarget: vi.fn(async () => {
           throw new Error("attach failed");
         }),
         closeTarget: vi.fn(async () => ({ success: true })),
+        detachFromTarget: vi.fn(async () => undefined),
       },
       on: vi.fn(),
       once: vi.fn(),

@@ -11,7 +11,7 @@ import {
   markBrowserCaptureCleanupPending,
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureFinalization,
-} from "../browser/runLifecycle.js";
+} from "../browser/ownedBrowserResources.js";
 import {
   findRemoteRecoveryAuthority,
   projectRemoteRecoveryRuntime,

@@ -3,9 +3,11 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import { terminateChromeWithExactEndpointAuthority } from "../browser/chromeEndpointAuthority.js";
 import {
-  readOracleChromeOwner,
   sameChromeProcessIdentity,
   type ChromeProcessIdentity,
+} from "../browser/chromeProcessIdentity.js";
+import {
+  readOracleChromeOwner,
   type ProfileStateLogger,
   type RecordedChromeTerminationOutcome,
 } from "../browser/profileState.js";

@@ -189,7 +189,18 @@ test("persists and resolves Project Sources cleanup while discarding successful 
         Runtime: { enable: vi.fn(), evaluate: vi.fn() },
         Input: {},
         DOM: undefined,
-        Target: {},
+      },
+      browserClient: {
+        Browser: {
+          getWindowForTarget: vi.fn(),
+          setWindowBounds: vi.fn(),
+        },
+        Target: {
+          getTargets: vi.fn(async () => ({ targetInfos: [] })),
+          getTargetInfo: vi.fn(async () => ({
+            targetInfo: { targetId: "project-sources-target", url: "about:blank" },
+          })),
+        },
       },
       targetId: "project-sources-target",
     }));

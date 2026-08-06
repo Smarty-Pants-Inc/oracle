@@ -1,9 +1,7 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import { closeBlankChromeTabsWithExactAuthority } from "./chromeLifecycle.js";
-import {
-  BrowserRunLifecycleController,
-  type BrowserCaptureSettlementMode,
-} from "./runLifecycle.js";
+import { BrowserRunLifecycleController } from "./runLifecycle.js";
+import type { BrowserCaptureSettlementMode } from "./ownedBrowserResources.js";
 import {
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,

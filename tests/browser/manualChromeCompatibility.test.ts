@@ -4,9 +4,9 @@ import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { acquireManualLoginChromeForRun, type BrowserChrome } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
 import {
   captureProfileDirectoryIdentity,
-  type ChromeProcessIdentity,
   type OracleChromeOwnerRecord,
   type ProfileRunLock,
 } from "../../src/browser/profileState.js";

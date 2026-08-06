@@ -2,11 +2,13 @@ import { describe, expect, test, vi } from "vitest";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import {
   BrowserRunLifecycleController,
-  completedBrowserCaptureCleanup,
   createBrowserRunTransaction,
-  pendingBrowserCaptureCleanup,
 } from "../../src/browser/runLifecycle.js";
-import { OwnedBrowserResourceTransaction } from "../../src/browser/ownedBrowserResources.js";
+import {
+  completedBrowserCaptureCleanup,
+  OwnedBrowserResourceTransaction,
+  pendingBrowserCaptureCleanup,
+} from "../../src/browser/ownedBrowserResources.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 
 const committedVerification = {

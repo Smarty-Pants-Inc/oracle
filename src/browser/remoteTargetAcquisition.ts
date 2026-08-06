@@ -26,18 +26,21 @@ import { extractStableConversationIdFromUrl as extractConversationIdFromUrl } fr
 import { buildSkippedModelSelectionEvidence } from "./promptSubmissionCoordinator.js";
 import { enableFocusEmulation } from "./coordinatorPolicy.js";
 import { installRemoteDisconnectHandler } from "./remoteDisconnectSettlement.js";
-import type { ChromeClient } from "./types.js";
+import type {
+  BrowserLevelChromeClient,
+  SessionBoundChromeClient,
+} from "./chromeSessionTransport.js";
 import type { RemoteBrowserExecutionContext } from "./remoteExecutionContext.js";
 import { retainChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 
 export interface RemoteBrowserTarget {
-  client: ChromeClient;
-  Network: ChromeClient["Network"];
-  Page: ChromeClient["Page"];
-  Runtime: ChromeClient["Runtime"];
-  Input: ChromeClient["Input"];
-  DOM: ChromeClient["DOM"];
-  Target: ChromeClient["Target"];
+  client: SessionBoundChromeClient;
+  browserClient: BrowserLevelChromeClient;
+  Network: SessionBoundChromeClient["Network"];
+  Page: SessionBoundChromeClient["Page"];
+  Runtime: SessionBoundChromeClient["Runtime"];
+  Input: SessionBoundChromeClient["Input"];
+  DOM: SessionBoundChromeClient["DOM"];
   activeConversationUrlMonitor: ConversationUrlMonitor;
 }
 
@@ -81,6 +84,7 @@ export async function acquireRemoteBrowserTarget(
       ref: config.browserTabRef,
     });
     context.client = attached.client;
+    context.browserClient = attached.browserClient;
     context.remoteTargetId = attached.targetId ?? null;
     context.lastUrl = attached.tab.url || context.lastUrl;
     context.attachedExistingTab = true;
@@ -101,6 +105,7 @@ export async function acquireRemoteBrowserTarget(
       },
     );
     context.client = context.connection.client;
+    context.browserClient = context.connection.browserClient;
     context.remoteTargetId = context.connection.targetId;
     context.ownsTarget = context.connection.ownership === "created";
     context.attachedExistingTab = context.connection.ownership === "attached";
@@ -138,11 +143,12 @@ export async function acquireRemoteBrowserTarget(
   }
 
   const client = context.client;
-  if (!client) {
-    throw new Error("Remote Chrome target acquisition did not produce a client.");
+  const browserClient = context.browserClient;
+  if (!client || !browserClient) {
+    throw new Error("Remote Chrome target acquisition did not produce its CDP clients.");
   }
   installRemoteDisconnectHandler(context, client);
-  const { Network, Page, Runtime, Input, DOM, Target } = client;
+  const { Network, Page, Runtime, Input, DOM } = client;
 
   const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
   if (DOM && typeof DOM.enable === "function") {
@@ -170,7 +176,7 @@ export async function acquireRemoteBrowserTarget(
   context.conversationUrlMonitor = activeConversationUrlMonitor;
 
   logger("Skipping cookie sync for remote Chrome (using existing session)");
-  await clearStaleChatGptConversationCookies(Network, Target, logger, {
+  await clearStaleChatGptConversationCookies(Network, browserClient.Target, logger, {
     preserveConversationIds: [
       extractConversationIdFromUrl(config.resumeConversationUrl ?? ""),
       extractConversationIdFromUrl(context.lastUrl ?? ""),
@@ -272,5 +278,14 @@ export async function acquireRemoteBrowserTarget(
     );
   }
 
-  return { client, Network, Page, Runtime, Input, DOM, Target, activeConversationUrlMonitor };
+  return {
+    client,
+    browserClient,
+    Network,
+    Page,
+    Runtime,
+    Input,
+    DOM,
+    activeConversationUrlMonitor,
+  };
 }

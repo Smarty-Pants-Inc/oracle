@@ -8,8 +8,8 @@ import {
   type CrashRecoverableFilesystemLockDeps,
 } from "../browser/filesystemLock.js";
 import { resumeBrowserSession, retryBrowserRecoveryCleanup } from "../browser/reattach.js";
+import type { ChromeProcessIdentity } from "../browser/chromeProcessIdentity.js";
 import type {
-  ChromeProcessIdentity,
   ProfileDirectoryIdentity,
   ProfileStateLogger,
   RecordedChromeTerminationOutcome,
@@ -40,11 +40,12 @@ import {
   sweepExpiredRemoteTransactions,
 } from "./transactionServer.js";
 import type { ReconcileRemoteTransactionResult } from "./transactionModel.js";
+import { RemoteTransactionStore } from "./transactionStore.js";
 import {
   assertRemoteTransactionStoreRootAuthority,
-  prepareRemoteTransactionStoreRoot,
-  RemoteTransactionStore,
-} from "./transactionStore.js";
+  initializeRemoteTransactionStoreRoot,
+  protectRemoteTransactionStoreRoot,
+} from "./transactionStoreRoot.js";
 import type { WindowsPrivateTreeAuthority } from "./windowsPrivateTreeAcl.js";
 import {
   DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS,
@@ -122,12 +123,19 @@ export async function createRemoteServer(
     rootKey: authToken,
     serverGeneration: controllerGeneration,
   });
-  const transactionStoreRoot = await prepareRemoteTransactionStoreRoot({
+  const transactionStoreRootOptions = {
     directory: transactionStoreDir,
     integrityKeyPath: transactionIntegrityKeyPath,
     platform: deps.transactionStorePlatform,
     windowsPrivateTreeAuthority: deps.windowsPrivateTreeAuthority,
-  });
+  };
+  const transactionStoreRoot = await initializeRemoteTransactionStoreRoot(
+    transactionStoreRootOptions,
+  );
+  const transactionStorePlatform = deps.transactionStorePlatform ?? process.platform;
+  if (transactionStorePlatform !== "win32") {
+    await protectRemoteTransactionStoreRoot(transactionStoreRootOptions, transactionStoreRoot);
+  }
   const controllerLock = await acquireCrashRecoverableFilesystemLock(
     path.join(transactionStoreRoot.directory, ".controller.lock"),
     {
@@ -139,6 +147,9 @@ export async function createRemoteServer(
   );
   let transactionStore: RemoteTransactionStore;
   try {
+    if (transactionStorePlatform === "win32") {
+      await protectRemoteTransactionStoreRoot(transactionStoreRootOptions, transactionStoreRoot);
+    }
     await assertRemoteTransactionStoreRootAuthority(transactionStoreRoot);
     transactionStore = await RemoteTransactionStore.open({
       directory: transactionStoreDir,

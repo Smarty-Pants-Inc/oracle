@@ -11,12 +11,9 @@ import type {
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
-import type {
-  ChromeOwnerDisposition,
-  ChromeProcessIdentity,
-  ChromeProcessLaunchClaim,
-  ProfileDirectoryIdentity,
-} from "./browser/profileState.js";
+import type { ChromeProcessIdentity } from "./browser/chromeProcessIdentity.js";
+import type { ChromeProcessLaunchClaim } from "./browser/chromeProcessLaunchClaim.js";
+import type { ChromeOwnerDisposition, ProfileDirectoryIdentity } from "./browser/profileState.js";
 import type {
   TransportFailureReason,
   ApiProviderMode,

@@ -1,7 +1,10 @@
 import CDP from "chrome-remote-interface";
 import { createHash } from "node:crypto";
 import type { SessionMetadata, BrowserHarvestState } from "../sessionStore.js";
-import type { ChromeClient } from "./types.js";
+import {
+  adaptDirectTargetChromeClient,
+  type ChromeTargetAttachment,
+} from "./chromeSessionTransport.js";
 import {
   ANSWER_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
@@ -324,8 +327,11 @@ export async function openChatGptTarget(
   return target.id;
 }
 
-async function connectToTarget(endpoint: NormalizedHostPort, targetId: string) {
-  const client =
+async function connectToTarget(
+  endpoint: NormalizedHostPort,
+  targetId: string,
+): Promise<ChromeTargetAttachment> {
+  const attachment =
     "endpointAuthority" in endpoint
       ? requireExactChromeEndpointOperation(
           await connectToChromeTargetWithExactAuthority({
@@ -333,16 +339,14 @@ async function connectToTarget(endpoint: NormalizedHostPort, targetId: string) {
             targetId,
           }),
           `Unable to attach to ChatGPT target ${targetId} through exact Chrome endpoint authority`,
-        ).client
-      : await CDP({ host: endpoint.host, port: endpoint.port, target: targetId });
-  const { Runtime, DOM } = client;
-  if (Runtime?.enable) {
-    await Runtime.enable();
-  }
-  if (DOM?.enable) {
-    await DOM.enable();
-  }
-  return client;
+        )
+      : adaptDirectTargetChromeClient(
+          await CDP({ host: endpoint.host, port: endpoint.port, target: targetId }),
+        );
+  const { Runtime, DOM } = attachment.client;
+  if (Runtime?.enable) await Runtime.enable();
+  if (DOM?.enable) await DOM.enable();
+  return attachment;
 }
 
 export async function inspectChatGptTab(
@@ -356,7 +360,8 @@ export async function inspectChatGptTab(
     throw new Error("inspectChatGptTab requires a target with targetId.");
   }
 
-  const client = await connectToTarget(endpoint, targetId);
+  const attachment = await connectToTarget(endpoint, targetId);
+  const client = attachment.client;
   try {
     const { Runtime } = client;
     const evaluation = await Runtime.evaluate({
@@ -645,7 +650,7 @@ export async function resolveChatGptTab(
 
 export async function connectToExistingChatGptTab(
   options: ResolveChatGptTabOptions = {},
-): Promise<{ client: ChromeClient; targetId: string; tab: ChatGptTabSummary }> {
+): Promise<ChromeTargetAttachment & { targetId: string; tab: ChatGptTabSummary }> {
   const endpoint = normalizeHostPort(options);
   const targets = await listChatGptTargets(options);
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
@@ -654,17 +659,17 @@ export async function connectToExistingChatGptTab(
     if (!targetId) {
       throw new Error("Resolved ChatGPT tab is missing a target id.");
     }
-    const client = await connectToTarget(endpoint, targetId);
+    const attachment = await connectToTarget(endpoint, targetId);
     return {
-      client,
+      ...attachment,
       targetId,
       tab: summaryFromTarget(endpoint.host, endpoint.port, exactTarget),
     };
   }
   const summaries = await collectChatGptTabsFromTargets(endpoint, targets);
   const tab = resolveChatGptTabFromSummaries(summaries, options.ref);
-  const client = await connectToTarget(endpoint, tab.targetId);
-  return { client, targetId: tab.targetId, tab };
+  const attachment = await connectToTarget(endpoint, tab.targetId);
+  return { ...attachment, targetId: tab.targetId, tab };
 }
 
 export async function harvestChatGptTab(
@@ -674,7 +679,8 @@ export async function harvestChatGptTab(
   const resolved = options.target
     ? await inspectChatGptTab({ ...endpoint, target: options.target })
     : await resolveChatGptTab({ ...endpoint, ref: options.ref });
-  const client = await connectToTarget(endpoint, resolved.targetId);
+  const attachment = await connectToTarget(endpoint, resolved.targetId);
+  const client = attachment.client;
   try {
     const { Runtime } = client;
     const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);

@@ -6,7 +6,7 @@ import {
   pendingBrowserCaptureCleanup,
   projectBrowserRetryableCleanupRuntime as projectRetryableCleanupRuntime,
   type BrowserCaptureSettlementMode,
-} from "./runLifecycle.js";
+} from "./ownedBrowserResources.js";
 import {
   assessChromeDisconnect,
   classifyPreservedBrowserError,
@@ -29,11 +29,8 @@ import {
   projectRuntimeAfterChromeTargetLoss,
 } from "./publicationSettlementCoordinator.js";
 import { closeRemoteConnectionAfterRun } from "./promptSubmissionCoordinator.js";
-import type {
-  BrowserCaptureFinalizationResult,
-  BrowserRunTransaction,
-  ChromeClient,
-} from "./types.js";
+import type { BrowserCaptureFinalizationResult, BrowserRunTransaction } from "./types.js";
+import type { SessionBoundChromeClient } from "./chromeSessionTransport.js";
 import type { RemoteBrowserExecutionContext } from "./remoteExecutionContext.js";
 
 function getRemoteDisconnectAssessment(
@@ -76,7 +73,7 @@ function classifyRemoteDisconnectAssessmentFailure(
 
 export function installRemoteDisconnectHandler(
   context: RemoteBrowserExecutionContext,
-  client: ChromeClient,
+  client: SessionBoundChromeClient,
 ): void {
   client.on("disconnect", () => {
     context.connectionClosedUnexpectedly = true;

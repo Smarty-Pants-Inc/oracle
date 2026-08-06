@@ -23,11 +23,11 @@ import {
   updateBrowserTabLease,
   type BrowserTabLeaseIdentity,
 } from "../../src/browser/tabLeaseRegistry.js";
+import { BrowserRunLifecycleController } from "../../src/browser/runLifecycle.js";
 import {
-  BrowserRunLifecycleController,
   completedBrowserCaptureCleanup,
   pendingBrowserCaptureCleanup,
-} from "../../src/browser/runLifecycle.js";
+} from "../../src/browser/ownedBrowserResources.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 
 const CANONICAL_TEMP_ROOT = await realpath(os.tmpdir());

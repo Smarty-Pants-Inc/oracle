@@ -5,8 +5,8 @@ import type {
   BrowserCaptureFinalizationResult,
   BrowserLogger,
   BrowserRunOptions,
-  ChromeClient,
 } from "../browser/types.js";
+import type { SessionBoundChromeClient } from "../browser/chromeSessionTransport.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import {
   LocalOwnedBrowserResourceAuthority,
@@ -19,17 +19,15 @@ import {
 } from "../browser/chromeLifecycle.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { acquireManualChromeOwner, type ManualChromeOwner } from "../browser/manualChromeOwner.js";
-import {
-  captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
-} from "../browser/profileState.js";
+import { createChromeProcessLaunchClaim } from "../browser/chromeProcessLaunchClaim.js";
+import { captureProfileDirectoryIdentity } from "../browser/profileState.js";
 import { acquireBrowserTabLease } from "../browser/tabLeaseRegistry.js";
 import { retainChromeTargetCloseCapability } from "../browser/targetCloseAuthority.js";
 
 export interface GeminiBrowserSession {
   profileDir: string;
   port: number;
-  client: ChromeClient;
+  client: SessionBoundChromeClient;
   targetId: string;
   processIdentity: ManualChromeOwner["processIdentity"];
   runtime: () => BrowserRuntimeMetadata;
@@ -98,7 +96,7 @@ export async function openGeminiBrowserSession(
       : {}),
   });
   let owner: ManualChromeOwner | null = null;
-  let client: ChromeClient | null = null;
+  let client: SessionBoundChromeClient | null = null;
   let targetId: string | null = null;
 
   try {

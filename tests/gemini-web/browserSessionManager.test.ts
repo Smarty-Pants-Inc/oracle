@@ -83,10 +83,13 @@ vi.mock("../../src/browser/manualChromeOwner.js", () => ({
   releaseManualChromeOwnerEndpointAuthority,
 }));
 
+vi.mock("../../src/browser/chromeProcessLaunchClaim.js", () => ({
+  createChromeProcessLaunchClaim,
+}));
+
 vi.mock("../../src/browser/profileState.js", () => ({
   cleanupStaleProfileState,
   captureProfileDirectoryIdentity,
-  createChromeProcessLaunchClaim,
   verifyProfileDirectoryIdentity,
   isSafeChromeTerminationOutcome,
 }));
@@ -121,6 +124,18 @@ describe("openGeminiBrowserSession", () => {
     kill: vi.fn(),
     runExactOperation: vi.fn(),
     release: vi.fn(async () => undefined),
+  };
+  const browserClient = {
+    Browser: {
+      getWindowForTarget: vi.fn(),
+      setWindowBounds: vi.fn(),
+    },
+    Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      getTargetInfo: vi.fn(async () => ({
+        targetInfo: { targetId: "target-1", url: "about:blank" },
+      })),
+    },
   };
 
   beforeEach(async () => {
@@ -215,6 +230,7 @@ describe("openGeminiBrowserSession", () => {
     connectWithNewTabWithExactAuthority.mockResolvedValue({
       targetId: "target-1",
       client: { close: clientClose },
+      browserClient,
     });
   });
 
@@ -400,7 +416,11 @@ describe("openGeminiBrowserSession", () => {
     });
     connectWithNewTabWithExactAuthority.mockImplementationOnce(async () => {
       events.push("acquire:chrome-target");
-      return { targetId: "target-ordered", client: { close: clientClose } };
+      return {
+        targetId: "target-ordered",
+        client: { close: clientClose },
+        browserClient,
+      };
     });
 
     const session = await openGeminiBrowserSession({

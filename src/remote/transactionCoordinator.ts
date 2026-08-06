@@ -3,7 +3,7 @@ import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
   pendingBrowserCaptureCleanup,
   projectBrowserCaptureFinalization,
-} from "../browser/runLifecycle.js";
+} from "../browser/ownedBrowserResources.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
   RemoteTransactionRecord,

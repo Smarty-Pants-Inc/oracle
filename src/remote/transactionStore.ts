@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { chmod, lstat, mkdir, readdir } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import path from "node:path";
 import {
   capturePhysicalDirectoryIdentity,
@@ -9,12 +9,16 @@ import {
 } from "../browser/filesystemLockDirectoryIdentity.js";
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
-import { syncDirectory } from "../fsDurability.js";
 import {
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeAuthority,
   type WindowsPrivateTreeScope,
 } from "./windowsPrivateTreeAcl.js";
+import {
+  assertRemoteTransactionStoreRootAuthority,
+  prepareRemoteTransactionStoreRoot,
+  type RemoteTransactionStoreRootAuthority,
+} from "./transactionStoreRoot.js";
 import {
   applyRemoteTransactionTransition,
   createRemoteTransactionRecord,
@@ -74,97 +78,6 @@ import {
 
 const MAX_REMOTE_TRANSACTION_LEASE_MS = 24 * 60 * 60 * 1000;
 type RemoteArtifactNamespaceCleanup = (record: RemoteTransactionRecord) => Promise<boolean>;
-interface RemoteTransactionStoreRootOptions {
-  directory: string;
-  integrityKeyPath: string;
-  platform?: NodeJS.Platform;
-  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
-}
-
-export interface RemoteTransactionStoreRootAuthority {
-  directory: string;
-  storeRootIdentity: PhysicalDirectoryIdentity;
-  integrityKeyDirectory: string;
-  integrityKeyDirectoryIdentity: PhysicalDirectoryIdentity;
-}
-
-export async function prepareRemoteTransactionStoreRoot(
-  options: RemoteTransactionStoreRootOptions,
-): Promise<RemoteTransactionStoreRootAuthority> {
-  const platform = options.platform ?? process.platform;
-  const directory = path.resolve(options.directory);
-  const integrityKeyPath = path.resolve(options.integrityKeyPath);
-  const integrityKeyDirectory = path.dirname(integrityKeyPath);
-  const windowsPrivateTreeAuthority =
-    platform === "win32"
-      ? (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)
-      : undefined;
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await mkdir(integrityKeyDirectory, { recursive: true, mode: 0o700 });
-  const storeRootBeforeProtection = await capturePhysicalDirectoryIdentity(directory);
-  const integrityKeyDirectoryBeforeProtection =
-    await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
-  if (platform === "win32") {
-    await windowsPrivateTreeAuthority?.({
-      storeDirectory: directory,
-      integrityKeyDirectory,
-      integrityKeyPath,
-    });
-  } else {
-    await chmod(directory, 0o700);
-    if (integrityKeyDirectory !== directory) await chmod(integrityKeyDirectory, 0o700);
-  }
-  await syncDirectory(directory);
-  if (integrityKeyDirectory !== directory) await syncDirectory(integrityKeyDirectory);
-  const storeRootIdentity = await capturePhysicalDirectoryIdentity(directory);
-  if (!samePhysicalDirectoryIdentity(storeRootBeforeProtection, storeRootIdentity)) {
-    throw new Error(
-      platform === "win32"
-        ? "Remote transaction store root generation changed during Windows private ACL protection"
-        : "Remote transaction store root generation changed during private-root protection",
-    );
-  }
-  const integrityKeyDirectoryIdentity =
-    await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
-  if (
-    !samePhysicalDirectoryIdentity(
-      integrityKeyDirectoryBeforeProtection,
-      integrityKeyDirectoryIdentity,
-    )
-  ) {
-    throw new Error(
-      platform === "win32"
-        ? "Remote transaction integrity key directory generation changed during Windows private ACL protection"
-        : "Remote transaction integrity key directory generation changed during private-root protection",
-    );
-  }
-  return {
-    directory,
-    storeRootIdentity,
-    integrityKeyDirectory,
-    integrityKeyDirectoryIdentity,
-  };
-}
-
-export async function assertRemoteTransactionStoreRootAuthority(
-  authority: RemoteTransactionStoreRootAuthority,
-): Promise<void> {
-  const currentStoreRoot = await capturePhysicalDirectoryIdentity(authority.directory);
-  if (!samePhysicalDirectoryIdentity(currentStoreRoot, authority.storeRootIdentity)) {
-    throw new Error("Remote transaction store root generation changed");
-  }
-  const currentIntegrityKeyDirectory = await capturePhysicalDirectoryIdentity(
-    authority.integrityKeyDirectory,
-  );
-  if (
-    !samePhysicalDirectoryIdentity(
-      currentIntegrityKeyDirectory,
-      authority.integrityKeyDirectoryIdentity,
-    )
-  ) {
-    throw new Error("Remote transaction integrity key directory generation changed");
-  }
-}
 
 export interface RemoteTransactionStoreOptions {
   directory: string;
@@ -921,7 +834,7 @@ export class RemoteTransactionStore {
     }
   }
 
-  // Windows ACL writes advance ctime; generation, protected metadata, and exact key bytes do not.
+  // Windows ACL protection must not mutate the integrity key's identity, metadata, or bytes.
   private assertWindowsIntegrityKeySnapshot(
     current: RemoteTransactionIntegrityKey,
     phase: "before" | "during",
@@ -933,6 +846,8 @@ export class RemoteTransactionStore {
       );
     }
     if (
+      current.fileIdentity.ctimeNs !== expectedIdentity.ctimeNs ||
+      current.fileIdentity.mtimeNs !== expectedIdentity.mtimeNs ||
       current.fileIdentity.size !== expectedIdentity.size ||
       current.fileIdentity.mode !== expectedIdentity.mode ||
       current.fileIdentity.nlink !== expectedIdentity.nlink
@@ -967,7 +882,7 @@ export class RemoteTransactionStore {
       await this.assertIntegrityDirectoryAuthority();
       this.assertWindowsIntegrityKeySnapshot(beforeProtection, "before");
 
-      const result = await authority(this.#windowsPrivateTreeScope);
+      await authority(this.#windowsPrivateTreeScope);
 
       await this.assertIntegrityDirectoryAuthority();
       const afterProtection = await readStableRemoteTransactionIntegrityKey(
@@ -977,14 +892,6 @@ export class RemoteTransactionStore {
         this.#platform,
       );
       this.assertWindowsIntegrityKeySnapshot(afterProtection, "during");
-      if (result.integrityKeyAclRepaired) {
-        if (beforeProtection.fileIdentity.ctimeNs === afterProtection.fileIdentity.ctimeNs) {
-          throw new Error(
-            "Remote transaction integrity key ctime did not change during attested Windows private ACL repair",
-          );
-        }
-        this.#integrityKey.fileIdentity = afterProtection.fileIdentity;
-      }
       await this.assertIntegrityAuthority();
       return await this.#windowsAuthorityContext.run(true, operation);
     } finally {

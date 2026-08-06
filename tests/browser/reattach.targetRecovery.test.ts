@@ -5,10 +5,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { __test__ } from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../../src/sessionManager.js";
-import {
-  captureProfileDirectoryIdentity,
-  type ChromeProcessIdentity,
-} from "../../src/browser/profileState.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import {
   closeChromeTargetWithRetainedCapability,
   retainChromeTargetCloseCapability,

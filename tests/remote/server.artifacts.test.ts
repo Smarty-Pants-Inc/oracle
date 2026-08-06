@@ -31,8 +31,8 @@ import {
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import {
   completedBrowserCaptureCleanup,
-  type BrowserCaptureSettlementAdapters,
-} from "../../src/browser/runLifecycle.js";
+  type OwnedBrowserResourceTransactionAdapters,
+} from "../../src/browser/ownedBrowserResources.js";
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,
@@ -67,7 +67,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ],
       };
       setOracleHomeDirOverrideForTest(tmpDir);
-      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+      const settleResources = vi.fn<OwnedBrowserResourceTransactionAdapters["settleResources"]>(
         async (_mode, pendingRuntime) => completedBrowserCaptureCleanup(pendingRuntime),
       );
       const resumeBrowser = vi.fn(async () => {
@@ -488,7 +488,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         ],
       };
-      const settleResources = vi.fn<BrowserCaptureSettlementAdapters["settleResources"]>(
+      const settleResources = vi.fn<OwnedBrowserResourceTransactionAdapters["settleResources"]>(
         async (_mode, pendingRuntime) => completedBrowserCaptureCleanup(pendingRuntime),
       );
       const server = await createTestRemoteServer(

@@ -8,9 +8,13 @@ import type {
 } from "../../src/sessionStore.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../../src/sessionManager.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
+import type {
+  BrowserLevelChromeClient,
+  SessionBoundChromeClient,
+} from "../../src/browser/chromeSessionTransport.js";
+import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
 import {
   captureProfileDirectoryIdentity,
-  type ChromeProcessIdentity,
   type RecordedChromeTerminationOutcome,
 } from "../../src/browser/profileState.js";
 import type { ExactChromeTargetCleanupResult } from "../../src/browser/chromeLifecycle.js";
@@ -391,9 +395,34 @@ export async function resumeFallbackWithManualOwner(
     DOM: { enable: vi.fn(async () => undefined) },
     Page: { enable: vi.fn(async () => undefined), navigate: vi.fn(async () => undefined) },
     Network: { getAllCookies: vi.fn(async () => ({ cookies: [] })) },
-    Target: { getTargets: vi.fn(async () => ({ targetInfos: [] })) },
+    Input: {},
+    Emulation: { setFocusEmulationEnabled: vi.fn(async () => undefined) },
+    sendSession: vi.fn(async () => ({})),
+    on: vi.fn(),
+    once: vi.fn(),
+    off: vi.fn(),
+    removeListener: vi.fn(),
     close: vi.fn(async () => undefined),
-  } as unknown as ChromeClient;
+  } as unknown as SessionBoundChromeClient;
+  const browserClient = {
+    Browser: {
+      getWindowForTarget: vi.fn(async () => ({ windowId: 1, bounds: {} })),
+      setWindowBounds: vi.fn(async () => undefined),
+    },
+    Target: {
+      getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      getTargetInfo: vi.fn(async () => ({
+        targetInfo: {
+          targetId: "fallback-owned-target",
+          type: "page",
+          title: "",
+          url: "about:blank",
+          attached: true,
+          canAccessOpener: false,
+        },
+      })),
+    },
+  } as BrowserLevelChromeClient;
   const kill = vi.fn(async () => {
     cleanupOrder.push("kill");
     return { status: "stopped" as const, pid: processIdentity.pid, signal: "SIGTERM" as const };
@@ -445,6 +474,7 @@ export async function resumeFallbackWithManualOwner(
         status: "completed" as const,
         value: {
           client,
+          browserClient,
           targetId: "fallback-owned-target",
           ownership: "created" as const,
           browserWSEndpoint: authority.browserWSEndpoint,

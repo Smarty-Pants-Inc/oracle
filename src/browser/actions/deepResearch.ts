@@ -1,4 +1,5 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
+import type { SessionBoundChromeClient } from "../chromeSessionTransport.js";
 import {
   DEEP_RESEARCH_PLUS_BUTTON,
   DEEP_RESEARCH_DROPDOWN_ITEM_TEXT,
@@ -220,7 +221,7 @@ export async function waitForDeepResearchCompletion(
   timeoutMs: number = DEEP_RESEARCH_DEFAULT_TIMEOUT_MS,
   minTurnIndex?: number | null,
   Page?: ChromeClient["Page"],
-  client?: ChromeClient,
+  client?: SessionBoundChromeClient,
   options?: {
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
@@ -541,7 +542,7 @@ export function pickPreferredDeepResearchReadForTest(
 async function readDeepResearchFrameResult(
   Runtime: ChromeClient["Runtime"],
   Page: ChromeClient["Page"],
-  client?: ChromeClient,
+  client?: SessionBoundChromeClient,
   minTurnIndex = -1,
 ): Promise<DeepResearchFrameReadResult | null> {
   const pageWithFrames = Page as ChromeClient["Page"] & {
@@ -563,30 +564,14 @@ async function readDeepResearchFrameResult(
   if (frameIds.length === 0) {
     return null;
   }
-  const rawClient = client as
-    | (ChromeClient & {
-        send?: (
-          method: string,
-          params?: Record<string, unknown>,
-          sessionId?: string,
-        ) => Promise<unknown>;
-        oraclePageSessionId?: string;
-      })
-    | undefined;
-  if (minTurnIndex >= 0) {
-    if (typeof rawClient?.send !== "function") {
-      return null;
-    }
+  if (minTurnIndex >= 0 && !client) {
+    return null;
   }
   let best: DeepResearchFrameReadResult | null = null;
   for (const frameId of frameIds) {
     let ownerTurnIndex: number | null = null;
-    if (minTurnIndex >= 0 && rawClient?.send) {
-      ownerTurnIndex = await readDeepResearchTargetOwnerTurnIndex(
-        rawClient as ChromeClient & { send: NonNullable<typeof rawClient.send> },
-        frameId,
-        rawClient.oraclePageSessionId,
-      );
+    if (minTurnIndex >= 0 && client) {
+      ownerTurnIndex = await readDeepResearchTargetOwnerTurnIndex(client, frameId);
       if (ownerTurnIndex === null || ownerTurnIndex < minTurnIndex) {
         continue;
       }
@@ -617,42 +602,13 @@ async function readDeepResearchFrameResult(
 }
 
 async function readDeepResearchTargetResult(
-  client: ChromeClient,
+  client: SessionBoundChromeClient,
   ignoredTargetKeys: ReadonlySet<string> = new Set(),
   minTurnIndex = -1,
 ): Promise<DeepResearchTargetScanResult | null> {
-  const rawClient = client as ChromeClient & {
-    send?: (
-      method: string,
-      params?: Record<string, unknown>,
-      sessionId?: string,
-    ) => Promise<unknown>;
-    oraclePageSessionId?: string;
-  };
-  if (typeof rawClient.send !== "function") {
-    return null;
-  }
-  if (typeof client.on !== "function") {
-    return null;
-  }
-
-  // On the browser-WSEndpoint path, `client` is a session-bound wrapper whose
-  // domain methods target the page session but whose raw `send` is the
-  // browser-level send. We must therefore pass the page session id explicitly so
-  // Target.setAutoAttach binds to THIS page (not the whole browser). For a direct
-  // tab client this is undefined and `send` already defaults to the page session.
-  const pageSessionId = rawClient.oraclePageSessionId;
-
   const sessions = new Map<string, { targetId?: string; url: string }>();
   const ownedSessionIds = new Set<string>();
   const onAttached = (params: unknown, parentSessionId?: string) => {
-    // chrome-remote-interface emits flattened target events both on the
-    // session-specific event name and on the shared base event. The second
-    // callback argument identifies the parent page session; ignore events from
-    // other tabs when this client wraps a shared browser WebSocket.
-    if (pageSessionId && parentSessionId !== pageSessionId) {
-      return;
-    }
     const targetInfo = (
       params as { targetInfo?: { targetId?: string; url?: string; type?: string } } | undefined
     )?.targetInfo;
@@ -666,7 +622,7 @@ async function readDeepResearchTargetResult(
     }
   };
 
-  client.on("Target.attachedToTarget", onAttached as never);
+  client.on("Target.attachedToTarget", onAttached);
   try {
     // Scope discovery to the current Oracle-controlled page. `client` is
     // connected to the conversation page target, so enabling auto-attach on this
@@ -678,16 +634,12 @@ async function readDeepResearchTargetResult(
     // would surface another tab's completed Deep Research report and let it be
     // saved into the current session (cross-tab leak). Only auto-attached,
     // page-scoped sessions are treated as belonging to this run.
-    const autoAttachEnabled = await rawClient
-      .send(
-        "Target.setAutoAttach",
-        {
-          autoAttach: true,
-          waitForDebuggerOnStart: false,
-          flatten: true,
-        },
-        pageSessionId,
-      )
+    const autoAttachEnabled = await client
+      .sendSession("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      })
       .then(
         () => true,
         () => false,
@@ -698,8 +650,8 @@ async function readDeepResearchTargetResult(
     await delay(100);
 
     if (minTurnIndex >= 0) {
-      await rawClient.send("DOM.enable", {}, pageSessionId).catch(() => undefined);
-      await rawClient.send("Runtime.enable", {}, pageSessionId).catch(() => undefined);
+      await client.sendSession("DOM.enable", {}).catch(() => undefined);
+      await client.sendSession("Runtime.enable", {}).catch(() => undefined);
     }
 
     // Baseline targets and owner turns before the submitted prompt are removed
@@ -709,7 +661,7 @@ async function readDeepResearchTargetResult(
     let latestProgress: DeepResearchFrameStatus | null = null;
     const targetKeys: string[] = [];
     for (const [sessionId, target] of sessions) {
-      const sessionResult = await readDeepResearchTargetSession(rawClient, sessionId, target.url);
+      const sessionResult = await readDeepResearchTargetSession(client, sessionId, target.url);
       if (!sessionResult.confirmed) {
         continue;
       }
@@ -721,11 +673,7 @@ async function readDeepResearchTargetResult(
       }
       if (minTurnIndex >= 0) {
         const ownerTurnIndex = sessionResult.frameId
-          ? await readDeepResearchTargetOwnerTurnIndex(
-              rawClient,
-              sessionResult.frameId,
-              pageSessionId,
-            )
+          ? await readDeepResearchTargetOwnerTurnIndex(client, sessionResult.frameId)
           : null;
         if (ownerTurnIndex === null || ownerTurnIndex < minTurnIndex) {
           continue;
@@ -743,29 +691,25 @@ async function readDeepResearchTargetResult(
       targetKeys,
     };
   } finally {
-    await rawClient
-      .send(
-        "Target.setAutoAttach",
-        {
-          autoAttach: false,
-          waitForDebuggerOnStart: false,
-          flatten: true,
-        },
-        pageSessionId,
-      )
+    await client
+      .sendSession("Target.setAutoAttach", {
+        autoAttach: false,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      })
       .catch(() => undefined);
     await Promise.all(
       Array.from(ownedSessionIds, (sessionId) =>
-        rawClient.send("Target.detachFromTarget", { sessionId }).catch(() => undefined),
+        client.sendSession("Target.detachFromTarget", { sessionId }).catch(() => undefined),
       ),
     );
-    (
-      client as ChromeClient & { removeListener?: (event: string, listener: unknown) => void }
-    ).removeListener?.("Target.attachedToTarget", onAttached);
+    client.removeListener("Target.attachedToTarget", onAttached);
   }
 }
 
-export async function captureDeepResearchTargetKeys(client: ChromeClient): Promise<string[]> {
+export async function captureDeepResearchTargetKeys(
+  client: SessionBoundChromeClient,
+): Promise<string[]> {
   const scan = await readDeepResearchTargetResult(client);
   if (!scan) {
     throw new Error("Deep Research target baseline capture unavailable");
@@ -774,72 +718,49 @@ export async function captureDeepResearchTargetKeys(client: ChromeClient): Promi
 }
 
 async function readDeepResearchTargetOwnerTurnIndex(
-  rawClient: {
-    send: (
-      method: string,
-      params?: Record<string, unknown>,
-      sessionId?: string,
-    ) => Promise<unknown>;
-  },
+  client: SessionBoundChromeClient,
   frameId: string,
-  pageSessionId?: string,
 ): Promise<number | null> {
-  const owner = (await rawClient
-    .send("DOM.getFrameOwner", { frameId }, pageSessionId)
-    .catch(() => null)) as { backendNodeId?: number } | null;
-  if (typeof owner?.backendNodeId !== "number") {
-    return null;
-  }
-  const resolved = (await rawClient
-    .send("DOM.resolveNode", { backendNodeId: owner.backendNodeId }, pageSessionId)
+  const owner = (await client.sendSession("DOM.getFrameOwner", { frameId }).catch(() => null)) as {
+    backendNodeId?: number;
+  } | null;
+  if (typeof owner?.backendNodeId !== "number") return null;
+  const resolved = (await client
+    .sendSession("DOM.resolveNode", { backendNodeId: owner.backendNodeId })
     .catch(() => null)) as { object?: { objectId?: string } } | null;
   const objectId = resolved?.object?.objectId;
-  if (!objectId) {
-    return null;
-  }
+  if (!objectId) return null;
   try {
-    const response = (await rawClient
-      .send(
-        "Runtime.callFunctionOn",
-        {
-          objectId,
-          functionDeclaration: `function() {
-            const turns = ${buildConversationTurnListExpression()};
-            const index = turns.findIndex((turn) => turn === this || turn.contains?.(this));
-            return index >= 0 ? index : null;
-          }`,
-          returnByValue: true,
-        },
-        pageSessionId,
-      )
+    const response = (await client
+      .sendSession("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function() {
+          const turns = ${buildConversationTurnListExpression()};
+          const index = turns.findIndex((turn) => turn === this || turn.contains?.(this));
+          return index >= 0 ? index : null;
+        }`,
+        returnByValue: true,
+      })
       .catch(() => null)) as { result?: { value?: unknown } } | null;
     const value = response?.result?.value;
     return typeof value === "number" && Number.isFinite(value) && value >= 0
       ? Math.floor(value)
       : null;
   } finally {
-    await rawClient
-      .send("Runtime.releaseObject", { objectId }, pageSessionId)
-      .catch(() => undefined);
+    await client.sendSession("Runtime.releaseObject", { objectId }).catch(() => undefined);
   }
 }
 
 async function readDeepResearchTargetSession(
-  rawClient: {
-    send: (
-      method: string,
-      params?: Record<string, unknown>,
-      sessionId?: string,
-    ) => Promise<unknown>;
-  },
+  client: SessionBoundChromeClient,
   sessionId: string,
   targetUrl: string,
 ): Promise<DeepResearchTargetSessionResult> {
-  await rawClient.send("Runtime.enable", {}, sessionId).catch(() => undefined);
-  await rawClient.send("Page.enable", {}, sessionId).catch(() => undefined);
+  await client.sendSession("Runtime.enable", {}, sessionId).catch(() => undefined);
+  await client.sendSession("Page.enable", {}, sessionId).catch(() => undefined);
 
-  const frameTree = (await rawClient
-    .send("Page.getFrameTree", {}, sessionId)
+  const frameTree = (await client
+    .sendSession("Page.getFrameTree", {}, sessionId)
     .catch(() => null)) as { frameTree?: DeepResearchFrameTree } | null;
   const ownerFrameId = frameTree?.frameTree?.frame?.id;
   if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
@@ -849,8 +770,8 @@ async function readDeepResearchTargetSession(
   let best: DeepResearchFrameStatus | null = null;
 
   for (const frameId of frameIds) {
-    const world = (await rawClient
-      .send(
+    const world = (await client
+      .sendSession(
         "Page.createIsolatedWorld",
         {
           frameId,
@@ -860,11 +781,9 @@ async function readDeepResearchTargetSession(
         sessionId,
       )
       .catch(() => null)) as { executionContextId?: number } | null;
-    if (typeof world?.executionContextId !== "number") {
-      continue;
-    }
+    if (typeof world?.executionContextId !== "number") continue;
     const value = await evaluateDeepResearchFrameStatus(
-      rawClient,
+      client,
       sessionId,
       world.executionContextId,
     );
@@ -876,7 +795,7 @@ async function readDeepResearchTargetSession(
     }
   }
 
-  const topFrameValue = await evaluateDeepResearchFrameStatus(rawClient, sessionId);
+  const topFrameValue = await evaluateDeepResearchFrameStatus(client, sessionId);
   if (topFrameValue?.completed) {
     return { confirmed: true, read: topFrameValue, frameId: ownerFrameId };
   }
@@ -888,18 +807,12 @@ async function readDeepResearchTargetSession(
 }
 
 async function evaluateDeepResearchFrameStatus(
-  rawClient: {
-    send: (
-      method: string,
-      params?: Record<string, unknown>,
-      sessionId?: string,
-    ) => Promise<unknown>;
-  },
+  client: SessionBoundChromeClient,
   sessionId: string,
   contextId?: number,
 ): Promise<DeepResearchFrameStatus | null> {
-  const response = (await rawClient
-    .send(
+  const response = (await client
+    .sendSession(
       "Runtime.evaluate",
       {
         expression: buildDeepResearchFrameStatusExpression(),

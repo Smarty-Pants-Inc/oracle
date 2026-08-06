@@ -40,10 +40,21 @@ describe("remote browser unpublished cleanup", () => {
       },
       Input: {},
       DOM: { enable: vi.fn(async () => undefined) },
-      Target: {},
       Emulation: { setFocusEmulationEnabled: vi.fn(async () => undefined) },
       on: vi.fn(),
       close: closeClient,
+    };
+    const browserClient = {
+      Browser: {
+        getWindowForTarget: vi.fn(),
+        setWindowBounds: vi.fn(),
+      },
+      Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId: "remote-cleanup-target", url: "about:blank" },
+        })),
+      },
     };
 
     vi.resetModules();
@@ -53,6 +64,7 @@ describe("remote browser unpublished cleanup", () => {
         ...actual,
         connectToRemoteChrome: vi.fn(async () => ({
           client,
+          browserClient,
           targetId: "remote-cleanup-target",
           ownership: "created" as const,
           targetCloseAuthority: {
@@ -198,10 +210,21 @@ describe("remote browser unpublished cleanup", () => {
       Runtime: { enable: vi.fn(async () => undefined), evaluate },
       Input: {},
       DOM: { enable: vi.fn(async () => undefined) },
-      Target: {},
       Emulation: { setFocusEmulationEnabled: vi.fn(async () => undefined) },
       on: vi.fn(),
       close: vi.fn(async () => undefined),
+    };
+    const browserClient = {
+      Browser: {
+        getWindowForTarget: vi.fn(),
+        setWindowBounds: vi.fn(),
+      },
+      Target: {
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+        getTargetInfo: vi.fn(async () => ({
+          targetInfo: { targetId, url: "about:blank" },
+        })),
+      },
     };
 
     vi.resetModules();
@@ -213,6 +236,7 @@ describe("remote browser unpublished cleanup", () => {
           acquisitionOrder.push("acquire:target");
           return {
             client,
+            browserClient,
             targetId,
             ownership: "created" as const,
             targetCloseAuthority: {
@@ -231,6 +255,7 @@ describe("remote browser unpublished cleanup", () => {
         acquisitionOrder.push("acquire:borrowed-tab");
         return {
           client,
+          browserClient,
           targetId: "borrowed-target",
           tab: { url: "https://chatgpt.com/c/borrowed-target" },
         };
