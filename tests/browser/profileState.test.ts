@@ -489,7 +489,7 @@ describe("profileState", () => {
   });
 
   test("captures a macOS Chrome generation from its audit token and physical text vnode", async () => {
-    const userDataDir = "/tmp/oracle-mac-profile";
+    const userDataDir = "/tmp/oracle mac profile";
     const launchClaim = {
       version: 1 as const,
       generationId: "40000000-0000-4000-8000-000000000004",
@@ -547,8 +547,16 @@ describe("profileState", () => {
     expect(execute).toHaveBeenNthCalledWith(4, "/usr/bin/lsappinfo", ["info", "4321"]);
   });
 
-  test("rejects a same-pid same-second macOS replacement while accepting the exact audit generation", async () => {
-    const userDataDir = "/tmp/oracle-mac-generation";
+  test.each([
+    ["Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+    ["Brave", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+  ])("captures and inspects an exact configured %s executable", async (_family, executablePath) => {
+    const userDataDir = "/tmp/oracle fork profile";
+    const launchClaim = {
+      version: 1 as const,
+      generationId: "40000000-0000-4000-8000-000000000004",
+      nonce: "50000000-0000-4000-8000-000000000005",
+    };
     const profileDirectory = {
       version: 2 as const,
       platform: "darwin" as const,
@@ -557,12 +565,67 @@ describe("profileState", () => {
       inode: "2",
       birthtimeNs: "3",
     };
+    const snapshot = {
+      pid: 4321,
+      processStartTime: "darwin-audit-pidversion:7001",
+      executablePath,
+      commandLine:
+        `${executablePath} --user-data-dir=${userDataDir} ` +
+        `--oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}`,
+    };
+    const identity = await profileState.captureChromeProcessIdentityForTest(userDataDir, 4321, {
+      platform: "darwin",
+      captureProfileIdentity: async () => profileDirectory,
+      readProcessSnapshot: async () => snapshot,
+      launchClaim,
+    });
+
+    expect(identity.executablePath).toBe(executablePath);
+    await expect(
+      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+        platform: "darwin",
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+        readProcessSnapshot: async () => snapshot,
+      }),
+    ).resolves.toBe("current");
+    await expect(
+      profileState.inspectChromeProcessIdentityForTest(userDataDir, identity, {
+        platform: "darwin",
+        verifyProfileIdentity: async () => true,
+        isProcessAlive: () => true,
+        readProcessSnapshot: async () => ({
+          ...snapshot,
+          executablePath: executablePath.includes("Edge")
+            ? "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+            : "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        }),
+      }),
+    ).resolves.toBe("unavailable");
+  });
+
+  test("rejects a same-pid same-second macOS replacement while accepting the exact audit generation", async () => {
+    const userDataDir = "/tmp/oracle mac generation";
+    const profileDirectory = {
+      version: 2 as const,
+      platform: "darwin" as const,
+      canonicalPath: userDataDir,
+      device: "1",
+      inode: "2",
+      birthtimeNs: "3",
+    };
+    const launchClaim = {
+      version: 1 as const,
+      generationId: "60000000-0000-4000-8000-000000000006",
+      nonce: "70000000-0000-4000-8000-000000000007",
+    };
     const identity = {
       pid: 4321,
       processStartTime: "darwin-audit-pidversion:7001",
       executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       normalizedUserDataDir: userDataDir,
-      launchNonce: "00000000-0000-4000-8000-000000007001",
+      launchNonce: launchClaim.nonce,
+      launchClaim,
       profileDirectory,
     };
     const processExecutor = (pidVersion: number) =>
@@ -579,7 +642,9 @@ describe("profileState", () => {
         }
         if (file === "/bin/ps" && args.at(-1) === "command=") {
           return {
-            stdout: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir}\n`,
+            stdout:
+              `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${userDataDir} ` +
+              `--oracle-launch-claim=${launchClaim.generationId}:${launchClaim.nonce}\n`,
           };
         }
         throw new Error(`Unexpected process query: ${file} ${args.join(" ")}`);
@@ -1486,23 +1551,56 @@ describe("profileState", () => {
     ).toBe(false);
     expect(
       profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir} with attacker suffix --no-first-run`,
+        dir,
+        "darwin",
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 "https://example.test/?q= --user-data-dir=${dir} --no-first-run about:blank"`,
+        dir,
+        "darwin",
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 "https://example.test/?q= --user-data-dir=/tmp/decoy --no-first-run about:blank" --user-data-dir=${dir} --no-first-run`,
+        dir,
+        "darwin",
+      ),
+    ).toBe(true);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
         `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome https://example.test/${dir} --user-data-dir=/tmp/other`,
         dir,
       ),
     ).toBe(false);
     expect(profileState.isChromeCommandForUserDataDirForTest("node worker.js", dir)).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/tmp/notbrave-worker --user-data-dir=${dir}`,
+        dir,
+        "darwin",
+      ),
+    ).toBe(false);
   });
 
   test("discovers running Chrome DevTools port from process list", () => {
     const dir = "/Users/example/.oracle/browser-profile";
     const processList = `
       123 node worker.js
-      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=64305 --user-data-dir=${dir} about:blank
+      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=64305 --user-data-dir=${dir} --no-first-run about:blank
       789 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/other
     `;
 
     expect(
-      profileState.findChromeDebugTargetForProfileFromProcessListForTest(processList, dir),
+      profileState.findChromeDebugTargetForProfileFromProcessListForTest(
+        processList,
+        dir,
+        null,
+        "darwin",
+      ),
     ).toEqual({
       pid: 456,
       port: 64305,
@@ -1512,16 +1610,21 @@ describe("profileState", () => {
   test("binds a port-zero Chrome process to its native active port", () => {
     const dir = "/Users/example/.oracle/browser-profile";
     const processList = `
-      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --user-data-dir=${dir} about:blank
+      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --user-data-dir=${dir} --no-first-run about:blank
     `;
 
     expect(
-      profileState.findChromeDebugTargetForProfileFromProcessListForTest(processList, dir, 64305),
+      profileState.findChromeDebugTargetForProfileFromProcessListForTest(
+        processList,
+        dir,
+        64305,
+        "darwin",
+      ),
     ).toEqual({ pid: 456, port: 64305 });
   });
 
   test("classifies an exact launch claim before DevTools is ready without adopting profile conflicts", () => {
-    const dir = "/Users/example/.oracle/browser-profile";
+    const dir = "/Users/example/.oracle/browser profile";
     const claim = {
       version: 1 as const,
       generationId: "10000000-0000-4000-8000-000000000001",
@@ -1539,6 +1642,8 @@ describe("profileState", () => {
         processList,
         dir,
         claim,
+        null,
+        "darwin",
       ),
     ).toEqual({
       exactMatches: [{ pid: 456, port: null }],
@@ -1550,6 +1655,7 @@ describe("profileState", () => {
         dir,
         claim,
         64_305,
+        "darwin",
       ).exactMatches,
     ).toEqual([{ pid: 456, port: 64_305 }]);
   });

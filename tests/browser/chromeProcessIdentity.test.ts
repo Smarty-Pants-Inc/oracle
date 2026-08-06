@@ -417,12 +417,16 @@ describe("stable Chrome process authority", () => {
 });
 
 describe("physical Chrome profile use authority", () => {
-  test("detects Darwin /var and /private/var as the same physical profile", async () => {
-    const aliasPath = "/var/folders/oracle/profile";
+  test.each([
+    ["Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+    ["Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+    ["Brave", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+  ])("detects Darwin %s using an unquoted spaced profile path", async (_family, executable) => {
+    const aliasPath = "/var/folders/oracle/profile with spaces";
     const expected = Object.freeze({
       version: 2 as const,
       platform: "darwin" as const,
-      canonicalPath: "/private/var/folders/oracle/profile",
+      canonicalPath: "/private/var/folders/oracle/profile with spaces",
       device: "7",
       inode: "99",
       birthtimeNs: "3",
@@ -437,9 +441,7 @@ describe("physical Chrome profile use authority", () => {
       listProcesses: async () => [
         {
           pid: 4321,
-          commandLine:
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome " +
-            `--user-data-dir=${aliasPath}`,
+          commandLine: `${executable} --user-data-dir=${aliasPath} --remote-debugging-port=9222`,
         },
       ],
       readProcessGeneration: async () => "darwin-audit-pidversion:7001",
@@ -556,8 +558,61 @@ describe("physical Chrome profile use authority", () => {
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      expect.stringContaining("Get-CimInstance Win32_Process"),
+      expect.stringContaining(
+        "Where-Object { $_.Name -match '^(chrome|chromium|msedge|brave)\\.exe$' }",
+      ),
     ]);
+  });
+
+  test.each([
+    ["Edge", 4_321, String.raw`C:\Program Files\Microsoft\Edge\Application\msedge.exe`],
+    [
+      "Brave",
+      4_322,
+      String.raw`C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe`,
+    ],
+  ])("enumerates the bounded Windows %s main process", async (_family, pid, executablePath) => {
+    const expected = Object.freeze({
+      version: 2 as const,
+      platform: "win32" as const,
+      canonicalPath: String.raw`C:\Users\Oracle\profile with spaces`,
+      device: "7",
+      inode: "99",
+      birthtimeNs: "3",
+    }) satisfies ProfileDirectoryIdentity;
+    const commandLine = `"${executablePath}" --user-data-dir="${expected.canonicalPath}"`;
+    const trustedPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+    const execute = vi.fn(async (file: string, args: string[]) => {
+      expect(file).toBe(trustedPowerShell);
+      expect(args[3]).toContain(
+        "Where-Object { $_.Name -match '^(chrome|chromium|msedge|brave)\\.exe$' }",
+      );
+      return { stdout: `${pid}:${Buffer.from(commandLine, "utf8").toString("base64")}\n` };
+    });
+    const captureProfileIdentity = vi.fn(async (candidate: string) => {
+      expect(candidate).toBe(expected.canonicalPath.toLowerCase());
+      return expected;
+    });
+
+    await expect(
+      inspectChromeProfileDirectoryUseForTest(expected, {
+        platform: "win32",
+        execute,
+        readProcessGeneration: async () => "win32:2026-08-06T12:00:00.0000000Z",
+        captureProfileIdentity,
+      }),
+    ).resolves.toEqual({
+      status: "in-use",
+      candidates: [
+        {
+          pid,
+          processGeneration: "win32:2026-08-06T12:00:00.0000000Z",
+          profileDirectory: expected,
+        },
+      ],
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(captureProfileIdentity).toHaveBeenCalledOnce();
   });
 
   test("fails closed when the trusted process probe is unavailable", async () => {

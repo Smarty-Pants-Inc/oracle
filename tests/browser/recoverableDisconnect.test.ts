@@ -932,7 +932,7 @@ describe("recoverable disconnect lifecycle", () => {
                 recoveryCleanup: {
                   ownsTarget: true,
                   profileKind: "temporary",
-                  keepBrowser: false,
+                  keepBrowser: true,
                   closeOwnedTargetOnComplete: false,
                 } satisfies BrowserRecoveryCleanupMetadata,
               }),

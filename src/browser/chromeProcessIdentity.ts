@@ -13,6 +13,7 @@ import {
   type ProfileDirectoryIdentity,
 } from "./profileDirectoryAuthority.js";
 import { readDevToolsPort } from "./profileDevToolsState.js";
+import { inferAttachRunningBrowserFamily } from "./detect.js";
 import {
   comparePlatformProcessGenerations,
   createPlatformProcessGenerationProvider,
@@ -171,7 +172,7 @@ async function captureChromeProcessIdentityWithDeps(
     !executablePath ||
     !isChromeExecutablePath(executablePath, platform) ||
     !isChromeSnapshotForUserDataDir(snapshot, profileDirectory.canonicalPath, platform) ||
-    (launchClaim && !isChromeSnapshotForLaunchClaim(snapshot, launchClaim))
+    (launchClaim && !isChromeSnapshotForLaunchClaim(snapshot, launchClaim, platform))
   ) {
     throw new Error(`Chrome pid ${pid} does not have a stable identity for ${userDataDir}`);
   }
@@ -238,7 +239,7 @@ export async function inspectChromeProcessIdentityWithDeps(
   );
   if (generationComparison === "different") return "exited";
   const launchClaimMatches = identity.launchClaim
-    ? isChromeSnapshotForLaunchClaim(snapshot, identity.launchClaim)
+    ? isChromeSnapshotForLaunchClaim(snapshot, identity.launchClaim, platform)
     : false;
   const executablePath = normalizeExecutablePath(snapshot.executablePath, platform);
   if (
@@ -452,7 +453,10 @@ async function inspectChromeProfileDirectoryUseWithDeps(
     }
     const tokens = tokenizeCommandLine(processCommand.commandLine);
     if (!tokens) {
-      if (platform === "win32" || /\b(?:chrome|chromium)\b/iu.test(processCommand.commandLine)) {
+      if (
+        platform === "win32" ||
+        /\b(?:chrome|chromium|edge|brave)\b/iu.test(processCommand.commandLine)
+      ) {
         return {
           status: "unavailable",
           candidates,
@@ -461,8 +465,11 @@ async function inspectChromeProfileDirectoryUseWithDeps(
       }
       continue;
     }
-    if (!isChromeExecutablePrefix(tokens)) continue;
-    const userDataDir = readChromeUserDataDirArgument(tokens, platform);
+    if (!isChromeExecutablePrefix(tokens, platform)) continue;
+    const userDataDir =
+      platform === "darwin"
+        ? readDarwinChromeUserDataDirArgument(processCommand.commandLine)
+        : readChromeUserDataDirArgument(tokens, platform);
     if (userDataDir === undefined) continue;
     if (userDataDir === null) {
       return {
@@ -608,6 +615,7 @@ export async function findRunningChromeDebugTargetForProfile(
       String(stdout ?? ""),
       userDataDir,
       activePort,
+      process.platform,
     );
   } catch {
     return null;
@@ -632,7 +640,7 @@ export async function findRunningChromeProcessForProfile(
       const command = match[2] ?? "";
       if (!Number.isFinite(pid) || pid <= 0 || (expectedPid && pid !== expectedPid)) continue;
       const tokens = tokenizeCommandLine(command);
-      if (!tokens || !isChromeCommandTokensForUserDataDir(tokens, userDataDir, process.platform)) {
+      if (!tokens || !isChromeCommandForUserDataDir(command, userDataDir, process.platform)) {
         continue;
       }
       if (
@@ -657,6 +665,7 @@ function findChromeDebugTargetForProfileFromProcessList(
   processList: string,
   userDataDir: string,
   activePort: number | null = null,
+  platform: NodeJS.Platform = process.platform,
 ): RunningChromeDebugTarget | null {
   for (const line of processList.split("\n")) {
     const match = line.match(/^\s*(\d+)\s+(.+)$/u);
@@ -664,7 +673,7 @@ function findChromeDebugTargetForProfileFromProcessList(
     const pid = Number.parseInt(match[1] ?? "", 10);
     const command = match[2] ?? "";
     if (!Number.isFinite(pid) || pid <= 0) continue;
-    if (!isChromeCommandForUserDataDir(command, userDataDir)) continue;
+    if (!isChromeCommandForUserDataDir(command, userDataDir, platform)) continue;
     const configuredPort = readRemoteDebuggingPortArgument(command);
     const port = configuredPort === 0 ? activePort : configuredPort;
     if (!port || port <= 0) continue;
@@ -677,8 +686,14 @@ export function findChromeDebugTargetForProfileFromProcessListForTest(
   processList: string,
   userDataDir: string,
   activePort: number | null = null,
+  platform: NodeJS.Platform = process.platform,
 ): RunningChromeDebugTarget | null {
-  return findChromeDebugTargetForProfileFromProcessList(processList, userDataDir, activePort);
+  return findChromeDebugTargetForProfileFromProcessList(
+    processList,
+    userDataDir,
+    activePort,
+    platform,
+  );
 }
 
 export function inspectChromeProcessesForLaunchClaimFromProcessListForTest(
@@ -712,7 +727,7 @@ function inspectChromeProcessesForLaunchClaim(
     const tokens = tokenizeCommandLine(processCommand.commandLine);
     if (
       !tokens ||
-      !isChromeCommandTokensForUserDataDir(tokens, userDataDir, platform) ||
+      !isChromeCommandForUserDataDir(processCommand.commandLine, userDataDir, platform) ||
       !hasRemoteDebuggingPortArgument(tokens)
     ) {
       continue;
@@ -745,7 +760,7 @@ async function listRunningChromeProcessCommands(
     "-NoProfile",
     "-NonInteractive",
     "-Command",
-    "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(chrome|chromium)\\.exe$' } | ForEach-Object { $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.CommandLine); '{0}:{1}' -f [int]$_.ProcessId, [Convert]::ToBase64String($bytes) }",
+    "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(chrome|chromium|msedge|brave)\\.exe$' } | ForEach-Object { $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.CommandLine); '{0}:{1}' -f [int]$_.ProcessId, [Convert]::ToBase64String($bytes) }",
   ]);
   const processes: RunningChromeProcessCommand[] = [];
   for (const line of stdout.split(/\r?\n/u)) {
@@ -828,9 +843,30 @@ function normalizeExecutablePath(value: string, platform: NodeJS.Platform): stri
 }
 
 function isChromeExecutablePath(value: string, platform: NodeJS.Platform): boolean {
+  const normalized = normalizeExecutablePath(value, platform);
+  if (!normalized) return false;
   const pathApi = platform === "win32" ? path.win32 : path.posix;
-  const basename = pathApi.basename(value).toLowerCase();
-  return basename.includes("chrome") || basename.includes("chromium");
+  const basename = pathApi.basename(normalized).toLowerCase();
+  switch (inferAttachRunningBrowserFamily(basename)) {
+    case "chrome":
+      return /^(?:(?:google[ -])?chrome)(?:(?:[ -](?:stable|beta|unstable|canary))|(?:[ -]helper(?: \((?:renderer|gpu|plugin)\))?))?(?:\.exe)?$/u.test(
+        basename,
+      );
+    case "chromium":
+      return /^chromium(?:(?:[ -]browser)|(?:[ -]helper(?: \((?:renderer|gpu|plugin)\))?))?(?:\.exe)?$/u.test(
+        basename,
+      );
+    case "edge":
+      return /^(?:microsoft[ -]edge|msedge)(?:(?:[ -](?:stable|beta|dev|canary))|(?:[ -]helper(?: \((?:renderer|gpu|plugin)\))?))?(?:\.exe)?$/u.test(
+        basename,
+      );
+    case "brave":
+      return /^brave(?:[ -]browser)?(?:(?:[ -](?:stable|beta|nightly))|(?:[ -]helper(?: \((?:renderer|gpu|plugin)\))?))?(?:\.exe)?$/u.test(
+        basename,
+      );
+    default:
+      return false;
+  }
 }
 
 async function readChromeProcessSnapshot(
@@ -972,11 +1008,10 @@ function parseLinuxProcStat(raw: string): { pid: number; startTicks: string } | 
   return { pid, startTicks };
 }
 
-function isChromeExecutablePrefix(tokens: readonly string[]): boolean {
+function isChromeExecutablePrefix(tokens: readonly string[], platform: NodeJS.Platform): boolean {
   const firstFlagIndex = tokens.findIndex((token) => token.startsWith("--"));
   if (firstFlagIndex <= 0) return false;
-  const executable = tokens.slice(0, firstFlagIndex).join(" ").toLowerCase();
-  return executable.includes("chrome") || executable.includes("chromium");
+  return isChromeExecutablePath(tokens.slice(0, firstFlagIndex).join(" "), platform);
 }
 
 function readChromeUserDataDirArgument(
@@ -1001,12 +1036,56 @@ function readChromeUserDataDirArgument(
   return normalizeProfileArgument(profileArguments[0] ?? "", platform);
 }
 
+function readDarwinChromeUserDataDirArgument(command: string): string | null | undefined {
+  const flag = "--user-data-dir";
+  const lowerCommand = command.toLowerCase();
+  const flagOffsets: number[] = [];
+  let quote: '"' | "'" | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index] ?? "";
+    if (quote) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    const following = command[index + flag.length];
+    if (
+      (index === 0 || /\s/u.test(command[index - 1] ?? "")) &&
+      lowerCommand.startsWith(flag, index) &&
+      (following === undefined || following === "=" || /\s/u.test(following))
+    ) {
+      flagOffsets.push(index);
+    }
+  }
+  if (flagOffsets.length === 0) return undefined;
+  if (flagOffsets.length !== 1) return null;
+  const flagOffset = flagOffsets[0] ?? -1;
+  let valueOffset = flagOffset + flag.length;
+  if (command[valueOffset] === "=") {
+    valueOffset += 1;
+  } else {
+    while (/\s/u.test(command[valueOffset] ?? "")) valueOffset += 1;
+  }
+  const remainder = command.slice(valueOffset).trim();
+  if (remainder.startsWith('"') || remainder.startsWith("'")) {
+    const tokens = tokenizeCommandLine(command);
+    return tokens ? readChromeUserDataDirArgument(tokens, "darwin") : null;
+  }
+  if (!remainder) return null;
+  const nextFlagOffset = remainder.search(/\s--[a-z0-9][a-z0-9-]*(?=$|=|\s)/iu);
+  const value = (nextFlagOffset < 0 ? remainder : remainder.slice(0, nextFlagOffset)).trim();
+  if (!value || (nextFlagOffset < 0 && /\s/u.test(value))) return null;
+  return normalizeProfileArgument(value, "darwin");
+}
 function isChromeCommandTokensForUserDataDir(
   tokens: readonly string[],
   userDataDir: string,
   platform: NodeJS.Platform,
 ): boolean {
-  if (!isChromeExecutablePrefix(tokens)) return false;
+  if (!isChromeExecutablePrefix(tokens, platform)) return false;
   const expected = normalizeProfileArgument(userDataDir, platform);
   const actual = readChromeUserDataDirArgument(tokens, platform);
   return (
@@ -1024,7 +1103,18 @@ function isChromeCommandForUserDataDir(
 ): boolean {
   if (!command) return false;
   const tokens = tokenizeCommandLine(command);
-  return Boolean(tokens && isChromeCommandTokensForUserDataDir(tokens, userDataDir, platform));
+  if (!tokens || !isChromeExecutablePrefix(tokens, platform)) return false;
+  const expected = normalizeProfileArgument(userDataDir, platform);
+  const actual =
+    platform === "darwin"
+      ? readDarwinChromeUserDataDirArgument(command)
+      : readChromeUserDataDirArgument(tokens, platform);
+  return (
+    expected !== null &&
+    actual !== null &&
+    actual !== undefined &&
+    sameProfileDirectoryPath(actual, expected, platform)
+  );
 }
 
 function isChromeSnapshotForUserDataDir(
@@ -1040,10 +1130,13 @@ function isChromeSnapshotForUserDataDir(
 function isChromeSnapshotForLaunchClaim(
   snapshot: ChromeProcessSnapshot,
   claim: ChromeProcessLaunchClaim,
+  platform: NodeJS.Platform,
 ): boolean {
   const tokens = snapshot.commandTokens ?? tokenizeCommandLine(snapshot.commandLine);
   return Boolean(
-    tokens && sameChromeProcessLaunchClaim(readChromeProcessLaunchClaimArgument(tokens), claim),
+    tokens &&
+    isChromeExecutablePrefix(tokens, platform) &&
+    sameChromeProcessLaunchClaim(readChromeProcessLaunchClaimArgument(tokens), claim),
   );
 }
 

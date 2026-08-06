@@ -17,6 +17,7 @@ import {
   RemoteTransactionCapacityError,
   RemoteTransactionRecordIntegrityError,
   RemoteTransactionStore,
+  type RemoteTransactionPublicationCheckpoint,
 } from "../../src/remote/transactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 function openTransactionStore(
@@ -1757,6 +1758,240 @@ describe("RemoteTransactionStore", () => {
     },
   );
 
+  test("fails before key parsing or record quarantine when Windows ACL authority is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-acl-failure-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+    const transactionToken = "e".repeat(64);
+    const invalidKey = Buffer.of(0x41);
+    const invalidRecord = Buffer.from("untrusted record\n", "utf8");
+    try {
+      await fs.mkdir(directory, { recursive: true });
+      await fs.mkdir(path.dirname(integrityKeyPath), { recursive: true });
+      await fs.writeFile(integrityKeyPath, invalidKey);
+      await fs.writeFile(path.join(directory, `${transactionToken}.json`), invalidRecord);
+      const windowsPrivateTreeAuthority = vi.fn(async () => {
+        throw new Error("different-account-readable Windows ACL");
+      });
+
+      await expect(
+        RemoteTransactionStore.open({
+          directory,
+          integrityKeyPath,
+          platform: "win32",
+          windowsPrivateTreeAuthority,
+        }),
+      ).rejects.toThrow("different-account-readable Windows ACL");
+
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+      await expect(fs.readFile(integrityKeyPath)).resolves.toEqual(invalidKey);
+      await expect(fs.readFile(path.join(directory, `${transactionToken}.json`))).resolves.toEqual(
+        invalidRecord,
+      );
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects Windows ACL-time root replacement before key or record use", async () => {
+    for (const replacedRoot of ["store", "integrity-key-directory"] as const) {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), `oracle-remote-windows-acl-${replacedRoot}-swap-`),
+      );
+      const directory = path.join(root, "transactions");
+      const integrityKeyDirectory = path.join(root, "protected");
+      const integrityKeyPath = path.join(integrityKeyDirectory, "record-integrity.key");
+      const replacedPath = replacedRoot === "store" ? directory : integrityKeyDirectory;
+      const displacedPath = `${replacedPath}.displaced`;
+      let replace = true;
+      const windowsPrivateTreeAuthority = vi.fn(async () => {
+        if (!replace) return;
+        replace = false;
+        await fs.rename(replacedPath, displacedPath);
+        await fs.mkdir(replacedPath, { recursive: true });
+        if (replacedRoot === "integrity-key-directory") {
+          await fs.writeFile(integrityKeyPath, Buffer.alloc(32, 0x41));
+        }
+      });
+      try {
+        await fs.mkdir(directory, { recursive: true });
+        await fs.mkdir(integrityKeyDirectory, { recursive: true });
+
+        await expect(
+          RemoteTransactionStore.open({
+            directory,
+            integrityKeyPath,
+            platform: "win32",
+            windowsPrivateTreeAuthority,
+          }),
+        ).rejects.toThrow(
+          replacedRoot === "store"
+            ? "store root generation changed during Windows private ACL protection"
+            : "integrity key directory generation changed during Windows private ACL protection",
+        );
+
+        expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+        expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+          false,
+        );
+        if (replacedRoot === "store") {
+          await expect(fs.stat(integrityKeyPath)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("protects and verifies a Windows transaction tree once for a bounded list operation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-acl-bounded-"));
+    const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+    try {
+      const store = await openTransactionStore({
+        directory: root,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await begin(store, "1".repeat(64), "bounded-1");
+      await begin(store, "2".repeat(64), "bounded-2");
+      windowsPrivateTreeAuthority.mockClear();
+
+      await expect(store.list()).resolves.toHaveLength(2);
+      expect(windowsPrivateTreeAuthority).toHaveBeenCalledOnce();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects live integrity-key file replacement before read or durable mutation", async () => {
+    for (const operation of ["read", "mutation"] as const) {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), `oracle-remote-key-file-swap-${operation}-`),
+      );
+      const directory = path.join(root, "transactions");
+      const integrityKeyPath = path.join(root, "protected", "record-integrity.key");
+      const displacedKeyPath = `${integrityKeyPath}.displaced`;
+      const transactionToken = operation === "read" ? "3".repeat(64) : "4".repeat(64);
+      let replaceKey: (() => Promise<void>) | undefined;
+      const windowsPrivateTreeAuthority = vi.fn(async () => {
+        const replacement = replaceKey;
+        replaceKey = undefined;
+        await replacement?.();
+      });
+      try {
+        const store = await RemoteTransactionStore.open({
+          directory,
+          integrityKeyPath,
+          platform: "win32",
+          windowsPrivateTreeAuthority,
+        });
+        await begin(store, transactionToken, `${operation}-run`);
+        const originalRecord = await fs.readFile(store.recordPath(transactionToken));
+        const originalKey = await fs.readFile(integrityKeyPath);
+        replaceKey = async () => {
+          await fs.rename(integrityKeyPath, displacedKeyPath);
+          await fs.writeFile(integrityKeyPath, originalKey);
+        };
+
+        const attempted =
+          operation === "read"
+            ? store.read(transactionToken)
+            : store.journalRuntime(transactionToken, runtime);
+        await expect(attempted).rejects.toThrow("integrity key generation changed");
+        await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(
+          originalRecord,
+        );
+        expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+          false,
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("rejects live integrity-key directory replacement before corrupt-record quarantine", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-key-directory-swap-"));
+    const directory = path.join(root, "transactions");
+    const integrityKeyDirectory = path.join(root, "protected");
+    const displacedKeyDirectory = path.join(root, "protected-displaced");
+    const integrityKeyPath = path.join(integrityKeyDirectory, "record-integrity.key");
+    const transactionToken = "5".repeat(64);
+    let replaceDirectory: (() => Promise<void>) | undefined;
+    const windowsPrivateTreeAuthority = vi.fn(async () => {
+      const replacement = replaceDirectory;
+      replaceDirectory = undefined;
+      await replacement?.();
+    });
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory,
+        integrityKeyPath,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await begin(store, transactionToken, "directory-swap-run");
+      const originalKey = await fs.readFile(integrityKeyPath);
+      const corruptRecord = Buffer.from("corrupt record awaiting quarantine\n", "utf8");
+      await fs.writeFile(store.recordPath(transactionToken), corruptRecord);
+      replaceDirectory = async () => {
+        await fs.rename(integrityKeyDirectory, displacedKeyDirectory);
+        await fs.mkdir(integrityKeyDirectory);
+        await fs.writeFile(integrityKeyPath, originalKey);
+      };
+
+      await expect(store.read(transactionToken)).rejects.toThrow(
+        "integrity key directory generation changed",
+      );
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(corruptRecord);
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails a live Windows ACL probe before record read, quarantine, or mutation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-probe-live-"));
+    const directory = path.join(root, "transactions");
+    const transactionToken = "6".repeat(64);
+    const mutationToken = "7".repeat(64);
+    const windowsPrivateTreeAuthority = vi.fn(async () => undefined);
+    try {
+      const store = await openTransactionStore({
+        directory,
+        platform: "win32",
+        windowsPrivateTreeAuthority,
+      });
+      await begin(store, transactionToken, "probe-read-run");
+      await begin(store, mutationToken, "probe-mutation-run");
+      const corruptRecord = Buffer.from("corrupt but not quarantined\n", "utf8");
+      await fs.writeFile(store.recordPath(transactionToken), corruptRecord);
+      const originalMutationRecord = await fs.readFile(store.recordPath(mutationToken));
+
+      windowsPrivateTreeAuthority.mockRejectedValueOnce(new Error("Windows ACL probe failed"));
+      await expect(store.read(transactionToken)).rejects.toThrow("Windows ACL probe failed");
+      await expect(fs.readFile(store.recordPath(transactionToken))).resolves.toEqual(corruptRecord);
+      expect((await fs.readdir(directory)).some((name) => name.endsWith(".quarantine"))).toBe(
+        false,
+      );
+
+      windowsPrivateTreeAuthority.mockRejectedValueOnce(new Error("Windows ACL probe failed"));
+      await expect(store.journalRuntime(mutationToken, runtime)).rejects.toThrow(
+        "Windows ACL probe failed",
+      );
+      await expect(fs.readFile(store.recordPath(mutationToken))).resolves.toEqual(
+        originalMutationRecord,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not replace a missing integrity key while authenticated records remain", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-integrity-missing-key-"));
     const directory = path.join(root, "transactions");
@@ -1996,6 +2231,73 @@ describe("RemoteTransactionStore", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
+
+  test("commits exact begin and mutation heads at namespace publication before later failures", async () => {
+    const checkpoints: RemoteTransactionPublicationCheckpoint[] = [
+      "namespace-publication",
+      "directory-sync",
+      "temp-cleanup",
+    ];
+    for (const checkpoint of checkpoints) {
+      for (const operation of ["begin", "mutation"] as const) {
+        const root = await mkdtemp(
+          path.join(os.tmpdir(), `oracle-remote-${operation}-${checkpoint}-`),
+        );
+        const transactionToken = operation === "begin" ? "8".repeat(64) : "9".repeat(64);
+        let injectedFailure:
+          | { operation: "begin" | "mutation"; checkpoint: RemoteTransactionPublicationCheckpoint }
+          | undefined;
+        const afterRecordPublication = vi.fn(
+          async (
+            publishedOperation: "begin" | "mutation",
+            publishedCheckpoint: RemoteTransactionPublicationCheckpoint,
+          ) => {
+            if (
+              injectedFailure?.operation === publishedOperation &&
+              injectedFailure.checkpoint === publishedCheckpoint
+            ) {
+              injectedFailure = undefined;
+              throw Object.assign(new Error(`injected ${publishedCheckpoint} failure`), {
+                code: "EIO",
+              });
+            }
+          },
+        );
+        try {
+          const store = await openTransactionStore({
+            directory: root,
+            afterRecordPublication,
+          });
+          if (operation === "begin") {
+            injectedFailure = { operation, checkpoint };
+            await expect(begin(store, transactionToken, "published-begin")).rejects.toMatchObject({
+              code: "EIO",
+            });
+            await expect(store.read(transactionToken)).resolves.toMatchObject({
+              transactionToken,
+              runId: "published-begin",
+            });
+            await expect(begin(store, transactionToken, "duplicate-begin")).rejects.toMatchObject({
+              code: "EEXIST",
+            });
+          } else {
+            await begin(store, transactionToken, "published-mutation");
+            injectedFailure = { operation, checkpoint };
+            await expect(store.journalRuntime(transactionToken, runtime)).rejects.toMatchObject({
+              code: "EIO",
+            });
+            await expect(store.read(transactionToken)).resolves.toMatchObject({ runtime });
+            await expect(store.journalRuntime(transactionToken, runtime)).resolves.toMatchObject({
+              runtime,
+            });
+          }
+          expect((await fs.readdir(root)).some((name) => name.endsWith(".quarantine"))).toBe(false);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    }
+  });
 
   test("redacts terminal authority and prunes it after retention", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-terminal-store-"));

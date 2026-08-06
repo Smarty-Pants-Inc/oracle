@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { constants, type BigIntStats } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
@@ -10,6 +11,11 @@ import {
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import { syncDirectory } from "../fsDurability.js";
+import {
+  protectWindowsPrivateTreeAcl,
+  type WindowsPrivateTreeAuthority,
+  type WindowsPrivateTreeScope,
+} from "./windowsPrivateTreeAcl.js";
 import {
   applyRemoteTransactionTransition,
   createRemoteTransactionRecord,
@@ -57,6 +63,11 @@ const REMOTE_TRANSACTION_QUARANTINE_PATTERN =
   /^\.invalid-remote-transaction\.([a-f0-9]{64})\..+\.quarantine$/u;
 const REMOTE_TRANSACTION_PRESERVED_AUTHORITY_PATTERN =
   /^\.preserved-remote-transaction\.[a-f0-9]{64}\..+\.authority$/u;
+export type RemoteTransactionPublicationCheckpoint =
+  | "namespace-publication"
+  | "directory-sync"
+  | "temp-cleanup";
+type RemoteTransactionPublicationOperation = "begin" | "mutation";
 type RemoteArtifactNamespaceCleanup = (record: RemoteTransactionRecord) => Promise<boolean>;
 type RemoteTransactionRecordEnvelope = {
   version: number;
@@ -97,6 +108,12 @@ export interface RemoteTransactionStoreOptions {
   now?: () => number;
   leaseDurationMs?: number;
   beforeQuarantineUnlink?: () => Promise<void>;
+  platform?: NodeJS.Platform;
+  windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+  afterRecordPublication?: (
+    operation: RemoteTransactionPublicationOperation,
+    checkpoint: RemoteTransactionPublicationCheckpoint,
+  ) => Promise<void>;
 }
 export class RemoteTransactionStore {
   readonly directory: string;
@@ -111,6 +128,11 @@ export class RemoteTransactionStore {
   readonly #maximumQuarantineBytes: number;
   readonly #now: () => number;
   readonly #beforeQuarantineUnlink?: () => Promise<void>;
+  readonly #platform: NodeJS.Platform;
+  readonly #windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+  readonly #windowsPrivateTreeScope: WindowsPrivateTreeScope;
+  readonly #windowsAuthorityContext = new AsyncLocalStorage<boolean>();
+  readonly #afterRecordPublication?: RemoteTransactionStoreOptions["afterRecordPublication"];
   readonly #integrityKey: Buffer;
   readonly #integrityKeyId: string;
   readonly #integrityKeyPath: string;
@@ -127,6 +149,7 @@ export class RemoteTransactionStore {
     options: RemoteTransactionStoreOptions,
     storeRootIdentity: PhysicalDirectoryIdentity,
     integrityKey: RemoteTransactionIntegrityKey,
+    windowsPrivateTreeAuthority: WindowsPrivateTreeAuthority | undefined,
   ) {
     this.directory = path.resolve(options.directory);
     this.controllerGeneration = options.controllerGeneration ?? randomUUID();
@@ -141,6 +164,14 @@ export class RemoteTransactionStore {
     this.#maximumQuarantineBytes =
       options.maximumQuarantineBytes ?? MAX_REMOTE_TRANSACTION_STORE_BYTES;
     this.#now = options.now ?? Date.now;
+    this.#platform = options.platform ?? process.platform;
+    this.#windowsPrivateTreeAuthority = windowsPrivateTreeAuthority;
+    this.#windowsPrivateTreeScope = {
+      storeDirectory: this.directory,
+      integrityKeyDirectory: integrityKey.directory,
+      integrityKeyPath: integrityKey.path,
+    };
+    this.#afterRecordPublication = options.afterRecordPublication;
     this.#beforeQuarantineUnlink = options.beforeQuarantineUnlink;
     this.#integrityKey = integrityKey.bytes;
     this.#integrityKeyId = integrityKey.keyId;
@@ -171,12 +202,60 @@ export class RemoteTransactionStore {
   }
 
   static async open(options: RemoteTransactionStoreOptions): Promise<RemoteTransactionStore> {
+    const platform = options.platform ?? process.platform;
     const directory = path.resolve(options.directory);
+    const integrityKeyPath = path.resolve(options.integrityKeyPath);
+    const integrityKeyDirectory = path.dirname(integrityKeyPath);
+    const windowsPrivateTreeAuthority =
+      platform === "win32"
+        ? (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)
+        : undefined;
+    const windowsPrivateTreeScope = {
+      storeDirectory: directory,
+      integrityKeyDirectory,
+      integrityKeyPath,
+    };
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    if (process.platform !== "win32") await chmod(directory, 0o700);
+    await mkdir(integrityKeyDirectory, { recursive: true, mode: 0o700 });
+    const storeRootBeforeWindowsAuthority =
+      platform === "win32" ? await capturePhysicalDirectoryIdentity(directory) : undefined;
+    const integrityKeyDirectoryBeforeWindowsAuthority =
+      platform === "win32"
+        ? await capturePhysicalDirectoryIdentity(integrityKeyDirectory)
+        : undefined;
+    if (platform === "win32") {
+      await windowsPrivateTreeAuthority?.(windowsPrivateTreeScope);
+    } else {
+      await chmod(directory, 0o700);
+    }
     await syncDirectory(directory);
     const storeRootIdentity = await capturePhysicalDirectoryIdentity(directory);
+    if (
+      storeRootBeforeWindowsAuthority &&
+      !samePhysicalDirectoryIdentity(storeRootBeforeWindowsAuthority, storeRootIdentity)
+    ) {
+      throw new Error(
+        "Remote transaction store root generation changed during Windows private ACL protection",
+      );
+    }
+    const integrityKeyDirectoryIdentity =
+      await capturePhysicalDirectoryIdentity(integrityKeyDirectory);
+    if (
+      integrityKeyDirectoryBeforeWindowsAuthority &&
+      !samePhysicalDirectoryIdentity(
+        integrityKeyDirectoryBeforeWindowsAuthority,
+        integrityKeyDirectoryIdentity,
+      )
+    ) {
+      throw new Error(
+        "Remote transaction integrity key directory generation changed during Windows private ACL protection",
+      );
+    }
     const names = await readdir(directory);
+    const storeRootAfterInventory = await capturePhysicalDirectoryIdentity(directory);
+    if (!samePhysicalDirectoryIdentity(storeRootIdentity, storeRootAfterInventory)) {
+      throw new Error("Remote transaction store root generation changed during inventory");
+    }
     const hasPersistedRecords = names.some(
       (name) =>
         /^[a-f0-9]{64}\.json$/u.test(name) ||
@@ -184,13 +263,20 @@ export class RemoteTransactionStore {
         REMOTE_TRANSACTION_PRESERVED_AUTHORITY_PATTERN.test(name),
     );
     const integrityKey = await loadRemoteTransactionIntegrityKey(
-      path.resolve(options.integrityKeyPath),
+      integrityKeyPath,
       hasPersistedRecords,
+      {
+        platform,
+        windowsPrivateTreeAuthority,
+        windowsPrivateTreeScope,
+        expectedDirectoryIdentity: platform === "win32" ? integrityKeyDirectoryIdentity : undefined,
+      },
     );
     const store = new RemoteTransactionStore(
-      { ...options, directory, integrityKeyPath: integrityKey.path },
+      { ...options, directory, integrityKeyPath: integrityKey.path, platform },
       storeRootIdentity,
       integrityKey,
+      windowsPrivateTreeAuthority,
     );
     await store.runMaintenance();
     return store;
@@ -217,6 +303,11 @@ export class RemoteTransactionStore {
       }
       await this.assertIntegrityAuthority();
       const serialized = this.serializeRecord(persisted, 1);
+      const targetPath = this.recordPath(persisted.transactionToken);
+      const tempPath = path.join(
+        this.directory,
+        `.${persisted.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
+      );
       let published = false;
       this.#expectedHeads.set(persisted.transactionToken, { revision: 0, digest: "" });
       try {
@@ -227,17 +318,12 @@ export class RemoteTransactionStore {
             undefined,
             persisted.capacityReservationBytes,
           );
-          const targetPath = this.recordPath(persisted.transactionToken);
-          const tempPath = path.join(
-            this.directory,
-            `.${persisted.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
-          );
           try {
             await this.assertIntegrityAuthority();
             const handle = await open(tempPath, "wx", 0o600);
             try {
               await handle.writeFile(serialized.contents);
-              if (process.platform !== "win32") await handle.chmod(0o600);
+              if (this.#platform !== "win32") await handle.chmod(0o600);
               await handle.sync();
             } finally {
               await handle.close();
@@ -245,18 +331,26 @@ export class RemoteTransactionStore {
             await this.assertIntegrityAuthority();
             await link(tempPath, targetPath);
             published = true;
+            this.#expectedHeads.set(persisted.transactionToken, serialized.head);
+            await this.#afterRecordPublication?.("begin", "namespace-publication");
             await this.assertIntegrityAuthority();
+            await this.#afterRecordPublication?.("begin", "directory-sync");
             await syncDirectory(this.directory);
           } finally {
             await this.assertIntegrityAuthority();
+            await this.#afterRecordPublication?.("begin", "temp-cleanup");
             await rm(tempPath, { force: true });
             await this.assertIntegrityAuthority();
             await syncDirectory(this.directory);
           }
         });
-        this.#expectedHeads.set(persisted.transactionToken, serialized.head);
       } catch (error) {
-        if (!published) this.#expectedHeads.delete(persisted.transactionToken);
+        if (published) {
+          await rm(tempPath, { force: true }).catch(() => undefined);
+          await this.reconcilePublishedHead(targetPath, persisted.transactionToken, serialized);
+        } else {
+          this.#expectedHeads.delete(persisted.transactionToken);
+        }
         throw error;
       }
     });
@@ -335,40 +429,44 @@ export class RemoteTransactionStore {
   }
 
   async listExpiredNonterminalRecords(): Promise<RemoteTransactionRecord[]> {
-    await this.runMaintenance();
-    await this.assertIntegrityAuthority();
-    const expiredAt = this.#now();
-    const names = await readdir(this.directory);
-    const expired: RemoteTransactionRecord[] = [];
-    for (const name of names.sort()) {
-      const match = /^([a-f0-9]{64})\.json$/u.exec(name);
-      if (!match?.[1]) continue;
-      await this.withLock(match[1], async () => {
-        const record = await this.readUnlocked(match[1]);
-        if (
-          record &&
-          !isTerminalRemoteTransactionState(record.state) &&
-          Date.parse(record.leaseExpiresAt ?? "") <= expiredAt
-        ) {
-          expired.push(record);
-        }
-      });
-    }
-    return expired;
+    return await this.withWindowsPrivateTreeAuthority(async () => {
+      await this.runMaintenance();
+      await this.assertIntegrityAuthority();
+      const expiredAt = this.#now();
+      const names = await readdir(this.directory);
+      const expired: RemoteTransactionRecord[] = [];
+      for (const name of names.sort()) {
+        const match = /^([a-f0-9]{64})\.json$/u.exec(name);
+        if (!match?.[1]) continue;
+        await this.withLock(match[1], async () => {
+          const record = await this.readUnlocked(match[1]);
+          if (
+            record &&
+            !isTerminalRemoteTransactionState(record.state) &&
+            Date.parse(record.leaseExpiresAt ?? "") <= expiredAt
+          ) {
+            expired.push(record);
+          }
+        });
+      }
+      return expired;
+    });
   }
 
   async list(): Promise<RemoteTransactionRecord[]> {
-    await this.runMaintenance();
-    await this.assertIntegrityAuthority();
-    const names = await readdir(this.directory);
-    const records: RemoteTransactionRecord[] = [];
-    for (const name of names.sort()) {
-      const match = /^([a-f0-9]{64})\.json$/u.exec(name);
-      if (!match?.[1]) continue;
-      const record = await this.read(match[1]);
-      if (record) records.push(record);
-    }
-    return records;
+    return await this.withWindowsPrivateTreeAuthority(async () => {
+      await this.runMaintenance();
+      await this.assertIntegrityAuthority();
+      const names = await readdir(this.directory);
+      const records: RemoteTransactionRecord[] = [];
+      for (const name of names.sort()) {
+        const match = /^([a-f0-9]{64})\.json$/u.exec(name);
+        if (!match?.[1]) continue;
+        const record = await this.read(match[1]);
+        if (record) records.push(record);
+      }
+      return records;
+    });
   }
 
   async journalRuntime(
@@ -665,7 +763,7 @@ export class RemoteTransactionStore {
     this.#locks.set(transactionToken, current);
     await prior;
     try {
-      return await operation();
+      return await this.withWindowsPrivateTreeAuthority(operation);
     } finally {
       gate.resolve();
       if (this.#locks.get(transactionToken) === current) this.#locks.delete(transactionToken);
@@ -690,34 +788,46 @@ export class RemoteTransactionStore {
       this.directory,
       `.${record.transactionToken}.${process.pid}.${randomUUID()}.tmp`,
     );
+    let published = false;
     await this.assertIntegrityAuthority();
-    await this.withMaintenanceLock(async () => {
-      await this.pruneExpiredTerminalRecords();
-      await this.assertCapacity(
-        serialized.contents.byteLength,
-        targetPath,
-        record.capacityReservationBytes,
-      );
-      try {
-        await this.assertIntegrityAuthority();
-        const handle = await open(tempPath, "wx", 0o600);
+    try {
+      await this.withMaintenanceLock(async () => {
+        await this.pruneExpiredTerminalRecords();
+        await this.assertCapacity(
+          serialized.contents.byteLength,
+          targetPath,
+          record.capacityReservationBytes,
+        );
         try {
-          await handle.writeFile(serialized.contents);
-          if (process.platform !== "win32") await handle.chmod(0o600);
-          await handle.sync();
+          await this.assertIntegrityAuthority();
+          const handle = await open(tempPath, "wx", 0o600);
+          try {
+            await handle.writeFile(serialized.contents);
+            if (this.#platform !== "win32") await handle.chmod(0o600);
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+          await this.assertIntegrityAuthority();
+          await rename(tempPath, targetPath);
+          published = true;
+          this.#expectedHeads.set(record.transactionToken, serialized.head);
+          await this.#afterRecordPublication?.("mutation", "namespace-publication");
+          await this.assertIntegrityAuthority();
+          await this.#afterRecordPublication?.("mutation", "directory-sync");
+          await syncDirectory(this.directory);
         } finally {
-          await handle.close();
+          await this.assertIntegrityAuthority();
+          await this.#afterRecordPublication?.("mutation", "temp-cleanup");
+          await rm(tempPath, { force: true }).catch(() => undefined);
         }
-        await this.assertIntegrityAuthority();
-        await rename(tempPath, targetPath);
-        await this.assertIntegrityAuthority();
-        await syncDirectory(this.directory);
-      } finally {
-        await this.assertIntegrityAuthority();
-        await rm(tempPath, { force: true }).catch(() => undefined);
+      });
+    } catch (error) {
+      if (published) {
+        await this.reconcilePublishedHead(targetPath, record.transactionToken, serialized);
       }
-    });
-    this.#expectedHeads.set(record.transactionToken, serialized.head);
+      throw error;
+    }
   }
 
   private serializeRecord(
@@ -744,6 +854,22 @@ export class RemoteTransactionStore {
       contents,
       head: { revision, digest: createHash("sha256").update(contents).digest("hex") },
     };
+  }
+  private async reconcilePublishedHead(
+    targetPath: string,
+    transactionToken: string,
+    serialized: SerializedRemoteTransactionRecord,
+  ): Promise<void> {
+    try {
+      const authenticated = await this.readStableRecordBytes(targetPath);
+      const digest = createHash("sha256").update(authenticated.contents).digest("hex");
+      if (digest === serialized.head.digest && authenticated.contents.equals(serialized.contents)) {
+        this.#expectedHeads.set(transactionToken, serialized.head);
+      }
+    } catch {
+      // Preserve the publication error. The committed head remains fail-closed until a later read
+      // can re-authenticate the exact named bytes or reject a changed generation.
+    }
   }
 
   private async readAuthenticatedRecord(
@@ -853,15 +979,15 @@ export class RemoteTransactionStore {
   ): Promise<{ contents: Buffer; fileIdentity: BigIntStats }> {
     await this.assertIntegrityAuthority();
     const before = await lstat(targetPath, { bigint: true });
-    assertPhysicalTransactionRecordFile(before);
+    assertPhysicalTransactionRecordFile(before, this.#platform);
     const flags =
-      process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+      this.#platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
     const handle = await open(targetPath, flags);
     let contents: Buffer | undefined;
     let authenticated: BigIntStats;
     try {
       authenticated = await handle.stat({ bigint: true });
-      assertPhysicalTransactionRecordFile(authenticated);
+      assertPhysicalTransactionRecordFile(authenticated, this.#platform);
       if (!samePhysicalFile(before, authenticated)) {
         throw new RemoteTransactionRecordIntegrityError();
       }
@@ -884,7 +1010,7 @@ export class RemoteTransactionStore {
         }
       }
       const afterRead = await handle.stat({ bigint: true });
-      assertPhysicalTransactionRecordFile(afterRead);
+      assertPhysicalTransactionRecordFile(afterRead, this.#platform);
       if (!samePhysicalFile(authenticated, afterRead)) {
         throw new RemoteTransactionRecordIntegrityError();
       }
@@ -893,7 +1019,7 @@ export class RemoteTransactionStore {
       await handle.close();
     }
     const namedAfterRead = await lstat(targetPath, { bigint: true });
-    assertPhysicalTransactionRecordFile(namedAfterRead);
+    assertPhysicalTransactionRecordFile(namedAfterRead, this.#platform);
     if (!samePhysicalFile(authenticated, namedAfterRead)) {
       throw new RemoteTransactionRecordIntegrityError();
     }
@@ -939,7 +1065,7 @@ export class RemoteTransactionStore {
       throw new Error("Remote transaction integrity key directory generation changed");
     }
     const currentKey = await lstat(this.#integrityKeyPath, { bigint: true });
-    assertProtectedIntegrityKeyFile(currentKey);
+    assertProtectedIntegrityKeyFile(currentKey, this.#platform);
     if (!samePhysicalFile(currentKey, this.#integrityKeyFileIdentity)) {
       throw new Error("Remote transaction integrity key generation changed");
     }
@@ -1058,17 +1184,17 @@ export class RemoteTransactionStore {
     const handle = await open(quarantinePath, "wx", 0o600);
     try {
       await handle.writeFile(contents);
-      if (process.platform !== "win32") await handle.chmod(0o600);
+      if (this.#platform !== "win32") await handle.chmod(0o600);
       await handle.sync();
       quarantineIdentity = await handle.stat({ bigint: true });
-      assertPhysicalTransactionRecordFile(quarantineIdentity);
+      assertPhysicalTransactionRecordFile(quarantineIdentity, this.#platform);
       published = true;
     } finally {
       await handle.close();
       if (!published) await rm(quarantinePath, { force: true }).catch(() => undefined);
     }
     const namedQuarantine = await lstat(quarantinePath, { bigint: true });
-    assertPhysicalTransactionRecordFile(namedQuarantine);
+    assertPhysicalTransactionRecordFile(namedQuarantine, this.#platform);
     if (!samePhysicalFile(quarantineIdentity, namedQuarantine)) {
       throw new Error("Remote transaction quarantine generation changed before publication");
     }
@@ -1085,7 +1211,7 @@ export class RemoteTransactionStore {
     const handle = await open(tempPath, "wx", 0o600);
     try {
       await handle.writeFile(contents);
-      if (process.platform !== "win32") await handle.chmod(0o600);
+      if (this.#platform !== "win32") await handle.chmod(0o600);
       await handle.sync();
     } finally {
       await handle.close();
@@ -1161,7 +1287,7 @@ export class RemoteTransactionStore {
         if (readErrorCode(error) === "ENOENT") continue;
         throw error;
       }
-      if (!isPhysicalTransactionRecordFile(identity)) continue;
+      if (!isPhysicalTransactionRecordFile(identity, this.#platform)) continue;
       candidates.push({ name, transactionToken: match[1], path: candidatePath, identity });
     }
     candidates.sort((left, right) => {
@@ -1295,13 +1421,21 @@ export class RemoteTransactionStore {
     }
   }
 
+  private async withWindowsPrivateTreeAuthority<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.#windowsPrivateTreeAuthority || this.#windowsAuthorityContext.getStore()) {
+      return await operation();
+    }
+    await this.#windowsPrivateTreeAuthority(this.#windowsPrivateTreeScope);
+    return await this.#windowsAuthorityContext.run(true, operation);
+  }
+
   private async withMaintenanceLock<T>(operation: () => Promise<T>): Promise<T> {
     const prior = this.#maintenanceLock;
     const gate = Promise.withResolvers<void>();
     this.#maintenanceLock = prior.then(() => gate.promise);
     await prior;
     try {
-      return await operation();
+      return await this.withWindowsPrivateTreeAuthority(operation);
     } finally {
       gate.resolve();
     }
@@ -1313,7 +1447,7 @@ export class RemoteTransactionStore {
     this.#quarantineMaintenanceLock = prior.then(() => gate.promise);
     await prior;
     try {
-      return await operation();
+      return await this.withWindowsPrivateTreeAuthority(operation);
     } finally {
       gate.resolve();
     }
@@ -1370,14 +1504,31 @@ class QuarantinableRemoteTransactionRecordIntegrityError extends RemoteTransacti
 async function loadRemoteTransactionIntegrityKey(
   integrityKeyPath: string,
   hasPersistedRecords: boolean,
+  options: {
+    platform: NodeJS.Platform;
+    windowsPrivateTreeAuthority: WindowsPrivateTreeAuthority | undefined;
+    windowsPrivateTreeScope: WindowsPrivateTreeScope;
+    expectedDirectoryIdentity?: PhysicalDirectoryIdentity;
+  },
 ): Promise<RemoteTransactionIntegrityKey> {
   const directory = path.dirname(integrityKeyPath);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await chmod(directory, 0o700);
+  if (options.platform !== "win32") await chmod(directory, 0o700);
   await syncDirectory(directory);
   const directoryIdentity = await capturePhysicalDirectoryIdentity(directory);
+  if (
+    options.expectedDirectoryIdentity &&
+    !samePhysicalDirectoryIdentity(options.expectedDirectoryIdentity, directoryIdentity)
+  ) {
+    throw new Error("Remote transaction integrity key directory generation changed before key use");
+  }
   try {
-    return await readRemoteTransactionIntegrityKey(integrityKeyPath, directory, directoryIdentity);
+    return await readRemoteTransactionIntegrityKey(
+      integrityKeyPath,
+      directory,
+      directoryIdentity,
+      options.platform,
+    );
   } catch (error) {
     if (readErrorCode(error) !== "ENOENT") throw error;
   }
@@ -1399,14 +1550,22 @@ async function loadRemoteTransactionIntegrityKey(
     handle = await open(integrityKeyPath, "wx", 0o600);
   } catch (error) {
     if (readErrorCode(error) !== "EEXIST") throw error;
-    return await readRemoteTransactionIntegrityKey(integrityKeyPath, directory, directoryIdentity);
+    return await readRemoteTransactionIntegrityKey(
+      integrityKeyPath,
+      directory,
+      directoryIdentity,
+      options.platform,
+    );
   }
   try {
     await handle.writeFile(key);
-    if (process.platform !== "win32") await handle.chmod(0o600);
+    if (options.platform !== "win32") await handle.chmod(0o600);
     await handle.sync();
   } finally {
     await handle.close();
+  }
+  if (options.platform === "win32") {
+    await options.windowsPrivateTreeAuthority?.(options.windowsPrivateTreeScope);
   }
   const directoryAfterWrite = await capturePhysicalDirectoryIdentity(directory);
   if (!samePhysicalDirectoryIdentity(directoryAfterWrite, directoryIdentity)) {
@@ -1415,30 +1574,36 @@ async function loadRemoteTransactionIntegrityKey(
     );
   }
   await syncDirectory(directory);
-  return await readRemoteTransactionIntegrityKey(integrityKeyPath, directory, directoryIdentity);
+  return await readRemoteTransactionIntegrityKey(
+    integrityKeyPath,
+    directory,
+    directoryIdentity,
+    options.platform,
+  );
 }
 
 async function readRemoteTransactionIntegrityKey(
   integrityKeyPath: string,
   directory: string,
   directoryIdentity: PhysicalDirectoryIdentity,
+  platform: NodeJS.Platform,
 ): Promise<RemoteTransactionIntegrityKey> {
   const before = await lstat(integrityKeyPath, { bigint: true });
-  assertProtectedIntegrityKeyFile(before);
+  assertProtectedIntegrityKeyFile(before, platform);
   const flags =
-    process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+    platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
   const handle = await open(integrityKeyPath, flags);
   let bytes: Buffer;
   let authenticated: BigIntStats;
   try {
     authenticated = await handle.stat({ bigint: true });
-    assertProtectedIntegrityKeyFile(authenticated);
+    assertProtectedIntegrityKeyFile(authenticated, platform);
     if (!samePhysicalFile(before, authenticated)) {
       throw new Error("Remote transaction integrity key changed before authenticated read");
     }
     bytes = await handle.readFile();
     const afterRead = await handle.stat({ bigint: true });
-    assertProtectedIntegrityKeyFile(afterRead);
+    assertProtectedIntegrityKeyFile(afterRead, platform);
     if (!samePhysicalFile(authenticated, afterRead)) {
       throw new Error("Remote transaction integrity key changed during authenticated read");
     }
@@ -1447,7 +1612,7 @@ async function readRemoteTransactionIntegrityKey(
     await handle.close();
   }
   const namedAfterRead = await lstat(integrityKeyPath, { bigint: true });
-  assertProtectedIntegrityKeyFile(namedAfterRead);
+  assertProtectedIntegrityKeyFile(namedAfterRead, platform);
   if (!samePhysicalFile(authenticated, namedAfterRead)) {
     throw new Error("Remote transaction integrity key pathname changed during authenticated read");
   }
@@ -1473,27 +1638,26 @@ async function readRemoteTransactionIntegrityKey(
   };
 }
 
-function isPhysicalTransactionRecordFile(entry: BigIntStats): boolean {
+function isPhysicalTransactionRecordFile(entry: BigIntStats, platform: NodeJS.Platform): boolean {
   return (
     entry.isFile() &&
     !entry.isSymbolicLink() &&
     entry.nlink === 1n &&
-    (process.platform === "win32" ||
-      ((entry.mode & 0o777n) === 0o600n && isOwnedByControllerUser(entry)))
+    (platform === "win32" || ((entry.mode & 0o777n) === 0o600n && isOwnedByControllerUser(entry)))
   );
 }
 
-function assertPhysicalTransactionRecordFile(entry: BigIntStats): void {
-  if (!isPhysicalTransactionRecordFile(entry)) {
+function assertPhysicalTransactionRecordFile(entry: BigIntStats, platform: NodeJS.Platform): void {
+  if (!isPhysicalTransactionRecordFile(entry, platform)) {
     throw new RemoteTransactionRecordIntegrityError();
   }
 }
 
-function assertProtectedIntegrityKeyFile(entry: BigIntStats): void {
+function assertProtectedIntegrityKeyFile(entry: BigIntStats, platform: NodeJS.Platform): void {
   if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1n) {
     throw new Error("Remote transaction integrity key is not a singly linked physical file");
   }
-  if (process.platform === "win32") return;
+  if (platform === "win32") return;
   if ((entry.mode & 0o777n) !== 0o600n) {
     throw new Error("Remote transaction integrity key permissions must be 0600");
   }

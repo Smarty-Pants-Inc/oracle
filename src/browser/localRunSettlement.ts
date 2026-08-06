@@ -51,31 +51,47 @@ export function createLocalRunSettlementCoordinator({
     config,
   } = acquisition;
 
-  const buildRuntimeBase = (tabUrl = state.lastUrl): BrowserRuntimeMetadata =>
-    resourceAuthority.projectRuntime(
+  const keepBrowserOpenForRuntime = (): boolean =>
+    manualLogin
+      ? shouldPreserveLocalOwnerForRecovery({
+          effectiveKeepBrowser,
+          manualLogin,
+          ownerDisposition: chromeOwnerDisposition,
+        })
+      : shouldKeepLocalBrowserOpen({
+          effectiveKeepBrowser,
+          preserveBrowserOnError: state.preserveBrowserOnError,
+          usingCopiedProfile,
+        });
+  const buildRuntimeBase = (tabUrl = state.lastUrl): BrowserRuntimeMetadata => {
+    const keepBrowser = keepBrowserOpenForRuntime();
+    return resourceAuthority.projectRuntime(
       {
         chromeTargetId: state.lastTargetId ?? state.isolatedTargetId ?? undefined,
         ...(tabUrl ? { tabUrl, conversationId: extractConversationIdFromUrl(tabUrl) } : {}),
       },
       {
-        keepBrowser: shouldPreserveLocalOwnerForRecovery({
-          effectiveKeepBrowser,
-          manualLogin,
-          ownerDisposition: chromeOwnerDisposition,
-        }),
+        keepBrowser,
         closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
           runStatus: state.runStatus,
           ownsTarget: state.ownsTarget,
-          keepBrowser: effectiveKeepBrowser,
+          keepBrowser: manualLogin ? effectiveKeepBrowser : keepBrowser,
           closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
           preserveForRecovery: state.preserveBrowserOnError,
         }),
         ...(tabUrl ? { tabUrl } : {}),
       },
     );
+  };
   const keepBrowserOpenForSettlement = (mode: BrowserCaptureSettlementMode): boolean =>
     mode === "abort"
-      ? manualLogin && (effectiveKeepBrowser || chromeOwnerDisposition === "preserve")
+      ? manualLogin
+        ? effectiveKeepBrowser || chromeOwnerDisposition === "preserve"
+        : shouldKeepLocalBrowserOpen({
+            effectiveKeepBrowser: false,
+            preserveBrowserOnError: state.preserveBrowserOnError,
+            usingCopiedProfile,
+          })
       : shouldKeepLocalBrowserOpen({
           effectiveKeepBrowser,
           preserveBrowserOnError: state.preserveBrowserOnError,
@@ -85,18 +101,20 @@ export function createLocalRunSettlementCoordinator({
   const projectSettlementRuntime = (
     mode: BrowserCaptureSettlementMode,
     runtime: BrowserRuntimeMetadata,
-  ): BrowserRuntimeMetadata =>
-    resourceAuthority.projectRuntime(runtime, {
-      keepBrowser: keepBrowserOpenForSettlement(mode),
+  ): BrowserRuntimeMetadata => {
+    const keepBrowser = keepBrowserOpenForSettlement(mode);
+    return resourceAuthority.projectRuntime(runtime, {
+      keepBrowser,
       closeOwnedTargetOnComplete: shouldCloseOwnedRunTargetAfterRun({
         runStatus: state.runStatus,
         ownsTarget: state.ownsTarget,
-        keepBrowser: effectiveKeepBrowser,
+        keepBrowser: manualLogin ? effectiveKeepBrowser : effectiveKeepBrowser || keepBrowser,
         closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
         preserveForRecovery: state.preserveBrowserOnError,
       }),
       ...(state.lastUrl ? { tabUrl: state.lastUrl } : {}),
     });
+  };
 
   resourceAuthority.configureSettlementAdapters({
     beforeProcessSettlement: async () => {

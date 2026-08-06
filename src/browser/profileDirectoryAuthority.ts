@@ -49,6 +49,10 @@ interface AuthenticatedProfileDirectory {
   readonly stats: BigIntStats;
   readonly generationMarker?: ProfileDirectoryGenerationMarker;
 }
+interface AuthenticatedProfileDirectoryOptions {
+  readonly forceLinuxGenerationMarker?: boolean;
+  readonly beforeFinalEntry?: () => void | Promise<void>;
+}
 export async function captureProfileDirectoryIdentity(
   userDataDir: string,
   options: { create?: boolean } = {},
@@ -86,9 +90,39 @@ export async function captureProfileDirectoryIdentity(
     ...physicalIdentity,
   });
 }
+export async function captureLinuxZeroBirthtimeProfileDirectoryIdentityForTest(
+  userDataDir: string,
+  options: { beforeFinalEntry?: () => void | Promise<void> } = {},
+): Promise<ProfileDirectoryIdentity> {
+  const resolvedPath = path.resolve(userDataDir);
+  await rejectProfileSymlinkTraversal(resolvedPath);
+  const canonicalPath = await realpath(resolvedPath);
+  const authenticated = await captureAuthenticatedProfileDirectory(canonicalPath, {
+    forceLinuxGenerationMarker: true,
+    beforeFinalEntry: options.beforeFinalEntry,
+  });
+  const physicalIdentity = physicalDirectoryIdentityFromStats(authenticated.stats);
+  if (
+    process.platform !== "linux" ||
+    physicalIdentity.inode === "0" ||
+    !authenticated.generationMarker ||
+    authenticated.generationMarker.device !== physicalIdentity.device
+  ) {
+    throw profileGenerationPrerequisiteError(canonicalPath);
+  }
+  return Object.freeze({
+    version: MARKER_PROFILE_IDENTITY_VERSION,
+    platform: "linux",
+    canonicalPath,
+    ...physicalIdentity,
+    birthtimeNs: "0",
+    generationMarker: authenticated.generationMarker,
+  });
+}
 
 async function captureAuthenticatedProfileDirectory(
   canonicalPath: string,
+  options: AuthenticatedProfileDirectoryOptions = {},
 ): Promise<AuthenticatedProfileDirectory> {
   const before = await lstat(canonicalPath, { bigint: true });
   if (!before.isDirectory() || before.isSymbolicLink()) {
@@ -136,9 +170,10 @@ async function captureAuthenticatedProfileDirectory(
       throw profileGenerationPrerequisiteError(canonicalPath);
     }
     const generationMarker =
-      authenticated.birthtimeNs === 0n
+      authenticated.birthtimeNs === 0n || options.forceLinuxGenerationMarker
         ? await captureLinuxProfileGenerationMarker(handle, authenticated, canonicalPath)
         : undefined;
+    await options.beforeFinalEntry?.();
     const finalEntry = await lstat(canonicalPath, { bigint: true });
     if (
       !finalEntry.isDirectory() ||

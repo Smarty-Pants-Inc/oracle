@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
@@ -123,6 +123,9 @@ afterEach(() => {
 async function settleLocalOwnedTarget(options: {
   mode: "finalize" | "abort";
   keepBrowser: boolean;
+  preserveBrowserOnError?: boolean;
+  usingCopiedProfile?: boolean;
+  unpublished?: boolean;
   loseTargetCapabilityBeforeSettlement?: boolean;
 }) {
   const [
@@ -152,14 +155,16 @@ async function settleLocalOwnedTarget(options: {
   state.lastTargetId = targetId;
   state.targetCloseCapability = targetCloseCapability;
   state.runStatus = "complete";
-  const config = resolveBrowserConfig({ keepBrowser: options.keepBrowser });
+  state.preserveBrowserOnError = options.preserveBrowserOnError ?? false;
+  const config = resolveBrowserConfig({ keepBrowser: options.keepBrowser, headless: false });
+  let latestRuntime: BrowserRuntimeMetadata | null = null;
   const resourceAuthority = new LocalOwnedBrowserResourceAuthority({
     ownerId: "test-owner",
     purpose: "Local ChatGPT test",
     targetLabel: "Owned Chrome",
     userDataDir: profileDir,
     profileDirectoryIdentity: profileDirectory,
-    profileKind: "temporary",
+    profileKind: options.usingCopiedProfile ? "copied" : "temporary",
     keepBrowser: options.keepBrowser,
     closeOwnedTargetOnComplete: !options.keepBrowser,
     generationId,
@@ -168,11 +173,20 @@ async function settleLocalOwnedTarget(options: {
     processOwnerDisposition: options.keepBrowser ? "preserve" : "close-on-last-lease",
     targetMarkerUrl: `about:blank#oracle-acquisition=${generationId}`,
     logger,
+    persistRuntime: async (runtime) => {
+      latestRuntime = structuredClone(runtime);
+      return runtime;
+    },
     settleTemporaryProcess: async (chrome) => {
-      if (options.mode === "finalize" && options.keepBrowser) {
+      const keepBrowser = latestRuntime?.recoveryCleanupResources?.find(
+        (resource) => resource.acquisition?.generationId === generationId,
+      )?.recoveryCleanup.keepBrowser;
+      if (keepBrowser) {
+        await chrome.endpointAuthority?.release();
         return { status: "completed", disposition: "preserved" };
       }
       await chrome.kill();
+      await rm(profileDir, { recursive: true, force: true });
       return { status: "completed", disposition: "terminated" };
     },
   });
@@ -189,7 +203,7 @@ async function settleLocalOwnedTarget(options: {
   const acquisition: LocalBrowserAcquisition = {
     config,
     manualLogin: false,
-    profileIsPreSigned: false,
+    profileIsPreSigned: options.usingCopiedProfile ?? false,
     userDataDir: profileDir,
     effectiveKeepBrowser: options.keepBrowser,
     resourceAuthority,
@@ -201,9 +215,14 @@ async function settleLocalOwnedTarget(options: {
   const coordinator = createLocalRunSettlementCoordinator({
     acquisition,
     state,
-    options: { prompt: "review" },
+    options: {
+      prompt: "review",
+      runtimeHintCb: async (runtime) => {
+        latestRuntime = structuredClone(runtime);
+      },
+    },
     logger,
-    usingCopiedProfile: false,
+    usingCopiedProfile: options.usingCopiedProfile ?? false,
     timing: { startedAt: Date.now() },
   });
   coordinator.lifecycle.markAcquired();
@@ -219,20 +238,38 @@ async function settleLocalOwnedTarget(options: {
     },
     identity,
   );
-  const transaction = coordinator.lifecycle.issueCapture({
-    answerText: "answer",
-    answerMarkdown: "answer",
-    tookMs: 1,
-    answerTokens: 1,
-    answerChars: 6,
-  });
-  const cleanup = transaction.runtime.recoveryCleanupResources?.[0]?.recoveryCleanup;
+  const projectedRuntime = coordinator.buildRuntimeMetadata();
+  const cleanup = projectedRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup;
   const disposition = cleanup?.closeOwnedTargetOnComplete;
   if (options.loseTargetCapabilityBeforeSettlement) {
     localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
   }
   try {
-    return { authority, closeTarget, disposition, result: await transaction[options.mode]() };
+    const result = await (async () => {
+      if (options.unpublished) return await coordinator.lifecycle.settleIfUnpublished();
+      const transaction = coordinator.lifecycle.issueCapture({
+        answerText: "answer",
+        answerMarkdown: "answer",
+        tookMs: 1,
+        answerTokens: 1,
+        answerChars: 6,
+      });
+      return await transaction[options.mode]();
+    })();
+    if (!result) throw new Error("Expected local browser resource settlement");
+    const profileExists = await stat(profileDir).then(
+      () => true,
+      () => false,
+    );
+    return {
+      authority,
+      closeTarget,
+      disposition,
+      profileExists,
+      projectedRuntime,
+      result,
+      targetId,
+    };
   } finally {
     localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     await rm(profileDir, { recursive: true, force: true });
@@ -259,6 +296,33 @@ describe("local owned-target disposition", () => {
       }
     },
   );
+
+  test.each([
+    { name: "temporary profile", usingCopiedProfile: false, preserved: true },
+    { name: "copied profile", usingCopiedProfile: true, preserved: false },
+  ])("unpublished abort settles a preserved $name safely", async (scenario) => {
+    const settlement = await settleLocalOwnedTarget({
+      mode: "abort",
+      keepBrowser: false,
+      preserveBrowserOnError: true,
+      usingCopiedProfile: scenario.usingCopiedProfile,
+      unpublished: true,
+    });
+
+    expect(settlement.result.status).toBe("completed");
+    expect(
+      settlement.projectedRuntime.recoveryCleanupResources?.[0]?.recoveryCleanup.keepBrowser,
+    ).toBe(scenario.preserved);
+    expect(settlement.disposition).toBe(!scenario.preserved);
+    expect(settlement.closeTarget).toHaveBeenCalledTimes(scenario.preserved ? 0 : 1);
+    expect(settlement.result.runtime.chromeTargetId).toBe(
+      scenario.preserved ? settlement.targetId : undefined,
+    );
+    expect(settlement.result.runtime.recoveryCleanupResources).toBeUndefined();
+    expect(settlement.result.runtime.recoveryCleanupResult).toBeUndefined();
+    expect(settlement.authority.kill).toHaveBeenCalledTimes(scenario.preserved ? 0 : 1);
+    expect(settlement.profileExists).toBe(scenario.preserved);
+  });
 
   test.each(["finalize", "abort"] as const)(
     "%s lets exact temporary-process teardown settle a target capability lost on restart",

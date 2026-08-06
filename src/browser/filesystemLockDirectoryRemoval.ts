@@ -65,6 +65,8 @@ interface InFlightIsolatedDirectoryRemoval {
 // Retained release and replay can converge on the same journal in one process. Only the first
 // exact-authority attempt may spawn a removal helper; concurrent callers share its settlement.
 const inFlightIsolatedDirectoryRemovals = new Map<string, InFlightIsolatedDirectoryRemoval>();
+// Replay must not finalize a journaled empty root while its generation move is still in flight.
+const inFlightIsolatedDirectoryPreparations = new Map<string, Promise<void>>();
 
 // The journal is durable before the candidate rename. A crash can therefore leave either an
 // empty prepared root or the exact moved generation, and restart can distinguish both without
@@ -87,103 +89,114 @@ export async function isolateDirectoryGenerationForRemoval(
   const rootPath = await mkdtemp(
     path.join(parentPath, isolatedDirectoryRemovalRootPrefix(canonicalReplayKey)),
   );
+  const preparation = Promise.withResolvers<void>();
+  inFlightIsolatedDirectoryPreparations.set(rootPath, preparation.promise);
   try {
-    await chmod(rootPath, 0o700);
-  } catch (error) {
-    await removeFreshEmptyIsolationRoot(rootPath);
-    throw error;
-  }
-
-  const rootIdentity = await capturePhysicalDirectoryIdentity(rootPath);
-  let generationIdentity: IsolatedDirectoryIdentity;
-  try {
-    generationIdentity = await capturePhysicalDirectoryIdentity(canonicalCandidatePath);
-  } catch (error) {
-    await removeFreshEmptyIsolationRoot(rootPath);
-    if (readErrorCode(error) === "ENOENT") return { status: "missing" };
-    throw error;
-  }
-
-  let matches: boolean;
-  try {
-    matches = await verifyGeneration(canonicalCandidatePath);
-  } catch (error) {
-    await removeFreshEmptyIsolationRoot(rootPath);
-    throw error;
-  }
-  const candidateAfterVerification = await inspectIsolatedDirectoryIdentity(
-    canonicalCandidatePath,
-    generationIdentity,
-  );
-  if (!matches || candidateAfterVerification !== "matches") {
-    await removeFreshEmptyIsolationRoot(rootPath);
-    return candidateAfterVerification === "missing" ? { status: "missing" } : { status: "changed" };
-  }
-
-  const journal: IsolatedDirectoryCleanupJournal = {
-    version: 1,
-    platform: process.platform,
-    journalNonce: randomUUID(),
-    rootPath,
-    rootIdentity,
-    generationName: ISOLATED_REMOVAL_GENERATION_NAME,
-    generationIdentity,
-  };
-  await persistIsolatedDirectoryCleanupJournal(journal);
-  if ((await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches") {
-    throw new Error(`Isolated cleanup root changed before generation move: ${rootPath}`);
-  }
-
-  const generationPath = path.join(rootPath, ISOLATED_REMOVAL_GENERATION_NAME);
-  try {
-    await renameLockPath(canonicalCandidatePath, generationPath);
-  } catch (error) {
     try {
-      await removeIsolatedDirectoryGeneration(rootPath);
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        `Filesystem generation isolation and prepared-journal cleanup both failed at ${canonicalCandidatePath}`,
-      );
+      await chmod(rootPath, 0o700);
+    } catch (error) {
+      await removeFreshEmptyIsolationRoot(rootPath);
+      throw error;
     }
-    if (readErrorCode(error) === "ENOENT") return { status: "missing" };
-    throw error;
-  }
 
-  try {
-    await syncDirectory(rootPath);
-    await syncDirectory(parentPath);
-    if (
-      (await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches" ||
-      (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
-    ) {
-      throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
+    const rootIdentity = await capturePhysicalDirectoryIdentity(rootPath);
+    let generationIdentity: IsolatedDirectoryIdentity;
+    try {
+      generationIdentity = await capturePhysicalDirectoryIdentity(canonicalCandidatePath);
+    } catch (error) {
+      await removeFreshEmptyIsolationRoot(rootPath);
+      if (readErrorCode(error) === "ENOENT") return { status: "missing" };
+      throw error;
     }
-    matches = await verifyGeneration(generationPath);
-    if (
-      (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
-    ) {
-      throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
+
+    let matches: boolean;
+    try {
+      matches = await verifyGeneration(canonicalCandidatePath);
+    } catch (error) {
+      await removeFreshEmptyIsolationRoot(rootPath);
+      throw error;
     }
-  } catch (error) {
-    await restoreIsolatedDirectoryGeneration(
+    const candidateAfterVerification = await inspectIsolatedDirectoryIdentity(
       canonicalCandidatePath,
-      rootPath,
-      generationPath,
-      journal,
+      generationIdentity,
     );
-    throw error;
-  }
-  if (!matches) {
-    await restoreIsolatedDirectoryGeneration(
-      canonicalCandidatePath,
+    if (!matches || candidateAfterVerification !== "matches") {
+      await removeFreshEmptyIsolationRoot(rootPath);
+      return candidateAfterVerification === "missing"
+        ? { status: "missing" }
+        : { status: "changed" };
+    }
+
+    const journal: IsolatedDirectoryCleanupJournal = {
+      version: 1,
+      platform: process.platform,
+      journalNonce: randomUUID(),
       rootPath,
-      generationPath,
-      journal,
-    );
-    return { status: "changed" };
+      rootIdentity,
+      generationName: ISOLATED_REMOVAL_GENERATION_NAME,
+      generationIdentity,
+    };
+    await persistIsolatedDirectoryCleanupJournal(journal);
+    if ((await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches") {
+      throw new Error(`Isolated cleanup root changed before generation move: ${rootPath}`);
+    }
+
+    const generationPath = path.join(rootPath, ISOLATED_REMOVAL_GENERATION_NAME);
+    try {
+      await renameLockPath(canonicalCandidatePath, generationPath);
+    } catch (error) {
+      try {
+        await removeIsolatedDirectoryGenerationNow(rootPath);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Filesystem generation isolation and prepared-journal cleanup both failed at ${canonicalCandidatePath}`,
+        );
+      }
+      if (readErrorCode(error) === "ENOENT") return { status: "missing" };
+      throw error;
+    }
+
+    try {
+      await syncDirectory(rootPath);
+      await syncDirectory(parentPath);
+      if (
+        (await inspectIsolatedDirectoryIdentity(rootPath, rootIdentity)) !== "matches" ||
+        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
+      ) {
+        throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
+      }
+      matches = await verifyGeneration(generationPath);
+      if (
+        (await inspectIsolatedDirectoryIdentity(generationPath, generationIdentity)) !== "matches"
+      ) {
+        throw new Error(`Filesystem isolated generation changed at ${canonicalCandidatePath}`);
+      }
+    } catch (error) {
+      await restoreIsolatedDirectoryGeneration(
+        canonicalCandidatePath,
+        rootPath,
+        generationPath,
+        journal,
+      );
+      throw error;
+    }
+    if (!matches) {
+      await restoreIsolatedDirectoryGeneration(
+        canonicalCandidatePath,
+        rootPath,
+        generationPath,
+        journal,
+      );
+      return { status: "changed" };
+    }
+    return { status: "isolated", rootPath, generationPath };
+  } finally {
+    if (inFlightIsolatedDirectoryPreparations.get(rootPath) === preparation.promise) {
+      inFlightIsolatedDirectoryPreparations.delete(rootPath);
+    }
+    preparation.resolve();
   }
-  return { status: "isolated", rootPath, generationPath };
 }
 
 export function removeIsolatedDirectoryGeneration(
@@ -191,6 +204,17 @@ export function removeIsolatedDirectoryGeneration(
   deps: IsolatedDirectoryRemovalDeps = {},
 ): Promise<void> {
   const canonicalRootPath = path.resolve(rootPath);
+  const preparation = inFlightIsolatedDirectoryPreparations.get(canonicalRootPath);
+  if (preparation !== undefined) {
+    return preparation.then(() => removeIsolatedDirectoryGeneration(canonicalRootPath, deps));
+  }
+  return removeIsolatedDirectoryGenerationNow(canonicalRootPath, deps);
+}
+
+function removeIsolatedDirectoryGenerationNow(
+  canonicalRootPath: string,
+  deps: IsolatedDirectoryRemovalDeps = {},
+): Promise<void> {
   const existing = inFlightIsolatedDirectoryRemovals.get(canonicalRootPath);
   if (existing !== undefined) return existing.removal;
 
@@ -389,7 +413,7 @@ async function restoreIsolatedDirectoryGeneration(
       { cause: error },
     );
   }
-  await removeIsolatedDirectoryGeneration(rootPath);
+  await removeIsolatedDirectoryGenerationNow(rootPath);
 }
 
 async function deleteIsolatedGenerationWithBoundHelper(
