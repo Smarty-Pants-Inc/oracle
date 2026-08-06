@@ -138,7 +138,7 @@ describe("Windows remote transaction private ACL authority", () => {
   });
 
   test.runIf(process.platform === "win32")(
-    "repairs an Everyone-readable key and transaction tree once without mutating the repaired key identity",
+    "repairs an ACL broadened after open on the next same-instance read without mutating the key identity",
     async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-private-acl-"));
       const directory = path.join(root, "remote-transactions");
@@ -185,35 +185,7 @@ foreach ($ItemPath in $ItemPaths) {
           { timeout: 12_000, windowsHide: true },
         );
 
-        const reopened = await RemoteTransactionStore.open({ directory, integrityKeyPath });
-        await expect(reopened.read(transactionToken)).resolves.toMatchObject({ transactionToken });
-        const keyAfterRepair = await fs.lstat(integrityKeyPath, { bigint: true });
-
-        const secondAuthorityPass = await RemoteTransactionStore.open({
-          directory,
-          integrityKeyPath,
-        });
-        await expect(secondAuthorityPass.read(transactionToken)).resolves.toMatchObject({
-          transactionToken,
-        });
-        const keyAfterSecondAuthorityPass = await fs.lstat(integrityKeyPath, { bigint: true });
-        expect([
-          keyAfterSecondAuthorityPass.dev,
-          keyAfterSecondAuthorityPass.ino,
-          keyAfterSecondAuthorityPass.birthtimeNs,
-          keyAfterSecondAuthorityPass.ctimeNs,
-          keyAfterSecondAuthorityPass.size,
-          keyAfterSecondAuthorityPass.mode,
-          keyAfterSecondAuthorityPass.nlink,
-        ]).toEqual([
-          keyAfterRepair.dev,
-          keyAfterRepair.ino,
-          keyAfterRepair.birthtimeNs,
-          keyAfterRepair.ctimeNs,
-          keyAfterRepair.size,
-          keyAfterRepair.mode,
-          keyAfterRepair.nlink,
-        ]);
+        await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
 
         const verifyScript = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -251,6 +223,34 @@ foreach ($ItemPath in $ItemPaths) {
           { encoding: "utf8", timeout: 12_000, windowsHide: true },
         );
         expect(stdout).toBe("private");
+
+        const keyAfterRepair = await fs.lstat(integrityKeyPath, { bigint: true });
+
+        const secondAuthorityPass = await RemoteTransactionStore.open({
+          directory,
+          integrityKeyPath,
+        });
+        await expect(secondAuthorityPass.read(transactionToken)).resolves.toMatchObject({
+          transactionToken,
+        });
+        const keyAfterSecondAuthorityPass = await fs.lstat(integrityKeyPath, { bigint: true });
+        expect([
+          keyAfterSecondAuthorityPass.dev,
+          keyAfterSecondAuthorityPass.ino,
+          keyAfterSecondAuthorityPass.birthtimeNs,
+          keyAfterSecondAuthorityPass.ctimeNs,
+          keyAfterSecondAuthorityPass.size,
+          keyAfterSecondAuthorityPass.mode,
+          keyAfterSecondAuthorityPass.nlink,
+        ]).toEqual([
+          keyAfterRepair.dev,
+          keyAfterRepair.ino,
+          keyAfterRepair.birthtimeNs,
+          keyAfterRepair.ctimeNs,
+          keyAfterRepair.size,
+          keyAfterRepair.mode,
+          keyAfterRepair.nlink,
+        ]);
       } finally {
         await fs.rm(root, { recursive: true, force: true });
       }
