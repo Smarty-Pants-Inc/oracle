@@ -8,6 +8,7 @@ import { runBridgeHost } from "../../src/cli/bridge/host.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import {
   applyWindowsPrivateFileAcl,
+  buildWindowsPrivateFileAclCommand,
   type WindowsPrivateFileAclRequest,
 } from "../../src/windowsPrivateFileAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
@@ -41,6 +42,7 @@ interface WindowsAclSnapshot {
   readonly path: string;
   readonly sddl: string;
   readonly protected: boolean;
+  readonly everyoneRuleCount: number;
 }
 
 afterEach(() => {
@@ -136,10 +138,12 @@ $Paths = @(([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encod
 $Snapshots = @($Paths | ForEach-Object {
   $Item = Get-Item -LiteralPath ([string]$_) -Force
   $Acl = $Item.GetAccessControl()
+  $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
   [pscustomobject]@{
     path = [string]$_
     sddl = $Acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
     protected = $Acl.AreAccessRulesProtected
+    everyoneRuleCount = @($Rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count
   }
 })
 [Console]::Out.Write((ConvertTo-Json -Compress -InputObject $Snapshots))`;
@@ -158,7 +162,61 @@ $Snapshots = @($Paths | ForEach-Object {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
+async function addWindowsParentReadInheritance(directoryPath: string): Promise<void> {
+  const encodedPath = Buffer.from(directoryPath, "utf8").toString("base64");
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$DirectoryPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}'))
+$Item = Get-Item -LiteralPath $DirectoryPath -Force
+$Acl = $Item.GetAccessControl()
+$Acl.SetAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+  [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+  ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+  [System.Security.AccessControl.PropagationFlags]::None,
+  [System.Security.AccessControl.AccessControlType]::Allow
+))
+$Item.SetAccessControl($Acl)
+[Console]::Out.Write('oracle.bridge-parent-acl:complete')`;
+  const { stdout } = await execFileAsync(
+    resolveWindowsPowerShellExecutable(),
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64"),
+    ],
+    { encoding: "utf8", timeout: 12_000, windowsHide: true },
+  );
+  expect(stdout).toBe("oracle.bridge-parent-acl:complete");
+}
 describe("bridge connection artifact privacy", () => {
+  it("creates Windows files through the trusted exact-ACL FileStream constructor", async () => {
+    const request: WindowsPrivateFileAclRequest = {
+      filePath: String.raw`C:\Users\Oracle\bridge-connection.tmp`,
+      repair: false,
+      createNew: true,
+    };
+    const command = buildWindowsPrivateFileAclCommand(request);
+    const script = Buffer.from(command.args.at(-1)!, "base64").toString("utf16le");
+    expect(command.file).toBe(resolveWindowsPowerShellExecutable());
+    expect(command.args.slice(0, -1)).toEqual([
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+    ]);
+    expect(script).toContain("$CreateNew = $true");
+    expect(script).toContain("[System.IO.FileMode]::CreateNew");
+    expect(script).toContain("[System.IO.FileShare]::None");
+    expect(script).toMatch(/\[System\.IO\.FileStream\]::new\([\s\S]*?\$ExpectedAcl\s*\)/u);
+
+    const execute = vi.fn(async () => ({ stdout: "oracle.private-file.v1:complete" }));
+    await expect(applyWindowsPrivateFileAcl(request, execute)).resolves.toBeUndefined();
+    expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
+  });
+
   it.runIf(process.platform !== "win32")(
     "replaces only the POSIX connection file beside a reparse point and more than 4096 siblings",
     async () => {
@@ -210,11 +268,17 @@ describe("bridge connection artifact privacy", () => {
     const reparseBefore = await captureEntryFingerprint(fixture.reparsePath);
     const fleetBefore = await captureEntryFingerprint(fixture.fleetSentinelPath);
     const requests: WindowsPrivateFileAclRequest[] = [];
+    const contentsAtAuthority: string[] = [];
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
       requests.push(request);
+      if (request.createNew) {
+        const handle = await fs.open(request.filePath, "wx", 0o600);
+        await handle.close();
+      }
       const entry = await fs.lstat(request.filePath);
       expect(entry.isFile()).toBe(true);
       expect(entry.isSymbolicLink()).toBe(false);
+      contentsAtAuthority.push(await fs.readFile(request.filePath, "utf8"));
     });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -225,10 +289,19 @@ describe("bridge connection artifact privacy", () => {
       };
       expect(artifact.remoteToken).toMatch(/^[0-9a-f]{64}$/u);
       expect(artifact.remoteToken).not.toBe(PREDECESSOR_TOKEN);
-      expect(requests.map(({ repair }) => repair)).toEqual([true, false]);
+      expect(
+        requests.map(({ createNew, repair }) => ({ createNew: createNew ?? false, repair })),
+      ).toEqual([
+        { createNew: true, repair: false },
+        { createNew: false, repair: false },
+        { createNew: false, repair: false },
+      ]);
+      expect(contentsAtAuthority.slice(0, 2)).toEqual(["", ""]);
+      expect(contentsAtAuthority[2]).toContain(artifact.remoteToken);
       expect(path.dirname(requests[0]!.filePath)).toBe(fixture.root);
+      expect(requests[0]!.filePath).toBe(requests[1]!.filePath);
       expect(requests[0]!.filePath).not.toBe(fixture.artifactPath);
-      expect(requests[1]!.filePath).toBe(fixture.artifactPath);
+      expect(requests[2]!.filePath).toBe(fixture.artifactPath);
       expect(await captureEntryFingerprint(fixture.root)).toMatchObject({
         device: parentBefore.device,
         inode: parentBefore.inode,
@@ -246,22 +319,41 @@ describe("bridge connection artifact privacy", () => {
   }, 60_000);
 
   it.runIf(process.platform === "win32")(
-    "rotates an inherited-DACL predecessor into one exact private Windows artifact",
+    "creates the temporary Windows credential with its exact ACL and leaves the inherited parent unchanged",
     async () => {
       const fixture = await createSiblingFixture();
+      await addWindowsParentReadInheritance(fixture.root);
       const [parentAclBefore, ordinaryAclBefore, predecessorAcl] = await readWindowsAclSnapshots([
         fixture.root,
         fixture.ordinaryPath,
         fixture.artifactPath,
       ]);
+      expect(parentAclBefore?.everyoneRuleCount).toBeGreaterThan(0);
       expect(predecessorAcl?.protected).toBe(false);
       const ordinaryBefore = await captureEntryFingerprint(fixture.ordinaryPath);
       const reparseBefore = await captureEntryFingerprint(fixture.reparsePath);
       const fleetBefore = await captureEntryFingerprint(fixture.fleetSentinelPath);
+      const requests: WindowsPrivateFileAclRequest[] = [];
+      const contentsAtAuthority: string[] = [];
+      let temporaryAclAtCreation: WindowsAclSnapshot | undefined;
+      let parentAclAtCreation: WindowsAclSnapshot | undefined;
+      const windowsPrivateFileAuthority = async (
+        request: WindowsPrivateFileAclRequest,
+      ): Promise<void> => {
+        requests.push(request);
+        await applyWindowsPrivateFileAcl(request);
+        contentsAtAuthority.push(await fs.readFile(request.filePath, "utf8"));
+        if (request.createNew) {
+          [parentAclAtCreation, temporaryAclAtCreation] = await readWindowsAclSnapshots([
+            fixture.root,
+            request.filePath,
+          ]);
+        }
+      };
       vi.spyOn(console, "log").mockImplementation(() => undefined);
 
       try {
-        await runReadyForegroundHost(fixture.artifactPath);
+        await runReadyForegroundHost(fixture.artifactPath, { windowsPrivateFileAuthority });
         await applyWindowsPrivateFileAcl({ filePath: fixture.artifactPath, repair: false });
         const artifact = JSON.parse(await fs.readFile(fixture.artifactPath, "utf8")) as {
           remoteToken: string;
@@ -271,10 +363,24 @@ describe("bridge connection artifact privacy", () => {
           fixture.ordinaryPath,
           fixture.artifactPath,
         ]);
+        expect(
+          requests.map(({ createNew, repair }) => ({ createNew: createNew ?? false, repair })),
+        ).toEqual([
+          { createNew: true, repair: false },
+          { createNew: false, repair: false },
+          { createNew: false, repair: false },
+        ]);
+        expect(requests[0]?.filePath).toBe(requests[1]?.filePath);
+        expect(requests[0]?.filePath).not.toBe(fixture.artifactPath);
+        expect(requests[2]?.filePath).toBe(fixture.artifactPath);
+        expect(contentsAtAuthority.slice(0, 2)).toEqual(["", ""]);
+        expect(contentsAtAuthority[2]).toContain(artifact.remoteToken);
         expect(artifact.remoteToken).toMatch(/^[0-9a-f]{64}$/u);
         expect(artifact.remoteToken).not.toBe(PREDECESSOR_TOKEN);
-        expect(artifactAclAfter?.protected).toBe(true);
-        expect(artifactAclAfter?.sddl).not.toBe(predecessorAcl?.sddl);
+        expect(temporaryAclAtCreation?.protected).toBe(true);
+        expect(temporaryAclAtCreation?.everyoneRuleCount).toBe(0);
+        expect(artifactAclAfter?.sddl).toBe(temporaryAclAtCreation?.sddl);
+        expect(parentAclAtCreation).toEqual(parentAclBefore);
         expect(parentAclAfter).toEqual(parentAclBefore);
         expect(ordinaryAclAfter).toEqual(ordinaryAclBefore);
         expect(await captureEntryFingerprint(fixture.ordinaryPath)).toEqual(ordinaryBefore);

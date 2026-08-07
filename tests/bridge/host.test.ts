@@ -50,6 +50,14 @@ async function waitForFileContents(filePath: string, timeoutMs = 5_000): Promise
   return fs.readFile(filePath, "utf8");
 }
 
+async function simulateWindowsPrivateFileCreation(
+  request: WindowsPrivateFileAclRequest,
+): Promise<void> {
+  if (!request.createNew) return;
+  const handle = await fs.open(request.filePath, "wx", 0o600);
+  await handle.close();
+}
+
 async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
   await expect
     .poll(
@@ -561,6 +569,7 @@ describe("bridge host detached child transport", () => {
     const requests: WindowsPrivateFileAclRequest[] = [];
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
       requests.push(request);
+      await simulateWindowsPrivateFileCreation(request);
       visibilityAtAcl.push(
         await fs.access(artifactPath).then(
           () => true,
@@ -568,8 +577,8 @@ describe("bridge host detached child transport", () => {
         ),
       );
       const contents = await fs.readFile(request.filePath, "utf8");
-      if (request.repair) expect(contents).toBe("");
-      else expect(contents).toContain(MODERN_TOKEN);
+      if (request.filePath === artifactPath) expect(contents).toContain(MODERN_TOKEN);
+      else expect(contents).toBe("");
     });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -583,12 +592,19 @@ describe("bridge host detached child transport", () => {
           generateReadinessNonce: () => READINESS_NONCE,
         },
       );
-      expect(windowsPrivateFileAuthority).toHaveBeenCalledTimes(2);
-      expect(requests.map(({ repair }) => repair)).toEqual([true, false]);
+      expect(windowsPrivateFileAuthority).toHaveBeenCalledTimes(3);
+      expect(
+        requests.map(({ createNew, repair }) => ({ createNew: createNew ?? false, repair })),
+      ).toEqual([
+        { createNew: true, repair: false },
+        { createNew: false, repair: false },
+        { createNew: false, repair: false },
+      ]);
       expect(requests[0]?.filePath).not.toBe(artifactPath);
+      expect(requests[0]?.filePath).toBe(requests[1]?.filePath);
       expect(path.dirname(requests[0]!.filePath)).toBe(tempDir);
-      expect(requests[1]?.filePath).toBe(artifactPath);
-      expect(visibilityAtAcl).toEqual([false, true]);
+      expect(requests[2]?.filePath).toBe(artifactPath);
+      expect(visibilityAtAcl).toEqual([false, false, true]);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -606,10 +622,11 @@ describe("bridge host detached child transport", () => {
       4242,
       true,
     );
-    let calls = 0;
-    const windowsPrivateFileAuthority = vi.fn(async () => {
-      calls += 1;
-      if (calls === 2) throw new Error("injected ACL failure");
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
+      await simulateWindowsPrivateFileCreation(request);
+      if (request.filePath === artifactPath && !request.createNew && !request.repair) {
+        throw new Error("injected ACL failure");
+      }
     });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -645,10 +662,9 @@ describe("bridge host detached child transport", () => {
       4242,
       true,
     );
-    let calls = 0;
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
-      calls += 1;
-      if (calls !== 2) return;
+      await simulateWindowsPrivateFileCreation(request);
+      if (request.filePath !== artifactPath || request.createNew || request.repair) return;
       expect(request).toEqual({ filePath: artifactPath, repair: false });
       await expect(fs.readFile(artifactPath, "utf8")).resolves.toContain(MODERN_TOKEN);
       await fs.rm(artifactPath);
@@ -693,7 +709,8 @@ describe("bridge host detached child transport", () => {
     );
     let replacementPublished = false;
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
-      if (!request.repair || replacementPublished) return;
+      await simulateWindowsPrivateFileCreation(request);
+      if (!request.createNew || replacementPublished) return;
       await fs.writeFile(artifactPath, replacement, { encoding: "utf8", flag: "wx" });
       replacementPublished = true;
     });
@@ -740,11 +757,12 @@ describe("bridge host detached child transport", () => {
     let publicationFailed = false;
     let replacementPublished = false;
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
-      if (request.filePath === artifactPath && !request.repair && !publicationFailed) {
+      await simulateWindowsPrivateFileCreation(request);
+      if (request.filePath === artifactPath && !request.createNew && !request.repair) {
         publicationFailed = true;
         throw new Error("injected final ACL failure before rollback");
       }
-      if (request.repair && publicationFailed && !replacementPublished) {
+      if (request.createNew && publicationFailed && !replacementPublished) {
         await fs.writeFile(artifactPath, replacement, { encoding: "utf8", flag: "wx" });
         replacementPublished = true;
       }
@@ -1158,11 +1176,17 @@ process.stdin.resume();
     let finalVerificationFailed = false;
     let rollbackStarted = false;
     const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
-      if (request.filePath === artifactPath && !request.repair && !finalVerificationFailed) {
+      await simulateWindowsPrivateFileCreation(request);
+      if (
+        request.filePath === artifactPath &&
+        !request.createNew &&
+        !request.repair &&
+        !finalVerificationFailed
+      ) {
         finalVerificationFailed = true;
         throw new Error("injected final ACL verification failure");
       }
-      if (request.repair && finalVerificationFailed) rollbackStarted = true;
+      if (request.createNew && finalVerificationFailed) rollbackStarted = true;
     });
     const syncDirectory = vi.spyOn(fsDurability, "syncDirectory");
     vi.spyOn(console, "log").mockImplementation(() => undefined);

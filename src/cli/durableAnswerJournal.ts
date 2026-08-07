@@ -6,6 +6,7 @@ import {
   bindCurrentBrowserRecoveryRuntime,
   settleBrowserRecoveryCleanup,
 } from "../browser/reattachSettlement.js";
+import { reattachCaptureKind, reattachPlanPromptLocator } from "../browser/reattachPlan.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../browser/types.js";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
@@ -193,6 +194,9 @@ export class DurableAnswerJournalAuthority {
     const journal = this.requireJournal();
     this.acquireRecoveryLockEffect = adapters.acquireRecoveryLock ?? this.acquireRecoveryLockEffect;
     const settleRecoveryCleanup = adapters.settleRecoveryCleanup ?? settleBrowserRecoveryCleanup;
+    const captureKind = reattachCaptureKind(browser.config);
+    const resolvePromptLocator = (runtime: BrowserRuntimeMetadata) =>
+      reattachPlanPromptLocator(runtime, browser.config, captureKind);
     const settlement = new OwnedBrowserResourceTransaction(
       {
         ownerId: sessionId,
@@ -203,6 +207,7 @@ export class DurableAnswerJournalAuthority {
             const authoritativeRuntime = bindCurrentBrowserRecoveryRuntime(
               proposedRuntime,
               await this.loadCurrentRuntime(journal.runtime),
+              resolvePromptLocator,
             );
             await sessionStore.updateSession(sessionId, {
               browser: { ...browser, runtime: authoritativeRuntime },

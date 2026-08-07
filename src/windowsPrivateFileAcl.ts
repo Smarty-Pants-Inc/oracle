@@ -9,6 +9,8 @@ const WINDOWS_PRIVATE_FILE_ACL_COMPLETE_MARKER = "oracle.private-file.v1:complet
 export interface WindowsPrivateFileAclRequest {
   readonly filePath: string;
   readonly repair: boolean;
+  /** Fail if the path exists and apply the exact private DACL in the create operation. */
+  readonly createNew?: boolean;
 }
 
 export interface WindowsFileAclCommandOptions {
@@ -28,10 +30,6 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 if ($null -eq $CurrentSid) { throw 'Current Windows identity has no user SID.' }
-$Item = [System.IO.FileInfo]::new($FilePath)
-$Item.Refresh()
-if (-not $Item.Exists) { throw "Protected file is missing: $FilePath" }
-if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Protected file is a reparse point: $FilePath" }
 
 $AllowedSidsByValue = @{}
 foreach ($CandidateSid in @(
@@ -83,6 +81,27 @@ function Assert-PrivateFileAcl([System.IO.FileInfo]$File) {
   if ($ActualRules -ne $ExpectedRules) { throw "Protected file has non-canonical private access rules: $($File.FullName); actual=[$ActualRules]; expected=[$ExpectedRules]" }
 }
 
+if ($CreateNew) {
+  $Stream = $null
+  try {
+    $Stream = [System.IO.FileStream]::new(
+      $FilePath,
+      [System.IO.FileMode]::CreateNew,
+      $FullControl,
+      [System.IO.FileShare]::None,
+      4096,
+      [System.IO.FileOptions]::None,
+      $ExpectedAcl
+    )
+  } finally {
+    if ($null -ne $Stream) { $Stream.Dispose() }
+  }
+}
+
+$Item = [System.IO.FileInfo]::new($FilePath)
+$Item.Refresh()
+if (-not $Item.Exists) { throw "Protected file is missing: $FilePath" }
+if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Protected file is a reparse point: $FilePath" }
 try {
   Assert-PrivateFileAcl $Item
 } catch {
@@ -101,6 +120,7 @@ function encodeWindowsPrivateFileAclCommand(request: WindowsPrivateFileAclReques
   const command = String.raw`
 $FilePath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}')))
 $Repair = ${request.repair ? "$true" : "$false"}
+$CreateNew = ${request.createNew ? "$true" : "$false"}
 ${WINDOWS_PRIVATE_FILE_ACL_SCRIPT}`;
   return Buffer.from(command, "utf16le").toString("base64");
 }
@@ -122,6 +142,9 @@ export function buildWindowsPrivateFileAclCommand(request: WindowsPrivateFileAcl
   readonly args: string[];
   readonly options: WindowsFileAclCommandOptions;
 } {
+  if (request.createNew && request.repair) {
+    throw new Error("Windows private file creation cannot also request ACL repair");
+  }
   if (!path.win32.isAbsolute(request.filePath)) {
     throw new Error("Windows private file protection requires an absolute native path");
   }
@@ -148,9 +171,11 @@ export async function applyWindowsPrivateFileAcl(
     ({ stdout } = await execute(command.file, command.args, command.options));
   } catch (error) {
     throw new Error(
-      request.repair
-        ? "Windows private file ACL protection failed"
-        : "Windows private file ACL verification failed",
+      request.createNew
+        ? "Windows private file creation failed"
+        : request.repair
+          ? "Windows private file ACL protection failed"
+          : "Windows private file ACL verification failed",
       { cause: error },
     );
   }

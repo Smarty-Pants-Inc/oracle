@@ -90,6 +90,9 @@ export class RemoteArtifactStore {
       await this.#transactionStore.beginArtifactNamespaceInitialization(params);
       const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
       if (this.#platform === "win32") {
+        const sessionsRoot = path.resolve(this.#sessionsRoot);
+        await mkdir(sessionsRoot, { recursive: true });
+        // The shared sessions root is only a container; private ACL authority starts at the exclusive namespace.
         const existingNamespace = await lstat(namespaceDirectory)
           .then(() => true)
           .catch((error) => {
@@ -99,20 +102,17 @@ export class RemoteArtifactStore {
         if (existingNamespace) {
           throw new Error("Remote artifact namespace was not created exclusively");
         }
-        const sessionsRoot = path.resolve(this.#sessionsRoot);
-        await this.#windowsPrivateDirectoriesAuthority([sessionsRoot, namespaceDirectory]);
+        await this.#windowsPrivateDirectoriesAuthority([namespaceDirectory]);
         namespaceCreated = true;
-        const sessionsRootIdentity = await capturePhysicalDirectoryIdentity(sessionsRoot);
         namespaceIdentity = await captureArtifactNamespaceIdentity(namespaceDirectory);
         await this.#transactionStore.bindArtifactNamespaceIdentity({
           ...params,
           identity: namespaceIdentity,
         });
 
-        const protectedDirectories = [sessionsRoot, namespaceDirectory, artifactsDirectory];
+        const protectedDirectories = [namespaceDirectory, artifactsDirectory];
         await this.#windowsPrivateDirectoriesAuthority(protectedDirectories);
         const initialIdentities = [
-          sessionsRootIdentity,
           namespaceIdentity,
           await capturePhysicalDirectoryIdentity(artifactsDirectory),
         ];

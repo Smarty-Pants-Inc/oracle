@@ -659,6 +659,46 @@ describe("browser recovery and publication rendering", () => {
     ).toBe(false);
   });
 
+  test("recovers a staged Gemini publication journal through FINALIZE cleanup", async () => {
+    const answer = "durable Gemini answer";
+    const runtime = committedGeminiRecoveryAuthority();
+    await installBrowserPublicationJournal("staged", runtime, answer);
+    const metadata: SessionMetadata = {
+      ...baseMeta,
+      status: "error",
+      mode: "browser",
+      browser: {
+        config: { desiredModel: "gemini-3-pro-deep-think" },
+        runtime,
+      },
+      response: { status: "error", incompleteReason: "incomplete-capture" },
+    };
+    const finalizedRuntime = completedBrowserCaptureCleanup(runtime).runtime;
+    readSessionMetadataMock.mockResolvedValue(metadata);
+    mockRecoveredCleanupResult({ status: "completed", runtime: finalizedRuntime });
+    writeFileAtomicDurableMock.mockImplementation(
+      async (targetPath: string, payload: string | Uint8Array) => {
+        await writeFile(targetPath, payload);
+      },
+    );
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await expect(orchestrateBrowserAttachAuthority("sess", metadata)).resolves.toBe(metadata);
+
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      "sess",
+      expect.objectContaining({
+        browser: expect.objectContaining({
+          runtime: expect.objectContaining({
+            recoveryCleanupResult: expect.objectContaining({ settlementMode: "finalize" }),
+          }),
+        }),
+      }),
+    );
+    expect(retryBrowserRecoveryCleanupMock).toHaveBeenCalledOnce();
+    await expect(readBrowserCapturePublicationJournal("sess")).resolves.toBeNull();
+  });
+
   test("retries cleanup-pending publication authority without recapturing the answer", async () => {
     const answer = "published answer awaiting cleanup";
     const runtime: BrowserRuntimeMetadata = {

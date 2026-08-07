@@ -37,6 +37,7 @@ import {
   initializeWindowsPrivateFile,
   verifyWindowsPrivateFile,
 } from "../../src/remote/windowsPrivateTreeAcl.js";
+import { transferRemoteArtifact } from "../../src/remote/clientArtifacts.js";
 
 function committedPromptEpoch(prompt: string) {
   return {
@@ -260,9 +261,8 @@ const deadlines = {
 async function writeCachedArtifactFixture(filePath: string, contents: string): Promise<void> {
   const artifactsDirectory = path.dirname(filePath);
   if (process.platform === "win32") {
-    const sessionDirectory = path.dirname(artifactsDirectory);
-    const sessionsRoot = path.dirname(sessionDirectory);
-    await establishWindowsPrivateDirectories([sessionsRoot, sessionDirectory, artifactsDirectory]);
+    await fsPromises.mkdir(path.dirname(artifactsDirectory), { recursive: true });
+    await establishWindowsPrivateDirectories([artifactsDirectory]);
     if (!(await initializeWindowsPrivateFile(filePath))) {
       throw new Error("Expected a fresh Windows private cached-artifact fixture");
     }
@@ -2115,6 +2115,15 @@ describe("remote client transport deadlines", () => {
         artifacts: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
         savedFiles: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
       });
+      const publishedStat = await fsPromises.lstat(finalPath, { bigint: true });
+      const publishedIdentity = {
+        device: publishedStat.dev.toString(),
+        inode: publishedStat.ino.toString(),
+        birthtimeNs: publishedStat.birthtimeNs.toString(),
+        ctimeNs: publishedStat.ctimeNs.toString(),
+      };
+      expect(transaction.artifacts?.[0]?.fileIdentity).toEqual(publishedIdentity);
+      expect(transaction.savedFiles?.[0]?.fileIdentity).toEqual(publishedIdentity);
       expect(transaction.warnings).toBeUndefined();
       expect(observedAtReceipt?.contents).toEqual(payload);
       expect(observedAtReceipt?.partExists).toBe(false);
@@ -2135,6 +2144,111 @@ describe("remote client transport deadlines", () => {
       await close(server);
       await fsPromises.rm(oracleHome, { recursive: true, force: true });
       syncDirectory.mockRestore();
+    }
+  });
+
+  it("rejects a final-path replacement before posting the artifact receipt", async () => {
+    const oracleHome = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "oracle-remote-artifact-generation-"),
+    );
+    setOracleHomeDirOverrideForTest(oracleHome);
+    const payload = Buffer.from("verified artifact");
+    const replacement = "replacement artifact";
+    const descriptor = {
+      artifactId: "artifact-generation",
+      runId: "run-1",
+      kind: "file" as const,
+      filename: "result.bin",
+      mimeType: "application/octet-stream",
+      byteSize: payload.byteLength,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+      sourceUrlKind: "browser-download" as const,
+      transferStatus: "ready" as const,
+      required: true,
+    };
+    const transactionToken = "f".repeat(64);
+    const finalPath = path.join(
+      oracleHome,
+      "sessions",
+      "artifact-generation",
+      "artifacts",
+      "artifact-artifact-generation.bin",
+    );
+    let receiptCount = 0;
+    let replacementIdentity:
+      | { device: string; inode: string; birthtimeNs: string; ctimeNs: string }
+      | undefined;
+    const server = createAuthenticatedServer(async (req, res) => {
+      if (
+        req.method === "GET" &&
+        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
+      ) {
+        res.setHeader("content-length", String(payload.byteLength));
+        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+        res.end(payload);
+        return;
+      }
+      if (
+        req.method === "POST" &&
+        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
+      ) {
+        receiptCount += 1;
+        await readJson(req);
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const port = await listen(server);
+
+    try {
+      await expect(
+        transferRemoteArtifact(
+          {
+            hostname: "127.0.0.1",
+            port,
+            token: "a".repeat(64),
+            descriptor,
+            transactionToken,
+            sessionId: "artifact-generation",
+            deadlines: {
+              ...deadlines,
+              controlOverallTimeoutMs: 1_000,
+              artifactOverallTimeoutMs: 1_000,
+              socketIdleTimeoutMs: 500,
+            },
+          },
+          {
+            afterHashVerification: async (authenticatedPath) => {
+              expect(authenticatedPath).toBe(finalPath);
+              await fsPromises.rename(finalPath, `${finalPath}.verified`);
+              await writeCachedArtifactFixture(finalPath, replacement);
+              const replacementStat = await fsPromises.lstat(finalPath, { bigint: true });
+              replacementIdentity = {
+                device: replacementStat.dev.toString(),
+                inode: replacementStat.ino.toString(),
+                birthtimeNs: replacementStat.birthtimeNs.toString(),
+                ctimeNs: replacementStat.ctimeNs.toString(),
+              };
+            },
+          },
+        ),
+      ).rejects.toThrow("local artifact cache generation changed after validation");
+      expect(receiptCount).toBe(0);
+      const preservedStat = await fsPromises.lstat(finalPath, { bigint: true });
+      expect({
+        device: preservedStat.dev.toString(),
+        inode: preservedStat.ino.toString(),
+        birthtimeNs: preservedStat.birthtimeNs.toString(),
+        ctimeNs: preservedStat.ctimeNs.toString(),
+      }).toEqual(replacementIdentity);
+      await expect(fsPromises.readFile(finalPath, "utf8")).resolves.toBe(replacement);
+    } finally {
+      setOracleHomeDirOverrideForTest(null);
+      await close(server);
+      await fsPromises.rm(oracleHome, { recursive: true, force: true });
     }
   });
 

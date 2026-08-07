@@ -4,17 +4,26 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
+import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import {
   createRemoteBrowserTransactionExecutor,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
-import type { ReattachDeps, retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
+import {
+  resumeBrowserSession,
+  type ReattachDeps,
+  type retryBrowserRecoveryCleanup,
+} from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
-import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
+import {
+  createTemporaryProfileAuthority,
+  establishPrivateRuntimeAuthority,
+} from "../../src/privateTempRoot.js";
+import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import {
   captureProfileDirectoryIdentity,
@@ -383,6 +392,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             answerMarkdown: transaction.answerMarkdown,
             runtime: transaction.runtime,
             bindSettlement: transaction.bindSettlement,
+            releaseSettlementLock: vi.fn(async () => undefined),
             finalize: transaction.finalize,
             abort: transaction.abort,
           };
@@ -435,6 +445,141 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
     15_000,
   );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "releases the real recovery lock after publication failure and reacquires it on retry",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recovery-lock-"));
+      const transactionStoreDir = path.join(tmpDir, "transactions");
+      const transactionToken = "7".repeat(64);
+      const prompt = "retry after recovered publication failure";
+      const controllerGeneration = "recovery-lock-controller";
+      const runtime: BrowserRunTransaction["runtime"] = {
+        conversationId: "remote-conversation",
+        promptEpoch: committedPromptEpoch(prompt),
+        recoveryCleanupResources: [
+          {
+            conversationId: "remote-conversation",
+            promptEpoch: committedPromptEpoch(prompt),
+            recoveryCleanup: {
+              ownsTarget: false,
+              profileKind: "none",
+              keepBrowser: true,
+            },
+          },
+        ],
+      };
+      const seeded = await openTestRemoteTransactionStore({
+        directory: transactionStoreDir,
+        integrityKeyPath: path.join(
+          path.dirname(transactionStoreDir),
+          ".remote-transaction-integrity.key",
+        ),
+        controllerGeneration: `${controllerGeneration}-seed`,
+      });
+      await seedRemoteTransaction(seeded, transactionToken, {
+        prompt,
+        state: "running",
+        runtime,
+      });
+      const seededArtifacts = new RemoteArtifactStore({
+        transactionStore: seeded,
+        sessionsRoot: path.join(tmpDir, "sessions"),
+      });
+      await seededArtifacts.createArtifactWriteAuthority({
+        transactionToken,
+        runId: `run-${transactionToken.slice(0, 8)}`,
+      });
+      const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: tmpDir });
+      const recoveryLockPath = path.join(lockAuthority.path, "browser-recovery.lock");
+      const recoverSession = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => ({
+        answerText: "recovered after lock release",
+        answerMarkdown: "recovered after lock release",
+        runtime: recoveryRuntime,
+        finalizeResources: async () => completedBrowserCaptureCleanup(recoveryRuntime),
+        abortResources: async () => completedBrowserCaptureCleanup(recoveryRuntime),
+      }));
+      const resumeBrowser = vi.fn(
+        async (
+          recoveryRuntime: BrowserRunTransaction["runtime"],
+          browserConfig: BrowserSessionConfig | undefined,
+          logger: BrowserLogger,
+          deps: ReattachDeps = {},
+        ) =>
+          await resumeBrowserSession(recoveryRuntime, browserConfig, logger, {
+            ...deps,
+            recoveryLockPath,
+            acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+            recoverSession,
+            persistFinalizationResult: async (result) => result,
+            completeFinalizationAfterLockRelease: async (result) => result,
+          }),
+      );
+      const stageCapture = vi
+        .spyOn(RemoteTransactionStore.prototype, "stageCapture")
+        .mockRejectedValueOnce(new Error("simulated recovered capture staging failure"));
+      const recordRecoverableFailure = vi
+        .spyOn(RemoteTransactionStore.prototype, "recordRecoverableFailure")
+        .mockRejectedValueOnce(new Error("simulated durable failure recording failure"));
+      const server = await createTestRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        { transactionStoreDir, controllerGeneration, resumeBrowser },
+      );
+      try {
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "a".repeat(64),
+            body: {},
+          }),
+        ).resolves.toMatchObject({ statusCode: 500, json: { error: "internal_error" } });
+
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "a".repeat(64),
+            body: {},
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 200,
+          json: {
+            status: "transaction",
+            transaction: {
+              state: "pending",
+              result: { answerText: "recovered after lock release" },
+            },
+          },
+        });
+        expect(resumeBrowser).toHaveBeenCalledTimes(2);
+        expect(recoverSession).toHaveBeenCalledTimes(2);
+        await expect(acquireReattachRecoveryLock(recoveryLockPath, lockAuthority)).rejects.toThrow(
+          /already in progress/i,
+        );
+
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            token: "a".repeat(64),
+            body: { durablePublication: true },
+          }),
+        ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        const reacquired = await acquireReattachRecoveryLock(recoveryLockPath, lockAuthority);
+        await reacquired.release();
+      } finally {
+        stageCapture.mockRestore();
+        recordRecoverableFailure.mockRestore();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "aborts cleanup-only committed epochs after restart without answer recapture",
     async () => {
@@ -763,6 +908,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             conversationId: "remote-conversation",
             runtime: acquiredTarget,
             bindSettlement: vi.fn(async () => acquiredTarget),
+            releaseSettlementLock: vi.fn(async () => undefined),
             finalize,
             abort,
           };
@@ -835,6 +981,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         answerMarkdown: "wrong answer",
         runtime: mismatchedRuntime,
         bindSettlement: vi.fn(async () => mismatchedRuntime),
+        releaseSettlementLock: vi.fn(async () => undefined),
         finalize: vi.fn(async () => ({ status: "completed" as const, runtime: mismatchedRuntime })),
         abort,
       }));

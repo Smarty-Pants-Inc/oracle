@@ -111,6 +111,7 @@ function createReattachResult(
       answerMarkdown,
       runtime: capturedRuntime,
       bindSettlement,
+      releaseSettlementLock: vi.fn(async () => undefined),
       finalize,
       abort,
     },

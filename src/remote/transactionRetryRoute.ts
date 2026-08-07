@@ -11,6 +11,7 @@ import {
   browserRuntimeFromError,
   browserTransactionFromRecoveredSession,
   projectRemotePublicResult,
+  remoteArtifactManualCopyWarning,
   serializeDurableBrowserAutomationError,
 } from "./transactionCapture.js";
 import {
@@ -79,7 +80,7 @@ export async function serveRemoteTransactionRetry(
   }
 
   try {
-    const record = await loadRetryRecord(params);
+    let record = await loadRetryRecord(params);
     if (!record) {
       sendJson(params.res, 404, {
         error: "transaction_not_retained",
@@ -96,13 +97,15 @@ export async function serveRemoteTransactionRetry(
       return;
     }
     if (record.settlementMode) {
+      const transactionToken = record.transactionToken;
+      const settlementMode = record.settlementMode;
       const settled = (
         await params.runBrowserWork(
           async () =>
             await params.transactionCoordinator.settle({
-              transactionToken: record.transactionToken,
-              mode: record.settlementMode!,
-              durablePublication: record.settlementMode === "finalize",
+              transactionToken,
+              mode: settlementMode,
+              durablePublication: settlementMode === "finalize",
             }),
         )
       ).record;
@@ -110,10 +113,11 @@ export async function serveRemoteTransactionRetry(
       return;
     }
     if (requiresCleanupOnlyCommittedPromptRecovery(record.runtime)) {
+      const transactionToken = record.transactionToken;
       const outcome = await params.runBrowserWork(
         async () =>
           await params.transactionCoordinator.settle({
-            transactionToken: record.transactionToken,
+            transactionToken,
             mode: "abort",
             durablePublication: false,
           }),
@@ -138,6 +142,25 @@ export async function serveRemoteTransactionRetry(
       };
       sendJson(params.res, 200, response);
       return;
+    }
+    if (record.stagedCapture && record.stagedCapture.artifacts === undefined) {
+      const staged = record.stagedCapture;
+      record = await params.transactionStore.stageCapture({
+        transactionToken: record.transactionToken,
+        runId: record.runId,
+        result: {
+          ...staged.result,
+          warnings: [
+            ...(staged.result.warnings ?? []),
+            remoteArtifactManualCopyWarning(
+              "Automatic remote artifact transfer could not be prepared. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
+            ),
+          ].slice(-64),
+        },
+        runtime: staged.runtime,
+        modelSelection: staged.modelSelection,
+        artifacts: [],
+      });
     }
     if (record.stagedCapture?.artifacts !== undefined) {
       const targetLivenessUnavailable =
@@ -224,115 +247,131 @@ async function recoverTransaction(
 ): Promise<{ statusCode: number; body: RemoteTransactionRetryResponse }> {
   const recoveryRuntime = record.runtime;
   const recoveryStartedAt = Date.now();
-  let recovered: ReattachResult;
+  let recovered: ReattachResult | undefined;
+  let coordinatorOwnsSettlement = false;
   try {
-    recovered = await params.resumeBrowser(recoveryRuntime, record.browserConfig, params.logger, {
-      sessionId: record.transactionToken,
-      pendingPromptSha256Authorities: record.requestIdentity.acceptedPromptSha256,
-      runtimeHintCb: async (runtime) => {
-        if (runtime.recoveryCleanupResult?.settlementMode) {
-          await params.transactionStore.persistSettlementRuntime(record.transactionToken, runtime);
-        } else {
-          await params.transactionStore.journalRecoveryRuntime(record.transactionToken, runtime);
-        }
-      },
-    });
-  } catch (rawError) {
-    const error =
-      rawError instanceof BrowserAutomationError
-        ? rawError
-        : new BrowserAutomationError(
-            rawError instanceof Error ? rawError.message : "Remote browser recovery failed",
-            { stage: "remote-answer-recovery" },
-            rawError,
-          );
-    const terminalFailure = isTerminalRemoteBrowserAutomationError(error);
-    const failed = await params.transactionStore.recordRecoverableFailure({
-      transactionToken: record.transactionToken,
-      runtime: browserRuntimeFromError(error) ?? recoveryRuntime,
-      error: serializeDurableBrowserAutomationError(error, !terminalFailure),
-      settlementMode: terminalFailure ? "abort" : undefined,
-    });
-    if (!terminalFailure) {
-      return { statusCode: 200, body: retryFailureResponse(failed) };
-    }
-    const settled = (
-      await params.transactionCoordinator.settle({
+    try {
+      recovered = await params.resumeBrowser(recoveryRuntime, record.browserConfig, params.logger, {
+        sessionId: record.transactionToken,
+        pendingPromptSha256Authorities: record.requestIdentity.acceptedPromptSha256,
+        runtimeHintCb: async (runtime) => {
+          if (runtime.recoveryCleanupResult?.settlementMode) {
+            await params.transactionStore.persistSettlementRuntime(
+              record.transactionToken,
+              runtime,
+            );
+          } else {
+            await params.transactionStore.journalRecoveryRuntime(record.transactionToken, runtime);
+          }
+        },
+      });
+    } catch (rawError) {
+      const error =
+        rawError instanceof BrowserAutomationError
+          ? rawError
+          : new BrowserAutomationError(
+              rawError instanceof Error ? rawError.message : "Remote browser recovery failed",
+              { stage: "remote-answer-recovery" },
+              rawError,
+            );
+      const terminalFailure = isTerminalRemoteBrowserAutomationError(error);
+      const failed = await params.transactionStore.recordRecoverableFailure({
         transactionToken: record.transactionToken,
-        mode: "abort",
-        durablePublication: false,
-      })
-    ).record;
-    return { statusCode: 200, body: retryFailureResponse(settled) };
-  }
+        runtime: browserRuntimeFromError(error) ?? recoveryRuntime,
+        error: serializeDurableBrowserAutomationError(error, !terminalFailure),
+        settlementMode: terminalFailure ? "abort" : undefined,
+      });
+      if (!terminalFailure) {
+        return { statusCode: 200, body: retryFailureResponse(failed) };
+      }
+      const settled = (
+        await params.transactionCoordinator.settle({
+          transactionToken: record.transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        })
+      ).record;
+      return { statusCode: 200, body: retryFailureResponse(settled) };
+    }
 
-  const capture = browserTransactionFromRecoveredSession(recovered, Date.now() - recoveryStartedAt);
-  const result = browserRunResultFromTransaction(capture);
-  try {
-    assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
-    const fileArtifacts: SessionArtifact[] = [
-      ...(result.savedFiles ?? []),
-      ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
-    ];
-    const registrations = await params.artifactStore.prepareRequiredArtifacts({
-      transactionToken: record.transactionToken,
-      runId: record.runId,
-      artifacts: fileArtifacts,
-    });
-    await params.transactionStore.stageCapture({
-      transactionToken: record.transactionToken,
-      runId: record.runId,
-      result: projectRemotePublicResult(result),
-      runtime: capture.runtime,
-      modelSelection: result.modelSelection,
-      artifacts: registrations,
-    });
-    const published = await params.transactionStore.publishCapture({
-      transactionToken: record.transactionToken,
-      runId: record.runId,
-      result: projectRemotePublicResult(result),
-      runtime: capture.runtime,
-      modelSelection: result.modelSelection,
-      artifacts: registrations,
-    });
-    params.transactionCoordinator.registerActive(record.transactionToken, capture);
-    return {
-      statusCode: 200,
-      body: { status: "transaction", transaction: remoteTransactionPayload(published) },
-    };
-  } catch (rawError) {
-    const error =
-      rawError instanceof BrowserAutomationError
-        ? rawError
-        : new BrowserAutomationError(
-            rawError instanceof Error
-              ? rawError.message
-              : "Recovered remote capture could not be durably published.",
-            {
-              stage: "remote-answer-publication",
-              code: "remote-answer-publication-failed",
-            },
-            rawError,
-          );
-    const terminalFailure = isAbortWorthyRemoteCaptureMismatch(rawError);
-    const failed = await params.transactionStore.recordRecoverableFailure({
-      transactionToken: record.transactionToken,
-      runtime: capture.runtime,
-      error: serializeDurableBrowserAutomationError(error, !terminalFailure),
-      settlementMode: terminalFailure ? "abort" : undefined,
-    });
-    if (!terminalFailure) {
-      return { statusCode: 200, body: retryFailureResponse(failed) };
-    }
-    params.transactionCoordinator.registerActive(record.transactionToken, capture);
-    const settled = (
-      await params.transactionCoordinator.settle({
+    if (!recovered) throw new Error("Remote browser recovery returned no capture transaction");
+    const capture = browserTransactionFromRecoveredSession(
+      recovered,
+      Date.now() - recoveryStartedAt,
+    );
+    const result = browserRunResultFromTransaction(capture);
+    try {
+      assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
+      const fileArtifacts: SessionArtifact[] = [
+        ...(result.savedFiles ?? []),
+        ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+      ];
+      const registrations = await params.artifactStore.prepareRequiredArtifacts({
         transactionToken: record.transactionToken,
-        mode: "abort",
-        durablePublication: false,
-      })
-    ).record;
-    return { statusCode: 200, body: retryFailureResponse(settled) };
+        runId: record.runId,
+        artifacts: fileArtifacts,
+      });
+      await params.transactionStore.stageCapture({
+        transactionToken: record.transactionToken,
+        runId: record.runId,
+        result: projectRemotePublicResult(result),
+        runtime: capture.runtime,
+        modelSelection: result.modelSelection,
+        artifacts: registrations,
+      });
+      const published = await params.transactionStore.publishCapture({
+        transactionToken: record.transactionToken,
+        runId: record.runId,
+        result: projectRemotePublicResult(result),
+        runtime: capture.runtime,
+        modelSelection: result.modelSelection,
+        artifacts: registrations,
+      });
+      params.transactionCoordinator.registerActive(record.transactionToken, capture);
+      coordinatorOwnsSettlement = true;
+      return {
+        statusCode: 200,
+        body: { status: "transaction", transaction: remoteTransactionPayload(published) },
+      };
+    } catch (rawError) {
+      const error =
+        rawError instanceof BrowserAutomationError
+          ? rawError
+          : new BrowserAutomationError(
+              rawError instanceof Error
+                ? rawError.message
+                : "Recovered remote capture could not be durably published.",
+              {
+                stage: "remote-answer-publication",
+                code: "remote-answer-publication-failed",
+              },
+              rawError,
+            );
+      const terminalFailure = isAbortWorthyRemoteCaptureMismatch(rawError);
+      const failed = await params.transactionStore.recordRecoverableFailure({
+        transactionToken: record.transactionToken,
+        runtime: capture.runtime,
+        error: serializeDurableBrowserAutomationError(error, !terminalFailure),
+        settlementMode: terminalFailure ? "abort" : undefined,
+      });
+      if (!terminalFailure) {
+        return { statusCode: 200, body: retryFailureResponse(failed) };
+      }
+      params.transactionCoordinator.registerActive(record.transactionToken, capture);
+      coordinatorOwnsSettlement = true;
+      const settled = (
+        await params.transactionCoordinator.settle({
+          transactionToken: record.transactionToken,
+          mode: "abort",
+          durablePublication: false,
+        })
+      ).record;
+      return { statusCode: 200, body: retryFailureResponse(settled) };
+    }
+  } finally {
+    if (recovered && !coordinatorOwnsSettlement) {
+      await recovered.releaseSettlementLock();
+    }
   }
 }
 

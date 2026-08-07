@@ -14,7 +14,6 @@ import {
 export type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattachCleanup.js";
 import { inferPortFromBrowserWSEndpoint } from "./reattachRuntime.js";
 import {
-  assertSameCommittedPromptEpoch,
   createOwnedRecoveryTargetConnection,
   resumeBrowserSessionViaNewChrome,
 } from "./reattachAcquisition.js";
@@ -37,7 +36,10 @@ import {
   openConversationFromSidebar,
 } from "./reattachHelpers.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
-import { resolvePendingPromptEpochAuthority } from "./reattachability.js";
+import {
+  assertSameCommittedPromptEpoch,
+  resolvePendingPromptEpochAuthority,
+} from "./reattachability.js";
 import { captureCommittedChatGptReattach } from "./reattachChatGptCapture.js";
 import { captureCommittedGeminiReattach } from "./reattachGeminiCapture.js";
 import { reconcilePendingReattachPrompt } from "./reattachPendingPrompt.js";

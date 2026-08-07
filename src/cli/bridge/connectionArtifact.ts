@@ -238,11 +238,21 @@ async function writePrivateConnectionFileAtomicDurable(
   let result: PublishedFile | undefined;
   let failure: unknown;
   try {
-    handle = await fs.open(temporaryPath, "wx", 0o600);
+    // PowerShell creates and closes the file with its final DACL before Node opens it.
+    if (platform === "win32") {
+      await windowsPrivateFileAuthority({
+        filePath: temporaryPath,
+        repair: false,
+        createNew: true,
+      });
+      handle = await fs.open(temporaryPath, "r+");
+    } else {
+      handle = await fs.open(temporaryPath, "wx", 0o600);
+    }
     temporaryIdentity = physicalFileIdentityFromStats(await handle.stat({ bigint: true }));
     await assertOpenFileIdentity(handle, temporaryPath, temporaryIdentity);
     if (platform === "win32") {
-      await windowsPrivateFileAuthority({ filePath: temporaryPath, repair: true });
+      await windowsPrivateFileAuthority({ filePath: temporaryPath, repair: false });
     } else {
       await handle.chmod(0o600);
       assertPrivatePosixFileMode(await handle.stat({ bigint: true }), temporaryPath);

@@ -288,6 +288,52 @@ export function requiresCleanupOnlyCommittedPromptRecovery(
     epoch.remainingFollowUps > 0
   );
 }
+export function requireCommittedPromptEpochLocator(
+  runtime: BrowserRuntimeMetadata,
+): CommittedPromptEpochLocator {
+  if (requiresCleanupOnlyCommittedPromptRecovery(runtime)) {
+    throw new BrowserAutomationError(
+      "Browser answer reattach is unavailable because the remaining follow-up prompt queue was not durably persisted; exact abort cleanup is required.",
+      {
+        stage: "prompt-epoch",
+        code: "committed-prompt-identity-mismatch",
+        reattachClassification: "cleanup-only-abort",
+        remainingFollowUps: runtime.promptEpoch?.remainingFollowUps,
+        runtime,
+      },
+    );
+  }
+  const locator = resolveCommittedPromptEpochLocator(runtime);
+  if (!locator) {
+    throw new BrowserAutomationError(
+      "Browser reattach requires a structurally valid committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
+  return locator;
+}
+
+export function assertSameCommittedPromptEpoch(
+  expected: CommittedPromptEpochLocator,
+  actual: CommittedPromptEpochLocator,
+): void {
+  if (
+    expected.epoch.epochId !== actual.epoch.epochId ||
+    expected.promptSha256 !== actual.promptSha256 ||
+    expected.conversationId !== actual.conversationId ||
+    expected.verifiedUserTurnIndex !== actual.verifiedUserTurnIndex ||
+    expected.verifiedUserTurnId !== actual.verifiedUserTurnId ||
+    expected.verifiedUserMessageId !== actual.verifiedUserMessageId ||
+    expected.epoch.baselineTurns !== actual.epoch.baselineTurns ||
+    expected.epoch.followUpOrdinal !== actual.epoch.followUpOrdinal ||
+    expected.epoch.remainingFollowUps !== actual.epoch.remainingFollowUps
+  ) {
+    throw new BrowserAutomationError(
+      "Recovered browser runtime does not match the committed prompt epoch.",
+      { stage: "prompt-epoch", code: "committed-prompt-identity-mismatch" },
+    );
+  }
+}
 
 export function hasRecoverableChatGptConversation(
   runtime: BrowserRuntimeMetadata | null | undefined,

@@ -82,6 +82,7 @@ $Inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInheri
 $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new($Everyone, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $Inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
 $Item = Get-Item -LiteralPath $ItemPaths[0] -Force
 $Acl = $Item.GetAccessControl()
+$Acl.SetAccessRuleProtection($false, $true)
 [void]$Acl.AddAccessRule($Rule)
 $Item.SetAccessControl($Acl)`;
   await execFileAsync(
@@ -89,6 +90,26 @@ $Item.SetAccessControl($Acl)`;
     buildWindowsAclTestArgs(script, [directoryPath]),
     { timeout: 12_000, windowsHide: true },
   );
+}
+
+async function captureWindowsAclSnapshot(directoryPath: string): Promise<string> {
+  const script = String.raw`
+$Everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+$Allow = [System.Security.AccessControl.AccessControlType]::Allow
+$Sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access
+$Item = Get-Item -LiteralPath $ItemPaths[0] -Force
+$Acl = $Item.GetAccessControl($Sections)
+$Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+$PermissiveInheritedRules = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Everyone.Value -and $_.IsInherited -and $_.AccessControlType -eq $Allow -and (([int64]$_.FileSystemRights -band [int64]$ReadAndExecute) -eq [int64]$ReadAndExecute) })
+$Sddl = $Acl.GetSecurityDescriptorSddlForm($Sections)
+[Console]::Out.Write("$($Acl.AreAccessRulesProtected)|$($PermissiveInheritedRules.Count)|$Sddl")`;
+  const { stdout } = await execFileAsync(
+    resolveWindowsPowerShellExecutable(),
+    buildWindowsAclTestArgs(script, [directoryPath]),
+    { encoding: "utf8", timeout: 12_000, windowsHide: true },
+  );
+  return stdout;
 }
 
 async function assertCanonicalPrivateWindowsAcls(itemPaths: readonly string[]): Promise<void> {
@@ -979,17 +1000,21 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.runIf(process.platform === "win32" && CAN_LISTEN_LOCALHOST)(
-    "keeps server transcripts, binaries, and client downloads private beneath permissive parents",
+    "keeps server artifact namespaces private without mutating the permissive shared sessions root",
     async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-artifacts-"));
       const serverHome = path.join(root, "server-home");
       const clientHome = path.join(root, "client-home");
+      const serverSessionsRoot = path.join(serverHome, "sessions");
       const transactionStoreDir = path.join(root, "transactions");
       const hostArtifactPaths: string[] = [];
       const payload = Buffer.from("private remote artifact", "utf8");
       await grantPermissiveInheritedWindowsAcl(root);
       await mkdir(serverHome);
       await mkdir(clientHome);
+      await mkdir(serverSessionsRoot);
+      const sharedSessionsAclBefore = await captureWindowsAclSnapshot(serverSessionsRoot);
+      expect(sharedSessionsAclBefore).toMatch(/^False\|[1-9]\d*\|/u);
       setOracleHomeDirOverrideForTest(serverHome);
       const server = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
@@ -1049,15 +1074,15 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         const serverArtifactsDirectory = path.dirname(hostArtifactPaths[0]!);
         const serverNamespaceDirectory = path.dirname(serverArtifactsDirectory);
         await assertCanonicalPrivateWindowsAcls([
-          path.join(serverHome, "sessions"),
           serverNamespaceDirectory,
           serverArtifactsDirectory,
           ...hostArtifactPaths,
-          path.join(clientHome, "sessions"),
-          path.join(clientHome, "sessions", "windows-private-client"),
           path.dirname(clientArtifact.path),
           clientArtifact.path,
         ]);
+        await expect(captureWindowsAclSnapshot(serverSessionsRoot)).resolves.toBe(
+          sharedSessionsAclBefore,
+        );
         await result.finalize();
       } finally {
         await server.close();

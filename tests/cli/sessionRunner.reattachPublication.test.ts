@@ -141,6 +141,7 @@ function createReattachResult(
       answerMarkdown,
       runtime: capturedRuntime,
       bindSettlement,
+      releaseSettlementLock: vi.fn(async () => undefined),
       finalize,
       abort,
     },
@@ -567,6 +568,7 @@ describe("performSessionRun", () => {
       answerMarkdown: "auto published markdown",
       runtime: capturedRuntime,
       bindSettlement: vi.fn(async () => capturedRuntime),
+      releaseSettlementLock: vi.fn(async () => undefined),
       finalize,
       abort,
     });

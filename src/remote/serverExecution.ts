@@ -29,6 +29,7 @@ import {
   browserRunResultFromTransaction,
   browserRuntimeFromError,
   hasBrowserCleanupAuthority,
+  remoteArtifactManualCopyWarning,
   projectRemotePublicResult,
   serializeDurableBrowserAutomationError,
 } from "./transactionCapture.js";
@@ -383,14 +384,7 @@ export async function handleRemoteRunRequest(params: {
       message: string,
     ): BrowserRunResult => ({
       ...source,
-      warnings: [
-        ...(source.warnings ?? []),
-        {
-          code: "remote-artifact-manual-copy-required",
-          severity: "warning" as const,
-          message,
-        },
-      ].slice(-64),
+      warnings: [...(source.warnings ?? []), remoteArtifactManualCopyWarning(message)].slice(-64),
     });
     let stagedResult = result;
     let registrations: DurableRemoteArtifactRegistration[] | undefined =

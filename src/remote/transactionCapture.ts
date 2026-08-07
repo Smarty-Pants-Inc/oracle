@@ -10,6 +10,17 @@ import type {
 import type { DurableRemoteAutomationError } from "./transactionModel.js";
 import { RemotePublicRunResultSchema, type RemotePublicRunResult } from "./types.js";
 
+export type RecoveredBrowserRunTransaction = BrowserRunTransaction &
+  Pick<ReattachResult, "releaseSettlementLock">;
+
+export function remoteArtifactManualCopyWarning(message: string) {
+  return {
+    code: "remote-artifact-manual-copy-required",
+    severity: "warning" as const,
+    message,
+  };
+}
+
 export function assertBrowserRunTransaction(
   value: unknown,
 ): asserts value is BrowserRunTransaction {
@@ -39,10 +50,11 @@ export function browserRunResultFromTransaction(
   const {
     runtime,
     bindSettlement: _bindSettlement,
+    releaseSettlementLock: _releaseSettlementLock,
     finalize: _finalize,
     abort: _abort,
     ...result
-  } = transaction;
+  } = transaction as BrowserRunTransaction & Partial<Pick<ReattachResult, "releaseSettlementLock">>;
   return {
     ...result,
     promptSubmitted: runtime.promptEpoch?.status === "committed",
@@ -52,7 +64,7 @@ export function browserRunResultFromTransaction(
 export function browserTransactionFromRecoveredSession(
   recovered: ReattachResult,
   tookMs: number,
-): BrowserRunTransaction {
+): RecoveredBrowserRunTransaction {
   const extended = recovered as ReattachResult & Partial<BrowserRunResult>;
   return {
     ...extended,
@@ -70,6 +82,7 @@ export function browserTransactionFromRecoveredSession(
     conversationId: recovered.runtime.conversationId,
     runtime: recovered.runtime,
     bindSettlement: recovered.bindSettlement,
+    releaseSettlementLock: recovered.releaseSettlementLock,
     finalize: recovered.finalize,
     abort: recovered.abort,
   };

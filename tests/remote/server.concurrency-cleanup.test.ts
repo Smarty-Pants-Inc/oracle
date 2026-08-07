@@ -46,6 +46,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           answerMarkdown: "one answer",
           runtime,
           bindSettlement: vi.fn(async () => runtime),
+          releaseSettlementLock: vi.fn(async () => undefined),
           finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
           abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
         };

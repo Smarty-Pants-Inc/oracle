@@ -14,13 +14,13 @@ import {
 } from "./reattachCleanup.js";
 import {
   assertSameCommittedPromptEpoch,
+  hasPendingPromptEpoch,
   requireCommittedPromptEpochLocator,
-} from "./reattachAcquisition.js";
-import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
-import type { CommittedPromptEpochLocator } from "./reattachability.js";
-import { hasPendingPromptEpoch } from "./reattachability.js";
+  type CommittedPromptEpochLocator,
+} from "./reattachability.js";
 import { recoveryCleanupResourceKey } from "./recoveryCleanupIdentity.js";
 import type { ReattachCapture, ReattachDeps, ReattachResult } from "./reattachContracts.js";
+import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "./reattachLock.js";
 
 export interface ReattachSettlementLockAuthority {
   ensure: () => Promise<void>;
@@ -38,7 +38,7 @@ export interface BrowserRecoverySettlementOutcome {
 
 export type BrowserRecoverySettlementMode = "finalize" | "abort";
 
-type ReattachPromptLocatorResolver = (
+export type ReattachPromptLocatorResolver = (
   runtime: BrowserRuntimeMetadata,
 ) => CommittedPromptEpochLocator;
 
@@ -72,7 +72,7 @@ const RECOVERY_LOCK_RELEASE_PENDING =
 export function bindCurrentBrowserRecoveryRuntime(
   proposedRuntime: BrowserRuntimeMetadata,
   currentRuntime: BrowserRuntimeMetadata,
-  resolvePromptLocator: ReattachPromptLocatorResolver = requireCommittedPromptEpochLocator,
+  resolvePromptLocator: ReattachPromptLocatorResolver,
 ): BrowserRuntimeMetadata {
   const requestedMode = proposedRuntime.recoveryCleanupResult?.settlementMode;
   const proposedHasCleanupAuthority = Boolean(

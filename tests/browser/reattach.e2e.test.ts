@@ -96,6 +96,7 @@ function createReattachResult(
           }
         : capturedRuntime,
     ),
+    releaseSettlementLock: vi.fn(async () => undefined),
     finalize: vi.fn(async () => {
       await onFinalize?.();
       return { status: "completed" as const, runtime: finalizedRuntime };

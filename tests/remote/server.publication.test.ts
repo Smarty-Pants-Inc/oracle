@@ -431,7 +431,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "never promotes a pre-artifact stage from the crash window",
+    "publishes a pre-manifest staged capture without browser recapture",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-pre-artifact-crash-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -487,14 +487,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
         runtime,
       });
-      const resumeBrowser = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => ({
-        answerText: "pre-artifact staged answer",
-        answerMarkdown: "pre-artifact staged answer",
-        runtime: recoveryRuntime,
-        bindSettlement: async () => recoveryRuntime,
-        finalize: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
-        abort: async () => ({ status: "completed" as const, runtime: recoveryRuntime }),
-      }));
+      const resumeBrowser = vi.fn(async () => {
+        throw new Error("retry must not recapture a durable staged answer");
+      });
       const restarted = await createTestRemoteServer(
         { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
         {
@@ -515,14 +510,18 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(retry).toMatchObject({
           statusCode: 200,
           json: {
-            status: "error",
-            error: {
-              code: "remote-answer-publication-failed",
-              recoverableDisconnect: true,
+            status: "transaction",
+            transaction: {
+              result: {
+                answerText: "pre-artifact staged answer",
+                warnings: expect.arrayContaining([
+                  expect.objectContaining({ code: "remote-artifact-manual-copy-required" }),
+                ]),
+              },
             },
           },
         });
-        expect(resumeBrowser).toHaveBeenCalledOnce();
+        expect(resumeBrowser).not.toHaveBeenCalled();
         const record = await openTestRemoteTransactionStore({
           directory: transactionStoreDir,
           integrityKeyPath: path.join(
@@ -532,12 +531,16 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           controllerGeneration: "pre-artifact-crash-reader",
         }).then((store) => store.read(transactionToken));
         expect(record).toMatchObject({
-          state: "recoverable-error",
-          stagedCapture: { result: { answerText: "pre-artifact staged answer" } },
+          state: "pending",
+          result: {
+            answerText: "pre-artifact staged answer",
+            warnings: expect.arrayContaining([
+              expect.objectContaining({ code: "remote-artifact-manual-copy-required" }),
+            ]),
+          },
+          artifacts: [],
         });
-        expect(record).not.toHaveProperty("result");
-        expect(record).not.toHaveProperty("artifacts");
-        expect(record?.stagedCapture).not.toHaveProperty("artifacts");
+        expect(record).not.toHaveProperty("stagedCapture");
       } finally {
         await restarted.close();
         await rm(tmpDir, { recursive: true, force: true });

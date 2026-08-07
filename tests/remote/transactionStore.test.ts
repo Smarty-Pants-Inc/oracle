@@ -537,7 +537,7 @@ describe("RemoteTransactionStore", () => {
     }
   });
 
-  test("never promotes an artifact-bearing stage before its durable manifest is complete", async () => {
+  test("requires an explicit manual-copy warning before completing a missing manifest", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-incomplete-manifest-"));
     const transactionToken = "4".repeat(64);
     try {
@@ -567,11 +567,47 @@ describe("RemoteTransactionStore", () => {
           artifacts: [],
         }),
       ).rejects.toMatchObject({ code: "staged_capture_artifact_manifest_incomplete" });
-      await expect(store.read(transactionToken)).resolves.toMatchObject({
+      await expect(
+        store.stageCapture({
+          transactionToken,
+          runId: "run-1",
+          result: {
+            ...capturedResult,
+            warnings: [
+              {
+                code: "remote-artifact-manual-copy-required",
+                severity: "warning",
+                message: "Generated files require manual copy from the remote browser host.",
+              },
+            ],
+          },
+          runtime,
+          artifacts: [],
+        }),
+      ).resolves.toMatchObject({
         state: "recoverable-error",
-        stagedCapture: { result: capturedResult },
+        stagedCapture: {
+          artifacts: [],
+          result: {
+            answerText: "captured",
+            warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
+          },
+        },
       });
-      expect((await store.read(transactionToken))?.stagedCapture).not.toHaveProperty("artifacts");
+      await expect(store.promoteStagedCapture({ transactionToken })).resolves.toMatchObject({
+        state: "pending",
+        artifacts: [],
+        result: {
+          answerText: "captured",
+          warnings: [expect.objectContaining({ code: "remote-artifact-manual-copy-required" })],
+        },
+      });
+      await expect(store.read(transactionToken)).resolves.toMatchObject({
+        state: "pending",
+        artifacts: [],
+        result: { answerText: "captured" },
+      });
+      expect((await store.read(transactionToken))?.stagedCapture).toBeUndefined();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

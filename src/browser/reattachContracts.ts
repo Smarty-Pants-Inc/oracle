@@ -76,6 +76,7 @@ export interface ReattachResult extends Partial<
   answerMarkdown: string;
   runtime: BrowserRuntimeMetadata;
   bindSettlement: (mode: "finalize" | "abort") => Promise<BrowserRuntimeMetadata>;
+  releaseSettlementLock: () => Promise<void>;
   finalize: () => Promise<ReattachFinalizationResult>;
   abort: () => Promise<ReattachFinalizationResult>;
 }

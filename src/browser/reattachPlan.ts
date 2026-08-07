@@ -1,10 +1,10 @@
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { resolveGeminiWebModel } from "../gemini-web/models.js";
-import { requireCommittedPromptEpochLocator } from "./reattachAcquisition.js";
 import {
   findRemoteRecoveryAuthority,
   hasPendingPromptEpoch,
+  requireCommittedPromptEpochLocator,
   resolveCommittedGeminiPromptEpochLocator,
   resolvePendingPromptEpochAuthority,
 } from "./reattachability.js";
