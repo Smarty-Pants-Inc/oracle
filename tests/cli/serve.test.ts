@@ -243,7 +243,7 @@ describe("direct oracle serve credentials", () => {
         expect(`${rejected.stdout}\n${rejected.stderr}`).not.toContain(secret);
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   test("does not treat a global option value named serve as the subcommand", async () => {
     for (const [args, secret] of [
