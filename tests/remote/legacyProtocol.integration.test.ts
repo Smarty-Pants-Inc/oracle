@@ -10,6 +10,7 @@ import {
   browserRunResultFromTransaction,
   projectRemotePublicResult,
 } from "../../src/remote/transactionCapture.js";
+import { httpPostJson } from "./serverTestHttp.js";
 import { CAN_LISTEN_LOCALHOST, createTestRemoteServer } from "./serverTestBuilders.js";
 
 // This exercises Node's actual TCP response-idle timer; fake timers cannot advance socket I/O.
@@ -63,6 +64,77 @@ describe("legacy remote protocol integration", () => {
       }).success,
     ).toBe(false);
   });
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "accepts predecessor persisted MCP browser authority fields without forwarding them",
+    async () => {
+      const directory = await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-persisted-mcp-"));
+      let receivedBrowserConfig: unknown;
+      const server = await createTestRemoteServer(
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "a".repeat(64),
+          legacyToken: "c".repeat(64),
+          logger: () => {},
+        },
+        {
+          transactionStoreDir: path.join(directory, "transactions"),
+          runBrowser: async (options) => {
+            receivedBrowserConfig = options.config;
+            return capturedTransaction(options.prompt, {
+              answerText: "accepted",
+              answerMarkdown: "accepted",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 8,
+            });
+          },
+        },
+      );
+      try {
+        const response = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: "/runs",
+          headers: { authorization: `Bearer ${"c".repeat(64)}` },
+          body: {
+            prompt: "persisted MCP compatibility",
+            attachments: [],
+            browserConfig: {
+              chatgptUrl: "https://chatgpt.com/",
+              remoteHost: "127.0.0.1:9473",
+              remoteToken: "a".repeat(64),
+              remoteViaSshReverseTunnel: {
+                ssh: "oracle@browser-host",
+                remotePort: 9473,
+                localPort: 9473,
+                identity: "~/.ssh/id_ed25519",
+                extraArgs: "-o ExitOnForwardFailure=yes",
+              },
+              remoteChromeBrowserWSEndpoint:
+                "ws://127.0.0.1:9222/devtools/browser/persisted-browser-id",
+              remoteChromeProfileRoot: "/private/var/folders/oracle-profile",
+            },
+            options: {},
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        for (const field of [
+          "remoteHost",
+          "remoteToken",
+          "remoteViaSshReverseTunnel",
+          "remoteChromeBrowserWSEndpoint",
+          "remoteChromeProfileRoot",
+        ]) {
+          expect(receivedBrowserConfig).not.toHaveProperty(field);
+        }
+      } finally {
+        await server.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("retains prompt submission in the strict public result projection", () => {
     const result = projectRemotePublicResult(

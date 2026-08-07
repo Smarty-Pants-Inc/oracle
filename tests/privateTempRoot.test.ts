@@ -2,10 +2,24 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import {
   createPrivateTempGeneration,
+  establishPrivateRuntimeAuthority,
+  privateRuntimeRootPathCandidates,
   removePrivateTempGeneration,
 } from "../src/privateTempRoot.js";
 import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
@@ -13,9 +27,87 @@ import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutab
 const execFileAsync = promisify(execFile);
 
 describe("private temporary root authority", () => {
+  test.skipIf(process.platform === "win32")(
+    "prefers only a validated XDG runtime directory and otherwise uses private Oracle state",
+    async () => {
+      const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-root-selection-"));
+      const xdg = path.join(ambient, "xdg");
+      const state = path.join(ambient, "state");
+      await mkdir(xdg, { mode: 0o700 });
+      try {
+        const xdgRoot = await establishPrivateRuntimeAuthority({
+          runtimeDirectory: xdg,
+          oracleStateDirectory: state,
+        });
+        expect(xdgRoot.path).toBe(path.join(await realpath(xdg), "oracle-private"));
+
+        await rm(xdgRoot.path, { recursive: true, force: true });
+        await chmod(xdg, 0o777);
+        const stateRoot = await establishPrivateRuntimeAuthority({
+          runtimeDirectory: xdg,
+          oracleStateDirectory: state,
+        });
+        expect(stateRoot.path).toBe(path.join(await realpath(state), "oracle-private"));
+        expect((await lstat(stateRoot.path)).mode & 0o777).toBe(0o700);
+      } finally {
+        await rm(ambient, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform !== "linux" || process.getuid?.() !== 0)(
+    "a different POSIX account cannot reserve the fixed shared-temp name",
+    async () => {
+      const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-cross-user-"));
+      await chmod(ambient, 0o777);
+      const shared = path.join(ambient, "shared");
+      const state = path.join(ambient, "state");
+      const hostileRoot = path.join(shared, "oracle-private");
+      await mkdir(shared, { mode: 0o777 });
+      await chmod(shared, 0o777);
+      const { stdout } = await execFileAsync("id", ["-u", "nobody"], { encoding: "utf8" });
+      const nobodyUid = Number.parseInt(stdout.trim(), 10);
+      try {
+        await execFileAsync(
+          process.execPath,
+          ["-e", "require('node:fs').mkdirSync(process.argv[1])", hostileRoot],
+          { uid: nobodyUid },
+        );
+        const root = await establishPrivateRuntimeAuthority({
+          runtimeDirectory: shared,
+          oracleStateDirectory: state,
+        });
+        expect(root.path).toBe(path.join(state, "oracle-private"));
+        expect((await stat(hostileRoot)).uid).toBe(nobodyUid);
+      } finally {
+        await rm(ambient, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("WSL selects only current-user Windows-backed state and otherwise fails closed", async () => {
+    const unavailable = {
+      platform: "linux" as const,
+      isWsl: true,
+      oracleStateDirectory: "/home/alice/.oracle",
+      environment: {},
+    };
+    expect(
+      privateRuntimeRootPathCandidates({
+        platform: "linux",
+        isWsl: true,
+        oracleStateDirectory: "/home/alice/.oracle",
+        environment: { LOCALAPPDATA: String.raw`C:\\Users\\Alice\\AppData\\Local` },
+      }),
+    ).toEqual(["/mnt/c/Users/Alice/AppData/Local/Oracle/oracle-private"]);
+    expect(privateRuntimeRootPathCandidates(unavailable)).toEqual([]);
+    await expect(establishPrivateRuntimeAuthority(unavailable)).rejects.toThrow(
+      /requires a current-user Windows-backed/u,
+    );
+  });
   test("proves the Windows parent before creating a per-run generation", async () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-order-"));
-    const rootPath = path.join(ambient, "oracle-private");
+    const rootPath = path.join(await realpath(ambient), "oracle-private");
     const calls: { path: string; existed: boolean }[] = [];
     let rootProven = false;
     const windowsPrivateDirectoryAuthority = vi.fn(async (directoryPath: string) => {

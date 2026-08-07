@@ -1,4 +1,4 @@
-import path from "node:path";
+import { recoveryLockPathForOwner } from "../browser/recoveryCleanupIdentity.js";
 import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { acquireReattachRecoveryLock, type ReattachRecoveryLock } from "../browser/reattachLock.js";
@@ -197,10 +197,7 @@ export class DurableAnswerJournalAuthority {
       {
         ownerId: sessionId,
         persistRuntime: async (proposedRuntime) => {
-          const lockPath = path.join(
-            (await sessionStore.getPaths(sessionId)).dir,
-            "browser-recovery.lock",
-          );
+          const lockPath = await recoveryLockPathForOwner(`session:${sessionId}`);
           await this.acquireRecoveryLock(lockPath);
           try {
             const authoritativeRuntime = bindCurrentBrowserRecoveryRuntime(
@@ -217,10 +214,7 @@ export class DurableAnswerJournalAuthority {
           }
         },
         settleResources: async (mode, runtime) => {
-          const lockPath = path.join(
-            (await sessionStore.getPaths(sessionId)).dir,
-            "browser-recovery.lock",
-          );
+          const lockPath = await recoveryLockPathForOwner(`session:${sessionId}`);
           const outcome = await settleRecoveryCleanup(
             runtime,
             logger,

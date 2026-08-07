@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { access } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { establishPrivateRuntimeAuthority } from "../privateTempRoot.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import {
@@ -268,16 +268,28 @@ export async function cleanupProfileAbsent(profileDir: string): Promise<boolean>
   }
 }
 
-export function defaultRecoveryLockPath(runtime: BrowserRuntimeMetadata): string {
+async function privateRecoveryLockPath(identity: string): Promise<string> {
+  const root = await establishPrivateRuntimeAuthority();
+  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
+  return path.join(root.path, `browser-recovery-${digest}.lock`);
+}
+
+export async function recoveryLockPathForOwner(ownerId: string): Promise<string> {
+  const owner = ownerId.trim();
+  if (!owner) throw new Error("Browser recovery lock owner id is required");
+  return await privateRecoveryLockPath(JSON.stringify(["recovery-owner-v1", owner]));
+}
+
+export async function defaultRecoveryLockPath(runtime: BrowserRuntimeMetadata): Promise<string> {
   const cleanupAuthority = (runtime.recoveryCleanupResources ?? []).map((resource) =>
     recoveryCleanupResourceKey(resource),
   );
-  const identity = JSON.stringify([
-    "recovery-v3",
-    cleanupAuthority,
-    immutablePromptIdentity(runtime.promptEpoch),
-    runtime.conversationId ?? null,
-  ]);
-  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 24);
-  return path.join(os.tmpdir(), "oracle-browser-recovery-locks", `${digest}.lock`);
+  return await privateRecoveryLockPath(
+    JSON.stringify([
+      "recovery-v4",
+      cleanupAuthority,
+      immutablePromptIdentity(runtime.promptEpoch),
+      runtime.conversationId ?? null,
+    ]),
+  );
 }

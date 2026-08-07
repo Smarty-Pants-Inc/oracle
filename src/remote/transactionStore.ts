@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat, readdir } from "node:fs/promises";
 import path from "node:path";
 import { samePhysicalDirectoryIdentity } from "../browser/filesystemLockDirectoryIdentity.js";
@@ -8,7 +7,6 @@ import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../s
 import {
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeAuthority,
-  type WindowsPrivateTreeScope,
 } from "./windowsPrivateTreeAcl.js";
 import {
   assertRemoteTransactionStoreRootAuthority,
@@ -48,23 +46,21 @@ import {
   type RemoteTransactionExpectedHead,
 } from "./transactionRecordEnvelope.js";
 import {
-  assertProtectedIntegrityKeyFile,
   loadRemoteTransactionIntegrityKey,
   publishSerializedRecord,
+  reclaimRetiredRemoteTransactionHeadAuthority,
   reconcileRemoteTransactionHeadAuthority,
   repairStaleCreatePublicationAliases,
   QuarantinableRemoteTransactionRecordIntegrityError,
   readErrorCode,
-  readStableRemoteTransactionIntegrityKey,
   readStableRemoteTransactionRecordBytes,
   RemoteTransactionRecordHeadMismatchError,
   retireRemoteTransactionHeadAuthority,
-  sameFileGeneration,
-  samePhysicalFile,
   type RemoteTransactionIntegrityKey,
   type RemoteTransactionPublicationCheckpoint,
   type RemoteTransactionPublicationOperation,
 } from "./transactionRecordStorage.js";
+import { RemoteTransactionStoreAuthority } from "./transactionStoreAuthority.js";
 import {
   isPersistedRemoteTransactionStoreEntry,
   RemoteTransactionStoreMaintenance,
@@ -113,14 +109,10 @@ export class RemoteTransactionStore {
   readonly #maximumDecodedRecordBytes: number;
   readonly #now: () => number;
   readonly #platform: NodeJS.Platform;
-  readonly #windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
-  readonly #windowsPrivateTreeScope: WindowsPrivateTreeScope;
-  readonly #windowsAuthorityContext = new AsyncLocalStorage<boolean>();
-  #windowsAuthorityLock: Promise<void> = Promise.resolve();
   readonly #afterRecordPublication?: RemoteTransactionStoreOptions["afterRecordPublication"];
   readonly #integrityKey: RemoteTransactionIntegrityKey;
-  readonly #rootAuthority: RemoteTransactionStoreRootAuthority;
   readonly #headDirectory: string;
+  readonly #authority: RemoteTransactionStoreAuthority;
   readonly #expectedHeads = new Map<string, RemoteTransactionExpectedHead>();
   readonly #maintenance: RemoteTransactionStoreMaintenance;
 
@@ -148,17 +140,15 @@ export class RemoteTransactionStore {
       options.maximumQuarantineBytes ?? MAX_REMOTE_TRANSACTION_STORE_BYTES;
     this.#now = options.now ?? Date.now;
     this.#platform = options.platform ?? process.platform;
-    this.#windowsPrivateTreeAuthority = windowsPrivateTreeAuthority;
-    this.#windowsPrivateTreeScope = {
-      authorityDirectory: rootAuthority.headDirectory,
-      storeDirectory: this.directory,
-      integrityKeyDirectory: integrityKey.directory,
-      integrityKeyPath: integrityKey.path,
-    };
     this.#afterRecordPublication = options.afterRecordPublication;
     this.#integrityKey = integrityKey;
-    this.#rootAuthority = rootAuthority;
     this.#headDirectory = rootAuthority.headDirectory;
+    this.#authority = new RemoteTransactionStoreAuthority({
+      rootAuthority,
+      integrityKey,
+      platform: this.#platform,
+      windowsPrivateTreeAuthority,
+    });
     if (
       !Number.isSafeInteger(terminalRetentionMs) ||
       terminalRetentionMs < 0 ||
@@ -201,6 +191,7 @@ export class RemoteTransactionStore {
       readAuthenticatedRecord: (targetPath, transactionToken) =>
         this.readAuthenticatedRecord(targetPath, transactionToken),
       retireAuthenticatedRecord: (transactionToken) => this.retireRecordHead(transactionToken),
+      reclaimRetiredRecord: (transactionToken) => this.reclaimRetiredRecordHead(transactionToken),
       recordPath: (transactionToken) => this.recordPath(transactionToken),
     });
   }
@@ -918,90 +909,32 @@ export class RemoteTransactionStore {
     });
   }
 
-  private async assertIntegrityDirectoryAuthority(): Promise<void> {
-    await assertRemoteTransactionStoreRootAuthority(this.#rootAuthority);
+  private async reclaimRetiredRecordHead(transactionToken: string): Promise<boolean> {
+    const expectedHead = this.#expectedHeads.get(transactionToken);
+    const reclaimed = await reclaimRetiredRemoteTransactionHeadAuthority({
+      headDirectory: this.#headDirectory,
+      storeDirectory: this.directory,
+      transactionToken,
+      expectedHead,
+      integrityKey: this.#integrityKey.bytes,
+      integrityKeyId: this.#integrityKey.keyId,
+      platform: this.#platform,
+      assertIntegrityAuthority: () => this.assertIntegrityAuthority(),
+    });
+    if (reclaimed) this.#expectedHeads.delete(transactionToken);
+    return reclaimed;
   }
 
   private async assertIntegrityAuthority(): Promise<void> {
-    await this.assertIntegrityDirectoryAuthority();
-    const currentKey = await lstat(this.#integrityKey.path, { bigint: true });
-    assertProtectedIntegrityKeyFile(currentKey, this.#platform);
-    if (!samePhysicalFile(currentKey, this.#integrityKey.fileIdentity)) {
-      throw new Error("Remote transaction integrity key generation changed");
-    }
+    await this.#authority.assertIntegrity();
   }
 
   private async initializeWindowsPrivateFile(filePath: string): Promise<void> {
-    const authority = this.#windowsPrivateTreeAuthority;
-    if (!authority) {
-      throw new Error("Windows private transaction file authority is unavailable");
-    }
-    await authority({ ...this.#windowsPrivateTreeScope, initializeFilePath: filePath });
-  }
-
-  // Windows ACL protection must not mutate the integrity key's identity, metadata, or bytes.
-  private assertWindowsIntegrityKeySnapshot(
-    current: RemoteTransactionIntegrityKey,
-    phase: "before" | "during",
-  ): void {
-    const expectedIdentity = this.#integrityKey.fileIdentity;
-    if (!sameFileGeneration(current.fileIdentity, expectedIdentity)) {
-      throw new Error(
-        `Remote transaction integrity key generation changed ${phase} Windows private ACL protection`,
-      );
-    }
-    if (
-      current.fileIdentity.ctimeNs !== expectedIdentity.ctimeNs ||
-      current.fileIdentity.mtimeNs !== expectedIdentity.mtimeNs ||
-      current.fileIdentity.size !== expectedIdentity.size ||
-      current.fileIdentity.mode !== expectedIdentity.mode ||
-      current.fileIdentity.nlink !== expectedIdentity.nlink
-    ) {
-      throw new Error(
-        `Remote transaction integrity key metadata changed ${phase} Windows private ACL protection`,
-      );
-    }
-    if (!current.bytes.equals(this.#integrityKey.bytes)) {
-      throw new Error(
-        `Remote transaction integrity key contents changed ${phase} Windows private ACL protection`,
-      );
-    }
+    await this.#authority.initializeWindowsPrivateFile(filePath);
   }
 
   private async withWindowsPrivateTreeAuthority<T>(operation: () => Promise<T>): Promise<T> {
-    const authority = this.#windowsPrivateTreeAuthority;
-    if (!authority || this.#windowsAuthorityContext.getStore()) return await operation();
-
-    const prior = this.#windowsAuthorityLock;
-    const gate = Promise.withResolvers<void>();
-    this.#windowsAuthorityLock = prior.then(() => gate.promise);
-    await prior;
-    try {
-      await this.assertIntegrityDirectoryAuthority();
-      const beforeProtection = await readStableRemoteTransactionIntegrityKey(
-        this.#integrityKey.path,
-        this.#integrityKey.directory,
-        this.#integrityKey.directoryIdentity,
-        this.#platform,
-      );
-      await this.assertIntegrityDirectoryAuthority();
-      this.assertWindowsIntegrityKeySnapshot(beforeProtection, "before");
-
-      await authority(this.#windowsPrivateTreeScope);
-
-      await this.assertIntegrityDirectoryAuthority();
-      const afterProtection = await readStableRemoteTransactionIntegrityKey(
-        this.#integrityKey.path,
-        this.#integrityKey.directory,
-        this.#integrityKey.directoryIdentity,
-        this.#platform,
-      );
-      this.assertWindowsIntegrityKeySnapshot(afterProtection, "during");
-      await this.assertIntegrityAuthority();
-      return await this.#windowsAuthorityContext.run(true, operation);
-    } finally {
-      gate.resolve();
-    }
+    return await this.#authority.run(operation);
   }
 
   private nowIso(): string {

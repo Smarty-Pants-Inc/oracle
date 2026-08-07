@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { retryBrowserRecoveryCleanup, __test__ } from "../../src/browser/reattach.js";
+import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
+import { establishPrivateRuntimeAuthority } from "../../src/privateTempRoot.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { RemoteRecoverySettlementOptions } from "../../src/remote/types.js";
 import { acquireBrowserTabLease } from "../../src/browser/tabLeaseRegistry.js";
@@ -235,6 +237,7 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
 
   test("retries no-target cleanup through exact endpoint shutdown under the recovery lock", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-retry-test-"));
+    const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
     const profileDir = await mkdtemp(path.join(root, "oracle-browser-retry-cleanup-"));
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     const events: string[] = [];
@@ -260,7 +263,8 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
         ),
         createBrowserLogger(),
         {
-          recoveryLockPath: path.join(root, "browser-recovery.lock"),
+          recoveryLockPath: path.join(lockAuthority.path, "browser-recovery.lock"),
+          acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
           recoveryCleanup: {
             ...authenticatedLocalTargetCleanupDeps({
               kill: (_profileDir, pid) => {

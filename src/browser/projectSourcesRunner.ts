@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { createPrivateTempChildGeneration } from "../privateTempRoot.js";
 import {
   closeChromeTargetWithExactAuthority,
   connectWithNewTabWithExactAuthority,
@@ -38,6 +39,7 @@ import {
   assertProjectSourcesCleanupProof,
   assertProjectSourcesCleanupStorage,
   assertProjectSourcesProfileParent,
+  assertProjectSourcesTemporaryProof,
   createProjectSourcesManualCleanupProof,
   createProjectSourcesProfileCreateIntent,
   createProjectSourcesTemporaryCleanupProof,
@@ -52,7 +54,7 @@ import {
   type ProjectSourcesCleanupStorage,
 } from "./projectSourcesRecovery.js";
 import { acquireReattachRecoveryLock } from "./reattachLock.js";
-import { resolveUserDataBaseDir, waitForLogin } from "./localExecutionContext.js";
+import { waitForLogin } from "./localExecutionContext.js";
 import { retainChromeTargetCloseCapability } from "./targetCloseAuthority.js";
 
 async function connectOwnedProjectSourcesTarget(
@@ -74,7 +76,8 @@ export async function runBrowserProjectSources(
 ): Promise<ProjectSourcesResult> {
   if (request.dryRun) return await runBrowserProjectSourcesUnlocked(request);
   const storage = await establishProjectSourcesCleanupStorage();
-  const recoveryLock = await acquireReattachRecoveryLock(storage.lockPath);
+  await assertProjectSourcesCleanupStorage(storage);
+  const recoveryLock = await acquireReattachRecoveryLock(storage.lockPath, storage.runtimeRoot);
   try {
     await assertProjectSourcesCleanupStorage(storage);
     return await runBrowserProjectSourcesUnlocked(request, storage);
@@ -151,9 +154,7 @@ async function runBrowserProjectSourcesUnlocked(
       leaseId as string,
     );
   } else {
-    const parent = await captureProfileDirectoryIdentity(await resolveUserDataBaseDir(), {
-      create: true,
-    });
+    const parent = await captureProfileDirectoryIdentity(cleanupStorage.runtimeRoot.path);
     const profileCreateIntent = createProjectSourcesProfileCreateIntent(
       cleanupStorage,
       parent,
@@ -163,18 +164,32 @@ async function runBrowserProjectSourcesUnlocked(
       profileCreate: profileCreateIntent,
     });
     await assertProjectSourcesProfileParent(profileCreateIntent, cleanupStorage);
-    await mkdir(profileCreateIntent.userDataDir);
-    userDataDir = profileCreateIntent.userDataDir;
+    const privateGeneration = await createPrivateTempChildGeneration(
+      cleanupStorage.runtimeRoot,
+      "oracle-browser-",
+      { randomId: () => targetGenerationId },
+    );
+    const establishedIntent = { ...profileCreateIntent, privateGeneration };
+    await assertProjectSourcesProfileParent(establishedIntent, cleanupStorage);
+    await persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
+      profileCreate: establishedIntent,
+    });
+    userDataDir = establishedIntent.userDataDir;
     logger(`Created temporary Chrome profile at ${userDataDir}`);
     cleanupProof = await createProjectSourcesTemporaryCleanupProof(
-      profileCreateIntent,
+      establishedIntent,
       cleanupStorage,
     );
     profileDirectoryIdentity = cleanupProof.profileDirectory;
     await persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
-      profileCreate: { ...profileCreateIntent, proof: cleanupProof },
+      profileCreate: { ...establishedIntent, proof: cleanupProof },
     });
   }
+  const assertTemporaryProfileAuthority = async (): Promise<void> => {
+    if (cleanupProof.kind === "temporary") {
+      await assertProjectSourcesTemporaryProof(cleanupProof, cleanupStorage);
+    }
+  };
 
   let cleanupRetryRuntime: BrowserRuntimeMetadata | undefined;
   const persistOwnedResources = async (
@@ -226,6 +241,10 @@ async function runBrowserProjectSourcesUnlocked(
       await persistOwnedResources(runtimeToPersist);
     },
   });
+  resources.configureSettlementAdapters({
+    beforeProcessSettlement: assertTemporaryProfileAuthority,
+    beforeTemporaryProfileRemoval: assertTemporaryProfileAuthority,
+  });
   let removeTerminationHooks: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let completed = false;
@@ -261,10 +280,21 @@ async function runBrowserProjectSourcesUnlocked(
           );
           return { kind: "manual" as const, owner };
         }
+        await assertTemporaryProfileAuthority();
         const chrome = await launchChrome({ ...config, remoteChrome: null }, userDataDir, logger, {
           launchClaim: processLaunchClaim,
         });
-        return { kind: "temporary" as const, chrome };
+        return {
+          kind: "temporary" as const,
+          chrome: {
+            ...chrome,
+            kill: async () => {
+              const termination = await chrome.kill();
+              await assertTemporaryProfileAuthority();
+              return termination;
+            },
+          },
+        };
       },
       authority: (authority) => authority,
     });

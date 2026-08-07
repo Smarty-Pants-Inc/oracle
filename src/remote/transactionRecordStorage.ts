@@ -647,7 +647,8 @@ export async function reconcileRemoteTransactionHeadAuthority(
     recordHead: RemoteTransactionExpectedHead | null;
   },
 ): Promise<RemoteTransactionHeadAuthority | null> {
-  const authority = await readRemoteTransactionHeadAuthority(options);
+  const authenticated = await readRemoteTransactionHeadAuthority(options);
+  const authority = authenticated?.authority ?? null;
   if (!authority) {
     if (!options.recordHead) return null;
     throw new RemoteTransactionRecordHeadMismatchError();
@@ -700,14 +701,101 @@ export async function retireRemoteTransactionHeadAuthority(
   });
 }
 
+export async function reclaimRetiredRemoteTransactionHeadAuthority(
+  options: RemoteTransactionHeadStorageOptions & {
+    expectedHead: RemoteTransactionExpectedHead | undefined;
+  },
+): Promise<boolean> {
+  const authenticated = await readRemoteTransactionHeadAuthority(options);
+  const authority = authenticated?.authority ?? null;
+  if (authority && !authority.retired) {
+    if (options.expectedHead) {
+      const currentAdmitsExpected = Boolean(
+        authority.current &&
+        (authority.current.revision > options.expectedHead.revision ||
+          sameRemoteTransactionHead(authority.current, options.expectedHead)),
+      );
+      const pendingAdmitsExpected = Boolean(
+        authority.pending &&
+        (authority.pending.revision > options.expectedHead.revision ||
+          sameRemoteTransactionHead(authority.pending, options.expectedHead)),
+      );
+      if (!currentAdmitsExpected && !pendingAdmitsExpected) {
+        throw new RemoteTransactionRecordIntegrityError();
+      }
+    }
+    return false;
+  }
+  if (
+    authority &&
+    options.expectedHead &&
+    !sameRemoteTransactionHead(authority.current, options.expectedHead)
+  ) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+  if (!(await syncAbsentRemoteTransactionRecord(options))) return false;
+
+  const confirmed = await readRemoteTransactionHeadAuthority(options);
+  if (!confirmed) {
+    await options.assertIntegrityAuthority();
+    await syncDirectory(options.headDirectory);
+    return true;
+  }
+  if (
+    !confirmed.authority.retired ||
+    confirmed.authority.pending ||
+    (options.expectedHead &&
+      !sameRemoteTransactionHead(confirmed.authority.current, options.expectedHead))
+  ) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+  await options.assertIntegrityAuthority();
+  const headPath = remoteTransactionHeadPath(options.headDirectory, options.transactionToken);
+  let namedIdentity: BigIntStats;
+  try {
+    namedIdentity = await lstat(headPath, { bigint: true });
+  } catch (error) {
+    if (readErrorCode(error) !== "ENOENT") throw error;
+    await options.assertIntegrityAuthority();
+    await syncDirectory(options.headDirectory);
+    return true;
+  }
+  assertPhysicalTransactionRecordFile(namedIdentity, options.platform);
+  if (!samePhysicalFile(namedIdentity, confirmed.fileIdentity)) {
+    throw new RemoteTransactionRecordIntegrityError();
+  }
+  await unlink(headPath);
+  await options.assertIntegrityAuthority();
+  await syncDirectory(options.headDirectory);
+  return true;
+}
+
+async function syncAbsentRemoteTransactionRecord(
+  options: RemoteTransactionHeadStorageOptions,
+): Promise<boolean> {
+  await options.assertIntegrityAuthority();
+  try {
+    await lstat(path.join(options.storeDirectory, `${options.transactionToken}.json`));
+    return false;
+  } catch (error) {
+    if (readErrorCode(error) !== "ENOENT") throw error;
+  }
+  await options.assertIntegrityAuthority();
+  await syncDirectory(options.storeDirectory);
+  return true;
+}
+
 export function remoteTransactionHeadPath(headDirectory: string, transactionToken: string): string {
   return path.join(headDirectory, `${transactionToken}.head`);
 }
 
 async function readRemoteTransactionHeadAuthority(
   options: RemoteTransactionHeadStorageOptions,
-): Promise<RemoteTransactionHeadAuthority | null> {
-  let authenticated: { contents: Buffer };
+): Promise<{
+  authority: RemoteTransactionHeadAuthority;
+  fileIdentity: BigIntStats;
+} | null> {
+  let authenticated: { contents: Buffer; fileIdentity: BigIntStats };
   try {
     authenticated = await readStableRemoteTransactionRecordBytes({
       targetPath: remoteTransactionHeadPath(options.headDirectory, options.transactionToken),
@@ -720,14 +808,17 @@ async function readRemoteTransactionHeadAuthority(
     throw new RemoteTransactionRecordIntegrityError();
   }
   try {
-    return authenticateRemoteTransactionHeadAuthority({
-      contents: authenticated.contents,
-      transactionToken: options.transactionToken,
-      integrityKey: options.integrityKey,
-      integrityKeyId: options.integrityKeyId,
-      headDirectory: options.headDirectory,
-      storeDirectory: options.storeDirectory,
-    });
+    return {
+      authority: authenticateRemoteTransactionHeadAuthority({
+        contents: authenticated.contents,
+        transactionToken: options.transactionToken,
+        integrityKey: options.integrityKey,
+        integrityKeyId: options.integrityKeyId,
+        headDirectory: options.headDirectory,
+        storeDirectory: options.storeDirectory,
+      }),
+      fileIdentity: authenticated.fileIdentity,
+    };
   } catch {
     throw new RemoteTransactionRecordIntegrityError();
   }

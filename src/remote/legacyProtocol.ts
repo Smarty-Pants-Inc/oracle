@@ -96,6 +96,19 @@ export const RemoteLegacyBrowserRunConfigSchema = z
     browserTabRef: z.string().max(256).nullable().optional(),
     chatgptUrl: trustedUrl.nullable().optional(),
     url: trustedUrl.optional(),
+    remoteHost: z.string().min(1).max(4096).nullable().optional(),
+    remoteToken: z.string().min(1).max(4096).nullable().optional(),
+    remoteViaSshReverseTunnel: z
+      .object({
+        ssh: z.string().min(1).max(4096).optional(),
+        remotePort: z.number().int().positive().max(65_535).optional(),
+        localPort: z.number().int().positive().max(65_535).optional(),
+        identity: z.string().min(1).max(4096).optional(),
+        extraArgs: z.string().max(4096).optional(),
+      })
+      .strict()
+      .nullable()
+      .optional(),
     timeoutMs: optionalPositiveDuration,
     debugPort: z.number().int().positive().max(65_535).nullable().optional(),
     inputTimeoutMs: optionalPositiveDuration,
@@ -125,6 +138,8 @@ export const RemoteLegacyBrowserRunConfigSchema = z
       .strict()
       .nullable()
       .optional(),
+    remoteChromeBrowserWSEndpoint: z.string().min(1).max(2048).nullable().optional(),
+    remoteChromeProfileRoot: optionalPath,
     manualLogin: z.boolean().optional(),
     manualLoginProfileDir: optionalPath,
     manualLoginCookieSync: z.boolean().optional(),

@@ -24,7 +24,7 @@ import {
 describe("recovery target authority", { timeout: 15_000 }, () => {
   const { finalizeRecoveredRuntime } = __test__;
   const stopped = { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
-  test("derives the recovery lock from prompt identity and ordered cleanup authority", () => {
+  test("derives the recovery lock from prompt identity and ordered cleanup authority", async () => {
     const profileDir = path.join(os.tmpdir(), "oracle-browser-lock-identity");
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
@@ -47,14 +47,14 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     );
 
     expect(
-      __test__.defaultRecoveryLockPath({
+      await __test__.defaultRecoveryLockPath({
         ...runtime,
         chromeHost: "localhost",
         chromePort: 9333,
         chromeBrowserWSEndpoint: "ws://localhost:9333/devtools/browser/new",
         chromeTargetId: "new-target",
       }),
-    ).toBe(__test__.defaultRecoveryLockPath(runtime));
+    ).toBe(await __test__.defaultRecoveryLockPath(runtime));
   });
 
   test("does not promote endpoint metadata after the recorded Chrome generation exits", async () => {
@@ -167,7 +167,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
   });
 
   test.each(["finalize", "abort"] as const)(
-    "%s closes an owned remote manual-login target after controller restart",
+    "%s preserves an owned remote manual-login target after live capability loss",
     async (mode) => {
       const profileDir = path.join(os.tmpdir(), "oracle-browser-rebound-process");
       const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_103);
@@ -213,9 +213,20 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         mode,
       );
 
-      expect(result.status).toBe("completed");
+      expect(result).toMatchObject({
+        status: "pending",
+        error: expect.stringContaining("Exact live Chrome target close capability is unavailable"),
+        runtime: {
+          recoveryCleanupResources: [
+            expect.objectContaining({
+              chromeTargetId: "rebound-target",
+              targetCloseCapability: capability,
+            }),
+          ],
+        },
+      });
       expect(recoveryCleanup.retainChromeEndpointAuthority).toHaveBeenCalledOnce();
-      expect(recoveryCleanup.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+      expect(recoveryCleanup.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     },
   );
 
@@ -267,7 +278,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
 
       expect(result).toMatchObject({
         status: "pending",
-        error: expect.stringContaining("could not be reconstructed"),
+        error: expect.stringContaining("Exact live Chrome target close capability is unavailable"),
       });
       expect(retainChromeEndpointAuthority).not.toHaveBeenCalled();
       expect(retainChromeBrowserWebSocketAuthority).not.toHaveBeenCalled();
@@ -411,15 +422,18 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  test("retries a transient target close after restart with reconstructed authority", async () => {
+  test("retries a transient target close while the exact live capability remains", async () => {
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     const profileDir = path.join(os.tmpdir(), "oracle-browser-target-close-retry");
     const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_120);
     const browserWSEndpoint = "ws://127.0.0.1:63340/devtools/browser/retry-generation";
-    const liveClose = vi.fn(async () => ({
-      status: "unsafe" as const,
-      reason: "transient close failure",
-    }));
+    const liveClose = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "unsafe" as const,
+        reason: "transient close failure",
+      })
+      .mockResolvedValueOnce({ status: "completed" as const });
     const capability = retainChromeTargetCloseCapability({
       ownerId: "test-owner",
       generationId: "retry-generation",
@@ -459,22 +473,15 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     });
     expect(liveClose).toHaveBeenCalledOnce();
 
-    targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
-    const recoveryCleanup = authenticatedLocalTargetCleanupDeps({
-      mockRetainedTargetClose: false,
-    });
-    const second = await finalizeRecoveredRuntime(
-      first.runtime,
-      createBrowserLogger(),
-      recoveryCleanup,
-    );
-
-    expect(second.status).toBe("completed");
-    expect(recoveryCleanup.retainChromeEndpointAuthority).toHaveBeenCalledOnce();
-    expect(recoveryCleanup.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+    await expect(
+      finalizeRecoveredRuntime(first.runtime, createBrowserLogger(), {
+        ownerId: "test-owner",
+      }),
+    ).resolves.toMatchObject({ status: "completed" });
+    expect(liveClose).toHaveBeenCalledTimes(2);
   });
 
-  test("reconciles a crash after close but before terminal target settlement persistence", async () => {
+  test("preserves a closed target after restart loses its unpersisted terminal capability", async () => {
     targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
     const profileDir = path.join(os.tmpdir(), "oracle-browser-target-close-crash");
     const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_121);
@@ -522,8 +529,15 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     });
     await expect(
       finalizeRecoveredRuntime(runtime, createBrowserLogger(), recoveryCleanup),
-    ).resolves.toMatchObject({ status: "completed" });
-    expect(recoveryCleanup.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+    ).resolves.toMatchObject({
+      status: "pending",
+      error: expect.stringContaining("Exact live Chrome target close capability is unavailable"),
+      runtime: {
+        recoveryCleanupResources: [expect.objectContaining({ chromeTargetId: "crash-target" })],
+      },
+    });
+    expect(recoveryCleanup.retainChromeEndpointAuthority).toHaveBeenCalledOnce();
+    expect(recoveryCleanup.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
   });
 
   test.each(["generation", "endpoint"] as const)(
@@ -655,12 +669,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-restart-settlement-"));
     const processIdentity = await physicalChromeProcessIdentity(profileDir, 9_110);
     const events: string[] = [];
-    const closeRetainedTarget = vi.fn(
-      async (options: Parameters<typeof closeChromeTargetWithRetainedCapability>[0]) => {
-        events.push("target-close");
-        return closeChromeTargetWithRetainedCapability(options);
-      },
-    );
+    const closeRetainedTarget = vi.fn(closeChromeTargetWithRetainedCapability);
     const cleanupDeps = authenticatedLocalTargetCleanupDeps({
       mockRetainedTargetClose: false,
       kill: (_userDataDir, pid) => {
@@ -701,12 +710,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       expect(result.runtime.recoveryCleanupResources).toBeUndefined();
       expect(closeRetainedTarget).toHaveBeenCalledOnce();
       expect(cleanupDeps.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
-      expect(events).toEqual([
-        "target-close",
-        "process-kill",
-        "profile-remove",
-        "endpoint-release",
-      ]);
+      expect(events).toEqual(["process-kill", "profile-remove", "endpoint-release"]);
 
       await expect(
         finalizeRecoveredRuntime(result.runtime, createBrowserLogger(), {
@@ -715,7 +719,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
           removeProfile,
         }),
       ).resolves.toMatchObject({ status: "completed" });
-      expect(events).toHaveLength(4);
+      expect(events).toHaveLength(3);
     } finally {
       await rm(profileDir, { recursive: true, force: true });
     }
@@ -879,7 +883,9 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     );
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     try {
-      expect(() => __test__.defaultRecoveryLockPath(runtime)).not.toThrow();
+      await expect(__test__.defaultRecoveryLockPath(runtime)).resolves.toMatch(
+        /browser-recovery-[0-9a-f]{24}\.lock$/u,
+      );
       const resource = runtime.recoveryCleanupResources?.[0];
       expect(resource).toBeDefined();
       expect(() =>

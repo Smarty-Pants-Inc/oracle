@@ -18,6 +18,7 @@ import {
   type OracleChromeOwnerRecord,
   type ProfileDirectoryIdentity,
 } from "../../src/browser/profileState.js";
+import { createPrivateTempChildGeneration } from "../../src/privateTempRoot.js";
 import {
   acquireBrowserTabLease,
   type BrowserTabLease,
@@ -146,10 +147,22 @@ async function temporaryAuthority(): Promise<TemporaryAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-proof-home-"));
   setOracleHomeDirOverrideForTest(oracleHome);
   const storage = await recovery.establishProjectSourcesCleanupStorage();
-  const parent = await captureProfileDirectoryIdentity(os.tmpdir(), { create: true });
-  const intent = recovery.createProjectSourcesProfileCreateIntent(storage, parent, randomUUID());
+  const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
+  const plannedIntent = recovery.createProjectSourcesProfileCreateIntent(
+    storage,
+    parent,
+    randomUUID(),
+  );
+  await recovery.persistProjectSourcesCleanupRuntime({}, storage, {
+    profileCreate: plannedIntent,
+  });
+  const privateGeneration = await createPrivateTempChildGeneration(
+    storage.runtimeRoot,
+    "oracle-browser-",
+    { randomId: () => plannedIntent.generationId },
+  );
+  const intent = { ...plannedIntent, privateGeneration };
   await recovery.persistProjectSourcesCleanupRuntime({}, storage, { profileCreate: intent });
-  await mkdir(intent.userDataDir);
   const proof = await recovery.createProjectSourcesTemporaryCleanupProof(intent, storage);
   return { oracleHome, storage, intent, proof };
 }
@@ -325,7 +338,7 @@ test("never moves an occupied create intent without its exact marker", async () 
   setOracleHomeDirOverrideForTest(oracleHome);
   try {
     const storage = await recovery.establishProjectSourcesCleanupStorage();
-    const parent = await captureProfileDirectoryIdentity(os.tmpdir(), { create: true });
+    const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
     const intent = recovery.createProjectSourcesProfileCreateIntent(storage, parent, randomUUID());
     await recovery.persistProjectSourcesCleanupRuntime({}, storage, { profileCreate: intent });
     await mkdir(intent.userDataDir);
@@ -339,6 +352,59 @@ test("never moves an occupied create intent without its exact marker", async () 
     await rm(intent.userDataDir, { recursive: true, force: true });
   } finally {
     await removeAuthority(oracleHome);
+  }
+});
+
+test("removes only the exact private pre-marker generation and preserves substitutions", async () => {
+  const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-private-child-"));
+  setOracleHomeDirOverrideForTest(oracleHome);
+  const retainedPaths: string[] = [];
+  try {
+    const storage = await recovery.establishProjectSourcesCleanupStorage();
+    const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
+    const createPrivateIntent = async () => {
+      const planned = recovery.createProjectSourcesProfileCreateIntent(
+        storage,
+        parent,
+        randomUUID(),
+      );
+      const privateGeneration = await createPrivateTempChildGeneration(
+        storage.runtimeRoot,
+        "oracle-browser-",
+        { randomId: () => planned.generationId },
+      );
+      const established = { ...planned, privateGeneration };
+      await recovery.persistProjectSourcesCleanupRuntime({}, storage, {
+        profileCreate: established,
+      });
+      return established;
+    };
+
+    const exact = await createPrivateIntent();
+    await expect(
+      recovery.retryPendingProjectSourcesCleanup(() => undefined, storage),
+    ).resolves.toBe(undefined);
+    await expect(lstat(exact.userDataDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+    const substituted = await createPrivateIntent();
+    const moved = `${substituted.userDataDir}-moved`;
+    retainedPaths.push(moved, substituted.userDataDir);
+    await rename(substituted.userDataDir, moved);
+    await mkdir(substituted.userDataDir, { mode: 0o700 });
+    await writeFile(path.join(substituted.userDataDir, "foreign.txt"), "preserve");
+    await expect(
+      recovery.retryPendingProjectSourcesCleanup(() => undefined, storage),
+    ).rejects.toThrow(/authority changed/i);
+    await expect(readFile(path.join(substituted.userDataDir, "foreign.txt"), "utf8")).resolves.toBe(
+      "preserve",
+    );
+    await expect(lstat(moved)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+  } finally {
+    setOracleHomeDirOverrideForTest(null);
+    for (const retainedPath of retainedPaths) {
+      await rm(retainedPath, { recursive: true, force: true });
+    }
+    await rm(oracleHome, { recursive: true, force: true });
   }
 });
 
@@ -951,7 +1017,9 @@ for (const { name, mutate } of temporaryProofTamperCases) {
           removeProfileDirectoryIfIdentityMatches: removeProfile,
           retryCleanup,
         }),
-      ).rejects.toThrow(/Project Sources|journal is invalid/i);
+      ).rejects.toThrow(
+        /Project Sources|journal is invalid|Private temporary directory authority changed/i,
+      );
       expect(retryCleanup).not.toHaveBeenCalled();
       expect(removeProfile).not.toHaveBeenCalled();
       await expect(readFile(authority.storage.journalPath, "utf8")).resolves.toContain(

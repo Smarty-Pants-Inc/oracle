@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { expect, test, vi } from "vitest";
+import type * as PrivateTempRootModule from "../../src/privateTempRoot.js";
 
 const { generationBAttachTarget, generationBCloseTarget, generationBCreateTarget } = vi.hoisted(
   () => ({
@@ -45,6 +46,9 @@ test("persists and resolves Project Sources cleanup while discarding successful 
   const temporaryBase = await mkdtemp(path.join(tmpdir(), "oracle-project-sources-runner-"));
   const mocks = {
     acquireLock: vi.fn(),
+    afterPrivateGeneration: vi.fn(
+      async (_generation: PrivateTempRootModule.PrivateTempGeneration) => undefined,
+    ),
     closeTarget: vi.fn(),
     connectTarget: vi.fn(),
     launchChrome: vi.fn(),
@@ -56,6 +60,28 @@ test("persists and resolves Project Sources cleanup while discarding successful 
   };
   // Module isolation is required so this focused runner test can replace browser process effects.
   vi.resetModules();
+  vi.doMock("../../src/oracleHome.js", () => ({
+    getOracleHomeDir: () => temporaryBase,
+  }));
+  vi.doMock("../../src/privateTempRoot.js", async () => {
+    const actual = await vi.importActual<typeof PrivateTempRootModule>(
+      "../../src/privateTempRoot.js",
+    );
+    return {
+      ...actual,
+      establishPrivateRuntimeAuthority: () =>
+        actual.establishPrivateRuntimeAuthority({ tempDirectory: temporaryBase }),
+      createPrivateTempChildGeneration: async (
+        parent: PrivateTempRootModule.PrivateDirectoryAuthority,
+        prefix: string,
+        options?: PrivateTempRootModule.PrivateTempRootOptions,
+      ) => {
+        const generation = await actual.createPrivateTempChildGeneration(parent, prefix, options);
+        await mocks.afterPrivateGeneration(generation);
+        return generation;
+      },
+    };
+  });
   vi.doMock("../../src/browser/config.js", () => ({
     resolveBrowserConfig: mocks.resolveBrowserConfig,
   }));
@@ -79,7 +105,6 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     acquireReattachRecoveryLock: mocks.acquireLock,
   }));
   vi.doMock("../../src/browser/localExecutionContext.js", () => ({
-    resolveUserDataBaseDir: vi.fn(async () => temporaryBase),
     waitForLogin: vi.fn(async () => undefined),
   }));
   vi.doMock("../../src/browser/cookies.js", () => ({
@@ -127,8 +152,10 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     await import("../../src/browser/targetCloseAuthority.js");
   try {
     const profileState = await import("../../src/browser/profileState.js");
-    const temporaryParent = await profileState.captureProfileDirectoryIdentity(temporaryBase);
     const cleanupStorage = await projectSourcesRecovery.establishProjectSourcesCleanupStorage();
+    const temporaryParent = await profileState.captureProfileDirectoryIdentity(
+      cleanupStorage.runtimeRoot.path,
+    );
     const profileCreateIntent = projectSourcesRecovery.createProjectSourcesProfileCreateIntent(
       cleanupStorage,
       temporaryParent,
@@ -204,7 +231,10 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       },
       targetId: "project-sources-target",
     }));
-    const killChrome = vi.fn(async () => ({ status: "completed", pid: 1 }));
+    const killChrome = vi.fn(async (_profileDir: string) => ({
+      status: "completed" as const,
+      pid: 1,
+    }));
     const releaseEndpoint = vi.fn(async () => undefined);
     mocks.launchChrome.mockImplementation(async (_config, profileDir, _logger, options) => ({
       host: "127.0.0.1",
@@ -225,7 +255,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
         browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/project",
         release: releaseEndpoint,
       },
-      kill: killChrome,
+      kill: () => killChrome(profileDir),
     }));
     const request = {
       operation: "list" as const,
@@ -386,6 +416,42 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     expect(killChrome).not.toHaveBeenCalled();
     expect(targetCloseAuthority.retainedTargetCloseAuthorityCount()).toBe(0);
     expect(releaseEndpoint).toHaveBeenCalledTimes(iterations);
+
+    targetCloseAuthority.clearRetainedTargetCloseAuthorities();
+    mocks.resolveBrowserConfig.mockReturnValue({
+      remoteChrome: null,
+      manualLogin: false,
+      keepBrowser: false,
+      headless: false,
+      hideWindow: false,
+      timeoutMs: 1_000,
+      inputTimeoutMs: 1_000,
+      cookieSync: false,
+    });
+    mocks.removeProfile.mockClear();
+    let removalSubstitution: { profileDir: string; moved: string } | undefined;
+    killChrome.mockImplementationOnce(async (profileDir) => {
+      const moved = `${profileDir}-before-removal`;
+      await rename(profileDir, moved);
+      await mkdir(profileDir, { mode: 0o700 });
+      removalSubstitution = { profileDir, moved };
+      return { status: "completed" as const, pid: 1 };
+    });
+    await expect(runBrowserProjectSources(request)).rejects.toThrow(/cleanup remains retryable/i);
+    expect(mocks.removeProfile).not.toHaveBeenCalled();
+    if (!removalSubstitution) throw new Error("expected a pre-removal profile substitution");
+    await rm(removalSubstitution.profileDir, { recursive: true, force: true });
+    await rm(removalSubstitution.moved, { recursive: true, force: true });
+    await rm(projectSourcesRecovery.projectSourcesCleanupJournalPath(), { force: true });
+    targetCloseAuthority.clearRetainedTargetCloseAuthorities();
+
+    mocks.launchChrome.mockClear();
+    mocks.afterPrivateGeneration.mockImplementationOnce(async (generation) => {
+      await rename(generation.path, `${generation.path}-substituted`);
+      await mkdir(generation.path, { mode: 0o700 });
+    });
+    await expect(runBrowserProjectSources(request)).rejects.toThrow(/authority changed/i);
+    expect(mocks.launchChrome).not.toHaveBeenCalled();
   } finally {
     targetCloseAuthority.clearRetainedTargetCloseAuthorities();
     await rm(projectSourcesRecovery.projectSourcesCleanupJournalPath(), { force: true });
@@ -400,6 +466,8 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     vi.doUnmock("../../src/browser/actions/projectSources.js");
     vi.doUnmock("../../src/browser/chromeTargetConnection.js");
     vi.doUnmock("../../src/browser/profileState.js");
+    vi.doUnmock("../../src/privateTempRoot.js");
+    vi.doUnmock("../../src/oracleHome.js");
     vi.doUnmock("node:fs/promises");
     vi.resetModules();
   }

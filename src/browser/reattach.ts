@@ -273,7 +273,7 @@ export async function resumeBrowserSession(
       : runtime.promptEpoch?.status === "committed"
         ? requireRecoveryPromptLocator(runtime)
         : null;
-  const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
+  const lockPath = deps.recoveryLockPath ?? (await defaultRecoveryLockPath(runtime));
   const acquireRecoveryLock = deps.acquireRecoveryLock ?? acquireReattachRecoveryLock;
   let recoveryLock: ReattachRecoveryLock | null = await acquireRecoveryLock(lockPath);
   const ensureRecoveryLock = async (): Promise<void> => {

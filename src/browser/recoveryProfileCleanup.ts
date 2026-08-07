@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import { privateRuntimeRootPathCandidates } from "../privateTempRoot.js";
 import type { RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import {
   cleanupStaleProfileState,
@@ -149,6 +150,7 @@ function validateCleanupProfilePath(
     return `Refusing unrecognized temporary profile path: ${profileDir}`;
   }
   const allowedRoots = [
+    ...privateRuntimeRootPathCandidates(),
     os.tmpdir(),
     "/tmp",
     "/mnt/c/Users/Public/AppData/Local/Temp",

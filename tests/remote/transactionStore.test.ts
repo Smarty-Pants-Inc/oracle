@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs/promises";
@@ -20,6 +20,8 @@ import {
   RemoteTransactionStore,
   type RemoteTransactionPublicationCheckpoint,
 } from "../../src/remote/transactionStore.js";
+import { remoteTransactionIntegrityKeyId } from "../../src/remote/transactionRecordEnvelope.js";
+import { retireRemoteTransactionHeadAuthority } from "../../src/remote/transactionRecordStorage.js";
 import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
 import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
@@ -215,6 +217,39 @@ async function publish(
     runtime,
     artifacts,
   });
+}
+
+async function retireRecordHeadForCrash(
+  store: RemoteTransactionStore,
+  transactionToken: string,
+  integrityKeyPath: string,
+  authorityDirectory: string,
+): Promise<string> {
+  const contents = await readFile(store.recordPath(transactionToken));
+  const envelope = JSON.parse(contents.toString("utf8")) as TestTransactionEnvelope;
+  const integrityKey = await readFile(integrityKeyPath);
+  await retireRemoteTransactionHeadAuthority({
+    headDirectory: authorityDirectory,
+    storeDirectory: store.directory,
+    transactionToken,
+    expectedHead: {
+      revision: envelope.revision,
+      digest: createHash("sha256").update(contents).digest("hex"),
+    },
+    integrityKey,
+    integrityKeyId: remoteTransactionIntegrityKeyId(integrityKey),
+    platform: process.platform,
+    assertIntegrityAuthority: async () => undefined,
+    initializeWindowsPrivateFile: async (filePath) =>
+      testWindowsPrivateTreeAuthority({
+        authorityDirectory,
+        storeDirectory: store.directory,
+        integrityKeyDirectory: path.dirname(integrityKeyPath),
+        integrityKeyPath,
+        initializeFilePath: filePath,
+      }),
+  });
+  return path.join(authorityDirectory, `${transactionToken}.head`);
 }
 
 describe("RemoteTransactionStore", () => {
@@ -2655,15 +2690,17 @@ describe("RemoteTransactionStore", () => {
     );
     let authorityNow = Date.parse("2026-01-01T00:00:00.000Z");
     try {
+      const authorityDirectory = path.join(authorityRoot, ".remote-transaction-authority");
       const store = await openTestRemoteTransactionStore({
         directory: path.join(authorityRoot, "remote-transactions"),
         integrityKeyPath: path.join(authorityRoot, ".remote-transaction-integrity.key"),
-        authorityDirectory: path.join(authorityRoot, ".remote-transaction-authority"),
+        authorityDirectory,
         maximumAuthorityRecords: 1,
         terminalRetentionMs: 0,
         now: () => authorityNow,
       });
       const retainedToken = "a".repeat(64);
+      const replacementToken = "b".repeat(64);
       await begin(store, retainedToken);
       await publish(store, retainedToken);
       await store.bindSettlement({
@@ -2679,9 +2716,11 @@ describe("RemoteTransactionStore", () => {
       });
       authorityNow += 1;
       await expect(store.list()).resolves.toEqual([]);
-      await expect(begin(store, "b".repeat(64), "authority-count-overflow")).rejects.toBeInstanceOf(
-        RemoteTransactionCapacityError,
-      );
+      await expect(fs.readdir(authorityDirectory)).resolves.toEqual([]);
+      await expect(
+        begin(store, replacementToken, "authority-count-reused"),
+      ).resolves.toBeUndefined();
+      await expect(fs.readdir(authorityDirectory)).resolves.toEqual([`${replacementToken}.head`]);
     } finally {
       await rm(authorityRoot, { recursive: true, force: true });
     }
@@ -2767,6 +2806,98 @@ describe("RemoteTransactionStore", () => {
       await rm(atomicRoot, { recursive: true, force: true });
     }
   }, 15_000);
+
+  test("recovers retired heads after record unlink without reclaiming current heads", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retired-head-recovery-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const authorityDirectory = path.join(root, ".remote-transaction-authority");
+    const retiredToken = "d".repeat(64);
+    const currentToken = "e".repeat(64);
+    const replacementToken = "f".repeat(64);
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        authorityDirectory,
+        maximumAuthorityRecords: 2,
+      });
+      await begin(store, retiredToken);
+      await publish(store, retiredToken);
+      await store.bindSettlement({
+        transactionToken: retiredToken,
+        mode: "finalize",
+        durablePublication: true,
+      });
+      await store.beginSettlementExecution({ transactionToken: retiredToken, mode: "finalize" });
+      await store.completeSettlement({
+        transactionToken: retiredToken,
+        mode: "finalize",
+        finalization: { status: "completed", runtime },
+      });
+      await begin(store, currentToken);
+      const retiredHeadPath = await retireRecordHeadForCrash(
+        store,
+        retiredToken,
+        integrityKeyPath,
+        authorityDirectory,
+      );
+      const currentHeadPath = path.join(authorityDirectory, `${currentToken}.head`);
+      await fs.unlink(store.recordPath(retiredToken));
+      await fs.unlink(store.recordPath(currentToken));
+
+      const reopened = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        authorityDirectory,
+        maximumAuthorityRecords: 2,
+      });
+      await expect(fs.access(retiredHeadPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.access(currentHeadPath)).resolves.toBeUndefined();
+      await expect(reopened.read(currentToken)).resolves.toBeNull();
+      await expect(
+        begin(reopened, replacementToken, "reclaimed-capacity"),
+      ).resolves.toBeUndefined();
+      await expect(
+        begin(reopened, "0".repeat(64), "current-head-still-counted"),
+      ).rejects.toBeInstanceOf(RemoteTransactionCapacityError);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses to reclaim an unauthenticated retired head", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-retired-head-auth-"));
+    const directory = path.join(root, "remote-transactions");
+    const integrityKeyPath = path.join(root, ".remote-transaction-integrity.key");
+    const authorityDirectory = path.join(root, ".remote-transaction-authority");
+    const transactionToken = "c".repeat(64);
+    try {
+      const store = await openTestRemoteTransactionStore({
+        directory,
+        integrityKeyPath,
+        authorityDirectory,
+      });
+      await begin(store, transactionToken);
+      const headPath = await retireRecordHeadForCrash(
+        store,
+        transactionToken,
+        integrityKeyPath,
+        authorityDirectory,
+      );
+      await fs.unlink(store.recordPath(transactionToken));
+      const head = JSON.parse(await readFile(headPath, "utf8")) as { mac: string };
+      head.mac = "0".repeat(64);
+      await fs.writeFile(headPath, `${JSON.stringify(head, null, 2)}\n`, { mode: 0o600 });
+
+      await expect(
+        openTestRemoteTransactionStore({ directory, integrityKeyPath, authorityDirectory }),
+      ).rejects.toBeInstanceOf(RemoteTransactionRecordIntegrityError);
+      await expect(fs.access(headPath)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("advances the controller-lifetime head only after a durable mutation", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-head-advance-"));

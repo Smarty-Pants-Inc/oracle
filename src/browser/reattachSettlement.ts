@@ -242,7 +242,7 @@ export async function settleBrowserRecoveryCleanup(
   requestedMode?: BrowserRecoverySettlementMode,
 ): Promise<BrowserRecoverySettlementOutcome> {
   const ownerId = deps.ownerId?.trim() ?? "";
-  const lockPath = deps.recoveryLockPath ?? defaultRecoveryLockPath(runtime);
+  const lockPath = deps.recoveryLockPath ?? (await defaultRecoveryLockPath(runtime));
   let recoveryLock: ReattachRecoveryLock;
   try {
     recoveryLock = await (deps.acquireRecoveryLock ?? acquireReattachRecoveryLock)(lockPath);

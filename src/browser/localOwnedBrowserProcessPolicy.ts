@@ -123,6 +123,7 @@ export interface LocalOwnedBrowserProcessPolicyOptions {
   settleTemporaryProcess?: (
     chrome: Extract<LocalOwnedBrowserProcessAuthority, { kind: "temporary" }>["chrome"],
   ) => Promise<LocalOwnedBrowserProcessSettlement>;
+  beforeTemporaryProfileRemoval?: () => Promise<void>;
 }
 
 export async function settleLocalOwnedBrowserProcess(
@@ -206,6 +207,14 @@ export async function settleLocalOwnedBrowserProcess(
   }));
   if (!isSafeChromeTerminationOutcome(termination)) {
     return { status: "pending", reason: termination.reason };
+  }
+  try {
+    await options.beforeTemporaryProfileRemoval?.();
+  } catch (error) {
+    return {
+      status: "pending",
+      reason: `Temporary Chrome profile authority changed after process termination: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
   const removed = await removeProfileDirectoryIfIdentityMatches(
     options.userDataDir,

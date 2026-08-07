@@ -352,6 +352,9 @@ export class LocalOwnedBrowserResourceSettlementAdapter {
       ...(this.state.options.settleTemporaryProcess
         ? { settleTemporaryProcess: this.state.options.settleTemporaryProcess }
         : {}),
+      ...(this.adapters.beforeTemporaryProfileRemoval
+        ? { beforeTemporaryProfileRemoval: this.adapters.beforeTemporaryProfileRemoval }
+        : {}),
     });
   }
 

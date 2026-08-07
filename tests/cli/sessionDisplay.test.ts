@@ -1020,7 +1020,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
         recoveryCleanup: {
           retainChromeEndpointAuthority: expect.any(Function),
         },
@@ -1576,7 +1576,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
       }),
       "abort",
     );
@@ -1645,7 +1645,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
       }),
       "abort",
     );
@@ -1707,7 +1707,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
         recoveryCleanup: expect.objectContaining({ resolveRemoteRecoveryConfig }),
       }),
       "abort",
@@ -1842,7 +1842,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
       }),
       "abort",
     );
@@ -2024,7 +2024,7 @@ describe("attachSession rendering", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
       }),
       "abort",
     );
@@ -2079,7 +2079,7 @@ describe("attachSession rendering", () => {
         pendingRuntime,
         expect.any(Function),
         expect.objectContaining({
-          recoveryLockPath: path.join("/tmp/sessions", "sess", "browser-recovery.lock"),
+          recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
         }),
         settlementMode,
       );

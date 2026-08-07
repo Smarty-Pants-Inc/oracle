@@ -1,5 +1,4 @@
 import chalk from "chalk";
-import path from "node:path";
 import type { BrowserRuntimeMetadata, SessionMetadata } from "../sessionStore.js";
 import { sessionStore } from "../sessionStore.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger } from "../browser/types.js";
@@ -11,6 +10,7 @@ import {
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/chromeProcessIdentity.js";
 import { acquireReattachRecoveryLock } from "../browser/reattachLock.js";
+import { recoveryLockPathForOwner } from "../browser/recoveryCleanupIdentity.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
@@ -271,13 +271,12 @@ export async function orchestrateBrowserAttachAuthority(
       return result;
     };
     try {
-      const sessionPaths = await sessionStore.getPaths(sessionId);
       const outcome = await settleBrowserRecoveryCleanup(
         runtime,
         cleanupLogger,
         {
           ownerId: sessionId,
-          recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+          recoveryLockPath: await recoveryLockPathForOwner(`session:${sessionId}`),
           recoveryCleanup: {
             retainChromeEndpointAuthority,
             resolveRemoteRecoveryConfig: options.resolveRemoteRecoveryConfig,
@@ -403,14 +402,13 @@ export async function orchestrateBrowserAttachAuthority(
     const existingPublicationBrowser = metadata.browser ?? publication.journal?.browserAudit;
     if (!existingPublicationBrowser) throw new Error("Browser publication metadata is unavailable");
     let publicationBrowser = existingPublicationBrowser;
-    const sessionPaths = await sessionStore.getPaths(sessionId);
     const reattachResult: ReattachResult = await resumeBrowserSession(
       authoritativeRuntime,
       metadata.browser?.config,
       browserLogger(),
       {
         sessionId,
-        recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+        recoveryLockPath: await recoveryLockPathForOwner(`session:${sessionId}`),
         acquireRecoveryLock: publication.acquireRecoveryLock,
         isRemotePublicationAcknowledged: publication.isRemotePublicationAcknowledged,
         recoveryCleanup: { resolveRemoteRecoveryConfig: options.resolveRemoteRecoveryConfig },

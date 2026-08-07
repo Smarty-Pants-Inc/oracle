@@ -1,10 +1,10 @@
-import path from "node:path";
 import chalk from "chalk";
 
 import { appendArtifacts } from "../browser/artifacts.js";
 import { retainChromeEndpointAuthority } from "../browser/chromeLifecycle.js";
 import { isProcessAlive } from "../browser/chromeProcessIdentity.js";
 import { settleBrowserRecoveryCleanup } from "../browser/reattach.js";
+import { recoveryLockPathForOwner } from "../browser/recoveryCleanupIdentity.js";
 import {
   hasExactPendingChromeAcquisitionAuthority,
   hasPendingChromeAcquisitionIntent,
@@ -237,7 +237,7 @@ async function settleCleanupOnlyRestart(
     }) as BrowserLogger,
     { verbose: true },
   );
-  const sessionPaths = await sessionStore.getPaths(sessionMeta.id);
+  const recoveryLockPath = await recoveryLockPathForOwner(`session:${sessionMeta.id}`);
   const recoveryMode = restartRuntime.recoveryCleanupResult?.settlementMode ?? "abort";
   const persistRecovery = async (result: BrowserCaptureFinalizationResult) => {
     await sessionStore.updateSession(sessionMeta.id, {
@@ -254,7 +254,7 @@ async function settleCleanupOnlyRestart(
     recoveryLogger,
     {
       ownerId: sessionMeta.id,
-      recoveryLockPath: path.join(sessionPaths.dir, "browser-recovery.lock"),
+      recoveryLockPath,
       recoveryCleanup: {
         retainChromeEndpointAuthority,
         resolveRemoteRecoveryConfig: context.browserDeps?.resolveRemoteRecoveryConfig,

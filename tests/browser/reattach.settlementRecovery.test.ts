@@ -8,6 +8,8 @@ import {
   settleBrowserRecoveryCleanup,
   __test__,
 } from "../../src/browser/reattach.js";
+import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
+import { establishPrivateRuntimeAuthority } from "../../src/privateTempRoot.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserCaptureFinalizationResult } from "../../src/browser/types.js";
 import {
@@ -476,7 +478,8 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
 
   test("serializes concurrent recovery for one session", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-lock-test-"));
-    const recoveryLockPath = path.join(root, "browser-recovery.lock");
+    const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const recoveryLockPath = path.join(lockAuthority.path, "browser-recovery.lock");
     const logger = createBrowserLogger();
     const recoverSession = vi.fn(async () => ({ answerText: "ok", answerMarkdown: "ok" }));
     const runtime = withCommittedPromptEpoch();
@@ -484,14 +487,20 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
       const first = await resumeBrowserSession(runtime, {}, logger, {
         recoverSession,
         recoveryLockPath,
+        acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
       });
       await expect(
-        resumeBrowserSession(runtime, {}, logger, { recoverSession, recoveryLockPath }),
+        resumeBrowserSession(runtime, {}, logger, {
+          recoverSession,
+          recoveryLockPath,
+          acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+        }),
       ).rejects.toThrow(/already in progress/i);
       await first.abort();
       const next = await resumeBrowserSession(runtime, {}, logger, {
         recoverSession,
         recoveryLockPath,
+        acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
       });
       await next.abort();
     } finally {

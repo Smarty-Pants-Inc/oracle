@@ -1,4 +1,4 @@
-import { execFile, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -33,6 +33,39 @@ const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
 const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
 const OTHER_NONCE = "22222222-2222-4222-8222-222222222222";
+async function waitForFileContents(filePath: string): Promise<string> {
+  await expect
+    .poll(
+      async () =>
+        fs.readFile(filePath, "utf8").then(
+          () => true,
+          (error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            return false;
+          },
+        ),
+      { timeout: 5_000, interval: 50 },
+    )
+    .toBe(true);
+  return fs.readFile(filePath, "utf8");
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  await expect
+    .poll(
+      () => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+          throw error;
+        }
+      },
+      { timeout: 5_000, interval: 50 },
+    )
+    .toBe(true);
+}
 
 interface FakeBridgeChild {
   child: ChildProcess;
@@ -634,6 +667,135 @@ describe("bridge host detached child transport", () => {
       await fs.rm(retiredDir, { recursive: true, force: true });
     }
   });
+
+  it.runIf(process.platform === "win32")(
+    "hard-kills an assigned child and its listener descendant when the Job supervisor dies",
+    async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-job-tree-"));
+      const artifactPath = path.join(tempDir, "connection.json");
+      const childPath = path.join(tempDir, "job-child.cjs");
+      const childPidPath = path.join(tempDir, "job-child.pid");
+      const descendantPath = path.join(tempDir, "job-descendant.cjs");
+      const descendantReadyPath = path.join(tempDir, "job-descendant-ready.json");
+      let supervisor: ChildProcess | undefined;
+      let childPid: number | undefined;
+      let descendantPid: number | undefined;
+      const jobProbe = String.raw`Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OracleBridgeJobProbe {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+}
+'@
+$inJob = $false
+if (-not [OracleBridgeJobProbe]::IsProcessInJob([OracleBridgeJobProbe]::GetCurrentProcess(), [IntPtr]::Zero, [ref]$inJob)) { exit 1 }
+if (-not $inJob) { exit 1 }`;
+      await fs.writeFile(
+        descendantPath,
+        `const fs = require("node:fs");
+const net = require("node:net");
+const server = net.createServer();
+server.listen(0, "127.0.0.1", () => fs.writeFileSync(${JSON.stringify(descendantReadyPath)}, JSON.stringify({ pid: process.pid, port: server.address().port })));
+setInterval(() => undefined, 1_000);
+`,
+      );
+      await fs.writeFile(
+        childPath,
+        `const { execFileSync, spawn } = require("node:child_process");
+const fs = require("node:fs");
+const isInJob = () => {
+  try {
+    execFileSync(${JSON.stringify(resolveWindowsPowerShellExecutable())}, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ${JSON.stringify(jobProbe)}], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+const waitForJob = () => {
+  if (!isInJob()) return setTimeout(waitForJob, 10);
+  spawn(process.execPath, [${JSON.stringify(descendantPath)}], { stdio: "ignore" });
+  fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));
+  setInterval(() => undefined, 1_000);
+};
+waitForJob();
+`,
+      );
+      const harness = createFakeBridgeChild(
+        (_payload, readiness) => {
+          readiness.push(readinessPayload(READINESS_NONCE));
+          readiness.push(null);
+        },
+        4242,
+        true,
+      );
+      const spawnChild = vi.fn(
+        (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
+      );
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      try {
+        await runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: spawnChild,
+            backgroundPlatform: "win32",
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        );
+        const [command, args, options] = spawnChild.mock.calls[0]!;
+        const launchConfig = Buffer.from(
+          JSON.stringify({ file: process.execPath, arguments: `"${childPath}"` }),
+          "utf8",
+        ).toString("base64");
+        supervisor = spawn(command, args, {
+          env: { ...options.env, ORACLE_BRIDGE_CHILD_LAUNCH_CONFIG: launchConfig },
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        expect(supervisor.pid).toBeTypeOf("number");
+
+        childPid = Number(await waitForFileContents(childPidPath));
+        const descendant = JSON.parse(await waitForFileContents(descendantReadyPath)) as {
+          pid: number;
+          port: number;
+        };
+        descendantPid = descendant.pid;
+        expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
+        expect(Number.isSafeInteger(descendantPid) && descendantPid > 0).toBe(true);
+        process.kill(childPid, 0);
+        expect(supervisor.exitCode).toBeNull();
+        expect(supervisor.signalCode).toBeNull();
+        process.kill(descendantPid, 0);
+        const connected = Promise.withResolvers<void>();
+        const listener = net.connect(descendant.port, "127.0.0.1");
+        listener.once("connect", () => {
+          listener.destroy();
+          connected.resolve();
+        });
+        listener.once("error", connected.reject);
+        await connected.promise;
+
+        expect(supervisor.kill("SIGKILL")).toBe(true);
+        await expect
+          .poll(() => supervisor!.exitCode !== null || supervisor!.signalCode !== null, {
+            timeout: 5_000,
+            interval: 50,
+          })
+          .toBe(true);
+        await Promise.all([waitForProcessExit(childPid), waitForProcessExit(descendantPid)]);
+      } finally {
+        for (const pid of [supervisor?.pid, childPid, descendantPid]) {
+          if (!pid) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 
   it.runIf(process.platform === "win32")(
     "kills and waits for the raw child when Job assignment throws after start",

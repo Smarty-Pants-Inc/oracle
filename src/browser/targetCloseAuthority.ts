@@ -5,9 +5,9 @@ import type {
   BrowserRecoveryTargetCloseCapabilityMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
-import {
+import type {
   closeChromeTargetWithExactAuthority,
-  type ExactChromeTargetCleanupResult,
+  ExactChromeTargetCleanupResult,
 } from "./chromeTargetConnection.js";
 import type { ExactChromeTargetOperationAuthority } from "./chromeTargetLifecycle.js";
 import { parseChromeProcessIdentity } from "./chromeProcessIdentity.js";
@@ -64,6 +64,7 @@ function normalizeExactBrowserWSEndpoint(value: string | undefined): string | nu
   }
 }
 
+/** Authenticates persisted endpoint metadata for recovery, never target-close permission. */
 export function hasRestartReconstructibleChromeTargetCloseAuthority(
   resource: BrowserRecoveryCleanupResourceMetadata,
   ownerId: string | undefined,
@@ -123,7 +124,18 @@ function hasRestartDurableTargetResourceAuthority(
   }
   if (!cleanup.ownsTarget || cleanup.closeOwnedTargetOnComplete === false) return true;
   if (cleanup.closeOwnedTargetOnComplete !== true) return false;
-  if (hasRestartReconstructibleChromeTargetCloseAuthority(resource, ownerId)) return true;
+  const targetId = resource.chromeTargetId?.trim();
+  const capability = resource.targetCloseCapability;
+  const generationId = resource.acquisition?.generationId?.trim();
+  if (
+    ownerId?.trim() &&
+    targetId &&
+    capability &&
+    generationId === capability.generationId &&
+    hasRetainedChromeTargetCloseCapability({ ownerId, capability, targetId })
+  ) {
+    return true;
+  }
   return canExactOwnedProcessTeardownSubsumeTargetClose({
     profileKind: cleanup.profileKind,
     keepBrowserOpen: cleanup.keepBrowser,
@@ -298,29 +310,11 @@ export async function closeChromeTargetWithRetainedCapability(options: {
   }
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
   if (!authority) {
-    const expectedEndpoint = normalizeExactBrowserWSEndpoint(capability.browserWSEndpoint);
-    const reconstructedEndpoint = normalizeExactBrowserWSEndpoint(
-      options.reconstructedAuthority?.browserWSEndpoint,
-    );
-    if (
-      !capability.ownerIdSha256 ||
-      capability.ownerIdSha256 !== ownerIdSha256 ||
-      capability.targetId !== targetId ||
-      !expectedEndpoint ||
-      reconstructedEndpoint !== expectedEndpoint ||
-      !options.reconstructedAuthority
-    ) {
-      return {
-        status: "unavailable",
-        reason:
-          "Persisted Chrome target close authority could not be reconstructed for the exact owner, browser generation, and target; the target was preserved",
-      };
-    }
-    return await (options.closeWithExactAuthority ?? closeChromeTargetWithExactAuthority)({
-      authority: options.reconstructedAuthority,
-      targetId,
-      logger,
-    });
+    return {
+      status: "unavailable",
+      reason:
+        "Exact live Chrome target close capability is unavailable and could not be reconstructed because persisted browser metadata is not close authority; the target was preserved",
+    };
   }
   if (
     authority.ownerId !== ownerId ||

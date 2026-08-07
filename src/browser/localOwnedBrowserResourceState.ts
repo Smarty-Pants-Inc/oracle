@@ -61,6 +61,7 @@ export interface LocalOwnedBrowserSettlementAdapters {
     mode: BrowserCaptureSettlementMode,
     runtime: BrowserRuntimeMetadata,
   ) => Promise<void>;
+  beforeTemporaryProfileRemoval?: () => Promise<void>;
   onActiveLeaseHandoff?: () => void;
   onLeaseSettled?: () => void;
 }

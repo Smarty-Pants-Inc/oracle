@@ -746,7 +746,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "reconstructs store-only manual target authority after server restart",
+    "preserves store-only manual target authority after server restart without live close capability",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recoverable-close-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -889,16 +889,29 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             token: "a".repeat(64),
             body: {},
           }),
-        ).resolves.toMatchObject({ statusCode: 200, json: { state: "aborted" } });
+        ).resolves.toMatchObject({
+          statusCode: 200,
+          json: { state: "pending", finalization: { status: "pending" } },
+        });
+
+        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retainChromeEndpointAuthority).toHaveBeenCalledOnce();
+        expect(closeTarget).not.toHaveBeenCalled();
+        retryCleanup.mockImplementationOnce(async (cleanupRuntime) => {
+          const completedRuntime = { ...cleanupRuntime };
+          delete completedRuntime.recoveryCleanupResources;
+          delete completedRuntime.recoveryCleanupResult;
+          return { status: "completed", runtime: completedRuntime };
+        });
 
         await drainRemoteServerShutdown(server, Promise.resolve(), {
           logger: () => {},
           retryDelayMs: 1,
         });
 
-        expect(retryCleanup).toHaveBeenCalledOnce();
+        expect(retryCleanup).toHaveBeenCalledTimes(2);
         expect(retainChromeEndpointAuthority).toHaveBeenCalledOnce();
-        expect(closeTarget).toHaveBeenCalledOnce();
+        expect(closeTarget).not.toHaveBeenCalled();
         expect(existsSync(controllerLockPath)).toBe(false);
         const terminalRecord = await readAuthenticatedTransactionRecord(
           transactionStoreDir,

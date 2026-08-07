@@ -1,9 +1,9 @@
 import kleur from "kleur";
-import path from "node:path";
 import type { RunOracleOptions } from "../oracle.js";
 import { asOracleUserError } from "../oracle.js";
 import { ensureSessionArtifacts } from "../browser/sessionRunner.js";
 import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.js";
+import { recoveryLockPathForOwner } from "../browser/recoveryCleanupIdentity.js";
 import { appendArtifacts } from "../browser/artifacts.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
@@ -85,6 +85,7 @@ export async function autoReattachUntilComplete({
     Math.max(0, browserConfig.timeoutMs ?? 0) ||
     120_000;
   const maxTotalMs = 2 * 60 * 60 * 1000;
+  const recoveryLockPath = await recoveryLockPathForOwner(`session:${sessionMeta.id}`);
   const maxDeadline = Date.now() + maxTotalMs;
   const attemptLimit =
     typeof maxAttempts === "number" && maxAttempts > 0
@@ -107,10 +108,6 @@ export async function autoReattachUntilComplete({
     if (message) log(dim(message));
   }) as BrowserLogger;
   logger.verbose = true;
-  const recoveryLockPath = path.join(
-    (await sessionStore.getPaths(sessionMeta.id)).dir,
-    "browser-recovery.lock",
-  );
   let retryRuntime = runtime;
   const runtimeAuthority = new MonotonicBrowserRuntimeAuthority(runtime, browserConfig);
   const publication = new BrowserPublicationTransaction();

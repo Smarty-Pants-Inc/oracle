@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
-import { link, lstat, open, readdir, rename, rm } from "node:fs/promises";
+import { link, lstat, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { syncDirectory } from "../fsDurability.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
@@ -19,6 +19,7 @@ import {
 } from "./transactionRecordStorage.js";
 
 const REMOTE_TRANSACTION_RECORD_PATTERN = /^([a-f0-9]{64})\.json$/u;
+const REMOTE_TRANSACTION_HEAD_PATTERN = /^([a-f0-9]{64})\.head$/u;
 const REMOTE_TRANSACTION_QUARANTINE_PATTERN =
   /^\.invalid-remote-transaction\.([a-f0-9]{64})\..+\.quarantine$/u;
 const REMOTE_TRANSACTION_PRESERVED_AUTHORITY_PATTERN =
@@ -53,6 +54,7 @@ type RemoteTransactionStoreMaintenanceOptions = {
     transactionToken: string,
   ) => Promise<AuthenticatedRemoteTransactionRecord>;
   retireAuthenticatedRecord: (transactionToken: string) => Promise<void>;
+  reclaimRetiredRecord: (transactionToken: string) => Promise<boolean>;
   recordPath: (transactionToken: string) => string;
 };
 
@@ -376,10 +378,10 @@ export class RemoteTransactionStoreMaintenance {
   }
 
   private async pruneExpiredTerminalRecords(): Promise<void> {
+    await this.reclaimRetiredHeadsWithoutRecords();
     const cutoff = this.#options.now() - this.#options.terminalRetentionMs;
     await this.#options.assertIntegrityAuthority();
     const names = await readdir(this.#options.directory);
-    let removed = false;
     for (const name of names) {
       const match = REMOTE_TRANSACTION_RECORD_PATTERN.exec(name);
       if (!match?.[1]) continue;
@@ -414,10 +416,25 @@ export class RemoteTransactionStoreMaintenance {
       }
       await this.#options.retireAuthenticatedRecord(match[1]);
       await this.#options.assertIntegrityAuthority();
-      await rm(targetPath, { force: true });
-      removed = true;
+      try {
+        await unlink(targetPath);
+      } catch (error) {
+        if (readErrorCode(error) !== "ENOENT") throw error;
+      }
+      if (!(await this.#options.reclaimRetiredRecord(match[1]))) {
+        throw new RemoteTransactionRecordIntegrityError();
+      }
     }
-    if (removed) await this.syncStorageDirectory();
+  }
+
+  private async reclaimRetiredHeadsWithoutRecords(): Promise<void> {
+    await this.#options.assertIntegrityAuthority();
+    for (const name of (await readdir(this.#options.headDirectory)).sort()) {
+      const match = REMOTE_TRANSACTION_HEAD_PATTERN.exec(name);
+      if (match?.[1]) await this.#options.reclaimRetiredRecord(match[1]);
+    }
+    await this.#options.assertIntegrityAuthority();
+    await syncDirectory(this.#options.headDirectory);
   }
 
   private async assertCapacity(

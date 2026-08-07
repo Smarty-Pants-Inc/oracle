@@ -61,9 +61,10 @@ export function settlementResponse(
   const cleanupStatus = finalization.status === "completed" ? "completed" : "pending";
   const mode = record.settlementMode ?? record.terminalAudit?.settlementMode;
   if (!mode) throw new Error("Remote settlement response lacks bound mode authority");
+  const state = finalization.status === "completed" ? record.state : "pending";
   return RemoteTransactionSettlementResponseSchema.parse({
     transactionToken: record.transactionToken,
-    state: record.state,
+    state,
     settlementAuthority: {
       mode,
       outcome: finalization.status === "completed" ? "completed" : "bound",

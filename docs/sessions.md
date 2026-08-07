@@ -87,11 +87,12 @@ oracle --engine browser \
 
 See [Browser Mode](browser-mode.md) for the full set.
 Browser target-close authority is opaque, generation-bound, and live only in the controller that
-acquired it. If that capability is unavailable after an upgrade, crash, or controller restart,
-Oracle leaves the tab open and cleanup pending. Saved DevTools host, port, websocket, target id,
-and marker URL remain diagnostic metadata only; they never reconstruct permission to close a tab.
-An authenticated teardown of an Oracle-owned temporary Chrome process may complete the cleanup
-when stopping that exact process necessarily closes the target.
+acquired it. Retries in that controller keep using the exact live capability. If the capability is
+unavailable after an upgrade, crash, or controller restart, Oracle leaves manual and borrowed tabs
+open and cleanup pending. Saved DevTools host, port, websocket, target id, process metadata, and
+marker URL are diagnostic only; they never recreate permission to close a tab. The only exception
+is authenticated teardown of the exact Oracle-owned temporary Chrome process when stopping that
+process necessarily closes the target.
 
 ## Restart
 

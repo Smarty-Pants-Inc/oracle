@@ -198,7 +198,7 @@ describe("performSessionRun", () => {
       pendingRuntime,
       expect.any(Function),
       expect.objectContaining({
-        recoveryLockPath: path.join(os.tmpdir(), "oracle-test-session", "browser-recovery.lock"),
+        recoveryLockPath: expect.stringMatching(/browser-recovery-[0-9a-f]{24}\.lock$/u),
       }),
       "abort",
     );

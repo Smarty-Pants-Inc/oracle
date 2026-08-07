@@ -4,6 +4,11 @@ import { syncDirectory, syncDirectoryIfPresent } from "../fsDurability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import {
+  assertPrivateDirectoryAuthority,
+  establishPrivateRuntimeAuthority,
+  removePrivateTempGeneration,
+} from "../privateTempRoot.js";
+import {
   type BrowserRecoveryTargetCloseCapabilityMetadata,
   type BrowserRuntimeMetadata,
   writeFileAtomicDurable,
@@ -47,6 +52,7 @@ import type { BrowserLogger } from "./types.js";
 export {
   assertProjectSourcesCleanupProof,
   assertProjectSourcesProfileParent,
+  assertProjectSourcesTemporaryProof,
   createProjectSourcesManualCleanupProof,
   createProjectSourcesProfileCreateIntent,
   createProjectSourcesTemporaryCleanupProof,
@@ -79,8 +85,15 @@ export interface ProjectSourcesRecoveryDeps extends ProjectSourcesPendingTargetD
 export async function establishProjectSourcesCleanupStorage(): Promise<ProjectSourcesCleanupStorage> {
   const requestedRoot = path.resolve(getOracleHomeDir());
   const root = await captureProfileDirectoryIdentity(requestedRoot, { create: true });
+  const runtimeRoot = await establishPrivateRuntimeAuthority();
   const journalPath = path.join(root.canonicalPath, PROJECT_SOURCES_CLEANUP_JOURNAL);
-  return { requestedRoot, root, journalPath, lockPath: `${journalPath}.lock` };
+  return {
+    requestedRoot,
+    root,
+    runtimeRoot,
+    journalPath,
+    lockPath: path.join(runtimeRoot.path, "project-sources-recovery.lock"),
+  };
 }
 
 export async function assertProjectSourcesCleanupStorage(
@@ -92,6 +105,16 @@ export async function assertProjectSourcesCleanupStorage(
   const current = await captureProfileDirectoryIdentity(storage.requestedRoot);
   if (!sameProfileDirectoryIdentity(current, storage.root)) {
     throw new Error("Project Sources cleanup Oracle-home physical authority changed.");
+  }
+  await assertPrivateDirectoryAuthority(storage.runtimeRoot);
+  const currentRuntimeRoot = await establishPrivateRuntimeAuthority();
+  if (
+    currentRuntimeRoot.path !== storage.runtimeRoot.path ||
+    currentRuntimeRoot.identity.device !== storage.runtimeRoot.identity.device ||
+    currentRuntimeRoot.identity.inode !== storage.runtimeRoot.identity.inode ||
+    currentRuntimeRoot.identity.birthtimeNs !== storage.runtimeRoot.identity.birthtimeNs
+  ) {
+    throw new Error("Project Sources private runtime root changed during the operation.");
   }
 }
 
@@ -298,11 +321,17 @@ export async function recoverPendingProjectSourcesProfileCreate(
 ): Promise<boolean> {
   const intent = journal.profileCreate;
   if (!intent) return false;
-  await assertProjectSourcesProfileParent(intent, storage);
   if (!(await projectSourcesEntryExists(intent.userDataDir))) {
     await persistProjectSourcesCleanupRuntime({}, storage);
     return true;
   }
+  await assertProjectSourcesProfileParent(intent, storage);
+  if (!intent.privateGeneration) {
+    throw new Error(
+      `Project Sources preserved an unproven temporary-profile occupant for manual recovery: ${intent.userDataDir}`,
+    );
+  }
+
   let proof = intent.proof;
   if (proof) {
     await assertProjectSourcesTemporaryProof(proof, storage);
@@ -310,15 +339,30 @@ export async function recoverPendingProjectSourcesProfileCreate(
     try {
       proof = await authenticateProjectSourcesTemporaryMarker(intent);
     } catch (error) {
-      throw new Error(
-        `Project Sources preserved an unproven temporary-profile occupant for manual recovery: ${intent.userDataDir}`,
-        { cause: error },
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(
+          `Project Sources preserved an unproven temporary-profile occupant for manual recovery: ${intent.userDataDir}`,
+          { cause: error },
+        );
+      }
+      const removedPrivateChild = await removePrivateTempGeneration(intent.privateGeneration);
+      if (!removedPrivateChild) {
+        throw new Error(
+          `Project Sources private pre-marker profile removal was not confirmed: ${intent.userDataDir}`,
+        );
+      }
+      await assertPrivateDirectoryAuthority(intent.privateGeneration.parent);
+      await persistProjectSourcesCleanupRuntime({}, storage);
+      logger(
+        `[browser] Removed interrupted Project Sources private profile ${intent.userDataDir}.`,
       );
+      return true;
     }
     await persistProjectSourcesCleanupRuntime({}, storage, {
       profileCreate: { ...intent, proof },
     });
   }
+  await assertProjectSourcesTemporaryProof(proof, storage);
   const removed = await (
     deps.removeProfileDirectoryIfIdentityMatches ?? removeProfileDirectoryIfIdentityMatches
   )(intent.userDataDir, proof.profileDirectory);
@@ -327,6 +371,7 @@ export async function recoverPendingProjectSourcesProfileCreate(
       `Project Sources proven temporary profile removal was not confirmed: ${intent.userDataDir}`,
     );
   }
+  await assertPrivateDirectoryAuthority(proof.privateGeneration.parent);
   await syncDirectory(intent.parent.canonicalPath);
   logger(`[browser] Removed interrupted Project Sources temporary profile ${intent.userDataDir}.`);
   await persistProjectSourcesCleanupRuntime({}, storage);
@@ -410,6 +455,18 @@ export async function retryPendingProjectSourcesCleanup(
             logger: closeLogger,
             deps,
           }),
+        removeProfile: async (profileDir, expectedIdentity) => {
+          if (durableProof.kind === "temporary") {
+            await assertProjectSourcesTemporaryProof(durableProof, resolvedStorage);
+          }
+          const removed = await (
+            deps.removeProfileDirectoryIfIdentityMatches ?? removeProfileDirectoryIfIdentityMatches
+          )(profileDir, expectedIdentity);
+          if (durableProof.kind === "temporary") {
+            await assertPrivateDirectoryAuthority(durableProof.privateGeneration.parent);
+          }
+          return removed;
+        },
       },
       persistFinalizationResult: async (result) => {
         if (hasProjectSourcesCleanupAuthority(result.runtime)) {

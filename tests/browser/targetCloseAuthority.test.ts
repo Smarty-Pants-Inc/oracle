@@ -223,7 +223,7 @@ describe("retained Chrome target close capabilities", () => {
     ).toBe(false);
   });
 
-  test("promotes authenticated process-bound target capabilities to restart authority", async () => {
+  test("requires a live capability or exact temporary-process teardown after restart", async () => {
     const browserWSEndpoint = "ws://service.example:9222/devtools/browser/live-generation";
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
@@ -253,6 +253,23 @@ describe("retained Chrome target close capabilities", () => {
         closeOwnedTargetOnComplete: true,
       },
     };
+    const temporaryResource = {
+      ...resource,
+      recoveryCleanup: {
+        ...resource.recoveryCleanup,
+        profileKind: "temporary" as const,
+        keepBrowser: false,
+      },
+    };
+    const borrowedResource = {
+      ...resource,
+      chromeProcessIdentity: undefined,
+      recoveryCleanup: {
+        ...resource.recoveryCleanup,
+        profileKind: "none" as const,
+        keepBrowser: false,
+      },
+    };
 
     expect(capability).toMatchObject({
       targetId: "owned-target",
@@ -260,45 +277,48 @@ describe("retained Chrome target close capabilities", () => {
       ownerIdSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
     expect(
-      [
-        resource,
-        {
-          ...resource,
-          recoveryCleanup: {
-            ...resource.recoveryCleanup,
-            profileKind: "temporary" as const,
-          },
-        },
-        {
-          ...resource,
-          chromeProcessIdentity: undefined,
-          recoveryCleanup: {
-            ...resource.recoveryCleanup,
-            profileKind: "none" as const,
-            keepBrowser: false,
-          },
-        },
-      ].map((candidate) =>
+      [resource, temporaryResource, borrowedResource].map((candidate) =>
         hasRestartDurableChromeTargetCleanupAuthority(
           { recoveryCleanupResources: [candidate] },
           "test-owner",
         ),
       ),
-    ).toEqual([true, true, false]);
+    ).toEqual([true, true, true]);
     expect(
       hasRestartDurableChromeTargetCleanupAuthority(
         { recoveryCleanupResources: [resource] },
         "different-owner",
       ),
     ).toBe(false);
+
+    __test__.clearRetainedTargetCloseAuthorities();
+    expect(
+      [resource, temporaryResource, borrowedResource].map((candidate) =>
+        hasRestartDurableChromeTargetCleanupAuthority(
+          { recoveryCleanupResources: [candidate] },
+          "test-owner",
+        ),
+      ),
+    ).toEqual([false, true, false]);
+
+    const closeWithExactAuthority = vi.fn(async () => ({ status: "completed" as const }));
     await expect(
       closeChromeTargetWithRetainedCapability({
         ownerId: "test-owner",
         capability,
-        targetId: "unrelated-target",
+        targetId: "owned-target",
         logger: vi.fn<(message: string) => void>() as BrowserLogger,
+        reconstructedAuthority: {
+          browserWSEndpoint,
+          runExactOperation: vi.fn(),
+        },
+        closeWithExactAuthority,
       }),
-    ).resolves.toMatchObject({ status: "unavailable" });
+    ).resolves.toMatchObject({
+      status: "unavailable",
+      reason: expect.stringContaining("Exact live Chrome target close capability is unavailable"),
+    });
+    expect(closeWithExactAuthority).not.toHaveBeenCalled();
     expect(close).not.toHaveBeenCalled();
   });
 

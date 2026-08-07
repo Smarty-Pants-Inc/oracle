@@ -27,6 +27,17 @@ vi.mock("../../src/browser/reattach.ts", () => ({
   resumeBrowserSession: vi.fn(),
   settleBrowserRecoveryCleanup: vi.fn(),
 }));
+const recoveryLockPathForOwnerMock = vi.hoisted(() =>
+  vi.fn(async () =>
+    process.platform === "win32"
+      ? String.raw`C:\oracle-test-recovery.lock`
+      : "/tmp/oracle-test-recovery.lock",
+  ),
+);
+vi.mock("../../src/browser/recoveryCleanupIdentity.ts", async () => ({
+  ...(await vi.importActual("../../src/browser/recoveryCleanupIdentity.ts")),
+  recoveryLockPathForOwner: recoveryLockPathForOwnerMock,
+}));
 const persistDurableBrowserAnswerMock = vi.hoisted(() => vi.fn());
 const publishCompletedBrowserCaptureMock = vi.hoisted(() => vi.fn());
 vi.mock("../../src/cli/durableAnswer.ts", async () => {

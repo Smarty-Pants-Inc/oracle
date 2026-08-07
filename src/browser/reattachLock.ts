@@ -1,4 +1,10 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
+import {
+  assertPrivateDirectoryAuthority,
+  establishPrivateRuntimeAuthority,
+  type PrivateDirectoryAuthority,
+} from "../privateTempRoot.js";
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
@@ -37,20 +43,50 @@ async function withReattachRecoveryAcquisitionGate<T>(
   }
 }
 
-export async function acquireReattachRecoveryLock(lockPath: string): Promise<ReattachRecoveryLock> {
+export async function acquireReattachRecoveryLock(
+  lockPath: string,
+  parentAuthority?: PrivateDirectoryAuthority,
+): Promise<ReattachRecoveryLock> {
+  const parent = parentAuthority ?? (await establishPrivateRuntimeAuthority());
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
+  if (path.dirname(canonicalPath) !== parent.path) {
+    throw new Error("Browser recovery lock is outside the exact private runtime authority");
+  }
+  const assertParentAuthority = async (): Promise<void> =>
+    await assertPrivateDirectoryAuthority(parent);
+
   return withReattachRecoveryAcquisitionGate(canonicalPath, async () => {
-    await retryPendingFilesystemLockReleases(canonicalPath);
+    await assertParentAuthority();
+    await retryPendingFilesystemLockReleases(canonicalPath, { assertParentAuthority });
+    await assertParentAuthority();
     if (hasRetainedFilesystemLockRelease(canonicalPath)) {
       throw new Error("Browser recovery is already in progress (current controller generation)");
     }
 
     const sessionId = `browser-recovery:${createHash("sha256").update(canonicalPath).digest("hex").slice(0, 24)}`;
     try {
-      return await acquireCrashRecoverableFilesystemLock(canonicalPath, {
+      const acquired = await acquireCrashRecoverableFilesystemLock(canonicalPath, {
         sessionId,
         adoptCurrentProcessGeneration: true,
+        createParent: false,
+        expectedParentIdentity: parent.identity,
       });
+      await assertParentAuthority();
+      return {
+        release: async (finalize) => {
+          await assertParentAuthority();
+          await acquired.release(
+            finalize
+              ? async () => {
+                  await assertParentAuthority();
+                  await finalize();
+                  await assertParentAuthority();
+                }
+              : undefined,
+          );
+          await assertParentAuthority();
+        },
+      };
     } catch (error) {
       if (error instanceof FilesystemLockBusyError) {
         const owner = error.owner ? ` (pid ${error.owner.pid})` : "";
