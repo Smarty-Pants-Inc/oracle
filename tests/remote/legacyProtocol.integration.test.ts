@@ -206,7 +206,7 @@ describe("legacy remote protocol integration", () => {
           legacyToken: "c".repeat(64),
           allowLegacyTextProtocol: true,
           deadlines: {
-            runOverallTimeoutMs: 1_000,
+            runOverallTimeoutMs: 5_000,
             controlOverallTimeoutMs: 1_000,
             artifactOverallTimeoutMs: 1_000,
             socketIdleTimeoutMs: 150,

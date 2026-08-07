@@ -40,16 +40,14 @@ export async function finalizeLocalRecoveryCleanupGroup(
   const errors: string[] = [];
   const pendingKeys = new Set<string>();
   const releasedLeaseAuthorities = new Set<string>();
-  const settledTargetCapabilities = new Set<string>();
+  const settledTargetAuthorities = new Set<string>();
   const processSubsumedTargets: RecoveryCleanupEntry[] = [];
   let classification: RecoveryCleanupPhaseResult["classification"];
   const groupLabel = createHash("sha256").update(group.key).digest("hex").slice(0, 12);
   const addPending = (entry: RecoveryCleanupEntry, error: string): void => {
-    const capabilityId = entry.resource.targetCloseCapability?.capabilityId;
-    const pendingEntry =
-      capabilityId && settledTargetCapabilities.has(capabilityId)
-        ? teardownOnlyEntry(entry)
-        : entry;
+    const pendingEntry = settledTargetAuthorities.has(recoveryCleanupResourceKey(entry.resource))
+      ? teardownOnlyEntry(entry)
+      : entry;
     const key = recoveryCleanupResourceKey(pendingEntry.resource);
     if (!pendingKeys.has(key)) {
       pendingKeys.add(key);
@@ -93,9 +91,7 @@ export async function finalizeLocalRecoveryCleanupGroup(
         continue;
       }
       if (!cleanup.closeOwnedTargetOnComplete) continue;
-      const targetKey =
-        resource.targetCloseCapability?.capabilityId ??
-        `missing:${recoveryCleanupResourceKey(resource)}`;
+      const targetKey = recoveryCleanupResourceKey(resource);
       const targetEntries = targets.get(targetKey);
       if (targetEntries) targetEntries.push(entry);
       else targets.set(targetKey, [entry]);
@@ -248,12 +244,14 @@ export async function finalizeLocalRecoveryCleanupGroup(
             targetId,
             logger,
             ...(endpointAuthority ? { reconstructedAuthority: endpointAuthority } : {}),
-            ...(deps.closeChromeTargetWithExactAuthority
-              ? { closeWithExactAuthority: deps.closeChromeTargetWithExactAuthority }
+            ...(deps.listChromeTargetsWithExactAuthority
+              ? { listWithExactAuthority: deps.listChromeTargetsWithExactAuthority }
               : {}),
           });
           if (closed.status === "completed" || closed.status === "gone") {
-            settledTargetCapabilities.add(capability.capabilityId);
+            for (const entry of targetEntries) {
+              settledTargetAuthorities.add(recoveryCleanupResourceKey(entry.resource));
+            }
           }
           if (closed.status === "gone") {
             recordedProcessExited = true;

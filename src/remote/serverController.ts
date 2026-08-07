@@ -27,7 +27,7 @@ import {
   assertLoopbackRemoteBind,
   REMOTE_PLAINTEXT_TRANSPORT_GUIDANCE,
 } from "./remoteServiceConfig.js";
-import { attachRemoteRequestRouter } from "./serverRouting.js";
+import { attachRemoteRequestRouter, type RemoteControllerOperation } from "./serverRouting.js";
 import { terminateRemoteChromeWithExactControl } from "./serverTransactionRuntime.js";
 import type { RemoteServerInstance, RemoteServerOptions } from "./serverTypes.js";
 import {
@@ -180,8 +180,9 @@ export async function createRemoteServer(
   const activeTransactions = new Map<string, BrowserRunTransaction>();
   const admittedTransactions = new Map<string, { controllerGeneration: string }>();
   const remoteTransactionRetryWork = new Map<string, Promise<unknown>>();
-  let closing = false;
-  let closed = false;
+  let lifecycleState: "open" | "draining" | "closed" = "open";
+  let settlementAdmissionOpen = true;
+  let controllerSettlementComplete = false;
   let closeInFlight: Promise<void> | null = null;
   let leaseSweepStopped = false;
   let listenerClosed = false;
@@ -254,8 +255,14 @@ export async function createRemoteServer(
     void inFlight.then(clear, clear);
     return await inFlight;
   };
-  const admitControllerOperation = (): (() => void) | null => {
-    if (closing) return null;
+  const admitControllerOperation = (operation: RemoteControllerOperation): (() => void) | null => {
+    if (
+      lifecycleState === "closed" ||
+      (lifecycleState === "draining" &&
+        (operation !== "settlement-continuation" || !settlementAdmissionOpen))
+    ) {
+      return null;
+    }
     if (controllerOperationCount === 0) controllerOperationsIdle = Promise.withResolvers<void>();
     controllerOperationCount += 1;
     let released = false;
@@ -281,7 +288,7 @@ export async function createRemoteServer(
     mode: "shared-run" | "exclusive" = "exclusive",
     allowDuringClose = false,
   ): (() => void) => {
-    if (closing && !allowDuringClose) {
+    if (lifecycleState !== "open" && !allowDuringClose) {
       throw new RemoteTransactionConflictError(
         503,
         "server_closing",
@@ -332,10 +339,15 @@ export async function createRemoteServer(
       if (!idle) throw new Error("Remote browser work queue lost its completion signal");
       await idle.promise;
     }
-    return await runBrowserWork(operation);
+    const finishBrowserWork = startBrowserWork("exclusive", true);
+    try {
+      return await operation();
+    } finally {
+      finishBrowserWork();
+    }
   };
   const sweepExpiredAuthority = async (waitForExisting = false): Promise<void> => {
-    if (closing) return;
+    if (lifecycleState !== "open") return;
     if (sweepInFlight) {
       if (waitForExisting) await sweepInFlight;
       return;
@@ -401,7 +413,7 @@ export async function createRemoteServer(
     admitRemoteTransaction,
     isRemoteTransactionAdmitted,
     runRemoteTransactionRetryWork,
-    isClosing: () => closing,
+    isClosing: () => lifecycleState !== "open",
     isBrowserWorkBusy: () => browserWorkCount > 0,
     isBrowserWorkExclusive: () => browserWorkExclusive,
     startBrowserWork,
@@ -457,49 +469,59 @@ export async function createRemoteServer(
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
   const closeRemoteServer = async (): Promise<void> => {
-    await waitForControllerOperationsToDrain();
-    await waitForBrowserWorkToDrain();
-    const finishBrowserWork = startBrowserWork("exclusive", true);
+    settlementAdmissionOpen = false;
     try {
-      await settleRemoteControllerShutdown({
-        transactionStore,
-        transactionCoordinator,
-        activeTransactions,
-        logger,
-      });
-    } finally {
-      finishBrowserWork();
-    }
-    if (!leaseSweepStopped) {
-      clearInterval(leaseSweepTimer);
-      leaseSweepStopped = true;
-    }
-    if (!listenerClosed) {
-      if (server.listening) {
-        const closeDeferred = Promise.withResolvers<void>();
-        server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
-        await closeDeferred.promise;
+      await waitForControllerOperationsToDrain();
+      await waitForBrowserWorkToDrain();
+      if (!controllerSettlementComplete) {
+        const finishBrowserWork = startBrowserWork("exclusive", true);
+        try {
+          await settleRemoteControllerShutdown({
+            transactionStore,
+            transactionCoordinator,
+            activeTransactions,
+            logger,
+          });
+          controllerSettlementComplete = true;
+        } finally {
+          finishBrowserWork();
+        }
       }
-      listenerClosed = true;
+      await waitForControllerOperationsToDrain();
+      await waitForBrowserWorkToDrain();
+      if (!leaseSweepStopped) {
+        clearInterval(leaseSweepTimer);
+        leaseSweepStopped = true;
+      }
+      if (!listenerClosed) {
+        if (server.listening) {
+          const closeDeferred = Promise.withResolvers<void>();
+          server.close((error) => (error ? closeDeferred.reject(error) : closeDeferred.resolve()));
+          await closeDeferred.promise;
+        }
+        listenerClosed = true;
+      }
+      if (!controllerLockReleased) {
+        await controllerLock.release();
+        controllerLockReleased = true;
+      }
+      lifecycleState = "closed";
+    } catch (error) {
+      if (!controllerSettlementComplete && !listenerClosed) settlementAdmissionOpen = true;
+      throw error;
     }
-    if (!controllerLockReleased) {
-      await controllerLock.release();
-      controllerLockReleased = true;
-    }
-    closed = true;
   };
 
   return {
     port: address.port,
     token: authToken,
     close() {
-      if (closed) return Promise.resolve();
+      if (lifecycleState === "closed") return Promise.resolve();
       if (closeInFlight) return closeInFlight;
-      closing = true;
+      lifecycleState = "draining";
       let retainedClose: Promise<void>;
       retainedClose = closeRemoteServer().catch((error) => {
         if (closeInFlight === retainedClose) closeInFlight = null;
-        if (!listenerClosed) closing = false;
         throw error;
       });
       closeInFlight = retainedClose;

@@ -66,6 +66,8 @@ const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
   boundedTransactionStore: true,
 };
 
+export type RemoteControllerOperation = "new-authority" | "settlement-continuation";
+
 export interface RemoteRequestRouterDeps {
   options: RemoteServerOptions;
   runBrowser: (
@@ -83,7 +85,7 @@ export interface RemoteRequestRouterDeps {
   artifactStore: RemoteArtifactStore;
   transactionStore: RemoteTransactionStore;
   transactionCoordinator: RemoteTransactionCoordinator;
-  admitControllerOperation: () => (() => void) | null;
+  admitControllerOperation: (operation: RemoteControllerOperation) => (() => void) | null;
   admitRemoteTransaction: (transactionToken: string) => (() => void) | null;
   isRemoteTransactionAdmitted: (transactionToken: string) => boolean;
   runRemoteTransactionRetryWork: <T>(
@@ -168,13 +170,32 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      releaseControllerOperation = deps.admitControllerOperation();
+      const legacyRunRequest = matchLegacyRunRequest(req);
+      const artifactWaiverMatch = matchArtifactManualCopyWaiverRequest(req);
+      const artifactReceiptMatch = matchArtifactReceiptRequest(req);
+      const artifactMatch = matchArtifactRequest(req);
+      const transactionMatch = matchTransactionRequest(req);
+      const operation: RemoteControllerOperation =
+        artifactWaiverMatch ||
+        artifactReceiptMatch ||
+        artifactMatch ||
+        transactionMatch?.action === "finalize" ||
+        transactionMatch?.action === "abort"
+          ? "settlement-continuation"
+          : "new-authority";
+      if (
+        operation === "settlement-continuation" &&
+        !authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)
+      ) {
+        return;
+      }
+      releaseControllerOperation = deps.admitControllerOperation(operation);
       if (!releaseControllerOperation) {
         sendJson(res, 503, { error: "server_closing" });
         return;
       }
 
-      if (matchLegacyRunRequest(req)) {
+      if (legacyRunRequest) {
         if (
           !authenticateLegacyRemoteRequest(
             req,
@@ -217,9 +238,7 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      const artifactWaiverMatch = matchArtifactManualCopyWaiverRequest(req);
       if (artifactWaiverMatch) {
-        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         await serveRemoteArtifactManualCopyWaiver({
           req,
           res,
@@ -231,9 +250,7 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      const artifactReceiptMatch = matchArtifactReceiptRequest(req);
       if (artifactReceiptMatch) {
-        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         await serveRemoteArtifactReceipt({
           req,
           res,
@@ -245,9 +262,7 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      const artifactMatch = matchArtifactRequest(req);
       if (artifactMatch) {
-        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
         await serveRemoteArtifact({
           req,
           res,
@@ -260,9 +275,13 @@ export function attachRemoteRequestRouter(
         return;
       }
 
-      const transactionMatch = matchTransactionRequest(req);
       if (transactionMatch) {
-        if (!authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)) return;
+        if (
+          operation === "new-authority" &&
+          !authenticateCurrentRemoteRequest(req, res, deps.requestAuthenticator)
+        ) {
+          return;
+        }
         if (transactionMatch.action === "run") {
           const releaseTransactionAdmission = deps.admitRemoteTransaction(
             transactionMatch.transactionToken,

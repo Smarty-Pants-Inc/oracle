@@ -26,7 +26,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
       - run: pnpm run docs:site
         if: matrix.os == 'ubuntu-latest'
-      - run: pnpm run test
+      - run: pnpm run test ${{ matrix.os == 'windows-latest' && '-- --maxWorkers=2' || '' }}
       - run: pnpm run build
         if: matrix.os == 'ubuntu-latest'
       - run: pnpm run test:packed-cli

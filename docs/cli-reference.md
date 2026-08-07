@@ -114,7 +114,7 @@ See [Browser Mode](browser-mode.md) for usage.
 | `--allow-legacy-text-protocol`             | Explicitly permit predecessor text-only fallback; no artifacts or v3 recovery.   |
 | `--remote-chrome <host:port>`              | Attach to an existing remote Chrome session.                                     |
 
-`oracle serve` requires `--token <64-lowercase-hex-characters>` (a 32-byte key), never prints that key, and rejects non-loopback plaintext binds. Use SSH tunneling between machines; verified TLS is not implemented. For predecessor clients, add `--legacy-token <distinct-64-lowercase-hex-characters>` to expose only the legacy health/text routes; the modern v3 key is never accepted as a bearer.
+`oracle serve` generates a fresh modern transaction-v3 HMAC key, atomically writes the exact endpoint/key pair to the owner-private `~/.oracle/serve-connection.json` (or `--write-connection <path>`), and never prints the key. Direct serve never requires or accepts `--token` / `--legacy-token`; if supplied, Oracle redacts their values from its traces and diagnostics and rejects the invocation before command execution. Copy the artifact through a private channel and import it with `oracle bridge client --connect <path>`. Direct serve rejects non-loopback plaintext binds and does not expose predecessor text compatibility; use SSH tunneling between machines because verified TLS is not implemented.
 
 ## Approved ChatGPT conversation export
 

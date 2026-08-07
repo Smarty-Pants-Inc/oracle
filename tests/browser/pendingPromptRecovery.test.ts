@@ -14,19 +14,19 @@ import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/br
 import { resolvePendingPromptEpochAuthority } from "../../src/browser/reattachability.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { ChromeClient } from "../../src/browser/types.js";
-import { createBrowserLogger, syntheticChromeProcessIdentity } from "./reattachTestHelpers.js";
+import { createBrowserLogger, restartBoundProcessIdentity } from "./reattachTestHelpers.js";
 
 const PROMPT = "Recover this exact prompt";
 const PROMPT_SHA256 = promptIdentitySha256(PROMPT);
 const OWNER_ID = "pending-epoch-owner";
 const TARGET_ID = "pending-target";
 const CONVERSATION_ID = "pending-conversation";
-const GENERATION_ID = "pending-generation";
+const GENERATION_ID = "22222222-2222-4222-8222-222222222222";
 const ENDPOINT = "ws://127.0.0.1:51559/devtools/browser/pending-browser";
 
 function pendingRuntime(): BrowserRuntimeMetadata {
   const userDataDir = "/tmp/oracle-pending-epoch-profile";
-  const processIdentity = syntheticChromeProcessIdentity(userDataDir, 4321);
+  const processIdentity = restartBoundProcessIdentity(userDataDir, 4321, GENERATION_ID);
   const promptEpoch = {
     status: "pending" as const,
     epochId: "pending-epoch",
@@ -59,7 +59,10 @@ function pendingRuntime(): BrowserRuntimeMetadata {
         chromeTargetId: TARGET_ID,
         conversationId: CONVERSATION_ID,
         promptEpoch,
-        acquisition: { generationId: GENERATION_ID },
+        acquisition: {
+          generationId: GENERATION_ID,
+          processLaunchClaim: processIdentity.launchClaim,
+        },
         targetCloseCapability: {
           version: 1,
           generationId: GENERATION_ID,

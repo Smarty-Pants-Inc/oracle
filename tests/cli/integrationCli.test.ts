@@ -181,7 +181,7 @@ export async function resolve(specifier, context, nextResolve) {
       try {
         const { stdout, stderr } = await execFileAsync(
           process.execPath,
-          ["--loader", loaderPath, "--import", TSX_LOADER, CLI_ENTRY, ...args],
+          ["--loader", pathToFileURL(loaderPath).href, "--import", TSX_LOADER, CLI_ENTRY, ...args],
           { env, timeout: INTEGRATION_TIMEOUT },
         );
         return { stdout: stdout.toString(), stderr: stderr.toString() };

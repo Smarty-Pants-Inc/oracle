@@ -88,12 +88,12 @@ describe("formatClaudeMcpConfig", () => {
     });
   });
 
-  test("rejects malformed remote credentials at CLI boundaries", async () => {
+  test("rejects direct serve argv credentials and malformed remote credentials", async () => {
     for (const token of ["dictionary-word", "A".repeat(64), "a".repeat(63), "g".repeat(64)]) {
       await expect(
         execFileAsync(process.execPath, ["--import", "tsx", CLI_ENTRY, "serve", "--token", token]),
       ).rejects.toMatchObject({
-        stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
+        stderr: expect.stringMatching(/refuses credentials in process arguments/i),
       });
     }
     await expect(
@@ -108,7 +108,7 @@ describe("formatClaudeMcpConfig", () => {
         "weak",
       ]),
     ).rejects.toMatchObject({
-      stderr: expect.stringMatching(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i),
+      stderr: expect.stringMatching(/refuses credentials in process arguments/i),
     });
     for (const args of [
       ["--remote-host", "127.0.0.1:9473", "--remote-token", "weak"],

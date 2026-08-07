@@ -53,6 +53,19 @@ export function syntheticChromeProcessIdentity(
   };
 }
 
+export function restartBoundProcessIdentity(
+  userDataDir: string,
+  pid: number,
+  generationId: string,
+): ChromeProcessIdentity & { launchClaim: NonNullable<ChromeProcessIdentity["launchClaim"]> } {
+  const launchClaim = {
+    version: 1 as const,
+    generationId,
+    nonce: "11111111-1111-4111-8111-111111111111",
+  };
+  return { ...syntheticChromeProcessIdentity(userDataDir, pid), launchClaim };
+}
+
 export async function physicalChromeProcessIdentity(
   userDataDir: string,
   pid = 1234,

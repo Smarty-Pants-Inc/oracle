@@ -634,7 +634,6 @@ describe("bridge host detached child transport", () => {
 
   it("preserves a replaced Windows connection generation during ACL-failure cleanup", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-acl-replaced-"));
-    const retiredDir = `${tempDir}-retired`;
     const artifactPath = path.join(tempDir, "connection.json");
     const replacement = '{"replacement":true}\n';
     setOracleHomeDirOverrideForTest(tempDir);
@@ -647,11 +646,12 @@ describe("bridge host detached child transport", () => {
       true,
     );
     let calls = 0;
-    const windowsPrivateFileAuthority = vi.fn(async () => {
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
       calls += 1;
       if (calls !== 2) return;
-      await fs.rename(tempDir, retiredDir);
-      await fs.mkdir(tempDir);
+      expect(request).toEqual({ filePath: artifactPath, repair: false });
+      await expect(fs.readFile(artifactPath, "utf8")).resolves.toContain(MODERN_TOKEN);
+      await fs.rm(artifactPath);
       await fs.writeFile(artifactPath, replacement);
       throw new Error("injected ACL replacement failure");
     });
@@ -670,12 +670,107 @@ describe("bridge host detached child transport", () => {
         ),
       ).rejects.toThrow("injected ACL replacement failure");
       await expect(fs.readFile(artifactPath, "utf8")).resolves.toBe(replacement);
-      await expect(
-        fs.readFile(path.join(retiredDir, "connection.json"), "utf8"),
-      ).resolves.toContain(MODERN_TOKEN);
+      expect(harness.kill).toHaveBeenCalledOnce();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
-      await fs.rm(retiredDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never overwrites a replacement created after predecessor quarantine", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-publish-replaced-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const predecessor = '{"predecessor":true}\n';
+    const replacement = '{"replacement-before-publication":true}\n';
+    await fs.writeFile(artifactPath, predecessor, "utf8");
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    let replacementPublished = false;
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
+      if (!request.repair || replacementPublished) return;
+      await fs.writeFile(artifactPath, replacement, { encoding: "utf8", flag: "wx" });
+      replacementPublished = true;
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            backgroundPlatform: "win32",
+            windowsPrivateFileAuthority,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toMatchObject({ code: "EEXIST" });
+      await expect(fs.readFile(artifactPath, "utf8")).resolves.toBe(replacement);
+      expect(replacementPublished).toBe(true);
+      expect(
+        (await fs.readdir(tempDir)).filter((name) => name.startsWith(".oracle-bridge-rollback-")),
+      ).toEqual([]);
+      expect(harness.kill).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a replacement created after exact publication quarantine", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-rollback-replaced-"));
+    const artifactPath = path.join(tempDir, "connection.json");
+    const predecessor = '{"predecessor":true}\n';
+    const replacement = '{"replacement-after-quarantine":true}\n';
+    await fs.writeFile(artifactPath, predecessor, "utf8");
+    setOracleHomeDirOverrideForTest(tempDir);
+    const harness = createFakeBridgeChild(
+      (_payload, readiness) => {
+        readiness.push(readinessPayload(READINESS_NONCE));
+        readiness.push(null);
+      },
+      4242,
+      true,
+    );
+    let publicationFailed = false;
+    let replacementPublished = false;
+    const windowsPrivateFileAuthority = vi.fn(async (request: WindowsPrivateFileAclRequest) => {
+      if (request.filePath === artifactPath && !request.repair && !publicationFailed) {
+        publicationFailed = true;
+        throw new Error("injected final ACL failure before rollback");
+      }
+      if (request.repair && publicationFailed && !replacementPublished) {
+        await fs.writeFile(artifactPath, replacement, { encoding: "utf8", flag: "wx" });
+        replacementPublished = true;
+      }
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runBridgeHost(
+          { background: true, token: MODERN_TOKEN, writeConnection: artifactPath },
+          {
+            spawn: () => harness.child,
+            backgroundPlatform: "win32",
+            windowsPrivateFileAuthority,
+            generateReadinessNonce: () => READINESS_NONCE,
+          },
+        ),
+      ).rejects.toThrow("injected final ACL failure before rollback");
+      await expect(fs.readFile(artifactPath, "utf8")).resolves.toBe(replacement);
+      expect(replacementPublished).toBe(true);
+      expect(
+        (await fs.readdir(tempDir)).filter((name) => name.startsWith(".oracle-bridge-rollback-")),
+      ).toEqual([]);
+      expect(harness.kill).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
@@ -685,51 +780,36 @@ describe("bridge host detached child transport", () => {
       const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-job-tree-"));
       const artifactPath = path.join(tempDir, "connection.json");
       const childPath = path.join(tempDir, "job-child.cjs");
-      const childPidPath = path.join(tempDir, "job-child.pid");
+      const childReadyPath = path.join(tempDir, "job-child-ready.json");
       const descendantPath = path.join(tempDir, "job-descendant.cjs");
       const descendantReadyPath = path.join(tempDir, "job-descendant-ready.json");
       let supervisor: ChildProcess | undefined;
       let childPid: number | undefined;
       let descendantPid: number | undefined;
-      const jobProbe = String.raw`Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class OracleBridgeJobProbe {
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
-  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
-}
-'@
-$inJob = $false
-if (-not [OracleBridgeJobProbe]::IsProcessInJob([OracleBridgeJobProbe]::GetCurrentProcess(), [IntPtr]::Zero, [ref]$inJob)) { exit 1 }
-if (-not $inJob) { exit 1 }`;
+      let childListener: net.Socket | undefined;
+      let descendantListener: net.Socket | undefined;
       await fs.writeFile(
         descendantPath,
         `const fs = require("node:fs");
 const net = require("node:net");
 const server = net.createServer();
 server.listen(0, "127.0.0.1", () => fs.writeFileSync(${JSON.stringify(descendantReadyPath)}, JSON.stringify({ pid: process.pid, port: server.address().port })));
-setInterval(() => undefined, 1_000);
 `,
       );
       await fs.writeFile(
         childPath,
-        `const { execFileSync, spawn } = require("node:child_process");
+        `const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const isInJob = () => {
-  try {
-    execFileSync(${JSON.stringify(resolveWindowsPowerShellExecutable())}, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ${JSON.stringify(jobProbe)}], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-};
-const waitForJob = () => {
-  if (!isInJob()) return setTimeout(waitForJob, 10);
-  spawn(process.execPath, [${JSON.stringify(descendantPath)}], { stdio: "ignore" });
-  fs.writeFileSync(${JSON.stringify(childPidPath)}, String(process.pid));
-  setInterval(() => undefined, 1_000);
-};
-waitForJob();
+const net = require("node:net");
+process.stdin.once("end", () => {
+  const server = net.createServer();
+  server.listen(0, "127.0.0.1", () => {
+    const descendant = spawn(process.execPath, [${JSON.stringify(descendantPath)}], { stdio: "ignore" });
+    descendant.unref();
+    fs.writeFileSync(${JSON.stringify(childReadyPath)}, JSON.stringify({ pid: process.pid, port: server.address().port }));
+  });
+});
+process.stdin.resume();
 `,
       );
       const harness = createFakeBridgeChild(
@@ -744,6 +824,14 @@ waitForJob();
         (_command: string, _args: readonly string[], _options: SpawnOptions) => harness.child,
       );
       vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      const connectListener = (port: number): Promise<net.Socket> => {
+        const connected = Promise.withResolvers<net.Socket>();
+        const socket = net.connect(port, "127.0.0.1");
+        socket.once("connect", () => connected.resolve(socket));
+        socket.once("error", connected.reject);
+        return connected.promise;
+      };
 
       try {
         await runBridgeHost(
@@ -761,41 +849,60 @@ waitForJob();
         ).toString("base64");
         supervisor = spawn(command, args, {
           env: { ...options.env, ORACLE_BRIDGE_CHILD_LAUNCH_CONFIG: launchConfig },
-          stdio: "ignore",
+          stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
         });
         expect(supervisor.pid).toBeTypeOf("number");
+        expect(supervisor.stdin).not.toBeNull();
+        expect(supervisor.stdout).not.toBeNull();
+        expect(supervisor.stderr).not.toBeNull();
+        supervisor.stdout!.resume();
+        supervisor.stderr!.resume();
+        // The supervisor forwards EOF only after assigning the child to the kill-on-close Job.
+        supervisor.stdin!.end();
 
-        childPid = Number(await waitForFileContents(childPidPath));
+        const child = JSON.parse(await waitForFileContents(childReadyPath)) as {
+          pid: number;
+          port: number;
+        };
         const descendant = JSON.parse(await waitForFileContents(descendantReadyPath)) as {
           pid: number;
           port: number;
         };
+        childPid = child.pid;
         descendantPid = descendant.pid;
         expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
         expect(Number.isSafeInteger(descendantPid) && descendantPid > 0).toBe(true);
-        process.kill(childPid, 0);
         expect(supervisor.exitCode).toBeNull();
         expect(supervisor.signalCode).toBeNull();
-        process.kill(descendantPid, 0);
-        const connected = Promise.withResolvers<void>();
-        const listener = net.connect(descendant.port, "127.0.0.1");
-        listener.once("connect", () => {
-          listener.destroy();
-          connected.resolve();
-        });
-        listener.once("error", connected.reject);
-        await connected.promise;
+        expect(supervisor.stdout!.readableEnded).toBe(false);
+        childListener = await connectListener(child.port);
+        descendantListener = await connectListener(descendant.port);
+
+        const supervisorExit = Promise.withResolvers<void>();
+        supervisor.once("error", supervisorExit.reject);
+        supervisor.once("exit", () => supervisorExit.resolve());
+        const supervisorStdoutEnd = Promise.withResolvers<void>();
+        supervisor.stdout!.once("error", supervisorStdoutEnd.reject);
+        supervisor.stdout!.once("end", () => supervisorStdoutEnd.resolve());
+        const childListenerClose = Promise.withResolvers<void>();
+        childListener.once("close", () => childListenerClose.resolve());
+        const descendantListenerClose = Promise.withResolvers<void>();
+        descendantListener.once("close", () => descendantListenerClose.resolve());
 
         expect(supervisor.kill("SIGKILL")).toBe(true);
-        await expect
-          .poll(() => supervisor!.exitCode !== null || supervisor!.signalCode !== null, {
-            timeout: 5_000,
-            interval: 50,
-          })
-          .toBe(true);
+        await Promise.all([
+          supervisorExit.promise,
+          supervisorStdoutEnd.promise,
+          childListenerClose.promise,
+          descendantListenerClose.promise,
+        ]);
+        expect(childListener.destroyed).toBe(true);
+        expect(descendantListener.destroyed).toBe(true);
         await Promise.all([waitForProcessExit(childPid), waitForProcessExit(descendantPid)]);
       } finally {
+        childListener?.destroy();
+        descendantListener?.destroy();
         for (const pid of [supervisor?.pid, childPid, descendantPid]) {
           if (!pid) continue;
           try {

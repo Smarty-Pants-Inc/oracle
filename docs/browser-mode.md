@@ -352,10 +352,10 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
 1. **Start the host on loopback**
 
    ```bash
-   oracle serve --host 127.0.0.1 --port 9473 --token <64-lowercase-hex-characters>
+   oracle serve --host 127.0.0.1 --port 9473
    ```
 
-   Oracle launches Chrome and starts the authenticated HTTP/SSE API. `--token` is required, must be exactly 64 lowercase hexadecimal characters (a 32-byte key), and must be supplied out of band; Oracle never logs the modern v3 HMAC root key. Use `--port` to select a fixed port. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
+   Oracle generates a fresh 32-byte modern HMAC root key, launches Chrome, and starts the authenticated HTTP/SSE API. After the listener is ready it atomically publishes the exact loopback endpoint and credential to the owner-private `~/.oracle/serve-connection.json`; use `--write-connection <path>` to choose another artifact path. The key is never placed in argv or ordinary logs. Direct serve rejects `--token` and `--legacy-token` without echoing their values. Non-loopback binds such as `0.0.0.0` are rejected because verified TLS is not implemented.
 
 2. **Create the client-side SSH tunnel**
 
@@ -365,21 +365,23 @@ Use the built-in service when Chrome should remain on a remote Mac. Oracle remot
 
    Keep that SSH process running. The local `127.0.0.1:9473` endpoint is now carried to the remote host's loopback service.
 
-3. **Run from the client**
+3. **Import the private connection artifact and run from the client**
+
+   Copy the artifact through a private channel after the tunnel is active, then import the exact endpoint/key pair:
 
    ```bash
+   scp user@remote-mac:.oracle/serve-connection.json ~/serve-connection.json
+   oracle bridge client --connect ~/serve-connection.json
    oracle --engine browser \
-     --remote-host 127.0.0.1:9473 \
-     --remote-token <64-lowercase-hex-characters> \
      --prompt "Summarize the incident doc" \
      --file docs/incidents/latest.md
    ```
 
-   For a one-off run, pass `--remote-host` / `--remote-token`; for process-scoped authority such as MCP, use `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN`; use `browser.remoteHost` / `browser.remoteToken` only as persistent defaults. Resolution is CLI, then environment, then user config, so mutable config cannot redirect a run that supplies a use-scoped pair. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
+   The import stores the exact modern credential in Oracle's client configuration instead of copying it into a command line. Keep the artifact private and do not paste its contents into logs. Cookies remain on the browser host. Remote runs force `--wait` so the client can stream output and complete transaction settlement.
 
 4. **Stop the host**
 
-   `Ctrl+C` shuts down the HTTP server and Chrome. Every restart requires an explicit `--token`; reuse or rotate the key through your secret distribution path.
+   `Ctrl+C` shuts down the HTTP server and Chrome. Every restart generates a fresh key and atomically replaces the private connection artifact; copy and import the new artifact before reconnecting.
 
 #### Migration from direct LAN endpoints
 
@@ -399,15 +401,7 @@ oracle --engine browser \
 
 Omit `--remote-token` when the predecessor host has no modern v3 key. The equivalent persistent settings are `browser.remoteLegacyToken` and `browser.remoteAllowLegacyTextProtocol`; the env equivalents are `ORACLE_REMOTE_LEGACY_TOKEN` and `ORACLE_REMOTE_ALLOW_LEGACY_TEXT_PROTOCOL=1`. The explicitly enabled legacy bearer must also be exactly 64 lowercase hexadecimal characters.
 
-For an old client contacting a new host, start the new host with a **distinct** legacy bearer:
-
-```bash
-oracle serve --host 127.0.0.1 --port 9473 \
-  --token <64-lowercase-hex-characters> \
-  --legacy-token <distinct-64-lowercase-hex-characters>
-```
-
-Configure the old client with only the predecessor bearer. The modern HMAC root key is never accepted as a bearer token. Legacy mode is text-only: generated files require manual transfer, and transaction-v3 generation-bound recovery is unavailable.
+Direct `oracle serve` does not expose predecessor-host compatibility: `--token` and `--legacy-token` are rejected because direct serve credentials are never accepted from argv. Upgrade the old client before connecting to a direct serve host. The modern HMAC root key remains unavailable as bearer authentication.
 
 ## Limitations / Follow-Up Plan
 

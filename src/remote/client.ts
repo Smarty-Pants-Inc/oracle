@@ -418,6 +418,8 @@ async function serializeAttachments(
       let namedAfterRead: BigIntStats;
       try {
         afterRead = await handle.stat({ bigint: true });
+        await handle.close();
+        handle = undefined;
         namedAfterRead = await lstat(attachment.path, { bigint: true });
       } catch {
         throw new BrowserAutomationError(

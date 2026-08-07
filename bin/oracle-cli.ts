@@ -84,12 +84,10 @@ import {
 import { loadUserConfig, type UserConfig } from "../src/config.js";
 import { shouldBlockDuplicatePrompt } from "../src/cli/duplicatePromptGuard.js";
 import {
-  assertLoopbackRemoteBind,
   createRemoteRecoveryConfigResolver,
   resolveRemoteServiceConfig,
   validateResolvedRemoteServiceConfig,
 } from "../src/remote/remoteServiceConfig.js";
-import { assertRemoteCredential } from "../src/remote/auth.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
 import {
   isAzureOpenAICandidateModel,
@@ -238,6 +236,8 @@ interface RestartCommandOptions {
 
 const VERSION = getCliVersion();
 const CLI_ENTRYPOINT = fileURLToPath(import.meta.url);
+const DIRECT_SERVE_ARGV_CREDENTIAL_ERROR =
+  "oracle serve refuses credentials in process arguments. Remove --token/--legacy-token; Oracle generates the modern HMAC key and publishes it only in the private connection artifact.";
 const LEGACY_FLAG_ALIASES = new Map<string, string>([
   ["--[no-]notify", "--notify"],
   ["--[no-]notify-sound", "--notify-sound"],
@@ -268,7 +268,10 @@ process.once("exit", (code) => {
   try {
     perfTrace.flush(code);
   } catch (error) {
-    console.error(`Failed to write perf trace: ${error instanceof Error ? error.message : error}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `Failed to write perf trace: ${redactCliCredentialValues(message, originalUserCliArgs)}`,
+    );
   }
 });
 
@@ -285,6 +288,51 @@ function stripPerfTraceArgs(args: string[]): string[] {
     stripped.push(arg);
   }
   return stripped;
+}
+
+const DIRECT_SERVE_CREDENTIAL_FLAGS = ["--token", "--legacy-token"] as const;
+const CLI_CREDENTIAL_FLAGS: Record<string, true> = {
+  "--token": true,
+  "--legacy-token": true,
+  "--remote-token": true,
+  "--remote-legacy-token": true,
+};
+
+function hasDirectServeCredentialArg(args: string[]): boolean {
+  return args.some((arg) =>
+    DIRECT_SERVE_CREDENTIAL_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`)),
+  );
+}
+
+function redactCliCredentialValues(text: string, args: string[]): string {
+  let redacted = text;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const equalsIndex = arg.indexOf("=");
+    const flag = equalsIndex < 0 ? arg : arg.slice(0, equalsIndex);
+    if (!CLI_CREDENTIAL_FLAGS[flag]) continue;
+    const value = equalsIndex < 0 ? args[index + 1] : arg.slice(equalsIndex + 1);
+    if (value) redacted = redacted.replaceAll(value, "<redacted>");
+  }
+  return redacted;
+}
+
+function isDirectServeInvocation(args: string[], rootOptions: readonly Option[]): boolean {
+  const detector = new Command();
+  for (const option of rootOptions) {
+    detector.addOption(new Option(option.flags));
+  }
+  for (const flag of DIRECT_SERVE_CREDENTIAL_FLAGS) {
+    detector.addOption(new Option(`${flag} <credential>`));
+  }
+  const detectorArgs = args.map((arg, index) =>
+    DIRECT_SERVE_CREDENTIAL_FLAGS.some((flag) => arg === flag) &&
+    (args[index + 1] === undefined || args[index + 1]?.startsWith("-"))
+      ? `${arg}=`
+      : arg,
+  );
+  // Keep malformed trailing value options from throwing during this routing-only parse.
+  return detector.parseOptions([...detectorArgs, ""]).operands[0] === "serve";
 }
 
 function normalizePerfTraceArgs(args: string[]): {
@@ -367,6 +415,9 @@ program.hook("preAction", (_thisCommand, actionCommand) => {
   introPrinted = true;
 });
 applyHelpStyling(program, VERSION, isTty);
+program.configureOutput({
+  outputError: (text, write) => write(redactCliCredentialValues(text, originalUserCliArgs)),
+});
 program.hook("preAction", async (thisCommand) => {
   if (thisCommand !== program) {
     return;
@@ -992,21 +1043,19 @@ Examples:
 program
   .command("serve")
   .description(
-    "Run Oracle browser automation as a loopback-only remote service; use SSH tunneling between machines.",
+    "Run Oracle browser automation as a loopback-only remote service with a private generated connection artifact.",
   )
   .option(
     "--host <address>",
     "Loopback interface to bind (default 127.0.0.1; non-loopback addresses are rejected).",
   )
   .option("--port <number>", "Port to listen on (default random).", parseIntOption)
-  .requiredOption(
-    "--token <64-lowercase-hex>",
-    "Modern v3 HMAC root key: exactly 64 lowercase hexadecimal characters (32 bytes; never logged).",
-  )
   .option(
-    "--legacy-token <64-lowercase-hex>",
-    "Distinct predecessor bearer: exactly 64 lowercase hexadecimal characters (32 bytes).",
+    "--write-connection <path>",
+    "Atomically write the private client connection artifact (default ~/.oracle/serve-connection.json).",
   )
+  .addOption(new Option("--token <credential>").hideHelp())
+  .addOption(new Option("--legacy-token <credential>").hideHelp())
   .option(
     "--manual-login",
     "Use a dedicated Chrome profile for manual login (recommended when cookie sync is unavailable).",
@@ -1016,28 +1065,16 @@ program
     "--manual-login-profile-dir <path>",
     "Chrome profile directory for manual login (default ~/.oracle/browser-profile).",
   )
+  .addHelpText(
+    "after",
+    "\nOracle generates a fresh modern HMAC credential and writes it only to the private connection artifact. --token and --legacy-token are rejected.\n",
+  )
   .action(async (commandOptions) => {
-    const { serveRemote } = await import("../src/remote/server.js");
-    const host = commandOptions.host?.trim() || "127.0.0.1";
-    assertLoopbackRemoteBind(host);
-    const token = assertRemoteCredential(commandOptions.token, "--token");
-    const legacyToken =
-      commandOptions.legacyToken === undefined
-        ? undefined
-        : assertRemoteCredential(commandOptions.legacyToken, "--legacy-token");
-    if (token && legacyToken && token === legacyToken) {
-      throw new Error(
-        "Legacy text clients require a bearer credential distinct from the modern v3 HMAC root key.",
-      );
+    if (commandOptions.token !== undefined || commandOptions.legacyToken !== undefined) {
+      throw new Error(DIRECT_SERVE_ARGV_CREDENTIAL_ERROR);
     }
-    await serveRemote({
-      host,
-      port: commandOptions.port,
-      token,
-      legacyToken,
-      manualLoginDefault: commandOptions.manualLogin,
-      manualLoginProfileDir: commandOptions.manualLoginProfileDir,
-    });
+    const { runDirectServe } = await import("../src/cli/serve.js");
+    await runDirectServe(commandOptions);
   });
 
 const projectSourcesCommand = program
@@ -3180,6 +3217,16 @@ program.action(async function (this: Command) {
 });
 
 async function main(): Promise<void> {
+  if (
+    hasDirectServeCredentialArg(originalUserCliArgs) &&
+    (isDirectServeInvocation(userCliArgs, program.options) ||
+      (perfTraceArgs.error !== undefined &&
+        isDirectServeInvocation(originalUserCliArgs, program.options)))
+  ) {
+    console.error(chalk.red("✖"), DIRECT_SERVE_ARGV_CREDENTIAL_ERROR);
+    process.exitCode = 1;
+    return;
+  }
   if (perfTraceArgs.error) {
     console.error(`error: ${perfTraceArgs.error}`);
     console.error("(use --help for usage)");
@@ -3205,10 +3252,10 @@ async function main(): Promise<void> {
 void main().catch((error: unknown) => {
   if (error instanceof Error) {
     if (!isErrorLogged(error)) {
-      console.error(chalk.red("✖"), error.message);
+      console.error(chalk.red("✖"), redactCliCredentialValues(error.message, originalUserCliArgs));
     }
   } else {
-    console.error(chalk.red("✖"), error);
+    console.error(chalk.red("✖"), redactCliCredentialValues(String(error), originalUserCliArgs));
   }
   process.exitCode = 1;
 });

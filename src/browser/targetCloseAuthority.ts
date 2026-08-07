@@ -5,11 +5,15 @@ import type {
   BrowserRecoveryTargetCloseCapabilityMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
-import type {
-  closeChromeTargetWithExactAuthority,
-  ExactChromeTargetCleanupResult,
+import {
+  listChromeTargetsWithExactAuthority,
+  type ExactChromeTargetCleanupResult,
 } from "./chromeTargetConnection.js";
 import type { ExactChromeTargetOperationAuthority } from "./chromeTargetLifecycle.js";
+import {
+  parseChromeProcessLaunchClaim,
+  sameChromeProcessLaunchClaim,
+} from "./chromeProcessLaunchClaim.js";
 import { parseChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import type { BrowserLogger } from "./types.js";
 
@@ -64,7 +68,7 @@ function normalizeExactBrowserWSEndpoint(value: string | undefined): string | nu
   }
 }
 
-/** Authenticates persisted endpoint metadata for recovery, never target-close permission. */
+/** Authenticates persisted owner, process, endpoint, generation, and target metadata for recovery. */
 export function hasRestartReconstructibleChromeTargetCloseAuthority(
   resource: BrowserRecoveryCleanupResourceMetadata,
   ownerId: string | undefined,
@@ -79,6 +83,9 @@ export function hasRestartReconstructibleChromeTargetCloseAuthority(
     resource.chromeProcessIdentity,
     process.platform,
   );
+  const processLaunchClaim = parseChromeProcessLaunchClaim(
+    resource.acquisition?.processLaunchClaim,
+  );
   if (
     cleanup.ownsTarget !== true ||
     cleanup.closeOwnedTargetOnComplete !== true ||
@@ -90,6 +97,9 @@ export function hasRestartReconstructibleChromeTargetCloseAuthority(
     !capability.ownerIdSha256 ||
     !SHA256_HEX_PATTERN.test(capability.ownerIdSha256) ||
     capability.ownerIdSha256 !== hashTargetCloseOwnerId(ownerId ?? "") ||
+    !processLaunchClaim ||
+    processLaunchClaim.generationId !== generationId ||
+    !sameChromeProcessLaunchClaim(processIdentity.launchClaim, processLaunchClaim) ||
     capability.generationId !== generationId ||
     capability.targetId !== targetId ||
     !resourceEndpoint ||
@@ -274,7 +284,7 @@ export async function closeChromeTargetWithRetainedCapability(options: {
   reconstructedAuthority?: ExactChromeTargetOperationAuthority & {
     readonly browserWSEndpoint: string;
   };
-  closeWithExactAuthority?: typeof closeChromeTargetWithExactAuthority;
+  listWithExactAuthority?: typeof listChromeTargetsWithExactAuthority;
 }): Promise<RetainedTargetCloseCapabilityResult> {
   const { capability, targetId, logger } = options;
   const ownerId = options.ownerId.trim();
@@ -293,12 +303,60 @@ export async function closeChromeTargetWithRetainedCapability(options: {
     };
   }
   const authority = retainedTargetCloseAuthorities.get(capability.capabilityId);
+  // Restart reconstruction may prove an earlier close completed; it never authorizes a new close.
   if (!authority) {
-    return {
-      status: "unavailable",
-      reason:
-        "Exact live Chrome target close capability is unavailable and could not be reconstructed because persisted browser metadata is not close authority; the target was preserved",
-    };
+    const reconstructedAuthority = options.reconstructedAuthority;
+    const capabilityEndpoint = normalizeExactBrowserWSEndpoint(capability.browserWSEndpoint);
+    if (
+      capability.targetId !== targetId ||
+      !capability.ownerIdSha256 ||
+      !capabilityEndpoint ||
+      !reconstructedAuthority ||
+      normalizeExactBrowserWSEndpoint(reconstructedAuthority.browserWSEndpoint) !==
+        capabilityEndpoint
+    ) {
+      return {
+        status: "unavailable",
+        reason:
+          "Exact live Chrome target close capability is unavailable and persisted target identity cannot authenticate a read-only liveness proof; the target was preserved",
+      };
+    }
+    const liveness = await (options.listWithExactAuthority ?? listChromeTargetsWithExactAuthority)(
+      reconstructedAuthority,
+    ).catch((error: unknown) => ({
+      status: "unsafe" as const,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
+    if (liveness.status === "gone") return liveness;
+    if (liveness.status === "unsafe") {
+      return {
+        status: "unavailable",
+        reason: `Exact Chrome target liveness proof is unavailable: ${liveness.reason}; the target was preserved`,
+      };
+    }
+    if (
+      !Array.isArray(liveness.value) ||
+      liveness.value.some(
+        (target) =>
+          !target ||
+          typeof target.targetId !== "string" ||
+          !target.targetId.trim() ||
+          target.targetId !== target.targetId.trim(),
+      )
+    ) {
+      return {
+        status: "unavailable",
+        reason: "Exact Chrome target liveness listing is ambiguous; the target was preserved",
+      };
+    }
+    if (liveness.value.some((target) => target.targetId === targetId)) {
+      return {
+        status: "unavailable",
+        reason:
+          "Exact Chrome target remains present and no live close capability is retained; the target was preserved",
+      };
+    }
+    return { status: "completed" };
   }
   if (
     authority.ownerId !== ownerId ||

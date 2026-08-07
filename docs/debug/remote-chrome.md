@@ -1,13 +1,13 @@
 # Remote Chrome Service Debug Log
 
-> Historical debugging record. Direct plaintext LAN serving shown in the original notes has been removed; current `oracle serve` is loopback-only and must be reached through SSH tunneling.
+> Historical debugging record. Direct plaintext LAN serving shown in the original notes has been removed; current `oracle serve` is loopback-only, generates its credential internally, publishes `~/.oracle/serve-connection.json`, and must be reached through SSH tunneling.
 
 ## Context
 
 - Date: 2025-11-20 (US timezone)
 - Goal: Run Oracle browser mode from a local laptop against VM-hosted Chrome via the then-new `oracle serve` remote service.
-- Current transport replacement: client and service both use `127.0.0.1:49810`, connected through SSH `-L`.
-- Credential examples below use the descriptive placeholder `<64-lowercase-hex-characters>`.
+- Current transport replacement: client and service both use `127.0.0.1:49810`, connected through SSH `-L` and the copied private connection artifact.
+- Credential placeholders below describe historical observations only; current commands never put the serve credential in argv.
 
 ## Attempts
 
@@ -17,9 +17,9 @@ Command:
 
 ```
 ssh -N -L 49810:127.0.0.1:49810 user@remote-host
+scp user@remote-host:.oracle/serve-connection.json ~/serve-connection.json
+oracle bridge client --connect ~/serve-connection.json
 oracle --engine browser \
-  --remote-host 127.0.0.1:49810 \
-  --remote-token <64-lowercase-hex-characters> \
   --prompt "Remote service sanity check" \
   --wait
 ```
@@ -42,13 +42,13 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <64-lowercase-hex-characters>
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810
   ```
 - When started correctly, logs show:
   ```
   Listening at 127.0.0.1:49810
   ```
-  The supplied modern v3 HMAC root key is never logged.
+  The generated modern v3 HMAC root key is written only to the private connection artifact and is never logged.
 - One run failed with EADDRINUSE when a stale node listener stayed on 49810; resolved by killing `node ...49810`.
 
 ### Observed blockers
@@ -65,13 +65,13 @@ Actions taken on VM (tmux `vmssh`):
   ```
   cd ~/Projects/oracle
   export PATH="$HOME/.bun/bin:$PATH"
-  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810 --token <64-lowercase-hex-characters>
+  ./runner pnpm run oracle -- serve --host 127.0.0.1 --port 49810
   ```
   Leave it running; verify with `lsof -nP -iTCP:49810 -sTCP:LISTEN`.
 - Sign into ChatGPT in the VM’s Chrome profile used by the service so model switching succeeds. (Currently we rely on host cookies only; client cookie shipping is disabled.)
 - If cookie loading keeps failing under SSH/nohup, start `oracle serve` from a GUI macOS session or switch to Node 20 to avoid Keychain issues. The service now exits early after opening chatgpt.com when no cookies are present—log in, then restart it.
 - Retry local command above; ensure service logs show incoming /runs and that the login probe passes (no login button).
-- Optional: switch to a fresh port and explicitly supplied fresh token to avoid lingering listeners.
+- Optional: switch to a fresh port; Oracle generates a fresh key automatically, then copy and re-import the replaced private connection artifact.
 - Code change (2025-11-20): `loadChromeCookies` now probes the macOS Keychain with a timeout and fails fast instead of hanging when Keychain access is denied. Remote runs should now emit a clear error instead of a socket hang up if the service can’t read Chrome cookies; re-test the SSH/nohup scenario.
 
 ## Notes

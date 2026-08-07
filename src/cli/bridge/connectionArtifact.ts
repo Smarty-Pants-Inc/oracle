@@ -29,17 +29,23 @@ export interface PhysicalFileIdentity {
 
 export interface FileSnapshot {
   contents: Buffer | null;
+  directoryIdentity: PhysicalDirectoryIdentity | null;
   fileIdentity: PhysicalFileIdentity | null;
 }
 
 export interface PublishedFile {
   readonly directoryIdentity: PhysicalDirectoryIdentity;
   readonly fileIdentity: PhysicalFileIdentity;
+  readonly priorFileQuarantine?: {
+    readonly filePath: string;
+    readonly publishedFile: PublishedFile;
+  };
 }
 
 export interface BridgeConnectionPrivacyOptions {
   readonly platform?: NodeJS.Platform;
   readonly windowsPrivateFileAuthority?: WindowsPrivateFileAuthority;
+  readonly expectedDirectoryIdentity?: PhysicalDirectoryIdentity;
   readonly deferFailureCleanup?: boolean;
 }
 
@@ -102,6 +108,13 @@ function samePhysicalFileIdentity(
   );
 }
 
+function samePublishedFile(left: PublishedFile, right: PublishedFile): boolean {
+  return (
+    samePhysicalDirectoryIdentity(left.directoryIdentity, right.directoryIdentity) &&
+    samePhysicalFileIdentity(left.fileIdentity, right.fileIdentity)
+  );
+}
+
 export async function capturePublishedFile(filePath: string): Promise<PublishedFile> {
   const [directoryIdentity, fileIdentity] = await Promise.all([
     capturePhysicalDirectoryIdentity(path.dirname(filePath)),
@@ -118,9 +131,7 @@ async function matchesPublishedFile(filePath: string, expected: PublishedFile): 
       capturePhysicalFileIdentity(filePath),
     ]);
     return (
-      fileIdentity !== null &&
-      samePhysicalDirectoryIdentity(directoryIdentity, expected.directoryIdentity) &&
-      samePhysicalFileIdentity(fileIdentity, expected.fileIdentity)
+      fileIdentity !== null && samePublishedFile({ directoryIdentity, fileIdentity }, expected)
     );
   } catch {
     return false;
@@ -156,13 +167,24 @@ export async function preflightBridgeConnectionArtifactPath(filePath: string): P
   await capturePhysicalFileIdentity(filePath);
 }
 
-async function prepareBridgeConnectionParent(filePath: string): Promise<PhysicalDirectoryIdentity> {
+export async function prepareBridgeConnectionArtifactParent(
+  filePath: string,
+  expectedDirectoryIdentity?: PhysicalDirectoryIdentity,
+): Promise<PhysicalDirectoryIdentity> {
   await preflightBridgeConnectionArtifactPath(filePath);
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  const directoryIdentity = await capturePhysicalDirectoryIdentity(directory);
+  const before = await capturePhysicalDirectoryIdentity(directory);
   await preflightBridgeConnectionArtifactPath(filePath);
-  return directoryIdentity;
+  const after = await capturePhysicalDirectoryIdentity(directory);
+  if (
+    !samePhysicalDirectoryIdentity(before, after) ||
+    (expectedDirectoryIdentity !== undefined &&
+      !samePhysicalDirectoryIdentity(after, expectedDirectoryIdentity))
+  ) {
+    throw new Error("Bridge connection artifact parent changed after preflight.");
+  }
+  return after;
 }
 
 async function assertOpenFileIdentity(
@@ -193,9 +215,13 @@ async function writePrivateConnectionFileAtomicDurable(
   filePath: string,
   data: string | Buffer,
   privacy: BridgeConnectionPrivacyOptions,
+  replaceExisting = true,
 ): Promise<PublishedFile> {
   const directory = path.dirname(filePath);
-  const directoryIdentity = await prepareBridgeConnectionParent(filePath);
+  const directoryIdentity = await prepareBridgeConnectionArtifactParent(
+    filePath,
+    privacy.expectedDirectoryIdentity,
+  );
   const temporaryPath = path.join(directory, `.oracle-bridge-${randomUUID()}.tmp`);
   const platform =
     privacy.platform === "win32" &&
@@ -206,10 +232,14 @@ async function writePrivateConnectionFileAtomicDurable(
     privacy.windowsPrivateFileAuthority ?? applyWindowsPrivateFileAcl;
   const expectedContents = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
   let handle: FileHandle | undefined;
+  let temporaryIdentity: PhysicalFileIdentity | undefined;
+  let temporaryContainsSecret = false;
   let publishedFile: PublishedFile | undefined;
+  let result: PublishedFile | undefined;
+  let failure: unknown;
   try {
     handle = await fs.open(temporaryPath, "wx", 0o600);
-    const temporaryIdentity = physicalFileIdentityFromStats(await handle.stat({ bigint: true }));
+    temporaryIdentity = physicalFileIdentityFromStats(await handle.stat({ bigint: true }));
     await assertOpenFileIdentity(handle, temporaryPath, temporaryIdentity);
     if (platform === "win32") {
       await windowsPrivateFileAuthority({ filePath: temporaryPath, repair: true });
@@ -218,6 +248,7 @@ async function writePrivateConnectionFileAtomicDurable(
       assertPrivatePosixFileMode(await handle.stat({ bigint: true }), temporaryPath);
     }
     await assertOpenFileIdentity(handle, temporaryPath, temporaryIdentity);
+    temporaryContainsSecret = true;
     await handle.writeFile(expectedContents);
     await handle.sync();
     await assertOpenFileIdentity(handle, temporaryPath, temporaryIdentity);
@@ -236,12 +267,15 @@ async function writePrivateConnectionFileAtomicDurable(
       throw new Error("Bridge connection destination changed before atomic publication.");
     }
 
-    await fs.rename(temporaryPath, filePath);
-    publishedFile = await capturePublishedFile(filePath);
-    if (
-      !samePhysicalDirectoryIdentity(publishedFile.directoryIdentity, directoryIdentity) ||
-      !samePhysicalFileIdentity(publishedFile.fileIdentity, temporaryIdentity)
-    ) {
+    if (replaceExisting) {
+      await fs.rename(temporaryPath, filePath);
+    } else {
+      await fs.link(temporaryPath, filePath);
+    }
+    // A later path observation may see a replacement, so cleanup authority stays bound here.
+    publishedFile = { directoryIdentity, fileIdentity: temporaryIdentity };
+    const observedPublishedFile = await capturePublishedFile(filePath);
+    if (!samePublishedFile(observedPublishedFile, publishedFile)) {
       throw new Error("Bridge connection artifact changed during atomic publication.");
     }
     await syncDirectoryIfPresent(directory);
@@ -254,33 +288,182 @@ async function writePrivateConnectionFileAtomicDurable(
     const actualContents = await fs.readFile(filePath);
     const verifiedAfterRead = await capturePublishedFile(filePath);
     if (
-      !samePhysicalDirectoryIdentity(verifiedBeforeRead.directoryIdentity, directoryIdentity) ||
-      !samePhysicalFileIdentity(verifiedBeforeRead.fileIdentity, temporaryIdentity) ||
-      !samePhysicalDirectoryIdentity(verifiedAfterRead.directoryIdentity, directoryIdentity) ||
-      !samePhysicalFileIdentity(verifiedAfterRead.fileIdentity, temporaryIdentity) ||
+      !samePublishedFile(verifiedBeforeRead, publishedFile) ||
+      !samePublishedFile(verifiedAfterRead, publishedFile) ||
       !actualContents.equals(expectedContents)
     ) {
       throw new Error("Bridge connection artifact failed final exact verification.");
     }
-    return verifiedAfterRead;
+    result = verifiedAfterRead;
   } catch (error) {
-    if (publishedFile) throw new BridgePrivateFilePublicationError(error, publishedFile);
-    throw error;
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+    failure = publishedFile ? new BridgePrivateFilePublicationError(error, publishedFile) : error;
   }
+
+  const cleanupErrors: unknown[] = [];
+  try {
+    await handle?.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (temporaryIdentity !== undefined) {
+    try {
+      const [currentDirectoryIdentity, currentTemporaryIdentity] = await Promise.all([
+        capturePhysicalDirectoryIdentity(directory),
+        capturePhysicalFileIdentity(temporaryPath),
+      ]);
+      if (!samePhysicalDirectoryIdentity(currentDirectoryIdentity, directoryIdentity)) {
+        if (temporaryContainsSecret) {
+          throw new Error("Bridge connection parent changed before temporary secret cleanup.");
+        }
+      } else if (
+        currentTemporaryIdentity !== null &&
+        samePhysicalFileIdentity(currentTemporaryIdentity, temporaryIdentity)
+      ) {
+        await fs.rm(temporaryPath);
+        await syncDirectoryIfPresent(directory);
+      } else if (temporaryContainsSecret && publishedFile === undefined) {
+        throw new Error("Bridge connection temporary secret cleanup could not be confirmed.");
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    const cleanupFailure = new AggregateError(
+      failure === undefined ? cleanupErrors : [failure, ...cleanupErrors],
+      "Bridge connection temporary secret cleanup failed.",
+    );
+    if (publishedFile) throw new BridgePrivateFilePublicationError(cleanupFailure, publishedFile);
+    throw cleanupFailure;
+  }
+  if (failure !== undefined) throw failure;
+  if (result === undefined)
+    throw new Error("Bridge connection artifact publication had no result.");
+  return result;
 }
 
 export async function captureFileSnapshot(filePath: string): Promise<FileSnapshot> {
-  const before = await capturePhysicalFileIdentity(filePath);
-  if (before === null) return { contents: null, fileIdentity: null };
+  const directory = path.dirname(filePath);
+  let directoryBefore: PhysicalDirectoryIdentity;
+  try {
+    directoryBefore = await capturePhysicalDirectoryIdentity(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      const fileIdentity = await capturePhysicalFileIdentity(filePath);
+      if (fileIdentity !== null) {
+        throw new Error(`Bridge connection artifact parent disappeared: ${directory}`);
+      }
+      return { contents: null, directoryIdentity: null, fileIdentity: null };
+    }
+    throw error;
+  }
+
+  const fileBefore = await capturePhysicalFileIdentity(filePath);
+  if (fileBefore === null) {
+    const [directoryAfter, fileAfter] = await Promise.all([
+      capturePhysicalDirectoryIdentity(directory),
+      capturePhysicalFileIdentity(filePath),
+    ]);
+    if (fileAfter !== null || !samePhysicalDirectoryIdentity(directoryBefore, directoryAfter)) {
+      throw new Error(
+        `Bridge connection artifact changed while capturing prior state: ${filePath}`,
+      );
+    }
+    return { contents: null, directoryIdentity: directoryAfter, fileIdentity: null };
+  }
+
   const contents = await fs.readFile(filePath);
-  const after = await capturePhysicalFileIdentity(filePath);
-  if (after === null || !samePhysicalFileIdentity(before, after)) {
+  const [directoryAfter, fileAfter] = await Promise.all([
+    capturePhysicalDirectoryIdentity(directory),
+    capturePhysicalFileIdentity(filePath),
+  ]);
+  if (
+    fileAfter === null ||
+    !samePhysicalDirectoryIdentity(directoryBefore, directoryAfter) ||
+    !samePhysicalFileIdentity(fileBefore, fileAfter)
+  ) {
     throw new Error(`Bridge connection artifact changed while capturing prior state: ${filePath}`);
   }
-  return { contents, fileIdentity: after };
+  return { contents, directoryIdentity: directoryAfter, fileIdentity: fileAfter };
+}
+
+async function restoreUnexpectedQuarantinedFile(
+  filePath: string,
+  quarantinedPath: string,
+  unexpected: PublishedFile,
+): Promise<void> {
+  try {
+    await fs.link(quarantinedPath, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        `Bridge connection replacement preserved at ${quarantinedPath}; its destination is occupied.`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  await syncDirectoryIfPresent(path.dirname(filePath));
+  const restored = await capturePublishedFile(filePath);
+  if (!samePublishedFile(restored, unexpected)) {
+    throw new Error(`Bridge connection replacement changed while being restored: ${filePath}`);
+  }
+  await fs.unlink(quarantinedPath);
+  await syncDirectoryIfPresent(path.dirname(filePath));
+}
+
+async function quarantinePublishedFile(
+  filePath: string,
+  expected: PublishedFile,
+): Promise<string | null> {
+  let currentDirectoryIdentity: PhysicalDirectoryIdentity;
+  try {
+    currentDirectoryIdentity = await capturePhysicalDirectoryIdentity(path.dirname(filePath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  if (!samePhysicalDirectoryIdentity(currentDirectoryIdentity, expected.directoryIdentity)) {
+    return null;
+  }
+
+  const quarantinedPath = path.join(
+    path.dirname(filePath),
+    `.oracle-bridge-rollback-${randomUUID()}.tmp`,
+  );
+  try {
+    await fs.rename(filePath, quarantinedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  await syncDirectoryIfPresent(path.dirname(filePath));
+
+  const quarantined = await capturePublishedFile(quarantinedPath);
+  if (!samePublishedFile(quarantined, expected)) {
+    await restoreUnexpectedQuarantinedFile(filePath, quarantinedPath, quarantined);
+    return null;
+  }
+  return quarantinedPath;
+}
+
+async function removeQuarantinedPublishedFile(
+  quarantinedPath: string,
+  expected: PublishedFile,
+): Promise<void> {
+  let directoryIdentity: PhysicalDirectoryIdentity;
+  try {
+    directoryIdentity = await capturePhysicalDirectoryIdentity(path.dirname(quarantinedPath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const fileIdentity = await capturePhysicalFileIdentity(quarantinedPath);
+  if (fileIdentity === null || !samePublishedFile({ directoryIdentity, fileIdentity }, expected)) {
+    return;
+  }
+  await fs.unlink(quarantinedPath);
+  await syncDirectoryIfPresent(path.dirname(quarantinedPath));
 }
 
 async function restoreFileSnapshot(
@@ -289,18 +472,102 @@ async function restoreFileSnapshot(
   expectedPublishedFile?: PublishedFile,
   privacy?: BridgeConnectionPrivacyOptions,
 ): Promise<void> {
-  if (expectedPublishedFile && !(await matchesPublishedFile(filePath, expectedPublishedFile))) {
+  const restorationPrivacy =
+    privacy !== undefined &&
+    privacy.expectedDirectoryIdentity === undefined &&
+    snapshot.directoryIdentity !== null
+      ? { ...privacy, expectedDirectoryIdentity: snapshot.directoryIdentity }
+      : privacy;
+  if (!expectedPublishedFile) {
+    if (snapshot.contents === null) {
+      await fs.rm(filePath, { force: true });
+      await syncDirectoryIfPresent(path.dirname(filePath));
+    } else if (restorationPrivacy !== undefined) {
+      await writePrivateConnectionFileAtomicDurable(
+        filePath,
+        snapshot.contents,
+        restorationPrivacy,
+      );
+    } else {
+      await writeFileAtomicDurable(filePath, snapshot.contents);
+    }
     return;
   }
-  if (snapshot.contents === null) {
-    await fs.rm(filePath, { force: true });
-    await syncDirectoryIfPresent(path.dirname(filePath));
+
+  const quarantinedPath = await quarantinePublishedFile(filePath, expectedPublishedFile);
+  if (quarantinedPath === null) {
+    if (expectedPublishedFile.priorFileQuarantine) {
+      await removeQuarantinedPublishedFile(
+        expectedPublishedFile.priorFileQuarantine.filePath,
+        expectedPublishedFile.priorFileQuarantine.publishedFile,
+      );
+    }
     return;
   }
-  if (privacy) {
-    await writePrivateConnectionFileAtomicDurable(filePath, snapshot.contents, privacy);
-  } else {
-    await writeFileAtomicDurable(filePath, snapshot.contents);
+  let restorationCompleted = false;
+  try {
+    if (snapshot.contents === null) {
+      restorationCompleted = true;
+      return;
+    }
+    if (restorationPrivacy === undefined) {
+      const preparedPath = `${filePath}.rollback-${randomUUID()}.tmp`;
+      let preparedFile: PublishedFile | undefined;
+      try {
+        await writeFileAtomicDurable(preparedPath, snapshot.contents);
+        preparedFile = await capturePublishedFile(preparedPath);
+        try {
+          await fs.link(preparedPath, filePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            restorationCompleted = true;
+            return;
+          }
+          throw error;
+        }
+        await syncDirectoryIfPresent(path.dirname(filePath));
+        if (!(await matchesPublishedFile(filePath, preparedFile))) {
+          throw new Error(`Restored file changed during exact publication: ${filePath}`);
+        }
+      } finally {
+        if (preparedFile && (await matchesPublishedFile(preparedPath, preparedFile))) {
+          await fs.unlink(preparedPath);
+          await syncDirectoryIfPresent(path.dirname(preparedPath));
+        }
+      }
+      restorationCompleted = true;
+      return;
+    }
+    try {
+      await writePrivateConnectionFileAtomicDurable(
+        filePath,
+        snapshot.contents,
+        restorationPrivacy,
+        false,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        restorationCompleted = true;
+        return;
+      }
+      if (error instanceof BridgePrivateFilePublicationError) {
+        const failedRestorationPath = await quarantinePublishedFile(filePath, error.publishedFile);
+        if (failedRestorationPath !== null) {
+          await removeQuarantinedPublishedFile(failedRestorationPath, error.publishedFile);
+        }
+        throw error.originalError;
+      }
+      throw error;
+    }
+    restorationCompleted = true;
+  } finally {
+    await removeQuarantinedPublishedFile(quarantinedPath, expectedPublishedFile);
+    if (restorationCompleted && expectedPublishedFile.priorFileQuarantine) {
+      await removeQuarantinedPublishedFile(
+        expectedPublishedFile.priorFileQuarantine.filePath,
+        expectedPublishedFile.priorFileQuarantine.publishedFile,
+      );
+    }
   }
 }
 
@@ -355,7 +622,14 @@ export async function upsertConnectionArtifact(
   priorSnapshot?: FileSnapshot,
 ): Promise<BridgeConnectionPublication> {
   const snapshot = priorSnapshot ?? (await captureFileSnapshot(filePath));
+  const publicationPrivacy =
+    privacy.expectedDirectoryIdentity !== undefined || snapshot.directoryIdentity === null
+      ? privacy
+      : { ...privacy, expectedDirectoryIdentity: snapshot.directoryIdentity };
   let publishedFile: PublishedFile | undefined;
+  let priorFileQuarantine:
+    | { readonly filePath: string; readonly publishedFile: PublishedFile }
+    | undefined;
   try {
     const now = new Date().toISOString();
     const existing = snapshot.contents?.toString("utf8") ?? null;
@@ -378,31 +652,69 @@ export async function upsertConnectionArtifact(
       updatedAt: now,
       tunnel: input.tunnel,
     };
+    if (snapshot.fileIdentity !== null) {
+      if (snapshot.directoryIdentity === null) {
+        throw new Error("Bridge connection predecessor has no parent generation authority.");
+      }
+      const predecessor: PublishedFile = {
+        directoryIdentity: snapshot.directoryIdentity,
+        fileIdentity: snapshot.fileIdentity,
+      };
+      const quarantinedPath = await quarantinePublishedFile(filePath, predecessor);
+      if (quarantinedPath === null) {
+        throw new Error("Bridge connection predecessor changed before atomic publication.");
+      }
+      priorFileQuarantine = { filePath: quarantinedPath, publishedFile: predecessor };
+    }
+
     publishedFile = await writePrivateConnectionFileAtomicDurable(
       filePath,
       `${JSON.stringify(artifact, null, 2)}\n`,
-      privacy,
+      publicationPrivacy,
+      false,
     );
+    if (priorFileQuarantine) {
+      await removeQuarantinedPublishedFile(
+        priorFileQuarantine.filePath,
+        priorFileQuarantine.publishedFile,
+      );
+      priorFileQuarantine = undefined;
+    }
     return { artifact, publishedFile };
   } catch (error) {
     const failure =
       error instanceof BridgePrivateFilePublicationError ? error.originalError : error;
     if (error instanceof BridgePrivateFilePublicationError) {
       publishedFile = error.publishedFile;
-    } else if (!publishedFile) {
-      const current = await capturePublishedFile(filePath).catch(() => undefined);
-      if (
-        current &&
-        (snapshot.fileIdentity === null ||
-          !samePhysicalFileIdentity(current.fileIdentity, snapshot.fileIdentity))
-      ) {
-        publishedFile = current;
-      }
     }
     if (publishedFile) {
-      if (privacy.deferFailureCleanup)
-        throw new BridgeArtifactPublicationError(failure, publishedFile);
-      await restoreFileSnapshot(filePath, snapshot, publishedFile, privacy);
+      const rollbackPublishedFile = priorFileQuarantine
+        ? { ...publishedFile, priorFileQuarantine }
+        : publishedFile;
+      if (privacy.deferFailureCleanup) {
+        throw new BridgeArtifactPublicationError(failure, rollbackPublishedFile);
+      }
+      await restoreFileSnapshot(filePath, snapshot, rollbackPublishedFile, publicationPrivacy);
+    } else if (priorFileQuarantine) {
+      try {
+        if ((failure as NodeJS.ErrnoException).code === "EEXIST") {
+          await removeQuarantinedPublishedFile(
+            priorFileQuarantine.filePath,
+            priorFileQuarantine.publishedFile,
+          );
+        } else {
+          await restoreUnexpectedQuarantinedFile(
+            filePath,
+            priorFileQuarantine.filePath,
+            priorFileQuarantine.publishedFile,
+          );
+        }
+      } catch (restoreError) {
+        throw new AggregateError(
+          [failure, restoreError],
+          "Bridge connection publication failed and its predecessor could not be fully restored.",
+        );
+      }
     }
     throw failure;
   }

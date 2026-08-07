@@ -461,6 +461,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       let hostPromise: Promise<void> | undefined;
+      let lateReceiptRequest: http.ClientRequest | undefined;
       let hostSettled = false;
       let lockPresentAtTunnelStop: boolean | undefined;
       let recordAtTunnelStop: Promise<unknown> | undefined;
@@ -527,6 +528,16 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           body: remoteRunPayload(),
         });
         await runStarted.promise;
+        const lateReceiptPath = `/transactions/${rejectedTransactionToken}/artifacts/pending/receipt`;
+        const lateReceiptBody = Buffer.from("{}");
+        const lateReceiptAuthentication = await prepareTestAuthentication({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: lateReceiptPath,
+          token: "a".repeat(64),
+          method: "POST",
+          body: lateReceiptBody,
+        });
         shutdownRequested.resolve();
 
         await vi.waitFor(async () => {
@@ -543,6 +554,33 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             json: { error: "server_closing" },
           });
         });
+        const lateReceiptStatus = Promise.withResolvers<number>();
+        lateReceiptRequest = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: lateReceiptPath,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": lateReceiptBody.byteLength,
+              Expect: "100-continue",
+              ...(lateReceiptAuthentication
+                ? lateReceiptAuthentication.authentication.headers
+                : {}),
+            },
+          },
+          (res) => {
+            res.resume();
+            res.once("end", () => lateReceiptStatus.resolve(res.statusCode ?? 0));
+          },
+        );
+        lateReceiptRequest.on("continue", () => {});
+        lateReceiptRequest.on("error", lateReceiptStatus.reject);
+        lateReceiptRequest.flushHeaders();
+        await expect(lateReceiptStatus.promise).resolves.toBe(503);
+        lateReceiptRequest.destroy();
+        lateReceiptRequest = undefined;
 
         const explicitClose = server.close();
         let explicitCloseSettled = false;
@@ -589,6 +627,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         );
         await expect(server.close()).resolves.toBeUndefined();
       } finally {
+        lateReceiptRequest?.destroy();
         continueRun.resolve();
         shutdownRequested.resolve();
         await hostPromise?.catch(() => undefined);
@@ -606,6 +645,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const controllerLockPath = path.join(transactionStoreDir, ".controller.lock");
       const transactionToken = "8".repeat(64);
+      const rejectedTransactionToken = "9".repeat(64);
       const targetId = "manual-kept-target";
       const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/manual-kept-generation";
       const profileDir = path.join(tmpDir, "manual-profile");
@@ -668,10 +708,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         delete settledRuntime.chromeTargetId;
         return completedBrowserCaptureCleanup(settledRuntime);
       });
-      const shutdownRequested = Promise.withResolvers<void>();
-      const shutdownErrors: string[] = [];
       let server: RemoteServerInstance | undefined;
-      let drain: Promise<void> | undefined;
 
       try {
         server = await createTestRemoteServer(
@@ -702,31 +739,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         expect(initial.statusCode).toBe(200);
 
-        let drainSettled = false;
-        drain = drainRemoteServerShutdown(server, shutdownRequested.promise, {
-          logger: (message) => shutdownErrors.push(message),
-          retryDelayMs: 250,
-        });
-        void drain.then(
-          () => {
-            drainSettled = true;
-          },
-          () => {
-            drainSettled = true;
-          },
+        const firstClose = server.close();
+        expect(server.close()).toBe(firstClose);
+        await expect(firstClose).rejects.toThrow(
+          "durable capture depends on non-restart-durable browser cleanup authority",
         );
-        shutdownRequested.resolve();
-
-        await vi.waitFor(() => {
-          expect(
-            shutdownErrors.some((message) =>
-              message.includes(
-                "durable capture depends on non-restart-durable browser cleanup authority",
-              ),
-            ),
-          ).toBe(true);
-        });
-        expect(drainSettled).toBe(false);
         expect(existsSync(controllerLockPath)).toBe(true);
         expect(closeTarget).not.toHaveBeenCalled();
         expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
@@ -741,6 +758,51 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         });
 
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${rejectedTransactionToken}/run`,
+            token: "a".repeat(64),
+            body: remoteRunPayload(),
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 503,
+          json: { error: "server_closing" },
+        });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/bind`,
+            token: "a".repeat(64),
+            body: {},
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 503,
+          json: { error: "server_closing" },
+        });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "a".repeat(64),
+            body: {},
+          }),
+        ).resolves.toMatchObject({
+          statusCode: 503,
+          json: { error: "server_closing" },
+        });
+        await expect(
+          httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/finalize`,
+            body: { durablePublication: true },
+          }),
+        ).resolves.toMatchObject({ statusCode: 401, json: { error: "authentication_required" } });
+
         const settlement = await httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
@@ -751,8 +813,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
         expect(closeTarget).toHaveBeenCalledOnce();
 
-        await drain;
-        expect(drainSettled).toBe(true);
+        const retriedClose = server.close();
+        expect(retriedClose).not.toBe(firstClose);
+        expect(server.close()).toBe(retriedClose);
+        await retriedClose;
         expect(existsSync(controllerLockPath)).toBe(false);
         await expect(
           readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
@@ -761,7 +825,6 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           finalization: { status: "completed" },
         });
       } finally {
-        shutdownRequested.resolve();
         if (server) {
           await server.close().catch(() => undefined);
         }
@@ -781,19 +844,27 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const controllerGeneration = "controller-with-live-recoverable-target";
       const transactionToken = "7".repeat(64);
       const targetId = "recoverable-manual-kept-target";
+      const targetGenerationId = "10000000-0000-4000-8000-000000000009";
       const browserWSEndpoint =
         "ws://127.0.0.1:9222/devtools/browser/recoverable-manual-kept-generation";
       const profileDir = path.join(tmpDir, "manual-profile");
-      const chromeProcessIdentity = processIdentity(
+      const baseChromeProcessIdentity = processIdentity(
         profileDir,
         4328,
         "10000000-0000-4000-8000-000000000008",
       );
+      const chromeProcessIdentity = {
+        ...baseChromeProcessIdentity,
+        launchClaim: {
+          ...baseChromeProcessIdentity.launchClaim,
+          generationId: targetGenerationId,
+        },
+      };
       const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
       targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       const targetCloseCapability = retainChromeTargetCloseCapability({
         ownerId: transactionToken,
-        generationId: "recoverable-manual-kept-generation",
+        generationId: targetGenerationId,
         targetId,
         browserWSEndpoint,
         close: closeTarget,
@@ -819,7 +890,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             userDataDir: profileDir,
             chromeTargetId: targetId,
             targetCloseCapability,
-            acquisition: { generationId: "recoverable-manual-kept-generation" },
+            acquisition: {
+              generationId: chromeProcessIdentity.launchClaim.generationId,
+              processLaunchClaim: chromeProcessIdentity.launchClaim,
+            },
             recoveryCleanup: {
               ownsTarget: true,
               profileKind: "manual-login",

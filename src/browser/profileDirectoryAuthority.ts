@@ -166,11 +166,7 @@ export function samePhysicalProfileDirectoryIdentity(
     left.version === PROFILE_IDENTITY_VERSION &&
     right.version === PROFILE_IDENTITY_VERSION &&
     left.platform === right.platform &&
-    left.birthtimeNs !== "0" &&
-    right.birthtimeNs !== "0" &&
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
+    samePhysicalDirectoryIdentity(left, right)
   );
 }
 

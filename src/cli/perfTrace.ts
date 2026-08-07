@@ -28,7 +28,9 @@ const SECRET_VALUE_FLAGS = new Set([
   "--browser-inline-cookies-file",
   "--message",
   "--prompt",
+  "--legacy-token",
   "--remote-token",
+  "--remote-legacy-token",
   "--token",
   "-p",
 ]);

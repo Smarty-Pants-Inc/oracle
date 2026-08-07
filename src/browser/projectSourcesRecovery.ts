@@ -13,6 +13,7 @@ import {
   type BrowserRuntimeMetadata,
   writeFileAtomicDurable,
 } from "../sessionManager.js";
+import { samePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 import {
   assertProjectSourcesCleanupProof,
   assertProjectSourcesProfileParent,
@@ -99,20 +100,22 @@ export async function establishProjectSourcesCleanupStorage(): Promise<ProjectSo
 export async function assertProjectSourcesCleanupStorage(
   storage: ProjectSourcesCleanupStorage,
 ): Promise<void> {
-  if (path.resolve(getOracleHomeDir()) !== storage.requestedRoot) {
+  const currentRequestedRoot = path.resolve(getOracleHomeDir());
+  if (process.platform !== "win32" && currentRequestedRoot !== storage.requestedRoot) {
     throw new Error("Project Sources cleanup Oracle-home root changed during the operation.");
   }
-  const current = await captureProfileDirectoryIdentity(storage.requestedRoot);
+  const current = await captureProfileDirectoryIdentity(currentRequestedRoot);
   if (!sameProfileDirectoryIdentity(current, storage.root)) {
     throw new Error("Project Sources cleanup Oracle-home physical authority changed.");
   }
   await assertPrivateDirectoryAuthority(storage.runtimeRoot);
+  // Windows runtime selection is derived from the authenticated Oracle root. The exact assertion
+  // already rechecks physical generation around the owner, DACL, and reparse-point proof.
+  if (process.platform === "win32") return;
   const currentRuntimeRoot = await establishPrivateRuntimeAuthority();
   if (
     currentRuntimeRoot.path !== storage.runtimeRoot.path ||
-    currentRuntimeRoot.identity.device !== storage.runtimeRoot.identity.device ||
-    currentRuntimeRoot.identity.inode !== storage.runtimeRoot.identity.inode ||
-    currentRuntimeRoot.identity.birthtimeNs !== storage.runtimeRoot.identity.birthtimeNs
+    !samePhysicalDirectoryIdentity(currentRuntimeRoot.identity, storage.runtimeRoot.identity)
   ) {
     throw new Error("Project Sources private runtime root changed during the operation.");
   }

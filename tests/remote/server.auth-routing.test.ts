@@ -25,10 +25,11 @@ import {
   REMOTE_REQUEST_MAC_HEADER,
   remoteBodySha256,
 } from "../../src/remote/auth.js";
+import { checkRemoteHealth } from "../../src/remote/health.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "keeps configured and generated v3 root keys out of ordinary startup diagnostics",
+    "keeps configured and generated v3 root keys out of diagnostics and authenticates the generated key",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-startup-token-"));
       const configuredToken = "f".repeat(64); // gitleaks:allow — synthetic test sentinel
@@ -57,6 +58,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         );
         expect(generatedLogs.join("\n")).not.toContain(generated.token);
         expect(generated.token).toMatch(/^[0-9a-f]{64}$/u);
+        await expect(
+          checkRemoteHealth({
+            host: `127.0.0.1:${generated.port}`,
+            token: generated.token,
+          }),
+        ).resolves.toMatchObject({ ok: true, protocol: "transaction-v3" });
       } finally {
         await generated?.close();
         await configured.close();

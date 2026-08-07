@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import * as fsPromises from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
-import type { FileHandle } from "node:fs/promises";
 import {
   createRemoteBrowserExecutor,
   resumeRemoteBrowserTransaction,
@@ -320,6 +319,7 @@ describe("remote client transport deadlines", () => {
   it.each([
     {
       name: "mutates the opened file",
+      changeWhen: "read" as const,
       change: async (attachmentPath: string) => {
         await fsPromises.writeFile(
           attachmentPath,
@@ -329,6 +329,7 @@ describe("remote client transport deadlines", () => {
     },
     {
       name: "swaps the named path",
+      changeWhen: "close" as const,
       change: async (attachmentPath: string, directory: string) => {
         const replacementPath = path.join(directory, "replacement.txt");
         await fsPromises.writeFile(
@@ -340,11 +341,12 @@ describe("remote client transport deadlines", () => {
     },
     {
       name: "adds a hardlink",
+      changeWhen: "read" as const,
       change: async (attachmentPath: string, directory: string) => {
         await fsPromises.link(attachmentPath, path.join(directory, "attachment-link.txt"));
       },
     },
-  ])("does not send replacement attachment bytes when it $name", async ({ change }) => {
+  ])("does not send replacement attachment bytes when it $name", async ({ change, changeWhen }) => {
     const directory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-attachment-"));
     const attachmentPath = path.join(directory, "attachment.txt");
     await fsPromises.writeFile(attachmentPath, "trusted attachment");
@@ -355,24 +357,48 @@ describe("remote client transport deadlines", () => {
       res.end();
     });
     const port = await listen(server);
-    const probe = await fsPromises.open(attachmentPath, "r");
-    const fileHandlePrototype = Object.getPrototypeOf(probe) as FileHandle;
-    await probe.close();
-    const originalReadFile = fileHandlePrototype.readFile;
+    const actualFs = await vi.importActual<typeof fsPromises>("node:fs/promises");
     let changed = false;
-    const readFile = vi.spyOn(fileHandlePrototype, "readFile").mockImplementation(async function (
-      this: FileHandle,
-      ...args: Parameters<FileHandle["readFile"]>
-    ) {
-      if (!changed) {
-        changed = true;
-        await change(attachmentPath, directory);
-      }
-      return await originalReadFile.apply(this, args);
-    });
+    let closedBeforeChange = false;
+    const applyChange = async (): Promise<void> => {
+      await change(attachmentPath, directory);
+      changed = true;
+    };
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({
+      ...actualFs,
+      open: async (...args: Parameters<typeof actualFs.open>) => {
+        const handle = await actualFs.open(...args);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === "readFile") {
+              return async (...readArgs: Parameters<typeof target.readFile>) => {
+                if (!changed && changeWhen === "read") await applyChange();
+                return await target.readFile(...readArgs);
+              };
+            }
+            if (property === "close") {
+              return async (...closeArgs: Parameters<typeof target.close>) => {
+                const result = await target.close(...closeArgs);
+                if (!changed && changeWhen === "close") {
+                  closedBeforeChange = true;
+                  await applyChange();
+                }
+                return result;
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
+    }));
+    // The client captures built-in ESM bindings, so reload it after installing this test-only seam.
+    const { createRemoteBrowserExecutor: isolatedCreateRemoteBrowserExecutor } =
+      await import("../../src/remote/client.js");
     try {
       await expect(
-        createRemoteBrowserExecutor({
+        isolatedCreateRemoteBrowserExecutor({
           host: `127.0.0.1:${port}`,
           token: "a".repeat(64),
           deadlines,
@@ -383,9 +409,11 @@ describe("remote client transport deadlines", () => {
         }),
       ).rejects.toThrow(/attachment changed while it was being read/i);
       expect(changed).toBe(true);
+      expect(closedBeforeChange).toBe(changeWhen === "close");
       expect(runRequests).toBe(0);
     } finally {
-      readFile.mockRestore();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
       await close(server);
       await fsPromises.rm(directory, { recursive: true, force: true });
     }

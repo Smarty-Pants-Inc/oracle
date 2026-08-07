@@ -899,16 +899,28 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         await expect(server.close()).rejects.toThrow("cleanup remains pending");
         expect(abort).toHaveBeenCalledTimes(2);
-        const cleanupRetry = await httpPostJson({
+        const rejectedRetry = await httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/retry`,
           token: "a".repeat(64),
           body: {},
         });
-        expect(cleanupRetry).toMatchObject({
+        expect(rejectedRetry).toMatchObject({
+          statusCode: 503,
+          json: { error: "server_closing" },
+        });
+        expect(abort).toHaveBeenCalledTimes(2);
+        const cleanupSettlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/abort`,
+          token: "a".repeat(64),
+          body: {},
+        });
+        expect(cleanupSettlement).toMatchObject({
           statusCode: 200,
-          json: { status: "terminal", outcome: { state: "aborted" } },
+          json: { state: "aborted", finalization: { status: "completed" } },
         });
         expect(abort).toHaveBeenCalledTimes(3);
       } finally {
