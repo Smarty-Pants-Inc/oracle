@@ -5,6 +5,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import { drainRemoteServerShutdown, type RemoteServerInstance } from "../../src/remote/server.js";
+import { serveRemote } from "../../src/remote/serverLifecycle.js";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
 import {
   createRemoteBrowserExecutor,
@@ -599,7 +600,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "preserves restart-durable manual kept target authority across graceful shutdown",
+    "keeps controller authority until live-only manual target close authority settles",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-live-close-drain-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -715,23 +716,49 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           },
         );
         shutdownRequested.resolve();
-        await drain;
 
-        expect(drainSettled).toBe(true);
-        expect(shutdownErrors).toEqual([]);
-        expect(existsSync(controllerLockPath)).toBe(false);
+        await vi.waitFor(() => {
+          expect(
+            shutdownErrors.some((message) =>
+              message.includes(
+                "durable capture depends on non-restart-durable browser cleanup authority",
+              ),
+            ),
+          ).toBe(true);
+        });
+        expect(drainSettled).toBe(false);
+        expect(existsSync(controllerLockPath)).toBe(true);
         expect(closeTarget).not.toHaveBeenCalled();
         expect(targetCloseAuthorityTest.retainedTargetCloseAuthorityCount()).toBe(1);
-        const pendingRecord = await readAuthenticatedTransactionRecord(
-          transactionStoreDir,
-          transactionToken,
-        );
-        expect(pendingRecord).toMatchObject({
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toMatchObject({
           state: "pending",
+          result: { answerText: "manual kept answer" },
           runtime: {
             chromeTargetId: targetId,
             recoveryCleanupResources: [{ targetCloseCapability }],
           },
+        });
+
+        const settlement = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${transactionToken}/finalize`,
+          token: "a".repeat(64),
+          body: { durablePublication: true },
+        });
+        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        expect(closeTarget).toHaveBeenCalledOnce();
+
+        await drain;
+        expect(drainSettled).toBe(true);
+        expect(existsSync(controllerLockPath)).toBe(false);
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toMatchObject({
+          state: "finalized",
+          finalization: { status: "completed" },
         });
       } finally {
         shutdownRequested.resolve();
@@ -1379,6 +1406,26 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       } finally {
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(process.platform !== "linux")(
+    "rejects WSL before remote service bootstrap without ACL authority",
+    async () => {
+      const previousWslDistro = process.env.WSL_DISTRO_NAME;
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      process.env.WSL_DISTRO_NAME = "oracle-test";
+      try {
+        await expect(serveRemote()).rejects.toThrow(
+          "WSL cannot prove private runtime Windows ACL authority",
+        );
+        expect(log.mock.calls.flat().join("\n")).toContain(
+          "WSL cannot certify the backing Windows ACL",
+        );
+      } finally {
+        if (previousWslDistro === undefined) delete process.env.WSL_DISTRO_NAME;
+        else process.env.WSL_DISTRO_NAME = previousWslDistro;
+        log.mockRestore();
       }
     },
   );

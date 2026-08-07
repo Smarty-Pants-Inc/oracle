@@ -50,43 +50,14 @@ function validatePrefix(prefix: string): void {
 }
 
 function isWslRuntime(options: PrivateTempRootOptions, platform: NodeJS.Platform): boolean {
-  if (options.isWsl !== undefined) return options.isWsl;
   if (platform !== "linux") return false;
+  if (options.isWsl !== undefined) return options.isWsl;
   const environment = options.environment ?? process.env;
   return Boolean(environment.WSL_DISTRO_NAME) || os.release().toLowerCase().includes("microsoft");
 }
 
-function windowsBackedWslPath(candidate: string | undefined): string | null {
-  const trimmed = candidate?.trim();
-  if (!trimmed) return null;
-  if (/^\/mnt\/[a-z](?:\/|$)/iu.test(trimmed)) return path.resolve(trimmed);
-  const native = trimmed.match(/^([a-z]):[\\/](.*)$/iu);
-  if (!native?.[1]) return null;
-  return path.posix.join(
-    "/mnt",
-    native[1].toLowerCase(),
-    ...(native[2] ?? "").split(/[\\/]+/u).filter(Boolean),
-  );
-}
-
-function resolveWslOracleStateDirectory(options: PrivateTempRootOptions): string {
-  const configuredState = options.oracleStateDirectory ?? getOracleHomeDir();
-  const configured = windowsBackedWslPath(configuredState);
-  if (configured) return configured;
-
-  const environment = options.environment ?? process.env;
-  const localAppData = windowsBackedWslPath(environment.LOCALAPPDATA);
-  if (localAppData) return path.join(localAppData, "Oracle");
-  const userProfile = windowsBackedWslPath(environment.USERPROFILE);
-  if (userProfile) return path.join(userProfile, "AppData", "Local", "Oracle");
-  throw new Error(
-    "WSL private runtime authority requires a current-user Windows-backed ORACLE_HOME_DIR, LOCALAPPDATA, or USERPROFILE; refusing shared Windows temp storage.",
-  );
-}
-
-function oracleStateDirectory(options: PrivateTempRootOptions, platform: NodeJS.Platform): string {
+function oracleStateDirectory(options: PrivateTempRootOptions): string {
   if (options.tempDirectory) return path.resolve(options.tempDirectory);
-  if (isWslRuntime(options, platform)) return resolveWslOracleStateDirectory(options);
   return path.resolve(options.oracleStateDirectory ?? getOracleHomeDir());
 }
 
@@ -103,18 +74,15 @@ export function privateRuntimeRootPathCandidates(
   options: PrivateTempRootOptions = {},
 ): readonly string[] {
   const platform = options.platform ?? process.platform;
+  if (isWslRuntime(options, platform)) return [];
   if (options.tempDirectory) {
     return [path.join(path.resolve(options.tempDirectory), PRIVATE_TEMP_ROOT_NAME)];
   }
-  if (platform === "win32" || isWslRuntime(options, platform)) {
-    try {
-      return [path.join(oracleStateDirectory(options, platform), PRIVATE_TEMP_ROOT_NAME)];
-    } catch {
-      return [];
-    }
+  if (platform === "win32") {
+    return [path.join(oracleStateDirectory(options), PRIVATE_TEMP_ROOT_NAME)];
   }
   const runtimeDirectory = configuredPosixRuntimeDirectory(options);
-  const stateRoot = path.join(oracleStateDirectory(options, platform), PRIVATE_TEMP_ROOT_NAME);
+  const stateRoot = path.join(oracleStateDirectory(options), PRIVATE_TEMP_ROOT_NAME);
   return runtimeDirectory
     ? [path.join(runtimeDirectory, PRIVATE_TEMP_ROOT_NAME), stateRoot]
     : [stateRoot];
@@ -254,7 +222,7 @@ async function establishPosixPrivateRoot(
 async function establishWindowsPrivateRoot(
   options: PrivateTempRootOptions,
 ): Promise<PrivateDirectoryAuthority> {
-  const stateDirectory = oracleStateDirectory(options, "win32");
+  const stateDirectory = oracleStateDirectory(options);
   const windowsAuthority =
     options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory;
   if (!options.tempDirectory) {
@@ -280,8 +248,13 @@ export async function establishPrivateRuntimeAuthority(
 ): Promise<PrivateDirectoryAuthority> {
   const platform = options.platform ?? process.platform;
   if (platform === "win32") return await establishWindowsPrivateRoot(options);
+  if (isWslRuntime(options, platform)) {
+    throw new Error(
+      "WSL private runtime authority is unavailable: Oracle cannot prove backing Windows ACL privacy",
+    );
+  }
 
-  if (!options.tempDirectory && !isWslRuntime(options, platform)) {
+  if (!options.tempDirectory) {
     const runtimeDirectory = configuredPosixRuntimeDirectory(options);
     if (runtimeDirectory) {
       try {
@@ -293,10 +266,7 @@ export async function establishPrivateRuntimeAuthority(
       }
     }
   }
-  const state = await establishPosixStateDirectory(
-    oracleStateDirectory(options, platform),
-    platform,
-  );
+  const state = await establishPosixStateDirectory(oracleStateDirectory(options), platform);
   return await establishPosixPrivateRoot(state);
 }
 

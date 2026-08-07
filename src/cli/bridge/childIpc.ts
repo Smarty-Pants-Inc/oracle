@@ -37,6 +37,7 @@ async function readOneShotBridgeHostLine(
   stream: NodeJS.ReadableStream,
   label: string,
   maxBytes: number,
+  completeAtNewline = false,
 ): Promise<Buffer> {
   if ((stream as NodeJS.ReadStream).isTTY) {
     throw new Error(`${label} is missing.`);
@@ -57,6 +58,14 @@ async function readOneShotBridgeHostLine(
       throw new Error(`${label} exceeds the ${maxBytes}-byte limit.`);
     }
     chunks.push(bytes);
+    if (completeAtNewline) {
+      const newlineIndex = bytes.indexOf(0x0a);
+      if (newlineIndex < 0) continue;
+      if (newlineIndex !== bytes.byteLength - 1) {
+        throw new Error(`${label} contains extra bytes.`);
+      }
+      return Buffer.concat(chunks, totalBytes);
+    }
   }
 
   if (totalBytes === 0) {
@@ -181,6 +190,7 @@ async function readBridgeHostReadinessPayload(
     stream,
     label,
     BRIDGE_HOST_READINESS_PAYLOAD_MAX_BYTES,
+    true,
   );
   const parsed = decodeBridgeHostLine(bytes, label);
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {

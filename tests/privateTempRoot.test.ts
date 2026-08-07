@@ -21,6 +21,7 @@ import {
   establishPrivateRuntimeAuthority,
   privateRuntimeRootPathCandidates,
   removePrivateTempGeneration,
+  type PrivateTempRootOptions,
 } from "../src/privateTempRoot.js";
 import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
 
@@ -85,26 +86,54 @@ describe("private temporary root authority", () => {
     },
   );
 
-  test("WSL selects only current-user Windows-backed state and otherwise fails closed", async () => {
-    const unavailable = {
-      platform: "linux" as const,
-      isWsl: true,
+  test("WSL rejects private runtime paths without backing Windows ACL authority", async () => {
+    const aclAuthorityError =
+      "WSL private runtime authority is unavailable: Oracle cannot prove backing Windows ACL privacy";
+    const wsl = { platform: "linux" as const, isWsl: true };
+    const expectRejected = async (options: PrivateTempRootOptions): Promise<void> => {
+      expect(privateRuntimeRootPathCandidates(options)).toEqual([]);
+      await expect(establishPrivateRuntimeAuthority(options)).rejects.toMatchObject({
+        message: aclAuthorityError,
+      });
+    };
+
+    for (const options of [
+      {
+        ...wsl,
+        oracleStateDirectory: String.raw`C:\Users\Alice\AppData\Local\Oracle`,
+        environment: { ORACLE_HOME_DIR: String.raw`C:\Users\Alice\AppData\Local\Oracle` },
+      },
+      {
+        ...wsl,
+        oracleStateDirectory: "/home/alice/.oracle",
+        environment: { LOCALAPPDATA: String.raw`C:\Users\Alice\AppData\Local` },
+      },
+      {
+        ...wsl,
+        oracleStateDirectory: "/home/alice/.oracle",
+        environment: { USERPROFILE: String.raw`C:\Users\Alice` },
+      },
+    ]) {
+      await expectRejected(options);
+    }
+
+    await expectRejected({
+      ...wsl,
       oracleStateDirectory: "/home/alice/.oracle",
       environment: {},
-    };
-    expect(
-      privateRuntimeRootPathCandidates({
-        platform: "linux",
-        isWsl: true,
-        oracleStateDirectory: "/home/alice/.oracle",
-        environment: { LOCALAPPDATA: String.raw`C:\\Users\\Alice\\AppData\\Local` },
-      }),
-    ).toEqual(["/mnt/c/Users/Alice/AppData/Local/Oracle/oracle-private"]);
-    expect(privateRuntimeRootPathCandidates(unavailable)).toEqual([]);
-    await expect(establishPrivateRuntimeAuthority(unavailable)).rejects.toThrow(
-      /requires a current-user Windows-backed/u,
-    );
+    });
+
+    const injectedParent = await mkdtemp(path.join(os.tmpdir(), "oracle-private-wsl-injected-"));
+    try {
+      await expectRejected({
+        ...wsl,
+        tempDirectory: `${path.join(injectedParent, "nested")}${path.sep}..${path.sep}private`,
+      });
+    } finally {
+      await rm(injectedParent, { recursive: true, force: true });
+    }
   });
+
   test("proves the Windows parent before creating a per-run generation", async () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-order-"));
     const rootPath = path.join(await realpath(ambient), "oracle-private");

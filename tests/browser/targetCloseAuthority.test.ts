@@ -4,8 +4,8 @@ import {
   acknowledgeChromeTargetCloseCapability,
   closeChromeTargetWithRetainedCapability,
   discardChromeTargetCloseCapability,
-  retainChromeTargetCloseCapability,
   hasRestartDurableChromeTargetCleanupAuthority,
+  retainChromeTargetCloseCapability,
 } from "../../src/browser/targetCloseAuthority.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
 import { processIdentity } from "./chromeLifecycleTestHelpers.js";
@@ -223,7 +223,7 @@ describe("retained Chrome target close capabilities", () => {
     ).toBe(false);
   });
 
-  test("requires a live capability or exact temporary-process teardown after restart", async () => {
+  test("keeps manual kept and borrowed targets non-restart-durable with live capabilities", async () => {
     const browserWSEndpoint = "ws://service.example:9222/devtools/browser/live-generation";
     const close = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
@@ -278,26 +278,18 @@ describe("retained Chrome target close capabilities", () => {
     });
     expect(
       [resource, temporaryResource, borrowedResource].map((candidate) =>
-        hasRestartDurableChromeTargetCleanupAuthority(
-          { recoveryCleanupResources: [candidate] },
-          "test-owner",
-        ),
+        hasRestartDurableChromeTargetCleanupAuthority({
+          recoveryCleanupResources: [candidate],
+        }),
       ),
-    ).toEqual([true, true, true]);
-    expect(
-      hasRestartDurableChromeTargetCleanupAuthority(
-        { recoveryCleanupResources: [resource] },
-        "different-owner",
-      ),
-    ).toBe(false);
+    ).toEqual([false, true, false]);
 
     __test__.clearRetainedTargetCloseAuthorities();
     expect(
       [resource, temporaryResource, borrowedResource].map((candidate) =>
-        hasRestartDurableChromeTargetCleanupAuthority(
-          { recoveryCleanupResources: [candidate] },
-          "test-owner",
-        ),
+        hasRestartDurableChromeTargetCleanupAuthority({
+          recoveryCleanupResources: [candidate],
+        }),
       ),
     ).toEqual([false, true, false]);
 

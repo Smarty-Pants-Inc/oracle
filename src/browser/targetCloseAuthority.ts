@@ -111,7 +111,6 @@ export function hasRestartReconstructibleChromeTargetCloseAuthority(
 
 function hasRestartDurableTargetResourceAuthority(
   resource: BrowserRecoveryCleanupResourceMetadata,
-  ownerId: string | undefined,
 ): boolean {
   const cleanup = resource.recoveryCleanup;
   if (
@@ -124,18 +123,6 @@ function hasRestartDurableTargetResourceAuthority(
   }
   if (!cleanup.ownsTarget || cleanup.closeOwnedTargetOnComplete === false) return true;
   if (cleanup.closeOwnedTargetOnComplete !== true) return false;
-  const targetId = resource.chromeTargetId?.trim();
-  const capability = resource.targetCloseCapability;
-  const generationId = resource.acquisition?.generationId?.trim();
-  if (
-    ownerId?.trim() &&
-    targetId &&
-    capability &&
-    generationId === capability.generationId &&
-    hasRetainedChromeTargetCloseCapability({ ownerId, capability, targetId })
-  ) {
-    return true;
-  }
   return canExactOwnedProcessTeardownSubsumeTargetClose({
     profileKind: cleanup.profileKind,
     keepBrowserOpen: cleanup.keepBrowser,
@@ -143,15 +130,12 @@ function hasRestartDurableTargetResourceAuthority(
   });
 }
 
+/** Uses persisted exact teardown authority only; retained capabilities are process-local. */
 export function hasRestartDurableChromeTargetCleanupAuthority(
   runtime: BrowserRuntimeMetadata,
-  ownerId?: string,
 ): boolean {
   const resources = runtime.recoveryCleanupResources ?? [];
-  if (resources.length > 0)
-    return resources.every((resource) =>
-      hasRestartDurableTargetResourceAuthority(resource, ownerId),
-    );
+  if (resources.length > 0) return resources.every(hasRestartDurableTargetResourceAuthority);
   return !(
     runtime.chromeTargetId ||
     runtime.chromeProcessIdentity ||

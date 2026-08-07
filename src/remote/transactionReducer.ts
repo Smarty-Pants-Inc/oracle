@@ -623,10 +623,7 @@ const reducers: RemoteTransactionReducers = {
       throw new Error("Cannot shut down while a remote transaction is still running");
     }
     if (!record.runtime) throw new Error("Nonterminal transaction lacks runtime authority");
-    const restartDurableCleanup = hasRestartDurableChromeTargetCleanupAuthority(
-      record.runtime,
-      record.transactionToken,
-    );
+    const restartDurableCleanup = hasRestartDurableChromeTargetCleanupAuthority(record.runtime);
     if (!record.settlementMode) {
       if (restartDurableCleanup) {
         return { persist: false, outcome: { action: "preserve" } };

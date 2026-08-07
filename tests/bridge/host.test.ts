@@ -460,14 +460,15 @@ describe("bridge host detached child transport", () => {
     }
   });
 
-  it("launches Windows background hosts inside a trusted kill-on-close Job supervisor", async () => {
+  it("publishes Windows background state before the Job supervisor stdout reaches EOF", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-windows-job-"));
     const artifactPath = path.join(tempDir, "connection.json");
+    const pidPath = path.join(tempDir, "bridge-host.pid");
     setOracleHomeDirOverrideForTest(tempDir);
     const harness = createFakeBridgeChild(
       (_payload, readiness) => {
         readiness.push(readinessPayload(READINESS_NONCE));
-        readiness.push(null);
+        // The long-lived Job supervisor deliberately leaves its stdout without EOF.
       },
       4242,
       true,
@@ -489,6 +490,7 @@ describe("bridge host detached child transport", () => {
           spawn: spawnChild,
           backgroundPlatform: "win32",
           generateReadinessNonce: () => READINESS_NONCE,
+          readinessTimeoutMs: 250,
           env: { PATH: String.raw`C:\attacker`, ORACLE_REMOTE_TOKEN: MODERN_TOKEN },
         },
       );
@@ -528,6 +530,15 @@ describe("bridge host detached child transport", () => {
       expect(launchConfig.arguments).toContain("--background-child");
       expect(JSON.stringify(options.env)).not.toContain(MODERN_TOKEN);
       expect(JSON.stringify(options.env)).not.toContain(READINESS_NONCE);
+      expect(JSON.parse(await fs.readFile(artifactPath, "utf8"))).toMatchObject({
+        remoteToken: MODERN_TOKEN,
+      });
+      expect(await fs.readFile(pidPath, "utf8")).toBe("4242\n");
+      expect(harness.child.exitCode).toBeNull();
+      expect(harness.child.signalCode).toBeNull();
+      expect(harness.child.stdout?.readableEnded).toBe(false);
+      expect(harness.child.stdout?.destroyed).toBe(true);
+      expect(harness.readinessUnref).toHaveBeenCalledOnce();
       expect(harness.kill).not.toHaveBeenCalled();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });

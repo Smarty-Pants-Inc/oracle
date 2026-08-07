@@ -82,18 +82,15 @@ export async function serveRemote(
   let cookies: CookieParam[] | null = null;
   let opened = false;
 
-  if (isWsl() && process.env.ORACLE_ALLOW_WSL_SERVE !== "1") {
+  if (isWsl()) {
     console.log(
-      "WSL detected. For reliable browser automation, run `oracle serve` from Windows PowerShell/Command Prompt so we can use your Windows Chrome profile.",
+      "WSL detected. Run `oracle serve` from Windows PowerShell/Command Prompt so Oracle can prove private runtime ACL authority and use your Windows Chrome profile.",
     );
     console.log(
-      "If you want to stay in WSL anyway, set ORACLE_ALLOW_WSL_SERVE=1 and ensure a Linux Chrome is installed, then rerun.",
-    );
-    console.log(
-      "Alternatively, start Windows Chrome with --remote-debugging-port=9222 and use `--remote-chrome <windows-ip>:9222`.",
+      "Alternatively, run Oracle on a native POSIX host; WSL cannot certify the backing Windows ACL for private browser and attachment storage.",
     );
     throw new Error(
-      "Remote service not started: WSL hosting requires ORACLE_ALLOW_WSL_SERVE=1 or a native Windows oracle serve process.",
+      "Remote service not started: WSL cannot prove private runtime Windows ACL authority; use a native Windows or POSIX Oracle host.",
     );
   }
 
