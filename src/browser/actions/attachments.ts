@@ -1186,9 +1186,9 @@ export async function uploadAttachmentFile(
 
   if (inputConfirmed || inputHasFile) {
     logger(
-      "Attachment input accepted the file but UI did not acknowledge it; continuing with input confirmation only.",
+      "Attachment input accepted the file but UI did not acknowledge it; reporting input-only confirmation.",
     );
-    return true;
+    return false;
   }
 
   await logDomFailure(runtime, logger, "file-upload-missing");
@@ -1743,6 +1743,7 @@ export async function waitForUserTurnAttachments(
 
   const deadline = Date.now() + timeoutMs;
   let sawAttachmentUi = false;
+  let sawCandidateTurn = false;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression, returnByValue: true });
     const value = result?.value as
@@ -1765,6 +1766,7 @@ export async function waitForUserTurnAttachments(
       await delay(200);
       continue;
     }
+    sawCandidateTurn = true;
     if (value.hasAttachmentUi) {
       sawAttachmentUi = true;
     }
@@ -1791,12 +1793,15 @@ export async function waitForUserTurnAttachments(
     await delay(250);
   }
 
-  if (!sawAttachmentUi) {
-    logger?.("Sent user message did not expose attachment UI; skipping attachment verification.");
+  if (!sawCandidateTurn) {
     return false;
   }
 
-  logger?.("Sent user message did not show expected attachment names in time.");
+  logger?.(
+    sawAttachmentUi
+      ? "Sent user message did not show expected attachment names in time."
+      : "Sent user message did not expose attachment UI; attachment could not be verified.",
+  );
   await logDomFailure(Runtime, logger ?? (() => {}), "attachment-missing-user-turn");
   throw new Error("Attachment was not present on the sent user message.");
 }
