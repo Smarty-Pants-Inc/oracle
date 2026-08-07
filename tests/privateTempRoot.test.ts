@@ -23,6 +23,7 @@ import {
   removePrivateTempGeneration,
   type PrivateTempRootOptions,
 } from "../src/privateTempRoot.js";
+import { establishWindowsPrivateDirectory } from "../src/remote/windowsPrivateTreeAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
@@ -170,10 +171,30 @@ describe("private temporary root authority", () => {
       });
 
       expect(generation.path).toBe(path.join(rootPath, "remote-fixed-generation"));
-      expect(calls[0]).toEqual({ path: rootPath, existed: false });
-      const childCreation = calls.find((call) => call.path === generation.path && !call.existed);
-      expect(childCreation).toBeDefined();
+      expect(calls).toEqual([
+        { path: rootPath, existed: false },
+        { path: rootPath, existed: true },
+        { path: generation.path, existed: false },
+      ]);
       expect(await readdir(generation.path)).toEqual([]);
+    } finally {
+      await rm(ambient, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the suite-scoped Windows authority for ordinary private generations", async () => {
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-suite-authority-"));
+    try {
+      const generation = await createPrivateTempGeneration("ordinary-", {
+        platform: "win32",
+        tempDirectory: ambient,
+        randomId: () => "fixed-generation",
+      });
+
+      expect(generation.path).toBe(
+        path.join(await realpath(ambient), "oracle-private", "ordinary-fixed-generation"),
+      );
+      expect((await lstat(generation.path)).isDirectory()).toBe(true);
     } finally {
       await rm(ambient, { recursive: true, force: true });
     }
@@ -240,6 +261,7 @@ $Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([Sy
       try {
         const generation = await createPrivateTempGeneration("reattach-", {
           tempDirectory: ambient,
+          windowsPrivateDirectoryAuthority: establishWindowsPrivateDirectory,
         });
         const defaultDirectory = path.join(generation.path, "Default");
         const activePortPath = path.join(generation.path, "DevToolsActivePort");
@@ -260,16 +282,22 @@ $Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([Sy
 $Paths = @(${encodedPaths.map((entry) => `'${entry}'`).join(",")}) | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_)) }
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $Allowed = @($CurrentSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+$FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $AmbientAcl = [System.IO.DirectoryInfo]::new($Paths[0]).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
 if (-not (@($AmbientAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count)) { throw 'Ambient TEMP fixture is not hostile.' }
 foreach ($Index in 1..5) {
   $Item = if ([System.IO.Directory]::Exists($Paths[$Index])) { [System.IO.DirectoryInfo]::new($Paths[$Index]) } else { [System.IO.FileInfo]::new($Paths[$Index]) }
   $Acl = $Item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access)
-  if ($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value) { throw "Private item owner mismatch: $($Paths[$Index])" }
+  $Owner = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+  if ($Index -le 2 -and $Owner -ne $CurrentSid.Value) { throw "Private authority owner mismatch: $($Paths[$Index]); actual=$Owner" }
+  if ($Index -gt 2 -and $Allowed -notcontains $Owner) { throw "Private descendant has an unauthorized owner: $($Paths[$Index]); actual=$Owner" }
   $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-  if (-not $Rules.Count) { throw "Private item has no access rules: $($Paths[$Index])" }
-  foreach ($Rule in $Rules) {
-    if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $Allowed -notcontains $Rule.IdentityReference.Value) { throw "Private item inherited an unauthorized rule: $($Paths[$Index])" }
+  if ($Rules.Count -ne $Allowed.Count) { throw "Private item has a non-canonical rule count: $($Paths[$Index]); actual=$($Rules.Count)" }
+  foreach ($Sid in $Allowed) {
+    $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid })
+    if ($Matches.Count -ne 1) { throw "Private item does not grant one exact rule to $Sid: $($Paths[$Index])" }
+    $Rule = $Matches[0]
+    if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl) { throw "Private item has a non-canonical rule for $Sid: $($Paths[$Index])" }
   }
 }
 [Console]::Out.Write('oracle.private-temp.inheritance:complete')

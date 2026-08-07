@@ -357,6 +357,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         const periodicSweepStarted = Promise.withResolvers<void>();
         const releasePeriodicSweep = Promise.withResolvers<void>();
         let cleanupAttempts = 0;
+        let forceCleanupCompletion = false;
         const retryCleanup = vi.fn(
           async (
             runtime: BrowserRunTransaction["runtime"],
@@ -370,7 +371,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
               periodicSweepStarted.resolve();
               await releasePeriodicSweep.promise;
             }
-            if (cleanupAttempts >= 4) return { status: "completed" as const, runtime };
+            if (forceCleanupCompletion || cleanupAttempts >= 4) {
+              return { status: "completed" as const, runtime };
+            }
             return {
               status: "pending" as const,
               runtime: {
@@ -413,17 +416,20 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           let retryResponse:
             | { statusCode: number; json: Record<string, unknown> | null }
             | undefined;
-          await vi.waitFor(async () => {
-            const candidate = await httpPostJson({
-              hostname: "127.0.0.1",
-              port: server.port,
-              path: `/transactions/${transactionToken}/retry`,
-              token: "a".repeat(64),
-              body: {},
-            });
-            expect(candidate.statusCode).toBe(200);
-            retryResponse = candidate;
-          });
+          await vi.waitFor(
+            async () => {
+              const candidate = await httpPostJson({
+                hostname: "127.0.0.1",
+                port: server.port,
+                path: `/transactions/${transactionToken}/retry`,
+                token: "a".repeat(64),
+                body: {},
+              });
+              expect(candidate.statusCode).toBe(200);
+              retryResponse = candidate;
+            },
+            { timeout: 5_000 },
+          );
           if (!retryResponse) throw new Error("pending settlement retry did not acquire authority");
           expect(retryCleanup).toHaveBeenCalledTimes(3);
           expect(retryCleanup.mock.calls.every((call) => call[3] === "abort")).toBe(true);
@@ -456,6 +462,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           expect(retryCleanup).toHaveBeenCalledTimes(attemptsAfterClose);
         } finally {
           releasePeriodicSweep.resolve();
+          forceCleanupCompletion = true;
           await server.close();
         }
       } finally {

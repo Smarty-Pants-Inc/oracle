@@ -9,8 +9,10 @@ import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
 import {
+  buildWindowsPrivateDirectoriesCommand,
   buildWindowsPrivateDirectoryCommand,
   buildWindowsPrivateTreeAclCommand,
+  establishWindowsPrivateDirectories,
   establishWindowsPrivateDirectory,
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeScope,
@@ -105,6 +107,51 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(decodedCommand).toContain("Refusing to promote an existing file");
     expect(decodedCommand).not.toContain(".SetAccessControl(");
     expect(command.args.join("\0")).not.toContain(directoryPath);
+  });
+
+  test("creates and re-verifies a private directory chain in one native command", async () => {
+    const directoryPaths = [
+      String.raw`C:\Users\Oracle\.oracle\oracle-private`,
+      String.raw`C:\Users\Oracle\.oracle\oracle-private\generation`,
+    ];
+    const execute = vi.fn(async () => ({
+      stdout: "oracle.windows-private-directory.v1:complete",
+    }));
+
+    await expect(
+      establishWindowsPrivateDirectories(directoryPaths, execute),
+    ).resolves.toBeUndefined();
+
+    const command = buildWindowsPrivateDirectoriesCommand(directoryPaths);
+    const decodedCommand = Buffer.from(command.args.at(-1) ?? "", "base64").toString("utf16le");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
+    expect(decodedCommand).toContain(
+      "foreach ($DirectoryPath in $DirectoryPaths) { Establish-PrivateDirectory $DirectoryPath }",
+    );
+    expect(decodedCommand).toContain(
+      "foreach ($DirectoryPath in $DirectoryPaths) { Assert-PrivateAcl",
+    );
+    expect([
+      ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
+    ]).toHaveLength(2);
+  });
+
+  test("uses the suite-scoped tree authority for ordinary simulated Windows stores", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-suite-authority-"));
+    const transactionToken = "e".repeat(64);
+    try {
+      const store = await RemoteTransactionStore.open({
+        directory: path.join(root, "remote-transactions"),
+        integrityKeyPath: path.join(root, ".remote-transaction-integrity.key"),
+        platform: "win32",
+      });
+      await beginAclTestRecord(store, transactionToken, "suite-authority-run");
+
+      await expect(store.read(transactionToken)).resolves.toMatchObject({ transactionToken });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   test("precreates fresh transaction files with exact ACLs and only verifies existing tree entries", () => {
@@ -405,7 +452,11 @@ describe("Windows remote transaction private ACL authority", () => {
       const powershellExecutable = resolveWindowsPowerShellExecutable();
       try {
         await establishWindowsPrivateDirectory(privateRoot);
-        const store = await RemoteTransactionStore.open({ directory, integrityKeyPath });
+        const store = await RemoteTransactionStore.open({
+          directory,
+          integrityKeyPath,
+          windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
+        });
         await beginAclTestRecord(store, transactionToken, "windows-fresh-acl-run");
         const headDirectory = remoteTransactionHeadDirectory(integrityKeyPath);
         const protectedPaths = [
@@ -477,6 +528,7 @@ foreach ($ItemPath in $ItemPaths) {
         const rejectedStore = await RemoteTransactionStore.open({
           directory: rejectedDirectory,
           integrityKeyPath: rejectedKeyPath,
+          windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
         });
         await beginAclTestRecord(rejectedStore, transactionToken, "rejected-generation-run");
         const rejectedRecordPath = rejectedStore.recordPath(transactionToken);
@@ -507,6 +559,7 @@ foreach ($ItemPath in $ItemPaths) {
           RemoteTransactionStore.open({
             directory: rejectedDirectory,
             integrityKeyPath: rejectedKeyPath,
+            windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
           }),
         ).rejects.toThrow("Windows remote transaction private ACL protection failed");
         const { stdout: rejectedAclCount } = await execFileAsync(
@@ -523,6 +576,7 @@ foreach ($ItemPath in $ItemPaths) {
         const acceptedStore = await RemoteTransactionStore.open({
           directory: path.join(acceptedRoot, "remote-transactions"),
           integrityKeyPath: path.join(acceptedRoot, ".remote-transaction-integrity.key"),
+          windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
         });
         await beginAclTestRecord(acceptedStore, transactionToken, "accepted-generation-run");
         const acceptedBytes = await fs.readFile(acceptedStore.recordPath(transactionToken));

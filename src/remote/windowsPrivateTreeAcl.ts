@@ -30,6 +30,30 @@ export type WindowsAclCommandExecutor = (
 ) => Promise<{ stdout: string }>;
 
 export type WindowsPrivateTreeAuthority = (scope: WindowsPrivateTreeScope) => Promise<void>;
+export type WindowsPrivateDirectoryAuthority = (directoryPath: string) => Promise<void>;
+
+let windowsPrivateDirectoryAuthorityOverrideForTest: WindowsPrivateDirectoryAuthority | undefined;
+let windowsPrivateTreeAuthorityOverrideForTest: WindowsPrivateTreeAuthority | undefined;
+
+export function setWindowsPrivateDirectoryAuthorityOverrideForTest(
+  authority: WindowsPrivateDirectoryAuthority | null,
+): void {
+  windowsPrivateDirectoryAuthorityOverrideForTest = authority ?? undefined;
+}
+
+export function setWindowsPrivateTreeAuthorityOverrideForTest(
+  authority: WindowsPrivateTreeAuthority | null,
+): void {
+  windowsPrivateTreeAuthorityOverrideForTest = authority ?? undefined;
+}
+
+export function resolveWindowsPrivateDirectoryAuthority(): WindowsPrivateDirectoryAuthority {
+  return windowsPrivateDirectoryAuthorityOverrideForTest ?? establishWindowsPrivateDirectory;
+}
+
+export function resolveWindowsPrivateTreeAuthority(): WindowsPrivateTreeAuthority {
+  return windowsPrivateTreeAuthorityOverrideForTest ?? protectWindowsPrivateTreeAcl;
+}
 
 const WINDOWS_PRIVATE_ACL_FUNCTIONS_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -253,12 +277,20 @@ ${WINDOWS_PRIVATE_TREE_ACL_SCRIPT}`;
   return Buffer.from(command, "utf16le").toString("base64");
 }
 
-function encodeWindowsPrivateDirectoryCommand(directoryPath: string): string {
-  const encodedPath = Buffer.from(directoryPath, "utf8").toString("base64");
+function encodeWindowsPrivateDirectoriesCommand(directoryPaths: readonly string[]): string {
+  const encodedPaths = directoryPaths.map((directoryPath) =>
+    Buffer.from(directoryPath, "utf8").toString("base64"),
+  );
   const command = String.raw`
-$DirectoryPath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}')))
+$DirectoryPaths = @(${encodedPaths
+    .map(
+      (encodedPath) =>
+        `[System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}')))`,
+    )
+    .join(",")})
 ${WINDOWS_PRIVATE_ACL_FUNCTIONS_SCRIPT}
-Establish-PrivateDirectory $DirectoryPath
+foreach ($DirectoryPath in $DirectoryPaths) { Establish-PrivateDirectory $DirectoryPath }
+foreach ($DirectoryPath in $DirectoryPaths) { Assert-PrivateAcl (Get-PhysicalItem $DirectoryPath $true) $true }
 [Console]::Out.Write('${WINDOWS_PRIVATE_DIRECTORY_COMPLETE_MARKER}')`;
   return Buffer.from(command, "utf16le").toString("base64");
 }
@@ -291,8 +323,15 @@ function assertAbsoluteNonRootWindowsPath(protectedPath: string): void {
   }
 }
 
-export function buildWindowsPrivateDirectoryCommand(directoryPath: string): WindowsAclCommand {
-  assertAbsoluteNonRootWindowsPath(directoryPath);
+export function buildWindowsPrivateDirectoriesCommand(
+  directoryPaths: readonly string[],
+): WindowsAclCommand {
+  if (directoryPaths.length === 0) {
+    throw new Error("Windows private ACL protection requires at least one directory");
+  }
+  for (const directoryPath of directoryPaths) {
+    assertAbsoluteNonRootWindowsPath(directoryPath);
+  }
   return {
     file: resolveWindowsPowerShellExecutable(),
     args: [
@@ -300,10 +339,14 @@ export function buildWindowsPrivateDirectoryCommand(directoryPath: string): Wind
       "-NoProfile",
       "-NonInteractive",
       "-EncodedCommand",
-      encodeWindowsPrivateDirectoryCommand(directoryPath),
+      encodeWindowsPrivateDirectoriesCommand(directoryPaths),
     ],
     options: { timeoutMs: WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS },
   };
+}
+
+export function buildWindowsPrivateDirectoryCommand(directoryPath: string): WindowsAclCommand {
+  return buildWindowsPrivateDirectoriesCommand([directoryPath]);
 }
 
 export function buildWindowsPrivateTreeAclCommand(
@@ -350,16 +393,23 @@ async function runWindowsPrivateAclCommand(
   }
 }
 
-export async function establishWindowsPrivateDirectory(
-  directoryPath: string,
+export async function establishWindowsPrivateDirectories(
+  directoryPaths: readonly string[],
   execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
 ): Promise<void> {
   await runWindowsPrivateAclCommand(
-    buildWindowsPrivateDirectoryCommand(directoryPath),
+    buildWindowsPrivateDirectoriesCommand(directoryPaths),
     WINDOWS_PRIVATE_DIRECTORY_COMPLETE_MARKER,
     "Windows private directory protection failed",
     execute,
   );
+}
+
+export async function establishWindowsPrivateDirectory(
+  directoryPath: string,
+  execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
+): Promise<void> {
+  await establishWindowsPrivateDirectories([directoryPath], execute);
 }
 
 export async function protectWindowsPrivateTreeAcl(

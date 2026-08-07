@@ -5,7 +5,7 @@ import { samePhysicalDirectoryIdentity } from "../browser/filesystemLockDirector
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
-  protectWindowsPrivateTreeAcl,
+  resolveWindowsPrivateTreeAuthority,
   type WindowsPrivateTreeAuthority,
 } from "./windowsPrivateTreeAcl.js";
 import {
@@ -207,7 +207,7 @@ export class RemoteTransactionStore {
     );
     const windowsPrivateTreeAuthority =
       platform === "win32"
-        ? (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)
+        ? (options.windowsPrivateTreeAuthority ?? resolveWindowsPrivateTreeAuthority())
         : undefined;
     const windowsPrivateTreeScope = {
       storeDirectory: directory,

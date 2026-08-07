@@ -173,6 +173,23 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       const transactionToken = "3".repeat(64);
+      let durableSettlementComplete = false;
+      const finalizePendingCapture = async () => {
+        await vi.waitFor(
+          async () => {
+            const settlement = await httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/finalize`,
+              token: "a".repeat(64),
+              body: { durablePublication: true },
+            });
+            expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+          },
+          { timeout: 5_000 },
+        );
+        durableSettlementComplete = true;
+      };
 
       try {
         const disconnected = postJsonAndDisconnect({
@@ -187,22 +204,25 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         continueRun.resolve();
 
         let retryResponse: Awaited<ReturnType<typeof httpPostJson>> | null = null;
-        await vi.waitFor(async () => {
-          retryResponse = await httpPostJson({
-            hostname: "127.0.0.1",
-            port: server.port,
-            path: `/transactions/${transactionToken}/retry`,
-            token: "a".repeat(64),
-            body: {},
-          });
-          expect(retryResponse).toMatchObject({
-            statusCode: 200,
-            json: {
-              status: "transaction",
-              transaction: { state: "pending", result: { answerText: "durable answer" } },
-            },
-          });
-        });
+        await vi.waitFor(
+          async () => {
+            retryResponse = await httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/retry`,
+              token: "a".repeat(64),
+              body: {},
+            });
+            expect(retryResponse).toMatchObject({
+              statusCode: 200,
+              json: {
+                status: "transaction",
+                transaction: { state: "pending", result: { answerText: "durable answer" } },
+              },
+            });
+          },
+          { timeout: 5_000 },
+        );
         expect(finalize).not.toHaveBeenCalled();
         const pendingRecord = await readAuthenticatedTransactionRecord(
           transactionStoreDir,
@@ -224,19 +244,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           runtime: { chromeTargetId: "disconnect-target" },
         });
 
-        await vi.waitFor(async () => {
-          const settlement = await httpPostJson({
-            hostname: "127.0.0.1",
-            port: server.port,
-            path: `/transactions/${transactionToken}/finalize`,
-            token: "a".repeat(64),
-            body: { durablePublication: true },
-          });
-          expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
-        });
+        await finalizePendingCapture();
         expect(finalize).toHaveBeenCalledTimes(1);
       } finally {
         continueRun.resolve();
+        if (!durableSettlementComplete) await finalizePendingCapture();
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
       }

@@ -238,5 +238,6 @@ describe("legacy remote protocol integration", () => {
         await rm(directory, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 });

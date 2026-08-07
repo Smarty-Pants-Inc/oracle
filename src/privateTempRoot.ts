@@ -15,7 +15,12 @@ import {
   removeIsolatedDirectoryGeneration,
 } from "./browser/filesystemLockDirectoryRemoval.js";
 import { getOracleHomeDir } from "./oracleHome.js";
-import { establishWindowsPrivateDirectory } from "./remote/windowsPrivateTreeAcl.js";
+import {
+  establishWindowsPrivateDirectories,
+  establishWindowsPrivateDirectory,
+  resolveWindowsPrivateDirectoryAuthority,
+  type WindowsPrivateDirectoryAuthority,
+} from "./remote/windowsPrivateTreeAcl.js";
 
 const PRIVATE_TEMP_ROOT_NAME = "oracle-private";
 
@@ -28,8 +33,6 @@ export interface PrivateDirectoryAuthority {
 export interface PrivateTempGeneration extends PrivateDirectoryAuthority {
   readonly parent: PrivateDirectoryAuthority;
 }
-
-export type WindowsPrivateDirectoryAuthority = (directoryPath: string) => Promise<void>;
 
 export interface PrivateTempRootOptions {
   readonly platform?: NodeJS.Platform;
@@ -168,7 +171,7 @@ export async function assertPrivateDirectoryAuthority(
 ): Promise<void> {
   await assertPhysicalDirectoryAuthority(authority);
   if (authority.platform === "win32") {
-    await (options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory)(
+    await (options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority())(
       authority.path,
     );
     await assertPhysicalDirectoryAuthority(authority);
@@ -224,7 +227,7 @@ async function establishWindowsPrivateRoot(
 ): Promise<PrivateDirectoryAuthority> {
   const stateDirectory = oracleStateDirectory(options);
   const windowsAuthority =
-    options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory;
+    options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
   if (!options.tempDirectory) {
     await mkdir(stateDirectory, { recursive: true });
   }
@@ -239,7 +242,7 @@ async function establishWindowsPrivateRoot(
     identity: await capturePhysicalDirectoryIdentity(rootPath),
     platform: "win32" as const,
   });
-  await assertPrivateDirectoryAuthority(authority, options);
+  await assertPhysicalDirectoryAuthority(authority);
   return authority;
 }
 
@@ -322,7 +325,19 @@ export async function createPrivateTempChildGeneration(
   if ((options.platform ?? parent.platform) !== parent.platform) {
     throw new Error("Private temporary child platform does not match its parent authority");
   }
-  await assertPrivateDirectoryAuthority(parent, options);
+  const windowsAuthority =
+    options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
+  const usesNativeWindowsAuthority =
+    parent.platform === "win32" && windowsAuthority === establishWindowsPrivateDirectory;
+  if (parent.platform === "win32") {
+    if (!usesNativeWindowsAuthority) {
+      await assertPrivateDirectoryAuthority(parent, {
+        windowsPrivateDirectoryAuthority: windowsAuthority,
+      });
+    }
+  } else {
+    await assertPrivateDirectoryAuthority(parent);
+  }
   let generationPath: string;
   let identity: PhysicalDirectoryIdentity;
   if (parent.platform === "win32" || options.randomId) {
@@ -330,9 +345,11 @@ export async function createPrivateTempChildGeneration(
     validatePrefix(generationName);
     generationPath = path.join(parent.path, generationName);
     if (parent.platform === "win32") {
-      await (options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory)(
-        generationPath,
-      );
+      if (usesNativeWindowsAuthority) {
+        await establishWindowsPrivateDirectories([parent.path, generationPath]);
+      } else {
+        await windowsAuthority(generationPath);
+      }
       identity = await capturePhysicalDirectoryIdentity(generationPath);
     } else {
       await mkdir(generationPath, { mode: 0o700 });
@@ -348,7 +365,12 @@ export async function createPrivateTempChildGeneration(
     identity,
     platform: parent.platform,
   });
-  await assertPrivateTempGeneration(generation, options);
+  if (parent.platform === "win32") {
+    await assertPhysicalDirectoryAuthority(parent);
+    await assertPhysicalDirectoryAuthority(generation);
+  } else {
+    await assertPrivateTempGeneration(generation, options);
+  }
   return generation;
 }
 
@@ -356,6 +378,18 @@ export async function assertPrivateTempGeneration(
   generation: PrivateTempGeneration,
   options: Pick<PrivateTempRootOptions, "windowsPrivateDirectoryAuthority"> = {},
 ): Promise<void> {
+  if (generation.platform === "win32") {
+    const windowsAuthority =
+      options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
+    if (windowsAuthority === establishWindowsPrivateDirectory) {
+      await assertPhysicalDirectoryAuthority(generation.parent);
+      await assertPhysicalDirectoryAuthority(generation);
+      await establishWindowsPrivateDirectories([generation.parent.path, generation.path]);
+      await assertPhysicalDirectoryAuthority(generation.parent);
+      await assertPhysicalDirectoryAuthority(generation);
+      return;
+    }
+  }
   await assertPrivateDirectoryAuthority(generation.parent, options);
   await assertPrivateDirectoryAuthority(generation, options);
 }

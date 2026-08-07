@@ -793,17 +793,12 @@ describe("profileState", () => {
       const profileDir = path.join(root, "profile with spaces");
       const chromeExecutable = path.join(root, "google-chrome");
       await mkdir(profileDir);
-      await copyFile(process.execPath, chromeExecutable);
+      await copyFile("/bin/sh", chromeExecutable);
       await chmod(chromeExecutable, 0o755);
       const child = spawn(
         chromeExecutable,
-        [
-          "-e",
-          "require('node:net').createServer().listen(0)",
-          "--",
-          `--user-data-dir=${profileDir}`,
-        ],
-        { stdio: "ignore" },
+        ["-c", "read _", "--", `--user-data-dir=${profileDir}`],
+        { stdio: ["pipe", "ignore", "ignore"] },
       );
       const exited = once(child, "exit");
       try {
