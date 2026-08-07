@@ -46,6 +46,56 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
     vi.resetModules();
   });
 
+  test("recovers directly when a named session has no recorded endpoint", async () => {
+    const metaWithoutRuntime = {
+      ...baseMeta,
+      browser: {
+        config: {
+          manualLogin: true,
+          manualLoginProfileDir: "/tmp/recover-profile",
+          url: "https://chatgpt.com/c/saved-conversation",
+        },
+      },
+    } as unknown as SessionMetadata;
+    const harvestChatGptTab = vi.fn().mockResolvedValue(completedHarvest);
+    const recoverConversationTab = vi.fn(async () => ({
+      host: "127.0.0.1",
+      port: 53997,
+      url: "https://chatgpt.com/c/saved-conversation",
+      ref: "saved-conversation",
+      chrome: null,
+    }));
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      collectChatGptTabs: vi.fn(),
+      DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
+      DEFAULT_REMOTE_CHROME_PORT: 9222,
+      extractConversationIdFromUrl: () => "saved-conversation",
+      formatBrowserTabState: () => "completed",
+      harvestChatGptTab,
+      sessionMatchesTab: () => false,
+    }));
+    vi.doMock("../../src/browser/recoverConversation.js", () => ({ recoverConversationTab }));
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        readSession: vi.fn(async () => metaWithoutRuntime),
+        updateSession: vi.fn(async () => {}),
+      },
+    }));
+
+    // vi.doMock needs a fresh import so this test observes its isolated module graph.
+    const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    await harvestSessionBrowserOutput("sess-recover", { quietOutput: true });
+
+    expect(recoverConversationTab).toHaveBeenCalledWith(metaWithoutRuntime, expect.any(Function), {
+      existingEndpoint: undefined,
+    });
+    expect(harvestChatGptTab).toHaveBeenCalledTimes(1);
+    expect(harvestChatGptTab).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "127.0.0.1", port: 53997, ref: "saved-conversation" }),
+    );
+  });
+
   test("retries via recoverConversationTab when initial harvest finds no live tab", async () => {
     const harvestChatGptTab = vi
       .fn()

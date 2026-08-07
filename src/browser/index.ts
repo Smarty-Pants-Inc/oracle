@@ -148,13 +148,18 @@ export function redactBrowserConfigForDebugLogForTest(
 
 function isCloudflareChallengeError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
-  return (error.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
+  const details = error.details as { stage?: string; code?: string } | undefined;
+  return details?.stage === "cloudflare-challenge" || details?.code === "cloudflare-challenge";
 }
 
 function isReattachableCaptureError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
   const stage = (error.details as { stage?: string } | undefined)?.stage;
-  return stage === "assistant-timeout" || stage === "assistant-recheck";
+  return (
+    stage === "assistant-timeout" ||
+    stage === "assistant-recheck" ||
+    stage === "attachment-verification"
+  );
 }
 
 type PreservedBrowserErrorKind = "cloudflare-challenge" | "reattachable-capture";
@@ -1663,7 +1668,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         name: path.basename(a.path),
         generatedBundle: a.generatedBundle === true,
       }));
-      let inputOnlyAttachments = false;
       await raceWithDisconnect(clearPromptComposer(Runtime, logger));
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       if (submissionAttachments.length > 0) {
@@ -1685,7 +1689,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             { expectedCount: attachmentIndex + 1 },
           );
           if (!uiConfirmed) {
-            inputOnlyAttachments = true;
+            throw new BrowserAutomationError(
+              `Attachment ${JSON.stringify(attachment.displayPath)} was accepted by the file input but not confirmed by the ChatGPT composer.`,
+              {
+                stage: "attachment-upload",
+                code: "attachment-ui-unconfirmed",
+                attachmentName: path.basename(attachment.path),
+              },
+            );
           }
           await delay(500);
         }
@@ -1747,30 +1758,38 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         baselineTurns = providerBaselineTurns;
       }
       if (attachmentNames.length > 0) {
-        if (inputOnlyAttachments) {
-          logger(
-            "Attachment UI did not render before send; skipping user-turn attachment verification.",
-          );
-        } else {
-          const verified = await waitForUserTurnAttachments(
-            Runtime,
-            attachmentNames,
-            20_000,
-            logger,
+        const verified = await waitForUserTurnAttachments(
+          Runtime,
+          attachmentNames,
+          20_000,
+          logger,
+          {
+            minTurnIndex: baselineTurns ?? undefined,
+            expectedPrompt: prompt,
+            expectedConversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+          },
+        ).catch((error) => {
+          throw new BrowserAutomationError(
+            "Attachment could not be verified on the sent ChatGPT user turn.",
             {
-              minTurnIndex: baselineTurns ?? undefined,
-              expectedPrompt: prompt,
-              expectedConversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+              stage: "attachment-verification",
+              code: "attachment-missing-user-turn",
+              attachmentNames,
+            },
+            error,
+          );
+        });
+        if (!verified) {
+          throw new BrowserAutomationError(
+            "The newly sent ChatGPT user turn could not be found for attachment verification.",
+            {
+              stage: "attachment-verification",
+              code: "attachment-user-turn-not-found",
+              attachmentNames,
             },
           );
-          if (!verified) {
-            logger(
-              "Sent user message did not expose attachment UI; continuing after upload check.",
-            );
-          } else {
-            logger("Verified attachments present on sent user message");
-          }
         }
+        logger("Verified attachments present on sent user message");
       }
       return {
         baselineTurns,
@@ -2489,6 +2508,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         lastUrl = archive.conversationUrl;
         await emitRuntimeHint();
       }
+      preserveBrowserOnError = promptSubmitted && archive?.archived !== true;
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);

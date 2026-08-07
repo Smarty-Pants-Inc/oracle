@@ -519,9 +519,11 @@ export async function performSessionRun({
     const assistantTimeout =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "assistant-timeout";
+    const cloudflareDetails = userError?.details as { stage?: string; code?: string } | undefined;
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
-      (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
+      (cloudflareDetails?.stage === "cloudflare-challenge" ||
+        cloudflareDetails?.code === "cloudflare-challenge");
     const browserCanReattach = !browserConfig?.copyProfileSource;
     let reattachGuidanceLogged = false;
     const logBrowserReattachGuidance = (

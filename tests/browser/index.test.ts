@@ -35,6 +35,14 @@ describe("shouldPreserveBrowserOnErrorForTest", () => {
     expect(shouldPreserveBrowserOnErrorForTest(error, false)).toBe(true);
   });
 
+  test("preserves post-submit Cloudflare codes emitted under another stage", () => {
+    const error = new BrowserAutomationError("Cloudflare challenge detected after submit.", {
+      stage: "submit-prompt",
+      code: "cloudflare-challenge",
+    });
+    expect(shouldPreserveBrowserOnErrorForTest(error, false)).toBe(true);
+  });
+
   test("does not preserve the browser for headless cloudflare challenge errors", () => {
     const error = new BrowserAutomationError("Cloudflare challenge detected.", {
       stage: "cloudflare-challenge",

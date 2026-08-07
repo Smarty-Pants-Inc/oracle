@@ -26,6 +26,25 @@ describe("browser tab CLI helpers", () => {
     expect(resolveSessionTabRefForTest(meta)).toBe("https://chatgpt.com/c/runtime-conversation");
   });
 
+  test("uses the configured conversation URL when runtime metadata is missing", () => {
+    const meta = {
+      id: "session-config-only",
+      createdAt: "2026-08-07T00:00:00.000Z",
+      status: "error",
+      options: {},
+      mode: "browser",
+      browser: {
+        config: {
+          url: "https://chatgpt.com/g/project/c/configured-conversation",
+        },
+      },
+    } as SessionMetadata;
+
+    expect(resolveSessionTabRefForTest(meta)).toBe(
+      "https://chatgpt.com/g/project/c/configured-conversation",
+    );
+  });
+
   const harvested = (overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary => ({
     targetId: "ABCDEF12",
     title: "Oracle review",

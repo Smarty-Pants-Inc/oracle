@@ -253,7 +253,7 @@ describe("sent turn attachment verification", () => {
     useRealTime();
   });
 
-  test("waitForUserTurnAttachments skips when user turn lacks attachment UI", async () => {
+  test("waitForUserTurnAttachments fails when user turn lacks attachment UI", async () => {
     useFakeTime();
 
     const runtime = {
@@ -270,8 +270,9 @@ describe("sent turn attachment verification", () => {
     } as unknown as ChromeClient["Runtime"];
 
     const promise = waitForUserTurnAttachments(runtime, ["oracle-attach-verify.txt"], 600);
+    const assertion = expect(promise).rejects.toThrow(/Attachment was not present/i);
     await vi.advanceTimersByTimeAsync(2_000);
-    await expect(promise).resolves.toBe(false);
+    await assertion;
     useRealTime();
   });
 
